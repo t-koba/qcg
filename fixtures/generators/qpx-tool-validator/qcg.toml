@@ -1,0 +1,81 @@
+[[flow]]
+id = "write_config"
+type = "write"
+artifact = { label = "qpx config", required = true }
+
+[flow.params]
+content = """
+routes: []
+"""
+output_file = "qpx.yaml"
+
+[[flow]]
+id = "validate_config"
+type = "check.tool"
+
+[flow.params]
+input = "qpx.yaml"
+tool = "qpx_validate"
+
+[generator]
+description = "Shows qpxd check as a logical validator tool with multiple sandbox backends."
+id = "qpx-tool-validator"
+name = "qpx Tool Validator"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[[permissions.commands]]
+args = [
+    "check",
+    "--config",
+    "*",
+]
+bin = "qpxd"
+purpose = "validate qpx config on host when explicitly approved"
+
+[permissions.containers]
+enabled = true
+images = ["ghcr.io/t-koba/qpxd@sha256:example"]
+on_missing = "error"
+
+[tools.qpx_validate]
+command = [
+    "qpxd",
+    "check",
+    "--config",
+    "{input}",
+]
+input = "qpx.yaml"
+kind = "validator"
+network = "none"
+output_limit_bytes = 1048576
+timeout_seconds = 30
+workspace = "read_only"
+
+[tools.qpx_validate.backends.bundled]
+bin = "resources/bin/{{ os }}/{{ arch }}/qpxd"
+sha256 = "replace-with-real-sha256"
+
+[tools.qpx_validate.backends.container]
+image = "ghcr.io/t-koba/qpxd@sha256:example"
+mount = "/work"
+
+[tools.qpx_validate.backends.host]
+bin = "qpxd"
+version_command = [
+    "qpxd",
+    "--version",
+]
+
+[tools.qpx_validate.resolution]
+allowed_backends = [
+    "bundled",
+    "container",
+    "host",
+]
+fallback = "explicit"
+preferred_backends = [
+    "bundled",
+    "container",
+    "host",
+]

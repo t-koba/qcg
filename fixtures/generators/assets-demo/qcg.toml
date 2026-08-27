@@ -1,0 +1,31 @@
+[[flow]]
+id = "emit"
+type = "write"
+artifact = { label = "Message", required = true }
+
+[flow.params]
+content = "{{ inputs.message }}"
+output_file = "message.txt"
+
+[generator]
+description = "Demonstrates exact-file and directory-backed generator assets."
+id = "assets-demo"
+name = "Generator Assets"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[[inputs.stages]]
+id = "input"
+
+[[inputs.stages.fields]]
+id = "message"
+pattern = ".+"
+required = true
+type = "string"
+
+[assets]
+files = [
+    "index.html",
+]
+dirs = ["ui"]
+meta = { entry = "index.html", custom = { answer = 42, enabled = true } }

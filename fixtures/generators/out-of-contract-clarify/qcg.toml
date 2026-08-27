@@ -1,0 +1,27 @@
+[failure.by_kind]
+out_of_contract = "clarify"
+
+[[flow]]
+id = "fill"
+output = "result"
+type = "llm.fill"
+
+[flow.params]
+max_iterations = 1
+prompt = "prompts/fill.j2"
+schema = "schemas/result.schema.json"
+
+[generator]
+description = "Turns an out-of-contract LLM response into a user clarification"
+id = "out-of-contract-clarify"
+name = "Out Of Contract Clarify"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[llm]
+max_tokens = 128
+temperature = 0.0
+
+[llm.model]
+model = "fake"
+provider = "fake"

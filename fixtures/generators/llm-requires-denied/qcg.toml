@@ -1,0 +1,26 @@
+[[flow]]
+id = "draft"
+type = "llm.generate"
+artifact = { label = "Draft", required = true }
+
+[flow.params]
+output_file = "draft.txt"
+prompt = "prompts/draft.j2"
+
+[generator]
+description = "Negative fixture: declared LLM capability is not provided."
+id = "llm-requires-denied"
+name = "LLM Requires Denied"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[llm]
+max_tokens = 128
+requires = ["streaming"]
+temperature = 0.0
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[permissions]

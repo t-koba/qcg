@@ -1,0 +1,31 @@
+[[flow]]
+id = "choose_mode"
+output = "mode"
+type = "ask_user"
+
+[flow.params]
+content = "Choose the output mode"
+options = [
+    "brief",
+    "detailed",
+]
+
+[[flow]]
+id = "write_answer"
+type = "write"
+artifact = { label = "Answer", required = true }
+
+[flow.params]
+content = """
+mode={{ steps.mode.output }}
+"""
+output_file = "answer.txt"
+
+[generator]
+description = "Asks for a declared choice during generation."
+id = "ask-user"
+name = "Ask User"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[permissions]

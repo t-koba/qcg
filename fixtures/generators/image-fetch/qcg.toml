@@ -1,0 +1,28 @@
+[[flow]]
+id = "fetch_image_metadata"
+type = "http"
+artifact = { label = "Image API response", required = true }
+
+[flow.params]
+method = "GET"
+output_file = "image-response.json"
+url = "https://example.com/images?q={{ inputs.query }}"
+
+[generator]
+description = "Declares an external image API fetch through the HTTP step."
+id = "image-fetch"
+name = "Image Fetch"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[[inputs.stages]]
+id = "image"
+
+[[inputs.stages.fields]]
+default = "diagram"
+id = "query"
+required = true
+type = "string"
+
+[permissions]
+network = ["example.com"]

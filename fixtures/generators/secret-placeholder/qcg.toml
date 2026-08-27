@@ -1,0 +1,37 @@
+[[flow]]
+id = "draft"
+type = "llm.generate"
+
+[flow.params]
+output_file = "config.template"
+prompt = "prompts/draft.j2"
+
+[[flow]]
+id = "inject"
+type = "transform"
+artifact = { label = "Config", required = true }
+
+[flow.params]
+source = "config.template"
+target = "config.txt"
+transform = "inject_secrets"
+secrets = ["api_token"]
+
+[generator]
+description = "LLM writes a placeholder and deterministic transform injects the secret"
+id = "secret-placeholder"
+name = "Secret Placeholder"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[llm]
+temperature = 0.0
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[permissions]
+
+[secrets.api_token]
+env = "QCG_TEST_TOKEN"

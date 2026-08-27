@@ -1,0 +1,45 @@
+[[flow]]
+id = "write_before"
+type = "write"
+
+[flow.params]
+content = """
+before
+"""
+output_file = "before.txt"
+
+[[flow]]
+id = "effect"
+type = "command"
+
+[flow.params]
+command = [
+    "echo",
+    "confirmed",
+]
+
+[[flow]]
+id = "write_after"
+type = "write"
+artifact = { label = "After", required = true }
+
+[flow.params]
+content = """
+after
+"""
+output_file = "after.txt"
+
+[generator]
+description = "Requires confirmation before running a command side effect"
+id = "side-effect-confirm"
+name = "Side Effect Confirm"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[permissions]
+side_effects = "confirm"
+
+[[permissions.commands]]
+args = ["confirmed"]
+bin = "echo"
+purpose = "demonstrate side effect confirmation"

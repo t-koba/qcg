@@ -1,0 +1,25 @@
+[[flow]]
+id = "try_command"
+type = "command"
+
+[flow.params]
+command = [
+    "sh",
+    "-c",
+    "echo should-not-run",
+]
+
+[generator]
+description = "Negative fixture: a skill resource does not grant command permission."
+id = "skill-command-denied"
+name = "Skill Command Denied"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[permissions]
+
+[resources.local_skill]
+llm_visible = false
+path = "resources/danger-skill"
+trust = "untrusted"
+type = "skill"

@@ -1,0 +1,30 @@
+[[flow]]
+id = "emit_html"
+type = "write"
+artifact = { label = "Unsafe HTML", required = true }
+
+[flow.params]
+content = """
+<!doctype html>
+<html>
+  <head>
+    <title>Unsafe preview</title>
+  </head>
+  <body>
+    <h1>Preview sandbox fixture</h1>
+    <script>
+      window.top.document.title = "preview script executed";
+    </script>
+  </body>
+</html>
+"""
+output_file = "preview.html"
+
+[generator]
+description = "Produces an HTML artifact that must not execute scripts in preview."
+id = "artifact-preview-sandbox"
+name = "Artifact Preview Sandbox"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[permissions]

@@ -1,0 +1,32 @@
+[[flow]]
+context = [{ resource = "todo_api", select = "paths" }]
+id = "draft"
+type = "llm.generate"
+artifact = { label = "Client Notes", required = true }
+
+[flow.params]
+output_file = "client-notes.txt"
+prompt = "prompts/draft.j2"
+
+[generator]
+description = "Uses an OpenAPI resource as bounded LLM context."
+id = "openapi-client"
+name = "OpenAPI Client"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[llm]
+max_tokens = 512
+temperature = 0.0
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[permissions]
+
+[resources.todo_api]
+llm_visible = true
+path = "resources/todo-openapi.json"
+trust = "trusted"
+type = "openapi"

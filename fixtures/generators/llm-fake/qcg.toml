@@ -1,0 +1,55 @@
+[[flow]]
+id = "fill_model"
+output = "model"
+type = "llm.fill"
+
+[flow.params]
+prompt = "prompts/fill.j2"
+schema = "schemas/model.schema.json"
+
+[[flow]]
+id = "choose_layout"
+output = "layout"
+type = "llm.choose"
+
+[flow.params]
+options = [
+    "single",
+    "split",
+]
+prompt = "prompts/choose.j2"
+
+[[flow]]
+id = "generate_readme"
+type = "llm.generate"
+artifact = { label = "README", required = true }
+
+[flow.params]
+output_file = "README.md"
+prompt = "prompts/generate.j2"
+
+[generator]
+description = "Deterministic LLM example using the fake provider"
+id = "llm-fake"
+name = "Fake LLM"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[[inputs.stages]]
+id = "basic"
+
+[[inputs.stages.fields]]
+id = "name"
+pattern = "^[a-z][a-z0-9_-]*$"
+required = true
+type = "string"
+
+[llm]
+max_tokens = 256
+temperature = 0.0
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[permissions]

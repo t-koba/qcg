@@ -1,0 +1,43 @@
+[[flow]]
+context = [
+    "inputs.*",
+    { resource = "note" },
+]
+id = "draft"
+type = "llm.generate"
+artifact = { label = "Context", required = true }
+
+[flow.params]
+output_file = "context.txt"
+prompt = "prompts/draft.j2"
+
+[generator]
+description = "Checks that declared LLM context is appended to prompts."
+id = "llm-context"
+name = "LLM Context"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[[inputs.stages]]
+id = "basic"
+
+[[inputs.stages.fields]]
+id = "name"
+required = true
+type = "string"
+
+[llm]
+max_tokens = 512
+temperature = 0.0
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[permissions]
+
+[resources.note]
+llm_visible = true
+path = "resources/note.txt"
+trust = "untrusted"
+type = "file"

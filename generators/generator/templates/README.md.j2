@@ -1,0 +1,17 @@
+{% set form = steps.ask_manual_form.output %}
+# {{ form.generator_name }}
+
+{{ steps.ask_purpose.output.description }}
+
+## Inputs
+
+{% set design = form.design_json %}
+{% for field in design.input_fields %}
+- `{{ field.id }}` ({{ field.type }}{% if field.required %}, required{% endif %})
+{% endfor %}
+
+## Run
+
+```bash
+qcg run . --yes
+```

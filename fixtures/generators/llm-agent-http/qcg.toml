@@ -1,0 +1,52 @@
+[[flow]]
+id = "agent"
+output = "agent_result"
+type = "llm.agent"
+
+[flow.params]
+max_iterations = 3
+max_tokens_total = 4096
+prompt = "prompts/agent.j2"
+
+[[flow.params.tools]]
+hosts = ["127.0.0.1"]
+kind = "http"
+methods = ["GET"]
+name = "fetch_health"
+
+[[flow]]
+id = "write_result"
+type = "write"
+artifact = { label = "Agent result", required = true }
+
+[flow.params]
+content = """
+{{ steps.agent_result.output.text }}
+"""
+output_file = "result.txt"
+
+[generator]
+description = "Deterministic llm.agent example using a declared HTTP tool."
+id = "llm-agent-http"
+name = "Fake LLM Agent HTTP"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[[inputs.stages]]
+id = "basic"
+
+[[inputs.stages.fields]]
+id = "base_url"
+required = true
+type = "string"
+
+[llm]
+max_tokens = 256
+temperature = 0.0
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[permissions]
+network = ["127.0.0.1"]

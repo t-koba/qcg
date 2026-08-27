@@ -1,0 +1,45 @@
+You are proposing the complete design for a new qcg generator.
+
+The operator's request (this is the ONLY requirement input — everything else is yours to deduce):
+
+<purpose>
+{{ steps.ask_purpose.output.description }}
+</purpose>
+
+Respond with a single JSON object and nothing else: no markdown fences, no commentary.
+
+Field rules:
+- `generator_id` MUST match ^[a-z][a-z0-9_-]*$ (lowercase kebab/snake). Derive it from the requested purpose; when nothing fits, use "generated".
+- `generator_name` MUST be a concise human-readable name.
+ - `package` is REQUIRED for every LLM proposal. It must contain the complete target `manifest` body and a `sources` object mapping each package-relative path to its UTF-8 text content (which may be empty); do not rely on a simple or partial fallback.
+ - Every `sources` key must be a safe relative slash-separated path with no empty, `.`, or `..` component, and the reserved root path `qcg.toml` must never be included. Source keys are unique by construction because `sources` is an object.
+- Input field types inside `package.manifest.inputs`: string, text, number, boolean, select, multiselect, list, json, natural_language, file.
+
+## qcg harness vocabulary (use it to deduce the whole package)
+
+Step types for `package.manifest.flow` (each item: id, type, params; optional needs, when, on_deps "none_failed", output, artifact):
+
+- `write`: output_file + content (content may reference the proposed input fields).
+- `render`: template + output_file (template ships via sources).
+- `llm.fill`: prompt + schema (schema ships via sources); output captured via top-level `output`.
+- `ask_user`: HITL question. `content`, optional `options` (single choice) or `fields_from` pointing at an array of input fields (dynamic form).
+- `copy`: source + target (package-relative source).
+- `transform`: json_pretty | json_compact | toml_to_json | json_to_toml | json_merge (with) | inject_secrets (secrets) | zip.
+- `command`: `command` (array of strings, required — the full command including the binary; templated) — run external tools.
+- `check.command`: run a host command and assert expectations. Params: `command` (array of strings, required — the full command including the binary), `expect` ({exit_code, stdout_contains, ...}) — USE THIS for validation gates like `nginx -t` after emitting a config.
+- `check.container`: run a command inside a container. Params: `command` (array of strings, required — the full command including the binary), optional `image`, `mounts` ([{from, to, mode}]), `expect` ({exit_code, stdout_contains, ...}). Example: command = ["nginx", "-t"], image = "nginx:stable".
+- `check.schema` / `check.format` / `check.contract`: structural validators.
+- `foreach`: items (dotted path to an array or object) + subflow naming a `blocks.<name>` group; block params see the current array entry as `item`. Object entries use the generic `{key, value}` shape, exposed as `item.key` and `item.value`.
+
+Control fields: `when` (boolean expr over inputs/steps), `on_deps` ("all_succeeded" default, "any_succeeded", "none_failed"), `needs`, `output`, `artifact` ({label, required}).
+
+Adaptive HITL design rules:
+- If an operator decision can change the workflow, declare that decision as an `ask_user` node in the DAG, give it explicit `needs`, and gate each resulting branch with `when` over `steps.<question>.output`.
+- If the LLM produces a variable question array, expose it with `ask_user`'s `fields_from` pointing at that declared array so the form is generated at run time; do not hard-code one question node per possible question.
+- Do not add fixed `ask_user` questions merely to simulate interaction. Ask only for information that is missing or whose answer materially changes the generated workflow or its permissions.
+
+If the requested description mentions validating, testing, linting, compiling, or checking the output ANYWHERE, you MUST propose the `package` tier whose `manifest.flow` contains BOTH the emission step AND the matching `check.command` / `check.schema` / `check.container` gate. Never omit verification the user asked for.
+
+Required outputs are declared ONLY as per-node `artifact = {label, required}` on flow items, or under `outputs.extras` as [{glob, label, required}]; never as a top-level `artifact` key. Permissions are never part of the proposal — the operator selects them explicitly.
+
+FAKE_JSON: {"generator_id":"proposed-gen","generator_name":"Proposed Generator","package":{"manifest":{"inputs":{"stages":[{"id":"main","fields":[{"id":"request","type":"string","required":true}]}]},"flow":[{"id":"emit","type":"write","params":{"content":"{{ '{{' }} inputs.request {{ '}}' }}","output_file":"README.md"}}]},"sources":{}}}

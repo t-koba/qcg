@@ -1,0 +1,57 @@
+[[flow]]
+id = "write_config"
+type = "write"
+artifact = { label = "qpx config", required = true }
+
+[flow.params]
+content = """
+routes: []
+"""
+output_file = "qpx.yaml"
+
+[[flow]]
+id = "validate_config"
+type = "check.tool"
+
+[flow.params]
+input = "qpx.yaml"
+tool = "qpx_validate"
+
+[generator]
+description = "Exercises check.tool with an explicit host validator backend."
+id = "logical-tool-host"
+name = "Logical Tool Host"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[[permissions.commands]]
+args = [
+    "-f",
+    "*",
+]
+bin = "test"
+purpose = "validate that qpx.yaml exists"
+
+[tools.qpx_validate]
+command = [
+    "qpxd",
+    "-f",
+    "{input}",
+]
+input = "qpx.yaml"
+kind = "validator"
+network = "none"
+timeout_seconds = 30
+workspace = "read_only"
+
+[tools.qpx_validate.backends.host]
+bin = "test"
+version_command = [
+    "test",
+    "--version",
+]
+
+[tools.qpx_validate.resolution]
+allowed_backends = ["host"]
+fallback = "explicit"
+preferred_backends = ["host"]

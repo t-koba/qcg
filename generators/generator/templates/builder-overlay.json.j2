@@ -1,0 +1,38 @@
+{% if steps.ask_design_mode.output == 'manual' %}
+{% set form = steps.ask_manual_form.output %}
+{% set gid = form.generator_id %}
+{% set gname = form.generator_name %}
+{% else %}
+{# In llm mode, derive the generated identity from the proposal. #}
+{% set d = steps.design_out.output %}
+{% set gid = d.generator_id %}
+{% set gname = d.generator_name | default(d.generator_id) %}
+{% endif %}
+{% set gdesc = steps.ask_purpose.output.description %}
+{
+  "generator": {
+    "id": {{ gid | tojson }},
+    "name": {{ gname | tojson }},
+    "version": "0.1.0",
+    "qcg_version": "^0.1",
+    "description": {{ gdesc | tojson }}
+  },
+  "permissions": {
+    "fs_read": ["workspace"],
+    "fs_write": [{% if steps.ask_fs_write.output == "workspace" %}"workspace"{% endif %}],
+{% if steps.ask_network.output != "none" %}
+    "network": ["{{ steps.ask_network.output }}"],
+{% endif %}
+{% if steps.ask_commands.output == "cc" %}
+    "commands": [{ "bin": "cc", "args": ["-o", "*", "*.c"], "purpose": "compile generated C code" }],
+{% endif %}
+{% if steps.ask_containers.output == "nginx" %}
+    "containers": { "enabled": true, "images": ["nginx:1.27"], "on_missing": "skip_with_warning" },
+{% endif %}
+    "side_effects": "{{ steps.ask_side_effects.output }}"
+  }
+{% if steps.ask_secrets.output == "api_token" %}
+  ,
+  "secrets": { "api_token": { "env": "QCG_GENERATED_API_TOKEN" } }
+{% endif %}
+}

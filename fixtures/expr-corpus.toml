@@ -1,0 +1,300 @@
+[context.inputs]
+enabled = true
+disabled = false
+name = "alpha"
+other = "beta"
+count = 3
+limit = 5
+zero = 0
+nullish = "null"
+
+[context.inputs.object]
+ready = true
+rank = 7
+
+[context.steps.render.output]
+ready = true
+status = "ok"
+count = 2
+
+[context.steps.render.output.nested]
+flag = false
+
+[context.steps.empty]
+output = "null"
+
+[context.item]
+name = "site-a"
+enabled = true
+priority = 10
+
+[context.item.meta]
+tier = "gold"
+
+[[cases]]
+expr = "true"
+expected = true
+
+[[cases]]
+expr = "false"
+expected = false
+
+[[cases]]
+expr = "inputs.enabled"
+expected = true
+
+[[cases]]
+expr = "inputs.disabled"
+expected = false
+
+[[cases]]
+expr = "inputs.missing"
+expected = false
+
+[[cases]]
+expr = "inputs.nullish"
+expected = false
+
+[[cases]]
+expr = "inputs.object.ready"
+expected = true
+
+[[cases]]
+expr = "steps.render.output.ready"
+expected = true
+
+[[cases]]
+expr = "steps.render.output.nested.flag"
+expected = false
+
+[[cases]]
+expr = "item.enabled"
+expected = true
+
+[[cases]]
+expr = "!true"
+expected = false
+
+[[cases]]
+expr = "!false"
+expected = true
+
+[[cases]]
+expr = "!inputs.disabled"
+expected = true
+
+[[cases]]
+expr = "!!inputs.enabled"
+expected = true
+
+[[cases]]
+expr = "inputs.enabled && item.enabled"
+expected = true
+
+[[cases]]
+expr = "inputs.enabled && inputs.disabled"
+expected = false
+
+[[cases]]
+expr = "inputs.disabled || steps.render.output.ready"
+expected = true
+
+[[cases]]
+expr = "inputs.disabled || false"
+expected = false
+
+[[cases]]
+expr = "inputs.enabled && inputs.disabled || item.enabled"
+expected = true
+
+[[cases]]
+expr = "inputs.disabled || inputs.enabled && item.enabled"
+expected = true
+
+[[cases]]
+expr = "inputs.name == 'alpha'"
+expected = true
+
+[[cases]]
+expr = "inputs.name != 'beta'"
+expected = true
+
+[[cases]]
+expr = "inputs.name == \"alpha\""
+expected = true
+
+[[cases]]
+expr = "inputs.name != \"alpha\""
+expected = false
+
+[[cases]]
+expr = "inputs.other > 'alpha'"
+expected = true
+
+[[cases]]
+expr = "inputs.name < 'beta'"
+expected = true
+
+[[cases]]
+expr = "inputs.other >= 'beta'"
+expected = true
+
+[[cases]]
+expr = "inputs.name <= 'alpha'"
+expected = true
+
+[[cases]]
+expr = "inputs.count == 3"
+expected = true
+
+[[cases]]
+expr = "inputs.count != 4"
+expected = true
+
+[[cases]]
+expr = "inputs.limit > 3"
+expected = true
+
+[[cases]]
+expr = "inputs.count < 5"
+expected = true
+
+[[cases]]
+expr = "inputs.count >= 3"
+expected = true
+
+[[cases]]
+expr = "inputs.count <= 3"
+expected = true
+
+[[cases]]
+expr = "inputs.zero == 0"
+expected = true
+
+[[cases]]
+expr = "inputs.limit == 5.0"
+expected = true
+
+[[cases]]
+expr = "inputs.enabled == true"
+expected = true
+
+[[cases]]
+expr = "inputs.disabled != true"
+expected = true
+
+[[cases]]
+expr = "inputs.disabled == false"
+expected = true
+
+[[cases]]
+expr = "inputs.nullish == null"
+expected = true
+
+[[cases]]
+expr = "inputs.nullish != true"
+expected = true
+
+[[cases]]
+expr = "inputs.name != inputs.other"
+expected = true
+
+[[cases]]
+expr = "inputs.count == steps.render.output.count"
+expected = false
+
+[[cases]]
+expr = "inputs.enabled == item.enabled"
+expected = true
+
+[[cases]]
+expr = "steps.render.output.status == 'ok'"
+expected = true
+
+[[cases]]
+expr = "steps.render.output.count == 2"
+expected = true
+
+[[cases]]
+expr = "steps.render.output.nested.flag == false"
+expected = true
+
+[[cases]]
+expr = "steps.empty.output"
+expected = false
+
+[[cases]]
+expr = "steps.empty.output == null"
+expected = true
+
+[[cases]]
+expr = "item.name == 'site-a'"
+expected = true
+
+[[cases]]
+expr = "item.priority > 5"
+expected = true
+
+[[cases]]
+expr = "item.meta.tier == 'gold'"
+expected = true
+
+[[cases]]
+expr = "inputs.name == 'a||b' || inputs.enabled"
+expected = true
+
+[[cases]]
+expr = "inputs.name == \"a&&b\" || inputs.enabled"
+expected = true
+
+[[cases]]
+expr = "!inputs.disabled && inputs.count == 3"
+expected = true
+
+[[cases]]
+expr = "inputs.enabled && item.enabled && steps.render.output.ready"
+expected = true
+
+[[cases]]
+expr = "inputs.disabled || false || steps.render.output.ready"
+expected = true
+
+[[cases]]
+expr = "  inputs.name == 'alpha'  "
+expected = true
+
+[[cases]]
+expr = "steps.render.output.status == 'failed'"
+expected = false
+
+[[cases]]
+expr = "item.priority < 5"
+expected = false
+
+[[cases]]
+expr = "inputs.disabled == item.enabled"
+expected = false
+
+[[cases]]
+expr = "inputs.name == inputs.count"
+expected = false
+
+[[cases]]
+expr = "steps.missing.output.ready"
+expected = false
+
+[[cases]]
+expr = "item.missing"
+expected = false
+
+[[cases]]
+expr = "inputs.name == 'Alpha'"
+expected = false
+
+[[cases]]
+expr = "inputs.zero > -1"
+expected = true
+
+[[cases]]
+expr = "inputs.zero < -1"
+expected = false

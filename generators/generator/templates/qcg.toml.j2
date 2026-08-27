@@ -1,0 +1,88 @@
+{% set form = steps.ask_manual_form.output %}
+{% set design = form.design_json %}
+{% set gid = form.generator_id %}
+{% set gname = form.generator_name %}
+{% set apath = form.artifact_path %}
+{% set stype = form.primary_step_type %}
+{% set input_fields = design.input_fields %}
+[generator]
+id = {{ gid | tojson }}
+name = {{ gname | tojson }}
+version = "0.1.0"
+qcg_version = "^0.1"
+description = {{ steps.ask_purpose.output.description | tojson }}
+
+[[inputs.stages]]
+id = "generated"
+{% for field in input_fields %}
+  [[inputs.stages.fields]]
+  id = "{{ field.id }}"
+  type = "{{ field.type }}"
+  {% if field.required %}required = true{% endif %}
+  {% if field.default %}default = {{ field.default }}{% endif %}
+{% endfor %}
+
+{% if stype == "llm.fill" %}
+{% set llm = steps.ask_manual_llm_details.output %}
+[llm]
+model = { provider = "{{ llm.llm_provider }}", model = "{{ llm.llm_model }}" }
+temperature = 0.0
+max_tokens = 512
+{% endif %}
+
+[permissions]
+fs_read = ["workspace"]
+{% if steps.ask_fs_write.output == "workspace" %}
+fs_write = ["workspace"]
+{% else %}
+fs_write = []
+{% endif %}
+{% if steps.ask_network.output != "none" %}
+network = ["{{ steps.ask_network.output }}"]
+{% endif %}
+{% if steps.ask_commands.output == "cc" %}
+commands = [{ bin = "cc", args = ["-o", "*", "*.c"], purpose = "compile generated C code" }]
+{% endif %}
+{% if steps.ask_containers.output == "nginx" %}
+containers = { enabled = true, images = ["nginx:1.27"], on_missing = "skip_with_warning" }
+{% endif %}
+side_effects = "{{ steps.ask_side_effects.output }}"
+
+{% if steps.ask_secrets.output == "api_token" %}
+[secrets.api_token]
+env = "QCG_GENERATED_API_TOKEN"
+{% endif %}
+
+{% if stype == "render" %}
+[[flow]]
+id = "emit_artifact"
+type = "render"
+artifact = { label = "Generated artifact", required = true }
+[flow.params]
+template = "templates/artifact.txt.j2"
+output_file = "{{ apath }}"
+{% elif stype == "llm.fill" %}
+[[flow]]
+id = "fill_artifact"
+type = "llm.fill"
+output = "artifact"
+[flow.params]
+prompt = "prompts/fill.j2"
+schema = "schemas/fill.schema.json"
+
+[[flow]]
+id = "emit_artifact"
+type = "write"
+artifact = { label = "Generated artifact", required = true }
+[flow.params]
+output_file = "{{ apath }}"
+content = "{{ '{{' }} steps.artifact.output.content {{ '}}' }}"
+{% else %}
+[[flow]]
+id = "emit_artifact"
+type = "write"
+artifact = { label = "Generated artifact", required = true }
+[flow.params]
+output_file = "{{ apath }}"
+content = "{{ '{{' }} inputs.{{ input_fields[0].id }} {{ '}}' }}"
+{% endif %}

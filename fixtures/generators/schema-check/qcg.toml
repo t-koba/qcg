@@ -1,0 +1,43 @@
+[[flow]]
+id = "write_model"
+type = "write"
+artifact = { label = "Model", required = true }
+
+[flow.params]
+content = """
+{
+  "name": "{{ inputs.name }}",
+  "count": {{ inputs.count }}
+}
+"""
+output_file = "model.json"
+
+[[flow]]
+id = "validate_model"
+type = "check.schema"
+
+[flow.params]
+schema = "schemas/model.schema.json"
+source = "model.json"
+
+[generator]
+description = "Writes JSON and validates it with check.schema."
+id = "schema-check"
+name = "Schema Check"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[[inputs.stages]]
+id = "basic"
+
+[[inputs.stages.fields]]
+id = "name"
+required = true
+type = "string"
+
+[[inputs.stages.fields]]
+id = "count"
+required = true
+type = "number"
+
+[permissions]

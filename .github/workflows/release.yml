@@ -1,0 +1,88 @@
+name: Release Bundles
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  bundle:
+    name: Bundle (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify tag version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(cargo metadata --no-deps --format-version 1 | node -e 'let s=""; process.stdin.on("data", c => s += c); process.stdin.on("end", () => { const p = JSON.parse(s).packages.find(p => p.name === "qcg"); process.stdout.write(p.version); });')"
+          test "$tag_version" = "$cargo_version" || {
+            echo "tag version $tag_version does not match Cargo version $cargo_version" >&2
+            exit 1
+          }
+
+      - name: Build bundle
+        shell: bash
+        run: bash scripts/package-dist.sh --out-dir dist
+
+      - name: Smoke-test bundle
+        shell: bash
+        run: |
+          archive="$(find dist -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print -quit)"
+          test -n "$archive"
+          bash scripts/check-dist-bundle.sh --archive "$archive"
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: qcg-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.spdx.json
+            dist/SHA256SUMS-*
+
+  github-release:
+    name: Publish GitHub Release
+    needs: bundle
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download bundles
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/**/*.tar.gz
+            dist/**/*.zip
+            dist/**/*.spdx.json
+            dist/**/SHA256SUMS-*

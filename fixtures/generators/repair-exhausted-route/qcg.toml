@@ -1,0 +1,65 @@
+[[flow]]
+id = "broken"
+type = "write"
+
+[flow.params]
+content = '{"name":'
+output_file = "config.json"
+
+[[flow]]
+id = "check"
+type = "check.format"
+
+[flow.on_fail]
+action = "repair"
+max_attempts = 1
+recheck = "recheck"
+repair = "repair"
+
+[flow.on_fail.on_exhausted]
+action = "route"
+to = "fallback"
+
+[flow.params]
+content = "json"
+source = "config.json"
+
+[[flow]]
+id = "repair"
+type = "llm.repair"
+
+[flow.params]
+prompt = "prompts/repair.txt"
+source = "config.json"
+target = "config.json"
+
+[[flow]]
+id = "recheck"
+type = "check.format"
+
+[flow.params]
+content = "json"
+source = "config.json"
+
+[[flow]]
+id = "fallback"
+needs = ["check"]
+type = "write"
+artifact = { label = "Fallback", required = true }
+
+[flow.params]
+content = "repair exhausted"
+output_file = "fallback.txt"
+
+[generator]
+description = "Routes to a fallback node when bounded repair is exhausted."
+id = "repair-exhausted-route"
+name = "Repair Exhausted Route"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[permissions]

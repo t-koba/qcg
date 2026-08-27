@@ -1,0 +1,67 @@
+[[flow]]
+id = "write_source"
+type = "write"
+artifact = { label = "C source", required = true }
+
+[flow.params]
+content = """
+#include <stdio.h>
+
+int main(void) {
+    puts("hello from qcg");
+    return 0;
+}
+"""
+output_file = "hello.c"
+
+[[flow]]
+id = "build"
+type = "command"
+
+[flow.params]
+command = [
+    "cc",
+    "hello.c",
+    "-o",
+    "hello",
+]
+
+[[flow]]
+id = "run_check"
+type = "check.command"
+
+[flow.params]
+command = ["./hello"]
+
+[flow.params.expect]
+exit_code = 0
+stdout_contains = "hello from qcg"
+
+[generator]
+description = "LLM-free generator that writes, builds, and checks a tiny C program"
+id = "hello-c-builder"
+name = "Hello C Builder"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[[outputs.extras]]
+label = "Executable"
+glob = "hello"
+required = true
+
+[permissions]
+side_effects = "allowed"
+
+[[permissions.commands]]
+args = [
+    "hello.c",
+    "-o",
+    "hello",
+]
+bin = "cc"
+purpose = "compile generated C source"
+
+[[permissions.commands]]
+args = []
+bin = "./hello"
+purpose = "run generated executable for validation"

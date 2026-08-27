@@ -1,0 +1,46 @@
+/target/
+/out/
+/dist/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local QCG and agent state
+/.qcg/
+/.qcg-test/
+/.opencode-worker/
+/.opencode/
+/.claude/
+/.codex/
+/.agents/
+/AGENTS.md
+/docs/internal/
+
+# Local credentials and environment overrides
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Editor, operating-system, and test-run artifacts
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~
+/.idea/
+/.vscode/
+/coverage/
+/playwright-report/
+/test-results/
+
+# Regenerable QCG and frontend outputs
+*.qcg
+/frontend/generator/node_modules/
+/frontend/generator/src/api/openapi.json
+/frontend/generator/src/api/types.d.ts
+/frontend/generator/src/expr/pkg/
+/generators/generator/ui/

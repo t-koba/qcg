@@ -1,0 +1,17 @@
+[
+  "/api/generators",
+  "/api/generators/{id}",
+  "/api/generators/{id}/assets/{path}",
+  "/api/openapi.json",
+  "/api/runs",
+  "/api/runs/{id}",
+  "/api/runs/{id}/artifacts",
+  "/api/runs/{id}/artifacts.zip",
+  "/api/runs/{id}/artifacts/{path}",
+  "/api/runs/{id}/confirmations/{cid}",
+  "/api/runs/{id}/events",
+  "/api/runs/{id}/journal",
+  "/api/runs/{id}/questions/{qid}",
+  "/api/runs/{id}:cancel",
+  "/healthz"
+]

@@ -1,0 +1,36 @@
+[[flow]]
+context = [
+    { resource = "local_skill", select = "meta" },
+    { resource = "local_skill", select = "instructions" },
+    { resource = "local_skill", select = "file", path = "example.txt" },
+]
+id = "draft"
+type = "llm.generate"
+artifact = { label = "Skill Context", required = true }
+
+[flow.params]
+output_file = "skill-context.txt"
+prompt = "prompts/draft.j2"
+
+[generator]
+description = "Checks that vendored SKILL.md resources can be used as LLM context."
+id = "skill-context"
+name = "Skill Context"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[llm]
+max_tokens = 512
+temperature = 0.0
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[permissions]
+
+[resources.local_skill]
+llm_visible = true
+path = "resources/demo-skill"
+trust = "trusted"
+type = "skill"

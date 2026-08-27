@@ -1,0 +1,38 @@
+[failure.by_kind]
+out_of_contract = "clamp"
+
+[[flow]]
+id = "fill"
+output = "result"
+type = "llm.fill"
+
+[flow.params]
+max_iterations = 1
+prompt = "prompts/fill.j2"
+schema = "schemas/result.schema.json"
+
+[[flow]]
+id = "write_result"
+type = "write"
+artifact = { label = "Clamped result", required = true }
+
+[flow.params]
+content = "{{ steps.result.output.content }}"
+output_file = "result.txt"
+
+[generator]
+description = "Clamps an out-of-contract LLM response back to schema output"
+id = "out-of-contract-clamp"
+name = "Out Of Contract Clamp"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[llm]
+max_tokens = 128
+temperature = 0.0
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[permissions]

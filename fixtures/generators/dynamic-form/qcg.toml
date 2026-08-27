@@ -1,0 +1,41 @@
+[[flow]]
+id = "collect"
+type = "ask_user"
+
+[flow.params]
+content = "Describe the change to apply."
+
+[[flow.params.fields]]
+id = "decision"
+options = [
+    "keep",
+    "revise",
+]
+required = true
+type = "select"
+
+[[flow.params.fields]]
+id = "reason"
+required = true
+type = "natural_language"
+
+[[flow]]
+id = "emit"
+type = "write"
+artifact = { label = "Decision", required = true }
+
+[flow.params]
+content = """
+Decision: {{ steps.collect.output.decision }}
+Reason: {{ steps.collect.output.reason }}
+"""
+output_file = "decision.txt"
+
+[generator]
+description = "A schema-constrained multi-field HITL form"
+id = "dynamic-form"
+name = "Dynamic Form"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[permissions]

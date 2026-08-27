@@ -1,0 +1,36 @@
+[[flow]]
+id = "agent"
+output = "agent_result"
+type = "llm.agent"
+
+[flow.params]
+max_iterations = 3
+max_tokens_total = 4096
+prompt = "prompts/agent.j2"
+
+[[flow.params.tools]]
+kind = "fs.write"
+name = "write_draft"
+path_prefix = "drafts/"
+
+[generator]
+description = "Deterministic llm.agent example using a declared fs.write tool."
+id = "llm-agent-fake"
+name = "Fake LLM Agent"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[llm]
+max_tokens = 256
+temperature = 0.0
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[[outputs.extras]]
+label = "Agent draft"
+glob = "drafts/result.txt"
+required = true
+
+[permissions]

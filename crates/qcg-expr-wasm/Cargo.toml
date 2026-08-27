@@ -1,0 +1,21 @@
+[package]
+name = "qcg-expr-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[dependencies]
+qcg-contract = { path = "../qcg-contract" }
+qcg-types = { path = "../qcg-types" }
+serde.workspace = true
+serde_json.workspace = true
+wasm-bindgen.workspace = true

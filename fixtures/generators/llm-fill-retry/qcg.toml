@@ -1,0 +1,35 @@
+[[flow]]
+id = "fill"
+output = "filled"
+type = "llm.fill"
+
+[flow.params]
+max_iterations = 2
+prompt = "prompts/fill.j2"
+schema = "schemas/fill.schema.json"
+
+[[flow]]
+id = "write_result"
+type = "write"
+artifact = { label = "Result", required = true }
+
+[flow.params]
+content = '{"title":"{{ steps.filled.output.title }}"}'
+output_file = "result.json"
+
+[generator]
+description = "Retries invalid structured LLM output until it satisfies the schema."
+id = "llm-fill-retry"
+name = "LLM Fill Retry"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[llm]
+max_tokens = 512
+temperature = 0.0
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[permissions]

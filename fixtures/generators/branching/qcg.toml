@@ -1,0 +1,60 @@
+parallel = [
+    "write_a",
+    "write_b",
+]
+
+[[flow]]
+id = "write_a"
+type = "write"
+when = "inputs.mode == 'a'"
+
+[flow.params]
+content = """
+A
+"""
+output_file = "a.txt"
+
+[[flow]]
+id = "write_b"
+type = "write"
+when = "inputs.mode == 'b'"
+
+[flow.params]
+content = """
+B
+"""
+output_file = "b.txt"
+
+[[flow]]
+id = "done"
+needs = [
+    "write_a",
+    "write_b",
+]
+on_deps = "any_succeeded"
+type = "write"
+artifact = { label = "Done", required = true }
+
+[flow.params]
+content = """
+done
+"""
+output_file = "done.txt"
+
+[generator]
+description = "DAG skip and join example"
+id = "branching"
+name = "Branching"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[[inputs.stages]]
+id = "basic"
+
+[[inputs.stages.fields]]
+default = "a"
+id = "mode"
+required = true
+type = "string"
+
+[permissions]

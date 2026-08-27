@@ -1,0 +1,50 @@
+[[flow]]
+id = "write_json"
+type = "write"
+artifact = { label = "JSON", required = true }
+
+[flow.params]
+content = """
+{
+  "name": "demo",
+  "enabled": true
+}
+"""
+output_file = "data.json"
+
+[[flow]]
+id = "check_json"
+type = "check.format"
+
+[flow.params]
+content = "json"
+source = "data.json"
+
+[[flow]]
+id = "write_toml"
+type = "write"
+artifact = { label = "TOML", required = true }
+
+[flow.params]
+content = """
+name = "demo"
+enabled = true
+"""
+output_file = "config.toml"
+
+[[flow]]
+id = "check_toml"
+type = "check.format"
+
+[flow.params]
+content = "toml"
+source = "config.toml"
+
+[generator]
+description = "Writes JSON and TOML files and validates their formats."
+id = "format-check"
+name = "Format Check"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[permissions]

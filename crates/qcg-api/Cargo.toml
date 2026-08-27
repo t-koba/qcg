@@ -1,0 +1,15 @@
+[package]
+name = "qcg-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+qcg-types = { path = "../qcg-types" }
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

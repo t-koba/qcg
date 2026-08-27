@@ -1,0 +1,44 @@
+[[flow]]
+id = "summary"
+type = "render"
+artifact = { label = "Summary", required = true }
+
+[flow.params]
+output_file = "summary.txt"
+template = "templates/summary.txt.j2"
+
+[generator]
+description = "Exercises first-class list and multiselect Web UI inputs."
+id = "list-multiselect"
+name = "List Multiselect"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[[inputs.stages]]
+id = "inputs"
+
+[[inputs.stages.fields]]
+default = [
+    "alpha.example",
+    "beta.example",
+]
+id = "sites"
+min_items = 2
+required = true
+type = "list"
+
+[[inputs.stages.fields]]
+default = [
+    "tls",
+    "metrics",
+]
+id = "features"
+options = [
+    "tls",
+    "metrics",
+    "cache",
+]
+required = true
+type = "multiselect"
+
+[permissions]

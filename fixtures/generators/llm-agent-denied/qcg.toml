@@ -1,0 +1,35 @@
+[[flow]]
+id = "agent"
+type = "llm.agent"
+
+[flow.params]
+max_iterations = 2
+max_tokens_total = 4096
+prompt = "prompts/agent.j2"
+
+[[flow.params.tools]]
+kind = "fs.write"
+name = "write_draft"
+path_prefix = "drafts/"
+
+[generator]
+description = "Negative fixture: fake agent calls an undeclared tool."
+id = "llm-agent-denied"
+name = "Denied LLM Agent"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[llm]
+max_tokens = 256
+temperature = 0.0
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[[outputs.extras]]
+label = "Agent draft"
+glob = "drafts/result.txt"
+required = true
+
+[permissions]

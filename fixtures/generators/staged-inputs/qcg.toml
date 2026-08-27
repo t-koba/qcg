@@ -1,0 +1,40 @@
+[[flow]]
+id = "write_summary"
+type = "render"
+artifact = { label = "Summary", required = true }
+
+[flow.params]
+output_file = "summary.txt"
+template = "templates/summary.txt.j2"
+
+[generator]
+description = "Demonstrates conditional input stages in the Web UI and engine."
+id = "staged-inputs"
+name = "Staged Inputs"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[[inputs.stages]]
+id = "basic"
+
+[[inputs.stages.fields]]
+default = "simple"
+id = "mode"
+options = [
+    "simple",
+    "advanced",
+]
+required = true
+type = "select"
+
+[[inputs.stages]]
+id = "advanced"
+when = "inputs.mode == 'advanced'"
+
+[[inputs.stages.fields]]
+default = "enabled"
+id = "advanced_value"
+required = true
+type = "string"
+
+[permissions]

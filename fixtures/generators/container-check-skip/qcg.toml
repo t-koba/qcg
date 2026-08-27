@@ -1,0 +1,39 @@
+[[flow]]
+id = "write_file"
+type = "write"
+artifact = { label = "Hello", required = true }
+
+[flow.params]
+content = """
+hello
+"""
+output_file = "hello.txt"
+
+[[flow]]
+id = "container_check"
+type = "check.container"
+
+[flow.params]
+command = [
+    "sh",
+    "-c",
+    "test -f /work/hello.txt",
+]
+image = "alpine:3.20"
+
+[[flow.params.mounts]]
+from = "workspace"
+mode = "ro"
+to = "/work"
+
+[generator]
+description = "Demonstrates check.container skip behavior when no runtime is installed"
+id = "container-check-skip"
+name = "Container Check Skip"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[permissions.containers]
+enabled = true
+images = ["alpine:3.20"]
+on_missing = "skip_with_warning"

@@ -1,0 +1,41 @@
+[[flow]]
+id = "agent"
+output = "agent_result"
+type = "llm.agent"
+
+[flow.params]
+max_iterations = 3
+max_tokens_total = 4096
+prompt = "prompts/agent.j2"
+
+[[flow.params.tools]]
+kind = "ask_user"
+name = "ask_mode"
+
+[[flow]]
+id = "write_result"
+type = "write"
+artifact = { label = "Agent result", required = true }
+
+[flow.params]
+content = """
+{{ steps.agent_result.output.text }}
+"""
+output_file = "result.txt"
+
+[generator]
+description = "Deterministic llm.agent example using ask_user as a tool."
+id = "llm-agent-ask"
+name = "Fake LLM Agent Ask"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[llm]
+max_tokens = 256
+temperature = 0.0
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[permissions]

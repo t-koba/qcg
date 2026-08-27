@@ -1,0 +1,66 @@
+[[flow]]
+id = "write_json"
+type = "write"
+
+[flow.params]
+content = '{"name":"qcg","enabled":true,"ports":[80,443]}'
+output_file = "input.json"
+
+[[flow]]
+id = "pretty_json"
+type = "transform"
+artifact = { label = "Pretty JSON", required = true }
+
+[flow.params]
+source = "input.json"
+target = "pretty.json"
+transform = "json_pretty"
+
+[[flow]]
+id = "compact_json"
+type = "transform"
+artifact = { label = "Compact JSON", required = true }
+
+[flow.params]
+source = "pretty.json"
+target = "compact.json"
+transform = "json_compact"
+
+[[flow]]
+id = "json_to_toml"
+type = "transform"
+artifact = { label = "TOML", required = true }
+
+[flow.params]
+source = "compact.json"
+target = "config.toml"
+transform = "json_to_toml"
+
+[[flow]]
+id = "toml_to_json"
+type = "transform"
+artifact = { label = "Roundtrip JSON", required = true }
+
+[flow.params]
+source = "config.toml"
+target = "roundtrip.json"
+transform = "toml_to_json"
+
+[[flow]]
+id = "zip_workspace"
+type = "transform"
+artifact = { label = "Bundle", required = true }
+
+[flow.params]
+source = "."
+target = "bundle.zip"
+transform = "zip"
+
+[generator]
+description = "Exercises JSON, TOML, and zip transforms."
+id = "transform-formats"
+name = "Transform Formats"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[permissions]

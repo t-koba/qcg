@@ -1,0 +1,27 @@
+[[flow]]
+id = "emit_readme"
+type = "write"
+artifact = { label = "README", required = true, mime = "text/markdown" }
+
+[flow.params]
+content = """
+# Hello from qcg
+"""
+output_file = "README.md"
+
+[generator]
+description = "Deterministic example generator without LLM"
+id = "hello-template"
+name = "Hello Template"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[[inputs.stages]]
+id = "basic"
+
+[[inputs.stages.fields]]
+id = "name"
+required = false
+type = "string"
+
+[permissions]

@@ -1,0 +1,48 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["generator_id", "generator_name", "package"],
+  "properties": {
+    "generator_id": { "type": "string", "pattern": "^[a-z][a-z0-9_-]*$" },
+    "generator_name": { "type": "string" },
+    "package": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["manifest", "sources"],
+      "properties": {
+        "manifest": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["flow"],
+          "description": "Full target manifest as structured data. generator identity and permissions are supplied by the operator answers and must not appear here.",
+          "properties": {
+            "llm": { "type": "object" },
+            "inputs": { "type": "object" },
+            "resources": { "type": "object" },
+            "tools": { "type": "object" },
+            "runtime": { "type": "object" },
+            "budget": { "type": "object" },
+            "flow": { "type": "array" },
+            "parallel": { "type": "array" },
+            "blocks": { "type": "object" },
+            "secrets": { "type": "object" },
+            "outputs": { "type": "object" },
+            "failure": { "type": "object" },
+            "journal": { "type": "object" },
+            "assets": { "type": "object" }
+          }
+        },
+        "sources": {
+          "type": "object",
+          "maxProperties": 64,
+          "propertyNames": {
+            "type": "string",
+            "pattern": "^(?:[A-Za-z0-9_-]+|\\.[A-Za-z0-9_-]+|[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)+)(?:/(?:[A-Za-z0-9_-]+|\\.[A-Za-z0-9_-]+|[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)+))*$",
+            "not": { "pattern": "^qcg\\.toml$" }
+          },
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    }
+  }
+}

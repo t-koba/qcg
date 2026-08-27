@@ -1,0 +1,33 @@
+[[flow]]
+id = "summarize_file"
+type = "render"
+artifact = { label = "File Summary", required = true }
+
+[flow.params]
+output_file = "summary.md"
+template = "templates/summary.md.j2"
+
+[[flow]]
+id = "check_file_json"
+type = "check.format"
+
+[flow.params]
+content = "json"
+source = "{{ inputs.config_file }}"
+
+[generator]
+description = "Accepts an inline JSON file and validates it inside the run workspace."
+id = "file-input"
+name = "File Input"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[[inputs.stages]]
+id = "basic"
+
+[[inputs.stages.fields]]
+id = "config_file"
+required = true
+type = "file"
+
+[permissions]

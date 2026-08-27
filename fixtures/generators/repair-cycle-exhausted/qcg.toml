@@ -1,0 +1,55 @@
+[[flow]]
+id = "broken"
+type = "write"
+
+[flow.params]
+content = '{"name":'
+output_file = "config.json"
+
+[[flow]]
+id = "check"
+type = "check.format"
+
+[flow.on_fail]
+action = "repair"
+max_attempts = 2
+recheck = "recheck"
+repair = "repair"
+
+[flow.on_fail.on_exhausted]
+action = "fail"
+
+[flow.params]
+content = "json"
+source = "config.json"
+
+[[flow]]
+id = "repair"
+type = "llm.repair"
+artifact = { label = "Config", required = true }
+
+[flow.params]
+prompt = "prompts/repair.txt"
+source = "config.json"
+target = "config.json"
+
+[[flow]]
+id = "recheck"
+type = "check.format"
+
+[flow.params]
+content = "json"
+source = "config.json"
+
+[generator]
+description = "Demonstrates bounded repair exhaustion"
+id = "repair-cycle-exhausted"
+name = "Repair Cycle Exhausted"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[permissions]

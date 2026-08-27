@@ -1,0 +1,63 @@
+parallel = [
+    "write_a",
+    "write_b",
+    "write_c",
+]
+
+[[flow]]
+id = "write_a"
+type = "write"
+artifact = { label = "A", required = true }
+
+[flow.params]
+content = """
+A
+"""
+output_file = "a.txt"
+
+[[flow]]
+id = "write_b"
+type = "write"
+artifact = { label = "B", required = true }
+
+[flow.params]
+content = """
+B
+"""
+output_file = "b.txt"
+
+[[flow]]
+id = "write_c"
+type = "write"
+artifact = { label = "C", required = true }
+
+[flow.params]
+content = """
+C
+"""
+output_file = "c.txt"
+
+[[flow]]
+id = "join"
+needs = [
+    "write_a",
+    "write_b",
+    "write_c",
+]
+type = "write"
+artifact = { label = "Joined", required = true }
+
+[flow.params]
+content = """
+joined
+"""
+output_file = "joined.txt"
+
+[generator]
+description = "Exercises parallel execution of independent DAG nodes."
+id = "parallel-wave"
+name = "Parallel Wave"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[permissions]

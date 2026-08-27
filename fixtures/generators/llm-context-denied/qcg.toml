@@ -1,0 +1,32 @@
+[[flow]]
+context = [{ resource = "hidden" }]
+id = "draft"
+type = "llm.generate"
+artifact = { label = "Context", required = true }
+
+[flow.params]
+output_file = "context.txt"
+prompt = "prompts/draft.j2"
+
+[generator]
+description = "Negative fixture: non-visible resource cannot enter LLM context."
+id = "llm-context-denied"
+name = "LLM Context Denied"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[llm]
+max_tokens = 512
+temperature = 0.0
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[permissions]
+
+[resources.hidden]
+llm_visible = false
+path = "resources/hidden.txt"
+trust = "trusted"
+type = "file"

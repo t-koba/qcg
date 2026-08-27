@@ -1,0 +1,49 @@
+[[blocks.site]]
+id = "write_site"
+type = "write"
+
+[blocks.site.params]
+content = """
+site={{ item }}
+"""
+output_file = "sites/{{ item }}.txt"
+
+[[flow]]
+id = "emit_sites"
+type = "foreach"
+
+[flow.params]
+items = "inputs.sites"
+max_iterations = 10
+parallel = 3
+subflow = "site"
+
+[[flow]]
+id = "done"
+type = "write"
+artifact = { label = "Done", required = true }
+
+[flow.params]
+content = """
+done
+"""
+output_file = "done.txt"
+
+[generator]
+description = "DAG foreach example"
+id = "foreach-sites"
+name = "Foreach Sites"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[[inputs.stages]]
+id = "basic"
+
+[[inputs.stages.fields]]
+id = "sites"
+item_type = "string"
+min_items = 1
+required = true
+type = "list"
+
+[permissions]

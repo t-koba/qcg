@@ -1,0 +1,19 @@
+[[flow]]
+id = "fetch"
+type = "http"
+artifact = { label = "Fetched HTML", required = true }
+
+[flow.params]
+method = "GET"
+output_file = "example.html"
+url = "https://example.com/"
+
+[generator]
+description = "Fetches a declared URL and writes the response body."
+id = "http-fetch"
+name = "HTTP Fetch"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[permissions]
+network = ["example.com"]

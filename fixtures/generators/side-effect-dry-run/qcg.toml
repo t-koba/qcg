@@ -1,0 +1,45 @@
+[[flow]]
+id = "write_plan"
+type = "write"
+
+[flow.params]
+content = """
+pending
+"""
+output_file = "plan.txt"
+
+[[flow]]
+id = "run_echo"
+type = "command"
+
+[flow.params]
+command = [
+    "echo",
+    "dry-run",
+]
+
+[[flow]]
+id = "write_done"
+type = "write"
+artifact = { label = "Done", required = true }
+
+[flow.params]
+content = """
+done
+"""
+output_file = "done.txt"
+
+[generator]
+description = "Requires a dry-run confirmation before running a command side effect"
+id = "side-effect-dry-run"
+name = "Side Effect Dry Run"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[permissions]
+side_effects = "dry_run_first"
+
+[[permissions.commands]]
+args = ["dry-run"]
+bin = "echo"
+purpose = "demonstrate dry-run side effect confirmation"

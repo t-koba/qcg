@@ -1,0 +1,186 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Check
+        run: cargo check --workspace --locked
+
+      - name: Check expression WASM
+        run: cargo check -p qcg-expr-wasm --target wasm32-unknown-unknown --locked
+
+      - name: Check generated documentation
+        run: bash scripts/check-generated-docs.sh
+
+      - name: Check third-party notices
+        run: bash scripts/check-third-party-notices.sh
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Test count
+        shell: bash
+        run: bash scripts/check-test-count.sh 461
+
+      - name: Fixtures smoke
+        shell: bash
+        run: bash scripts/check-fixtures.sh
+
+      - name: Server smoke
+        if: matrix.os == 'ubuntu-latest'
+        run: bash scripts/e2e-server-smoke.sh
+
+      - name: Distribution bundle dry-run
+        shell: bash
+        run: bash scripts/package-dist.sh --dry-run
+
+  demo-frontend:
+    name: Demo frontend
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/generator/package-lock.json
+
+      - name: Install demo dependencies
+        run: npm ci
+        working-directory: frontend/generator
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked
+
+      - name: Generate API types
+        run: npm run generate:api
+        working-directory: frontend/generator
+
+      - name: Generate expression WASM
+        run: npm run generate:wasm
+        working-directory: frontend/generator
+
+      - name: Check demo
+        run: npm run check:api && npm run check && npm test && npm run build
+        working-directory: frontend/generator
+
+  e2e:
+    name: Demo end-to-end
+    needs: demo-frontend
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/generator/package-lock.json
+
+      - name: Install demo dependencies and build
+        run: npm ci && npm run generate:api && npm run generate:wasm && npm run build
+        working-directory: frontend/generator
+
+      - name: Install Playwright
+        run: |
+          npm install --no-save playwright
+          npx playwright install --with-deps chromium
+
+      - name: UI Playwright smoke
+        run: node scripts/e2e-ui-playwright.mjs
+
+  msrv:
+    name: Rust 1.85 MSRV
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85.0
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check workspace
+        run: cargo check --workspace --locked
+
+  security:
+    name: Security and dependency policy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: Cargo audit
+        run: cargo audit --deny warnings
+
+      - name: Cargo deny
+        run: cargo deny check

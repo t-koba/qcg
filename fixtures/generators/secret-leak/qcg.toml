@@ -1,0 +1,24 @@
+[[flow]]
+id = "draft"
+type = "llm.generate"
+artifact = { label = "Output", required = true }
+
+[flow.params]
+output_file = "out.txt"
+prompt = "prompts/draft.j2"
+
+[generator]
+description = "Negative fixture: prompt contains a secret value and must fail"
+id = "secret-leak"
+name = "Secret Leak"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[permissions]
+
+[secrets.api_token]
+env = "QCG_TEST_TOKEN"

@@ -1,0 +1,27 @@
+[[flow]]
+id = "write_bad_json"
+type = "write"
+artifact = { label = "Bad JSON", required = true }
+
+[flow.params]
+content = """
+{ invalid json
+"""
+output_file = "bad.json"
+
+[[flow]]
+id = "check_json"
+type = "check.format"
+
+[flow.params]
+content = "json"
+source = "bad.json"
+
+[generator]
+description = "Negative fixture: invalid JSON fails check.format."
+id = "format-check-denied"
+name = "Format Check Denied"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[permissions]

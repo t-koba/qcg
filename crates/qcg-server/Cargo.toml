@@ -1,0 +1,26 @@
+[package]
+name = "qcg-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+camino.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+qcg-api = { path = "../qcg-api" }
+qcg-service = { path = "../qcg-service" }
+qcg-types = { path = "../qcg-types" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+tower-http.workspace = true

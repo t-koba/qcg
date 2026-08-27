@@ -1,0 +1,45 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Todo API",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/todos": {
+      "get": {
+        "operationId": "listTodos",
+        "responses": {
+          "200": {
+            "description": "Todo list"
+          }
+        }
+      },
+      "post": {
+        "operationId": "createTodo",
+        "responses": {
+          "201": {
+            "description": "Created todo"
+          }
+        }
+      }
+    },
+    "/todos/{id}": {
+      "delete": {
+        "operationId": "deleteTodo",
+        "responses": {
+          "204": {
+            "description": "Deleted todo"
+          }
+        }
+      },
+      "get": {
+        "operationId": "getTodo",
+        "responses": {
+          "200": {
+            "description": "Todo"
+          }
+        }
+      }
+    }
+  }
+}

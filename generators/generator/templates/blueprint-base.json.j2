@@ -1,0 +1,6 @@
+{% if steps.ask_design_mode.output == 'manual' %}
+{% set package = steps.ask_manual_form.output.design_json.package %}
+{% else %}
+{% set package = steps.design_out.output.package %}
+{% endif %}
+{{ package.manifest | tojson }}

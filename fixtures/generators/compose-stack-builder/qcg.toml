@@ -1,0 +1,38 @@
+[[flow]]
+id = "compose"
+type = "write"
+artifact = { label = "Compose stack", required = true }
+
+[flow.params]
+content = """
+services:
+  {{ inputs.service_name }}:
+    image: {{ inputs.image }}
+    ports:
+      - "8080:80"
+"""
+output_file = "compose.yaml"
+
+[generator]
+description = "Builds a deterministic Docker Compose stack file."
+id = "compose-stack-builder"
+name = "Compose Stack Builder"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[[inputs.stages]]
+id = "stack"
+
+[[inputs.stages.fields]]
+default = "web"
+id = "service_name"
+required = true
+type = "string"
+
+[[inputs.stages.fields]]
+default = "nginx:1.27"
+id = "image"
+required = true
+type = "string"
+
+[permissions]

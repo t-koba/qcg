@@ -1,0 +1,38 @@
+[[flow]]
+id = "broken"
+type = "write"
+
+[flow.params]
+content = '{"name":'
+output_file = "broken.json"
+
+[[flow]]
+id = "repair"
+type = "llm.repair"
+artifact = { label = "Fixed JSON", required = true }
+
+[flow.params]
+prompt = "prompts/repair.txt"
+source = "broken.json"
+target = "fixed.json"
+
+[[flow]]
+id = "check"
+type = "check.format"
+
+[flow.params]
+content = "json"
+source = "fixed.json"
+
+[generator]
+description = "Repairs a generated file with the fake LLM provider"
+id = "llm-repair-fake"
+name = "LLM Repair Fake"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[permissions]

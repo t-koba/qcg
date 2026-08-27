@@ -1,0 +1,36 @@
+[[flow]]
+id = "write_bad_json"
+type = "write"
+
+[flow.params]
+content = '{"name":'
+output_file = "data.json"
+
+[[flow]]
+id = "check"
+type = "check.format"
+
+[flow.on_fail]
+action = "ask_user"
+
+[flow.params]
+content = "json"
+source = "data.json"
+
+[[flow]]
+id = "write_decision"
+type = "write"
+artifact = { label = "Decision", required = true }
+
+[flow.params]
+content = "{{ steps.check.output.answer }}"
+output_file = "decision.txt"
+
+[generator]
+description = "Turns a check failure into a user decision."
+id = "on-fail-ask-user"
+name = "On Fail Ask User"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[permissions]
