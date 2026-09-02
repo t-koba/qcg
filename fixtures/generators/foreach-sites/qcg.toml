@@ -47,3 +47,4 @@ required = true
 type = "list"
 
 [permissions]
+fs_write = ["workspace"]

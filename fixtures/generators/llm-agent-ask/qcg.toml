@@ -39,3 +39,4 @@ model = "fake"
 provider = "fake"
 
 [permissions]
+fs_write = ["workspace"]

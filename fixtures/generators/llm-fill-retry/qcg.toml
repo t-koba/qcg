@@ -5,6 +5,7 @@ type = "llm.fill"
 
 [flow.params]
 max_iterations = 2
+max_tokens_total = 2048
 prompt = "prompts/fill.j2"
 schema = "schemas/fill.schema.json"
 
@@ -33,3 +34,4 @@ model = "fake"
 provider = "fake"
 
 [permissions]
+fs_write = ["workspace"]

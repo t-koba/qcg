@@ -33,3 +33,4 @@ glob = "drafts/result.txt"
 required = true
 
 [permissions]
+fs_write = ["workspace"]

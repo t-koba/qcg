@@ -37,9 +37,11 @@ qcg_version = "^0.1"
 version = "0.1.0"
 
 [permissions]
+fs_write = ["workspace"]
 side_effects = "dry_run_first"
 
 [[permissions.commands]]
 args = ["dry-run"]
 bin = "echo"
 purpose = "demonstrate dry-run side effect confirmation"
+isolation = "trusted_host"

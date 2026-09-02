@@ -31,8 +31,13 @@ name = "LLM Repair Fake"
 qcg_version = "^0.1"
 version = "0.1.0"
 
+[llm]
+max_tokens = 512
+
 [llm.model]
 model = "fake"
 provider = "fake"
 
 [permissions]
+fs_read = ["workspace"]
+fs_write = ["workspace"]

@@ -82,14 +82,8 @@ mkdir -p "$tmp_root/sample-run"
   "$bin" run "$bundle_dir/share/qcg/generators/generator" \
     --answer 'ask_purpose={"description":"Bundle smoke generated package"}' \
     --answer 'ask_design_mode=manual' \
-    --answer 'ask_manual_form={"generator_id":"sample-gen","generator_name":"Sample Gen","artifact_path":"README.md","primary_step_type":"render","design_json":{"input_fields":[{"id":"request","type":"natural_language","required":true}]},"include_readme":false}' \
-    --answer 'ask_manual_render_details={"artifact_content":"# Sample"}' \
-    --answer ask_fs_write=workspace \
-    --answer ask_network=none \
-    --answer ask_commands=none \
-    --answer ask_containers=none \
-    --answer ask_side_effects=none \
-    --answer ask_secrets=none \
+    --answer 'ask_manual_form={"package":{"manifest":{"generator":{"id":"sample-gen","name":"Sample Gen","version":"0.1.0","qcg_version":"^0.1","description":"Generate a sample artifact","authors":[]},"inputs":{"stages":[{"id":"main","fields":[{"id":"request","type":"natural_language","required":true}]}]},"flow":[{"id":"emit","type":"render","artifact":{"label":"Sample artifact","preview":"text","required":true},"params":{"template":"templates/artifact.txt.j2","output_file":"README.md"}}]},"sources":{"templates/artifact.txt.j2":{"encoding":"utf8","content":"# Sample"}}}}' \
+    --answer 'ask_authority={"permissions":{"fs_read":[],"fs_write":["workspace"],"network":[],"commands":[],"containers":{"enabled":false,"images":[],"on_missing":"error"},"side_effects":"none"},"secrets":{}}' \
     --output "$tmp_root/sample-run" \
     --yes >/dev/null
 )

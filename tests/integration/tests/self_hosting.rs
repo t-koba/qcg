@@ -38,8 +38,12 @@ async fn run_generator(
     reply: BTreeMap<String, Value>,
 ) -> Result<Utf8PathBuf, String> {
     let runs = run_dir(label).join("runs");
-    let service = LocalQcgService::new(workspace_root().join("fixtures/generators"), runs, None)
-        .map_err(|error| error.to_string())?;
+    let service = LocalQcgService::new(
+        workspace_root().join("fixtures/generators"),
+        runs,
+        Some(workspace_root().join("providers.toml")),
+    )
+    .map_err(|error| error.to_string())?;
     let manifest = service
         .run_generator_path(DirectRun {
             generator_path: generator,
@@ -66,10 +70,6 @@ fn generator_blueprint() -> Value {
     let text = fs::read_to_string(root.join("qcg.toml")).expect("builder qcg.toml");
     let value: toml::Value = toml::from_str(&text).expect("builder manifest should parse");
     let mut manifest = serde_json::to_value(value).expect("manifest converts to JSON");
-    if let Some(object) = manifest.as_object_mut() {
-        object.remove("generator");
-        object.remove("permissions");
-    }
     let asset_dirs = manifest
         .get("assets")
         .and_then(Value::as_object)
@@ -80,6 +80,13 @@ fn generator_blueprint() -> Value {
         .filter_map(Value::as_str)
         .map(PathBuf::from)
         .collect::<Vec<_>>();
+    if let Some(object) = manifest.as_object_mut() {
+        object.remove("permissions");
+        object.remove("secrets");
+        // The checked-in UI is a derived build artifact and is intentionally
+        // absent from the self-hosting source map; omit its asset contract too.
+        object.remove("assets");
+    }
 
     let mut sources = BTreeMap::new();
     for entry in walkdir::WalkDir::new(&root)
@@ -105,27 +112,34 @@ fn generator_blueprint() -> Value {
         let content = fs::read_to_string(path).expect("builder sources are UTF-8 text files");
         sources.insert(
             relative.to_string_lossy().replace('\\', "/"),
-            Value::String(content),
+            json!({"encoding": "utf8", "content": content}),
         );
     }
 
-    json!({
-        "input_fields": [],
-        "package": {
-            "manifest": manifest,
-            "sources": sources,
-        },
-    })
+    json!({"manifest": manifest, "sources": sources})
 }
 
 fn builder_answers() -> BTreeMap<String, Value> {
     answers([
-        ("ask_fs_write", json!("workspace")),
-        ("ask_network", json!("none")),
-        ("ask_commands", json!("none")),
-        ("ask_containers", json!("none")),
-        ("ask_side_effects", json!("none")),
-        ("ask_secrets", json!("none")),
+        (
+            "ask_llm_model",
+            json!({"provider": "fake", "model": "fake"}),
+        ),
+        ("ask_research", json!("none")),
+        (
+            "ask_authority",
+            json!({
+                "permissions": {
+                    "fs_read": ["workspace"],
+                    "fs_write": ["workspace"],
+                    "network": ["mcp.exa.ai", "search.parallel.ai"],
+                    "commands": [],
+                    "containers": {"enabled": false, "images": [], "on_missing": "error"},
+                    "side_effects": "none"
+                },
+                "secrets": {}
+            }),
+        ),
     ])
 }
 
@@ -180,12 +194,7 @@ async fn generator_reproduces_itself_and_the_clone_reproduces_again() {
             (
                 "ask_manual_form",
                 json!({
-                    "generator_id": "self-host-a",
-                    "generator_name": "Self Host A",
-                    "artifact_path": "README.md",
-                    "primary_step_type": "write",
-                    "design_json": blueprint.clone(),
-                    "include_readme": false
+                    "package": blueprint.clone()
                 }),
             ),
         ]),
@@ -198,12 +207,11 @@ async fn generator_reproduces_itself_and_the_clone_reproduces_again() {
 
     // Reproduction is not duplication: every source must have been written by
     // the declared foreach/write steps, byte for byte from the blue print.
-    let blueprint_sources = blueprint["package"]["sources"]
-        .as_object()
-        .expect("sources");
+    let blueprint_sources = blueprint["sources"].as_object().expect("sources");
     assert!(!blueprint_sources.is_empty(), "blueprint carries sources");
     for (path, source) in blueprint_sources {
-        let expected = source.as_str().expect("source content");
+        assert_eq!(source["encoding"], "utf8");
+        let expected = source["content"].as_str().expect("source content");
         let actual = fs::read_to_string(clone_a_root.join(path))
             .unwrap_or_else(|error| panic!("source `{path}` should exist: {error}"));
         assert_eq!(
@@ -215,7 +223,18 @@ async fn generator_reproduces_itself_and_the_clone_reproduces_again() {
     // Capability parity: the reproduced flow is the original flow.
     let original = manifest_as_json(&workspace_root().join("generators/generator/qcg.toml"));
     let reproduced = manifest_as_json(&clone_a_root.join("qcg.toml"));
-    for section in ["flow", "blocks", "outputs", "inputs", "assets", "llm"] {
+    for section in [
+        "generator",
+        "flow",
+        "blocks",
+        "outputs",
+        "inputs",
+        "llm",
+        "runtime",
+        "budget",
+        "failure",
+        "journal",
+    ] {
         assert_eq!(
             original.get(section),
             reproduced.get(section),
@@ -241,12 +260,7 @@ async fn generator_reproduces_itself_and_the_clone_reproduces_again() {
             (
                 "ask_manual_form",
                 json!({
-                    "generator_id": "self-host-a",
-                    "generator_name": "Self Host A",
-                    "artifact_path": "README.md",
-                    "primary_step_type": "write",
-                    "design_json": blueprint,
-                    "include_readme": false
+                    "package": blueprint
                 }),
             ),
         ]),

@@ -31,3 +31,5 @@ required = true
 type = "file"
 
 [permissions]
+fs_read = ["workspace"]
+fs_write = ["workspace"]

@@ -41,3 +41,5 @@ required = true
 type = "number"
 
 [permissions]
+fs_read = ["workspace"]
+fs_write = ["workspace"]

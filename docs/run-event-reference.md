@@ -6,10 +6,11 @@ This reference is generated from the OpenAPI `RunEvent` schema. Update it with
 <!-- qcg-run-events:start -->
 ## RunEvent Reference
 
-Generated from the OpenAPI `RunEvent` schema. Every event uses the required envelope fields `seq`, `ts`, `run_id`, `kind`, and `data`; `path` is present for node-scoped events. Unknown `kind` values are preserved with opaque `data`.
+Generated from the OpenAPI `RunEvent` schema. Every event uses the required envelope fields `seq`, `ts`, `run_id`, `trace_id`, `span_id`, `kind`, and `data`; `path` is present for node-scoped events. Trace and span IDs use W3C-compatible hexadecimal widths. Unknown `kind` values are preserved with opaque `data`.
 
 | Event | Required `data` fields |
 |---|---|
+| `run_queued` | `generator`, `generator_path`, `contract_sha256`, `inputs`, `qcg`, `schema_version` |
 | `run_started` | `generator`, `generator_path`, `contract_sha256`, `inputs`, `qcg`, `schema_version` |
 | `run_resumed` | none |
 | `graph_resolved` | `nodes` |
@@ -24,9 +25,20 @@ Generated from the OpenAPI `RunEvent` schema. Every event uses the required enve
 | `repair_attempt_finished` | `attempt`, `status` |
 | `regenerate_attempt_started` | `attempt`, `max_attempts` |
 | `regenerate_attempt_finished` | `attempt`, `status` |
-| `llm_call` | `provider`, `tokens`, `cost_microusd` |
+| `llm_call` | `provider`, `model`, `max_tokens`, `tokens`, `cost_microusd` |
+| `llm_delta` | `provider`, `model`, `index`, `text` |
+| `agent_checkpoint` | `turn`, `phase`, `checkpoint` |
+| `agent_delegated` | `agent`, `tool_call_id`, `tools`, `max_calls`, `max_iterations`, `max_tokens_total`, `max_tool_calls_total` |
+| `agent_completed` | `agent`, `tool_call_id`, `turn`, `tokens_total` |
+| `agent_failed` | `agent`, `tool_call_id`, `code`, `action`, `message` |
+| `agent_handoff` | `agent`, `tool_call_id` |
+| `context_compacted` | none |
 | `llm_validation_failed` | `attempt`, `message` |
-| `tool_call` | `tool`, `id`, `ok` |
+| `llm_route_failed` | `provider`, `model`, `attempt`, `kind` |
+| `tool_call` | `tool`, `id`, `status`, `phase`, `duration_ms`, `arguments`, `result`, `sources`, `truncated` |
+| `guardrail_evaluated` | `guardrail`, `kind`, `stage`, `passed`, `tripwire` |
+| `guardrail_error` | `guardrail`, `kind`, `stage`, `error_kind`, `code`, `message`, `policy` |
+| `guardrail_tripwire` | `guardrail`, `kind`, `stage`, `violation` |
 | `tool_backend_resolved` | `tool`, `backend`, `argv` |
 | `user_interaction` | none |
 | `out_of_contract` | `policy`, `reason` |

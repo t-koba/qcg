@@ -2,17 +2,36 @@
   import type { Messages } from "../messages";
   import type { RunStore } from "../run-store.svelte";
   let { store, messages }: { store: RunStore; messages: Messages } = $props();
-  let details = $derived(typeof store.confirm?.details === "string" ? store.confirm.details : JSON.stringify(store.confirm?.details, null, 2));
+  let heading = $state<HTMLElement>();
+  let details = $derived(typeof store.confirm?.details === "string"
+    ? store.confirm.details
+    : JSON.stringify(store.confirm?.details, null, 2));
+  $effect(() => { if (store.confirm) queueMicrotask(() => heading?.focus()); });
 </script>
 
 {#if store.confirm}
-  <div class="confirm-card" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
-    <h3 id="confirm-title">{store.confirm.title || messages.confirm}</h3>
-    <p>{[store.confirm.kind, store.confirm.target].filter(Boolean).join(" ")}</p>
+  <section class="interaction-card confirmation" aria-labelledby="confirm-title">
+    <div class="interaction-heading">
+      <span class="interaction-index" aria-hidden="true">!</span>
+      <h2 id="confirm-title" tabindex="-1" bind:this={heading}>{store.confirm.title || messages.confirm}</h2>
+    </div>
+    {#if store.confirm.kind || store.confirm.target}
+      <p class="confirmation-target">{[store.confirm.kind, store.confirm.target].filter(Boolean).join(" · ")}</p>
+    {/if}
     {#if store.confirm.details !== null}<pre>{details}</pre>{/if}
     <div class="confirm-actions">
-      <button class="submit-btn" type="button" onclick={() => void store.withError(() => store.decideConfirmation("approve"))}>{messages.approve}</button>
-      <button class="secondary-btn" type="button" onclick={() => void store.withError(() => store.decideConfirmation("deny"))}>{messages.deny}</button>
+      <button
+        class="primary-btn"
+        type="button"
+        disabled={store.pendingAction !== null}
+        onclick={() => void store.withError(() => store.decideConfirmation("approve"))}
+      >{store.pendingAction === "approving" ? messages.approving : messages.approve}</button>
+      <button
+        class="secondary-btn"
+        type="button"
+        disabled={store.pendingAction !== null}
+        onclick={() => void store.withError(() => store.decideConfirmation("deny"))}
+      >{store.pendingAction === "denying" ? messages.denying : messages.deny}</button>
     </div>
-  </div>
+  </section>
 {/if}

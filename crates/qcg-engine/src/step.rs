@@ -1,14 +1,13 @@
 use async_trait::async_trait;
 use camino::Utf8PathBuf;
 use minijinja::{Environment, ErrorKind};
-use qcg_contract::{Contract, NodeDef, StepType};
+use qcg_contract::{Contract, NodeDef, RuntimeLimits, StepType};
 use qcg_types::{ConfirmSpec, Finding, FormSpec};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io;
 use std::sync::Arc;
-use std::sync::Mutex;
 
 use crate::{JournalWriter, LlmGateway, RunContext};
 
@@ -76,6 +75,10 @@ pub enum StepOutcome {
     },
     CheckFailed {
         findings: Vec<Finding>,
+        #[serde(default)]
+        output: Option<Value>,
+        #[serde(default)]
+        files: Vec<Utf8PathBuf>,
     },
     NeedsUser {
         question: FormSpec,
@@ -167,12 +170,14 @@ impl StepRegistry {
 
     pub fn validate_contract(&self, contract: &Contract) -> Result<(), StepError> {
         for (secret_name, secret) in &contract.manifest.secrets {
-            if self.reserved_secret_env_names.contains(&secret.env) {
+            let Some(source) = secret.source_env_name() else {
+                continue;
+            };
+            if self.reserved_secret_env_names.contains(source) {
                 return Err(StepError::failed(
                     "contract",
                     format!(
-                        "generator secret `{secret_name}` targets reserved LLM provider credential environment variable `{}`",
-                        secret.env
+                        "generator secret `{secret_name}` targets reserved provider credential environment variable `{source}`"
                     ),
                 ));
             }
@@ -276,7 +281,11 @@ impl StepContext<'_> {
     pub fn render_inline(&self, node: &NodeDef, source: &str) -> Result<String, StepError> {
         self.run
             .templates
-            .render_inline(source, self.vars.to_json())
+            .render_inline(
+                source,
+                self.vars.to_json(),
+                &self.run.contract.manifest.runtime,
+            )
             .step_err(&node.id)
     }
 
@@ -289,71 +298,260 @@ pub(crate) fn usd_to_microusd(value: f64) -> u64 {
     (value * 1_000_000.0).round().clamp(0.0, u64::MAX as f64) as u64
 }
 
-#[derive(Clone)]
-pub struct TemplateService {
-    inner: Arc<Mutex<TemplateCache>>,
-}
-
-impl Default for TemplateService {
-    fn default() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(TemplateCache {
-                env: Environment::new(),
-                names_by_source_hash: BTreeMap::new(),
-            })),
-        }
-    }
-}
+#[derive(Clone, Default)]
+pub struct TemplateService;
 
 impl TemplateService {
-    pub fn render_inline(&self, source: &str, context: Value) -> Result<String, minijinja::Error> {
-        let mut cache = self.inner.lock().map_err(|_| {
+    pub fn render_inline(
+        &self,
+        source: &str,
+        context: Value,
+        limits: &RuntimeLimits,
+    ) -> Result<String, minijinja::Error> {
+        validate_template_limits(limits)?;
+        if source.len() > limits.template_source_limit_bytes {
+            return Err(minijinja::Error::new(
+                ErrorKind::InvalidOperation,
+                format!(
+                    "template source exceeds {} bytes",
+                    limits.template_source_limit_bytes
+                ),
+            ));
+        }
+        validate_template_context(&context, limits.template_context_limit_bytes)?;
+        let mut env = Environment::new();
+        env.set_fuel(Some(limits.template_fuel));
+        env.add_template_owned("inline".to_owned(), source.to_owned())?;
+        let template = env.get_template("inline")?;
+        let mut writer = BoundedTemplateWriter::new(limits.template_output_limit_bytes);
+        let captured = template
+            .render_captured_to(context, &mut writer)
+            .map_err(|error| {
+                let Some(source) = std::error::Error::source(&error) else {
+                    return error;
+                };
+                minijinja::Error::new(error.kind(), format!("{error}: {source}"))
+            })?;
+        drop(captured);
+        String::from_utf8(writer.into_inner()).map_err(|error| {
             minijinja::Error::new(
                 ErrorKind::InvalidOperation,
-                "template cache mutex was poisoned",
+                format!("template output is not valid UTF-8: {error}"),
             )
-        })?;
-        let name = cache.template_name(source)?;
-        cache.env.get_template(&name)?.render(context)
+        })
     }
 }
 
-struct TemplateCache {
-    env: Environment<'static>,
-    names_by_source_hash: BTreeMap<String, String>,
+fn validate_template_limits(limits: &RuntimeLimits) -> Result<(), minijinja::Error> {
+    for (name, value) in [
+        (
+            "template_source_limit_bytes",
+            limits.template_source_limit_bytes,
+        ),
+        (
+            "template_context_limit_bytes",
+            limits.template_context_limit_bytes,
+        ),
+        (
+            "template_output_limit_bytes",
+            limits.template_output_limit_bytes,
+        ),
+    ] {
+        if value == 0 {
+            return Err(minijinja::Error::new(
+                ErrorKind::InvalidOperation,
+                format!("runtime.{name} must be greater than zero"),
+            ));
+        }
+    }
+    if limits.template_fuel == 0 {
+        return Err(minijinja::Error::new(
+            ErrorKind::InvalidOperation,
+            "runtime.template_fuel must be greater than zero",
+        ));
+    }
+    Ok(())
 }
 
-impl TemplateCache {
-    fn template_name(&mut self, source: &str) -> Result<String, minijinja::Error> {
-        let hash = hex::encode(Sha256::digest(source.as_bytes()));
-        if let Some(name) = self.names_by_source_hash.get(&hash) {
-            return Ok(name.clone());
+fn validate_template_context(context: &Value, limit: usize) -> Result<(), minijinja::Error> {
+    let mut writer = CountingTemplateWriter::new(limit);
+    serde_json::to_writer(&mut writer, context).map_err(|error| {
+        if writer.exceeded {
+            minijinja::Error::new(
+                ErrorKind::InvalidOperation,
+                format!("template context exceeds {limit} bytes"),
+            )
+        } else {
+            minijinja::Error::new(
+                ErrorKind::InvalidOperation,
+                format!("template context serialization failed: {error}"),
+            )
         }
-        let name = format!("inline/{hash}");
-        self.env
-            .add_template_owned(name.clone(), source.to_string())?;
-        self.names_by_source_hash.insert(hash, name.clone());
-        Ok(name)
+    })
+}
+
+struct CountingTemplateWriter {
+    bytes: usize,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl CountingTemplateWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: 0,
+            limit,
+            exceeded: false,
+        }
+    }
+}
+
+impl io::Write for CountingTemplateWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let next = self
+            .bytes
+            .checked_add(bytes.len())
+            .ok_or_else(|| io::Error::other("template context size overflowed"))?;
+        if next > self.limit {
+            self.exceeded = true;
+            return Err(io::Error::other(format!(
+                "template context exceeds {} bytes",
+                self.limit
+            )));
+        }
+        self.bytes = next;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct BoundedTemplateWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedTemplateWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+        }
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl io::Write for BoundedTemplateWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let next = self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .ok_or_else(|| io::Error::other("template output size overflowed"))?;
+        if next > self.limit {
+            return Err(io::Error::other(format!(
+                "template output exceeds {} bytes",
+                self.limit
+            )));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::TemplateService;
+    use super::{RuntimeLimits, TemplateService};
     use serde_json::json;
 
     #[test]
-    fn template_service_reuses_compiled_inline_template() {
-        let service = TemplateService::default();
+    fn template_service_renders_repeated_sources_without_retaining_cache_state() {
+        let service = TemplateService;
+        let limits = RuntimeLimits::default();
         let first = service
-            .render_inline("hello {{ name }}", json!({ "name": "one" }))
+            .render_inline("hello {{ name }}", json!({ "name": "one" }), &limits)
             .expect("first render should succeed");
         let second = service
-            .render_inline("hello {{ name }}", json!({ "name": "two" }))
+            .render_inline("hello {{ name }}", json!({ "name": "two" }), &limits)
             .expect("second render should succeed");
         assert_eq!(first, "hello one");
         assert_eq!(second, "hello two");
-        let cache = service.inner.lock().expect("cache should lock");
-        assert_eq!(cache.names_by_source_hash.len(), 1);
+    }
+
+    #[test]
+    fn template_service_rejects_source_larger_than_runtime_limit() {
+        let service = TemplateService;
+        let limits = RuntimeLimits {
+            template_source_limit_bytes: 8,
+            ..RuntimeLimits::default()
+        };
+        let error = service
+            .render_inline("0123456789", json!({}), &limits)
+            .expect_err("template source should be bounded");
+        assert!(
+            error
+                .to_string()
+                .contains("template source exceeds 8 bytes")
+        );
+    }
+
+    #[test]
+    fn template_service_rejects_context_larger_than_runtime_limit() {
+        let service = TemplateService;
+        let limits = RuntimeLimits {
+            template_context_limit_bytes: 8,
+            ..RuntimeLimits::default()
+        };
+        let error = service
+            .render_inline("{{ value }}", json!({ "value": "0123456789" }), &limits)
+            .expect_err("template context should be bounded");
+        assert!(
+            error
+                .to_string()
+                .contains("template context exceeds 8 bytes")
+        );
+    }
+
+    #[test]
+    fn template_service_rejects_output_larger_than_runtime_limit() {
+        let service = TemplateService;
+        let limits = RuntimeLimits {
+            template_output_limit_bytes: 8,
+            ..RuntimeLimits::default()
+        };
+        let error = service
+            .render_inline("{{ value }}", json!({ "value": "0123456789" }), &limits)
+            .expect_err("template output should be bounded");
+        assert!(
+            error
+                .to_string()
+                .contains("template output exceeds 8 bytes")
+        );
+    }
+
+    #[test]
+    fn template_service_stops_when_fuel_is_exhausted() {
+        let service = TemplateService;
+        let limits = RuntimeLimits {
+            template_fuel: 1,
+            ..RuntimeLimits::default()
+        };
+        let error = service
+            .render_inline(
+                "{% for value in values %}{{ value }}{% endfor %}",
+                json!({ "values": [1, 2, 3, 4, 5] }),
+                &limits,
+            )
+            .expect_err("template fuel should be bounded");
+        assert!(error.to_string().contains("fuel"));
     }
 }

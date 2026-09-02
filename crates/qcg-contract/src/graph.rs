@@ -280,9 +280,7 @@ fn validate_on_fail_ref(
                     node.id
                 ));
             }
-            if let Some(on_exhausted) = on_exhausted {
-                validate_repair_on_exhausted_ref(node, nodes, on_exhausted)?;
-            }
+            validate_on_exhausted_ref(node, nodes, on_exhausted)?;
         }
         crate::manifest::OnFail::Route { to } => {
             if !nodes.contains_key(to) {
@@ -292,24 +290,26 @@ fn validate_on_fail_ref(
                 ));
             }
         }
-        crate::manifest::OnFail::Regenerate { .. }
-        | crate::manifest::OnFail::AskUser
-        | crate::manifest::OnFail::Fail => {}
+        crate::manifest::OnFail::Regenerate { on_exhausted, .. } => {
+            validate_on_exhausted_ref(node, nodes, on_exhausted)?;
+        }
+        crate::manifest::OnFail::AskUser | crate::manifest::OnFail::Fail => {}
     }
     Ok(())
 }
 
-fn validate_repair_on_exhausted_ref(
+fn validate_on_exhausted_ref(
     node: &NodeDef,
     nodes: &BTreeMap<String, NodeDef>,
-    on_exhausted: &crate::manifest::RepairExhausted,
+    on_exhausted: &crate::manifest::ExhaustedAction,
 ) -> Result<(), String> {
     match on_exhausted {
-        crate::manifest::RepairExhausted::Fail => Ok(()),
-        crate::manifest::RepairExhausted::Route { to } => {
+        crate::manifest::ExhaustedAction::Fail
+        | crate::manifest::ExhaustedAction::AskUser { .. } => Ok(()),
+        crate::manifest::ExhaustedAction::Route { to } => {
             if !nodes.contains_key(to) {
                 return Err(format!(
-                    "node `{}` on_fail repair on_exhausted route references unknown node `{to}`",
+                    "node `{}` on_fail on_exhausted route references unknown node `{to}`",
                     node.id
                 ));
             }
@@ -432,8 +432,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_repair_on_exhausted_strategy() {
-        let error = toml::from_str::<Manifest>(
+    fn accepts_ask_user_repair_on_exhausted_strategy() {
+        let manifest = toml::from_str::<Manifest>(
             r#"
 [generator]
 id = "x"
@@ -456,11 +456,8 @@ id = "recheck"
 type = "check.format"
 "#,
         )
-        .expect_err("ask_user is not a valid exhaustion action");
-        assert!(
-            error.to_string().contains("unknown variant `ask_user`"),
-            "unexpected error: {error}"
-        );
+        .expect("ask_user is a valid exhaustion action");
+        Graph::build(&manifest).expect("ask_user does not introduce a graph edge");
     }
 
     #[test]

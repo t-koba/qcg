@@ -1,0 +1,42 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "sources", "uncertainties"],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sources": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["url", "claim", "provider"],
+        "properties": {
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "pattern": "^https://"
+          },
+          "claim": {
+            "type": "string",
+            "minLength": 1
+          },
+          "provider": {
+            "enum": ["exa", "parallel"]
+          }
+        }
+      }
+    },
+    "uncertainties": {
+      "type": "array",
+      "maxItems": 16,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  }
+}

@@ -20,6 +20,33 @@ content = """
 """
 output_file = "preview.html"
 
+[[flow]]
+id = "emit_json"
+type = "write"
+artifact = { label = "JSON preview", required = true }
+
+[flow.params]
+content = '{"safe":true}'
+output_file = "result.json"
+
+[[flow]]
+id = "emit_markdown"
+type = "write"
+artifact = { label = "Markdown preview", required = true }
+
+[flow.params]
+content = "# Safe markdown"
+output_file = "README.md"
+
+[[flow]]
+id = "emit_mismatched"
+type = "write"
+artifact = { label = "Mismatched preview", required = true, preview = "image" }
+
+[flow.params]
+content = "This is plain text, not an image."
+output_file = "mismatch.txt"
+
 [generator]
 description = "Produces an HTML artifact that must not execute scripts in preview."
 id = "artifact-preview-sandbox"
@@ -28,3 +55,4 @@ qcg_version = "^0.1"
 version = "0.1.0"
 
 [permissions]
+fs_write = ["workspace"]

@@ -1,11 +1,14 @@
+use crate::{JournalLimits, read_journal_values_through, serialize_bounded};
 use camino::{Utf8Path, Utf8PathBuf};
 use qcg_contract::ValueBag;
 use qcg_types::{ConfirmSpec, FailureCode, FailureDetail, FormSpec, NodePath};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::io::Write;
 
 pub const RUN_STATE_SCHEMA_VERSION: u32 = 1;
 
@@ -53,6 +56,18 @@ pub struct BudgetState {
     #[serde(default)]
     pub steps_executed: usize,
     #[serde(default)]
+    pub steps_succeeded: u64,
+    #[serde(default)]
+    pub steps_failed: u64,
+    #[serde(default)]
+    pub steps_skipped: u64,
+    #[serde(default)]
+    pub repair_attempts: u64,
+    #[serde(default)]
+    pub regenerate_attempts: u64,
+    #[serde(default)]
+    pub llm_calls: u64,
+    #[serde(default)]
     pub tokens_input: u64,
     #[serde(default)]
     pub tokens_output: u64,
@@ -79,6 +94,8 @@ pub struct RunState {
     #[serde(default)]
     pub nodes: BTreeMap<NodePath, NodeOutcome>,
     #[serde(default)]
+    pub checkpoints: BTreeMap<NodePath, Value>,
+    #[serde(default)]
     pub budget: BudgetState,
     #[serde(default)]
     pub resource_pins: BTreeMap<String, String>,
@@ -86,6 +103,8 @@ pub struct RunState {
     pub pending: Option<Interaction>,
     #[serde(default)]
     pub terminal: Option<TerminalState>,
+    #[serde(default)]
+    pub execution_started: bool,
 }
 
 impl Default for RunState {
@@ -98,39 +117,49 @@ impl Default for RunState {
             inputs: None,
             vars: ValueBag::default(),
             nodes: BTreeMap::new(),
+            checkpoints: BTreeMap::new(),
             budget: BudgetState::default(),
             resource_pins: BTreeMap::new(),
             pending: None,
             terminal: None,
+            execution_started: false,
         }
     }
 }
 
 impl RunState {
     pub fn fold_journal(path: &Utf8Path) -> Result<Self, crate::JournalError> {
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let file = File::open(path)?;
+        Self::fold_journal_through(path, None)
+    }
+
+    pub fn fold_journal_with_limits(
+        path: &Utf8Path,
+        limits: JournalLimits,
+    ) -> Result<Self, crate::JournalError> {
+        Self::fold_journal_through_with_limits(path, None, limits)
+    }
+
+    pub fn fold_journal_through(
+        path: &Utf8Path,
+        through_seq: Option<u64>,
+    ) -> Result<Self, crate::JournalError> {
+        Self::fold_journal_through_with_limits(path, through_seq, JournalLimits::default())
+    }
+
+    pub fn fold_journal_through_with_limits(
+        path: &Utf8Path,
+        through_seq: Option<u64>,
+        limits: JournalLimits,
+    ) -> Result<Self, crate::JournalError> {
         let mut state = Self::default();
-        let mut lines = BufReader::new(file).lines().peekable();
-        let mut line_number = 0_usize;
-        while let Some(line) = lines.next() {
-            line_number += 1;
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
+        for event in read_journal_values_through(path, through_seq, limits)?.events {
+            let parsed = qcg_types::RunEvent::from_flat(&event).map_err(|message| {
+                crate::JournalError::InvalidEvent(format!("invalid journal event: {message}"))
+            })?;
+            if through_seq.is_some_and(|limit| parsed.seq > limit) {
+                break;
             }
-            match serde_json::from_str::<Value>(&line) {
-                Ok(event) => state.apply(&event)?,
-                Err(_) if lines.peek().is_none() => break,
-                Err(source) => {
-                    return Err(crate::JournalError::InvalidLine {
-                        line: line_number,
-                        source,
-                    });
-                }
-            }
+            state.apply(&event)?;
         }
         Ok(state)
     }
@@ -144,7 +173,7 @@ impl RunState {
             .and_then(Value::as_str)
             .ok_or_else(|| crate::JournalError::InvalidEvent("event kind is required".into()))?;
         match kind {
-            "run_started" => {
+            "run_queued" | "run_started" => {
                 self.run_id = event
                     .get("run_id")
                     .and_then(Value::as_str)
@@ -166,6 +195,9 @@ impl RunState {
                     self.budget.started_at =
                         event.get("ts").and_then(Value::as_str).map(str::to_string);
                 }
+                if kind == "run_started" {
+                    self.execution_started = true;
+                }
             }
             "run_resumed" => {
                 self.terminal = None;
@@ -174,6 +206,7 @@ impl RunState {
                 self.budget.steps_executed = self.budget.steps_executed.saturating_add(1);
             }
             "llm_call" => {
+                self.budget.llm_calls = self.budget.llm_calls.saturating_add(1);
                 if let Some(tokens) = event.get("tokens").and_then(Value::as_object) {
                     self.budget.tokens_input = self.budget.tokens_input.saturating_add(
                         tokens
@@ -195,8 +228,51 @@ impl RunState {
                         .unwrap_or_default(),
                 );
             }
+            "agent_checkpoint" => {
+                if let (Some(path), Some(checkpoint)) = (
+                    event.get("node").and_then(Value::as_str),
+                    event.get("checkpoint").cloned(),
+                ) {
+                    self.checkpoints.insert(NodePath::root(path), checkpoint);
+                }
+            }
+            "state_patched" => {
+                if let Some(values) = event.get("inputs").and_then(Value::as_object) {
+                    let values = values
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect::<BTreeMap<_, _>>();
+                    if let Some(inputs) = self.inputs.as_mut() {
+                        inputs.extend(values.clone());
+                    }
+                    self.vars.patch_inputs(values);
+                }
+                if let Some(values) = event.get("step_outputs").and_then(Value::as_object) {
+                    self.vars.patch_step_outputs(
+                        values
+                            .iter()
+                            .map(|(key, value)| (key.clone(), value.clone()))
+                            .collect(),
+                    );
+                }
+                if let Some(values) = event.get("step_statuses").and_then(Value::as_object) {
+                    let values = values
+                        .iter()
+                        .map(|(key, value)| {
+                            value.as_str().map(|value| (key.clone(), value.to_string()))
+                        })
+                        .collect::<Option<BTreeMap<_, _>>>()
+                        .ok_or_else(|| {
+                            crate::JournalError::InvalidEvent(
+                                "state patch statuses must be strings".into(),
+                            )
+                        })?;
+                    self.vars.patch_step_statuses(values);
+                }
+            }
             "step_finished" => self.apply_step_finished(event)?,
             "step_skipped" => {
+                self.budget.steps_skipped = self.budget.steps_skipped.saturating_add(1);
                 if let Some(path) = event.get("node").and_then(Value::as_str) {
                     let reason =
                         failure_detail(event, FailureCode::ExecutionFailed, "step was skipped")?;
@@ -208,6 +284,12 @@ impl RunState {
                     );
                     self.vars.set_step_status(path, "skipped");
                 }
+            }
+            "repair_attempt_started" => {
+                self.budget.repair_attempts = self.budget.repair_attempts.saturating_add(1);
+            }
+            "regenerate_attempt_started" => {
+                self.budget.regenerate_attempts = self.budget.regenerate_attempts.saturating_add(1);
             }
             "resource" => {
                 if let (Some(name), Some(digest)) = (
@@ -266,17 +348,17 @@ impl RunState {
     }
 
     fn apply_step_finished(&mut self, event: &Value) -> Result<(), crate::JournalError> {
-        let Some(path) = event.get("node").and_then(Value::as_str) else {
-            return Ok(());
-        };
-        let status = event
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("failed");
+        let path = event.get("node").and_then(Value::as_str).ok_or_else(|| {
+            crate::JournalError::InvalidEvent("step_finished node is required".into())
+        })?;
+        let status = event.get("status").and_then(Value::as_str).ok_or_else(|| {
+            crate::JournalError::InvalidEvent("step_finished status is required".into())
+        })?;
         if matches!(
             status,
             "success" | "repaired" | "routed" | "answered_on_fail" | "regenerated"
         ) {
+            self.budget.steps_succeeded = self.budget.steps_succeeded.saturating_add(1);
             let output = event
                 .get("output")
                 .filter(|value| !value.is_null())
@@ -302,29 +384,47 @@ impl RunState {
                 .unwrap_or_default();
             self.nodes
                 .insert(NodePath::root(path), NodeOutcome::Success { output, files });
+            self.checkpoints.remove(&NodePath::root(path));
             self.pending = None;
         } else if !matches!(status, "needs_user" | "needs_confirm") {
+            self.budget.steps_failed = self.budget.steps_failed.saturating_add(1);
             let reason = failure_detail(event, FailureCode::ExecutionFailed, status)?;
             self.vars.set_step_status(path, "failed");
             self.nodes
                 .insert(NodePath::root(path), NodeOutcome::Failed { reason });
+            self.checkpoints.remove(&NodePath::root(path));
         }
         Ok(())
     }
 
     pub fn persist_atomic(&self, path: &Utf8Path) -> Result<(), crate::JournalError> {
+        self.persist_atomic_with_limits(path, JournalLimits::default().max_state_bytes)
+    }
+
+    pub fn persist_atomic_with_limits(
+        &self,
+        path: &Utf8Path,
+        max_bytes: usize,
+    ) -> Result<(), crate::JournalError> {
+        let bytes = serialize_bounded(self, max_bytes, "state")?;
+        Self::persist_serialized_atomic(path, &bytes)
+    }
+
+    pub(crate) fn persist_serialized_atomic(
+        path: &Utf8Path,
+        bytes: &[u8],
+    ) -> Result<(), crate::JournalError> {
         let parent = path.parent().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "state path has no parent")
         })?;
         std::fs::create_dir_all(parent)?;
         let tmp = path.with_extension("json.tmp");
-        let bytes = serde_json::to_vec_pretty(self)?;
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
             .open(&tmp)?;
-        file.write_all(&bytes)?;
+        file.write_all(bytes)?;
         file.sync_data()?;
         std::fs::rename(&tmp, path)?;
         #[cfg(unix)]

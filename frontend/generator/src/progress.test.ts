@@ -3,7 +3,17 @@ import type { RunEvent } from "./api/client";
 import { collectNodeProgress } from "./progress";
 
 function event(seq: number, kind: string, data: unknown, path: string | null = null): RunEvent {
-  return { seq, kind, data, path, run_id: "run-1", ts: "2026-01-01T00:00:00Z" };
+  return {
+    seq,
+    kind,
+    data,
+    path,
+    run_id: "run-1",
+    trace_id: "00000000000000000000000000000001",
+    span_id: "0000000000000001",
+    parent_span_id: null,
+    ts: "2026-01-01T00:00:00Z",
+  };
 }
 
 describe("collectNodeProgress", () => {

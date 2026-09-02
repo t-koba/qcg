@@ -49,4 +49,5 @@ model = "fake"
 provider = "fake"
 
 [permissions]
+fs_write = ["workspace"]
 network = ["127.0.0.1"]

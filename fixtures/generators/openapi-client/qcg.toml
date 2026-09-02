@@ -24,6 +24,7 @@ model = "fake"
 provider = "fake"
 
 [permissions]
+fs_write = ["workspace"]
 
 [resources.todo_api]
 llm_visible = true

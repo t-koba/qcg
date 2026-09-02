@@ -1,6 +1,166 @@
 {
   "components": {
     "schemas": {
+      "AgentCheckpointEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "checkpoint": true,
+          "phase": {
+            "type": "string"
+          },
+          "turn": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "turn",
+          "phase",
+          "checkpoint"
+        ],
+        "type": "object"
+      },
+      "AgentCompletedEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "agent": {
+            "type": "string"
+          },
+          "tokens_total": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tool_call_id": {
+            "type": "string"
+          },
+          "turn": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "agent",
+          "tool_call_id",
+          "turn",
+          "tokens_total"
+        ],
+        "type": "object"
+      },
+      "AgentDelegatedEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "agent": {
+            "type": "string"
+          },
+          "max_calls": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_iterations": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_tokens_total": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_tool_calls_total": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tool_call_id": {
+            "type": "string"
+          },
+          "tools": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "agent",
+          "tool_call_id",
+          "tools",
+          "max_calls",
+          "max_iterations",
+          "max_tokens_total",
+          "max_tool_calls_total"
+        ],
+        "type": "object"
+      },
+      "AgentFailedEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/AgentFailureAction"
+          },
+          "agent": {
+            "type": "string"
+          },
+          "code": {
+            "$ref": "#/components/schemas/AgentFailureCode"
+          },
+          "message": {
+            "type": "string"
+          },
+          "tool_call_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent",
+          "tool_call_id",
+          "code",
+          "action",
+          "message"
+        ],
+        "type": "object"
+      },
+      "AgentFailureAction": {
+        "enum": [
+          "fail",
+          "return_error"
+        ],
+        "type": "string"
+      },
+      "AgentFailureCode": {
+        "enum": [
+          "tool_failed",
+          "guardrail_rejected",
+          "token_budget_exceeded",
+          "tool_call_budget_exceeded",
+          "iteration_budget_exceeded",
+          "run_budget_exceeded",
+          "validation_failed",
+          "provider_failed",
+          "cancelled"
+        ],
+        "type": "string"
+      },
+      "AgentHandoffEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "agent": {
+            "type": "string"
+          },
+          "tool_call_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent",
+          "tool_call_id"
+        ],
+        "type": "object"
+      },
       "AnswerPayload": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
@@ -14,6 +174,21 @@
         ],
         "title": "AnswerPayload",
         "type": "object"
+      },
+      "ArtifactPreview": {
+        "enum": [
+          "auto",
+          "text",
+          "json",
+          "markdown",
+          "image",
+          "html",
+          "pdf",
+          "audio",
+          "video",
+          "none"
+        ],
+        "type": "string"
       },
       "AssetSpec": {
         "additionalProperties": false,
@@ -174,6 +349,109 @@
         "enum": [
           "approve",
           "deny"
+        ],
+        "type": "string"
+      },
+      "ContextCompactedEventData": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/ContextCompactedPromptEventData"
+          },
+          {
+            "$ref": "#/components/schemas/ContextCompactedRequestEventData"
+          }
+        ],
+        "description": "The two payload shapes emitted by context management are deliberately kept\nas separate closed objects so prompt compaction cannot silently acquire\ntranscript-only fields."
+      },
+      "ContextCompactedPromptEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "final_bytes": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "limit_bytes": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "original_bytes": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/ContextCompactionPolicy"
+          }
+        },
+        "required": [
+          "policy",
+          "original_bytes",
+          "final_bytes",
+          "limit_bytes"
+        ],
+        "type": "object"
+      },
+      "ContextCompactedRequestEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "compacted_messages": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "compacted_tool_results": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "final_bytes": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "limit_bytes": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "original_bytes": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/ContextCompactionPolicy"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/ContextCompactionScope"
+          }
+        },
+        "required": [
+          "scope",
+          "policy",
+          "original_bytes",
+          "final_bytes",
+          "limit_bytes",
+          "compacted_tool_results",
+          "compacted_messages"
+        ],
+        "type": "object"
+      },
+      "ContextCompactionPolicy": {
+        "description": "The policy used when a prompt or an agent transcript exceeded its context limit.",
+        "enum": [
+          "error",
+          "truncate_head",
+          "truncate_tail"
+        ],
+        "type": "string"
+      },
+      "ContextCompactionScope": {
+        "enum": [
+          "request",
+          "agent_transcript"
         ],
         "type": "string"
       },
@@ -347,6 +625,55 @@
         ],
         "type": "object"
       },
+      "ForkRun": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "at_seq": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "state_patch": {
+            "$ref": "#/components/schemas/ForkStatePatch",
+            "default": {
+              "inputs": {},
+              "step_outputs": {},
+              "step_statuses": {}
+            }
+          }
+        },
+        "required": [
+          "at_seq"
+        ],
+        "title": "ForkRun",
+        "type": "object"
+      },
+      "ForkStatePatch": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "inputs": {
+            "additionalProperties": true,
+            "default": {},
+            "type": "object"
+          },
+          "step_outputs": {
+            "additionalProperties": true,
+            "default": {},
+            "type": "object"
+          },
+          "step_statuses": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "type": "object"
+          }
+        },
+        "title": "ForkStatePatch",
+        "type": "object"
+      },
       "FormSpec": {
         "properties": {
           "fields": {
@@ -360,6 +687,12 @@
           },
           "title": {
             "type": "string"
+          },
+          "title_i18n": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
           }
         },
         "required": [
@@ -465,11 +798,185 @@
         ],
         "type": "object"
       },
+      "GuardrailErrorEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "error_kind": {
+            "$ref": "#/components/schemas/GuardrailErrorKind"
+          },
+          "guardrail": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/GuardrailErrorPolicy"
+          },
+          "stage": {
+            "$ref": "#/components/schemas/GuardrailStage"
+          },
+          "tool": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "guardrail",
+          "kind",
+          "stage",
+          "error_kind",
+          "code",
+          "message",
+          "policy"
+        ],
+        "type": "object"
+      },
+      "GuardrailErrorKind": {
+        "enum": [
+          "invalid_configuration",
+          "evaluation"
+        ],
+        "type": "string"
+      },
+      "GuardrailErrorPolicy": {
+        "enum": [
+          "fail",
+          "block"
+        ],
+        "type": "string"
+      },
+      "GuardrailEvaluatedEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "guardrail": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "passed": {
+            "type": "boolean"
+          },
+          "stage": {
+            "$ref": "#/components/schemas/GuardrailStage"
+          },
+          "tool": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tripwire": {
+            "type": "boolean"
+          },
+          "violation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GuardrailViolationEventData"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "required": [
+          "guardrail",
+          "kind",
+          "stage",
+          "passed",
+          "tripwire"
+        ],
+        "type": "object"
+      },
+      "GuardrailStage": {
+        "enum": [
+          "input",
+          "output",
+          "tool_input",
+          "tool_output"
+        ],
+        "type": "string"
+      },
+      "GuardrailTripwireEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "guardrail": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "stage": {
+            "$ref": "#/components/schemas/GuardrailStage"
+          },
+          "tool": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "violation": {
+            "$ref": "#/components/schemas/GuardrailViolationEventData"
+          }
+        },
+        "required": [
+          "guardrail",
+          "kind",
+          "stage",
+          "violation"
+        ],
+        "type": "object"
+      },
+      "GuardrailViolationEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "details": {
+            "default": null
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "type": "object"
+      },
       "InputField": {
         "additionalProperties": false,
         "properties": {
           "default": {
             "default": null
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description_i18n": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
           },
           "id": {
             "type": "string"
@@ -481,6 +988,18 @@
               "null"
             ]
           },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "label_i18n": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
           "min_items": {
             "default": null,
             "format": "uint",
@@ -489,6 +1008,15 @@
               "integer",
               "null"
             ]
+          },
+          "option_labels_i18n": {
+            "additionalProperties": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "type": "object"
           },
           "options": {
             "default": [],
@@ -504,12 +1032,32 @@
               "null"
             ]
           },
+          "placeholder": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "placeholder_i18n": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
           "required": {
             "default": false,
             "type": "boolean"
           },
+          "schema": {
+            "description": "Optional JSON Schema applied after the canonical field-type checks."
+          },
           "type": {
             "type": "string"
+          },
+          "ui": {
+            "additionalProperties": true,
+            "description": "Renderer-specific presentation metadata forwarded to clients unchanged.",
+            "type": "object"
           }
         },
         "required": [
@@ -578,6 +1126,13 @@
       "LlmCallEventData": {
         "additionalProperties": false,
         "properties": {
+          "agent": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "attempt": {
             "default": 0,
             "format": "uint",
@@ -586,6 +1141,11 @@
           },
           "cost_microusd": {
             "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_tokens": {
+            "format": "uint32",
             "minimum": 0,
             "type": "integer"
           },
@@ -598,8 +1158,29 @@
               "null"
             ]
           },
+          "model": {
+            "type": "string"
+          },
+          "parallel_tool_calls": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "provider": {
             "type": "string"
+          },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ReasoningEffort"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "repair": {
             "default": null,
@@ -617,6 +1198,29 @@
               "null"
             ]
           },
+          "stop_sequences": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "stream": {
+            "default": false,
+            "type": "boolean"
+          },
+          "structured_output": {
+            "$ref": "#/components/schemas/StructuredOutputMode",
+            "default": "auto"
+          },
+          "temperature": {
+            "default": null,
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
           "tokens": {
             "$ref": "#/components/schemas/TokenUsageEventData"
           },
@@ -629,6 +1233,25 @@
               "null"
             ]
           },
+          "tool_choice": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ToolChoice"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "top_p": {
+            "default": null,
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
           "turn": {
             "default": null,
             "format": "uint",
@@ -637,14 +1260,111 @@
               "integer",
               "null"
             ]
+          },
+          "verbosity": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ResponseVerbosity"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           }
         },
         "required": [
           "provider",
+          "model",
+          "max_tokens",
           "tokens",
           "cost_microusd"
         ],
         "type": "object"
+      },
+      "LlmDeltaEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "index": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "model": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider",
+          "model",
+          "index",
+          "text"
+        ],
+        "type": "object"
+      },
+      "LlmRouteFailedEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "attempt": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/LlmRouteFailureKind"
+          },
+          "model": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider",
+          "model",
+          "attempt",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "LlmRouteFailureKind": {
+        "oneOf": [
+          {
+            "enum": [
+              "timed_out",
+              "network",
+              "empty_response",
+              "invalid_response",
+              "partial_stream",
+              "canceled",
+              "circuit_open",
+              "other"
+            ],
+            "type": "string"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "http_status": {
+                "format": "uint16",
+                "maximum": 65535,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "http_status"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "LlmValidationFailedEventData": {
         "additionalProperties": false,
@@ -662,6 +1382,60 @@
           "attempt",
           "message"
         ],
+        "type": "object"
+      },
+      "McpAuthorizationStart": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "authorization_url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "authorization_url"
+        ],
+        "title": "McpAuthorizationStart",
+        "type": "object"
+      },
+      "McpServerList": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/McpServerSummary"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "McpServerList",
+        "type": "object"
+      },
+      "McpServerSummary": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "auth": {
+            "type": "string"
+          },
+          "authorized": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "transport": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "transport",
+          "auth",
+          "authorized"
+        ],
+        "title": "McpServerSummary",
         "type": "object"
       },
       "OutOfContractEventData": {
@@ -687,6 +1461,10 @@
             "minimum": 0,
             "type": "integer"
           },
+          "description": {
+            "default": "",
+            "type": "string"
+          },
           "label": {
             "type": "string"
           },
@@ -699,6 +1477,10 @@
           },
           "path": {
             "type": "string"
+          },
+          "preview": {
+            "$ref": "#/components/schemas/ArtifactPreview",
+            "default": "auto"
           },
           "required": {
             "type": "boolean"
@@ -801,6 +1583,19 @@
           "reason"
         ],
         "type": "object"
+      },
+      "ReasoningEffort": {
+        "description": "Provider-neutral reasoning effort requested for a model invocation.",
+        "enum": [
+          "none",
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "type": "string"
       },
       "RegenerateAttemptStartedEventData": {
         "additionalProperties": false,
@@ -983,8 +1778,37 @@
               "final_url"
             ],
             "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "command": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "kind": {
+                "const": "command",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "command"
+            ],
+            "type": "object"
           }
         ]
+      },
+      "ResponseVerbosity": {
+        "description": "Provider-neutral control for the detail of a model response.",
+        "enum": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "type": "string"
       },
       "RunCompletionStatus": {
         "enum": [
@@ -1014,6 +1838,13 @@
           "kind": {
             "type": "string"
           },
+          "parent_span_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "path": {
             "default": null,
             "type": [
@@ -1029,6 +1860,12 @@
             "minimum": 0,
             "type": "integer"
           },
+          "span_id": {
+            "type": "string"
+          },
+          "trace_id": {
+            "type": "string"
+          },
           "ts": {
             "type": "string"
           }
@@ -1037,6 +1874,8 @@
           "seq",
           "ts",
           "run_id",
+          "trace_id",
+          "span_id",
           "kind",
           "data"
         ],
@@ -1045,6 +1884,9 @@
       },
       "RunEventData": {
         "anyOf": [
+          {
+            "$ref": "#/components/schemas/RunStartedEventData"
+          },
           {
             "$ref": "#/components/schemas/RunStartedEventData"
           },
@@ -1091,10 +1933,43 @@
             "$ref": "#/components/schemas/LlmCallEventData"
           },
           {
+            "$ref": "#/components/schemas/LlmDeltaEventData"
+          },
+          {
+            "$ref": "#/components/schemas/AgentCheckpointEventData"
+          },
+          {
+            "$ref": "#/components/schemas/AgentDelegatedEventData"
+          },
+          {
+            "$ref": "#/components/schemas/AgentCompletedEventData"
+          },
+          {
+            "$ref": "#/components/schemas/AgentFailedEventData"
+          },
+          {
+            "$ref": "#/components/schemas/AgentHandoffEventData"
+          },
+          {
+            "$ref": "#/components/schemas/ContextCompactedEventData"
+          },
+          {
             "$ref": "#/components/schemas/LlmValidationFailedEventData"
           },
           {
+            "$ref": "#/components/schemas/LlmRouteFailedEventData"
+          },
+          {
             "$ref": "#/components/schemas/ToolCallEventData"
+          },
+          {
+            "$ref": "#/components/schemas/GuardrailEvaluatedEventData"
+          },
+          {
+            "$ref": "#/components/schemas/GuardrailErrorEventData"
+          },
+          {
+            "$ref": "#/components/schemas/GuardrailTripwireEventData"
           },
           {
             "$ref": "#/components/schemas/ToolBackendResolvedEventData"
@@ -1438,6 +2313,7 @@
       },
       "RunStatus": {
         "enum": [
+          "queued",
           "running",
           "waiting",
           "confirming",
@@ -1530,6 +2406,14 @@
         "additionalProperties": false,
         "properties": {
           "answer": {
+            "default": null
+          },
+          "failed_files": {
+            "default": [],
+            "items": true,
+            "type": "array"
+          },
+          "failed_output": {
             "default": null
           },
           "files": {
@@ -1644,6 +2528,15 @@
         ],
         "type": "string"
       },
+      "StructuredOutputMode": {
+        "enum": [
+          "auto",
+          "native_strict",
+          "native_compatible",
+          "prompt"
+        ],
+        "type": "string"
+      },
       "TokenUsageEventData": {
         "additionalProperties": false,
         "properties": {
@@ -1653,6 +2546,13 @@
             "type": "integer"
           },
           "output": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "reasoning": {
+            "default": 0,
+            "description": "Reasoning tokens included in `output`.",
             "format": "uint64",
             "minimum": 0,
             "type": "integer"
@@ -1687,25 +2587,168 @@
         ],
         "type": "object"
       },
+      "ToolCallError": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/ToolCallErrorCode"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "type": "object"
+      },
+      "ToolCallErrorCode": {
+        "enum": [
+          "invalid_arguments",
+          "guardrail_rejected",
+          "execution_failed",
+          "output_rejected",
+          "cancelled",
+          "budget_exceeded",
+          "tool_reported_error"
+        ],
+        "type": "string"
+      },
       "ToolCallEventData": {
         "additionalProperties": false,
         "properties": {
+          "agent": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "arguments": true,
+          "duration_ms": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ToolCallError"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
           "id": {
             "type": "string"
           },
-          "ok": {
-            "type": "boolean"
+          "phase": {
+            "$ref": "#/components/schemas/ToolCallPhase"
+          },
+          "result": true,
+          "server": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/ToolCallSource"
+            },
+            "type": "array"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ToolCallStatus"
           },
           "tool": {
             "type": "string"
+          },
+          "truncated": {
+            "type": "boolean"
           }
         },
         "required": [
           "tool",
           "id",
-          "ok"
+          "status",
+          "phase",
+          "duration_ms",
+          "arguments",
+          "result",
+          "sources",
+          "truncated"
         ],
         "type": "object"
+      },
+      "ToolCallPhase": {
+        "enum": [
+          "input_validation",
+          "input_guardrail",
+          "execution",
+          "output_guardrail",
+          "completed"
+        ],
+        "type": "string"
+      },
+      "ToolCallSource": {
+        "additionalProperties": false,
+        "properties": {
+          "title": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      },
+      "ToolCallStatus": {
+        "enum": [
+          "succeeded",
+          "failed",
+          "needs_user",
+          "needs_confirmation"
+        ],
+        "type": "string"
+      },
+      "ToolChoice": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/ToolChoiceMode"
+          },
+          {
+            "properties": {
+              "tool": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "tool"
+            ],
+            "type": "object"
+          }
+        ],
+        "description": "Provider-neutral policy for whether a model may call an exposed tool."
+      },
+      "ToolChoiceMode": {
+        "enum": [
+          "none",
+          "auto",
+          "required"
+        ],
+        "type": "string"
       },
       "UserInteractionEventData": {
         "additionalProperties": false,
@@ -1719,6 +2762,12 @@
           }
         },
         "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "scheme": "bearer",
+        "type": "http"
       }
     }
   },
@@ -1907,6 +2956,239 @@
           }
         },
         "summary": "Read a declared generator asset"
+      }
+    },
+    "/api/mcp/oauth/callback": {
+      "get": {
+        "parameters": [
+          {
+            "in": "query",
+            "name": "code",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "state",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "iss",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "error",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Authorization completed"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request failed"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Complete an MCP OAuth authorization callback"
+      }
+    },
+    "/api/mcp/servers": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpServerList"
+                }
+              }
+            },
+            "description": "Configured MCP servers"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "List configured MCP servers and authorization status"
+      }
+    },
+    "/api/mcp/servers/{id}/authorization": {
+      "delete": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Authorization cleared"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request failed"
+          }
+        },
+        "summary": "Clear stored MCP OAuth authorization"
+      },
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpAuthorizationStart"
+                }
+              }
+            },
+            "description": "Authorization URL"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request failed"
+          }
+        },
+        "summary": "Start MCP OAuth authorization"
+      }
+    },
+    "/api/mcp/servers/{id}/authorization/pending": {
+      "delete": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Pending authorization canceled"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request failed"
+          }
+        },
+        "summary": "Cancel a pending MCP OAuth authorization"
       }
     },
     "/api/openapi.json": {
@@ -2503,6 +3785,16 @@
               }
             },
             "description": "Internal server error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service unavailable"
           }
         },
         "summary": "Confirm or deny a pending side effect"
@@ -2572,6 +3864,111 @@
           }
         },
         "summary": "Subscribe to run events"
+      }
+    },
+    "/api/runs/{id}/fork": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ForkRun"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunSnapshot"
+                }
+              }
+            },
+            "description": "Forked run",
+            "headers": {
+              "Location": {
+                "description": "URL of the newly created run.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Resource conflict"
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Payload too large"
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Validation failed"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service unavailable"
+          }
+        },
+        "summary": "Fork a run from a durable checkpoint"
       }
     },
     "/api/runs/{id}/journal": {
@@ -2721,6 +4118,16 @@
               }
             },
             "description": "Internal server error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service unavailable"
           }
         },
         "summary": "Answer a pending run question"
@@ -2747,7 +4154,7 @@
                 }
               }
             },
-            "description": "Canceled run snapshot"
+            "description": "Settled run snapshot"
           },
           "404": {
             "content": {
@@ -2805,6 +4212,39 @@
         },
         "summary": "Health check"
       }
+    },
+    "/metrics": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "text/plain; version=0.0.4": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Prometheus text exposition"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Prometheus metrics"
+      }
     }
-  }
+  },
+  "security": [
+    {},
+    {
+      "bearerAuth": []
+    }
+  ]
 }

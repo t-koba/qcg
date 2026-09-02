@@ -21,6 +21,7 @@ fn built_in_registry_exposes_parameter_schemas_for_all_steps() {
         "llm.fill",
         "llm.generate",
         "llm.repair",
+        "mcp.call",
         "render",
         "transform",
         "write",

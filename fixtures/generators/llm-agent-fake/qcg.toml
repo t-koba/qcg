@@ -9,12 +9,24 @@ max_tokens_total = 4096
 prompt = "prompts/agent.j2"
 
 [[flow.params.tools]]
+kind = "agent"
+name = "researcher"
+description = "Bounded deterministic specialist used by the agent integration fixture."
+input_schema = { type = "object", additionalProperties = false, required = ["task"], properties = { task = { type = "string", minLength = 1 } } }
+output_schema = "schemas/specialist.schema.json"
+instructions = "Return a schema-valid specialist result."
+tools = []
+max_iterations = 2
+max_tokens_total = 1024
+max_tool_calls_total = 1
+
+[[flow.params.tools]]
 kind = "fs.write"
 name = "write_draft"
 path_prefix = "drafts/"
 
 [generator]
-description = "Deterministic llm.agent example using a declared fs.write tool."
+description = "Deterministic llm.agent example exercising specialist delegation and fs.write."
 id = "llm-agent-fake"
 name = "Fake LLM Agent"
 qcg_version = "^0.1"
@@ -34,3 +46,4 @@ glob = "drafts/result.txt"
 required = true
 
 [permissions]
+fs_write = ["workspace"]

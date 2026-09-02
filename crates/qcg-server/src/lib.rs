@@ -10,14 +10,15 @@ use axum::{Json, Router};
 use camino::Utf8PathBuf;
 use futures_util::StreamExt as FuturesStreamExt;
 use qcg_api::{
-    AnswerPayload, ApiError, ConfirmDecision, GeneratorSummary, ProblemDetails, ProblemFieldError,
-    RunListQuery, RunListResponse, RunSnapshot, StartRun,
+    AnswerPayload, ApiError, ConfirmDecision, ForkRun, GeneratorSummary, McpAuthorizationStart,
+    McpServerList, ProblemDetails, ProblemFieldError, RunListQuery, RunListResponse, RunSnapshot,
+    StartRun,
 };
-use qcg_service::LocalQcgService;
+use qcg_service::{LocalQcgService, RunStoreMode};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::io::{self, Write};
 use std::net::SocketAddr;
@@ -25,6 +26,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::io::ReaderStream;
 use tower_http::cors::CorsLayer;
 
 const IDEMPOTENCY_HEADER: &str = "idempotency-key";
@@ -35,6 +37,7 @@ const RUN_REQUEST_BODY_LIMIT: usize = qcg_types::MAX_FILE_INPUT_BYTES * 2;
 #[cfg(test)]
 const SERVER_ROUTES: &[(&str, &str, Option<&str>, Option<qcg_api::ResponseSchema>)] = &[
     ("get", "/healthz", None, None),
+    ("get", "/metrics", None, None),
     ("get", "/api/openapi.json", None, None),
     (
         "get",
@@ -51,6 +54,26 @@ const SERVER_ROUTES: &[(&str, &str, Option<&str>, Option<qcg_api::ResponseSchema
     ("get", "/api/generators/{id}/assets/{path}", None, None),
     (
         "get",
+        "/api/mcp/servers",
+        None,
+        Some(qcg_api::ResponseSchema::Ref("McpServerList")),
+    ),
+    (
+        "post",
+        "/api/mcp/servers/{id}/authorization",
+        None,
+        Some(qcg_api::ResponseSchema::Ref("McpAuthorizationStart")),
+    ),
+    ("delete", "/api/mcp/servers/{id}/authorization", None, None),
+    (
+        "delete",
+        "/api/mcp/servers/{id}/authorization/pending",
+        None,
+        None,
+    ),
+    ("get", "/api/mcp/oauth/callback", None, None),
+    (
+        "get",
         "/api/runs",
         None,
         Some(qcg_api::ResponseSchema::Ref("RunListResponse")),
@@ -65,6 +88,12 @@ const SERVER_ROUTES: &[(&str, &str, Option<&str>, Option<qcg_api::ResponseSchema
         "get",
         "/api/runs/{id}",
         None,
+        Some(qcg_api::ResponseSchema::Ref("RunSnapshot")),
+    ),
+    (
+        "post",
+        "/api/runs/{id}/fork",
+        Some("ForkRun"),
         Some(qcg_api::ResponseSchema::Ref("RunSnapshot")),
     ),
     (
@@ -108,19 +137,29 @@ pub struct ServerConfig {
     /// The first root containing an id wins.
     pub extra_generators_dirs: Vec<Utf8PathBuf>,
     pub runs_dir: Utf8PathBuf,
+    pub max_active_runs: usize,
+    pub max_tracked_runs: usize,
+    pub run_store_mode: RunStoreMode,
     pub cors_origins: Vec<String>,
+    /// Optional bearer token. When omitted, the selected listener is unauthenticated.
+    pub api_token: Option<String>,
 }
 
 #[derive(Debug)]
 struct AppState {
     service: LocalQcgService,
+    oauth_origin: Option<String>,
+    oauth_allowed_origins: BTreeSet<String>,
+    oauth_callback_url: Option<String>,
     idempotency: tokio::sync::Mutex<BTreeMap<String, IdempotencyEntry>>,
+    api_token_digest: Option<[u8; 32]>,
 }
 
 #[derive(Debug)]
 enum IdempotencyEntry {
     Pending {
         digest: String,
+        owner_id: uuid::Uuid,
         created_at: Instant,
         completed: tokio::sync::watch::Sender<bool>,
     },
@@ -131,25 +170,99 @@ enum IdempotencyEntry {
     },
 }
 
+struct PendingIdempotencyGuard {
+    state: Arc<AppState>,
+    key: String,
+    owner_id: uuid::Uuid,
+    armed: bool,
+}
+
+impl PendingIdempotencyGuard {
+    fn new(state: Arc<AppState>, key: String, owner_id: uuid::Uuid) -> Self {
+        Self {
+            state,
+            key,
+            owner_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingIdempotencyGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let state = Arc::clone(&self.state);
+        let key = self.key.clone();
+        let owner_id = self.owner_id;
+        tokio::spawn(async move {
+            let completed = {
+                let mut entries = state.idempotency.lock().await;
+                if matches!(
+                    entries.get(&key),
+                    Some(IdempotencyEntry::Pending {
+                        owner_id: current,
+                        ..
+                    }) if *current == owner_id
+                ) {
+                    match entries.remove(&key) {
+                        Some(IdempotencyEntry::Pending { completed, .. }) => Some(completed),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some(completed) = completed {
+                let _ = completed.send(true);
+            }
+        });
+    }
+}
+
 pub async fn serve_with_listener(
     config: ServerConfig,
     listener: tokio::net::TcpListener,
 ) -> Result<SocketAddr> {
+    let actual_addr = listener.local_addr()?;
     let mut roots = vec![config.generators_dir.clone()];
     roots.extend(config.extra_generators_dirs.clone());
-    let service = LocalQcgService::with_generator_roots(
+    let service = LocalQcgService::with_generator_roots_max_active_runs_and_store_mode(
         roots,
         config.runs_dir.clone(),
         config.providers_path.clone(),
+        config.max_active_runs,
+        config.max_tracked_runs,
+        config.run_store_mode,
     )?;
+    service.resume_recovered_runs().await;
+    let _shared_recovery_task = service.start_shared_store_recovery();
     let _gc_task = service.start_retention_gc();
+    let oauth_origin = actual_addr
+        .ip()
+        .is_loopback()
+        .then(|| format!("http://{actual_addr}"));
+    let oauth_allowed_origins = loopback_oauth_origins(actual_addr);
+    let oauth_callback_url = oauth_origin
+        .as_ref()
+        .map(|origin| format!("{origin}/api/mcp/oauth/callback"));
     let state = Arc::new(AppState {
         service,
+        oauth_origin,
+        oauth_allowed_origins,
+        oauth_callback_url,
         idempotency: tokio::sync::Mutex::new(BTreeMap::new()),
+        api_token_digest: config.api_token.as_deref().map(sha256_bytes),
     });
     let shutdown_service = state.service.clone();
     let app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics))
         .route("/api/openapi.json", get(openapi))
         .route("/api/generators", get(list_generators))
         .route("/api/generators/{id}", get(describe_generator))
@@ -157,8 +270,22 @@ pub async fn serve_with_listener(
             "/api/generators/{id}/assets/{*path}",
             get(read_generator_asset),
         )
+        .route("/api/mcp/servers", get(list_mcp_servers))
+        .route(
+            "/api/mcp/servers/{id}/authorization",
+            axum::routing::post(start_mcp_authorization).delete(clear_mcp_authorization),
+        )
+        .route(
+            "/api/mcp/servers/{id}/authorization/pending",
+            axum::routing::delete(cancel_pending_mcp_authorization),
+        )
+        .route("/api/mcp/oauth/callback", get(complete_mcp_authorization))
         .route("/api/runs", get(list_runs).post(start_run))
-        .route("/api/runs/{id}", get(run_snapshot))
+        .route(
+            "/api/runs/{id}",
+            get(run_snapshot).post(cancel_run_from_path),
+        )
+        .route("/api/runs/{id}/fork", axum::routing::post(fork_run))
         .route("/api/runs/{id}/questions/{qid}", put(answer_run))
         .route("/api/runs/{id}/confirmations/{cid}", put(confirm_run))
         .route("/api/runs/{id}/events", get(run_events))
@@ -170,6 +297,10 @@ pub async fn serve_with_listener(
         .layer(DefaultBodyLimit::max(RUN_REQUEST_BODY_LIMIT))
         .layer(middleware::from_fn(reject_unsafe_generator_asset_path))
         .layer(middleware::from_fn(security_headers_middleware))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            require_api_auth,
+        ))
         .with_state(state);
     let app = if !config.cors_origins.is_empty() {
         let origins = config
@@ -181,21 +312,132 @@ pub async fn serve_with_listener(
             CorsLayer::new()
                 .allow_origin(tower_http::cors::AllowOrigin::list(origins))
                 .allow_headers([
+                    header::AUTHORIZATION,
                     header::CONTENT_TYPE,
                     header::HeaderName::from_static(IDEMPOTENCY_HEADER),
                 ])
-                .allow_methods([Method::GET, Method::POST, Method::PUT, Method::OPTIONS]),
+                .allow_methods([
+                    Method::GET,
+                    Method::POST,
+                    Method::PUT,
+                    Method::DELETE,
+                    Method::OPTIONS,
+                ]),
         )
     } else {
         app
     };
 
-    let actual_addr = listener.local_addr()?;
     tracing::info!(%actual_addr, "qcg server listening");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(shutdown_service))
         .await?;
     Ok(actual_addr)
+}
+
+fn sha256_bytes(value: &str) -> [u8; 32] {
+    Sha256::digest(value.as_bytes()).into()
+}
+
+async fn require_api_auth(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    if state.api_token_digest.is_none()
+        || matches!(
+            path,
+            "/healthz" | "/api/openapi.json" | "/api/mcp/oauth/callback"
+        )
+    {
+        return next.run(request).await;
+    }
+    let supplied = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(sha256_bytes);
+    let authorized = supplied.is_some_and(|supplied| {
+        constant_time_digest_eq(
+            &supplied,
+            state
+                .api_token_digest
+                .as_ref()
+                .expect("checked token digest"),
+        )
+    });
+    if authorized {
+        next.run(request).await
+    } else {
+        let mut response =
+            ApiHttpError::unauthorized("valid bearer token required").into_response();
+        response.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Bearer realm=\"qcg\""),
+        );
+        response
+    }
+}
+
+async fn metrics(State(state): State<Arc<AppState>>) -> Result<Response, ApiHttpError> {
+    let runs = state
+        .service
+        .list_run_items()
+        .await
+        .map_err(ApiHttpError::from_api)?;
+    let mut states = BTreeMap::<String, usize>::new();
+    for run in &runs {
+        *states.entry(run.state.to_string()).or_default() += 1;
+    }
+    let active = runs
+        .iter()
+        .filter(|run| {
+            matches!(
+                run.state,
+                qcg_api::RunStatus::Queued | qcg_api::RunStatus::Running
+            )
+        })
+        .count();
+    let mut body = String::from(
+        "# HELP qcg_runs_total Number of durable runs by state.\n# TYPE qcg_runs_total gauge\n",
+    );
+    for (status, count) in states {
+        body.push_str(&format!("qcg_runs_total{{state=\"{status}\"}} {count}\n"));
+    }
+    body.push_str("# HELP qcg_runs_active Number of queued or running runs.\n");
+    body.push_str("# TYPE qcg_runs_active gauge\n");
+    body.push_str(&format!("qcg_runs_active {active}\n"));
+    Ok((
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response())
+}
+
+fn constant_time_digest_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
+}
+
+fn loopback_oauth_origins(address: SocketAddr) -> BTreeSet<String> {
+    if !address.ip().is_loopback() {
+        return BTreeSet::new();
+    }
+    BTreeSet::from([
+        format!("http://{address}"),
+        format!("http://localhost:{}", address.port()),
+        format!("http://127.0.0.1:{}", address.port()),
+        format!("http://[::1]:{}", address.port()),
+    ])
 }
 
 async fn shutdown_signal(service: LocalQcgService) {
@@ -287,7 +529,12 @@ async fn openapi() -> Json<Value> {
 async fn list_generators(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<GeneratorSummary>>, ApiHttpError> {
-    Ok(Json(state.service.list_generators().await))
+    state
+        .service
+        .list_generators()
+        .await
+        .map(Json)
+        .map_err(ApiHttpError::from_api)
 }
 
 async fn describe_generator(
@@ -323,6 +570,113 @@ async fn read_generator_asset(
         .header(header::CACHE_CONTROL, "no-store")
         .body(Body::from(bytes))
         .map_err(ApiHttpError::internal)
+}
+
+async fn list_mcp_servers(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<McpServerList>, ApiHttpError> {
+    state
+        .service
+        .list_mcp_servers()
+        .await
+        .map(Json)
+        .map_err(ApiHttpError::internal)
+}
+
+async fn start_mcp_authorization(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<McpAuthorizationStart>, ApiHttpError> {
+    require_local_oauth_origin(&state, &headers)?;
+    let callback_url = state.oauth_callback_url.as_deref().ok_or_else(|| {
+        ApiHttpError::forbidden("MCP OAuth is available only on a loopback listener")
+    })?;
+    state
+        .service
+        .start_mcp_authorization(&id, callback_url)
+        .await
+        .map(Json)
+        .map_err(|error| ApiHttpError::bad_request(error.to_string()))
+}
+
+async fn clear_mcp_authorization(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiHttpError> {
+    require_local_oauth_origin(&state, &headers)?;
+    state
+        .service
+        .clear_mcp_authorization(&id)
+        .await
+        .map_err(|error| ApiHttpError::bad_request(error.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn cancel_pending_mcp_authorization(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiHttpError> {
+    require_local_oauth_origin(&state, &headers)?;
+    state
+        .service
+        .cancel_pending_mcp_authorization(&id)
+        .await
+        .map_err(|error| ApiHttpError::bad_request(error.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn complete_mcp_authorization(
+    State(state): State<Arc<AppState>>,
+    OriginalUri(uri): OriginalUri,
+) -> Result<Response, ApiHttpError> {
+    let origin = state.oauth_origin.as_deref().ok_or_else(|| {
+        ApiHttpError::forbidden("MCP OAuth is available only on a loopback listener")
+    })?;
+    let path_and_query = uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or(uri.path());
+    let callback_url = format!("{origin}{path_and_query}");
+    let server_id = state
+        .service
+        .complete_mcp_authorization(&callback_url)
+        .await
+        .map_err(|error| ApiHttpError::bad_request(error.to_string()))?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(format!(
+            "<!doctype html><meta charset=\"utf-8\"><title>MCP connected</title><p>MCP server <code>{server_id}</code> is connected. You can close this window.</p>"
+        )))
+        .map_err(ApiHttpError::internal)
+}
+
+fn require_local_oauth_origin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiHttpError> {
+    if state.oauth_origin.is_none() {
+        return Err(ApiHttpError::forbidden(
+            "MCP OAuth is available only on a loopback listener",
+        ));
+    }
+    if state.oauth_allowed_origins.is_empty() {
+        return Err(ApiHttpError::forbidden(
+            "MCP OAuth has no allowed loopback origins",
+        ));
+    }
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        let origin = origin
+            .to_str()
+            .map_err(|_| ApiHttpError::forbidden("request Origin is invalid"))?;
+        if !state.oauth_allowed_origins.contains(origin) {
+            return Err(ApiHttpError::forbidden(
+                "cross-origin MCP authorization is not allowed",
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn list_runs(
@@ -390,8 +744,8 @@ async fn start_run(
     let Some(idempotency_key) = idempotency_key else {
         return start_new_run(&state, req).await;
     };
-    loop {
-        let wait = {
+    let owner_id = loop {
+        let (wait, owner_id) = {
             let mut idempotency = state.idempotency.lock().await;
             prune_idempotency(&mut idempotency, Instant::now());
             match idempotency.get(&idempotency_key) {
@@ -414,7 +768,7 @@ async fn start_run(
                     if digest != &request_digest {
                         return Err(idempotency_conflict());
                     }
-                    Some(completed.subscribe())
+                    (Some(completed.subscribe()), None)
                 }
                 None => {
                     if idempotency.len() >= IDEMPOTENCY_MAX_ENTRIES {
@@ -423,36 +777,54 @@ async fn start_run(
                         ));
                     }
                     let (completed, _) = tokio::sync::watch::channel(false);
+                    let owner_id = uuid::Uuid::now_v7();
                     idempotency.insert(
                         idempotency_key.clone(),
                         IdempotencyEntry::Pending {
                             digest: request_digest.clone(),
+                            owner_id,
                             created_at: Instant::now(),
                             completed,
                         },
                     );
-                    None
+                    (None, Some(owner_id))
                 }
             }
         };
+        if let Some(owner_id) = owner_id {
+            break owner_id;
+        }
         if let Some(mut completed) = wait {
             if !*completed.borrow() {
                 let _ = completed.changed().await;
             }
             continue;
         }
-        break;
-    }
+        unreachable!("idempotency admission must wait or assign an owner");
+    };
+    let mut pending_guard =
+        PendingIdempotencyGuard::new(Arc::clone(&state), idempotency_key.clone(), owner_id);
     let run_id = match state.service.start_run(req).await {
         Ok(run_id) => run_id,
         Err(error) => {
             let completed = {
                 let mut idempotency = state.idempotency.lock().await;
-                match idempotency.remove(&idempotency_key) {
-                    Some(IdempotencyEntry::Pending { completed, .. }) => Some(completed),
-                    _ => None,
+                if matches!(
+                    idempotency.get(&idempotency_key),
+                    Some(IdempotencyEntry::Pending {
+                        owner_id: current,
+                        ..
+                    }) if *current == owner_id
+                ) {
+                    match idempotency.remove(&idempotency_key) {
+                        Some(IdempotencyEntry::Pending { completed, .. }) => Some(completed),
+                        _ => None,
+                    }
+                } else {
+                    None
                 }
             };
+            pending_guard.disarm();
             if let Some(completed) = completed {
                 let _ = completed.send(true);
             }
@@ -461,9 +833,19 @@ async fn start_run(
     };
     let completed = {
         let mut idempotency = state.idempotency.lock().await;
-        let completed = match idempotency.remove(&idempotency_key) {
-            Some(IdempotencyEntry::Pending { completed, .. }) => Some(completed),
-            _ => None,
+        let completed = if matches!(
+            idempotency.get(&idempotency_key),
+            Some(IdempotencyEntry::Pending {
+                owner_id: current,
+                ..
+            }) if *current == owner_id
+        ) {
+            match idempotency.remove(&idempotency_key) {
+                Some(IdempotencyEntry::Pending { completed, .. }) => Some(completed),
+                _ => None,
+            }
+        } else {
+            None
         };
         idempotency.insert(
             idempotency_key,
@@ -475,6 +857,7 @@ async fn start_run(
         );
         completed
     };
+    pending_guard.disarm();
     if let Some(completed) = completed {
         let _ = completed.send(true);
     }
@@ -490,6 +873,24 @@ async fn start_new_run(state: &AppState, req: StartRun) -> Result<Response, ApiH
     let run_id = state
         .service
         .start_run(req)
+        .await
+        .map_err(ApiHttpError::from_api)?;
+    let snapshot = state
+        .service
+        .snapshot(run_id)
+        .await
+        .map_err(ApiHttpError::from_api)?;
+    created_run_response(snapshot)
+}
+
+async fn fork_run(
+    State(state): State<Arc<AppState>>,
+    Path(source_id): Path<String>,
+    Json(request): Json<ForkRun>,
+) -> Result<Response, ApiHttpError> {
+    let run_id = state
+        .service
+        .fork_run(&source_id, request)
         .await
         .map_err(ApiHttpError::from_api)?;
     let snapshot = state
@@ -554,7 +955,7 @@ async fn run_snapshot(
         .map_err(ApiHttpError::from_api)?;
     conditional_json(
         &headers,
-        weak_etag(&format!("run-{}", snapshot.seq)),
+        weak_etag(&format!("run-{}-{}", snapshot.seq, snapshot.state)),
         &snapshot,
     )
 }
@@ -612,18 +1013,29 @@ async fn cancel_run(
         .map_err(ApiHttpError::from_api)
 }
 
-async fn dispatch_fallback(
+async fn cancel_run_from_path(
     State(state): State<Arc<AppState>>,
+    Path(path_id): Path<String>,
+) -> Result<Response, ApiHttpError> {
+    let Some(id) = path_id.strip_suffix(":cancel").filter(|id| !id.is_empty()) else {
+        return Err(ApiHttpError::new(
+            StatusCode::NOT_FOUND,
+            "Resource not found",
+            "not_found",
+            format!("route `POST /api/runs/{path_id}` was not found"),
+            format!("/api/runs/{path_id}"),
+            Vec::new(),
+        ));
+    };
+    cancel_run(State(state), Path(id.to_string()))
+        .await
+        .map(IntoResponse::into_response)
+}
+
+async fn dispatch_fallback(
     method: Method,
     original_uri: OriginalUri,
 ) -> Result<Response, ApiHttpError> {
-    if method == Method::POST
-        && let Some(id) = cancel_run_id(original_uri.path())
-    {
-        return cancel_run(State(state), Path(id.to_string()))
-            .await
-            .map(IntoResponse::into_response);
-    }
     Err(ApiHttpError::new(
         StatusCode::NOT_FOUND,
         "Resource not found",
@@ -646,11 +1058,6 @@ fn unsafe_generator_asset_path(path: &str) -> bool {
         || encoded.contains("%2e")
         || encoded.contains("%2f")
         || encoded.contains("%5c")
-}
-
-fn cancel_run_id(path: &str) -> Option<&str> {
-    let id = path.strip_prefix("/api/runs/")?.strip_suffix(":cancel")?;
-    (!id.is_empty() && !id.contains('/')).then_some(id)
 }
 
 async fn run_events(
@@ -740,7 +1147,7 @@ async fn read_artifact(
     Path((id, path)): Path<(String, String)>,
 ) -> Result<Response, ApiHttpError> {
     let content_disposition = content_disposition_attachment(&path);
-    let (artifact, bytes) = state
+    let (artifact, resolved) = state
         .service
         .read_artifact(id, path)
         .await
@@ -748,11 +1155,24 @@ async fn read_artifact(
     let content_type = artifact
         .mime
         .unwrap_or_else(|| content_type_for_name(&artifact.path).to_string());
+    let file = tokio::fs::File::open(resolved)
+        .await
+        .map_err(ApiHttpError::internal)?;
+    let metadata = file.metadata().await.map_err(ApiHttpError::internal)?;
+    if !metadata.is_file() || metadata.len() != artifact.bytes {
+        return Err(ApiHttpError::internal(format!(
+            "artifact `{}` bytes mismatch: manifest={}, actual={}",
+            artifact.path,
+            artifact.bytes,
+            metadata.len()
+        )));
+    }
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CONTENT_DISPOSITION, content_disposition)
-        .body(Body::from(bytes))
+        .header(header::CONTENT_LENGTH, artifact.bytes)
+        .body(Body::from_stream(ReaderStream::new(file)))
         .map_err(ApiHttpError::internal)
 }
 
@@ -898,6 +1318,28 @@ impl ApiHttpError {
         )
     }
 
+    fn unauthorized(detail: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            "Unauthorized",
+            "unauthorized",
+            detail,
+            "",
+            Vec::new(),
+        )
+    }
+
+    fn forbidden(detail: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            "forbidden",
+            detail,
+            "",
+            Vec::new(),
+        )
+    }
+
     fn service_unavailable(detail: impl Into<String>) -> Self {
         Self::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -972,6 +1414,7 @@ impl ApiHttpError {
                 "",
                 Vec::new(),
             ),
+            ApiError::Unavailable { detail } => Self::service_unavailable(detail),
             ApiError::Internal { detail } => Self::internal(detail),
         }
     }
@@ -1043,11 +1486,28 @@ mod tests {
     }
 
     #[test]
-    fn cancel_suffix_route_accepts_exactly_one_run_id_segment() {
-        assert_eq!(cancel_run_id("/api/runs/run-1:cancel"), Some("run-1"));
-        assert_eq!(cancel_run_id("/api/runs/:cancel"), None);
-        assert_eq!(cancel_run_id("/api/runs/a/b:cancel"), None);
-        assert_eq!(cancel_run_id("/api/runs/run-1/cancel"), None);
+    fn oauth_accepts_only_loopback_aliases_on_the_bound_port() {
+        let origins = loopback_oauth_origins("127.0.0.1:43123".parse().expect("valid address"));
+        assert!(origins.contains("http://127.0.0.1:43123"));
+        assert!(origins.contains("http://localhost:43123"));
+        assert!(origins.contains("http://[::1]:43123"));
+        assert!(!origins.contains("http://localhost:43124"));
+
+        let remote = loopback_oauth_origins("192.0.2.1:43123".parse().expect("valid address"));
+        assert!(remote.is_empty());
+    }
+
+    #[test]
+    fn bearer_digest_comparison_rejects_any_difference() {
+        let expected = sha256_bytes("correct-token");
+        assert!(constant_time_digest_eq(
+            &expected,
+            &sha256_bytes("correct-token")
+        ));
+        assert!(!constant_time_digest_eq(
+            &expected,
+            &sha256_bytes("wrong-token")
+        ));
     }
 
     #[tokio::test]
@@ -1068,7 +1528,11 @@ mod tests {
                 providers_path: Some(missing.clone()),
                 extra_generators_dirs: Vec::new(),
                 runs_dir: root.join("runs"),
+                max_active_runs: qcg_service::DEFAULT_MAX_ACTIVE_RUNS,
+                max_tracked_runs: qcg_service::DEFAULT_MAX_TRACKED_RUNS,
+                run_store_mode: RunStoreMode::Exclusive,
                 cors_origins: Vec::new(),
+                api_token: None,
             },
             listener,
         )
@@ -1095,7 +1559,11 @@ mod tests {
                 None,
             )
             .expect("service should initialize"),
+            oauth_origin: None,
+            oauth_allowed_origins: BTreeSet::new(),
+            oauth_callback_url: None,
             idempotency: tokio::sync::Mutex::new(BTreeMap::new()),
+            api_token_digest: None,
         });
         let mut headers = HeaderMap::new();
         headers.insert(IDEMPOTENCY_HEADER, HeaderValue::from_static("same-run"));
@@ -1154,6 +1622,7 @@ mod tests {
                     format!("pending-{index}"),
                     IdempotencyEntry::Pending {
                         digest: "digest".into(),
+                        owner_id: uuid::Uuid::now_v7(),
                         created_at: Instant::now(),
                         completed,
                     },
@@ -1184,6 +1653,54 @@ mod tests {
                 .values()
                 .all(|entry| matches!(entry, IdempotencyEntry::Pending { .. }))
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_idempotency_owner_releases_pending_entry() {
+        let workspace = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .expect("workspace root should exist")
+            .to_path_buf();
+        let runs = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .expect("temporary directory path should be UTF-8")
+            .join(format!("qcg-idempotency-cancel-{}", uuid::Uuid::now_v7()));
+        let state = Arc::new(AppState {
+            service: LocalQcgService::new(workspace.join("fixtures/generators"), runs, None)
+                .expect("service should initialize"),
+            oauth_origin: None,
+            oauth_allowed_origins: BTreeSet::new(),
+            oauth_callback_url: None,
+            idempotency: tokio::sync::Mutex::new(BTreeMap::new()),
+            api_token_digest: None,
+        });
+        let owner_id = uuid::Uuid::now_v7();
+        let (completed, _) = tokio::sync::watch::channel(false);
+        state.idempotency.lock().await.insert(
+            "cancelled".into(),
+            IdempotencyEntry::Pending {
+                digest: "digest".into(),
+                owner_id,
+                created_at: Instant::now(),
+                completed,
+            },
+        );
+        drop(PendingIdempotencyGuard::new(
+            Arc::clone(&state),
+            "cancelled".into(),
+            owner_id,
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state.idempotency.lock().await.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled pending entry should be released promptly");
     }
 
     #[test]

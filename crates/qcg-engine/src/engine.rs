@@ -1,24 +1,28 @@
 use crate::{
     CmdGateway, ConfirmSpec, FailureCode, FailureDetail, FilePin, FormSpec, FsGateway, HttpGateway,
-    JournalWriter, NodeOutcome, NodePath, OutputManifest, ResourceSnapshot, RunEvent,
-    RunNodeFailureEventData, RunState, SecretStore, StepContext, StepControlFlow, StepError,
-    StepOutcome, StepRegistry, TemplateService, collect_outputs, collect_resource_hashes,
-    write_output_manifest,
+    JournalLimits, JournalWriter, NodeOutcome, NodePath, OutputManifest, ResourceSnapshot,
+    RunEvent, RunNodeFailureEventData, RunState, SecretStore, StepContext, StepControlFlow,
+    StepError, StepOutcome, StepRegistry, TemplateService, collect_outputs,
+    collect_resource_hashes, write_output_manifest_with_limits,
 };
 use camino::Utf8PathBuf;
-use qcg_contract::{Contract, NodeState, SideEffects, ValueBag};
-use qcg_contract::{NodeDef, OnFail, RepairExhausted};
+use qcg_contract::{Contract, NodeState, RuntimeLimits, SideEffects, ValueBag};
+use qcg_contract::{ExhaustedAction, NodeDef, OnFail};
 use qcg_types::{FieldType, FileValue, Finding, InputField};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::broadcast;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+pub const MAX_FOREACH_ITERATIONS: usize = 10_000;
+pub const MAX_FOREACH_PARALLELISM: usize = 256;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -77,6 +81,13 @@ struct NamedNodeTarget<'a> {
     attempt: u32,
 }
 
+struct ForeachIteration<'a> {
+    node: &'a NodeDef,
+    block: &'a [NodeDef],
+    index: usize,
+    item: Value,
+}
+
 impl EngineError {
     pub fn is_canceled(&self) -> bool {
         matches!(
@@ -132,6 +143,7 @@ pub struct RunContext {
     pub templates: TemplateService,
     pub cancellation: CancellationToken,
     replayed_steps: Arc<BTreeMap<String, ReplayedStep>>,
+    checkpoint_accounting: Arc<Mutex<CheckpointAccounting>>,
 }
 
 #[derive(Clone)]
@@ -168,7 +180,11 @@ fn canonical_file_inputs(
         let Some(value) = inputs.get(&field.id) else {
             continue;
         };
-        let file = FileValue::from_value(value).map_err(|error| {
+        let file = FileValue::from_value_with_limit(
+            value,
+            contract.manifest.runtime.file_input_limit_bytes,
+        )
+        .map_err(|error| {
             EngineError::Failed(format!("invalid file input `{}`: {error}", field.id))
         })?;
         inputs.insert(
@@ -196,21 +212,26 @@ fn materialize_file_inputs(
         let Some(value) = inputs.get(&field.id) else {
             continue;
         };
-        let file = FileValue::from_value(value).map_err(|error| {
+        let file = FileValue::from_value_with_limit(
+            value,
+            contract.manifest.runtime.file_input_limit_bytes,
+        )
+        .map_err(|error| {
             EngineError::Failed(format!("invalid file input `{}`: {error}", field.id))
         })?;
-        let relative = Utf8PathBuf::from("files").join(&field.id).join(&file.name);
+        let relative = format!("files/{}/{}", field.id, file.name);
         let target = workspace.join(&relative);
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(
             &target,
-            file.decode().map_err(|error| {
-                EngineError::Failed(format!("invalid file input `{}`: {error}", field.id))
-            })?,
+            file.decode_with_limit(contract.manifest.runtime.file_input_limit_bytes)
+                .map_err(|error| {
+                    EngineError::Failed(format!("invalid file input `{}`: {error}", field.id))
+                })?,
         )?;
-        materialized.insert(field.id.clone(), Value::String(relative.into_string()));
+        materialized.insert(field.id.clone(), Value::String(relative));
     }
     Ok(materialized)
 }
@@ -228,14 +249,26 @@ impl Engine {
     ) -> Result<OutputManifest, EngineError> {
         let run_id = Uuid::now_v7().to_string();
         let metadata_dir = default_metadata_dir(&options.output_dir, &run_id);
+        let journal_limits = JournalLimits::from(&contract.manifest.runtime);
         let cancellation = options.cancellation.clone();
         let event_sender = options.event_sender.clone();
         let result = self
-            .run_inner(contract, inputs, options, run_id, metadata_dir.clone())
+            .run_inner(
+                contract,
+                inputs,
+                options,
+                run_id.clone(),
+                metadata_dir.clone(),
+            )
             .await;
         if result.as_ref().is_err_and(|error| error.is_canceled()) {
-            let journal =
-                JournalWriter::create(&metadata_dir.join("journal.jsonl"), false, event_sender)?;
+            let journal = JournalWriter::create_with_limits(
+                &metadata_dir.join("journal.jsonl"),
+                run_id,
+                false,
+                event_sender,
+                journal_limits,
+            )?;
             if !matches!(
                 journal.state().terminal,
                 Some(crate::TerminalState::Canceled)
@@ -259,13 +292,25 @@ impl Engine {
         options: RunOptions,
     ) -> Result<OutputManifest, EngineError> {
         let cancellation = options.cancellation.clone();
+        let journal_limits = JournalLimits::from(&contract.manifest.runtime);
         let event_sender = options.event_sender.clone();
         let result = self
-            .run_inner(contract, inputs, options, run_id, metadata_dir.clone())
+            .run_inner(
+                contract,
+                inputs,
+                options,
+                run_id.clone(),
+                metadata_dir.clone(),
+            )
             .await;
         if result.as_ref().is_err_and(|error| error.is_canceled()) {
-            let journal =
-                JournalWriter::create(&metadata_dir.join("journal.jsonl"), false, event_sender)?;
+            let journal = JournalWriter::create_with_limits(
+                &metadata_dir.join("journal.jsonl"),
+                run_id,
+                false,
+                event_sender,
+                journal_limits,
+            )?;
             if !matches!(
                 journal.state().terminal,
                 Some(crate::TerminalState::Canceled)
@@ -320,6 +365,7 @@ impl Engine {
         requested_run_id: String,
         metadata_dir: Utf8PathBuf,
     ) -> Result<OutputManifest, EngineError> {
+        let journal_limits = JournalLimits::from(&contract.manifest.runtime);
         let mut validation_registry = self.registry.clone();
         if let Some(provider) = options.llm_provider.as_deref() {
             validation_registry.reserve_secret_env_names(provider.credential_env_names());
@@ -336,10 +382,12 @@ impl Engine {
                 ))
             })?;
         std::fs::create_dir_all(&metadata_dir)?;
-        let journal = JournalWriter::create(
+        let journal = JournalWriter::create_with_limits(
             &metadata_dir.join("journal.jsonl"),
+            &requested_run_id,
             options.json_events,
             options.event_sender,
+            journal_limits,
         )?;
         let replay = JournalReplay::from_state(journal.state());
         let run_id = match &replay.state.run_id {
@@ -370,22 +418,24 @@ impl Engine {
                 &contract.manifest.runtime,
             )?
             .with_cancellation(options.cancellation.clone()),
-            secrets: SecretStore::from_env(&contract.manifest.secrets),
+            secrets: SecretStore::try_from_env(&contract.manifest.secrets)
+                .map_err(EngineError::Failed)?,
             interactive: options.interactive,
             answers: options.answers,
             confirmations: options.confirmations,
             llm_provider: options.llm_provider,
             llm_seed_override: options.llm_seed_override,
-            templates: TemplateService::default(),
+            templates: TemplateService,
             cancellation: options.cancellation.clone(),
             replayed_steps: Arc::new(replay.steps.clone()),
+            checkpoint_accounting: Arc::new(Mutex::new(CheckpointAccounting::default())),
             contract,
             workspace,
             metadata: metadata_dir.clone(),
         };
         let canonical_inputs = replay.state.inputs.clone().unwrap_or(inputs);
         let resource_hashes = collect_resource_hashes(&context).await?;
-        if replay.state.run_id.is_none() {
+        if !replay.state.execution_started {
             journal.event(
                 "run_started",
                 json!({
@@ -413,7 +463,11 @@ impl Engine {
 
         let materialized_inputs =
             materialize_file_inputs(&context.contract, &canonical_inputs, &context.workspace)?;
-        replay.verify_files(&context.workspace)?;
+        replay.verify_files(
+            &context.workspace,
+            &context.contract.manifest.runtime,
+            &context.checkpoint_accounting,
+        )?;
         verify_resource_pins(&replay.state, &resource_hashes)?;
 
         let mut vars = if replay.state.run_id.is_some() {
@@ -540,7 +594,13 @@ impl Engine {
                 }
                 match outcome {
                     StepOutcome::Success { output, files } => {
-                        let file_pins = pin_files(&context.workspace, &files)?;
+                        let file_pins = pin_files(
+                            &context.workspace,
+                            &context.metadata,
+                            &files,
+                            &context.contract.manifest.runtime,
+                            &context.checkpoint_accounting,
+                        )?;
                         let output_name = node.output.as_deref().unwrap_or(&node.id);
                         if let Some(output_name) = &node.output {
                             if let Some(value) = output.clone() {
@@ -552,8 +612,20 @@ impl Engine {
                         states.insert(id.clone(), NodeState::Success);
                         journal.event("step_finished", json!({ "node": id, "status": "success", "files": file_pins, "output": output, "output_name": output_name }))?;
                     }
-                    StepOutcome::CheckFailed { findings } => {
+                    StepOutcome::CheckFailed {
+                        findings,
+                        output,
+                        files,
+                    } => {
                         let reason = failure_from_findings(&findings, FailureCode::CheckFailed);
+                        let failure_file_pins = pin_files(
+                            &context.workspace,
+                            &context.metadata,
+                            &files,
+                            &context.contract.manifest.runtime,
+                            &context.checkpoint_accounting,
+                        )?;
+                        let failure_output = output.clone();
                         match &node.on_fail {
                             Some(OnFail::Repair { .. }) => {
                                 let env = ExecutionEnv {
@@ -578,7 +650,7 @@ impl Engine {
                                         states.insert(id.clone(), NodeState::Success);
                                         journal.event(
                                             "step_finished",
-                                            json!({ "node": id, "status": "repaired", "output": output, "output_name": node.id }),
+                                            json!({ "node": id, "status": "repaired", "output": output, "output_name": node.id, "failed_output": failure_output, "failed_files": failure_file_pins }),
                                         )?;
                                     }
                                     RepairCycleOutcome::Routed { to, output } => {
@@ -586,7 +658,15 @@ impl Engine {
                                         states.insert(id.clone(), NodeState::Success);
                                         journal.event(
                                             "step_finished",
-                                            json!({ "node": id, "status": "routed", "to": to, "output": output, "output_name": node.id }),
+                                            json!({ "node": id, "status": "routed", "to": to, "output": output, "output_name": node.id, "failed_output": failure_output, "failed_files": failure_file_pins }),
+                                        )?;
+                                    }
+                                    RepairCycleOutcome::Answered { output } => {
+                                        vars.set_step_output(&node.id, output.clone());
+                                        states.insert(id.clone(), NodeState::Success);
+                                        journal.event(
+                                            "step_finished",
+                                            json!({ "node": id, "status": "answered_on_fail", "output": output, "output_name": node.id, "failed_output": failure_output, "failed_files": failure_file_pins }),
                                         )?;
                                     }
                                     RepairCycleOutcome::Failed { reason } => {
@@ -600,7 +680,7 @@ impl Engine {
                                 }
                             }
                             Some(OnFail::Route { to }) => {
-                                let output = json!({ "routed_to": to, "findings": findings });
+                                let output = json!({ "routed_to": to, "findings": findings, "failed_output": failure_output, "failed_files": failure_file_pins });
                                 vars.set_step_output(&node.id, output.clone());
                                 states.insert(id.clone(), NodeState::Success);
                                 journal.event(
@@ -616,7 +696,7 @@ impl Engine {
                                     states.insert(id.clone(), NodeState::Success);
                                     journal.event(
                                         "step_finished",
-                                        json!({ "node": id, "status": "answered_on_fail", "answer": answer, "output": output, "output_name": node.id }),
+                                        json!({ "node": id, "status": "answered_on_fail", "answer": answer, "output": output, "output_name": node.id, "failed_output": failure_output, "failed_files": failure_file_pins }),
                                     )?;
                                 } else {
                                     let question = FormSpec {
@@ -625,20 +705,30 @@ impl Engine {
                                             "Resolve check failure for node `{}`",
                                             node.id
                                         ),
+                                        title_i18n: Default::default(),
                                         fields: vec![InputField {
                                             id: "answer".into(),
+                                            label: None,
+                                            label_i18n: Default::default(),
+                                            description: None,
+                                            description_i18n: Default::default(),
+                                            placeholder: None,
+                                            placeholder_i18n: Default::default(),
                                             kind: FieldType::String,
                                             required: true,
                                             default: None,
                                             pattern: None,
                                             options: vec![],
+                                            option_labels_i18n: Default::default(),
                                             min_items: None,
                                             item_type: None,
+                                            schema: None,
+                                            ui: Default::default(),
                                         }],
                                     };
                                     journal.event(
                                         "step_finished",
-                                        json!({ "node": id, "status": "needs_user", "question": question, "findings": findings }),
+                                        json!({ "node": id, "status": "needs_user", "question": question, "findings": findings, "failed_output": failure_output, "failed_files": failure_file_pins }),
                                     )?;
                                     return Err(EngineError::NeedsUser {
                                         question_id: question.id.clone(),
@@ -646,7 +736,10 @@ impl Engine {
                                     });
                                 }
                             }
-                            Some(OnFail::Regenerate { max_attempts }) => {
+                            Some(OnFail::Regenerate {
+                                max_attempts,
+                                on_exhausted,
+                            }) => {
                                 let env = ExecutionEnv {
                                     context: &context,
                                     journal: &journal,
@@ -663,7 +756,13 @@ impl Engine {
                                     .await?
                                 {
                                     StepOutcome::Success { output, files } => {
-                                        let file_pins = pin_files(&context.workspace, &files)?;
+                                        let file_pins = pin_files(
+                                            &context.workspace,
+                                            &context.metadata,
+                                            &files,
+                                            &context.contract.manifest.runtime,
+                                            &context.checkpoint_accounting,
+                                        )?;
                                         let output_name =
                                             node.output.as_deref().unwrap_or(&node.id);
                                         if let Some(output_name) = &node.output {
@@ -679,18 +778,67 @@ impl Engine {
                                             json!({ "node": id, "status": "regenerated", "files": file_pins, "output": output, "output_name": output_name }),
                                         )?;
                                     }
-                                    StepOutcome::CheckFailed { findings } => {
-                                        let reason = failure_from_findings(
-                                            &findings,
-                                            FailureCode::CheckFailed,
-                                        );
-                                        states
-                                            .insert(id.clone(), NodeState::Failed(reason.clone()));
-                                        journal.event(
-                                            "step_finished",
-                                            json!({ "node": id, "status": "regenerate_exhausted", "findings": findings, "reason": reason }),
-                                        )?;
-                                    }
+                                    StepOutcome::CheckFailed { findings, .. } => match on_exhausted
+                                    {
+                                        ExhaustedAction::Fail => {
+                                            let reason = failure_from_findings(
+                                                &findings,
+                                                FailureCode::CheckFailed,
+                                            );
+                                            states.insert(
+                                                id.clone(),
+                                                NodeState::Failed(reason.clone()),
+                                            );
+                                            journal.event(
+                                                    "step_finished",
+                                                    json!({ "node": id, "status": "regenerate_exhausted", "findings": findings, "reason": reason }),
+                                                )?;
+                                        }
+                                        ExhaustedAction::Route { to } => {
+                                            let output = json!({
+                                                "status": "regenerate_exhausted",
+                                                "routed_to": to,
+                                                "findings": findings,
+                                            });
+                                            vars.set_step_output(&node.id, output.clone());
+                                            states.insert(id.clone(), NodeState::Success);
+                                            journal.event(
+                                                    "step_finished",
+                                                    json!({ "node": id, "status": "routed", "to": to, "output": output, "output_name": node.id }),
+                                                )?;
+                                        }
+                                        ExhaustedAction::AskUser { title, fields } => {
+                                            let question = exhausted_question(
+                                                node,
+                                                "regenerate",
+                                                title.as_deref(),
+                                                fields,
+                                            );
+                                            if let Some(answer) = context.answers.get(&question.id)
+                                            {
+                                                let output = json!({
+                                                    "status": "regenerate_exhausted_answered",
+                                                    "answer": answer,
+                                                    "findings": findings,
+                                                });
+                                                vars.set_step_output(&node.id, output.clone());
+                                                states.insert(id.clone(), NodeState::Success);
+                                                journal.event(
+                                                        "step_finished",
+                                                        json!({ "node": id, "status": "answered_on_fail", "answer": answer, "output": output, "output_name": node.id }),
+                                                    )?;
+                                            } else {
+                                                journal.event(
+                                                        "step_finished",
+                                                        json!({ "node": id, "status": "needs_user", "question": question, "findings": findings }),
+                                                    )?;
+                                                return Err(EngineError::NeedsUser {
+                                                    question_id: question.id.clone(),
+                                                    question: Box::new(question),
+                                                });
+                                            }
+                                        }
+                                    },
                                     StepOutcome::NeedsUser { question } => {
                                         journal.event(
                                             "step_finished",
@@ -717,7 +865,7 @@ impl Engine {
                                 states.insert(id.clone(), NodeState::Failed(reason.clone()));
                                 journal.event(
                                     "step_finished",
-                                    json!({ "node": id, "status": "check_failed", "findings": findings, "reason": reason }),
+                                json!({ "node": id, "status": "check_failed", "findings": findings, "reason": reason, "output": failure_output, "files": failure_file_pins }),
                                 )?;
                             }
                         }
@@ -784,7 +932,11 @@ impl Engine {
             &vars,
             &context.templates,
         )?;
-        write_output_manifest(&metadata_dir, &outputs)?;
+        write_output_manifest_with_limits(
+            &metadata_dir,
+            &outputs,
+            &context.contract.manifest.runtime,
+        )?;
         for artifact in &outputs.artifacts {
             journal.event("artifact", artifact)?;
         }
@@ -892,7 +1044,13 @@ impl Engine {
             };
             match outcome {
                 StepOutcome::Success { output, files } => {
-                    let file_pins = pin_files(&context.workspace, &files)?;
+                    let file_pins = pin_files(
+                        &context.workspace,
+                        &context.metadata,
+                        &files,
+                        &context.contract.manifest.runtime,
+                        &context.checkpoint_accounting,
+                    )?;
                     let output_name = node.output.as_deref().unwrap_or(&node.id);
                     if let Some(output_name) = &node.output {
                         if let Some(value) = output.clone() {
@@ -907,12 +1065,23 @@ impl Engine {
                         json!({ "node": node.id, "status": "success", "files": file_pins, "output": output, "output_name": output_name, "parallel": true }),
                     )?;
                 }
-                StepOutcome::CheckFailed { findings } => {
+                StepOutcome::CheckFailed {
+                    findings,
+                    output,
+                    files,
+                } => {
                     let reason = failure_from_findings(&findings, FailureCode::CheckFailed);
+                    let file_pins = pin_files(
+                        &context.workspace,
+                        &context.metadata,
+                        &files,
+                        &context.contract.manifest.runtime,
+                        &context.checkpoint_accounting,
+                    )?;
                     states.insert(node.id.clone(), NodeState::Failed(reason.clone()));
                     journal.event(
                         "step_finished",
-                        json!({ "node": node.id, "status": "check_failed", "findings": findings, "reason": reason, "parallel": true }),
+                        json!({ "node": node.id, "status": "check_failed", "findings": findings, "reason": reason, "output": output, "files": file_pins, "parallel": true }),
                     )?;
                 }
                 StepOutcome::NeedsUser { question } => {
@@ -944,20 +1113,24 @@ impl Engine {
         terminal_error.map_or(Ok(()), Err)
     }
 
-    async fn execute_node_after_budget(
-        &self,
-        context: &RunContext,
-        journal: &JournalWriter,
-        vars: &mut ValueBag,
-        budget: &mut BudgetTracker,
-        node: &NodeDef,
-    ) -> Result<StepOutcome, EngineError> {
-        if self.is_foreach_node(node) {
-            return self
-                .execute_foreach(context, journal, vars, budget, node)
-                .await;
-        }
-        self.execute_plain_node(context, journal, vars, node).await
+    fn execute_node_after_budget<'a>(
+        &'a self,
+        context: &'a RunContext,
+        journal: &'a JournalWriter,
+        vars: &'a mut ValueBag,
+        budget: &'a mut BudgetTracker,
+        node: &'a NodeDef,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<StepOutcome, EngineError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            if self.is_foreach_node(node) {
+                return self
+                    .execute_foreach(context, journal, vars, budget, node)
+                    .await;
+            }
+            self.execute_plain_node(context, journal, vars, node).await
+        })
     }
 
     async fn execute_node(
@@ -980,9 +1153,6 @@ impl Engine {
         vars: &mut ValueBag,
         node: &NodeDef,
     ) -> Result<StepOutcome, EngineError> {
-        if self.is_foreach_node(node) {
-            return Err(StepError::failed(&node.id, "nested foreach is not supported yet").into());
-        }
         let executor = self
             .registry
             .get(&node.kind)
@@ -998,12 +1168,7 @@ impl Engine {
                     journal,
                     context.cancellation.clone(),
                     &context.contract.manifest.budget,
-                    context
-                        .contract
-                        .manifest
-                        .llm
-                        .as_ref()
-                        .and_then(|llm| llm.model.as_ref()),
+                    context.contract.manifest.llm.as_ref(),
                 )
             }),
         };
@@ -1028,17 +1193,19 @@ impl Engine {
         if params.subflow.trim().is_empty() {
             return Err(StepError::failed(&node.id, "foreach subflow is required").into());
         }
-        if params.max_iterations == 0 {
+        if !(1..=MAX_FOREACH_ITERATIONS).contains(&params.max_iterations) {
             return Err(StepError::failed(
                 &node.id,
-                "foreach max_iterations must be greater than zero",
+                format!("foreach max_iterations must be from 1 through {MAX_FOREACH_ITERATIONS}"),
             )
             .into());
         }
-        if params.parallel == 0 {
-            return Err(
-                StepError::failed(&node.id, "foreach parallel must be greater than zero").into(),
-            );
+        if !(1..=MAX_FOREACH_PARALLELISM).contains(&params.parallel) {
+            return Err(StepError::failed(
+                &node.id,
+                format!("foreach parallel must be from 1 through {MAX_FOREACH_PARALLELISM}"),
+            )
+            .into());
         }
         let items_ref = params.items.as_str();
         let items_value = vars.get_path(items_ref).ok_or_else(|| {
@@ -1089,12 +1256,20 @@ impl Engine {
             for (index, item) in items.into_iter().enumerate() {
                 let (iteration_files, outcome) = self
                     .execute_foreach_iteration(
-                        context, journal, vars, budget, node, block, index, item,
+                        context,
+                        journal,
+                        vars,
+                        budget,
+                        ForeachIteration {
+                            node,
+                            block,
+                            index,
+                            item,
+                        },
                     )
                     .await?;
                 files.extend(iteration_files);
                 if let Some(outcome) = outcome {
-                    vars.set_item(None);
                     return Ok(outcome);
                 }
             }
@@ -1102,48 +1277,46 @@ impl Engine {
             let context = Arc::new(context.clone());
             let journal = Arc::new(journal.clone_for_parallel()?);
             let block = Arc::new(block.clone());
-            let permits = Arc::new(tokio::sync::Semaphore::new(params.parallel));
             let mut tasks = JoinSet::new();
-            for (index, item) in items.into_iter().enumerate() {
-                let engine = self.clone();
-                let context = Arc::clone(&context);
-                let journal = Arc::clone(&journal);
-                let block = Arc::clone(&block);
-                let permits = Arc::clone(&permits);
-                let mut iteration_vars = vars.clone();
-                let mut iteration_budget = budget.clone();
-                let foreach_node = node.clone();
-                tasks.spawn(async move {
-                    let _permit = permits.acquire_owned().await.map_err(|_| {
-                        EngineError::Step(StepError::failed(
-                            &foreach_node.id,
-                            "foreach parallel semaphore was closed",
-                        ))
-                    })?;
-                    let outcome = engine
-                        .execute_foreach_iteration(
-                            &context,
-                            &journal,
-                            &mut iteration_vars,
-                            &mut iteration_budget,
-                            &foreach_node,
-                            &block,
-                            index,
-                            item,
-                        )
-                        .await;
-                    Ok::<_, EngineError>((index, outcome))
-                });
-            }
+            let mut pending = items.into_iter().enumerate();
             let mut outcomes = BTreeMap::new();
             let mut task_error = None;
-            while let Some(result) = tasks.join_next().await {
+            loop {
+                while tasks.len() < params.parallel {
+                    let Some((index, item)) = pending.next() else {
+                        break;
+                    };
+                    let engine = self.clone();
+                    let context = Arc::clone(&context);
+                    let journal = Arc::clone(&journal);
+                    let block = Arc::clone(&block);
+                    let mut iteration_vars = vars.clone();
+                    let mut iteration_budget = budget.clone();
+                    let foreach_node = node.clone();
+                    tasks.spawn(async move {
+                        let outcome = engine
+                            .execute_foreach_iteration(
+                                &context,
+                                &journal,
+                                &mut iteration_vars,
+                                &mut iteration_budget,
+                                ForeachIteration {
+                                    node: &foreach_node,
+                                    block: &block,
+                                    index,
+                                    item,
+                                },
+                            )
+                            .await;
+                        (index, outcome)
+                    });
+                }
+                let Some(result) = tasks.join_next().await else {
+                    break;
+                };
                 match result {
-                    Ok(Ok((index, outcome))) => {
+                    Ok((index, outcome)) => {
                         outcomes.insert(index, outcome);
-                    }
-                    Ok(Err(error)) => {
-                        task_error.get_or_insert(error);
                     }
                     Err(error) => {
                         task_error.get_or_insert_with(|| {
@@ -1166,7 +1339,7 @@ impl Engine {
                 }
             }
         }
-        vars.set_item(None);
+        let files = existing_regular_files(files)?;
         Ok(StepOutcome::Success {
             output: Some(json!({
                 "iterations": item_count,
@@ -1177,20 +1350,23 @@ impl Engine {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn execute_foreach_iteration(
         &self,
         context: &RunContext,
         journal: &JournalWriter,
         vars: &mut ValueBag,
         budget: &mut BudgetTracker,
-        node: &NodeDef,
-        block: &[NodeDef],
-        index: usize,
-        item: Value,
+        iteration: ForeachIteration<'_>,
     ) -> Result<(Vec<Utf8PathBuf>, Option<StepOutcome>), EngineError> {
+        let ForeachIteration {
+            node,
+            block,
+            index,
+            item,
+        } = iteration;
         let mut files = Vec::new();
         context.checkpoint()?;
+        let parent_item = vars.item().cloned();
         vars.set_item(Some(item));
         journal.event(
             "foreach_iteration",
@@ -1239,14 +1415,20 @@ impl Engine {
             )?;
             budget.consume(&block_id)?;
             match self
-                .execute_plain_node(context, journal, vars, &addressed_node)
+                .execute_node_after_budget(context, journal, vars, budget, &addressed_node)
                 .await?
             {
                 StepOutcome::Success {
                     output,
                     files: block_files,
                 } => {
-                    let file_pins = pin_files(&context.workspace, &block_files)?;
+                    let file_pins = pin_files(
+                        &context.workspace,
+                        &context.metadata,
+                        &block_files,
+                        &context.contract.manifest.runtime,
+                        &context.checkpoint_accounting,
+                    )?;
                     if let Some(value) = output.clone() {
                         vars.set_step_output(&block_id, value);
                     }
@@ -1256,17 +1438,34 @@ impl Engine {
                         json!({ "node": block_id, "status": "success", "output": output, "output_name": block_id, "files": file_pins }),
                     )?;
                 }
-                StepOutcome::CheckFailed { findings } => {
-                    return Ok((files, Some(StepOutcome::CheckFailed { findings })));
+                StepOutcome::CheckFailed {
+                    findings,
+                    output,
+                    files: failed_files,
+                } => {
+                    vars.set_item(parent_item);
+                    let mut all_files = files;
+                    all_files.extend(failed_files);
+                    return Ok((
+                        all_files,
+                        Some(StepOutcome::CheckFailed {
+                            findings,
+                            output,
+                            files: vec![],
+                        }),
+                    ));
                 }
                 StepOutcome::NeedsUser { question } => {
+                    vars.set_item(parent_item);
                     return Ok((files, Some(StepOutcome::NeedsUser { question })));
                 }
                 StepOutcome::NeedsConfirm { confirm } => {
+                    vars.set_item(parent_item);
                     return Ok((files, Some(StepOutcome::NeedsConfirm { confirm })));
                 }
             }
         }
+        vars.set_item(parent_item);
         Ok((files, None))
     }
 
@@ -1369,7 +1568,7 @@ impl Engine {
                         })),
                     });
                 }
-                StepOutcome::CheckFailed { findings } => {
+                StepOutcome::CheckFailed { findings, .. } => {
                     last_reason = failure_from_findings(&findings, FailureCode::CheckFailed);
                     vars.set_step_output(
                         failed_node.id.as_str(),
@@ -1402,8 +1601,8 @@ impl Engine {
                 }
             }
         }
-        match on_exhausted.as_ref() {
-            Some(RepairExhausted::Route { to }) => {
+        match on_exhausted {
+            ExhaustedAction::Route { to } => {
                 states.insert(
                     repair.clone(),
                     NodeState::Skipped("repair cycle exhausted".into()),
@@ -1422,7 +1621,33 @@ impl Engine {
                     }),
                 })
             }
-            Some(RepairExhausted::Fail) | None => {
+            ExhaustedAction::AskUser { title, fields } => {
+                states.insert(
+                    repair.clone(),
+                    NodeState::Skipped("repair cycle exhausted".into()),
+                );
+                states.insert(
+                    recheck.clone(),
+                    NodeState::Skipped("repair cycle exhausted".into()),
+                );
+                let question = exhausted_question(failed_node, "repair", title.as_deref(), fields);
+                if let Some(answer) = env.context.answers.get(&question.id) {
+                    Ok(RepairCycleOutcome::Answered {
+                        output: json!({
+                            "status": "repair_exhausted_answered",
+                            "attempts": max_attempts,
+                            "answer": answer,
+                            "reason": last_reason,
+                        }),
+                    })
+                } else {
+                    Err(EngineError::NeedsUser {
+                        question_id: question.id.clone(),
+                        question: Box::new(question),
+                    })
+                }
+            }
+            ExhaustedAction::Fail => {
                 states.insert(
                     repair.clone(),
                     NodeState::Skipped("repair cycle exhausted".into()),
@@ -1455,6 +1680,8 @@ impl Engine {
         if max_attempts == 0 {
             return Ok(StepOutcome::CheckFailed {
                 findings: initial_findings,
+                output: None,
+                files: vec![],
             });
         }
         let mut last_findings = initial_findings;
@@ -1471,7 +1698,7 @@ impl Engine {
                 .execute_node(env.context, env.journal, vars, budget, node)
                 .await?
             {
-                StepOutcome::CheckFailed { findings } => {
+                StepOutcome::CheckFailed { findings, .. } => {
                     vars.set_step_output(
                         node.id.as_str(),
                         json!({ "status": "check_failed", "findings": findings }),
@@ -1495,6 +1722,8 @@ impl Engine {
         }
         Ok(StepOutcome::CheckFailed {
             findings: last_findings,
+            output: None,
+            files: vec![],
         })
     }
 
@@ -1548,7 +1777,13 @@ impl Engine {
             .await?;
         match &outcome {
             StepOutcome::Success { output, files } => {
-                let file_pins = pin_files(&env.context.workspace, files)?;
+                let file_pins = pin_files(
+                    &env.context.workspace,
+                    &env.context.metadata,
+                    files,
+                    &env.context.contract.manifest.runtime,
+                    &env.context.checkpoint_accounting,
+                )?;
                 let output_name = node.output.as_deref().unwrap_or(&node.id);
                 if let Some(output_name) = &node.output {
                     if let Some(value) = output.clone() {
@@ -1565,12 +1800,23 @@ impl Engine {
                     json!({ "node": node.id, "status": "success", "files": file_pins, "output": output, "output_name": output_name }),
                 )?;
             }
-            StepOutcome::CheckFailed { findings } => {
+            StepOutcome::CheckFailed {
+                findings,
+                output,
+                files,
+            } => {
                 let reason = failure_from_findings(findings, FailureCode::CheckFailed);
+                let file_pins = pin_files(
+                    &env.context.workspace,
+                    &env.context.metadata,
+                    files,
+                    &env.context.contract.manifest.runtime,
+                    &env.context.checkpoint_accounting,
+                )?;
                 states.insert(graph_node_id.clone(), NodeState::Failed(reason.clone()));
                 env.journal.event(
                     "step_finished",
-                    json!({ "node": node.id, "status": "check_failed", "findings": findings, "reason": reason }),
+                    json!({ "node": node.id, "status": "check_failed", "findings": findings, "reason": reason, "output": output, "files": file_pins }),
                 )?;
             }
             StepOutcome::NeedsUser { question } => {
@@ -1688,7 +1934,49 @@ impl RunContext {
 enum RepairCycleOutcome {
     Repaired { output: Option<Value> },
     Routed { to: String, output: Value },
+    Answered { output: Value },
     Failed { reason: FailureDetail },
+}
+
+fn exhausted_question(
+    node: &NodeDef,
+    phase: &str,
+    title: Option<&str>,
+    fields: &[InputField],
+) -> FormSpec {
+    let fields = if fields.is_empty() {
+        vec![InputField {
+            id: "answer".into(),
+            label: Some("Resolution".into()),
+            label_i18n: Default::default(),
+            description: Some(format!(
+                "Provide the resolution after {phase} attempts were exhausted"
+            )),
+            description_i18n: Default::default(),
+            placeholder: None,
+            placeholder_i18n: Default::default(),
+            kind: FieldType::Text,
+            required: true,
+            default: None,
+            pattern: None,
+            options: Vec::new(),
+            option_labels_i18n: Default::default(),
+            min_items: None,
+            item_type: None,
+            schema: None,
+            ui: Default::default(),
+        }]
+    } else {
+        fields.to_vec()
+    };
+    FormSpec {
+        id: format!("{}:{phase}_exhausted", node.id),
+        title: title
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("Resolve exhausted {phase} for node `{}`", node.id)),
+        title_i18n: Default::default(),
+        fields,
+    }
 }
 
 fn failure_from_findings(findings: &[Finding], code: FailureCode) -> FailureDetail {
@@ -1717,9 +2005,88 @@ fn default_metadata_dir(workspace: &camino::Utf8Path, run_id: &str) -> Utf8PathB
         .join("meta")
 }
 
+#[derive(Default)]
+struct CheckpointAccounting {
+    bytes_by_path: BTreeMap<String, u64>,
+    total_bytes: u64,
+}
+
+impl CheckpointAccounting {
+    fn record(
+        &mut self,
+        path: &camino::Utf8Path,
+        bytes: u64,
+        limits: &RuntimeLimits,
+    ) -> Result<Option<u64>, EngineError> {
+        let file_limit = u64::try_from(limits.output_file_limit_bytes).map_err(|_| {
+            EngineError::Failed("runtime.output_file_limit_bytes does not fit in u64".into())
+        })?;
+        let total_limit = u64::try_from(limits.output_total_limit_bytes).map_err(|_| {
+            EngineError::Failed("runtime.output_total_limit_bytes does not fit in u64".into())
+        })?;
+        if file_limit == 0 || total_limit == 0 || limits.output_artifact_limit == 0 {
+            return Err(EngineError::Failed(
+                "runtime output limits must be greater than zero".into(),
+            ));
+        }
+        if bytes > file_limit {
+            return Err(EngineError::Failed(format!(
+                "output file `{path}` exceeds {file_limit} bytes"
+            )));
+        }
+        let key = path.as_str().to_owned();
+        let previous = self.bytes_by_path.get(&key).copied();
+        let next_count = self
+            .bytes_by_path
+            .len()
+            .checked_add(if previous.is_some() { 0 } else { 1 })
+            .ok_or_else(|| EngineError::Failed("output artifact count overflowed".into()))?;
+        if next_count > limits.output_artifact_limit {
+            return Err(EngineError::Failed(format!(
+                "output artifact count exceeds {}",
+                limits.output_artifact_limit
+            )));
+        }
+        let total_without_previous = self
+            .total_bytes
+            .checked_sub(previous.unwrap_or(0))
+            .ok_or_else(|| EngineError::Failed("output byte accounting underflowed".into()))?;
+        let next_total = total_without_previous
+            .checked_add(bytes)
+            .ok_or_else(|| EngineError::Failed("output byte accounting overflowed".into()))?;
+        if next_total > total_limit {
+            return Err(EngineError::Failed(format!(
+                "output bytes exceed {total_limit}"
+            )));
+        }
+        self.total_bytes = next_total;
+        self.bytes_by_path.insert(key, bytes);
+        Ok(previous)
+    }
+
+    fn rollback(&mut self, path: &camino::Utf8Path, bytes: u64, previous: Option<u64>) {
+        let key = path.as_str();
+        self.total_bytes = self
+            .total_bytes
+            .saturating_sub(bytes)
+            .saturating_add(previous.unwrap_or(0));
+        match previous {
+            Some(previous) => {
+                self.bytes_by_path.insert(key.to_owned(), previous);
+            }
+            None => {
+                self.bytes_by_path.remove(key);
+            }
+        }
+    }
+}
+
 fn pin_files(
     workspace: &camino::Utf8Path,
+    metadata: &camino::Utf8Path,
     files: &[Utf8PathBuf],
+    limits: &RuntimeLimits,
+    accounting: &Arc<Mutex<CheckpointAccounting>>,
 ) -> Result<Vec<FilePin>, EngineError> {
     let canonical_workspace = dunce::canonicalize(workspace)?;
     let canonical_workspace = Utf8PathBuf::from_path_buf(canonical_workspace).map_err(|path| {
@@ -1757,13 +2124,194 @@ fn pin_files(
                     "step output `{relative}` escapes the workspace"
                 )));
             }
-            let bytes = std::fs::read(workspace.join(relative))?;
+            let source = workspace.join(relative);
+            let digest = hash_file(&source, limits.output_file_limit_bytes)?;
+            let previous = {
+                let mut accounting = accounting.lock().map_err(|_| {
+                    EngineError::Failed("checkpoint accounting mutex was poisoned".into())
+                })?;
+                accounting.record(relative, digest.bytes, limits)?
+            };
+            if let Err(error) = persist_checkpoint_blob(
+                metadata,
+                &digest.sha256,
+                &source,
+                limits.output_file_limit_bytes,
+            ) {
+                let mut accounting = accounting.lock().map_err(|_| {
+                    EngineError::Failed("checkpoint accounting mutex was poisoned".into())
+                })?;
+                accounting.rollback(relative, digest.bytes, previous);
+                return Err(error);
+            }
             Ok(FilePin {
                 path: relative.to_path_buf(),
-                sha256: hex::encode(Sha256::digest(&bytes)),
+                sha256: digest.sha256,
             })
         })
         .collect()
+}
+
+fn existing_regular_files(files: Vec<Utf8PathBuf>) -> Result<Vec<Utf8PathBuf>, EngineError> {
+    let mut existing = Vec::with_capacity(files.len());
+    for path in files {
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => existing.push(path),
+            Ok(_) => {
+                return Err(EngineError::Failed(format!(
+                    "step output `{path}` is not a regular file"
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(existing)
+}
+
+fn persist_checkpoint_blob(
+    metadata: &camino::Utf8Path,
+    sha256: &str,
+    source: &camino::Utf8Path,
+    file_limit: usize,
+) -> Result<(), EngineError> {
+    let blobs = metadata.join("checkpoint-blobs");
+    std::fs::create_dir_all(&blobs)?;
+    let destination = blobs.join(sha256);
+    if destination.exists() {
+        if hash_file(&destination, file_limit)?.sha256 != sha256 {
+            return Err(EngineError::Failed(format!(
+                "checkpoint blob `{sha256}` does not match its content digest"
+            )));
+        }
+        return Ok(());
+    }
+    let temporary = blobs.join(format!(".{sha256}.tmp-{}", Uuid::now_v7()));
+    let copy_result = (|| -> Result<(), std::io::Error> {
+        let mut input = std::fs::File::open(source)?;
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        {
+            let mut writer = LimitedFileWriter {
+                file: &mut file,
+                bytes: 0,
+                limit: u64::try_from(file_limit)
+                    .map_err(|_| std::io::Error::other("output file limit does not fit in u64"))?,
+            };
+            std::io::copy(&mut input, &mut writer)?;
+        }
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = copy_result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    match std::fs::rename(&temporary, &destination) {
+        Ok(()) => Ok(()),
+        Err(_error) if destination.exists() => {
+            let _ = std::fs::remove_file(&temporary);
+            if hash_file(&destination, file_limit)?.sha256 == sha256 {
+                Ok(())
+            } else {
+                Err(EngineError::Failed(format!(
+                    "checkpoint blob `{sha256}` was replaced with invalid content"
+                )))
+            }
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            Err(error.into())
+        }
+    }
+}
+
+struct FileDigest {
+    sha256: String,
+    bytes: u64,
+}
+
+fn hash_file(path: &camino::Utf8Path, file_limit: usize) -> Result<FileDigest, std::io::Error> {
+    let mut file = std::fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let bytes = {
+        let mut writer = Sha256Writer {
+            digest: &mut digest,
+            bytes: 0,
+            limit: u64::try_from(file_limit)
+                .map_err(|_| std::io::Error::other("output file limit does not fit in u64"))?,
+        };
+        std::io::copy(&mut file, &mut writer)?;
+        writer.bytes
+    };
+    Ok(FileDigest {
+        sha256: hex::encode(digest.finalize()),
+        bytes,
+    })
+}
+
+struct Sha256Writer<'a> {
+    digest: &'a mut Sha256,
+    bytes: u64,
+    limit: u64,
+}
+
+impl std::io::Write for Sha256Writer<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let next = self
+            .bytes
+            .checked_add(
+                u64::try_from(bytes.len())
+                    .map_err(|_| std::io::Error::other("output byte count does not fit in u64"))?,
+            )
+            .ok_or_else(|| std::io::Error::other("output byte count overflowed"))?;
+        let limit = self.limit;
+        if next > limit {
+            return Err(std::io::Error::other(format!(
+                "output file exceeds {limit} bytes"
+            )));
+        }
+        self.digest.update(bytes);
+        self.bytes = next;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct LimitedFileWriter<'a> {
+    file: &'a mut std::fs::File,
+    bytes: u64,
+    limit: u64,
+}
+
+impl std::io::Write for LimitedFileWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let next = self
+            .bytes
+            .checked_add(
+                u64::try_from(bytes.len())
+                    .map_err(|_| std::io::Error::other("output byte count does not fit in u64"))?,
+            )
+            .ok_or_else(|| std::io::Error::other("output byte count overflowed"))?;
+        if next > self.limit {
+            return Err(std::io::Error::other(format!(
+                "output file exceeds {} bytes",
+                self.limit
+            )));
+        }
+        self.file.write_all(bytes)?;
+        self.bytes = next;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
 }
 
 fn verify_resource_pins(
@@ -1825,18 +2373,29 @@ impl JournalReplay {
         Self { steps, state }
     }
 
-    fn verify_files(&self, workspace: &camino::Utf8Path) -> Result<(), EngineError> {
+    fn verify_files(
+        &self,
+        workspace: &camino::Utf8Path,
+        limits: &RuntimeLimits,
+        accounting: &Arc<Mutex<CheckpointAccounting>>,
+    ) -> Result<(), EngineError> {
         for (path, step) in &self.steps {
-            step.verify_files(workspace).map_err(|message| {
-                EngineError::Failed(format!("cannot safely resume node `{path}`: {message}"))
-            })?;
+            step.verify_files(workspace, limits, accounting)
+                .map_err(|message| {
+                    EngineError::Failed(format!("cannot safely resume node `{path}`: {message}"))
+                })?;
         }
         Ok(())
     }
 }
 
 impl ReplayedStep {
-    fn verify_files(&self, workspace: &camino::Utf8Path) -> Result<(), String> {
+    fn verify_files(
+        &self,
+        workspace: &camino::Utf8Path,
+        limits: &RuntimeLimits,
+        accounting: &Arc<Mutex<CheckpointAccounting>>,
+    ) -> Result<(), String> {
         for pin in &self.files {
             if pin.path.is_absolute() {
                 return Err(format!(
@@ -1845,15 +2404,20 @@ impl ReplayedStep {
                 ));
             }
             let candidate = workspace.join(&pin.path);
-            let bytes = std::fs::read(&candidate)
+            let digest = hash_file(&candidate, limits.output_file_limit_bytes)
                 .map_err(|error| format!("output `{}` is unavailable: {error}", pin.path))?;
-            let digest = hex::encode(Sha256::digest(&bytes));
-            if digest != pin.sha256 {
+            if digest.sha256 != pin.sha256 {
                 return Err(format!(
-                    "output `{}` digest changed: expected {}, got {digest}",
-                    pin.path, pin.sha256
+                    "output `{}` digest changed: expected {}, got {}",
+                    pin.path, pin.sha256, digest.sha256
                 ));
             }
+            let mut accounting = accounting
+                .lock()
+                .map_err(|_| "checkpoint accounting mutex was poisoned".to_owned())?;
+            accounting
+                .record(&pin.path, digest.bytes, limits)
+                .map_err(|error| error.to_string())?;
         }
         Ok(())
     }
@@ -1923,6 +2487,28 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_accounting_enforces_output_bounds() {
+        let limits = RuntimeLimits {
+            output_file_limit_bytes: 4,
+            output_total_limit_bytes: 5,
+            output_artifact_limit: 2,
+            ..RuntimeLimits::default()
+        };
+        let mut accounting = CheckpointAccounting::default();
+        accounting
+            .record(camino::Utf8Path::new("one.txt"), 4, &limits)
+            .expect("first output should fit");
+        let error = accounting
+            .record(camino::Utf8Path::new("two.txt"), 2, &limits)
+            .expect_err("total output limit should be enforced");
+        assert!(error.to_string().contains("output bytes exceed 5"));
+        let error = accounting
+            .record(camino::Utf8Path::new("too-large"), 5, &limits)
+            .expect_err("per-file output limit should be enforced");
+        assert!(error.to_string().contains("exceeds 4 bytes"));
+    }
+
+    #[test]
     fn generator_cannot_claim_llm_provider_credential_environment() {
         let provider = qcg_llm::LlmRouter::parse_text(
             r#"
@@ -1938,7 +2524,8 @@ api_key_env = "QCG_SECURE_API_KEY"
         manifest.secrets.insert(
             "stolen_provider_key".into(),
             SecretRef {
-                env: "QCG_SECURE_API_KEY".into(),
+                env: Some("QCG_SECURE_API_KEY".into()),
+                file_env: None,
             },
         );
         let contract = Contract {
@@ -1953,11 +2540,7 @@ api_key_env = "QCG_SECURE_API_KEY"
         let error = registry
             .validate_contract(&contract)
             .expect_err("provider credentials must remain unavailable to generator secrets");
-        assert!(
-            error
-                .to_string()
-                .contains("reserved LLM provider credential")
-        );
+        assert!(error.to_string().contains("reserved provider credential"));
         assert!(error.to_string().contains("QCG_SECURE_API_KEY"));
     }
 
@@ -2059,7 +2642,7 @@ api_key_env = "QCG_SECURE_API_KEY"
         ]);
         let run_dir = temp_run_dir("when-skip-propagates");
         let result = run_manifest(manifest, run_dir.clone(), 1).await;
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "skip propagation failed: {result:?}");
         let events = journal_events(&run_dir);
         assert!(has_event(&events, "step_skipped", "skipped"));
         assert!(has_event(&events, "step_skipped", "dependent"));
@@ -2072,7 +2655,7 @@ api_key_env = "QCG_SECURE_API_KEY"
             repair: "repair".into(),
             recheck: "recheck".into(),
             max_attempts: 1,
-            on_exhausted: None,
+            on_exhausted: ExhaustedAction::Fail,
         });
         let manifest = manifest(vec![
             broken,
@@ -2081,7 +2664,7 @@ api_key_env = "QCG_SECURE_API_KEY"
         ]);
         let run_dir = temp_run_dir("repair-cycle-repaired");
         let result = run_manifest(manifest, run_dir.clone(), 1).await;
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "repair cycle failed: {result:?}");
         let events = journal_events(&run_dir);
         assert!(has_status(&events, "step_finished", "broken", "repaired"));
         assert!(has_event(&events, "repair_attempt_started", "broken"));
@@ -2091,6 +2674,58 @@ api_key_env = "QCG_SECURE_API_KEY"
             "broken",
             "repaired"
         ));
+    }
+
+    #[tokio::test]
+    async fn repair_exhaustion_returns_the_declared_typed_form() {
+        let mut broken = node("broken", "test.check_fail");
+        broken.on_fail = Some(OnFail::Repair {
+            repair: "repair".into(),
+            recheck: "recheck".into(),
+            max_attempts: 1,
+            on_exhausted: ExhaustedAction::AskUser {
+                title: Some("Choose a recovery".into()),
+                fields: vec![InputField {
+                    id: "decision".into(),
+                    label: Some("Decision".into()),
+                    label_i18n: Default::default(),
+                    description: Some("Select the recovery action".into()),
+                    description_i18n: Default::default(),
+                    placeholder: None,
+                    placeholder_i18n: Default::default(),
+                    kind: FieldType::Select,
+                    required: true,
+                    default: None,
+                    pattern: None,
+                    options: vec!["retry".into(), "stop".into()],
+                    option_labels_i18n: Default::default(),
+                    min_items: None,
+                    item_type: None,
+                    schema: None,
+                    ui: Default::default(),
+                }],
+            },
+        });
+        let manifest = manifest(vec![
+            broken,
+            node("repair", "test.pass"),
+            node("recheck", "test.check_fail"),
+        ]);
+        let run_dir = temp_run_dir("repair-exhausted-ask-user");
+        let error = run_manifest(manifest, run_dir, 1)
+            .await
+            .expect_err("repair exhaustion should pause for the declared form");
+        let EngineError::NeedsUser {
+            question_id,
+            question,
+        } = error
+        else {
+            panic!("unexpected error: {error}");
+        };
+        assert_eq!(question_id, "broken:repair_exhausted");
+        assert_eq!(question.title, "Choose a recovery");
+        assert_eq!(question.fields[0].id, "decision");
+        assert_eq!(question.fields[0].options, ["retry", "stop"]);
     }
 
     #[tokio::test]
@@ -2386,6 +3021,8 @@ api_key_env = "QCG_SECURE_API_KEY"
                     location: None,
                     raw_output: None,
                 }],
+                output: None,
+                files: vec![],
             })
         }
     }

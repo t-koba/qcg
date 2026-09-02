@@ -1,4 +1,4 @@
-# qcg LLM provider registry.
+# qcg provider registry.
 #
 # Each [[provider]] row declares how to reach one LLM endpoint. Contracts
 # reference these rows by `id` through `[llm].model` in `qcg.toml`:
@@ -9,7 +9,7 @@
 # Remote providers below ship commented out. Enable one by deleting the
 # leading "# " from its block; the URLs are fixed constants, so uncommenting
 # is the only edit needed before setting the credential variable. Rows with
-# variable endpoints (azure-openai, cloudflare) resolve placeholders such as
+# variable endpoints (Azure OpenAI, Cloudflare) resolve placeholders such as
 # {QCG_AZURE_OPENAI_API_VERSION} or {QCG_CLOUDFLARE_ACCOUNT_ID} from the
 # environment and fail validation while they stay unresolved.
 #
@@ -17,14 +17,27 @@
 # only connect when a run reaches them. Ollama and LM Studio need no credential;
 # openai_compat reads the explicitly named credential variable below.
 #
-# The `fake` provider is built into the qcg binary for tests and demos.
+# The `fake` provider is built into the qcg binary for deterministic tests. The
+# bundled authoring demo asks for a configured real model before LLM work.
 #
-# When a contract omits `[llm].model`, the row declared in `[default]` is
-# used. A run fails when neither is declared. No default ships enabled so
-# that contracts always state their model explicitly:
+# When a contract omits `[llm].model`, the model declared in `[default]` is
+# used. No LLM default ships enabled, so contracts state their model explicitly.
+# Search and MCP tools are opt-in at the contract level. Generator execution
+# calls no such endpoint unless a contract declares the corresponding tool and
+# grants its hosts or command. Anonymous Exa and Parallel MCP profiles ship as
+# the default public research choices; they need no credential or connection
+# setup. Explicit Connections-panel OAuth operations are independent of
+# generator execution.
 #
 #   [default]
 #   model = { provider = "openai", model = "gpt-4.1-mini" }
+#   search = "tinyfish-api"
+#
+# A search default is consulted only by an explicitly declared `web.search`
+# tool that omits `provider`. No search default ships enabled.
+#
+# Search and MCP credentials are read only when the corresponding declared tool
+# runs. LLM provider credentials are read when an LLM request starts.
 #
 # Fields:
 #   id            unique provider id referenced by contracts
@@ -35,23 +48,174 @@
 #   api_key_env   environment variable whose value is sent as the credential;
 #                 omit for endpoints that need no authentication
 #   auth_header   header name for the credential; omit to use Bearer auth
-#   capabilities  advertised tool_use / json_schema / streaming / seed support
+#   capabilities  advertised request mechanisms, including sampling, stop,
+#                 tool selection, streaming, structured output, multimodal
+#                 input, verbosity, seed, and the exact supported
+#                 reasoning_effort values. Leave
+#                 structured_output_with_tools false unless the endpoint can
+#                 combine native schema output with external tool calls.
 #   path_template optional request path ({model} expands to the model name)
 #   query         optional query parameters appended to the endpoint URL
+#   response_body_limit_bytes
+#                 maximum response body size (default 16 MiB)
+#   chat_token_limit_field
+#                 max_tokens (default) or max_completion_tokens for Chat
+#   lifecycle     MCP only: initialize | discover; defaults to discover and
+#                 must match the server's documented lifecycle
+
+# Search providers are active configuration profiles. They do not enable web
+# access by themselves: each contract must declare `web.search` and allow the
+# selected endpoint host in `[permissions].network`. There is no automatic
+# provider fallback.
+
+[[search_provider]]
+id = "tinyfish-api"
+endpoint = "https://api.search.tinyfish.ai"
+query_param = "query"
+results_pointer = "/results"
+title_pointer = "/title"
+url_pointer = "/url"
+snippet_pointer = "/snippet"
+api_key_env = "TINYFISH_API_KEY"
+auth_header = "X-API-Key"
+
+# TinyFish remains available as an authenticated alternative. It does not use
+# TINYFISH_API_KEY, but it requires interactive OAuth authorization. Credentials
+# are stored in the OS credential store, never in this file.
+[[mcp_server]]
+id = "tinyfish"
+transport = "streamable_http"
+lifecycle = "initialize"
+url = "https://agent.tinyfish.ai/mcp"
+auth = "oauth"
+oauth_store = "keyring"
+allowed_hosts = ["agent.tinyfish.ai", "clerk.tinyfish.ai"]
+timeout_seconds = 120
+max_response_bytes = 4194304
+
+[[search_provider]]
+id = "parallel-fast"
+endpoint = "https://api.parallel.ai/v1/search"
+method = "post"
+query_param = "search_queries"
+query_is_array = true
+body = { mode = "fast" }
+results_pointer = "/results"
+title_pointer = "/title"
+url_pointer = "/url"
+snippet_pointer = "/excerpts"
+api_key_env = "PARALLEL_API_KEY"
+auth_header = "x-api-key"
+
+[[search_provider]]
+id = "parallel-advanced"
+endpoint = "https://api.parallel.ai/v1/search"
+method = "post"
+query_param = "search_queries"
+query_is_array = true
+body = { mode = "advanced" }
+results_pointer = "/results"
+title_pointer = "/title"
+url_pointer = "/url"
+snippet_pointer = "/excerpts"
+api_key_env = "PARALLEL_API_KEY"
+auth_header = "x-api-key"
+
+[[search_provider]]
+id = "exa"
+endpoint = "https://api.exa.ai/search"
+method = "post"
+query_param = "query"
+limit_param = "numResults"
+body = { contents = { highlights = true } }
+results_pointer = "/results"
+title_pointer = "/title"
+url_pointer = "/url"
+snippet_pointer = "/highlights"
+api_key_env = "EXA_API_KEY"
+auth_header = "x-api-key"
+
+[[search_provider]]
+id = "firecrawl"
+endpoint = "https://api.firecrawl.dev/v2/search"
+method = "post"
+query_param = "query"
+limit_param = "limit"
+results_pointer = "/data/web"
+title_pointer = "/title"
+url_pointer = "/url"
+snippet_pointer = "/description"
+api_key_env = "FIRECRAWL_API_KEY"
+auth_header = "Authorization"
+auth_prefix = "Bearer "
+
+[[search_provider]]
+id = "tavily"
+endpoint = "https://api.tavily.com/search"
+method = "post"
+query_param = "query"
+limit_param = "max_results"
+body = { search_depth = "basic" }
+results_pointer = "/results"
+title_pointer = "/title"
+url_pointer = "/url"
+snippet_pointer = "/content"
+api_key_env = "TAVILY_API_KEY"
+auth_header = "Authorization"
+auth_prefix = "Bearer "
+
+[[search_provider]]
+id = "brave"
+endpoint = "https://api.search.brave.com/res/v1/web/search"
+query_param = "q"
+limit_param = "count"
+headers = { Accept = "application/json" }
+results_pointer = "/web/results"
+title_pointer = "/title"
+url_pointer = "/url"
+snippet_pointer = "/description"
+api_key_env = "BRAVE_SEARCH_API_KEY"
+auth_header = "X-Subscription-Token"
+
+[[search_provider]]
+id = "serper"
+endpoint = "https://google.serper.dev/search"
+method = "post"
+query_param = "q"
+limit_param = "num"
+results_pointer = "/organic"
+title_pointer = "/title"
+url_pointer = "/link"
+snippet_pointer = "/snippet"
+api_key_env = "SERPER_API_KEY"
+auth_header = "X-API-KEY"
+
+[[search_provider]]
+id = "serpapi"
+endpoint = "https://serpapi.com/search.json"
+query_param = "q"
+limit_param = "num"
+query = { engine = "google" }
+results_pointer = "/organic_results"
+title_pointer = "/title"
+url_pointer = "/link"
+snippet_pointer = "/snippet"
+api_key_env = "SERPAPI_API_KEY"
+auth_query_param = "api_key"
 
 [[provider]]
 id = "ollama"
 api = "chat_completions"
 base_url = "http://127.0.0.1:11434/v1"
 base_url_env = "QCG_OLLAMA_BASE_URL"
-capabilities = { tool_use = true, json_schema = true, streaming = false, seed = false }
+capabilities = { tool_use = true, json_schema = true, seed = false, temperature = true, top_p = true, stop_sequences = true, tool_choice = true, parallel_tool_calls = true }
 
 [[provider]]
 id = "lmstudio"
 api = "chat_completions"
 base_url = "http://127.0.0.1:1234/v1"
 base_url_env = "QCG_LMSTUDIO_BASE_URL"
-capabilities = { tool_use = true, json_schema = true, streaming = false, seed = false }
+capabilities = { tool_use = true, json_schema = true, seed = false, temperature = true, top_p = true, stop_sequences = true, tool_choice = true, parallel_tool_calls = true }
 
 [[provider]]
 id = "openai_compat"
@@ -59,7 +223,7 @@ api = "chat_completions"
 base_url = "http://127.0.0.1:8080/v1"
 base_url_env = "QCG_OPENAI_COMPAT_BASE_URL"
 api_key_env = "QCG_OPENAI_COMPAT_API_KEY"
-capabilities = { tool_use = true, json_schema = true, streaming = false, seed = false }
+capabilities = { tool_use = true, json_schema = true, seed = false, temperature = true, top_p = true, stop_sequences = true, tool_choice = true, parallel_tool_calls = true }
 
 # [[provider]]
 # id = "anthropic"
@@ -68,7 +232,7 @@ capabilities = { tool_use = true, json_schema = true, streaming = false, seed = 
 # base_url_env = "QCG_ANTHROPIC_BASE_URL"
 # api_key_env = "QCG_ANTHROPIC_API_KEY"
 # auth_header = "x-api-key"
-# capabilities = { tool_use = true, json_schema = true, streaming = false, seed = false }
+# capabilities = { tool_use = true, json_schema = true, seed = false, temperature = true, top_p = true, stop_sequences = true, tool_choice = true, parallel_tool_calls = true }
 
 # [[provider]]
 # id = "openai"
@@ -76,7 +240,8 @@ capabilities = { tool_use = true, json_schema = true, streaming = false, seed = 
 # base_url = "https://api.openai.com/v1"
 # base_url_env = "QCG_OPENAI_BASE_URL"
 # api_key_env = "QCG_OPENAI_API_KEY"
-# capabilities = { tool_use = true, json_schema = true, streaming = false, seed = true }
+# chat_token_limit_field = "max_completion_tokens"
+# capabilities = { tool_use = true, json_schema = true, seed = true, temperature = true, top_p = true, stop_sequences = true, tool_choice = true, parallel_tool_calls = true, reasoning_effort = ["none", "minimal", "low", "medium", "high", "xhigh", "max"] }
 
 # [[provider]]
 # id = "openai_responses"
@@ -84,7 +249,7 @@ capabilities = { tool_use = true, json_schema = true, streaming = false, seed = 
 # base_url = "https://api.openai.com/v1"
 # base_url_env = "QCG_OPENAI_BASE_URL"
 # api_key_env = "QCG_OPENAI_API_KEY"
-# capabilities = { tool_use = true, json_schema = true, streaming = false, seed = false }
+# capabilities = { tool_use = true, json_schema = true, seed = false, temperature = true, top_p = true, tool_choice = true, parallel_tool_calls = true, verbosity = true, reasoning_effort = ["none", "minimal", "low", "medium", "high", "xhigh", "max"] }
 
 # [[provider]]
 # id = "openrouter"
@@ -93,7 +258,7 @@ capabilities = { tool_use = true, json_schema = true, streaming = false, seed = 
 # base_url_env = "QCG_OPENROUTER_BASE_URL"
 # api_key_env = "QCG_OPENROUTER_API_KEY"
 # timeout_seconds = 300
-# capabilities = { tool_use = true, json_schema = true, streaming = false, seed = false }
+# capabilities = { tool_use = true, json_schema = true, seed = false }
 
 # [[provider]]
 # id = "gemini"
@@ -101,7 +266,7 @@ capabilities = { tool_use = true, json_schema = true, streaming = false, seed = 
 # base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
 # base_url_env = "QCG_GEMINI_BASE_URL"
 # api_key_env = "QCG_GEMINI_API_KEY"
-# capabilities = { tool_use = true, json_schema = true, streaming = false, seed = false }
+# capabilities = { tool_use = true, json_schema = true, seed = false }
 
 # [[provider]]
 # id = "sakura"
@@ -109,7 +274,7 @@ capabilities = { tool_use = true, json_schema = true, streaming = false, seed = 
 # base_url = "https://api.ai.sakura.ad.jp/v1"
 # base_url_env = "QCG_SAKURA_BASE_URL"
 # api_key_env = "QCG_SAKURA_API_KEY"
-# capabilities = { tool_use = true, json_schema = true, streaming = false, seed = false }
+# capabilities = { tool_use = true, json_schema = true, seed = false }
 
 # [[provider]]
 # id = "cloudflare"
@@ -117,7 +282,7 @@ capabilities = { tool_use = true, json_schema = true, streaming = false, seed = 
 # base_url = "https://api.cloudflare.com/client/v4/accounts/{QCG_CLOUDFLARE_ACCOUNT_ID}/ai/v1"
 # base_url_env = "QCG_CLOUDFLARE_BASE_URL"
 # api_key_env = "QCG_CLOUDFLARE_API_KEY"
-# capabilities = { tool_use = true, json_schema = true, streaming = false, seed = false }
+# capabilities = { tool_use = true, json_schema = true, seed = false }
 
 # [[provider]]
 # id = "opencode-go"
@@ -125,7 +290,7 @@ capabilities = { tool_use = true, json_schema = true, streaming = false, seed = 
 # base_url = "https://opencode.ai/zen/go/v1"
 # base_url_env = "QCG_OPENCODE_GO_BASE_URL"
 # api_key_env = "QCG_OPENCODE_API_KEY"
-# capabilities = { tool_use = true, json_schema = true, streaming = false, seed = false }
+# capabilities = { tool_use = true, json_schema = true, seed = false }
 
 # [[provider]]
 # id = "opencode-zen"
@@ -133,7 +298,7 @@ capabilities = { tool_use = true, json_schema = true, streaming = false, seed = 
 # base_url = "https://opencode.ai/zen/v1"
 # base_url_env = "QCG_OPENCODE_ZEN_BASE_URL"
 # api_key_env = "QCG_OPENCODE_API_KEY"
-# capabilities = { tool_use = true, json_schema = true, streaming = false, seed = false }
+# capabilities = { tool_use = true, json_schema = true, seed = false }
 
 # [[provider]]
 # id = "opencode-go-responses"
@@ -141,7 +306,7 @@ capabilities = { tool_use = true, json_schema = true, streaming = false, seed = 
 # base_url = "https://opencode.ai/zen/go/v1"
 # base_url_env = "QCG_OPENCODE_GO_BASE_URL"
 # api_key_env = "QCG_OPENCODE_API_KEY"
-# capabilities = { tool_use = true, json_schema = true, streaming = false, seed = false }
+# capabilities = { tool_use = true, json_schema = true, seed = false }
 
 # [[provider]]
 # id = "opencode-zen-responses"
@@ -149,7 +314,7 @@ capabilities = { tool_use = true, json_schema = true, streaming = false, seed = 
 # base_url = "https://opencode.ai/zen/v1"
 # base_url_env = "QCG_OPENCODE_ZEN_BASE_URL"
 # api_key_env = "QCG_OPENCODE_API_KEY"
-# capabilities = { tool_use = true, json_schema = true, streaming = false, seed = false }
+# capabilities = { tool_use = true, json_schema = true, seed = false }
 
 # [[provider]]
 # id = "groq"
@@ -157,7 +322,7 @@ capabilities = { tool_use = true, json_schema = true, streaming = false, seed = 
 # base_url = "https://api.groq.com/openai/v1"
 # base_url_env = "QCG_GROQ_BASE_URL"
 # api_key_env = "QCG_GROQ_API_KEY"
-# capabilities = { tool_use = true, json_schema = true, streaming = false, seed = false }
+# capabilities = { tool_use = true, json_schema = true, seed = false }
 
 # [[provider]]
 # id = "deepseek"
@@ -165,7 +330,7 @@ capabilities = { tool_use = true, json_schema = true, streaming = false, seed = 
 # base_url = "https://api.deepseek.com/v1"
 # base_url_env = "QCG_DEEPSEEK_BASE_URL"
 # api_key_env = "QCG_DEEPSEEK_API_KEY"
-# capabilities = { tool_use = true, json_schema = true, streaming = false, seed = false }
+# capabilities = { tool_use = true, json_schema = true, seed = false }
 
 # [[provider]]
 # id = "mistral"
@@ -173,7 +338,7 @@ capabilities = { tool_use = true, json_schema = true, streaming = false, seed = 
 # base_url = "https://api.mistral.ai/v1"
 # base_url_env = "QCG_MISTRAL_BASE_URL"
 # api_key_env = "QCG_MISTRAL_API_KEY"
-# capabilities = { tool_use = true, json_schema = true, streaming = false, seed = false }
+# capabilities = { tool_use = true, json_schema = true, seed = false }
 
 # [[provider]]
 # id = "xai"
@@ -181,7 +346,7 @@ capabilities = { tool_use = true, json_schema = true, streaming = false, seed = 
 # base_url = "https://api.x.ai/v1"
 # base_url_env = "QCG_XAI_BASE_URL"
 # api_key_env = "QCG_XAI_API_KEY"
-# capabilities = { tool_use = true, json_schema = true, streaming = false, seed = false }
+# capabilities = { tool_use = true, json_schema = true, seed = false }
 
 # [[provider]]
 # id = "together"
@@ -189,7 +354,7 @@ capabilities = { tool_use = true, json_schema = true, streaming = false, seed = 
 # base_url = "https://api.together.xyz/v1"
 # base_url_env = "QCG_TOGETHER_BASE_URL"
 # api_key_env = "QCG_TOGETHER_API_KEY"
-# capabilities = { tool_use = true, json_schema = true, streaming = false, seed = false }
+# capabilities = { tool_use = true, json_schema = true, seed = false }
 
 # [[provider]]
 # id = "fireworks"
@@ -197,14 +362,13 @@ capabilities = { tool_use = true, json_schema = true, streaming = false, seed = 
 # base_url = "https://api.fireworks.ai/inference/v1"
 # base_url_env = "QCG_FIREWORKS_BASE_URL"
 # api_key_env = "QCG_FIREWORKS_API_KEY"
-# capabilities = { tool_use = true, json_schema = true, streaming = false, seed = false }
+# capabilities = { tool_use = true, json_schema = true, seed = false }
 
 # [[provider]]
 # id = "azure-openai"
-# api = "chat_completions"
-# base_url_env = "QCG_AZURE_OPENAI_ENDPOINT"
+# api = "responses"
+## QCG_AZURE_OPENAI_BASE_URL must include /openai/v1.
+# base_url_env = "QCG_AZURE_OPENAI_BASE_URL"
 # api_key_env = "QCG_AZURE_OPENAI_API_KEY"
 # auth_header = "api-key"
-# path_template = "openai/deployments/{model}/chat/completions"
-# query = { "api-version" = "{QCG_AZURE_OPENAI_API_VERSION}" }
-# capabilities = { tool_use = true, json_schema = true, streaming = false, seed = false }
+# capabilities = { tool_use = true, json_schema = true, seed = false, reasoning_effort = ["none", "minimal", "low", "medium", "high", "xhigh", "max"] }

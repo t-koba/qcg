@@ -1,8 +1,10 @@
 import { ApiClient, type ConfirmSpec, type FormSpec, type GeneratorDetail, type GeneratorSummary, type InputField, type OutputArtifact, type RunEvent, type RunSnapshot, type RunStatus } from "./api/client";
 import { evalWhen } from "./expr/loader";
+import { encodeBase64, validateFileInput } from "./field";
 import { collectNodeProgress, record } from "./progress";
 
-const MAX_FILE_INPUT_BYTES = 16 * 1024 * 1024;
+const CANCEL_REQUEST_TIMEOUT_MS = 15_000;
+type PendingAction = "starting" | "answering" | "approving" | "denying" | "canceling";
 
 export class RunStore {
   api = $state(new ApiClient());
@@ -18,49 +20,91 @@ export class RunStore {
   question = $state<FormSpec | null>(null);
   confirm = $state<ConfirmSpec | null>(null);
   errorText = $state("");
+  pendingAction = $state<PendingAction | null>(null);
   nodeProgress = $derived(collectNodeProgress(this.events));
 
   #eventSource: EventSource | null = null;
+  #selectionController: AbortController | null = null;
+  #cancelController: AbortController | null = null;
+  #selectionVersion = 0;
+  #snapshotVersion = 0;
+  #lastSnapshotSeq = 0;
+  #fieldVersion = 0;
 
   async initialize(): Promise<void> {
     await this.loadGenerators();
   }
 
   destroy(): void {
+    this.#selectionController?.abort();
+    this.#selectionController = null;
+    this.#cancelController?.abort();
+    this.#cancelController = null;
     this.#closeEventSource();
   }
 
   async loadGenerators(): Promise<void> {
     this.runState = "loading";
-    this.generators = await this.api.get<GeneratorSummary[]>("/api/generators");
-    if (this.generators.length > 0 && !this.selected) {
-      await this.selectGenerator(this.generators[0].id);
-    } else {
+    try {
+      this.generators = await this.api.get<GeneratorSummary[]>("/api/generators");
+      if (this.generators.length > 0 && !this.selected) {
+        await this.selectGenerator(this.generators[0].id);
+      } else {
+        this.runState = "idle";
+      }
+    } catch (error) {
       this.runState = "idle";
+      throw error;
     }
   }
 
   async selectGenerator(id: string): Promise<void> {
-    this.destroy();
+    if (isActive(this.runState) && id !== this.selected) return;
+    this.#selectionController?.abort();
+    const controller = new AbortController();
+    const version = ++this.#selectionVersion;
+    this.#selectionController = controller;
+    this.#closeEventSource();
     this.selected = id;
-    this.detail = await this.api.get<GeneratorDetail>(`/api/generators/${encodeURIComponent(id)}`);
-    this.values = {};
-    this.currentRun = "";
-    this.events = [];
-    this.question = null;
-    this.confirm = null;
-    this.artifacts = [];
-    await this.refreshActiveFields();
-    this.runState = "idle";
+    this.runState = "loading";
+    try {
+      const detail = await this.api.get<GeneratorDetail>(
+        `/api/generators/${encodeURIComponent(id)}`,
+        controller.signal,
+      );
+      if (version !== this.#selectionVersion) return;
+      this.detail = detail;
+      this.values = {};
+      this.currentRun = "";
+      this.events = [];
+      this.question = null;
+      this.confirm = null;
+      this.artifacts = [];
+      this.#lastSnapshotSeq = 0;
+      this.#snapshotVersion += 1;
+      await this.refreshActiveFields();
+      if (version === this.#selectionVersion) this.runState = "idle";
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
+      if (version === this.#selectionVersion) this.runState = "idle";
+      throw error;
+    } finally {
+      if (this.#selectionController === controller) this.#selectionController = null;
+    }
   }
 
   async refreshActiveFields(): Promise<void> {
+    const version = ++this.#fieldVersion;
+    const valuesSnapshot = { ...this.values };
     const fields: InputField[] = [];
     for (const stage of this.detail?.inputs?.stages || []) {
-      if (await evalWhen(stage.when || undefined, { inputs: this.values })) fields.push(...stage.fields);
+      if (await evalWhen(stage.when || undefined, { inputs: valuesSnapshot })) {
+        fields.push(...stage.fields);
+      }
     }
+    if (version !== this.#fieldVersion) return;
     this.activeFields = fields;
-    const values = { ...this.values };
+    const values = { ...valuesSnapshot };
     for (const field of fields) {
       if (values[field.id] === undefined && field.default !== undefined && field.default !== null) {
         values[field.id] = field.default;
@@ -79,62 +123,99 @@ export class RunStore {
       this.setValue(id, undefined);
       return;
     }
-    if (file.size > MAX_FILE_INPUT_BYTES) {
-      throw new Error(`file input exceeds the ${MAX_FILE_INPUT_BYTES} byte limit`);
-    }
-    if (!isSafeFileName(file.name)) {
-      throw new Error(`file name must be one safe path component: ${file.name}`);
-    }
+    validateFileInput(file);
     const bytes = new Uint8Array(await file.arrayBuffer());
     this.setValue(id, { name: file.name, content_base64: encodeBase64(bytes) });
   }
 
   async startRun(overrideInputs?: Record<string, unknown>): Promise<void> {
     const generatorId = this.selected || this.generators[0]?.id;
-    if (!generatorId) return;
+    if (!generatorId || this.pendingAction) return;
     this.destroy();
     this.errorText = "";
+    this.pendingAction = "starting";
+    this.#snapshotVersion += 1;
     this.runState = "running";
     this.events = [];
     this.question = null;
     this.confirm = null;
     this.artifacts = [];
     const inputs = overrideInputs ? { ...overrideInputs } : this.#collectInputs();
-    const response = await this.api.post<RunSnapshot>("/api/runs", {
-      generator_id: generatorId,
-      inputs,
-    }, crypto.randomUUID());
-    this.applySnapshot(response);
-    this.subscribe(response.run_id);
+    try {
+      const response = await this.api.post<RunSnapshot>("/api/runs", {
+        generator_id: generatorId,
+        inputs,
+      }, crypto.randomUUID());
+      this.applySnapshot(response);
+      this.subscribe(response.run_id);
+    } catch (error) {
+      this.runState = "idle";
+      throw error;
+    } finally {
+      this.pendingAction = null;
+    }
   }
 
   async answerQuestion(overrideValues?: Record<string, unknown>): Promise<void> {
-    if (!this.currentRun || !this.question) return;
+    if (!this.currentRun || !this.question || this.pendingAction) return;
+    this.pendingAction = "answering";
+    this.#snapshotVersion += 1;
     const values = overrideValues || Object.fromEntries(this.question.fields.map((field) => [field.id, this.values[`question:${field.id}`] ?? field.default]));
-    const snapshot = await this.api.put<RunSnapshot>(
-      `/api/runs/${encodeURIComponent(this.currentRun)}/questions/${encodeURIComponent(this.question.id)}`,
-      { values },
-    );
-    this.applySnapshot(snapshot);
+    try {
+      const snapshot = await this.api.put<RunSnapshot>(
+        `/api/runs/${encodeURIComponent(this.currentRun)}/questions/${encodeURIComponent(this.question.id)}`,
+        { values },
+      );
+      this.applySnapshot(snapshot);
+    } finally {
+      this.pendingAction = null;
+    }
   }
 
   async decideConfirmation(decision: "approve" | "deny"): Promise<void> {
-    if (!this.currentRun || !this.confirm) return;
-    const snapshot = await this.api.put<RunSnapshot>(
-      `/api/runs/${encodeURIComponent(this.currentRun)}/confirmations/${encodeURIComponent(this.confirm.id)}`,
-      { decision },
-    );
-    this.applySnapshot(snapshot);
+    if (!this.currentRun || !this.confirm || this.pendingAction) return;
+    this.pendingAction = decision === "approve" ? "approving" : "denying";
+    this.#snapshotVersion += 1;
+    try {
+      const snapshot = await this.api.put<RunSnapshot>(
+        `/api/runs/${encodeURIComponent(this.currentRun)}/confirmations/${encodeURIComponent(this.confirm.id)}`,
+        { decision },
+      );
+      this.applySnapshot(snapshot);
+    } finally {
+      this.pendingAction = null;
+    }
   }
 
   async cancelRun(): Promise<void> {
-    if (!this.currentRun) return;
-    const snapshot = await this.api.post<RunSnapshot>(`/api/runs/${encodeURIComponent(this.currentRun)}:cancel`, {});
-    this.applySnapshot(snapshot);
-    this.destroy();
+    if (!this.currentRun || this.pendingAction || !isCancelable(this.runState)) return;
+    this.pendingAction = "canceling";
+    this.#snapshotVersion += 1;
+    const controller = new AbortController();
+    this.#cancelController = controller;
+    const timeout = setTimeout(() => controller.abort(), CANCEL_REQUEST_TIMEOUT_MS);
+    try {
+      const snapshot = await this.api.post<RunSnapshot>(
+        `/api/runs/${encodeURIComponent(this.currentRun)}:cancel`,
+        {},
+        undefined,
+        controller.signal,
+      );
+      this.applySnapshot(snapshot);
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new Error("The cancellation request timed out.");
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+      if (this.#cancelController === controller) this.#cancelController = null;
+      this.pendingAction = null;
+    }
   }
 
   async withError(task: () => Promise<void>): Promise<void> {
+    this.errorText = "";
     try {
       await task();
     } catch (error) {
@@ -142,15 +223,37 @@ export class RunStore {
     }
   }
 
+  dismissError(): void {
+    this.errorText = "";
+  }
+
+  resetRun(): void {
+    this.destroy();
+    this.currentRun = "";
+    this.runState = "idle";
+    this.events = [];
+    this.artifacts = [];
+    this.question = null;
+    this.confirm = null;
+    this.errorText = "";
+    this.pendingAction = null;
+    this.#lastSnapshotSeq = 0;
+    this.#snapshotVersion += 1;
+  }
+
   async refreshRun(runId: string): Promise<void> {
     if (runId !== this.currentRun) return;
+    const version = ++this.#snapshotVersion;
     const snapshot = await this.api.get<RunSnapshot>(`/api/runs/${encodeURIComponent(runId)}`);
-    if (runId !== this.currentRun) return;
+    if (runId !== this.currentRun || version !== this.#snapshotVersion) return;
     this.applySnapshot(snapshot);
   }
 
   applySnapshot(snapshot: RunSnapshot): void {
+    if (snapshot.run_id === this.currentRun && snapshot.seq < this.#lastSnapshotSeq) return;
+    if (snapshot.run_id !== this.currentRun) this.#lastSnapshotSeq = 0;
     this.currentRun = snapshot.run_id;
+    this.#lastSnapshotSeq = Math.max(this.#lastSnapshotSeq, snapshot.seq);
     this.runState = snapshot.state;
     this.artifacts = snapshot.artifacts?.artifacts || [];
     this.question = snapshot.question || null;
@@ -169,8 +272,8 @@ export class RunStore {
       }
     };
     source.onerror = () => {
-      if (source.readyState === EventSource.CLOSED && this.#eventSource === source) {
-        this.errorText = "The event stream closed unexpectedly.";
+      if (this.#eventSource === source && isActive(this.runState)) {
+        void this.withError(() => this.refreshRun(runId));
       }
     };
     this.#eventSource = source;
@@ -191,6 +294,7 @@ export class RunStore {
     }
     if (this.events.some((candidate) => candidate.seq === event.seq)) return;
     this.events = [...this.events, event].sort((left, right) => left.seq - right.seq);
+    this.#lastSnapshotSeq = Math.max(this.#lastSnapshotSeq, event.seq);
     if (event.kind === "run_error") {
       const data = record(event.data);
       this.errorText = typeof data.error === "string" ? data.error : JSON.stringify(data);
@@ -207,17 +311,9 @@ export class RunStore {
 }
 
 function isActive(state: RunStatus | "idle" | "loading"): boolean {
-  return state === "running" || state === "waiting" || state === "confirming" || state === "interrupted";
+  return state === "queued" || state === "running" || state === "waiting" || state === "confirming";
 }
 
-function isSafeFileName(name: string): boolean {
-  return name.length > 0 && name !== "." && name !== ".." && !name.includes("/") && !name.includes("\\") && !name.includes("\0");
-}
-
-function encodeBase64(bytes: Uint8Array): string {
-  let binary = "";
-  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
-    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
-  }
-  return btoa(binary);
+function isCancelable(state: RunStatus | "idle" | "loading"): boolean {
+  return state === "queued" || state === "running" || state === "waiting" || state === "confirming";
 }

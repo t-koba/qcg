@@ -3,13 +3,43 @@ use serde_json::Value;
 
 use crate::StepError;
 
+pub const MAX_SCHEMA_FINDINGS_COUNT: usize = 64;
+pub const MAX_SCHEMA_FINDING_MESSAGE_BYTES: usize = 1024;
+pub const MAX_SCHEMA_FINDINGS_BYTES: usize = 32 * 1024;
+pub const MAX_SCHEMA_REPORT_BYTES: usize = 32 * 1024;
+
 pub fn validate_json_schema_findings(
     schema: &Value,
     value: &Value,
     location: &str,
 ) -> Vec<Finding> {
+    let validator = match jsonschema::validator_for(schema) {
+        Ok(validator) => validator,
+        Err(error) => {
+            return vec![error_finding(
+                format!("invalid JSON Schema: {error}"),
+                location,
+            )];
+        }
+    };
     let mut findings = Vec::new();
-    collect_schema_findings(schema, value, location, &mut findings);
+    let mut omitted = 0;
+    for error in validator.iter_errors(value) {
+        let finding = error_finding(
+            format!("{}: {error}", error.schema_path()),
+            &join_instance_location(location, &error.instance_path().to_string()),
+        );
+        if findings.len() >= MAX_SCHEMA_FINDINGS_COUNT.saturating_sub(1)
+            || !findings_fit(&findings, &finding)
+        {
+            omitted = 1;
+            break;
+        }
+        findings.push(finding);
+    }
+    if omitted > 0 {
+        append_truncation_finding(&mut findings, location, omitted);
+    }
     findings
 }
 
@@ -19,18 +49,68 @@ pub fn validate_json_schema_step(
     value: &Value,
     label: &str,
 ) -> Result<(), StepError> {
-    if schema.get("type").and_then(Value::as_str) == Some("object") && !value.is_object() {
-        return Err(StepError::failed(
-            node,
-            format!("{label} must have JSON Schema type `object`"),
-        ));
-    }
     let findings = validate_json_schema_findings(schema, value, label);
     if findings.is_empty() {
         return Ok(());
     }
-    // Surface every violation (with its location) so an LLM retry loop can
-    // correct the response in one round instead of guessing.
+    // Surface bounded violations (with their locations) so an LLM retry loop
+    // can correct the response without allowing untrusted schema errors to
+    // expand the retry transcript indefinitely.
+    let prefix = format!("{} violations: ", findings.len());
+    let report = findings_report(
+        &findings,
+        MAX_SCHEMA_REPORT_BYTES.saturating_sub(prefix.len()),
+    );
+    Err(StepError::failed(node, format!("{prefix}{report}")))
+}
+
+fn error_finding(message: String, location: &str) -> Finding {
+    Finding {
+        severity: Severity::Error,
+        message: truncate_utf8(&message, MAX_SCHEMA_FINDING_MESSAGE_BYTES),
+        location: Some(truncate_utf8(location, MAX_SCHEMA_FINDING_MESSAGE_BYTES)),
+        raw_output: None,
+    }
+}
+
+fn findings_fit(findings: &[Finding], candidate: &Finding) -> bool {
+    let mut combined = Vec::with_capacity(findings.len() + 1);
+    combined.extend(findings.iter().cloned());
+    combined.push(candidate.clone());
+    serialized_findings_bytes(&combined) <= MAX_SCHEMA_FINDINGS_BYTES
+}
+
+fn serialized_findings_bytes(findings: &[Finding]) -> usize {
+    serde_json::to_vec(findings)
+        .expect("Finding values contain only JSON-serializable fields")
+        .len()
+}
+
+fn append_truncation_finding(findings: &mut Vec<Finding>, location: &str, mut omitted: usize) {
+    omitted = omitted.max(1);
+    loop {
+        let finding = error_finding(
+            format!(
+                "JSON Schema validation findings truncated: at least {omitted} additional violation(s) omitted; limits are {MAX_SCHEMA_FINDINGS_COUNT} findings, {MAX_SCHEMA_FINDINGS_BYTES} bytes total, and {MAX_SCHEMA_FINDING_MESSAGE_BYTES} bytes per message"
+            ),
+            location,
+        );
+        if findings_fit(findings, &finding) {
+            findings.push(finding);
+            return;
+        }
+        if findings.pop().is_some() {
+            omitted = omitted.saturating_add(1);
+        } else {
+            // The truncation finding is itself bounded and must remain visible
+            // even if the configured aggregate limit is later reduced.
+            findings.push(finding);
+            return;
+        }
+    }
+}
+
+fn findings_report(findings: &[Finding], limit: usize) -> String {
     let report = findings
         .iter()
         .map(|finding| match &finding.location {
@@ -39,205 +119,47 @@ pub fn validate_json_schema_step(
         })
         .collect::<Vec<_>>()
         .join("; ");
-    Err(StepError::failed(
-        node,
-        format!("{} violations: {report}", findings.len()),
-    ))
+    truncate_utf8_with_marker(&report, limit, " ... [validation report truncated]")
 }
 
-fn collect_schema_findings(
-    schema: &Value,
-    value: &Value,
-    location: &str,
-    findings: &mut Vec<Finding>,
-) {
-    if let Some(negated_schema) = schema.get("not") {
-        let mut matches = Vec::new();
-        collect_schema_findings(negated_schema, value, location, &mut matches);
-        if matches.is_empty() {
-            findings.push(Finding {
-                severity: Severity::Error,
-                message: "value matches a forbidden schema".into(),
-                location: Some(location.to_string()),
-                raw_output: None,
-            });
-        }
-    }
-    if let Some(expected_type) = schema.get("type").and_then(Value::as_str)
-        && !json_type_matches(expected_type, value)
-    {
-        findings.push(Finding {
-            severity: Severity::Error,
-            message: format!("expected {expected_type}, got {}", json_type_name(value)),
-            location: Some(location.to_string()),
-            raw_output: None,
-        });
-        return;
-    }
-    if let Some(required) = schema.get("required").and_then(Value::as_array)
-        && let Some(object) = value.as_object()
-    {
-        for field in required.iter().filter_map(Value::as_str) {
-            if !object.contains_key(field) {
-                findings.push(Finding {
-                    severity: Severity::Error,
-                    message: format!("required property `{field}` is missing"),
-                    location: Some(location.to_string()),
-                    raw_output: None,
-                });
-            }
-        }
-    }
-    if let (Some(pattern), Some(actual)) = (
-        schema.get("pattern").and_then(Value::as_str),
-        value.as_str(),
-    ) && !regex::Regex::new(pattern)
-        .map(|re| re.is_match(actual))
-        .unwrap_or(false)
-    {
-        findings.push(Finding {
-            severity: Severity::Error,
-            message: format!("value does not match pattern `{pattern}`"),
-            location: Some(location.to_string()),
-            raw_output: None,
-        });
-    }
-    if let Some(allowed) = schema.get("enum").and_then(Value::as_array) {
-        let matches_enum = allowed.iter().any(|candidate| candidate == value);
-        if !matches_enum {
-            findings.push(Finding {
-                severity: Severity::Error,
-                message: format!(
-                    "value {} is not one of the allowed values",
-                    json_type_name(value)
-                ),
-                location: Some(location.to_string()),
-                raw_output: None,
-            });
-        }
-    }
-    if let Some(min_items) = schema.get("minItems").and_then(Value::as_u64)
-        && let Some(array) = value.as_array()
-        && (array.len() as u64) < min_items
-    {
-        findings.push(Finding {
-            severity: Severity::Error,
-            message: format!("expected at least {min_items} items, got {}", array.len()),
-            location: Some(location.to_string()),
-            raw_output: None,
-        });
-    }
-    if let Some(max_properties) = schema.get("maxProperties").and_then(Value::as_u64)
-        && let Some(object) = value.as_object()
-        && (object.len() as u64) > max_properties
-    {
-        findings.push(Finding {
-            severity: Severity::Error,
-            message: format!(
-                "expected at most {max_properties} properties, got {}",
-                object.len()
-            ),
-            location: Some(location.to_string()),
-            raw_output: None,
-        });
-    }
-    if schema.get("additionalProperties") == Some(&Value::Bool(false))
-        && let (Some(properties), Some(object)) = (
-            schema.get("properties").and_then(Value::as_object),
-            value.as_object(),
-        )
-    {
-        for key in object.keys() {
-            if !properties.contains_key(key) {
-                findings.push(Finding {
-                    severity: Severity::Error,
-                    message: format!("unknown property `{key}`"),
-                    location: Some(location.to_string()),
-                    raw_output: None,
-                });
-            }
-        }
-    }
-    if let (Some(properties), Some(object)) = (
-        schema.get("properties").and_then(Value::as_object),
-        value.as_object(),
-    ) {
-        for (name, property_schema) in properties {
-            if let Some(property_value) = object.get(name) {
-                collect_schema_findings(
-                    property_schema,
-                    property_value,
-                    &format!("{location}.{name}"),
-                    findings,
-                );
-            }
-        }
-    }
-    if let (Some(property_name_schema), Some(object)) =
-        (schema.get("propertyNames"), value.as_object())
-    {
-        for name in object.keys() {
-            collect_schema_findings(
-                property_name_schema,
-                &Value::String(name.clone()),
-                &format!("{location}.{name}"),
-                findings,
-            );
-        }
-    }
-    if let (Some(additional_schema), Some(object)) = (
-        schema
-            .get("additionalProperties")
-            .filter(|schema| schema.is_object()),
-        value.as_object(),
-    ) {
-        let properties = schema
-            .get("properties")
-            .and_then(Value::as_object)
-            .into_iter()
-            .flatten()
-            .map(|(name, _)| name.as_str())
-            .collect::<std::collections::BTreeSet<_>>();
-        for (name, property_value) in object {
-            if !properties.contains(name.as_str()) {
-                collect_schema_findings(
-                    additional_schema,
-                    property_value,
-                    &format!("{location}.{name}"),
-                    findings,
-                );
-            }
-        }
-    }
-    if let (Some(item_schema), Some(array)) = (schema.get("items"), value.as_array()) {
-        for (index, item) in array.iter().enumerate() {
-            collect_schema_findings(item_schema, item, &format!("{location}[{index}]"), findings);
-        }
-    }
+fn truncate_utf8(value: &str, limit: usize) -> String {
+    truncate_utf8_with_marker(value, limit, "...")
 }
 
-fn json_type_matches(expected: &str, value: &Value) -> bool {
-    match expected {
-        "object" => value.is_object(),
-        "array" => value.is_array(),
-        "string" => value.is_string(),
-        "number" => value.is_number(),
-        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
-        "boolean" => value.is_boolean(),
-        "null" => value.is_null(),
-        _ => true,
+fn truncate_utf8_with_marker(value: &str, limit: usize, marker: &str) -> String {
+    if value.len() <= limit {
+        return value.to_owned();
     }
+    if limit <= marker.len() {
+        return marker[..limit].to_owned();
+    }
+    let mut end = limit - marker.len();
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut bounded = String::with_capacity(limit);
+    bounded.push_str(&value[..end]);
+    bounded.push_str(marker);
+    bounded
 }
 
-fn json_type_name(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
+fn join_instance_location(base: &str, pointer: &str) -> String {
+    if pointer.is_empty() {
+        return base.to_string();
     }
+    let mut location = base.to_string();
+    for component in pointer.split('/').skip(1) {
+        let component = component.replace("~1", "/").replace("~0", "~");
+        if component.bytes().all(|byte| byte.is_ascii_digit()) {
+            location.push('[');
+            location.push_str(&component);
+            location.push(']');
+        } else {
+            location.push('.');
+            location.push_str(&component);
+        }
+    }
+    location
 }
 
 #[cfg(test)]
@@ -255,7 +177,8 @@ mod tests {
         let value = json!({});
         let findings = validate_json_schema_findings(&schema, &value, "$");
         assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].message, "required property `name` is missing");
+        assert!(findings[0].message.contains("required"));
+        assert!(findings[0].message.contains("name"));
     }
 
     #[test]
@@ -291,14 +214,8 @@ mod validation_rules_tests {
         let findings = validate_json_schema_findings(&schema, &bad, "v");
         let text: Vec<&str> = findings.iter().map(|f| f.message.as_str()).collect();
         assert!(text.iter().any(|m| m.contains("pattern")), "{text:?}");
-        assert!(
-            text.iter().any(|m| m.contains("allowed values")),
-            "{text:?}"
-        );
-        assert!(
-            text.iter().any(|m| m.contains("at least 2 items")),
-            "{text:?}"
-        );
+        assert!(text.iter().any(|m| m.contains("enum")), "{text:?}");
+        assert!(text.iter().any(|m| m.contains("minItems")), "{text:?}");
 
         let good = json!({ "id": "abc", "kind": "a", "items": ["one", "two"] });
         assert!(validate_json_schema_findings(&schema, &good, "v").is_empty());
@@ -313,11 +230,7 @@ mod validation_rules_tests {
         });
         let bad = json!({ "id": "x", "label": "extra" });
         let findings = validate_json_schema_findings(&schema, &bad, "v");
-        assert!(
-            findings
-                .iter()
-                .any(|f| f.message.contains("unknown property `label`"))
-        );
+        assert!(findings.iter().any(|f| f.message.contains("label")));
         let good = json!({ "id": "x" });
         assert!(validate_json_schema_findings(&schema, &good, "v").is_empty());
     }
@@ -342,22 +255,22 @@ mod validation_rules_tests {
             .collect();
         assert!(
             text.iter()
-                .any(|message| message.contains("forbidden schema")),
+                .any(|message| message.contains("/propertyNames/not")),
             "{text:?}"
         );
         assert!(
             text.iter()
-                .any(|message| message.contains("does not match pattern")),
+                .any(|message| message.contains("/propertyNames/pattern")),
             "{text:?}"
         );
         assert!(
             text.iter()
-                .any(|message| message.contains("expected string")),
+                .any(|message| message.contains("/additionalProperties/type")),
             "{text:?}"
         );
         assert!(
             text.iter()
-                .any(|message| message.contains("at most 1 properties")),
+                .any(|message| message.contains("/maxProperties")),
             "{text:?}"
         );
 
@@ -418,5 +331,126 @@ mod validation_rules_tests {
             "sources": { "README.md": 7 }
         });
         assert!(!validate_json_schema_findings(&schema, &invalid_content, "$").is_empty());
+    }
+
+    #[test]
+    fn full_validator_reports_all_scalar_and_array_keyword_violations() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "minLength": 3 },
+                "items": { "type": "array", "maxItems": 1 },
+                "score": { "type": "number", "minimum": 10 }
+            }
+        });
+        let value = json!({
+            "name": "x",
+            "items": [1, 2],
+            "score": 2
+        });
+        let findings = validate_json_schema_findings(&schema, &value, "$");
+        assert_eq!(findings.len(), 3, "{findings:?}");
+        let messages = findings
+            .iter()
+            .map(|finding| finding.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(messages.iter().any(|message| message.contains("minLength")));
+        assert!(messages.iter().any(|message| message.contains("maxItems")));
+        assert!(messages.iter().any(|message| message.contains("minimum")));
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.location.as_deref() == Some("$.name"))
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.location.as_deref() == Some("$.items"))
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.location.as_deref() == Some("$.score"))
+        );
+    }
+
+    #[test]
+    fn full_validator_resolves_internal_refs_and_combinators() {
+        let schema = json!({
+            "$defs": {
+                "positive": { "type": "integer", "minimum": 1 }
+            },
+            "type": "object",
+            "properties": {
+                "count": { "$ref": "#/$defs/positive" },
+                "choice": {
+                    "anyOf": [
+                        { "type": "string", "minLength": 2 },
+                        { "type": "integer", "minimum": 10 }
+                    ]
+                }
+            }
+        });
+        let value = json!({ "count": 0, "choice": false });
+        let findings = validate_json_schema_findings(&schema, &value, "response");
+        assert!(
+            findings.iter().any(
+                |finding| finding.location.as_deref() == Some("response.count")
+                    && finding.message.contains("minimum")
+            ),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| {
+                finding.location.as_deref() == Some("response.choice")
+                    && finding.message.contains("anyOf")
+            }),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn findings_are_bounded_and_report_truncation() {
+        let required = (0..(MAX_SCHEMA_FINDINGS_COUNT * 2))
+            .map(|index| format!("required_{index}"))
+            .collect::<Vec<_>>();
+        let schema = json!({
+            "type": "object",
+            "required": required,
+            "additionalProperties": false
+        });
+        let findings = validate_json_schema_findings(&schema, &json!({}), "response");
+
+        assert!(findings.len() <= MAX_SCHEMA_FINDINGS_COUNT);
+        assert!(findings.iter().any(|finding| {
+            finding
+                .message
+                .contains("JSON Schema validation findings truncated")
+        }));
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.message.len() <= MAX_SCHEMA_FINDING_MESSAGE_BYTES)
+        );
+        assert!(serialized_findings_bytes(&findings) <= MAX_SCHEMA_FINDINGS_BYTES);
+
+        let error = validate_json_schema_step("node", &schema, &json!({}), "response")
+            .expect_err("missing required properties should fail validation");
+        assert!(error.to_string().len() <= MAX_SCHEMA_REPORT_BYTES + 64);
+        assert!(error.to_string().contains("truncated"));
+    }
+
+    #[test]
+    fn individual_finding_messages_are_bounded() {
+        let property = "property_".to_string() + &"x".repeat(MAX_SCHEMA_FINDING_MESSAGE_BYTES * 4);
+        let schema = json!({
+            "type": "object",
+            "required": [property]
+        });
+        let findings = validate_json_schema_findings(&schema, &json!({}), "response");
+
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.len() <= MAX_SCHEMA_FINDING_MESSAGE_BYTES);
+        assert!(serialized_findings_bytes(&findings) <= MAX_SCHEMA_FINDINGS_BYTES);
     }
 }

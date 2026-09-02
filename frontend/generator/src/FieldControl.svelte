@@ -1,86 +1,77 @@
 <script lang="ts">
   import type { InputField } from "./api/client";
-  import { fieldKind } from "./field";
+  import SchemaField from "./SchemaField.svelte";
+  import { encodeBase64, fieldSchema, removePath, setPath, validateFileInput, type JsonObject, type PathSegment } from "./field";
+  import { humanizeIdentifier, localizedText } from "./format";
 
   let {
     field,
     value = undefined,
     valueKey = field.id,
+    language = "en",
     onValue,
     onFile,
   }: {
     field: InputField;
     value?: unknown;
     valueKey?: string;
+    requiredLabel?: string;
+    language?: string;
     onValue: (id: string, value: unknown) => void;
     onFile: (id: string, file: File | undefined) => Promise<void>;
   } = $props();
 
-  let kind = $derived(fieldKind(field));
+  let schemaData = $derived(fieldSchema(field));
+  let inputId = $derived(`field-${valueKey.replace(/[^A-Za-z0-9_-]/g, "-")}`);
+  let ui = $derived((field.ui || {}) as JsonObject);
+  let rendererUi = $derived({
+    ...ui,
+    title: localizedText(field.label || humanizeIdentifier(field.id), field.label_i18n, language),
+    description: localizedText(field.description || "", field.description_i18n, language),
+    placeholder: localizedText(field.placeholder || "", field.placeholder_i18n, language),
+  });
+  let rendererSchema = $derived({
+    ...schemaData.schema,
+    ...(field.pattern && schemaData.schema.pattern === undefined ? { pattern: field.pattern } : {}),
+    ...(field.min_items !== null && schemaData.schema.minItems === undefined ? { minItems: field.min_items } : {}),
+  });
 
-  function emit(candidate: unknown): void {
-    onValue(valueKey, candidate);
+  function updateValue(path: PathSegment[], candidate: unknown): void {
+    if (path.length === 0) {
+      onValue(valueKey, candidate);
+      return;
+    }
+    onValue(valueKey, candidate === undefined ? removePath(value, path) : setPath(value, path, candidate));
   }
 
-  function stringValue(candidate: unknown): string {
-    if (candidate === undefined || candidate === null) return "";
-    return typeof candidate === "string" ? candidate : JSON.stringify(candidate, null, 2);
-  }
-
-  function listValue(candidate: unknown): string {
-    return Array.isArray(candidate) ? candidate.map(String).join("\n") : "";
+  async function updateFile(path: PathSegment[], file: File | undefined): Promise<void> {
+    if (path.length === 0) {
+      await onFile(valueKey, file);
+      return;
+    }
+    if (!file) {
+      updateValue(path, undefined);
+      return;
+    }
+    validateFileInput(file);
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    updateValue(path, { name: file.name, content_base64: encodeBase64(bytes) });
   }
 </script>
 
 <div class="field">
-  <label for={`field-${valueKey}`}>{field.id}</label>
-
-  {#if kind === "boolean"}
-    <select id={`field-${valueKey}`} name={field.id} value={String(value ?? field.default ?? false)} onchange={(e) => emit((e.currentTarget as HTMLSelectElement).value === "true")}>
-      <option value="false">false</option>
-      <option value="true">true</option>
-    </select>
-  {:else if kind === "select"}
-    <select id={`field-${valueKey}`} name={field.id} value={String(value ?? "")} onchange={(e) => emit((e.currentTarget as HTMLSelectElement).value)}>
-      {#each field.options as option}
-        <option value={option}>{option}</option>
-      {/each}
-    </select>
-  {:else if kind === "multiselect"}
-    <select id={`field-${valueKey}`} name={field.id} multiple size={Math.min(Math.max(field.options.length, 2), 8)} onchange={(e) => emit([...(e.currentTarget as HTMLSelectElement).selectedOptions].map((o) => o.value))}>
-      {#each field.options as option}
-        <option value={option} selected={Array.isArray(value) && (value as unknown[]).includes(option)}>{option}</option>
-      {/each}
-    </select>
-  {:else if kind === "file"}
-    <input id={`field-${valueKey}`} name={field.id} type="file" onchange={(e) => void onFile(valueKey, (e.currentTarget as HTMLInputElement).files?.[0])} />
-  {:else if kind === "json"}
-    <textarea id={`field-${valueKey}`} name={field.id} data-json placeholder="JSON" value={stringValue(value ?? field.default)} oninput={(e) => { try { emit(JSON.parse(e.currentTarget.value)); } catch { /* typing */ } }}></textarea>
-  {:else if kind === "list"}
-    <textarea id={`field-${valueKey}`} name={field.id} value={listValue(value)} oninput={(e) => emit(e.currentTarget.value.split("\n").map((s) => s.trim()).filter(Boolean))}></textarea>
-  {:else if kind === "natural_language"}
-    <textarea id={`field-${valueKey}`} name={field.id} value={stringValue(value ?? field.default)} oninput={(e) => emit(e.currentTarget.value)}></textarea>
-  {:else if kind === "number"}
-    <input id={`field-${valueKey}`} name={field.id} type="number" value={stringValue(value ?? field.default)} oninput={(e) => emit(Number(e.currentTarget.value))} />
-  {:else}
-    <input id={`field-${valueKey}`} name={field.id} type="text" value={stringValue(value ?? field.default)} oninput={(e) => emit(e.currentTarget.value)} />
-  {/if}
-
-  {#if field.pattern && (kind === "string" || kind === "number")}
-    <div class="hint">Pattern: {field.pattern}</div>
-  {/if}
-  {#if field.min_items !== null && kind === "list"}
-    <div class="hint">Min items: {field.min_items}</div>
-  {/if}
-  {#if field.options.length && kind === "select"}
-    <div class="hint">Options: {field.options.join(", ")}</div>
-  {/if}
+  <SchemaField
+    schema={rendererSchema}
+    value={value}
+    idPrefix={inputId}
+    canonicalType={field.type}
+    {field}
+    ui={rendererUi}
+    {language}
+    required={field.required}
+    root
+    explicitSchema={schemaData.explicit}
+    onValue={updateValue}
+    onFile={updateFile}
+  />
 </div>
-
-<style>
-  .field { display: grid; gap: 5px; }
-  label { font-weight: 700; }
-  input, select, textarea { border: 1px solid var(--line); border-radius: 6px; font: inherit; min-height: 36px; min-width: 0; padding: 8px 10px; width: 100%; }
-  textarea { min-height: 100px; resize: vertical; }
-  .hint { color: var(--muted); font-size: 12px; }
-</style>

@@ -4,6 +4,8 @@ output = "model"
 type = "llm.fill"
 
 [flow.params]
+max_iterations = 3
+max_tokens_total = 2048
 prompt = "prompts/fill.j2"
 schema = "schemas/model.schema.json"
 
@@ -13,6 +15,8 @@ output = "layout"
 type = "llm.choose"
 
 [flow.params]
+max_iterations = 3
+max_tokens_total = 2048
 options = [
     "single",
     "split",
@@ -53,3 +57,4 @@ model = "fake"
 provider = "fake"
 
 [permissions]
+fs_write = ["workspace"]

@@ -15,32 +15,67 @@ export type InputField = NonNullable<GeneratorDetail["inputs"]["stages"]>[number
 export type FormSpec = NonNullable<RunSnapshot["question"]>;
 export type ConfirmSpec = NonNullable<RunSnapshot["confirm"]>;
 
+export type McpServerSummary = components["schemas"]["McpServerSummary"];
+export type McpServersResponse = components["schemas"]["McpServerList"];
+export type McpAuthorizationResponse = components["schemas"]["McpAuthorizationStart"];
+
 export class ApiClient {
   readonly base = "";
 
   async get<T>(path: string, signal?: AbortSignal): Promise<T> {
-    const response = await fetch(path, { signal });
+    const response = await fetch(`${this.base}${path}`, { signal });
     return parseResponse<T>(response);
   }
 
-  async post<T>(path: string, body: unknown, idempotencyKey?: string): Promise<T> {
+  async post<T>(path: string, body: unknown, idempotencyKey?: string, signal?: AbortSignal): Promise<T> {
     const headers: Record<string, string> = { "content-type": "application/json" };
     if (idempotencyKey) headers["idempotency-key"] = idempotencyKey;
     const response = await fetch(`${this.base}${path}`, {
       method: "POST",
       headers,
       body: JSON.stringify(body),
+      signal,
     });
     return parseResponse<T>(response);
   }
 
-  async put<T>(path: string, body: unknown): Promise<T> {
+  async put<T>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
     const response = await fetch(`${this.base}${path}`, {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
+      signal,
     });
     return parseResponse<T>(response);
+  }
+
+  async delete<T = undefined>(path: string, signal?: AbortSignal): Promise<T> {
+    const response = await fetch(`${this.base}${path}`, { method: "DELETE", signal });
+    return parseResponse<T>(response);
+  }
+
+  listMcpServers(signal?: AbortSignal): Promise<McpServersResponse> {
+    return this.get<McpServersResponse>("/api/mcp/servers", signal);
+  }
+
+  beginMcpAuthorization(serverId: string, signal?: AbortSignal): Promise<McpAuthorizationResponse> {
+    return this.post<McpAuthorizationResponse>(
+      `/api/mcp/servers/${encodeURIComponent(serverId)}/authorization`,
+      {},
+      undefined,
+      signal,
+    );
+  }
+
+  cancelPendingMcpAuthorization(serverId: string, signal?: AbortSignal): Promise<void> {
+    return this.delete<void>(
+      `/api/mcp/servers/${encodeURIComponent(serverId)}/authorization/pending`,
+      signal,
+    );
+  }
+
+  clearMcpAuthorization(serverId: string, signal?: AbortSignal): Promise<void> {
+    return this.delete<void>(`/api/mcp/servers/${encodeURIComponent(serverId)}/authorization`, signal);
   }
 
   artifactUrl(runId: string, path: string): string {

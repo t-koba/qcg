@@ -14,6 +14,9 @@ name = "Generator Assets"
 qcg_version = "^0.1"
 version = "0.1.0"
 
+[permissions]
+fs_write = ["workspace"]
+
 [[inputs.stages]]
 id = "input"
 

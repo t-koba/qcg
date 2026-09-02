@@ -28,11 +28,31 @@ pub struct StartRun {
     pub inputs: BTreeMap<String, Value>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ForkStatePatch {
+    #[serde(default)]
+    pub inputs: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub step_outputs: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub step_statuses: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ForkRun {
+    pub at_seq: u64,
+    #[serde(default)]
+    pub state_patch: ForkStatePatch,
+}
+
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
+    Queued,
     Running,
     Waiting,
     Confirming,
@@ -44,13 +64,17 @@ pub enum RunStatus {
 
 impl RunStatus {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Succeeded | Self::Failed | Self::Canceled)
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Canceled | Self::Interrupted
+        )
     }
 }
 
 impl std::fmt::Display for RunStatus {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
+            Self::Queued => "queued",
             Self::Running => "running",
             Self::Waiting => "waiting",
             Self::Confirming => "confirming",
@@ -111,6 +135,24 @@ pub struct ConfirmDecision {
     pub decision: ConfirmationDecision,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct McpServerSummary {
+    pub id: String,
+    pub transport: String,
+    pub auth: String,
+    pub authorized: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct McpServerList {
+    pub items: Vec<McpServerSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct McpAuthorizationStart {
+    pub authorization_url: String,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfirmationDecision {
@@ -142,6 +184,8 @@ pub fn openapi_components() -> Value {
     insert_schema::<GeneratorSummary>(&mut schemas, "GeneratorSummary");
     insert_schema::<GeneratorDetail>(&mut schemas, "GeneratorDetail");
     insert_schema::<StartRun>(&mut schemas, "StartRun");
+    insert_schema::<ForkStatePatch>(&mut schemas, "ForkStatePatch");
+    insert_schema::<ForkRun>(&mut schemas, "ForkRun");
     insert_schema::<RunSnapshot>(&mut schemas, "RunSnapshot");
     insert_schema::<RunListItem>(&mut schemas, "RunListItem");
     insert_schema::<RunListResponse>(&mut schemas, "RunListResponse");
@@ -149,15 +193,27 @@ pub fn openapi_components() -> Value {
     insert_schema::<RunEvent>(&mut schemas, "RunEvent");
     insert_schema::<AnswerPayload>(&mut schemas, "AnswerPayload");
     insert_schema::<ConfirmDecision>(&mut schemas, "ConfirmDecision");
+    insert_schema::<McpServerSummary>(&mut schemas, "McpServerSummary");
+    insert_schema::<McpServerList>(&mut schemas, "McpServerList");
+    insert_schema::<McpAuthorizationStart>(&mut schemas, "McpAuthorizationStart");
     insert_schema::<ProblemDetails>(&mut schemas, "ProblemDetails");
     insert_schema::<OutputManifest>(&mut schemas, "OutputManifest");
-    json!({ "schemas": schemas })
+    json!({
+        "schemas": schemas,
+        "securitySchemes": {
+            "bearerAuth": {
+                "type": "http",
+                "scheme": "bearer"
+            }
+        }
+    })
 }
 
 pub fn openapi_document(version: &str) -> Value {
     json!({
         "openapi": "3.1.0",
         "info": { "title": "qcg", "version": version },
+        "security": [{}, { "bearerAuth": [] }],
         "paths": openapi_paths(),
         "components": openapi_components()
     })
@@ -227,8 +283,10 @@ pub struct ApiRoute {
 const ERR_INTERNAL: &[u16] = &[500];
 const ERR_RESOURCE: &[u16] = &[400, 404, 500];
 const ERR_INVALID: &[u16] = &[400, 500];
+const ERR_MCP_MUTATION: &[u16] = &[400, 403];
+const ERR_MCP_CALLBACK: &[u16] = &[400, 403, 500];
 const ERR_START_RUN: &[u16] = &[400, 409, 413, 422, 500, 503];
-const ERR_INTERACTION: &[u16] = &[400, 404, 409, 422, 500];
+const ERR_INTERACTION: &[u16] = &[400, 404, 409, 422, 500, 503];
 const ERR_MUTATION: &[u16] = &[404, 409, 500];
 
 const NO_HEADERS: &[ApiHeader] = &[];
@@ -262,6 +320,28 @@ const RUN_LIST_QUERY_PARAMETERS: &[ApiParameter] = &[
         name: "since",
         required: false,
         schema: ParameterSchema::DateTime,
+    },
+];
+const OAUTH_CALLBACK_QUERY_PARAMETERS: &[ApiParameter] = &[
+    ApiParameter {
+        name: "code",
+        required: false,
+        schema: ParameterSchema::String,
+    },
+    ApiParameter {
+        name: "state",
+        required: true,
+        schema: ParameterSchema::String,
+    },
+    ApiParameter {
+        name: "iss",
+        required: false,
+        schema: ParameterSchema::String,
+    },
+    ApiParameter {
+        name: "error",
+        required: false,
+        schema: ParameterSchema::String,
     },
 ];
 const NO_ADDITIONAL_RESPONSES: &[ApiResponse] = &[];
@@ -306,6 +386,22 @@ pub const API_ROUTES: &[ApiRoute] = &[
             status: 200,
             description: "Server is healthy",
             body: ResponseBody::Json(None),
+            headers: NO_HEADERS,
+        },
+        additional_responses: NO_ADDITIONAL_RESPONSES,
+        request_schema: None,
+        request_headers: NO_HEADERS,
+        query_parameters: NO_QUERY_PARAMETERS,
+        errors: ERR_INTERNAL,
+    },
+    ApiRoute {
+        method: "get",
+        path: "/metrics",
+        summary: "Prometheus metrics",
+        response: ApiResponse {
+            status: 200,
+            description: "Prometheus text exposition",
+            body: ResponseBody::Text("text/plain; version=0.0.4"),
             headers: NO_HEADERS,
         },
         additional_responses: NO_ADDITIONAL_RESPONSES,
@@ -380,6 +476,86 @@ pub const API_ROUTES: &[ApiRoute] = &[
     },
     ApiRoute {
         method: "get",
+        path: "/api/mcp/servers",
+        summary: "List configured MCP servers and authorization status",
+        response: ApiResponse {
+            status: 200,
+            description: "Configured MCP servers",
+            body: ResponseBody::Json(Some(ResponseSchema::Ref("McpServerList"))),
+            headers: NO_HEADERS,
+        },
+        additional_responses: NO_ADDITIONAL_RESPONSES,
+        request_schema: None,
+        request_headers: NO_HEADERS,
+        query_parameters: NO_QUERY_PARAMETERS,
+        errors: ERR_INTERNAL,
+    },
+    ApiRoute {
+        method: "post",
+        path: "/api/mcp/servers/{id}/authorization",
+        summary: "Start MCP OAuth authorization",
+        response: ApiResponse {
+            status: 200,
+            description: "Authorization URL",
+            body: ResponseBody::Json(Some(ResponseSchema::Ref("McpAuthorizationStart"))),
+            headers: NO_HEADERS,
+        },
+        additional_responses: NO_ADDITIONAL_RESPONSES,
+        request_schema: None,
+        request_headers: NO_HEADERS,
+        query_parameters: NO_QUERY_PARAMETERS,
+        errors: ERR_MCP_MUTATION,
+    },
+    ApiRoute {
+        method: "delete",
+        path: "/api/mcp/servers/{id}/authorization",
+        summary: "Clear stored MCP OAuth authorization",
+        response: ApiResponse {
+            status: 204,
+            description: "Authorization cleared",
+            body: ResponseBody::Empty,
+            headers: NO_HEADERS,
+        },
+        additional_responses: NO_ADDITIONAL_RESPONSES,
+        request_schema: None,
+        request_headers: NO_HEADERS,
+        query_parameters: NO_QUERY_PARAMETERS,
+        errors: ERR_MCP_MUTATION,
+    },
+    ApiRoute {
+        method: "delete",
+        path: "/api/mcp/servers/{id}/authorization/pending",
+        summary: "Cancel a pending MCP OAuth authorization",
+        response: ApiResponse {
+            status: 204,
+            description: "Pending authorization canceled",
+            body: ResponseBody::Empty,
+            headers: NO_HEADERS,
+        },
+        additional_responses: NO_ADDITIONAL_RESPONSES,
+        request_schema: None,
+        request_headers: NO_HEADERS,
+        query_parameters: NO_QUERY_PARAMETERS,
+        errors: ERR_MCP_MUTATION,
+    },
+    ApiRoute {
+        method: "get",
+        path: "/api/mcp/oauth/callback",
+        summary: "Complete an MCP OAuth authorization callback",
+        response: ApiResponse {
+            status: 200,
+            description: "Authorization completed",
+            body: ResponseBody::Text("text/html"),
+            headers: NO_HEADERS,
+        },
+        additional_responses: NO_ADDITIONAL_RESPONSES,
+        request_schema: None,
+        request_headers: NO_HEADERS,
+        query_parameters: OAUTH_CALLBACK_QUERY_PARAMETERS,
+        errors: ERR_MCP_CALLBACK,
+    },
+    ApiRoute {
+        method: "get",
         path: "/api/runs",
         summary: "List runs",
         response: ApiResponse {
@@ -427,6 +603,22 @@ pub const API_ROUTES: &[ApiRoute] = &[
         errors: ERR_RESOURCE,
     },
     ApiRoute {
+        method: "post",
+        path: "/api/runs/{id}/fork",
+        summary: "Fork a run from a durable checkpoint",
+        response: ApiResponse {
+            status: 201,
+            description: "Forked run",
+            body: ResponseBody::Json(Some(ResponseSchema::Ref("RunSnapshot"))),
+            headers: LOCATION_HEADERS,
+        },
+        additional_responses: NO_ADDITIONAL_RESPONSES,
+        request_schema: Some("ForkRun"),
+        request_headers: NO_HEADERS,
+        query_parameters: NO_QUERY_PARAMETERS,
+        errors: ERR_START_RUN,
+    },
+    ApiRoute {
         method: "put",
         path: "/api/runs/{id}/questions/{qid}",
         summary: "Answer a pending run question",
@@ -464,7 +656,7 @@ pub const API_ROUTES: &[ApiRoute] = &[
         summary: "Cancel a run",
         response: ApiResponse {
             status: 200,
-            description: "Canceled run snapshot",
+            description: "Settled run snapshot",
             body: ResponseBody::Json(Some(ResponseSchema::Ref("RunSnapshot"))),
             headers: NO_HEADERS,
         },
@@ -737,7 +929,7 @@ fn response_schema(schema: ResponseSchema) -> Value {
 pub fn run_event_reference_markdown() -> String {
     let components = openapi_components();
     let mut markdown = String::from(
-        "## RunEvent Reference\n\nGenerated from the OpenAPI `RunEvent` schema. Every event uses the required envelope fields `seq`, `ts`, `run_id`, `kind`, and `data`; `path` is present for node-scoped events. Unknown `kind` values are preserved with opaque `data`.\n\n| Event | Required `data` fields |\n|---|---|\n",
+        "## RunEvent Reference\n\nGenerated from the OpenAPI `RunEvent` schema. Every event uses the required envelope fields `seq`, `ts`, `run_id`, `trace_id`, `span_id`, `kind`, and `data`; `path` is present for node-scoped events. Trace and span IDs use W3C-compatible hexadecimal widths. Unknown `kind` values are preserved with opaque `data`.\n\n| Event | Required `data` fields |\n|---|---|\n",
     );
     for (event, schema_name) in RUN_EVENT_DATA_SCHEMAS {
         let required = components["schemas"][schema_name]
@@ -873,6 +1065,8 @@ pub enum ApiError {
     #[error("{detail}")]
     Unsupported { detail: String },
     #[error("{detail}")]
+    Unavailable { detail: String },
+    #[error("{detail}")]
     Internal { detail: String },
 }
 
@@ -899,6 +1093,12 @@ impl ApiError {
 
     pub fn internal(detail: impl Into<String>) -> Self {
         Self::Internal {
+            detail: detail.into(),
+        }
+    }
+
+    pub fn unavailable(detail: impl Into<String>) -> Self {
+        Self::Unavailable {
             detail: detail.into(),
         }
     }

@@ -8,6 +8,7 @@ type = "llm.fill"
 
 [flow.params]
 max_iterations = 1
+max_tokens_total = 1024
 prompt = "prompts/fill.j2"
 schema = "schemas/result.schema.json"
 

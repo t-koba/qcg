@@ -37,9 +37,11 @@ qcg_version = "^0.1"
 version = "0.1.0"
 
 [permissions]
+fs_write = ["workspace"]
 side_effects = "confirm"
 
 [[permissions.commands]]
 args = ["confirmed"]
 bin = "echo"
 purpose = "demonstrate side effect confirmation"
+isolation = "trusted_host"

@@ -2,11 +2,91 @@ use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
 use serde_json::Value;
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::fmt;
 
 mod run_event;
 
 pub use run_event::*;
+
+/// Provider-neutral reasoning effort requested for a model invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+/// Provider-neutral policy for whether a model may call an exposed tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum ToolChoice {
+    Mode(ToolChoiceMode),
+    Tool { tool: String },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolChoiceMode {
+    None,
+    #[default]
+    Auto,
+    Required,
+}
+
+impl ToolChoice {
+    pub const fn none() -> Self {
+        Self::Mode(ToolChoiceMode::None)
+    }
+
+    pub const fn auto() -> Self {
+        Self::Mode(ToolChoiceMode::Auto)
+    }
+
+    pub const fn required() -> Self {
+        Self::Mode(ToolChoiceMode::Required)
+    }
+}
+
+impl Default for ToolChoice {
+    fn default() -> Self {
+        Self::auto()
+    }
+}
+
+/// Provider-neutral control for the detail of a model response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseVerbosity {
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+impl fmt::Display for ReasoningEffort {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
 
 /// Maximum decoded size of an inline file input.
 pub const MAX_FILE_INPUT_BYTES: usize = 16 * 1024 * 1024;
@@ -16,13 +96,49 @@ pub const MAX_FILE_INPUT_BYTES: usize = 16 * 1024 * 1024;
 /// The check is intentionally platform-independent because these paths are
 /// persisted in contracts and journals and may be consumed on another host.
 pub fn is_safe_relative_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
     !path.is_empty()
         && !path.starts_with('/')
+        && !(bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
         && !path.contains('\\')
         && !path.contains('\0')
         && !path
             .split('/')
             .any(|part| part.is_empty() || part == "." || part == "..")
+}
+
+/// Returns whether a configuration name conventionally denotes credential material.
+///
+/// Token boundaries avoid false positives such as `AUTHORITY` and `TOKENIZER`, while
+/// also recognizing compact names such as `APIKEY` and numbered secret slots.
+pub fn credential_like_name(name: &str) -> bool {
+    name.split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_uppercase())
+        .any(|token| {
+            [
+                "APIKEY",
+                "APITOKEN",
+                "AUTH",
+                "AUTHORIZATION",
+                "BEARER",
+                "COOKIE",
+                "CREDENTIAL",
+                "CREDENTIALS",
+                "KEY",
+                "PASSWORD",
+                "PASSWD",
+                "SECRET",
+                "TOKEN",
+            ]
+            .iter()
+            .any(|marker| {
+                token == *marker
+                    || token.strip_prefix(marker).is_some_and(|suffix| {
+                        !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit())
+                    })
+            })
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,24 +243,45 @@ impl FileValue {
         name: impl Into<String>,
         text: impl Into<String>,
     ) -> Result<Self, FileValueError> {
+        Self::from_text_with_limit(name, text, MAX_FILE_INPUT_BYTES)
+    }
+
+    pub fn from_text_with_limit(
+        name: impl Into<String>,
+        text: impl Into<String>,
+        max_bytes: usize,
+    ) -> Result<Self, FileValueError> {
         Self {
             name: name.into(),
             text: Some(text.into()),
             content_base64: None,
         }
-        .normalized()
+        .normalized_with_limit(max_bytes)
     }
 
     pub fn from_bytes(name: impl Into<String>, bytes: &[u8]) -> Result<Self, FileValueError> {
+        Self::from_bytes_with_limit(name, bytes, MAX_FILE_INPUT_BYTES)
+    }
+
+    pub fn from_bytes_with_limit(
+        name: impl Into<String>,
+        bytes: &[u8],
+        max_bytes: usize,
+    ) -> Result<Self, FileValueError> {
+        validate_decoded_size_with_limit(bytes.len(), max_bytes)?;
         Self {
             name: name.into(),
             text: None,
             content_base64: Some(encode_base64(bytes)),
         }
-        .normalized()
+        .normalized_with_limit(max_bytes)
     }
 
     pub fn from_value(value: &Value) -> Result<Self, FileValueError> {
+        Self::from_value_with_limit(value, MAX_FILE_INPUT_BYTES)
+    }
+
+    pub fn from_value_with_limit(value: &Value, max_bytes: usize) -> Result<Self, FileValueError> {
         let object = value
             .as_object()
             .ok_or_else(|| FileValueError::InvalidShape("file input must be an object".into()))?;
@@ -185,18 +322,23 @@ impl FileValue {
             text,
             content_base64,
         }
-        .normalized()
+        .normalized_with_limit(max_bytes)
     }
 
     pub fn validate(&self) -> Result<(), FileValueError> {
+        self.validate_with_limit(MAX_FILE_INPUT_BYTES)
+    }
+
+    pub fn validate_with_limit(&self, max_bytes: usize) -> Result<(), FileValueError> {
         if !is_safe_relative_path(&self.name) || self.name.contains('/') {
             return Err(FileValueError::UnsafeName(self.name.clone()));
         }
         match (&self.text, &self.content_base64) {
-            (Some(text), None) => validate_decoded_size(text.len()),
+            (Some(text), None) => validate_decoded_size_with_limit(text.len(), max_bytes),
             (None, Some(content_base64)) => {
+                validate_base64_input_size(content_base64, max_bytes)?;
                 let bytes = decode_base64(content_base64)?;
-                validate_decoded_size(bytes.len())
+                validate_decoded_size_with_limit(bytes.len(), max_bytes)
             }
             (None, None) => Err(FileValueError::MissingContent),
             (Some(_), Some(_)) => Err(FileValueError::MultipleContent),
@@ -204,7 +346,11 @@ impl FileValue {
     }
 
     pub fn decode(&self) -> Result<Vec<u8>, FileValueError> {
-        self.validate()?;
+        self.decode_with_limit(MAX_FILE_INPUT_BYTES)
+    }
+
+    pub fn decode_with_limit(&self, max_bytes: usize) -> Result<Vec<u8>, FileValueError> {
+        self.validate_with_limit(max_bytes)?;
         match (&self.text, &self.content_base64) {
             (Some(text), None) => Ok(text.as_bytes().to_vec()),
             (None, Some(content_base64)) => decode_base64(content_base64),
@@ -212,15 +358,16 @@ impl FileValue {
         }
     }
 
-    fn normalized(self) -> Result<Self, FileValueError> {
+    fn normalized_with_limit(self, max_bytes: usize) -> Result<Self, FileValueError> {
         let bytes = match (&self.text, &self.content_base64) {
             (Some(text), None) => {
-                validate_decoded_size(text.len())?;
+                validate_decoded_size_with_limit(text.len(), max_bytes)?;
                 None
             }
             (None, Some(content_base64)) => {
+                validate_base64_input_size(content_base64, max_bytes)?;
                 let bytes = decode_base64(content_base64)?;
-                validate_decoded_size(bytes.len())?;
+                validate_decoded_size_with_limit(bytes.len(), max_bytes)?;
                 Some(bytes)
             }
             (None, None) => return Err(FileValueError::MissingContent),
@@ -240,11 +387,22 @@ impl FileValue {
     }
 }
 
-fn validate_decoded_size(bytes: usize) -> Result<(), FileValueError> {
-    if bytes > MAX_FILE_INPUT_BYTES {
+fn validate_decoded_size_with_limit(bytes: usize, max_bytes: usize) -> Result<(), FileValueError> {
+    if bytes > max_bytes {
         return Err(FileValueError::TooLarge {
             actual_bytes: bytes,
-            limit_bytes: MAX_FILE_INPUT_BYTES,
+            limit_bytes: max_bytes,
+        });
+    }
+    Ok(())
+}
+
+fn validate_base64_input_size(input: &str, max_bytes: usize) -> Result<(), FileValueError> {
+    let max_encoded = max_bytes.div_ceil(3).saturating_mul(4);
+    if input.len() > max_encoded {
+        return Err(FileValueError::TooLarge {
+            actual_bytes: input.len().saturating_mul(3) / 4,
+            limit_bytes: max_bytes,
         });
     }
     Ok(())
@@ -497,6 +655,18 @@ pub struct InputStage {
 #[serde(deny_unknown_fields)]
 pub struct InputField {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub label_i18n: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub description_i18n: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub placeholder_i18n: BTreeMap<String, String>,
     #[serde(rename = "type")]
     #[schemars(with = "String")]
     pub kind: FieldType,
@@ -508,11 +678,19 @@ pub struct InputField {
     pub pattern: Option<String>,
     #[serde(default)]
     pub options: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub option_labels_i18n: BTreeMap<String, BTreeMap<String, String>>,
     #[serde(default)]
     pub min_items: Option<usize>,
     #[serde(default)]
     #[schemars(with = "Option<String>")]
     pub item_type: Option<FieldType>,
+    /// Optional JSON Schema applied after the canonical field-type checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<Value>,
+    /// Renderer-specific presentation metadata forwarded to clients unchanged.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub ui: serde_json::Map<String, Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, JsonSchema)]
@@ -588,6 +766,36 @@ pub struct OutputArtifact {
     pub required: bool,
     #[serde(default)]
     pub mime: Option<String>,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub preview: ArtifactPreview,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactPreview {
+    #[default]
+    Auto,
+    Text,
+    Json,
+    Markdown,
+    Image,
+    Html,
+    Pdf,
+    Audio,
+    Video,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StructuredOutputMode {
+    #[default]
+    Auto,
+    NativeStrict,
+    NativeCompatible,
+    Prompt,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -610,6 +818,8 @@ pub enum Severity {
 pub struct FormSpec {
     pub id: String,
     pub title: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub title_i18n: BTreeMap<String, String>,
     pub fields: Vec<InputField>,
 }
 
@@ -659,6 +869,10 @@ pub struct RunEvent {
     pub seq: u64,
     pub ts: String,
     pub run_id: String,
+    pub trace_id: String,
+    pub span_id: String,
+    #[serde(default)]
+    pub parent_span_id: Option<String>,
     #[serde(default)]
     pub path: Option<NodePath>,
     pub kind: String,
@@ -675,6 +889,10 @@ impl<'de> Deserialize<'de> for RunEvent {
             seq: u64,
             ts: String,
             run_id: String,
+            trace_id: String,
+            span_id: String,
+            #[serde(default)]
+            parent_span_id: Option<String>,
             #[serde(default)]
             path: Option<NodePath>,
             kind: String,
@@ -687,6 +905,9 @@ impl<'de> Deserialize<'de> for RunEvent {
             seq: raw.seq,
             ts: raw.ts,
             run_id: raw.run_id,
+            trace_id: raw.trace_id,
+            span_id: raw.span_id,
+            parent_span_id: raw.parent_span_id,
             path: raw.path,
             kind: raw.kind,
             data,
@@ -695,7 +916,7 @@ impl<'de> Deserialize<'de> for RunEvent {
 }
 
 impl RunEvent {
-    pub fn from_flat(value: &Value, default_run_id: &str) -> Result<Self, String> {
+    pub fn from_flat(value: &Value) -> Result<Self, String> {
         let object = value
             .as_object()
             .ok_or_else(|| "run event must be an object".to_string())?;
@@ -716,14 +937,33 @@ impl RunEvent {
         let run_id = object
             .get("run_id")
             .and_then(Value::as_str)
-            .unwrap_or(default_run_id)
+            .ok_or_else(|| "run event run_id is required".to_string())?
+            .to_string();
+        let trace_id = object
+            .get("trace_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "run event trace_id is required".to_string())?
+            .to_string();
+        let span_id = object
+            .get("span_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "run event span_id is required".to_string())?
             .to_string();
         let path = object
             .get("node")
             .and_then(Value::as_str)
             .map(NodePath::root);
         let mut data = object.clone();
-        for common in ["seq", "ts", "t", "run_id", "node"] {
+        for common in [
+            "seq",
+            "ts",
+            "t",
+            "run_id",
+            "trace_id",
+            "span_id",
+            "parent_span_id",
+            "node",
+        ] {
             data.remove(common);
         }
         let data = RunEventData::parse(&kind, Value::Object(data))?;
@@ -731,6 +971,12 @@ impl RunEvent {
             seq,
             ts,
             run_id,
+            trace_id,
+            span_id,
+            parent_span_id: object
+                .get("parent_span_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             path,
             kind,
             data,
@@ -738,10 +984,14 @@ impl RunEvent {
     }
 
     pub fn lagged(run_id: impl Into<String>, seq: u64) -> Self {
+        let run_id = run_id.into();
         Self {
             seq,
             ts: chrono::Utc::now().to_rfc3339(),
-            run_id: run_id.into(),
+            trace_id: trace_id_for_run(&run_id),
+            span_id: span_id_for_seq(seq),
+            parent_span_id: None,
+            run_id,
             path: None,
             kind: "lagged".into(),
             data: RunEventData::Lagged(LaggedEventData {
@@ -749,6 +999,40 @@ impl RunEvent {
             }),
         }
     }
+}
+
+pub fn trace_id_for_run(run_id: &str) -> String {
+    let compact = run_id
+        .bytes()
+        .filter(|byte| byte.is_ascii_hexdigit())
+        .map(|byte| (byte as char).to_ascii_lowercase())
+        .collect::<String>();
+    if compact.len() == 32 && compact.bytes().any(|byte| byte != b'0') {
+        return compact;
+    }
+    let mut state = [0xcbf29ce484222325_u64, 0x84222325cbf29ce4_u64];
+    for (index, byte) in run_id.bytes().enumerate() {
+        let slot = index & 1;
+        state[slot] ^= u64::from(byte);
+        state[slot] = state[slot].wrapping_mul(0x100000001b3);
+    }
+    format!("{:016x}{:016x}", state[0], state[1])
+}
+
+pub fn span_id_for_seq(seq: u64) -> String {
+    format!("{:016x}", seq.max(1))
+}
+
+pub fn span_id_for_scope(run_id: &str, scope: &str) -> String {
+    let mut state = 0xcbf29ce484222325_u64;
+    for byte in run_id.bytes().chain(*b":").chain(scope.bytes()) {
+        state ^= u64::from(byte);
+        state = state.wrapping_mul(0x100000001b3);
+    }
+    if state == 0 {
+        state = 1;
+    }
+    format!("{state:016x}")
 }
 
 #[cfg(test)]
@@ -763,13 +1047,15 @@ mod tests {
             "seq": 7,
             "ts": "2026-07-05T00:00:00Z",
             "run_id": "run-1",
+            "trace_id": "trace-1",
+            "span_id": "span-7",
             "node": "write_config",
             "status": "success",
             "files": [],
             "output": { "ok": true },
             "output_name": "write_config"
         });
-        let event = RunEvent::from_flat(&value, "unused").expect("event should decode");
+        let event = RunEvent::from_flat(&value).expect("event should decode");
 
         assert_eq!(
             event.path.as_ref().map(NodePath::as_str),
@@ -790,6 +1076,9 @@ mod tests {
             "t": "step_skipped",
             "seq": 1,
             "ts": "2026-07-05T00:00:00Z",
+            "run_id": "run-1",
+            "trace_id": "trace-1",
+            "span_id": "span-1",
             "node": "skip",
             "reason": {
                 "code": "when_false",
@@ -797,9 +1086,246 @@ mod tests {
             },
             "unexpected": true
         });
-        let error =
-            RunEvent::from_flat(&value, "run-1").expect_err("known event data must be closed");
+        let error = RunEvent::from_flat(&value).expect_err("known event data must be closed");
         assert!(error.contains("unknown field"));
+    }
+
+    #[test]
+    fn command_resource_events_decode_as_a_typed_source() {
+        let value = json!({
+            "t": "resource",
+            "seq": 2,
+            "ts": "2026-09-01T00:00:00Z",
+            "run_id": "run-1",
+            "trace_id": "trace-1",
+            "span_id": "span-2",
+            "name": "generated",
+            "type": "exec",
+            "source": { "kind": "command", "command": ["printf", "hello"] },
+            "sha256": "00",
+            "bytes": 5,
+            "cache": "not_applicable",
+            "trust": "untrusted",
+            "llm_visible": true
+        });
+        let event = RunEvent::from_flat(&value).expect("command resource event should decode");
+        assert!(matches!(
+            event.data,
+            RunEventData::Resource(ResourceEventData {
+                source: ResourceSource::Command { command },
+                ..
+            }) if command == ["printf", "hello"]
+        ));
+    }
+
+    #[test]
+    fn specialist_events_use_the_node_envelope_and_closed_typed_data() {
+        let delegated = json!({
+            "t": "agent_delegated",
+            "seq": 1,
+            "ts": "2026-08-31T00:00:00Z",
+            "run_id": "run-1",
+            "trace_id": "trace-1",
+            "span_id": "span-1",
+            "node": "research",
+            "agent": "parallel_researcher",
+            "tool_call_id": "call-delegate-1",
+            "tools": ["parallel_search"],
+            "max_calls": 2,
+            "max_iterations": 4,
+            "max_tokens_total": 10000,
+            "max_tool_calls_total": 3
+        });
+        let event = RunEvent::from_flat(&delegated).expect("delegated event should decode");
+        assert_eq!(event.path.as_ref().map(NodePath::as_str), Some("research"));
+        assert!(matches!(event.data, RunEventData::AgentDelegated(_)));
+
+        let llm_call = json!({
+            "t": "llm_call",
+            "seq": 2,
+            "ts": "2026-08-31T00:00:01Z",
+            "run_id": "run-1",
+            "trace_id": "trace-1",
+            "span_id": "span-2",
+            "node": "research",
+            "provider": "fake",
+            "model": "fake",
+            "max_tokens": 128,
+            "agent": "parallel_researcher",
+            "tokens": { "input": 10, "output": 2 },
+            "cost_microusd": 0
+        });
+        let event = RunEvent::from_flat(&llm_call).expect("specialist LLM event should decode");
+        match event.data {
+            RunEventData::LlmCall(data) => {
+                assert_eq!(data.agent.as_deref(), Some("parallel_researcher"));
+            }
+            other => panic!("expected typed llm_call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn failed_tool_events_decode_typed_phase_status_and_error() {
+        let value = json!({
+            "t": "tool_call",
+            "seq": 3,
+            "ts": "2026-08-31T00:00:02Z",
+            "run_id": "run-1",
+            "trace_id": "trace-1",
+            "span_id": "span-3",
+            "node": "research",
+            "tool": "parallel_search",
+            "id": "call-1",
+            "status": "failed",
+            "phase": "execution",
+            "agent": "parallel_researcher",
+            "error": { "code": "execution_failed", "message": "transport failed" },
+            "duration_ms": 7,
+            "arguments": { "objective": "research" },
+            "result": null,
+            "sources": [],
+            "truncated": false
+        });
+        let event = RunEvent::from_flat(&value).expect("typed tool failure should decode");
+        match event.data {
+            RunEventData::ToolCall(data) => {
+                assert_eq!(data.status, ToolCallStatus::Failed);
+                assert_eq!(data.phase, ToolCallPhase::Execution);
+                assert_eq!(
+                    data.error.expect("error details").code,
+                    ToolCallErrorCode::ExecutionFailed
+                );
+            }
+            other => panic!("expected typed tool_call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn context_compaction_events_decode_prompt_and_transcript_shapes() {
+        let prompt = json!({
+            "t": "context_compacted",
+            "seq": 4,
+            "ts": "2026-08-31T00:00:03Z",
+            "run_id": "run-1",
+            "trace_id": "trace-1",
+            "span_id": "span-4",
+            "node": "generate",
+            "policy": "truncate_tail",
+            "original_bytes": 4096,
+            "final_bytes": 1024,
+            "limit_bytes": 1024
+        });
+        let event = RunEvent::from_flat(&prompt).expect("prompt compaction should decode");
+        assert!(matches!(
+            event.data,
+            RunEventData::ContextCompacted(ContextCompactedEventData::Prompt(data))
+                if data.policy == ContextCompactionPolicy::TruncateTail
+                    && data.original_bytes == 4096
+        ));
+
+        let transcript = json!({
+            "t": "context_compacted",
+            "seq": 5,
+            "ts": "2026-08-31T00:00:04Z",
+            "run_id": "run-1",
+            "trace_id": "trace-1",
+            "span_id": "span-5",
+            "node": "research",
+            "scope": "agent_transcript",
+            "policy": "truncate_head",
+            "original_bytes": 8192,
+            "final_bytes": 2048,
+            "limit_bytes": 2048,
+            "compacted_tool_results": 3,
+            "compacted_messages": 1
+        });
+        let event = RunEvent::from_flat(&transcript).expect("transcript compaction should decode");
+        assert!(matches!(
+            event.data,
+            RunEventData::ContextCompacted(ContextCompactedEventData::RequestOrTranscript(data))
+                if data.scope == ContextCompactionScope::AgentTranscript
+                    && data.compacted_tool_results == 3
+                    && data.compacted_messages == 1
+        ));
+
+        let request = json!({
+            "t": "context_compacted",
+            "seq": 6,
+            "ts": "2026-08-31T00:00:05Z",
+            "run_id": "run-1",
+            "trace_id": "trace-1",
+            "span_id": "span-6",
+            "node": "research",
+            "scope": "request",
+            "policy": "truncate_tail",
+            "original_bytes": 16384,
+            "final_bytes": 4096,
+            "limit_bytes": 4096,
+            "compacted_tool_results": 2,
+            "compacted_messages": 0
+        });
+        let event = RunEvent::from_flat(&request).expect("request compaction should decode");
+        assert!(matches!(
+            event.data,
+            RunEventData::ContextCompacted(ContextCompactedEventData::RequestOrTranscript(data))
+                if data.scope == ContextCompactionScope::Request
+                    && data.compacted_tool_results == 2
+        ));
+
+        let mut invalid = transcript;
+        invalid["unexpected"] = json!(true);
+        let error = RunEvent::from_flat(&invalid)
+            .expect_err("closed context compaction payload should reject unknown fields");
+        assert!(!error.is_empty(), "{error}");
+    }
+
+    #[test]
+    fn agent_handoff_and_llm_route_failure_events_decode_closed_payloads() {
+        let handoff = json!({
+            "t": "agent_handoff",
+            "seq": 6,
+            "ts": "2026-08-31T00:00:05Z",
+            "run_id": "run-1",
+            "trace_id": "trace-1",
+            "span_id": "span-6",
+            "node": "research",
+            "agent": "parallel_researcher",
+            "tool_call_id": "call-handoff-1"
+        });
+        let event = RunEvent::from_flat(&handoff).expect("agent handoff should decode");
+        assert!(matches!(
+            event.data,
+            RunEventData::AgentHandoff(AgentHandoffEventData { agent, tool_call_id })
+                if agent == "parallel_researcher" && tool_call_id == "call-handoff-1"
+        ));
+
+        let route_failed = json!({
+            "t": "llm_route_failed",
+            "seq": 7,
+            "ts": "2026-08-31T00:00:06Z",
+            "run_id": "run-1",
+            "trace_id": "trace-1",
+            "span_id": "span-7",
+            "node": "research",
+            "provider": "openai",
+            "model": "gpt-5",
+            "attempt": 1,
+            "kind": { "http_status": 503 }
+        });
+        let event = RunEvent::from_flat(&route_failed).expect("route failure should decode");
+        assert!(matches!(
+            event.data,
+            RunEventData::LlmRouteFailed(LlmRouteFailedEventData {
+                kind: LlmRouteFailureKind::HttpStatus(503),
+                ..
+            })
+        ));
+
+        let mut invalid = route_failed;
+        invalid["unexpected"] = json!(true);
+        let error = RunEvent::from_flat(&invalid)
+            .expect_err("closed route failure payload should reject unknown fields");
+        assert!(error.contains("unknown field"), "{error}");
     }
 
     #[test]
@@ -808,12 +1334,33 @@ mod tests {
             "t": "third_party.progress",
             "seq": 3,
             "ts": "2026-07-05T00:00:00Z",
+            "run_id": "run-1",
+            "trace_id": "trace-1",
+            "span_id": "span-3",
             "percent": 50
         });
-        let event = RunEvent::from_flat(&value, "run-1").expect("unknown event should decode");
+        let event = RunEvent::from_flat(&value).expect("unknown event should decode");
         match event.data {
             RunEventData::Unknown(data) => assert_eq!(data, json!({ "percent": 50 })),
             other => panic!("expected unknown event data, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flat_event_requires_complete_trace_identity() {
+        let base = json!({
+            "t": "third_party.progress",
+            "seq": 1,
+            "ts": "2026-07-05T00:00:00Z",
+            "run_id": "run-1",
+            "trace_id": "trace-1",
+            "span_id": "span-1"
+        });
+        for field in ["run_id", "trace_id", "span_id"] {
+            let mut value = base.clone();
+            value.as_object_mut().expect("object").remove(field);
+            let error = RunEvent::from_flat(&value).expect_err("identity field must be required");
+            assert!(error.contains(field), "{error}");
         }
     }
 
@@ -841,11 +1388,26 @@ mod tests {
             "assets//index.html",
             "assets/./index.html",
             "assets\\index.html",
+            "C:/index.html",
+            "C:index.html",
             ".",
             "..",
             "assets\0/index.html",
         ] {
             assert!(!is_safe_relative_path(path), "{path:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn credential_names_use_token_boundaries() {
+        for name in ["APIKEY", "QCG_AUTH", "X-Credential", "ACCESS_KEY", "TOKEN2"] {
+            assert!(credential_like_name(name), "{name} should be sensitive");
+        }
+        for name in ["AUTHORITY", "KEYBOARD", "PASSWORDLESS", "TOKENIZER"] {
+            assert!(
+                !credential_like_name(name),
+                "{name} should not be sensitive"
+            );
         }
     }
 

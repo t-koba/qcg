@@ -28,6 +28,7 @@ model = "fake"
 provider = "fake"
 
 [permissions]
+fs_write = ["workspace"]
 
 [resources.local_skill]
 llm_visible = true

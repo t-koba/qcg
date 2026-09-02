@@ -1,0 +1,10 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status"],
+  "properties": {
+    "status": {
+      "const": "retried_child_and_respected_retry_bound"
+    }
+  }
+}

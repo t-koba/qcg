@@ -24,18 +24,23 @@ name = "Logical Tool Host"
 qcg_version = "^0.1"
 version = "0.1.0"
 
+[permissions]
+fs_read = ["workspace"]
+fs_write = ["workspace"]
+
 [[permissions.commands]]
 args = [
-    "-f",
+    "hash-object",
     "*",
 ]
-bin = "test"
+bin = "git"
 purpose = "validate that qpx.yaml exists"
+isolation = "trusted_host"
 
 [tools.qpx_validate]
 command = [
-    "qpxd",
-    "-f",
+    "git",
+    "hash-object",
     "{input}",
 ]
 input = "qpx.yaml"
@@ -45,9 +50,9 @@ timeout_seconds = 30
 workspace = "read_only"
 
 [tools.qpx_validate.backends.host]
-bin = "test"
+bin = "git"
 version_command = [
-    "test",
+    "git",
     "--version",
 ]
 

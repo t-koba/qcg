@@ -38,7 +38,7 @@ public_docs=(
   "built-in-generators.md"
   "cli-reference.md"
   "contract-reference.md"
-  "custom-extension-guide.md"
+  "external-process-guide.md"
   "dag-flow-guide.md"
   "dynamic-ui-guide.md"
   "http-server-guide.md"

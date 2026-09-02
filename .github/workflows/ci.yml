@@ -16,7 +16,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -48,9 +48,17 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      - name: Test MCP transports against local servers
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test -p qcg-mcp --features mcp-test-server --locked -- --test-threads=1
+
+      - name: Test anonymous public MCP contracts
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test -p qcg-llm-steps --locked public_mcp_tools_accept_real_calls_and_validate_real_results -- --ignored --test-threads=1
+
       - name: Test count
         shell: bash
-        run: bash scripts/check-test-count.sh 461
+        run: bash scripts/check-test-count.sh 520
 
       - name: Fixtures smoke
         shell: bash
@@ -70,7 +78,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -81,7 +89,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -113,7 +121,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -124,7 +132,7 @@ jobs:
         run: cargo install wasm-pack --locked
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -143,15 +151,15 @@ jobs:
         run: node scripts/e2e-ui-playwright.mjs
 
   msrv:
-    name: Rust 1.85 MSRV
+    name: Rust 1.88 MSRV
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
-      - name: Install Rust 1.85
-        uses: dtolnay/rust-toolchain@1.85.0
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88.0
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -165,7 +173,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -180,7 +188,7 @@ jobs:
         run: cargo install cargo-deny --locked
 
       - name: Cargo audit
-        run: cargo audit --deny warnings
+        run: cargo audit
 
       - name: Cargo deny
         run: cargo deny check

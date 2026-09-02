@@ -6,10 +6,12 @@ rust-version.workspace = true
 description.workspace = true
 repository.workspace = true
 readme.workspace = true
+publish.workspace = true
 
 [dependencies]
 camino.workspace = true
 hex.workspace = true
+jsonschema.workspace = true
 mime.workspace = true
 regex.workspace = true
 qcg-types = { path = "../qcg-types" }

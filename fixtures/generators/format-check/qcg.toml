@@ -48,3 +48,5 @@ qcg_version = "^0.1"
 version = "0.1.0"
 
 [permissions]
+fs_read = ["workspace"]
+fs_write = ["workspace"]

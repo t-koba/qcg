@@ -25,4 +25,5 @@ required = true
 type = "string"
 
 [permissions]
+fs_write = ["workspace"]
 network = ["example.com"]

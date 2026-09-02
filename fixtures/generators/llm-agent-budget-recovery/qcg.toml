@@ -1,0 +1,51 @@
+[[flow]]
+id = "agent"
+output = "agent_result"
+type = "llm.agent"
+
+[flow.params]
+max_iterations = 5
+max_tokens_total = 8192
+prompt = "prompts/agent.j2"
+schema = "schemas/parent.schema.json"
+
+[[flow.params.tools]]
+kind = "agent"
+name = "researcher"
+description = "A specialist whose local token budget is intentionally exhausted."
+input_schema = { type = "object", additionalProperties = false, required = ["task"], properties = { task = { type = "string", minLength = 1 } } }
+output_schema = "schemas/specialist.schema.json"
+instructions = "Return a schema-valid specialist result."
+tools = []
+max_calls = 3
+max_iterations = 2
+max_tokens_total = 300
+max_tool_calls_total = 1
+on_failure = { default = "return_error" }
+
+[[flow]]
+id = "write_result"
+type = "write"
+artifact = { label = "Recovered result", required = true }
+
+[flow.params]
+content = "{{ steps.agent_result.output.status }}"
+output_file = "result.txt"
+
+[generator]
+description = "Proves that a parent can inspect a specialist-local budget exhaustion and retry the child."
+id = "llm-agent-budget-recovery"
+name = "LLM Agent Budget Recovery"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[llm]
+max_tokens = 256
+temperature = 0.0
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[permissions]
+fs_write = ["workspace"]

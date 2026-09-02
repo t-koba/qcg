@@ -1,5 +1,5 @@
 {% if steps.ask_design_mode.output == 'manual' %}
-{% set package = steps.ask_manual_form.output.design_json.package %}
+{% set package = steps.ask_manual_form.output.package %}
 {% else %}
 {% set package = steps.design_out.output.package %}
 {% endif %}

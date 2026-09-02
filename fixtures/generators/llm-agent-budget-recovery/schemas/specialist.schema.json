@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary"],
+  "default": {
+    "summary": "this response must exceed the one-token specialist budget"
+  },
+  "properties": {
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}

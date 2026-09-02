@@ -1,8 +1,6 @@
 {% if steps.ask_design_mode.output == 'manual' %}
 {
-  "generator_id": {{ steps.ask_manual_form.output.generator_id | tojson }},
-  "generator_name": {{ steps.ask_manual_form.output.generator_name | tojson }},
-  "package": {{ steps.ask_manual_form.output.design_json.package | tojson }}
+  "package": {{ steps.ask_manual_form.output.package | tojson }}
 }
 {% else %}
 {{ steps.design_out.output | tojson }}

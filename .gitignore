@@ -23,6 +23,14 @@ pnpm-debug.log*
 .env.*
 !.env.example
 !.env.*.example
+auth.json
+credentials*.json
+*.pem
+*.key
+*.p12
+*.pfx
+.netrc
+.npmrc
 
 # Editor, operating-system, and test-run artifacts
 .DS_Store

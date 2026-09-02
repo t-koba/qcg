@@ -25,6 +25,7 @@ qcg_version = "^0.1"
 version = "0.1.0"
 
 [llm]
+max_tokens = 2048
 temperature = 0.0
 
 [llm.model]
@@ -32,6 +33,8 @@ model = "fake"
 provider = "fake"
 
 [permissions]
+fs_read = ["workspace"]
+fs_write = ["workspace"]
 
 [secrets.api_token]
 env = "QCG_TEST_TOKEN"

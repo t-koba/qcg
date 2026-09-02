@@ -3,6 +3,31 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+/// Maximum UTF-8 byte length accepted for one expression.
+pub const MAX_EXPRESSION_BYTES: usize = 64 * 1024;
+/// Maximum number of lexer tokens accepted for one expression, including `End`.
+pub const MAX_EXPRESSION_TOKENS: usize = 4096;
+/// Maximum recursive expression nesting accepted by the parser.
+pub const MAX_EXPRESSION_DEPTH: usize = 128;
+/// Maximum number of AST nodes accepted for one expression.
+pub const MAX_EXPRESSION_NODES: usize = 2048;
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ExprError {
+    #[error("expression input is {bytes} bytes, exceeding the {limit}-byte limit")]
+    InputTooLarge { bytes: usize, limit: usize },
+    #[error("expression token count exceeds the {limit}-token limit")]
+    TooManyTokens { limit: usize },
+    #[error("expression nesting depth exceeds the {limit}-level limit")]
+    TooDeep { limit: usize },
+    #[error("expression AST node count exceeds the {limit}-node limit")]
+    TooManyNodes { limit: usize },
+    #[error("{0}")]
+    Syntax(String),
+    #[error("{0}")]
+    Evaluation(String),
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ValueBag {
     #[serde(default)]
@@ -40,6 +65,30 @@ impl ValueBag {
 
     pub fn set_item(&mut self, value: Option<Value>) {
         self.item = value;
+    }
+
+    pub fn patch_inputs(&mut self, values: BTreeMap<String, Value>) {
+        self.inputs.extend(values);
+    }
+
+    pub fn patch_step_outputs(&mut self, values: BTreeMap<String, Value>) {
+        self.steps.extend(values);
+    }
+
+    pub fn patch_step_statuses(&mut self, values: BTreeMap<String, String>) {
+        self.statuses.extend(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, Value::String(value))),
+        );
+    }
+
+    pub fn item(&self) -> Option<&Value> {
+        self.item.as_ref()
+    }
+
+    pub fn inputs(&self) -> &BTreeMap<String, Value> {
+        &self.inputs
     }
 
     pub fn to_json(&self) -> Value {
@@ -98,6 +147,11 @@ impl ValueBag {
     }
 
     pub fn eval_bool(&self, expr: Option<&Expr>) -> Result<bool, String> {
+        self.eval_bool_typed(expr)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn eval_bool_typed(&self, expr: Option<&Expr>) -> Result<bool, ExprError> {
         let Some(expr) = expr else {
             return Ok(true);
         };
@@ -105,14 +159,27 @@ impl ValueBag {
     }
 }
 
-fn eval_expression(src: &str, bag: &ValueBag) -> Result<bool, String> {
+fn eval_expression(src: &str, bag: &ValueBag) -> Result<bool, ExprError> {
+    ensure_expression_bytes(src)?;
     if src.trim().is_empty() {
         return Ok(false);
     }
     let mut parser = Parser::new(tokenize(src)?);
     let expression = parser.parse_expression(0)?;
     parser.expect_end()?;
-    Ok(truthy(&expression.evaluate(bag)?))
+    Ok(truthy(
+        &expression.evaluate(bag).map_err(ExprError::Evaluation)?,
+    ))
+}
+
+fn ensure_expression_bytes(source: &str) -> Result<(), ExprError> {
+    if source.len() > MAX_EXPRESSION_BYTES {
+        return Err(ExprError::InputTooLarge {
+            bytes: source.len(),
+            limit: MAX_EXPRESSION_BYTES,
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -129,7 +196,8 @@ enum Token {
     End,
 }
 
-fn tokenize(source: &str) -> Result<Vec<Token>, String> {
+fn tokenize(source: &str) -> Result<Vec<Token>, ExprError> {
+    ensure_expression_bytes(source)?;
     let chars = source.chars().collect::<Vec<_>>();
     let mut tokens = Vec::new();
     let mut index = 0;
@@ -153,10 +221,9 @@ fn tokenize(source: &str) -> Result<Vec<Token>, String> {
                     }
                     '\\' => {
                         index += 1;
-                        let escaped = chars
-                            .get(index)
-                            .copied()
-                            .ok_or_else(|| "unterminated string escape".to_string())?;
+                        let escaped = chars.get(index).copied().ok_or_else(|| {
+                            ExprError::Syntax("unterminated string escape".into())
+                        })?;
                         value.push(match escaped {
                             'n' => '\n',
                             'r' => '\r',
@@ -165,7 +232,9 @@ fn tokenize(source: &str) -> Result<Vec<Token>, String> {
                             '\'' => '\'',
                             '"' => '"',
                             other => {
-                                return Err(format!("unsupported string escape `\\{other}`"));
+                                return Err(ExprError::Syntax(format!(
+                                    "unsupported string escape `\\{other}`"
+                                )));
                             }
                         });
                         index += 1;
@@ -177,9 +246,9 @@ fn tokenize(source: &str) -> Result<Vec<Token>, String> {
                 }
             }
             if !closed {
-                return Err("unterminated string literal".into());
+                return Err(ExprError::Syntax("unterminated string literal".into()));
             }
-            tokens.push(Token::String(value));
+            push_token(&mut tokens, Token::String(value))?;
             continue;
         }
         if ch.is_ascii_digit()
@@ -203,11 +272,11 @@ fn tokenize(source: &str) -> Result<Vec<Token>, String> {
             let literal = chars[start..index].iter().collect::<String>();
             let value = literal
                 .parse::<f64>()
-                .map_err(|_| format!("invalid number literal `{literal}`"))?;
+                .map_err(|_| ExprError::Syntax(format!("invalid number literal `{literal}`")))?;
             if !value.is_finite() {
-                return Err("number literal is not finite".into());
+                return Err(ExprError::Syntax("number literal is not finite".into()));
             }
-            tokens.push(Token::Number(value));
+            push_token(&mut tokens, Token::Number(value))?;
             continue;
         }
         if ch.is_ascii_alphabetic() || ch == '_' {
@@ -219,12 +288,15 @@ fn tokenize(source: &str) -> Result<Vec<Token>, String> {
                 index += 1;
             }
             let identifier = chars[start..index].iter().collect::<String>();
-            tokens.push(match identifier.as_str() {
-                "true" => Token::Bool(true),
-                "false" => Token::Bool(false),
-                "null" => Token::Null,
-                _ => Token::Identifier(identifier),
-            });
+            push_token(
+                &mut tokens,
+                match identifier.as_str() {
+                    "true" => Token::Bool(true),
+                    "false" => Token::Bool(false),
+                    "null" => Token::Null,
+                    _ => Token::Identifier(identifier),
+                },
+            )?;
             continue;
         }
         let pair = chars
@@ -239,28 +311,45 @@ fn tokenize(source: &str) -> Result<Vec<Token>, String> {
             "<=" => Some("<="),
             _ => None,
         }) {
-            tokens.push(Token::Operator(operator));
+            push_token(&mut tokens, Token::Operator(operator))?;
             index += 2;
             continue;
         }
-        tokens.push(match ch {
-            '!' => Token::Operator("!"),
-            '>' => Token::Operator(">"),
-            '<' => Token::Operator("<"),
-            '+' => Token::Operator("+"),
-            '-' => Token::Operator("-"),
-            '*' => Token::Operator("*"),
-            '/' => Token::Operator("/"),
-            '%' => Token::Operator("%"),
-            '(' => Token::LeftParen,
-            ')' => Token::RightParen,
-            ',' => Token::Comma,
-            _ => return Err(format!("unexpected character `{ch}` at position {index}")),
-        });
+        push_token(
+            &mut tokens,
+            match ch {
+                '!' => Token::Operator("!"),
+                '>' => Token::Operator(">"),
+                '<' => Token::Operator("<"),
+                '+' => Token::Operator("+"),
+                '-' => Token::Operator("-"),
+                '*' => Token::Operator("*"),
+                '/' => Token::Operator("/"),
+                '%' => Token::Operator("%"),
+                '(' => Token::LeftParen,
+                ')' => Token::RightParen,
+                ',' => Token::Comma,
+                _ => {
+                    return Err(ExprError::Syntax(format!(
+                        "unexpected character `{ch}` at position {index}"
+                    )));
+                }
+            },
+        )?;
         index += 1;
     }
-    tokens.push(Token::End);
+    push_token(&mut tokens, Token::End)?;
     Ok(tokens)
+}
+
+fn push_token(tokens: &mut Vec<Token>, token: Token) -> Result<(), ExprError> {
+    if tokens.len() >= MAX_EXPRESSION_TOKENS {
+        return Err(ExprError::TooManyTokens {
+            limit: MAX_EXPRESSION_TOKENS,
+        });
+    }
+    tokens.push(token);
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -323,15 +412,29 @@ impl ExpressionNode {
 struct Parser {
     tokens: Vec<Token>,
     cursor: usize,
+    nodes: usize,
 }
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, cursor: 0 }
+        Self {
+            tokens,
+            cursor: 0,
+            nodes: 0,
+        }
     }
 
-    fn parse_expression(&mut self, min_binding_power: u8) -> Result<ExpressionNode, String> {
-        let mut left = self.parse_prefix()?;
+    fn parse_expression(&mut self, min_binding_power: u8) -> Result<ExpressionNode, ExprError> {
+        self.parse_expression_at(min_binding_power, 0)
+    }
+
+    fn parse_expression_at(
+        &mut self,
+        min_binding_power: u8,
+        depth: usize,
+    ) -> Result<ExpressionNode, ExprError> {
+        self.ensure_depth(depth)?;
+        let mut left = self.parse_prefix(depth)?;
         while let Token::Operator(operator) = self.peek() {
             let Some((left_power, right_power)) = infix_binding_power(operator) else {
                 break;
@@ -341,7 +444,8 @@ impl Parser {
             }
             let operator = *operator;
             self.cursor += 1;
-            let right = self.parse_expression(right_power)?;
+            let right = self.parse_expression_at(right_power, self.next_depth(depth)?)?;
+            self.reserve_node()?;
             left = ExpressionNode::Binary {
                 operator,
                 left: Box::new(left),
@@ -351,57 +455,117 @@ impl Parser {
         Ok(left)
     }
 
-    fn parse_prefix(&mut self) -> Result<ExpressionNode, String> {
+    fn parse_prefix(&mut self, depth: usize) -> Result<ExpressionNode, ExprError> {
+        self.ensure_depth(depth)?;
         let token = self.next().clone();
         match token {
-            Token::Bool(value) => Ok(ExpressionNode::Literal(Value::Bool(value))),
-            Token::Null => Ok(ExpressionNode::Literal(Value::Null)),
-            Token::String(value) => Ok(ExpressionNode::Literal(Value::String(value))),
-            Token::Number(value) => number_value(value).map(ExpressionNode::Literal),
+            Token::Bool(value) => {
+                self.reserve_node()?;
+                Ok(ExpressionNode::Literal(Value::Bool(value)))
+            }
+            Token::Null => {
+                self.reserve_node()?;
+                Ok(ExpressionNode::Literal(Value::Null))
+            }
+            Token::String(value) => {
+                self.reserve_node()?;
+                Ok(ExpressionNode::Literal(Value::String(value)))
+            }
+            Token::Number(value) => {
+                let value = number_value(value).map_err(ExprError::Syntax)?;
+                self.reserve_node()?;
+                Ok(ExpressionNode::Literal(value))
+            }
             Token::Identifier(identifier) => {
                 if matches!(self.peek(), Token::LeftParen) {
                     self.cursor += 1;
-                    self.parse_call(identifier)
+                    self.parse_call(identifier, self.next_depth(depth)?)
                 } else if identifier.starts_with("inputs.")
                     || identifier.starts_with("steps.")
                     || identifier == "item"
                     || identifier.starts_with("item.")
                 {
+                    if identifier.split('.').count() > MAX_EXPRESSION_DEPTH {
+                        return Err(ExprError::TooDeep {
+                            limit: MAX_EXPRESSION_DEPTH,
+                        });
+                    }
+                    self.reserve_node()?;
                     Ok(ExpressionNode::Path(identifier))
                 } else {
-                    Err(format!("unsupported literal `{identifier}`"))
+                    Err(ExprError::Syntax(format!(
+                        "unsupported literal `{identifier}`"
+                    )))
                 }
             }
-            Token::Operator(operator @ ("!" | "-")) => Ok(ExpressionNode::Unary {
-                operator,
-                value: Box::new(self.parse_expression(13)?),
-            }),
+            Token::Operator(operator @ ("!" | "-")) => {
+                let value = self.parse_expression_at(13, self.next_depth(depth)?)?;
+                self.reserve_node()?;
+                Ok(ExpressionNode::Unary {
+                    operator,
+                    value: Box::new(value),
+                })
+            }
             Token::LeftParen => {
-                let expression = self.parse_expression(0)?;
+                let expression = self.parse_expression_at(0, self.next_depth(depth)?)?;
                 match self.next() {
                     Token::RightParen => Ok(expression),
-                    token => Err(format!("expected `)`, found {token:?}")),
+                    token => Err(ExprError::Syntax(format!("expected `)`, found {token:?}"))),
                 }
             }
-            token => Err(format!("expected expression, found {token:?}")),
+            token => Err(ExprError::Syntax(format!(
+                "expected expression, found {token:?}"
+            ))),
         }
     }
 
-    fn parse_call(&mut self, name: String) -> Result<ExpressionNode, String> {
+    fn parse_call(&mut self, name: String, depth: usize) -> Result<ExpressionNode, ExprError> {
+        self.ensure_depth(depth)?;
         let mut arguments = Vec::new();
         if matches!(self.peek(), Token::RightParen) {
             self.cursor += 1;
+            self.reserve_node()?;
             return Ok(ExpressionNode::Call { name, arguments });
         }
         loop {
-            arguments.push(self.parse_expression(0)?);
+            arguments.push(self.parse_expression_at(0, self.next_depth(depth)?)?);
             match self.next() {
                 Token::Comma => {}
                 Token::RightParen => break,
-                token => return Err(format!("expected `,` or `)`, found {token:?}")),
+                token => {
+                    return Err(ExprError::Syntax(format!(
+                        "expected `,` or `)`, found {token:?}"
+                    )));
+                }
             }
         }
+        self.reserve_node()?;
         Ok(ExpressionNode::Call { name, arguments })
+    }
+
+    fn ensure_depth(&self, depth: usize) -> Result<(), ExprError> {
+        if depth > MAX_EXPRESSION_DEPTH {
+            return Err(ExprError::TooDeep {
+                limit: MAX_EXPRESSION_DEPTH,
+            });
+        }
+        Ok(())
+    }
+
+    fn next_depth(&self, depth: usize) -> Result<usize, ExprError> {
+        depth.checked_add(1).ok_or(ExprError::TooDeep {
+            limit: MAX_EXPRESSION_DEPTH,
+        })
+    }
+
+    fn reserve_node(&mut self) -> Result<(), ExprError> {
+        if self.nodes >= MAX_EXPRESSION_NODES {
+            return Err(ExprError::TooManyNodes {
+                limit: MAX_EXPRESSION_NODES,
+            });
+        }
+        self.nodes += 1;
+        Ok(())
     }
 
     fn peek(&self) -> &Token {
@@ -414,10 +578,12 @@ impl Parser {
         self.tokens.get(index).unwrap_or(&Token::End)
     }
 
-    fn expect_end(&self) -> Result<(), String> {
+    fn expect_end(&self) -> Result<(), ExprError> {
         match self.peek() {
             Token::End => Ok(()),
-            token => Err(format!("unexpected trailing token {token:?}")),
+            token => Err(ExprError::Syntax(format!(
+                "unexpected trailing token {token:?}"
+            ))),
         }
     }
 }
@@ -569,6 +735,65 @@ mod tests {
             !bag.eval_bool(Some(&Expr("inputs.name == 'other'".into())))
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn expression_input_byte_limit_is_typed_and_explicit() {
+        let expression = Expr("x".repeat(MAX_EXPRESSION_BYTES + 1));
+        let error = ValueBag::default()
+            .eval_bool_typed(Some(&expression))
+            .expect_err("oversized expression should fail");
+        assert_eq!(
+            error,
+            ExprError::InputTooLarge {
+                bytes: MAX_EXPRESSION_BYTES + 1,
+                limit: MAX_EXPRESSION_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn expression_token_limit_is_typed_and_explicit() {
+        let expression = (0..MAX_EXPRESSION_TOKENS)
+            .map(|_| "true")
+            .collect::<Vec<_>>()
+            .join(" ");
+        let error = ValueBag::default()
+            .eval_bool_typed(Some(&Expr(expression)))
+            .expect_err("oversized token stream should fail");
+        assert!(matches!(error, ExprError::TooManyTokens { .. }));
+    }
+
+    #[test]
+    fn expression_parenthesis_and_unary_depth_limits_are_typed() {
+        let nested = format!(
+            "{}true{}",
+            "(".repeat(MAX_EXPRESSION_DEPTH + 1),
+            ")".repeat(MAX_EXPRESSION_DEPTH + 1)
+        );
+        let error = ValueBag::default()
+            .eval_bool_typed(Some(&Expr(nested)))
+            .expect_err("deep parenthesized expression should fail");
+        assert!(matches!(error, ExprError::TooDeep { .. }));
+
+        let unary = format!("{}true", "!".repeat(MAX_EXPRESSION_DEPTH + 1));
+        let error = ValueBag::default()
+            .eval_bool_typed(Some(&Expr(unary)))
+            .expect_err("deep unary expression should fail");
+        assert!(matches!(error, ExprError::TooDeep { .. }));
+    }
+
+    #[test]
+    fn expression_node_limit_is_typed_and_explicit() {
+        let terms = MAX_EXPRESSION_NODES / 4 + 2;
+        let expression = (0..terms)
+            .map(|_| "true == true")
+            .collect::<Vec<_>>()
+            .join(" && ");
+        let error = ValueBag::default()
+            .eval_bool_typed(Some(&Expr(expression)))
+            .expect_err("oversized AST should fail");
+        assert!(matches!(error, ExprError::TooManyNodes { .. }));
     }
 
     fn corpus_bag() -> ValueBag {

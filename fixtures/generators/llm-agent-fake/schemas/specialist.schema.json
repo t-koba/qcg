@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary"],
+  "default": {
+    "summary": "bounded specialist result"
+  },
+  "properties": {
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}

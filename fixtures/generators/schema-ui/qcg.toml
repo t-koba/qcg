@@ -1,0 +1,30 @@
+[generator]
+id = "schema-ui"
+name = "Schema-driven UI"
+description = "Exercises recursive object, array, and union input controls."
+version = "0.1.0"
+qcg_version = "^0.1"
+
+[permissions]
+fs_write = ["workspace"]
+
+[[inputs.stages]]
+id = "settings"
+
+[[inputs.stages.fields]]
+id = "settings"
+label = "Settings"
+description = "A recursively rendered custom field."
+type = "vendor.settings"
+required = true
+ui = { preview = true }
+schema = { type = "object", additionalProperties = false, required = ["name", "ports", "mode"], properties = { name = { type = "string", title = "Name", minLength = 2 }, ports = { type = "array", title = "Ports", minItems = 1, items = { type = "integer", minimum = 1, maximum = 65535 } }, mode = { title = "Mode", oneOf = [{ const = "local", title = "Local" }, { const = "remote", title = "Remote" }] } } }
+
+[[flow]]
+id = "write"
+type = "write"
+artifact = { label = "Settings", required = true, preview = "auto" }
+
+[flow.params]
+output_file = "settings.json"
+content = "name={{ inputs.settings.name }}\nports={{ inputs.settings.ports }}\nmode={{ inputs.settings.mode }}"

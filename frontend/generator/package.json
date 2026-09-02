@@ -8,7 +8,7 @@
     "dev": "vite",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "generate:api": "node scripts/generate-api-types.mjs",
-    "generate:wasm": "cd ../.. && wasm-pack build crates/qcg-expr-wasm --target web --out-dir ../../frontend/generator/src/expr/pkg --out-name qcg_expr_wasm",
+    "generate:wasm": "node scripts/generate-wasm.mjs",
     "check:api": "node scripts/check-api-types.mjs",
     "test": "vitest run"
   },

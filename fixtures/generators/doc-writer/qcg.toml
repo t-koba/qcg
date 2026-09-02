@@ -34,3 +34,4 @@ required = true
 type = "text"
 
 [permissions]
+fs_write = ["workspace"]

@@ -42,3 +42,4 @@ required = true
 type = "multiselect"
 
 [permissions]
+fs_write = ["workspace"]

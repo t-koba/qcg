@@ -24,6 +24,10 @@ name = "qpx Tool Validator"
 qcg_version = "^0.1"
 version = "0.1.0"
 
+[permissions]
+fs_read = ["workspace"]
+fs_write = ["workspace"]
+
 [[permissions.commands]]
 args = [
     "check",
@@ -32,9 +36,11 @@ args = [
 ]
 bin = "qpxd"
 purpose = "validate qpx config on host when explicitly approved"
+isolation = "trusted_host"
 
 [permissions.containers]
 enabled = true
+runtime = "docker"
 images = ["ghcr.io/t-koba/qpxd@sha256:example"]
 on_missing = "error"
 

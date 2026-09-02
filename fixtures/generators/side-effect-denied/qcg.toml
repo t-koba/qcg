@@ -22,3 +22,4 @@ side_effects = "none"
 args = ["denied"]
 bin = "echo"
 purpose = "demonstrate side effect denial"
+isolation = "trusted_host"

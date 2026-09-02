@@ -2,6 +2,10 @@
   "/api/generators",
   "/api/generators/{id}",
   "/api/generators/{id}/assets/{path}",
+  "/api/mcp/oauth/callback",
+  "/api/mcp/servers",
+  "/api/mcp/servers/{id}/authorization",
+  "/api/mcp/servers/{id}/authorization/pending",
   "/api/openapi.json",
   "/api/runs",
   "/api/runs/{id}",
@@ -10,8 +14,10 @@
   "/api/runs/{id}/artifacts/{path}",
   "/api/runs/{id}/confirmations/{cid}",
   "/api/runs/{id}/events",
+  "/api/runs/{id}/fork",
   "/api/runs/{id}/journal",
   "/api/runs/{id}/questions/{qid}",
   "/api/runs/{id}:cancel",
-  "/healthz"
+  "/healthz",
+  "/metrics"
 ]

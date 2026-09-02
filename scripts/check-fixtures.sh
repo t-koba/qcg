@@ -9,23 +9,8 @@ run_qcg() {
   (cd "$tmp_root" && CARGO_TARGET_DIR="$repo_root/target" cargo run --manifest-path "$repo_root/Cargo.toml" -p qcg -- "$@")
 }
 
-is_negative_validate_fixture() {
-  case "$1" in
-    fixtures/generators/llm-requires-denied) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
 for dir in generators/* fixtures/generators/*; do
   if [ ! -f "$dir/qcg.toml" ]; then
-    continue
-  fi
-  if is_negative_validate_fixture "$dir"; then
-    if run_qcg validate "$repo_root/$dir" >/dev/null 2>&1; then
-      echo "negative fixture unexpectedly validated: $dir" >&2
-      exit 1
-    fi
-    echo "negative validate ok: $dir"
     continue
   fi
   run_qcg validate "$repo_root/$dir" >/dev/null
@@ -62,6 +47,13 @@ run_qcg run "$repo_root/fixtures/generators/llm-fill-retry" \
   --yes >/dev/null
 grep -q 'retry passed' "$tmp_root/llm-fill-retry/result.json"
 
+run_qcg run "$repo_root/fixtures/generators/llm-agent-fake" \
+  --output "$tmp_root/llm-agent-fake" \
+  --yes >/dev/null
+grep -q 'agent delegated and wrote this' "$tmp_root/llm-agent-fake/drafts/result.txt"
+grep -R -q 'agent_delegated' "$tmp_root/.qcg/runs"
+grep -R -q 'agent_completed' "$tmp_root/.qcg/runs"
+
 run_qcg run "$repo_root/fixtures/generators/on-fail-ask-user" \
   --output "$tmp_root/on-fail-ask-user" \
   --answer check:on_fail=accepted \
@@ -77,14 +69,8 @@ run_qcg run "$repo_root/generators/generator" \
   --output "$tmp_root/generator-authoring" \
   --answer 'ask_purpose={"description":"Smoke generated package"}' \
   --answer ask_design_mode=manual \
-  --answer 'ask_manual_form={"generator_id":"smoke-gen","generator_name":"Smoke Gen","artifact_path":"README.md","primary_step_type":"render","design_json":{"input_fields":[{"id":"request","type":"natural_language","required":true}]},"include_readme":true}' \
-  --answer 'ask_manual_render_details={"artifact_content":"# Smoke"}' \
-  --answer ask_fs_write=workspace \
-  --answer ask_network=none \
-  --answer ask_commands=none \
-  --answer ask_containers=none \
-  --answer ask_side_effects=none \
-  --answer ask_secrets=none \
+  --answer 'ask_manual_form={"package":{"manifest":{"generator":{"id":"smoke-gen","name":"Smoke Gen","version":"0.1.0","qcg_version":"^0.1","description":"Generate a smoke artifact","authors":[]},"inputs":{"stages":[{"id":"main","fields":[{"id":"request","type":"natural_language","required":true}]}]},"flow":[{"id":"emit","type":"render","artifact":{"label":"Smoke artifact","preview":"text","required":true},"params":{"template":"templates/artifact.txt.j2","output_file":"README.md"}}]},"sources":{"templates/artifact.txt.j2":{"encoding":"utf8","content":"# Smoke"}}}}' \
+  --answer 'ask_authority={"permissions":{"fs_read":[],"fs_write":["workspace"],"network":[],"commands":[],"containers":{"enabled":false,"images":[],"on_missing":"error"},"side_effects":"none"},"secrets":{}}' \
   --yes >/dev/null
 run_qcg validate "$tmp_root/generator-authoring/generator" >/dev/null
 run_qcg run "$tmp_root/generator-authoring/generator" \

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-minimum="${1:-461}"
+minimum="${1:-520}"
 count="$(
   cargo test --workspace --locked -- --list \
     | awk '/ tests, 0 benchmarks$/ { total += $1 } END { print total + 0 }'

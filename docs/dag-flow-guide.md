@@ -48,6 +48,17 @@ source map plus a `[[blocks.*]]` write node (`content = "{{ item.value }}"`,
 declared by data instead of hard-coded steps. Object iteration uses the generic
 `{key, value}` item shape. See the bundled `generator`.
 
+### Adaptive HITL and MCP
+
+If an operator decision changes the workflow, declare it as an `ask_user` node
+with explicit `needs`, then gate the resulting branches with `when` over that
+node's output. An MCP agent binding is fixed to its configured server and
+remote tool, while `side_effects = true` routes calls through the normal
+`[permissions].side_effects` policy and can pause at a confirmation boundary.
+Use an explicit `ask_user` node when the answer changes the MCP tool or DAG
+branch; do not add a duplicate confirmation node solely to mirror the runtime
+side-effect check.
+
 ## Parallel Waves
 
 Declare a contiguous parallel group once at the manifest root, for example

@@ -1,10 +1,13 @@
 use camino::{Utf8Path, Utf8PathBuf};
-use qcg_contract::{CommandPermission, Permissions, RuntimeLimits};
+use qcg_contract::{
+    CommandIsolation, CommandPermission, ContainerRuntime, Permissions, RuntimeLimits,
+};
+use qcg_types::{credential_like_name, is_safe_relative_path};
 use reqwest::{Client, Method, redirect::Policy};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::process::Stdio;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
@@ -38,16 +41,28 @@ pub enum GatewayError {
         actual: Vec<String>,
         allowed: Vec<CommandPermissionSummary>,
     },
+    #[error("command path `{bin}` is not a safe executable inside the workspace")]
+    CommandPathDenied { bin: String },
+    #[error("command `{bin}` has no declared execution isolation")]
+    CommandIsolationMissing { bin: String },
+    #[error("container runtime was not found for command `{bin}`")]
+    ContainerRuntimeMissing { bin: String },
+    #[error("container-isolated command `{bin}` has no image")]
+    ContainerImageMissing { bin: String },
     #[error("command `{bin}` timed out")]
     CommandTimedOut { bin: String },
     #[error("command `{bin}` output exceeded limit")]
     CommandOutputTooLarge { bin: String },
+    #[error("command `{bin}` input exceeded limit")]
+    CommandInputTooLarge { bin: String },
     #[error("network access to host `{host}` is not allowed by permissions.network")]
     NetworkDenied { host: String },
     #[error("unsupported URL `{url}`")]
     UnsupportedUrl { url: String },
     #[error("HTTP response body exceeded limit for `{url}`")]
     HttpBodyTooLarge { url: String },
+    #[error("HTTP request body exceeded limit for `{url}`")]
+    HttpRequestBodyTooLarge { url: String },
     #[error(transparent)]
     Http(#[from] reqwest::Error),
     #[error(transparent)]
@@ -61,6 +76,8 @@ pub struct CommandPermissionSummary {
     pub bin: String,
     pub args: Vec<String>,
     pub purpose: String,
+    pub isolation: Option<CommandIsolation>,
+    pub image: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +187,10 @@ pub struct CommandOutput {
     pub status: i32,
     pub stdout: String,
     pub stderr: String,
+    /// Raw stdout bytes retained for strict machine-readable command modes.
+    pub stdout_bytes: Vec<u8>,
+    /// Raw stderr bytes retained for diagnostics without lossy decoding.
+    pub stderr_bytes: Vec<u8>,
 }
 
 impl CmdGateway {
@@ -193,8 +214,7 @@ impl CmdGateway {
     }
 
     pub async fn run(&self, argv: &[String]) -> Result<CommandOutput, GatewayError> {
-        self.command_plan(argv)?;
-        self.run_trusted_process(
+        self.run_with_limits(
             argv,
             self.limits.command_timeout_seconds,
             self.limits.command_output_limit_bytes,
@@ -208,9 +228,108 @@ impl CmdGateway {
         timeout_seconds: u64,
         output_limit_bytes: usize,
     ) -> Result<CommandOutput, GatewayError> {
-        self.command_plan(argv)?;
-        self.run_trusted_process(argv, timeout_seconds, output_limit_bytes)
+        self.run_with_limits_and_stdin(argv, timeout_seconds, output_limit_bytes, None)
             .await
+    }
+
+    pub async fn run_with_stdin(
+        &self,
+        argv: &[String],
+        stdin: &[u8],
+    ) -> Result<CommandOutput, GatewayError> {
+        self.run_with_limits_and_stdin(
+            argv,
+            self.limits.command_timeout_seconds,
+            self.limits.command_output_limit_bytes,
+            Some(stdin),
+        )
+        .await
+    }
+
+    pub async fn run_with_limits_and_stdin(
+        &self,
+        argv: &[String],
+        timeout_seconds: u64,
+        output_limit_bytes: usize,
+        stdin: Option<&[u8]>,
+    ) -> Result<CommandOutput, GatewayError> {
+        let permission = self.command_permission(argv)?;
+        match permission.isolation.as_ref().ok_or_else(|| {
+            GatewayError::CommandIsolationMissing {
+                bin: permission.bin.clone(),
+            }
+        })? {
+            CommandIsolation::TrustedHost => {
+                self.run_trusted_process_with_stdin(
+                    argv,
+                    timeout_seconds,
+                    output_limit_bytes,
+                    stdin,
+                )
+                .await
+            }
+            CommandIsolation::Container => {
+                self.run_container_process(
+                    argv,
+                    permission.image.as_deref().ok_or_else(|| {
+                        GatewayError::ContainerImageMissing {
+                            bin: permission.bin.clone(),
+                        }
+                    })?,
+                    timeout_seconds,
+                    output_limit_bytes,
+                    stdin,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn run_container_process(
+        &self,
+        argv: &[String],
+        image: &str,
+        timeout_seconds: u64,
+        output_limit_bytes: usize,
+        stdin: Option<&[u8]>,
+    ) -> Result<CommandOutput, GatewayError> {
+        let bin = argv.first().cloned().ok_or(GatewayError::EmptyCommand)?;
+        let mut container_argv = container_runtime_argv(
+            self.permissions
+                .containers
+                .runtime
+                .as_ref()
+                .ok_or_else(|| GatewayError::ContainerRuntimeMissing { bin: bin.clone() })?,
+        )
+        .ok_or_else(|| GatewayError::ContainerRuntimeMissing { bin: bin.clone() })?;
+        let mount = format!("type=bind,src={},dst=/work", self.workspace);
+        container_argv.extend([
+            "--rm".into(),
+            "--network".into(),
+            "none".into(),
+            "--read-only".into(),
+            "--cap-drop".into(),
+            "ALL".into(),
+            "--security-opt".into(),
+            "no-new-privileges".into(),
+            "--pids-limit".into(),
+            "256".into(),
+            "--tmpfs".into(),
+            "/tmp:rw,noexec,nosuid,size=64m".into(),
+            "--mount".into(),
+            mount,
+            "--workdir".into(),
+            "/work".into(),
+            image.into(),
+        ]);
+        container_argv.extend_from_slice(argv);
+        self.run_trusted_process_with_stdin(
+            &container_argv,
+            timeout_seconds,
+            output_limit_bytes,
+            stdin,
+        )
+        .await
     }
 
     #[doc(hidden)]
@@ -220,15 +339,35 @@ impl CmdGateway {
         timeout_seconds: u64,
         output_limit_bytes: usize,
     ) -> Result<CommandOutput, GatewayError> {
+        self.run_trusted_process_with_stdin(argv, timeout_seconds, output_limit_bytes, None)
+            .await
+    }
+
+    #[doc(hidden)]
+    pub async fn run_trusted_process_with_stdin(
+        &self,
+        argv: &[String],
+        timeout_seconds: u64,
+        output_limit_bytes: usize,
+        stdin_bytes: Option<&[u8]>,
+    ) -> Result<CommandOutput, GatewayError> {
         let (bin, args) = argv.split_first().ok_or(GatewayError::EmptyCommand)?;
-        let mut command = Command::new(bin);
+        if stdin_bytes.is_some_and(|bytes| bytes.len() > self.limits.command_input_limit_bytes) {
+            return Err(GatewayError::CommandInputTooLarge { bin: bin.clone() });
+        }
+        let program = resolve_command_program(&self.workspace, bin)?;
+        let mut command = Command::new(program);
         command
             .args(args)
             .current_dir(&self.workspace)
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("TMPDIR", self.workspace.as_str())
-            .stdin(Stdio::null())
+            .stdin(if stdin_bytes.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -236,46 +375,181 @@ impl CmdGateway {
         let mut child = command.spawn()?;
         let process_tree = ProcessTreeGuard::attach(&child)?;
         let pid = child.id();
-        let mut stdout = child
+        let stdin_task = if let Some(stdin_bytes) = stdin_bytes {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| std::io::Error::other("command stdin pipe was not available"))?;
+            let stdin_bytes = stdin_bytes.to_vec();
+            Some(tokio::spawn(async move {
+                let result = stdin.write_all(&stdin_bytes).await;
+                drop(stdin);
+                result
+            }))
+        } else {
+            None
+        };
+        let stdout = child
             .stdout
             .take()
             .ok_or_else(|| std::io::Error::other("command stdout pipe was not available"))?;
-        let mut stderr = child
+        let stderr = child
             .stderr
             .take()
             .ok_or_else(|| std::io::Error::other("command stderr pipe was not available"))?;
-        let stdout_task = tokio::spawn(async move {
-            let mut bytes = Vec::new();
-            stdout.read_to_end(&mut bytes).await.map(|_| bytes)
-        });
-        let stderr_task = tokio::spawn(async move {
-            let mut bytes = Vec::new();
-            stderr.read_to_end(&mut bytes).await.map(|_| bytes)
-        });
-        let status = tokio::select! {
-            _ = self.cancellation.cancelled() => {
-                process_tree.terminate(&mut child, pid).await;
-                return Err(GatewayError::Canceled);
-            },
-            result = timeout(Duration::from_secs(timeout_seconds), child.wait()) => {
-                match result {
-                    Ok(status) => status?,
-                    Err(_) => {
+        let output_bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stdout_task = tokio::spawn(read_stream_bounded(
+            stdout,
+            output_bytes.clone(),
+            output_limit_bytes,
+        ));
+        let stderr_task = tokio::spawn(read_stream_bounded(
+            stderr,
+            output_bytes,
+            output_limit_bytes,
+        ));
+        let mut stdout_task = stdout_task;
+        let mut stderr_task = stderr_task;
+        let mut stdout_result: Option<Result<Vec<u8>, StreamReadError>> = None;
+        let mut stderr_result: Option<Result<Vec<u8>, StreamReadError>> = None;
+        let mut child_status: Option<std::process::ExitStatus> = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);
+
+        enum CommandEvent {
+            Canceled,
+            TimedOut,
+            Child(Result<std::process::ExitStatus, std::io::Error>),
+            Stdout(Result<Result<Vec<u8>, StreamReadError>, tokio::task::JoinError>),
+            Stderr(Result<Result<Vec<u8>, StreamReadError>, tokio::task::JoinError>),
+        }
+
+        macro_rules! stop_tasks {
+            () => {{
+                stdout_task.abort();
+                stderr_task.abort();
+                if let Some(stdin_task) = stdin_task.as_ref() {
+                    stdin_task.abort();
+                }
+            }};
+        }
+
+        loop {
+            if child_status.is_some() && stdout_result.is_some() && stderr_result.is_some() {
+                break;
+            }
+            let event = if child_status.is_none() {
+                tokio::select! {
+                    _ = self.cancellation.cancelled() => CommandEvent::Canceled,
+                    _ = tokio::time::sleep_until(deadline) => CommandEvent::TimedOut,
+                    result = child.wait() => CommandEvent::Child(result),
+                    result = &mut stdout_task, if stdout_result.is_none() => CommandEvent::Stdout(result),
+                    result = &mut stderr_task, if stderr_result.is_none() => CommandEvent::Stderr(result),
+                }
+            } else {
+                tokio::select! {
+                    _ = self.cancellation.cancelled() => CommandEvent::Canceled,
+                    _ = tokio::time::sleep_until(deadline) => CommandEvent::TimedOut,
+                    result = &mut stdout_task, if stdout_result.is_none() => CommandEvent::Stdout(result),
+                    result = &mut stderr_task, if stderr_result.is_none() => CommandEvent::Stderr(result),
+                }
+            };
+
+            match event {
+                CommandEvent::Canceled => {
+                    process_tree.terminate(&mut child, pid).await;
+                    stop_tasks!();
+                    return Err(GatewayError::Canceled);
+                }
+                CommandEvent::TimedOut => {
+                    process_tree.terminate(&mut child, pid).await;
+                    stop_tasks!();
+                    return Err(GatewayError::CommandTimedOut { bin: bin.clone() });
+                }
+                CommandEvent::Child(result) => match result {
+                    Ok(status) => child_status = Some(status),
+                    Err(error) => {
                         process_tree.terminate(&mut child, pid).await;
-                        return Err(GatewayError::CommandTimedOut { bin: bin.clone() });
+                        stop_tasks!();
+                        return Err(GatewayError::Io(error));
+                    }
+                },
+                CommandEvent::Stdout(result) => {
+                    let result = result.map_err(|error| {
+                        GatewayError::Io(std::io::Error::other(error.to_string()))
+                    });
+                    match result {
+                        Ok(Ok(bytes)) => stdout_result = Some(Ok(bytes)),
+                        Ok(Err(StreamReadError::LimitExceeded)) => {
+                            process_tree.terminate(&mut child, pid).await;
+                            stop_tasks!();
+                            return Err(GatewayError::CommandOutputTooLarge { bin: bin.clone() });
+                        }
+                        Ok(Err(StreamReadError::Io(error))) => {
+                            process_tree.terminate(&mut child, pid).await;
+                            stop_tasks!();
+                            return Err(GatewayError::Io(error));
+                        }
+                        Err(error) => {
+                            process_tree.terminate(&mut child, pid).await;
+                            stop_tasks!();
+                            return Err(error);
+                        }
+                    }
+                }
+                CommandEvent::Stderr(result) => {
+                    let result = result.map_err(|error| {
+                        GatewayError::Io(std::io::Error::other(error.to_string()))
+                    });
+                    match result {
+                        Ok(Ok(bytes)) => stderr_result = Some(Ok(bytes)),
+                        Ok(Err(StreamReadError::LimitExceeded)) => {
+                            process_tree.terminate(&mut child, pid).await;
+                            stop_tasks!();
+                            return Err(GatewayError::CommandOutputTooLarge { bin: bin.clone() });
+                        }
+                        Ok(Err(StreamReadError::Io(error))) => {
+                            process_tree.terminate(&mut child, pid).await;
+                            stop_tasks!();
+                            return Err(GatewayError::Io(error));
+                        }
+                        Err(error) => {
+                            process_tree.terminate(&mut child, pid).await;
+                            stop_tasks!();
+                            return Err(error);
+                        }
                     }
                 }
             }
-        };
-        let stdout = stdout_task.await.map_err(std::io::Error::other)??;
-        let stderr = stderr_task.await.map_err(std::io::Error::other)??;
-        if stdout.len() + stderr.len() > output_limit_bytes {
-            return Err(GatewayError::CommandOutputTooLarge { bin: bin.clone() });
+        }
+        let status = child_status.expect("child status is collected before command completion");
+        let stdout = stdout_result
+            .expect("stdout result is collected before command completion")
+            .map_err(|error| match error {
+                StreamReadError::LimitExceeded => {
+                    GatewayError::CommandOutputTooLarge { bin: bin.clone() }
+                }
+                StreamReadError::Io(error) => GatewayError::Io(error),
+            })?;
+        let stderr = stderr_result
+            .expect("stderr result is collected before command completion")
+            .map_err(|error| match error {
+                StreamReadError::LimitExceeded => {
+                    GatewayError::CommandOutputTooLarge { bin: bin.clone() }
+                }
+                StreamReadError::Io(error) => GatewayError::Io(error),
+            })?;
+        if let Some(stdin_task) = stdin_task {
+            stdin_task
+                .await
+                .map_err(|error| GatewayError::Io(std::io::Error::other(error.to_string())))?
+                .map_err(GatewayError::Io)?;
         }
         Ok(CommandOutput {
             status: status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            stdout_bytes: stdout,
+            stderr_bytes: stderr,
         })
     }
 
@@ -298,31 +572,12 @@ impl CmdGateway {
     }
 
     pub fn command_plan(&self, argv: &[String]) -> Result<Value, GatewayError> {
-        let (bin, args) = argv.split_first().ok_or(GatewayError::EmptyCommand)?;
-        let permissions = self
-            .permissions
-            .commands
-            .iter()
-            .filter(|permission| permission.bin == *bin)
-            .cloned()
-            .collect::<Vec<_>>();
-        if permissions.is_empty() {
-            return Err(GatewayError::CommandDenied {
-                bin: bin.clone(),
-                allowed: command_permission_summaries(&self.permissions.commands),
-            });
-        }
-        let permission = permissions
-            .iter()
-            .find(|permission| args_allowed(permission, args))
-            .ok_or_else(|| GatewayError::CommandArgsDenied {
-                bin: bin.clone(),
-                actual: args.to_vec(),
-                allowed: command_permission_summaries(&permissions),
-            })?;
+        let permission = self.command_permission(argv)?;
         Ok(json!({
             "argv": argv,
             "cwd": self.workspace.as_str(),
+            "isolation": permission.isolation,
+            "image": permission.image,
             "env_clear": true,
             "env": {
                 "PATH": std::env::var("PATH").unwrap_or_default(),
@@ -330,14 +585,116 @@ impl CmdGateway {
             },
             "stdin": "null",
             "timeout_seconds": self.limits.command_timeout_seconds,
+            "input_limit_bytes": self.limits.command_input_limit_bytes,
             "output_limit_bytes": self.limits.command_output_limit_bytes,
             "permission": {
                 "bin": &permission.bin,
                 "args": &permission.args,
                 "purpose": &permission.purpose,
+                "isolation": &permission.isolation,
+                "image": &permission.image,
             }
         }))
     }
+
+    fn command_permission(&self, argv: &[String]) -> Result<&CommandPermission, GatewayError> {
+        let (bin, args) = argv.split_first().ok_or(GatewayError::EmptyCommand)?;
+        let permissions = self
+            .permissions
+            .commands
+            .iter()
+            .filter(|permission| permission.bin == *bin)
+            .collect::<Vec<_>>();
+        if permissions.is_empty() {
+            return Err(GatewayError::CommandDenied {
+                bin: bin.clone(),
+                allowed: command_permission_summaries(&self.permissions.commands),
+            });
+        }
+        permissions
+            .iter()
+            .copied()
+            .find(|permission| args_allowed(permission, args))
+            .ok_or_else(|| GatewayError::CommandArgsDenied {
+                bin: bin.clone(),
+                actual: args.to_vec(),
+                allowed: permissions
+                    .iter()
+                    .map(|permission| command_permission_summary(permission))
+                    .collect(),
+            })
+    }
+}
+
+enum StreamReadError {
+    LimitExceeded,
+    Io(std::io::Error),
+}
+
+async fn read_stream_bounded<R>(
+    mut stream: R,
+    used: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    limit: usize,
+) -> Result<Vec<u8>, StreamReadError>
+where
+    R: AsyncRead + Unpin,
+{
+    use std::sync::atomic::Ordering;
+
+    const CHUNK_SIZE: usize = 16 * 1024;
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; CHUNK_SIZE];
+    loop {
+        let read = stream.read(&mut chunk).await.map_err(StreamReadError::Io)?;
+        if read == 0 {
+            return Ok(bytes);
+        }
+        let reserved = used.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current.checked_add(read).filter(|next| *next <= limit)
+        });
+        if reserved.is_err() {
+            return Err(StreamReadError::LimitExceeded);
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn resolve_command_program(
+    workspace: &Utf8Path,
+    bin: &str,
+) -> Result<std::path::PathBuf, GatewayError> {
+    let path = Utf8Path::new(bin);
+    if path.is_absolute() || !bin.contains('/') {
+        return Ok(bin.into());
+    }
+    let relative = bin.strip_prefix("./").unwrap_or(bin);
+    if !is_safe_relative_path(relative) {
+        return Err(GatewayError::CommandPathDenied { bin: bin.into() });
+    }
+    let workspace = dunce::canonicalize(workspace)?;
+    let program = dunce::canonicalize(workspace.join(relative))?;
+    if !program.starts_with(&workspace) {
+        return Err(GatewayError::CommandPathDenied { bin: bin.into() });
+    }
+    Ok(program)
+}
+
+fn container_runtime_argv(runtime: &ContainerRuntime) -> Option<Vec<String>> {
+    let path = std::env::var_os("PATH")?;
+    let (binary, runtime_arg) = match runtime {
+        ContainerRuntime::Docker => ("docker", None),
+        ContainerRuntime::Podman => ("podman", None),
+        ContainerRuntime::DockerRunsc => ("docker", Some("runsc")),
+    };
+    std::env::split_paths(&path)
+        .any(|dir| dir.join(binary).is_file())
+        .then(|| {
+            let mut argv = vec![binary.to_string(), "run".into()];
+            if let Some(runtime) = runtime_arg {
+                argv.extend(["--runtime".into(), runtime.into()]);
+            }
+            argv
+        })
 }
 
 fn configure_process_group(command: &mut Command) {
@@ -358,7 +715,7 @@ fn configure_process_group(command: &mut Command) {
 
 struct ProcessTreeGuard {
     #[cfg(windows)]
-    job: windows_sys::Win32::Foundation::HANDLE,
+    job: std::os::windows::io::OwnedHandle,
 }
 
 impl ProcessTreeGuard {
@@ -366,8 +723,7 @@ impl ProcessTreeGuard {
         #[cfg(windows)]
         {
             use std::ffi::c_void;
-            use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::Foundation::CloseHandle;
+            use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
             use windows_sys::Win32::System::JobObjects::{
                 AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
                 JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
@@ -376,14 +732,15 @@ impl ProcessTreeGuard {
 
             // SAFETY: all handles and pointers are valid for the duration of each Win32 call.
             unsafe {
-                let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-                if job.is_null() {
+                let raw_job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if raw_job.is_null() {
                     return Err(std::io::Error::last_os_error());
                 }
+                let job = OwnedHandle::from_raw_handle(raw_job);
                 let mut information = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
                 information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
                 let configured = SetInformationJobObject(
-                    job,
+                    job.as_raw_handle(),
                     JobObjectExtendedLimitInformation,
                     (&raw const information).cast::<c_void>(),
                     u32::try_from(std::mem::size_of_val(&information)).map_err(|_| {
@@ -391,17 +748,15 @@ impl ProcessTreeGuard {
                     })?,
                 );
                 if configured == 0 {
-                    let error = std::io::Error::last_os_error();
-                    CloseHandle(job);
-                    return Err(error);
+                    return Err(std::io::Error::last_os_error());
                 }
-                let process = child.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
-                if AssignProcessToJobObject(job, process) == 0 {
-                    let error = std::io::Error::last_os_error();
-                    CloseHandle(job);
-                    return Err(error);
+                let Some(process) = child.raw_handle() else {
+                    return Err(std::io::Error::other("child process handle is unavailable"));
+                };
+                if AssignProcessToJobObject(job.as_raw_handle(), process) == 0 {
+                    return Err(std::io::Error::last_os_error());
                 }
-                return Ok(Self { job });
+                Ok(Self { job })
             }
         }
         #[cfg(not(windows))]
@@ -413,20 +768,21 @@ impl ProcessTreeGuard {
 
     async fn terminate(&self, child: &mut tokio::process::Child, pid: Option<u32>) {
         #[cfg(unix)]
-        if let Some(pid) = pid {
-            if let Ok(pid) = i32::try_from(pid) {
-                // SAFETY: the child was spawned into a new process group whose id is its pid.
-                unsafe {
-                    libc::killpg(pid, libc::SIGKILL);
-                }
+        if let Some(pid) = pid
+            && let Ok(pid) = i32::try_from(pid)
+        {
+            // SAFETY: the child was spawned into a new process group whose id is its pid.
+            unsafe {
+                libc::killpg(pid, libc::SIGKILL);
             }
         }
         #[cfg(windows)]
         {
+            use std::os::windows::io::AsRawHandle;
             use windows_sys::Win32::System::JobObjects::TerminateJobObject;
             // SAFETY: the Job Object handle remains owned by this guard.
             unsafe {
-                TerminateJobObject(self.job, 1);
+                TerminateJobObject(self.job.as_raw_handle(), 1);
             }
             let _ = pid;
         }
@@ -435,28 +791,20 @@ impl ProcessTreeGuard {
     }
 }
 
-#[cfg(windows)]
-impl Drop for ProcessTreeGuard {
-    fn drop(&mut self) {
-        use windows_sys::Win32::Foundation::CloseHandle;
-        // SAFETY: the handle is owned by this guard and is closed exactly once.
-        unsafe {
-            CloseHandle(self.job);
-        }
-    }
-}
-
 fn command_permission_summaries(
     permissions: &[CommandPermission],
 ) -> Vec<CommandPermissionSummary> {
-    permissions
-        .iter()
-        .map(|permission| CommandPermissionSummary {
-            bin: permission.bin.clone(),
-            args: permission.args.clone(),
-            purpose: permission.purpose.clone(),
-        })
-        .collect()
+    permissions.iter().map(command_permission_summary).collect()
+}
+
+fn command_permission_summary(permission: &CommandPermission) -> CommandPermissionSummary {
+    CommandPermissionSummary {
+        bin: permission.bin.clone(),
+        args: permission.args.clone(),
+        purpose: permission.purpose.clone(),
+        isolation: permission.isolation.clone(),
+        image: permission.image.clone(),
+    }
 }
 
 fn args_allowed(permission: &CommandPermission, args: &[String]) -> bool {
@@ -522,7 +870,11 @@ pub struct HttpRequest {
     pub method: String,
     pub url: String,
     pub headers: BTreeMap<String, String>,
-    pub body: Option<String>,
+    /// Query parameters containing credentials. They are appended only after
+    /// permission checks and removed from all returned URLs and errors.
+    pub sensitive_query: BTreeMap<String, String>,
+    pub body: Option<Vec<u8>>,
+    pub follow_redirects: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -530,7 +882,8 @@ pub struct HttpOutput {
     pub status: u16,
     pub url: String,
     pub headers: BTreeMap<String, String>,
-    pub body: String,
+    pub body: Vec<u8>,
+    pub content_type: Option<String>,
 }
 
 impl HttpGateway {
@@ -552,6 +905,30 @@ impl HttpGateway {
     }
 
     pub async fn request(&self, request: HttpRequest) -> Result<HttpOutput, GatewayError> {
+        if request.follow_redirects && !request.sensitive_query.is_empty() {
+            return Err(GatewayError::UnsupportedUrl {
+                url: "requests with sensitive query parameters cannot follow redirects".into(),
+            });
+        }
+        if request.follow_redirects
+            && request
+                .headers
+                .keys()
+                .any(|name| credential_like_name(name))
+        {
+            return Err(GatewayError::UnsupportedUrl {
+                url: "requests with credential headers cannot follow redirects".into(),
+            });
+        }
+        if request
+            .body
+            .as_ref()
+            .is_some_and(|body| body.len() > self.body_limit_bytes)
+        {
+            return Err(GatewayError::HttpRequestBodyTooLarge {
+                url: request.url.clone(),
+            });
+        }
         let mut url = request.url.clone();
         for _ in 0..=self.redirect_limit {
             ensure_url_allowed(&self.permissions, &url)?;
@@ -562,19 +939,31 @@ impl HttpGateway {
                     .map_err(|_| GatewayError::UnsupportedUrl {
                         url: request.method.clone(),
                     })?;
-            let mut builder = self.client.request(method, &url).timeout(self.timeout);
+            let mut request_url =
+                Url::parse(&url).map_err(|_| GatewayError::UnsupportedUrl { url: url.clone() })?;
+            if !request.sensitive_query.is_empty() {
+                let mut pairs = request_url.query_pairs_mut();
+                for (key, value) in &request.sensitive_query {
+                    pairs.append_pair(key, value);
+                }
+            }
+            let mut builder = self
+                .client
+                .request(method, request_url)
+                .timeout(self.timeout);
             for (key, value) in &request.headers {
                 builder = builder.header(key, value);
             }
             if let Some(body) = &request.body {
                 builder = builder.body(body.clone());
             }
-            let response = tokio::select! {
+            let mut response = tokio::select! {
                 _ = self.cancellation.cancelled() => return Err(GatewayError::Canceled),
-                response = builder.send() => response?,
+                response = builder.send() => response.map_err(|error| GatewayError::Http(error.without_url()))?,
             };
             let status = response.status();
-            if status.is_redirection()
+            if request.follow_redirects
+                && status.is_redirection()
                 && let Some(location) = response.headers().get(reqwest::header::LOCATION)
             {
                 let location = location
@@ -585,6 +974,7 @@ impl HttpGateway {
             }
             let final_url = response.url().to_string();
             ensure_url_allowed(&self.permissions, &final_url)?;
+            let public_final_url = redact_query_parameters(&final_url, &request.sensitive_query)?;
             let headers = response
                 .headers()
                 .iter()
@@ -595,22 +985,67 @@ impl HttpGateway {
                         .map(|value| (key.as_str().to_string(), value.to_string()))
                 })
                 .collect();
-            let body = tokio::select! {
-                _ = self.cancellation.cancelled() => return Err(GatewayError::Canceled),
-                body = response.text() => body?,
-            };
-            if body.len() > self.body_limit_bytes {
-                return Err(GatewayError::HttpBodyTooLarge { url: final_url });
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let initial_capacity = response
+                .content_length()
+                .and_then(|length| usize::try_from(length).ok())
+                .unwrap_or_default()
+                .min(self.body_limit_bytes);
+            let mut body = Vec::with_capacity(initial_capacity);
+            loop {
+                let chunk = tokio::select! {
+                    _ = self.cancellation.cancelled() => return Err(GatewayError::Canceled),
+                    chunk = response.chunk() => chunk.map_err(|error| GatewayError::Http(error.without_url()))?,
+                };
+                let Some(chunk) = chunk else {
+                    break;
+                };
+                if body.len().saturating_add(chunk.len()) > self.body_limit_bytes {
+                    return Err(GatewayError::HttpBodyTooLarge {
+                        url: public_final_url.clone(),
+                    });
+                }
+                body.extend_from_slice(&chunk);
             }
             return Ok(HttpOutput {
                 status: status.as_u16(),
-                url: final_url,
+                url: public_final_url,
                 headers,
                 body,
+                content_type,
             });
         }
         Err(GatewayError::UnsupportedUrl { url })
     }
+}
+
+fn redact_query_parameters(
+    value: &str,
+    sensitive: &BTreeMap<String, String>,
+) -> Result<String, GatewayError> {
+    if sensitive.is_empty() {
+        return Ok(value.to_string());
+    }
+    let mut url = Url::parse(value).map_err(|_| GatewayError::UnsupportedUrl {
+        url: "HTTP response returned an invalid final URL".into(),
+    })?;
+    let retained = url
+        .query_pairs()
+        .filter(|(key, _)| !sensitive.contains_key(key.as_ref()))
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    url.set_query(None);
+    if !retained.is_empty() {
+        let mut pairs = url.query_pairs_mut();
+        for (key, value) in retained {
+            pairs.append_pair(&key, &value);
+        }
+    }
+    Ok(url.to_string())
 }
 
 fn ensure_url_allowed(permissions: &Permissions, url: &str) -> Result<(), GatewayError> {
@@ -726,6 +1161,8 @@ mod tests {
             bin: "cc".into(),
             args: vec!["-o".into(), "*".into(), "*.c".into()],
             purpose: "compile".into(),
+            isolation: Some(CommandIsolation::TrustedHost),
+            image: None,
         };
         let args = vec!["-o".into(), "hello".into(), "main.c".into()];
         assert!(args_allowed(&permission, &args));
@@ -740,6 +1177,8 @@ mod tests {
             bin: "date".into(),
             args: vec![],
             purpose: "show time".into(),
+            isolation: Some(CommandIsolation::TrustedHost),
+            image: None,
         });
         let limits = RuntimeLimits {
             command_timeout_seconds: 17,
@@ -754,6 +1193,57 @@ mod tests {
         assert_eq!(plan["output_limit_bytes"], 4096);
     }
 
+    #[tokio::test]
+    async fn workspace_relative_command_resolves_against_the_declared_workspace() {
+        let workspace = temp_workspace().join(format!(
+            "relative-command-{}",
+            uuid::Uuid::now_v7().as_simple()
+        ));
+        std::fs::create_dir_all(&workspace).expect("test workspace should be created");
+        let executable_name = if cfg!(windows) {
+            "local-command.exe"
+        } else {
+            "local-command"
+        };
+        let executable = workspace.join(executable_name);
+        std::fs::copy(
+            std::env::current_exe().expect("current test executable should resolve"),
+            &executable,
+        )
+        .expect("test executable should be copied into the workspace");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+                .expect("test executable should be executable");
+        }
+        let bin = format!("./{executable_name}");
+        let mut permissions = Permissions::default();
+        permissions.commands.push(CommandPermission {
+            bin: bin.clone(),
+            args: vec!["--list".into()],
+            purpose: "verify workspace-relative execution".into(),
+            isolation: Some(CommandIsolation::TrustedHost),
+            image: None,
+        });
+
+        let output = CmdGateway::new(permissions, workspace.clone())
+            .run_with_limits(&[bin, "--list".into()], 30, 1024 * 1024)
+            .await
+            .expect("workspace-relative executable should run");
+
+        assert_eq!(output.status, 0);
+        assert!(output.stdout.contains("workspace_relative_command"));
+        std::fs::remove_dir_all(workspace).expect("test workspace should be removed");
+    }
+
+    #[test]
+    fn workspace_relative_command_rejects_parent_traversal() {
+        let error = resolve_command_program(&temp_workspace(), "./../outside")
+            .expect_err("parent traversal must be rejected before filesystem resolution");
+        assert!(matches!(error, GatewayError::CommandPathDenied { .. }));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn cancellation_stops_a_running_command() {
@@ -762,6 +1252,8 @@ mod tests {
             bin: "sh".into(),
             args: vec!["-c".into(), "sleep 30".into()],
             purpose: "cancellation test".into(),
+            isolation: Some(CommandIsolation::TrustedHost),
+            image: None,
         });
         let cancellation = CancellationToken::new();
         let gateway =
@@ -778,6 +1270,105 @@ mod tests {
             .expect("command cancellation should not wait for the timeout")
             .expect("command task should join");
         assert!(matches!(result, Err(GatewayError::Canceled)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_output_limit_stops_stdout_overflow_during_read() {
+        let gateway = CmdGateway::new(Permissions::default(), temp_workspace());
+        let result = gateway
+            .run_trusted_process(
+                &["sh".into(), "-c".into(), "head -c 4097 /dev/zero".into()],
+                5,
+                4096,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(GatewayError::CommandOutputTooLarge { bin }) if bin == "sh"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_output_limit_stops_stderr_overflow_during_read() {
+        let gateway = CmdGateway::new(Permissions::default(), temp_workspace());
+        let result = gateway
+            .run_trusted_process(
+                &[
+                    "sh".into(),
+                    "-c".into(),
+                    "head -c 4097 /dev/zero >&2".into(),
+                ],
+                5,
+                4096,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(GatewayError::CommandOutputTooLarge { bin }) if bin == "sh"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_output_limit_is_shared_between_stdout_and_stderr() {
+        let gateway = CmdGateway::new(Permissions::default(), temp_workspace());
+        let result = gateway
+            .run_trusted_process(
+                &[
+                    "sh".into(),
+                    "-c".into(),
+                    "head -c 3000 /dev/zero; head -c 3000 /dev/zero >&2".into(),
+                ],
+                5,
+                4096,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(GatewayError::CommandOutputTooLarge { bin }) if bin == "sh"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_output_limit_is_observed_after_one_stream_eof() {
+        let gateway = CmdGateway::new(Permissions::default(), temp_workspace());
+        let started = tokio::time::Instant::now();
+        let result = gateway
+            .run_trusted_process(
+                &[
+                    "sh".into(),
+                    "-c".into(),
+                    "printf done; exec 1>&-; head -c 8192 /dev/zero >&2".into(),
+                ],
+                5,
+                4096,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(GatewayError::CommandOutputTooLarge { bin }) if bin == "sh"
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn command_stdin_limit_is_separate_from_output_limit() {
+        let limits = RuntimeLimits {
+            command_input_limit_bytes: 4,
+            command_output_limit_bytes: 4096,
+            ..RuntimeLimits::default()
+        };
+        let gateway = CmdGateway::new(Permissions::default(), temp_workspace()).with_limits(limits);
+        let result = gateway
+            .run_trusted_process_with_stdin(&["cat".into()], 5, 4096, Some(b"12345"))
+            .await;
+        assert!(matches!(
+            result,
+            Err(GatewayError::CommandInputTooLarge { bin }) if bin == "cat"
+        ));
     }
 
     #[cfg(unix)]
@@ -813,6 +1404,8 @@ mod tests {
             bin: "sh".into(),
             args: vec!["-c".into(), script.into()],
             purpose: "process group cancellation test".into(),
+            isolation: Some(CommandIsolation::TrustedHost),
+            image: None,
         });
         let cancellation = CancellationToken::new();
         let gateway =
@@ -861,6 +1454,8 @@ mod tests {
             bin: "test".into(),
             args: vec!["-f".into(), "*".into()],
             purpose: "probe file".into(),
+            isolation: Some(CommandIsolation::TrustedHost),
+            image: None,
         };
         for denied in [
             "../secret",
@@ -886,6 +1481,8 @@ mod tests {
             bin: "cc".into(),
             args: vec!["*.c".into()],
             purpose: "compile source".into(),
+            isolation: Some(CommandIsolation::TrustedHost),
+            image: None,
         };
         assert!(args_allowed(&permission, &["main.c".into()]));
         assert!(args_allowed(&permission, &["src/main.c".into()]));
@@ -900,6 +1497,8 @@ mod tests {
             bin: "cc".into(),
             args: vec!["-o".into(), "*".into(), "*.c".into()],
             purpose: "compile".into(),
+            isolation: Some(CommandIsolation::TrustedHost),
+            image: None,
         });
         let gateway = CmdGateway::new(permissions, temp_workspace());
         let denied = gateway
@@ -928,11 +1527,15 @@ mod tests {
                 bin: "cc".into(),
                 args: vec!["-shared".into(), "*.c".into()],
                 purpose: "build a shared library".into(),
+                isolation: Some(CommandIsolation::TrustedHost),
+                image: None,
             },
             CommandPermission {
                 bin: "cc".into(),
                 args: vec!["-o".into(), "*".into(), "*.c".into()],
                 purpose: "build an executable".into(),
+                isolation: Some(CommandIsolation::TrustedHost),
+                image: None,
             },
         ]);
         let plan = CmdGateway::new(permissions, temp_workspace())
@@ -955,6 +1558,18 @@ mod tests {
         let mut permissions = Permissions::default();
         permissions.network.push("example.com".into());
         assert!(ensure_url_allowed(&permissions, "https://example.com/path").is_ok());
+    }
+
+    #[test]
+    fn sensitive_query_parameters_are_removed_from_public_urls() {
+        let sensitive = BTreeMap::from([("api_key".to_string(), "secret-value".to_string())]);
+        let public = redact_query_parameters(
+            "https://example.com/search?engine=google&api_key=secret-value&q=qcg",
+            &sensitive,
+        )
+        .expect("URL should be redacted");
+        assert_eq!(public, "https://example.com/search?engine=google&q=qcg");
+        assert!(!public.contains("secret-value"));
     }
 
     macro_rules! fs_write_denied_path_case {
@@ -1003,6 +1618,8 @@ mod tests {
                     bin: "tool".into(),
                     args: vec![$pattern.into()],
                     purpose: "test wildcard".into(),
+                    isolation: Some(CommandIsolation::TrustedHost),
+                    image: None,
                 };
                 assert!(
                     !args_allowed(&permission, &[$actual.into()]),
@@ -1022,6 +1639,8 @@ mod tests {
                     bin: "tool".into(),
                     args: vec![$pattern.into()],
                     purpose: "test wildcard".into(),
+                    isolation: Some(CommandIsolation::TrustedHost),
+                    image: None,
                 };
                 assert!(
                     args_allowed(&permission, &[$actual.into()]),
@@ -1412,6 +2031,8 @@ mod tests {
             bin: "cc".into(),
             args: vec!["*.c".into()],
             purpose: "compile".into(),
+            isolation: Some(CommandIsolation::TrustedHost),
+            image: None,
         });
         let gateway = CmdGateway::new(permissions, temp_workspace());
         let error = gateway
@@ -1434,6 +2055,8 @@ mod tests {
             bin: "date".into(),
             args: vec![],
             purpose: "print date".into(),
+            isolation: Some(CommandIsolation::TrustedHost),
+            image: None,
         });
         let gateway = CmdGateway::new(permissions, temp_workspace());
         assert!(matches!(
@@ -1449,6 +2072,8 @@ mod tests {
             bin: "cc".into(),
             args: vec!["*.c".into()],
             purpose: "compile".into(),
+            isolation: Some(CommandIsolation::TrustedHost),
+            image: None,
         });
         let gateway = CmdGateway::new(permissions, temp_workspace());
         assert!(matches!(
@@ -1464,6 +2089,8 @@ mod tests {
             bin: "cc".into(),
             args: vec!["*.c".into()],
             purpose: "compile".into(),
+            isolation: Some(CommandIsolation::TrustedHost),
+            image: None,
         });
         let gateway = CmdGateway::new(permissions, temp_workspace());
         assert!(matches!(

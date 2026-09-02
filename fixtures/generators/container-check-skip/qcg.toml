@@ -19,7 +19,7 @@ command = [
     "-c",
     "test -f /work/hello.txt",
 ]
-image = "alpine:3.20"
+image = "alpine@sha256:fixture"
 
 [[flow.params.mounts]]
 from = "workspace"
@@ -33,7 +33,11 @@ name = "Container Check Skip"
 qcg_version = "^0.1"
 version = "0.1.0"
 
+[permissions]
+fs_write = ["workspace"]
+
 [permissions.containers]
 enabled = true
-images = ["alpine:3.20"]
+runtime = "docker"
+images = ["alpine@sha256:fixture"]
 on_missing = "skip_with_warning"

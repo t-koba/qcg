@@ -23,7 +23,7 @@ command = [
     "cc",
     "hello.c",
     "-o",
-    "hello",
+    "hello.exe",
 ]
 
 [[flow]]
@@ -31,7 +31,7 @@ id = "run_check"
 type = "check.command"
 
 [flow.params]
-command = ["./hello"]
+command = ["./hello.exe"]
 
 [flow.params.expect]
 exit_code = 0
@@ -46,22 +46,25 @@ version = "0.1.0"
 
 [[outputs.extras]]
 label = "Executable"
-glob = "hello"
+glob = "hello.exe"
 required = true
 
 [permissions]
+fs_write = ["workspace"]
 side_effects = "allowed"
 
 [[permissions.commands]]
 args = [
     "hello.c",
     "-o",
-    "hello",
+    "hello.exe",
 ]
 bin = "cc"
 purpose = "compile generated C source"
+isolation = "trusted_host"
 
 [[permissions.commands]]
 args = []
-bin = "./hello"
+bin = "./hello.exe"
 purpose = "run generated executable for validation"
+isolation = "trusted_host"

@@ -1,5 +1,5 @@
-Use the declared tool to write a draft.
+Delegate once, then use the declared write tool to create a draft.
 
-FAKE_TOOL: {"name":"write_draft","args":{"path":"drafts/result.txt","content":"agent wrote this\n"}}
+FAKE_TOOL_SEQUENCE: [{"name":"researcher","args":{"task":"Return a bounded specialist result."}},{"name":"write_draft","args":{"path":"drafts/result.txt","content":"agent delegated and wrote this\n"}}]
 FAKE_AGENT_FINAL:
 done
