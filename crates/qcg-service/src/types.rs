@@ -76,6 +76,8 @@ pub(crate) struct LocalQcgServiceInner {
     pub(crate) run_store_mode: RunStoreMode,
     pub(crate) _runs_lock: Option<File>,
     pub(crate) queue_notify: Arc<tokio::sync::Notify>,
+    /// Stable identity of this service process for shared-store ownership.
+    pub(crate) owner_id: String,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct RunRecord {
@@ -98,6 +100,9 @@ pub(crate) struct RunRecord {
     pub(crate) cancellation: CancellationToken,
     pub(crate) task: Arc<Mutex<Option<JoinHandle<()>>>>,
     pub(crate) queued_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Owning service process for shared-store coordination. Empty means
+    /// unowned (recovered); the first process to spawn claims ownership.
+    pub(crate) owner_id: String,
 }
 
 /// Owned inputs for a self-contained run bundle export.

@@ -59,7 +59,11 @@ impl StepExecutor for LlmRepairStep {
         if let Some(output_path) = output_path {
             let output_path = ctx.render_inline(node, output_path)?;
             let target = ctx.run.fs.resolve_write(&output_path).step_err(&node.id)?;
-            tokio::fs::write(&target, &text).await?;
+            ctx.run
+                .fs
+                .write_file_atomic(&target, text.as_bytes())
+                .await
+                .map_err(|error| StepError::from_gateway(&node.id, error))?;
             files.push(target);
         }
         Ok(StepOutcome::Success {

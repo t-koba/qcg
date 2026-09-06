@@ -85,7 +85,7 @@ async function runMode(mode) {
     await assertListMultiselectForm(page);
     await assertSchemaDrivenForm(page);
     await assertSkippedReason(page);
-    await assertArtifactPreviewSandbox(page);
+    await assertArtifactPreviewSandbox(page, mode);
     await assertFileInput(page);
     await context.close();
     context = undefined;
@@ -258,12 +258,39 @@ async function assertSkippedReason(page) {
     .waitFor({ timeout: 5000 });
 }
 
-async function assertArtifactPreviewSandbox(page) {
+async function assertArtifactPreviewSandbox(page, mode) {
   await selectGenerator(page, /Artifact Preview Sandbox/);
   await page.getByRole("button", { name: /^Start generation$/ }).click();
   await page.locator("#run-state.succeeded").waitFor({ timeout: 15000 });
   const row = page.locator("#artifact-list .artifact").filter({ hasText: "preview.html" });
   await row.waitFor({ timeout: 5000 });
+  // Watch for the iframe before it exists: the load event proves the blob
+  // URL actually framed content instead of being blocked by CSP frame-src.
+  const frameLoaded = page.evaluate(() => new Promise((resolve) => {
+    const timer = setTimeout(() => resolve("timeout"), 10000);
+    const observer = new MutationObserver(() => {
+      const iframe = document.querySelector("#artifact-preview iframe");
+      if (iframe) {
+        observer.disconnect();
+        iframe.addEventListener("load", () => {
+          clearTimeout(timer);
+          resolve("loaded");
+        });
+        iframe.addEventListener("error", () => {
+          clearTimeout(timer);
+          resolve("error");
+        });
+      }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+  }));
+  const cspErrors = [];
+  const cspListener = (message) => {
+    if (message.type() === "error" && /content security policy/i.test(message.text())) {
+      cspErrors.push(message.text());
+    }
+  };
+  page.on("console", cspListener);
   const titleBeforePreview = await page.title();
   await row.getByRole("button", { name: "Preview" }).click();
   try {
@@ -279,6 +306,13 @@ async function assertArtifactPreviewSandbox(page) {
   const sandbox = await frame.getAttribute("sandbox");
   if (sandbox !== "") {
     throw new Error(`artifact preview iframe should have an empty sandbox policy, got ${sandbox}`);
+  }
+  const frameSrc = await frame.getAttribute("src");
+  if (!frameSrc || !frameSrc.startsWith("blob:")) {
+    throw new Error(`artifact preview iframe should load a blob URL, got ${frameSrc}`);
+  }
+  if ((await frameLoaded) !== "loaded") {
+    throw new Error(`artifact preview frame never fired load (${await frameLoaded}); CSP frame-src may be blocking the blob URL`);
   }
   await page.waitForTimeout(300);
   const title = await page.title();
@@ -297,6 +331,21 @@ async function assertArtifactPreviewSandbox(page) {
   const mismatchedRow = page.locator("#artifact-list .artifact").filter({ hasText: "mismatch.txt" });
   await mismatchedRow.getByRole("button", { name: "Preview" }).click();
   await page.locator("#artifact-preview .preview-error").filter({ hasText: "MIME" }).waitFor({ timeout: 5000 });
+  page.off("console", cspListener);
+  if (cspErrors.length > 0) {
+    throw new Error(`CSP blocked preview content: ${cspErrors.join(" | ")}`);
+  }
+  if (mode.frontend === "assets") {
+    // Production asset delivery must explicitly allow framed and media blob
+    // URLs; without them HTML/PDF frames and audio/video previews stay blank.
+    const response = await fetch(`http://127.0.0.1:${mode.apiPort}/api/generators/generator/assets/ui/index.html`);
+    const csp = response.headers.get("content-security-policy") || "";
+    for (const directive of ["frame-src blob:", "media-src blob:"]) {
+      if (!csp.includes(directive)) {
+        throw new Error(`production CSP must allow ${directive}, got: ${csp}`);
+      }
+    }
+  }
 }
 
 async function assertFileInput(page) {

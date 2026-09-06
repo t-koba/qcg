@@ -13,6 +13,10 @@ pub struct RunStartedEventData {
     pub contract_sha256: String,
     pub inputs: BTreeMap<String, Value>,
     #[serde(default)]
+    pub answers: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub confirmations: BTreeMap<String, bool>,
+    #[serde(default)]
     pub resource_hashes: Vec<ResourceEventData>,
     pub qcg: String,
     pub schema_version: u32,

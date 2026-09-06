@@ -2084,6 +2084,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -2106,6 +2107,7 @@ dependencies = [
  "camino",
  "chrono",
  "futures-util",
+ "hex",
  "qcg-api",
  "qcg-policy",
  "qcg-service",

@@ -58,6 +58,21 @@ impl SecretStore {
         self.values.get(name).map(String::as_str)
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// Longest registered secret in bytes. Streaming publication holds back
+    /// this many bytes minus one so a secret split across deltas can never
+    /// be reconstructed from already-published fragments.
+    pub fn max_value_len(&self) -> usize {
+        self.values
+            .values()
+            .map(|value| value.len())
+            .max()
+            .unwrap_or(0)
+    }
+
     pub fn assert_absent(&self, text: &str) -> Result<(), String> {
         for (name, value) in &self.values {
             if !value.is_empty() && text.contains(value) {

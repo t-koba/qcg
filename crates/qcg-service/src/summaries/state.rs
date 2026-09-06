@@ -10,6 +10,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
+use super::reads::read_persisted_hitl;
+use super::reads::read_persisted_mcp_pending;
 use super::reads::read_queued_identity;
 use super::runs::{read_run_generator_path, read_run_inputs};
 use super::summary::run_meta_dir;
@@ -18,6 +20,17 @@ use qcg_policy::MAX_DIRECTORY_SCAN_ENTRIES;
 pub(crate) fn fold_run_state(run_dir: &Utf8Path) -> Result<RunState, ServiceError> {
     RunState::fold_journal(&run_meta_dir(run_dir).join("journal.jsonl"))
         .map_err(|error| ServiceError::Invalid(error.to_string()))
+}
+
+fn read_last_queued_at(run_dir: &Utf8Path) -> Option<chrono::DateTime<chrono::Utc>> {
+    let events = crate::summaries::read_journal_events(run_dir).ok()?;
+    events
+        .iter()
+        .rev()
+        .find(|event| event.get("t").and_then(serde_json::Value::as_str) == Some("run_queued"))
+        .and_then(|event| event.get("ts").and_then(serde_json::Value::as_str))
+        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+        .map(|ts| ts.with_timezone(&chrono::Utc))
 }
 
 pub(crate) fn read_optional_output_manifest(
@@ -99,6 +112,18 @@ pub(crate) fn rehydrate_runs(
             .map_err(|error| ServiceError::Invalid(error.to_string()))?;
         let inputs = read_run_inputs(&run_dir)?;
         let queued_identity = read_queued_identity(&run_dir).unwrap_or((0, None));
+        let (mut answers, confirmations) =
+            read_persisted_hitl(&run_dir).unwrap_or((BTreeMap::new(), BTreeMap::new()));
+        // Journaled MCP continuations ride along in the answers map under
+        // reserved #__mcp_pending keys so resumed steps can continue the
+        // original remote request.
+        if let Ok(pending) = read_persisted_mcp_pending(&run_dir) {
+            answers.extend(pending);
+        }
+        // Restore FIFO admission order from the last run_queued timestamp so
+        // a restart preserves cross-generator submission order instead of
+        // falling back to run_id string order.
+        let queued_at = read_last_queued_at(&run_dir);
         let (events, _) = broadcast::channel(512);
         records.insert(
             run_id,
@@ -106,8 +131,8 @@ pub(crate) fn rehydrate_runs(
                 contract_sha256: contract.sha256.clone(),
                 contract,
                 inputs,
-                answers: BTreeMap::new(),
-                confirmations: BTreeMap::new(),
+                answers,
+                confirmations,
                 priority: queued_identity.0,
                 parent_run_id: queued_identity.1,
                 preempted: false,
@@ -119,7 +144,8 @@ pub(crate) fn rehydrate_runs(
                 events,
                 cancellation: CancellationToken::new(),
                 task: Arc::new(Mutex::new(None)),
-                queued_at: None,
+                queued_at,
+                owner_id: String::new(),
             },
         );
     }

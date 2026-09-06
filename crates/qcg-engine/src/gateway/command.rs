@@ -156,8 +156,19 @@ impl CmdGateway {
         )
         .ok_or_else(|| GatewayError::ContainerRuntimeMissing { bin: bin.clone() })?;
         let mount = format!("type=bind,src={},dst=/work", self.workspace);
+        // Track the daemon-side container so cancel/timeout can stop it, not
+        // just the client CLI process. The cidfile lives outside the mounted
+        // workspace so the container cannot tamper with it.
+        let cidfile = std::env::temp_dir().join(format!(
+            ".qcg-container-{}.cid",
+            uuid::Uuid::now_v7().as_simple()
+        ));
+        let cidfile_str = cidfile.to_string_lossy().into_owned();
         container_argv.extend([
             "--rm".into(),
+            "-i".into(),
+            "--cidfile".into(),
+            cidfile_str,
             "--network".into(),
             "none".into(),
             "--read-only".into(),
@@ -176,13 +187,35 @@ impl CmdGateway {
             image.into(),
         ]);
         container_argv.extend_from_slice(argv);
-        self.run_trusted_process_with_stdin(
-            &container_argv,
-            timeout_seconds,
-            output_limit_bytes,
-            stdin,
-        )
-        .await
+        let result = self
+            .run_trusted_process_with_stdin(
+                &container_argv,
+                timeout_seconds,
+                output_limit_bytes,
+                stdin,
+            )
+            .await;
+        // Best-effort daemon cleanup: on cancel/timeout the CLI tree kill
+        // does not stop the daemon-side container. Read the cidfile and
+        // stop/remove the container, then remove the cidfile.
+        if result.is_err()
+            && let Ok(id) = std::fs::read_to_string(&cidfile)
+            && !id.trim().is_empty()
+        {
+            let runtime = self
+                .permissions
+                .containers
+                .runtime
+                .as_ref()
+                .map(|runtime| match runtime {
+                    qcg_contract::ContainerRuntime::Podman => "podman",
+                    _ => "docker",
+                })
+                .unwrap_or("docker");
+            self.kill_container(runtime, id.trim()).await;
+        }
+        let _ = std::fs::remove_file(&cidfile);
+        result
     }
 
     #[doc(hidden)]
@@ -416,6 +449,22 @@ impl CmdGateway {
             Duration::from_secs(10),
             Command::new(runtime)
                 .args(["kill", container_id])
+                .current_dir(&self.workspace)
+                .env_clear()
+                .env("PATH", std::env::var("PATH").unwrap_or_default())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .status(),
+        )
+        .await;
+        // Ensure a killed or exited container does not linger when --rm did
+        // not remove it (for example after a client-side timeout).
+        let _ = timeout(
+            Duration::from_secs(10),
+            Command::new(runtime)
+                .args(["rm", "-f", container_id])
                 .current_dir(&self.workspace)
                 .env_clear()
                 .env("PATH", std::env::var("PATH").unwrap_or_default())

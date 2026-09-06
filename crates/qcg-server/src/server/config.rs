@@ -34,6 +34,7 @@ pub struct ServerConfig {
 #[derive(Debug)]
 pub(crate) struct AppState {
     pub(crate) service: LocalQcgService,
+    pub(crate) runs_dir: Utf8PathBuf,
     pub(crate) oauth_origin: Option<String>,
     pub(crate) oauth_allowed_origins: BTreeSet<String>,
     pub(crate) oauth_callback_url: Option<String>,

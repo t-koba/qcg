@@ -81,22 +81,24 @@ export class ApiClient {
   }
 
   listRuns(
-    query?: { state?: string; generator_id?: string; since?: string },
+    query?: { state?: string; generator_id?: string; since?: string; cursor?: string; limit?: number },
     signal?: AbortSignal,
   ): Promise<RunListResponse> {
     const params = new URLSearchParams();
     if (query?.state) params.set("state", query.state);
     if (query?.generator_id) params.set("generator_id", query.generator_id);
     if (query?.since) params.set("since", query.since);
+    if (query?.cursor) params.set("cursor", query.cursor);
+    if (query?.limit !== undefined) params.set("limit", String(query.limit));
     const suffix = params.size > 0 ? `?${params.toString()}` : "";
     return this.get<RunListResponse>(`/api/runs${suffix}`, signal);
   }
 
-  forkRun(runId: string, atSeq: number, signal?: AbortSignal): Promise<RunSnapshot> {
+  forkRun(runId: string, atSeq: number, idempotencyKey?: string, signal?: AbortSignal): Promise<RunSnapshot> {
     return this.post<RunSnapshot>(
       `/api/runs/${encodeURIComponent(runId)}/fork`,
       { at_seq: atSeq, state_patch: {} },
-      undefined,
+      idempotencyKey,
       signal,
     );
   }

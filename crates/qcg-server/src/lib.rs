@@ -36,6 +36,7 @@ mod tests {
                 None,
             )
             .expect("service should initialize"),
+            runs_dir: runs.clone(),
             oauth_origin: None,
             oauth_allowed_origins: BTreeSet::new(),
             oauth_callback_url: None,
@@ -185,6 +186,7 @@ mod tests {
                 None,
             )
             .expect("service should initialize"),
+            runs_dir: runs.clone(),
             oauth_origin: None,
             oauth_allowed_origins: BTreeSet::new(),
             oauth_callback_url: None,
@@ -286,6 +288,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idempotent_start_reuses_run_after_restart() {
+        let workspace = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .expect("workspace root should exist")
+            .to_path_buf();
+        let runs = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .expect("temporary directory path should be UTF-8")
+            .join(format!("qcg-idempotency-restart-{}", uuid::Uuid::now_v7()));
+        let make_state = || {
+            Arc::new(AppState {
+                service: LocalQcgService::new(
+                    workspace.join("fixtures/generators"),
+                    runs.clone(),
+                    None,
+                )
+                .expect("service should initialize"),
+                runs_dir: runs.clone(),
+                oauth_origin: None,
+                oauth_allowed_origins: BTreeSet::new(),
+                oauth_callback_url: None,
+                idempotency: tokio::sync::Mutex::new(BTreeMap::new()),
+                api_token_digest: None,
+                artifact_limits: qcg_service::ArtifactZipLimits::default(),
+                asset_limit: None,
+            })
+        };
+        let state = make_state();
+        let mut headers = HeaderMap::new();
+        headers.insert(IDEMPOTENCY_HEADER, HeaderValue::from_static("restart-run"));
+        let request = StartRun {
+            generator_id: "hello-template".into(),
+            inputs: BTreeMap::from([("name".into(), json!("qcg"))]),
+            ..Default::default()
+        };
+        let first = start_run(
+            State(Arc::clone(&state)),
+            headers.clone(),
+            Json(request.clone()),
+        )
+        .await
+        .expect("first request should start");
+        let first_location = first
+            .headers()
+            .get(header::LOCATION)
+            .expect("start should carry a location")
+            .clone();
+        drop(state);
+        // Simulate a process restart: empty in-memory map, same runs dir.
+        // The first service releases its directory lock once background
+        // tasks settle; poll briefly for handoff.
+        let restarted = {
+            let mut attempts = 0;
+            loop {
+                match LocalQcgService::new(
+                    workspace.join("fixtures/generators"),
+                    runs.clone(),
+                    None,
+                ) {
+                    Ok(service) => {
+                        break Arc::new(AppState {
+                            service,
+                            runs_dir: runs.clone(),
+                            oauth_origin: None,
+                            oauth_allowed_origins: BTreeSet::new(),
+                            oauth_callback_url: None,
+                            idempotency: tokio::sync::Mutex::new(BTreeMap::new()),
+                            api_token_digest: None,
+                            artifact_limits: qcg_service::ArtifactZipLimits::default(),
+                            asset_limit: None,
+                        });
+                    }
+                    Err(error) if attempts < 100 => {
+                        attempts += 1;
+                        let _ = &error;
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(error) => panic!("restarted service should initialize: {error}"),
+                }
+            }
+        };
+        let retry = start_run(State(Arc::clone(&restarted)), headers, Json(request))
+            .await
+            .expect("retry after restart must reuse the run");
+        assert_eq!(
+            retry.headers().get(header::LOCATION),
+            Some(&first_location),
+            "same key after restart must return the same run"
+        );
+        assert_eq!(
+            restarted
+                .service
+                .list_runs()
+                .await
+                .expect("runs should be listable")
+                .len(),
+            1,
+            "retry must not create a duplicate run"
+        );
+        let _ = std::fs::remove_dir_all(&runs);
+    }
+
+    #[tokio::test]
     async fn idempotent_fork_reuses_run_and_conflicts_on_digest() {
         let workspace = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -302,6 +407,7 @@ mod tests {
                 None,
             )
             .expect("service should initialize"),
+            runs_dir: runs.clone(),
             oauth_origin: None,
             oauth_allowed_origins: BTreeSet::new(),
             oauth_callback_url: None,
@@ -382,6 +488,7 @@ mod tests {
                 None,
             )
             .expect("service should initialize"),
+            runs_dir: runs.clone(),
             oauth_origin: None,
             oauth_allowed_origins: BTreeSet::new(),
             oauth_callback_url: None,
@@ -453,6 +560,7 @@ mod tests {
                 None,
             )
             .expect("service should initialize"),
+            runs_dir: runs.clone(),
             oauth_origin: None,
             oauth_allowed_origins: BTreeSet::new(),
             oauth_callback_url: None,
@@ -526,8 +634,13 @@ mod tests {
             .expect("temporary directory path should be UTF-8")
             .join(format!("qcg-idempotency-cancel-{}", uuid::Uuid::now_v7()));
         let state = Arc::new(AppState {
-            service: LocalQcgService::new(workspace.join("fixtures/generators"), runs, None)
-                .expect("service should initialize"),
+            service: LocalQcgService::new(
+                workspace.join("fixtures/generators"),
+                runs.clone(),
+                None,
+            )
+            .expect("service should initialize"),
+            runs_dir: runs.clone(),
             oauth_origin: None,
             oauth_allowed_origins: BTreeSet::new(),
             oauth_callback_url: None,

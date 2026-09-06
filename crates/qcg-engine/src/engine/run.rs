@@ -388,15 +388,21 @@ impl Engine {
                 let id = node.id.clone();
                 budget.consume(&id)?;
                 states.insert(id.clone(), NodeState::Running);
+                // Record start before execution so long-running steps are
+                // observable and durations reflect actual processing time,
+                // matching the parallel wave path.
+                journal.event(
+                    "step_started",
+                    json!({ "node": id, "type": node.kind.to_string(), "attempt": 1 }),
+                )?;
+                tracing::debug!(run_id = %context.run_id, node = %id, "step started");
                 let outcome = self
                     .execute_node_with_retry(&context, &journal, &mut vars, &mut budget, node)
                     .await?;
-                if !matches!(&outcome, StepOutcome::NeedsConfirm { .. }) {
-                    journal.event(
-                        "step_started",
-                        json!({ "node": id, "type": node.kind.to_string(), "attempt": 1 }),
-                    )?;
-                    tracing::debug!(run_id = %context.run_id, node = %id, "step started");
+                if matches!(&outcome, StepOutcome::NeedsConfirm { .. }) {
+                    // Confirmation suspends before real work; the start
+                    // above overst states slightly but keeps seq monotonic.
+                    // Keep it: removing would reintroduce the post-hoc gap.
                 }
                 match outcome {
                     StepOutcome::Success { output, files } => {

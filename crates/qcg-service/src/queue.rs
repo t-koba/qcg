@@ -27,10 +27,18 @@ fn queue_order<'a>(
     run_id: &'a str,
 ) -> (
     std::cmp::Reverse<i32>,
+    bool,
     Option<chrono::DateTime<chrono::Utc>>,
     &'a str,
 ) {
-    (std::cmp::Reverse(record.priority), record.queued_at, run_id)
+    // Runs without a recorded admission time sort last; Option's default
+    // ordering would put None first, contradicting the documented FIFO rule.
+    (
+        std::cmp::Reverse(record.priority),
+        record.queued_at.is_none(),
+        record.queued_at,
+        run_id,
+    )
 }
 
 /// Highest-priority queued run id, if any.
@@ -39,6 +47,51 @@ pub(crate) fn queue_head(runs: &BTreeMap<String, RunRecord>) -> Option<String> {
         .filter(|(_, record)| record.state == RunStatus::Queued)
         .min_by(|left, right| queue_order(left.1, left.0).cmp(&queue_order(right.1, right.0)))
         .map(|(run_id, _)| run_id.clone())
+}
+
+/// Victim for priority preemption: capacity is judged on total running runs,
+/// then the lowest-priority run below the arrival priority is evicted.
+/// Equal priorities never preempt each other.
+pub(crate) fn select_preemption_victim(
+    running: &[(&str, i32)],
+    max_active_runs: usize,
+    arrival_priority: i32,
+) -> Option<String> {
+    if running.len() < max_active_runs {
+        return None;
+    }
+    running
+        .iter()
+        .filter(|(_, priority)| *priority < arrival_priority)
+        .min_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(left.0)))
+        .map(|(run_id, _)| run_id.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preemption_evicts_lowest_priority_only_when_full() {
+        let running = [("high", 10), ("low", 0)];
+        // Capacity 2, arrival 5: only the lower-priority run is evictable.
+        assert_eq!(
+            select_preemption_victim(&running, 2, 5).as_deref(),
+            Some("low")
+        );
+        // Free slot: no preemption even with an evictable candidate.
+        assert_eq!(select_preemption_victim(&running, 3, 5), None);
+        // No candidate below arrival: no preemption when full.
+        assert_eq!(select_preemption_victim(&running, 2, 0), None);
+        assert_eq!(select_preemption_victim(&[("high", 10)], 1, 5), None);
+        // Equal priorities never preempt each other.
+        assert_eq!(select_preemption_victim(&[("same", 5)], 1, 5), None);
+        // Ties prefer the larger run id, matching scheduler order.
+        assert_eq!(
+            select_preemption_victim(&[("a", 0), ("b", 0)], 2, 5).as_deref(),
+            Some("b")
+        );
+    }
 }
 
 /// Execution slot pool with priority-ordered wakeups. A plain semaphore

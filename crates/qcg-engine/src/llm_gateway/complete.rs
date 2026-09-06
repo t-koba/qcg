@@ -201,6 +201,12 @@ impl<'a> LlmGateway<'a> {
         tokio::pin!(stream);
         let mut response = None;
         let mut index = 0_usize;
+        // Unverified suffix withheld from publication so split secrets stay
+        // unrecoverable until the completed response passes its final scan.
+        // published_tail keeps the last holdback bytes of published text so
+        // secrets spanning a publish boundary are still detected.
+        let mut pending = String::new();
+        let mut published_tail = String::new();
         loop {
             tokio::select! {
                 _ = self.cancellation.cancelled() => {
@@ -217,6 +223,8 @@ impl<'a> LlmGateway<'a> {
                             &model_id,
                             event,
                             &mut index,
+                            &mut pending,
+                            &mut published_tail,
                             &mut response,
                         )?;
                     }
@@ -241,6 +249,8 @@ impl<'a> LlmGateway<'a> {
                             &model_id,
                             event,
                             &mut index,
+                            &mut pending,
+                            &mut published_tail,
                             &mut response,
                         )?,
                         None => {
@@ -252,6 +262,7 @@ impl<'a> LlmGateway<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_stream_event(
         &self,
         node: &NodeDef,
@@ -259,30 +270,110 @@ impl<'a> LlmGateway<'a> {
         model: &str,
         event: ChatStreamEvent,
         index: &mut usize,
+        pending: &mut String,
+        published_tail: &mut String,
         response: &mut Option<ChatResponse>,
     ) -> Result<(), LlmError> {
         match event {
             ChatStreamEvent::TextDelta { text } => {
-                self.scan_text(node, &text)
+                if self.secrets.is_empty() {
+                    self.scan_text(node, &text)
+                        .map_err(|error| LlmError::new(error.to_string()))?;
+                    self.publish_delta(node, provider, model, &text, index)?;
+                    return Ok(());
+                }
+                // Buffered publication: only a prefix that no future text
+                // can complete into a registered secret becomes visible.
+                // Split secrets can bypass per-delta checks while the
+                // concatenated journal and SSE stream stay recoverable, so
+                // the unverified suffix is withheld until the completed
+                // response passes its final scan. Every arrival is examined
+                // jointly with the published tail so secrets spanning a
+                // publish boundary are still detected before the bytes that
+                // complete them become visible.
+                pending.push_str(&text);
+                let holdback = self.secrets.max_value_len().saturating_sub(1);
+                let mut window = published_tail.clone();
+                window.push_str(pending);
+                self.scan_text(node, &window)
                     .map_err(|error| LlmError::new(error.to_string()))?;
-                self.journal
-                    .event(
-                        "llm_delta",
-                        json!({
-                            "node": node.id,
-                            "provider": provider,
-                            "model": model,
-                            "index": *index,
-                            "text": text,
-                        }),
-                    )
-                    .map_err(|error| LlmError::new(error.to_string()))?;
-                *index = index.saturating_add(1);
+                let mut publish_len = pending.len().saturating_sub(holdback);
+                while publish_len > 0 && !pending.is_char_boundary(publish_len) {
+                    publish_len = publish_len.saturating_sub(1);
+                }
+                if publish_len == 0 {
+                    return Ok(());
+                }
+                let publish = pending[..publish_len].to_string();
+                // Drain before I/O so a journal failure cannot double
+                // publish the same bytes on retry.
+                pending.drain(..publish_len);
+                self.publish_delta(node, provider, model, &publish, index)?;
+                published_tail.push_str(&publish);
+                let trimmed = holdback_tail(published_tail.as_str(), holdback);
+                *published_tail = trimmed;
             }
             ChatStreamEvent::Completed {
                 response: completed,
-            } => *response = Some(completed),
+            } => {
+                if !self.secrets.is_empty() {
+                    // Final gate before the withheld suffix becomes visible.
+                    // A rejection here publishes nothing further, and the
+                    // already-visible prefixes were each verified jointly
+                    // with their predecessors, so no recoverable secret is
+                    // left behind.
+                    self.scan_response(node, &completed)
+                        .map_err(|error| LlmError::new(error.to_string()))?;
+                    if !pending.is_empty() {
+                        let mut window = published_tail.clone();
+                        window.push_str(pending);
+                        self.scan_text(node, &window)
+                            .map_err(|error| LlmError::new(error.to_string()))?;
+                        let flush = std::mem::take(pending);
+                        self.publish_delta(node, provider, model, &flush, index)?;
+                        published_tail.clear();
+                    }
+                }
+                *response = Some(completed);
+            }
         }
         Ok(())
     }
+
+    fn publish_delta(
+        &self,
+        node: &NodeDef,
+        provider: &str,
+        model: &str,
+        text: &str,
+        index: &mut usize,
+    ) -> Result<(), LlmError> {
+        self.journal
+            .event(
+                "llm_delta",
+                json!({
+                    "node": node.id,
+                    "provider": provider,
+                    "model": model,
+                    "index": *index,
+                    "text": text,
+                }),
+            )
+            .map_err(|error| LlmError::new(error.to_string()))?;
+        *index = index.saturating_add(1);
+        Ok(())
+    }
+}
+
+/// Last `holdback` bytes of published text at a UTF-8 boundary, used as the
+/// joint-scan window for boundary-spanning secrets.
+fn holdback_tail(published: &str, holdback: usize) -> String {
+    if published.len() <= holdback {
+        return published.to_string();
+    }
+    let mut start = published.len() - holdback;
+    while start < published.len() && !published.is_char_boundary(start) {
+        start = start.saturating_add(1);
+    }
+    published[start..].to_string()
 }

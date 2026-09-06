@@ -8,12 +8,12 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use futures_util::StreamExt as FuturesStreamExt;
 use qcg_api::{AnswerPayload, ConfirmDecision};
 use serde::Serialize;
+use sha2::Digest as _;
 use std::convert::Infallible;
 use std::io::{self, Write};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_util::io::ReaderStream;
 
 use super::config::AppState;
 use super::error::ApiHttpError;
@@ -276,27 +276,21 @@ pub(crate) async fn read_artifact(
         .read_artifact(id, path)
         .await
         .map_err(ApiHttpError::from_api)?;
+    // Read once and verify size + hash before serving so a same-size
+    // post-completion swap is rejected like the ZIP/bundle paths.
+    let bytes = tokio::fs::read(&resolved)
+        .await
+        .map_err(ApiHttpError::internal)?;
+    verify_artifact_bytes(&artifact, &bytes).map_err(ApiHttpError::internal)?;
     let content_type = artifact
         .mime
         .unwrap_or_else(|| content_type_for_name(&artifact.path).to_string());
-    let file = tokio::fs::File::open(resolved)
-        .await
-        .map_err(ApiHttpError::internal)?;
-    let metadata = file.metadata().await.map_err(ApiHttpError::internal)?;
-    if !metadata.is_file() || metadata.len() != artifact.bytes {
-        return Err(ApiHttpError::internal(format!(
-            "artifact `{}` bytes mismatch: manifest={}, actual={}",
-            artifact.path,
-            artifact.bytes,
-            metadata.len()
-        )));
-    }
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CONTENT_DISPOSITION, content_disposition)
         .header(header::CONTENT_LENGTH, artifact.bytes)
-        .body(Body::from_stream(ReaderStream::new(file)))
+        .body(Body::from(bytes))
         .map_err(ApiHttpError::internal)
 }
 
@@ -412,4 +406,63 @@ pub(crate) fn content_disposition_attachment(path: &str) -> String {
         .unwrap_or("artifact")
         .replace(['"', '\\', '\r', '\n'], "_");
     format!("attachment; filename=\"{file_name}\"")
+}
+
+/// Verify a singly-served artifact against its manifest before delivery.
+/// Size alone cannot detect a same-length post-completion swap, so the
+/// sha256 is always compared, matching the ZIP/bundle verification.
+pub(crate) fn verify_artifact_bytes(
+    artifact: &qcg_types::OutputArtifact,
+    bytes: &[u8],
+) -> Result<(), String> {
+    if bytes.len() as u64 != artifact.bytes {
+        return Err(format!(
+            "artifact `{}` bytes mismatch: manifest={}, actual={}",
+            artifact.path,
+            artifact.bytes,
+            bytes.len()
+        ));
+    }
+    let actual_sha256 = hex::encode(sha2::Sha256::digest(bytes));
+    if actual_sha256 != artifact.sha256 {
+        return Err(format!(
+            "artifact `{}` content mismatch: manifest sha256 does not match file",
+            artifact.path,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn artifact_for(bytes: &[u8]) -> qcg_types::OutputArtifact {
+        qcg_types::OutputArtifact {
+            path: "reports/result.txt".into(),
+            sha256: hex::encode(sha2::Sha256::digest(bytes)),
+            bytes: bytes.len() as u64,
+            label: "Result".into(),
+            required: true,
+            mime: None,
+            description: String::new(),
+            preview: Default::default(),
+        }
+    }
+
+    #[test]
+    fn single_artifact_delivery_rejects_same_size_swap() {
+        let original = b"result-v1";
+        let artifact = artifact_for(original);
+        verify_artifact_bytes(&artifact, original).expect("matching content should pass");
+        let swapped = b"result-v2";
+        assert_eq!(swapped.len(), original.len());
+        let error = verify_artifact_bytes(&artifact, swapped)
+            .expect_err("same-size content swap must be rejected");
+        assert!(error.contains("content mismatch"));
+        let truncated = b"result-";
+        let error =
+            verify_artifact_bytes(&artifact, truncated).expect_err("size change must be rejected");
+        assert!(error.contains("bytes mismatch"));
+    }
 }

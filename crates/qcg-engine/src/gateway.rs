@@ -83,6 +83,102 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn denies_symlink_write_escape() {
+        let base = Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
+            "qcg-gateway-write-{}",
+            uuid::Uuid::now_v7().as_simple()
+        )))
+        .expect("temporary directory path must be utf-8");
+        let workspace = base.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("test workspace should be created");
+        let outside = base.join("outside.txt");
+        std::fs::write(&outside, "outside").expect("outside file should be written");
+        let link = workspace.join("out.txt");
+        std::os::unix::fs::symlink(&outside, &link).expect("symlink should be created");
+        let mut permissions = Permissions::default();
+        permissions.fs_write.push("workspace".into());
+        let gateway = FsGateway::new(workspace, &permissions);
+        assert!(matches!(
+            gateway.resolve_write("out.txt"),
+            Err(GatewayError::PathDenied { .. })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("outside file should be readable"),
+            "outside"
+        );
+        std::fs::remove_dir_all(base).expect("test workspace should be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn denies_parent_symlink_write_without_external_side_effect() {
+        let base = Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
+            "qcg-gateway-parent-{}",
+            uuid::Uuid::now_v7().as_simple()
+        )))
+        .expect("temporary directory path must be utf-8");
+        let workspace = base.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("test workspace should be created");
+        let external = base.join("external");
+        std::fs::create_dir_all(&external).expect("external dir should be created");
+        let link = workspace.join("linked");
+        std::os::unix::fs::symlink(&external, &link).expect("symlink should be created");
+        let mut permissions = Permissions::default();
+        permissions.fs_write.push("workspace".into());
+        let gateway = FsGateway::new(workspace, &permissions);
+        assert!(matches!(
+            gateway.resolve_write("linked/newdir/out.txt"),
+            Err(GatewayError::PathDenied { .. })
+        ));
+        assert!(
+            !external.join("newdir").exists(),
+            "rejected write must not create directories outside the workspace"
+        );
+        std::fs::remove_dir_all(base).expect("test workspace should be removed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn atomic_write_replaces_terminal_symlink_target_safely() {
+        let base = Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
+            "qcg-gateway-atomic-{}",
+            uuid::Uuid::now_v7().as_simple()
+        )))
+        .expect("temporary directory path must be utf-8");
+        let workspace = base.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("test workspace should be created");
+        let mut permissions = Permissions::default();
+        permissions.fs_write.push("workspace".into());
+        let gateway = FsGateway::new(workspace.clone(), &permissions);
+        let resolved = gateway
+            .resolve_write("nested/out.txt")
+            .expect("nested write should resolve");
+        gateway
+            .write_file_atomic(&resolved, b"hello")
+            .await
+            .expect("atomic write should succeed");
+        assert_eq!(
+            std::fs::read_to_string(&resolved).expect("written file should be readable"),
+            "hello"
+        );
+        // A terminal symlink must be denied even when the atomic path is used.
+        let outside = base.join("outside.txt");
+        std::fs::write(&outside, "outside").expect("outside file should be written");
+        let link = workspace.join("linked.txt");
+        std::os::unix::fs::symlink(&outside, &link).expect("symlink should be created");
+        assert!(matches!(
+            gateway.resolve_write("linked.txt"),
+            Err(GatewayError::PathDenied { .. })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("outside file should be readable"),
+            "outside"
+        );
+        std::fs::remove_dir_all(base).expect("test workspace should be removed");
+    }
+
     #[test]
     fn permits_declared_command_shape() {
         let permission = CommandPermission {

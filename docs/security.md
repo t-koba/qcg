@@ -117,6 +117,19 @@ Tool results remain untrusted data (the agent
 guardrail tells the model not to treat them as instructions) and are scanned
 for declared secret values before they enter the next LLM turn.
 
+Streaming text is published as `llm_delta` events only after a holdback
+window covering the longest registered secret clears: each arrival is scanned
+jointly with the tail of already-published text, and the final suffix is
+withheld until the completed response passes its scan. A rejected stream
+therefore leaves no recoverable secret in the journal or event stream, while
+clean streams keep incremental delivery.
+
+MCP interactive input (`InputRequired`) passes the same credential-reflection
+and size checks as completed tool results before its questions reach the UI
+or journal. A suspended MCP call records its server continuation
+(`mcp_input_pending`) so resuming answers the original remote request instead
+of starting a duplicate one.
+
 MCP OAuth uses authorization-server discovery, PKCE, state validation, and
 single-use callback state. The default `oauth_store = "keyring"` keeps access
 and refresh credentials in the OS credential store; `memory` is an explicit

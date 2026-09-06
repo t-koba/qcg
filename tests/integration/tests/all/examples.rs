@@ -1838,7 +1838,7 @@ async fn http_assets_are_declared_generic_and_metadata_is_verbatim() {
     assert_eq!(wasm.headers()[header::X_FRAME_OPTIONS], "DENY");
     assert_eq!(
         wasm.headers()[header::CONTENT_SECURITY_POLICY],
-        "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"
+        "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data: blob:; media-src blob:; frame-src blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"
     );
     assert_eq!(
         wasm.text().await.expect("wasm asset should be readable"),

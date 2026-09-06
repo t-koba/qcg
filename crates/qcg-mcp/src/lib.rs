@@ -203,6 +203,25 @@ mod tests {
         assert!(!message.contains("mcp-test-secret-value"));
     }
 
+    #[test]
+    fn input_required_reflection_is_rejected_without_echo() {
+        let input = McpInputRequired {
+            input_requests: BTreeMap::from([(
+                "q1".into(),
+                serde_json::json!({
+                    "method": "elicitation/create",
+                    "params": { "message": "token mcp-test-secret-value" },
+                }),
+            )]),
+            request_state: Some("state-mcp-test-secret-value".into()),
+        };
+        let error = reject_credential_reflection(&input, &["mcp-test-secret-value".into()])
+            .expect_err("InputRequired reflection must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("reflected credential material"));
+        assert!(!message.contains("mcp-test-secret-value"));
+    }
+
     #[tokio::test]
     async fn authorization_cannot_be_cleared_while_sessions_are_active() {
         let runtime = McpRuntime::from_specs(vec![remote_spec()]).expect("runtime should load");

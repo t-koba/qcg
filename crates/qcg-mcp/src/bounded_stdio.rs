@@ -21,6 +21,7 @@ pub(crate) struct BoundedChildTransport {
         BoundedLineReader<tokio::process::ChildStdout>,
         tokio::process::ChildStdin,
     >,
+    container_cleanup: Option<(String, std::path::PathBuf)>,
 }
 
 impl BoundedChildTransport {
@@ -57,7 +58,17 @@ impl BoundedChildTransport {
                 BoundedLineReader::new(stdout, max_message_bytes),
                 stdin,
             ),
+            container_cleanup: None,
         })
+    }
+
+    pub(crate) fn with_container_cleanup(
+        mut self,
+        runtime: String,
+        cidfile: std::path::PathBuf,
+    ) -> Self {
+        self.container_cleanup = Some((runtime, cidfile));
+        self
     }
 }
 
@@ -81,6 +92,7 @@ impl Transport<RoleClient> for BoundedChildTransport {
             Err(_) => {
                 self.terminate_process_group();
                 self.terminate_child().await?;
+                self.kill_container_blocking();
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "MCP stdio transport close timed out",
@@ -94,8 +106,10 @@ impl Transport<RoleClient> for BoundedChildTransport {
             Err(_) => {
                 self.terminate_process_group();
                 self.terminate_child().await?;
+                self.kill_container_blocking();
             }
         }
+        self.kill_container_blocking();
         #[cfg(unix)]
         {
             self.process_group_id = None;
@@ -123,11 +137,35 @@ impl BoundedChildTransport {
         }
         self.child.wait().await.map(|_| ())
     }
+
+    fn kill_container_blocking(&mut self) {
+        let Some((runtime, cidfile)) = self.container_cleanup.take() else {
+            return;
+        };
+        let id = std::fs::read_to_string(&cidfile)
+            .map(|id| id.trim().to_string())
+            .unwrap_or_default();
+        let _ = std::fs::remove_file(&cidfile);
+        if id.is_empty() {
+            return;
+        }
+        // Best effort: stop the daemon-side container when the CLI wrapper
+        // is gone. Timeouts are short because this also runs on Drop.
+        for args in [vec!["kill", &id], vec!["rm", "-f", &id]] {
+            let _ = std::process::Command::new(&runtime)
+                .args(&args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
 }
 
 impl Drop for BoundedChildTransport {
     fn drop(&mut self) {
         self.terminate_process_group();
+        self.kill_container_blocking();
     }
 }
 

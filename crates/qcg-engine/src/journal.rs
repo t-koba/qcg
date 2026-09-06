@@ -547,4 +547,99 @@ mod tests {
         assert!(journal.state().checkpoints.is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn truncated_tail_is_repaired_before_append() {
+        let dir = std::env::temp_dir().join(format!(
+            "qcg-journal-truncate-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.join("journal.jsonl")).unwrap();
+        {
+            let journal = JournalWriter::create(&path, "truncate-run", false, None).unwrap();
+            journal
+                .event(
+                    "run_started",
+                    json!({
+                        "generator": "truncate@1.0.0",
+                        "generator_path": "truncate",
+                        "contract_sha256": "abc",
+                        "inputs": {},
+                        "resource_hashes": [],
+                        "qcg": "0.1.0",
+                        "schema_version": 1,
+                    }),
+                )
+                .unwrap();
+        }
+        // Simulate a crash leaving a torn trailing line without a newline.
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(b"{\"t\":\"step_started\",\"node\":")
+                .unwrap();
+        }
+        let journal = JournalWriter::create(&path, "truncate-run", false, None)
+            .expect("reopen must repair the torn tail");
+        journal
+            .event(
+                "step_started",
+                json!({ "node": "after", "type": "test", "attempt": 1 }),
+            )
+            .expect("append after repair must succeed");
+        let scan = read_journal_values(&path, JournalLimits::default())
+            .expect("fold after repair must succeed");
+        assert!(scan.events.iter().any(|event| event["t"] == "run_started"));
+        assert!(scan.events.iter().any(|event| event["t"] == "step_started"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn complete_tail_without_newline_is_committed() {
+        let dir = std::env::temp_dir().join(format!(
+            "qcg-journal-commit-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.join("journal.jsonl")).unwrap();
+        {
+            let journal = JournalWriter::create(&path, "commit-run", false, None).unwrap();
+            journal
+                .event(
+                    "run_started",
+                    json!({
+                        "generator": "commit@1.0.0",
+                        "generator_path": "commit",
+                        "contract_sha256": "abc",
+                        "inputs": {},
+                        "resource_hashes": [],
+                        "qcg": "0.1.0",
+                        "schema_version": 1,
+                    }),
+                )
+                .unwrap();
+            // Strip the final newline to simulate a committed event that
+            // missed its terminator.
+            let bytes = std::fs::read(&path).unwrap();
+            assert_eq!(bytes.last(), Some(&b'\n'));
+            std::fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
+        }
+        let journal = JournalWriter::create(&path, "commit-run", false, None)
+            .expect("reopen must commit the complete tail");
+        journal
+            .event(
+                "step_started",
+                json!({ "node": "after", "type": "test", "attempt": 1 }),
+            )
+            .unwrap();
+        let scan = read_journal_values(&path, JournalLimits::default()).unwrap();
+        assert_eq!(scan.events.len(), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

@@ -138,7 +138,7 @@ pub(crate) async fn security_headers_middleware(request: Request, next: Next) ->
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
             if generator_asset {
-                "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"
+                "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data: blob:; media-src blob:; frame-src blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"
             } else {
                 "default-src 'none'; frame-ancestors 'none'"
             },

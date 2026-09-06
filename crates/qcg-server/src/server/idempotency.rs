@@ -1,11 +1,13 @@
 use anyhow::Result;
 use axum::http::HeaderMap;
 use axum::response::Response;
+use camino::Utf8PathBuf;
 use qcg_api::ApiError;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use super::config::AppState;
 use super::error::ApiHttpError;
@@ -156,6 +158,30 @@ where
                     (Some(completed.subscribe()), None)
                 }
                 None => {
+                    // Cross-restart and cross-process guarantee: a durable
+                    // Ready record wins over starting a duplicate run.
+                    if let Some(durable) = load_durable_ready(&state.runs_dir, &idempotency_key) {
+                        if durable.digest != request_digest {
+                            return Err(idempotency_conflict());
+                        }
+                        let run_id = durable.run_id.clone();
+                        // Refresh in-memory cache for subsequent hits.
+                        idempotency.insert(
+                            idempotency_key.clone(),
+                            IdempotencyEntry::Ready {
+                                digest: durable.digest,
+                                created_at: Instant::now(),
+                                run_id: run_id.clone(),
+                            },
+                        );
+                        drop(idempotency);
+                        let snapshot = state
+                            .service
+                            .snapshot(run_id)
+                            .await
+                            .map_err(ApiHttpError::from_api)?;
+                        return respond_with_snapshot(snapshot, created);
+                    }
                     if idempotency.len() >= IDEMPOTENCY_MAX_ENTRIES {
                         return Err(ApiHttpError::service_unavailable(
                             "too many idempotent requests are still in progress",
@@ -233,15 +259,28 @@ where
             None
         };
         idempotency.insert(
-            idempotency_key,
+            idempotency_key.clone(),
             IdempotencyEntry::Ready {
-                digest: request_digest,
+                digest: request_digest.clone(),
                 created_at: Instant::now(),
                 run_id: run_id.clone(),
             },
         );
         completed
     };
+    // Durable commit before responding: a crash after HTTP success must
+    // still return the same run_id on retry with the same key.
+    if let Err(error) =
+        store_durable_ready(&state.runs_dir, &idempotency_key, &request_digest, &run_id)
+    {
+        if error.contains("different request") {
+            return Err(idempotency_conflict());
+        }
+        // Storage failure fails closed rather than risking duplicate runs.
+        return Err(ApiHttpError::internal(format!(
+            "failed to persist idempotency record: {error}"
+        )));
+    }
     pending_guard.disarm();
     if let Some(completed) = completed {
         let _ = completed.send(true);
@@ -258,6 +297,109 @@ pub(crate) fn idempotency_conflict() -> ApiHttpError {
     ApiHttpError::from_api(ApiError::Conflict {
         detail: "Idempotency-Key was already used with a different request".into(),
     })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DurableIdempotencyRecord {
+    key: String,
+    digest: String,
+    run_id: String,
+    created_at_unix: u64,
+}
+
+fn idempotency_dir(runs_dir: &Utf8PathBuf) -> Utf8PathBuf {
+    runs_dir.join("idempotency")
+}
+
+fn idempotency_path(runs_dir: &Utf8PathBuf, key: &str) -> Utf8PathBuf {
+    idempotency_dir(runs_dir).join(format!("{:x}.json", Sha256::digest(key.as_bytes())))
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn ttl_secs() -> u64 {
+    IDEMPOTENCY_TTL.as_secs().max(1)
+}
+
+/// Load a durable Ready record, returning None when absent or expired.
+/// Expired files are removed best-effort.
+pub(crate) fn load_durable_ready(
+    runs_dir: &Utf8PathBuf,
+    key: &str,
+) -> Option<DurableIdempotencyRecord> {
+    let path = idempotency_path(runs_dir, key);
+    let bytes = std::fs::read(path.as_std_path()).ok()?;
+    let record: DurableIdempotencyRecord = serde_json::from_slice(&bytes).ok()?;
+    if record.key != key {
+        return None;
+    }
+    if now_unix().saturating_sub(record.created_at_unix) >= ttl_secs() {
+        let _ = std::fs::remove_file(path.as_std_path());
+        return None;
+    }
+    Some(record)
+}
+
+/// Persist a Ready record atomically (create_new temp + rename) so restart
+/// and peer processes observe the same operation id to run id mapping.
+/// Same key + same digest is idempotent; same key + different digest is a
+/// conflict preserved from the existing record.
+pub(crate) fn store_durable_ready(
+    runs_dir: &Utf8PathBuf,
+    key: &str,
+    digest: &str,
+    run_id: &str,
+) -> Result<(), String> {
+    std::fs::create_dir_all(idempotency_dir(runs_dir).as_std_path())
+        .map_err(|error| error.to_string())?;
+    let path = idempotency_path(runs_dir, key);
+    if let Some(existing) = load_durable_ready(runs_dir, key) {
+        if existing.digest != digest {
+            return Err("Idempotency-Key was already used with a different request".into());
+        }
+        return Ok(());
+    }
+    let record = DurableIdempotencyRecord {
+        key: key.to_string(),
+        digest: digest.to_string(),
+        run_id: run_id.to_string(),
+        created_at_unix: now_unix(),
+    };
+    let bytes = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
+    // create_new avoids clobbering a concurrent peer's record; on
+    // AlreadyExists re-read and compare digests for conflict accuracy.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path.as_std_path())
+    {
+        Ok(mut file) => {
+            use std::io::Write as _;
+            file.write_all(&bytes).map_err(|error| error.to_string())?;
+            file.sync_data().map_err(|error| error.to_string())?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            match load_durable_ready(runs_dir, key) {
+                Some(existing) if existing.digest == digest => Ok(()),
+                Some(_) => Err("Idempotency-Key was already used with a different request".into()),
+                // Expired between check and create; retry once via rename.
+                None => {
+                    let tmp = path.with_extension(format!("tmp-{}", uuid::Uuid::now_v7()));
+                    std::fs::write(tmp.as_std_path(), &bytes).map_err(|error| error.to_string())?;
+                    std::fs::rename(tmp.as_std_path(), path.as_std_path())
+                        .map_err(|error| error.to_string())?;
+                    Ok(())
+                }
+            }
+        }
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 pub(crate) fn prune_idempotency(entries: &mut BTreeMap<String, IdempotencyEntry>, now: Instant) {

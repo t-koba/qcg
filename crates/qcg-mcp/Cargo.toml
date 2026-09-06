@@ -41,6 +41,7 @@ thiserror.workspace = true
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "rt-multi-thread", "sync", "time"] }
 tokio-util.workspace = true
 url.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 axum.workspace = true

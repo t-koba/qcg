@@ -860,6 +860,123 @@ api_key_env = "QCG_SECURE_API_KEY"
         let _ = std::fs::remove_dir_all(&run_dir);
     }
 
+    #[tokio::test]
+    async fn sequential_step_records_started_before_execution_finishes() {
+        struct GateStep;
+
+        #[async_trait]
+        impl StepExecutor for GateStep {
+            fn type_id(&self) -> &'static str {
+                "test.gate"
+            }
+
+            async fn execute(
+                &self,
+                ctx: &mut StepContext<'_>,
+                node: &NodeDef,
+            ) -> Result<StepOutcome, StepError> {
+                std::fs::create_dir_all(&ctx.run.workspace)
+                    .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
+                std::fs::write(ctx.run.workspace.join("started.marker"), "started")
+                    .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
+                for _ in 0..500 {
+                    if ctx.run.workspace.join("release.marker").exists() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                if !ctx.run.workspace.join("release.marker").exists() {
+                    return Err(StepError::failed(&node.id, "gate was never released"));
+                }
+                Ok(StepOutcome::Success {
+                    output: None,
+                    files: vec![],
+                })
+            }
+        }
+
+        let run_dir = temp_run_dir("step-started-order");
+        let manifest = manifest(vec![node("gated", "test.gate")]);
+        let graph = Graph::build(&manifest).expect("test graph should build");
+        let contract = Contract {
+            root: run_dir.clone(),
+            manifest,
+            graph,
+            sha256: "test".into(),
+        };
+        let mut registry = StepRegistry::new();
+        registry.register(GateStep);
+        let engine = Engine::new(registry);
+        let meta_dir = run_dir.join("meta");
+        let workspace_dir = run_dir.join("workspace");
+        let task = tokio::spawn(async move {
+            engine
+                .run_with_id(
+                    "step-started-order".into(),
+                    meta_dir,
+                    contract,
+                    BTreeMap::new(),
+                    RunOptions {
+                        output_dir: workspace_dir,
+                        json_events: false,
+                        event_sender: None,
+                        interactive: false,
+                        answers: BTreeMap::new(),
+                        confirmations: BTreeMap::new(),
+                        max_total_steps: 100,
+                        max_parallel_steps: 1,
+                        llm_provider: None,
+                        llm_seed_override: None,
+                        cancellation: CancellationToken::new(),
+                    },
+                )
+                .await
+        });
+        // Wait until the step body is actually executing.
+        let mut started = false;
+        for _ in 0..500 {
+            if run_dir.join("workspace/started.marker").exists() {
+                started = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(started, "gated step should start executing");
+        // The start event must already be journaled while the step is still
+        // blocked, not after it finishes.
+        assert!(
+            has_event(&journal_events(&run_dir), "step_started", "gated"),
+            "step_started must precede execution completion"
+        );
+        std::fs::write(run_dir.join("workspace/release.marker"), "go")
+            .expect("release marker should be written");
+        task.await
+            .expect("run task should join")
+            .expect("gated run should succeed");
+        let events = journal_events(&run_dir);
+        let started_seq = events
+            .iter()
+            .find(|event| {
+                event.get("t").and_then(Value::as_str) == Some("step_started")
+                    && event.get("node").and_then(Value::as_str) == Some("gated")
+            })
+            .and_then(|event| event.get("seq").and_then(Value::as_u64))
+            .expect("step_started should carry seq");
+        let finished_seq = events
+            .iter()
+            .find(|event| {
+                event.get("t").and_then(Value::as_str) == Some("step_finished")
+                    && event.get("node").and_then(Value::as_str) == Some("gated")
+            })
+            .and_then(|event| event.get("seq").and_then(Value::as_u64))
+            .expect("step_finished should carry seq");
+        assert!(
+            started_seq < finished_seq,
+            "step_started must order before step_finished"
+        );
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
     fn manifest(flow: Vec<NodeDef>) -> Manifest {
         Manifest {
             generator: GeneratorMeta {

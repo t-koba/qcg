@@ -6,9 +6,10 @@ use crate::run_dirs::{
     warn_if_shared_runs_dir_owned, write_run_event,
 };
 use crate::summaries::{
-    fold_run_state, gc_run_directories, read_events_from_meta, read_optional_output_manifest,
-    read_queued_identity, read_run_contract_sha256, read_run_metrics, rehydrate_runs, run_meta_dir,
-    run_summary, run_workspace_dir, status_from_journal,
+    fold_run_state, gc_run_directories, has_remote_cancel_request, read_events_from_meta,
+    read_optional_output_manifest, read_queued_identity, read_run_contract_sha256,
+    read_run_metrics, rehydrate_runs, run_meta_dir, run_summary, run_workspace_dir,
+    status_from_journal,
 };
 use crate::types::{
     DirectRun, DirectRunEvents, FinishTransition, LocalQcgService, LocalQcgServiceInner, RunRecord,
@@ -119,6 +120,7 @@ impl LocalQcgService {
                 run_store_mode,
                 _runs_lock: runs_lock,
                 queue_notify: Arc::new(tokio::sync::Notify::new()),
+                owner_id: uuid::Uuid::now_v7().as_simple().to_string(),
             }),
         })
     }
@@ -167,7 +169,14 @@ impl LocalQcgService {
         for (run_id, record) in recovered {
             runs.entry(run_id).or_insert(record);
         }
-        for record in runs.values_mut() {
+        // Merge durable journal progress into existing records so a browser
+        // attached to a non-owning process observes questions, answers, and
+        // terminal settlement. Remote cancel requests are honored here.
+        let ids: Vec<String> = runs.keys().cloned().collect();
+        for run_id in ids {
+            let Some(record) = runs.get_mut(&run_id) else {
+                continue;
+            };
             if record
                 .task
                 .lock()
@@ -177,6 +186,16 @@ impl LocalQcgService {
                 continue;
             }
             let state = fold_run_state(&record.run_dir)?;
+            if has_remote_cancel_request(&record.run_dir)? {
+                // A peer requested cancellation via the shared journal.
+                // Apply locally: stop any local task and mark canceled.
+                record.cancellation.cancel();
+                record.state = RunStatus::Canceled;
+                record.preempted = false;
+                record.question = None;
+                record.confirm = None;
+                continue;
+            }
             if let Some(terminal) = state.terminal {
                 record.state = match terminal {
                     qcg_engine::TerminalState::Succeeded => RunStatus::Succeeded,
@@ -184,6 +203,65 @@ impl LocalQcgService {
                     qcg_engine::TerminalState::Canceled => RunStatus::Canceled,
                     qcg_engine::TerminalState::Interrupted => RunStatus::Interrupted,
                 };
+                continue;
+            }
+            // Refresh pending prompts and durable HITL maps from the journal.
+            let mut pending = state.pending.clone();
+            let (answers, confirmations) =
+                crate::summaries::read_persisted_hitl(&record.run_dir).unwrap_or_default();
+            let mcp_pending =
+                crate::summaries::read_persisted_mcp_pending(&record.run_dir).unwrap_or_default();
+            match pending.take() {
+                Some(Interaction::Question { question }) => {
+                    // If the journal already holds an accepted answer for
+                    // this question (written by a peer), resume locally.
+                    if answers.contains_key(&question.id) {
+                        record.answers = answers;
+                        record.confirmations = confirmations;
+                        for (key, value) in mcp_pending {
+                            record.answers.insert(key, value);
+                        }
+                        record.state = RunStatus::Queued;
+                        record.queued_at = Some(chrono::Utc::now());
+                        record.question = None;
+                        record.confirm = None;
+                    } else {
+                        record.answers = answers;
+                        record.confirmations = confirmations;
+                        record.state = RunStatus::Waiting;
+                        record.question = Some(question);
+                        record.confirm = None;
+                    }
+                }
+                Some(Interaction::Confirmation { confirm }) => {
+                    if confirmations.contains_key(&confirm.id) {
+                        record.answers = answers;
+                        record.confirmations = confirmations;
+                        record.state = RunStatus::Queued;
+                        record.queued_at = Some(chrono::Utc::now());
+                        record.question = None;
+                        record.confirm = None;
+                    } else {
+                        record.answers = answers;
+                        record.confirmations = confirmations;
+                        record.state = RunStatus::Confirming;
+                        record.question = None;
+                        record.confirm = Some(confirm);
+                    }
+                }
+                None => {
+                    record.answers = answers;
+                    record.confirmations = confirmations;
+                    for (key, value) in mcp_pending {
+                        record.answers.insert(key, value);
+                    }
+                    if record.state == RunStatus::Waiting || record.state == RunStatus::Confirming {
+                        record.state = RunStatus::Queued;
+                        record.queued_at.get_or_insert_with(chrono::Utc::now);
+                        record.question = None;
+                        record.confirm = None;
+                    }
+                }
             }
         }
         Ok(())
@@ -373,6 +451,29 @@ impl LocalQcgService {
             .get(id)
             .ok_or_else(|| api_not_found(format!("run `{id}` was not found")))?;
         Ok(record.events.subscribe())
+    }
+
+    /// Whether this process drives the run's live event broadcast.
+    /// Exclusive stores always do; shared stores only when this process owns
+    /// execution or still runs the local engine task. Otherwise subscribers
+    /// must follow the durable journal so peer progress stays visible.
+    pub(crate) async fn owns_live_stream(&self, id: &str) -> bool {
+        if self.inner.run_store_mode == RunStoreMode::Exclusive {
+            return true;
+        }
+        let runs = self.inner.runs.read().await;
+        let Some(record) = runs.get(id) else {
+            return false;
+        };
+        if record
+            .task
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+        {
+            return true;
+        }
+        record.owner_id == self.inner.owner_id
     }
 
     pub async fn run_dir_for(&self, id: &str) -> Result<Utf8PathBuf, ApiError> {
@@ -609,6 +710,9 @@ impl LocalQcgService {
                     return;
                 }
                 record.state = RunStatus::Running;
+                // Claim shared-store ownership while holding the execution
+                // lease so peers observe the active owner.
+                record.owner_id = service.inner.owner_id.clone();
             }
             let engine = Engine::new(app_registry(Arc::clone(&runtime))).with_snapshot_source(
                 Arc::new(ServiceSnapshotSource {

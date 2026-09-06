@@ -23,6 +23,10 @@ mod tests {
 
     struct LeakingProvider;
 
+    struct SplitStreamLeakingProvider;
+
+    struct SafeSplitStreamProvider;
+
     struct MeteredProvider;
 
     struct ToolLeakingProvider;
@@ -51,6 +55,102 @@ mod tests {
                 stop: StopReason::EndTurn,
                 provider_state: None,
             })
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for SplitStreamLeakingProvider {
+        fn id(&self) -> &str {
+            "split-leak"
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+
+        async fn complete(&self, _req: ChatRequest) -> Result<ChatResponse, LlmError> {
+            Ok(ChatResponse {
+                content: vec![qcg_llm::ChatContent::Text("safe fallback".into())],
+                usage: TokenUsage::default(),
+                stop: StopReason::EndTurn,
+                provider_state: None,
+            })
+        }
+
+        async fn stream(
+            &self,
+            _req: ChatRequest,
+            events: tokio::sync::mpsc::Sender<qcg_llm::ChatStreamEvent>,
+        ) -> Result<(), LlmError> {
+            // Each fragment alone bypasses per-delta secret checks, while the
+            // concatenation reconstructs the registered secret value.
+            for fragment in ["sec", "ret-", "value"] {
+                events
+                    .send(qcg_llm::ChatStreamEvent::TextDelta {
+                        text: fragment.into(),
+                    })
+                    .await
+                    .map_err(|_| LlmError::new("LLM stream receiver closed"))?;
+            }
+            events
+                .send(qcg_llm::ChatStreamEvent::Completed {
+                    response: ChatResponse {
+                        content: vec![qcg_llm::ChatContent::Text("secret-value".into())],
+                        usage: TokenUsage::default(),
+                        stop: StopReason::EndTurn,
+                        provider_state: None,
+                    },
+                })
+                .await
+                .map_err(|_| LlmError::new("LLM stream receiver closed"))?;
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for SafeSplitStreamProvider {
+        fn id(&self) -> &str {
+            "safe-split"
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+
+        async fn complete(&self, _req: ChatRequest) -> Result<ChatResponse, LlmError> {
+            Ok(ChatResponse {
+                content: vec![qcg_llm::ChatContent::Text("hello world".into())],
+                usage: TokenUsage::default(),
+                stop: StopReason::EndTurn,
+                provider_state: None,
+            })
+        }
+
+        async fn stream(
+            &self,
+            _req: ChatRequest,
+            events: tokio::sync::mpsc::Sender<qcg_llm::ChatStreamEvent>,
+        ) -> Result<(), LlmError> {
+            for fragment in ["hello ", "wo", "rld"] {
+                events
+                    .send(qcg_llm::ChatStreamEvent::TextDelta {
+                        text: fragment.into(),
+                    })
+                    .await
+                    .map_err(|_| LlmError::new("LLM stream receiver closed"))?;
+            }
+            events
+                .send(qcg_llm::ChatStreamEvent::Completed {
+                    response: ChatResponse {
+                        content: vec![qcg_llm::ChatContent::Text("hello world".into())],
+                        usage: TokenUsage::default(),
+                        stop: StopReason::EndTurn,
+                        provider_state: None,
+                    },
+                })
+                .await
+                .map_err(|_| LlmError::new("LLM stream receiver closed"))?;
+            Ok(())
         }
     }
 
@@ -382,6 +482,120 @@ mod tests {
             .await
             .expect_err("gateway should reject leaked secret output");
         assert!(error.to_string().contains("secret `token`"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn split_stream_deltas_do_not_persist_secrets() {
+        let dir = Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
+            "qcg-llm-split-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        )))
+        .expect("temporary path must be UTF-8");
+        let journal = JournalWriter::create(&dir.join("journal.jsonl"), "split-test", false, None)
+            .expect("journal should be created");
+        let secrets =
+            SecretStore::from_values(BTreeMap::from([("token".into(), "secret-value".into())]));
+        let gateway = LlmGateway::new(
+            Arc::new(SplitStreamLeakingProvider),
+            &secrets,
+            &journal,
+            CancellationToken::new(),
+            LlmCostBudget {
+                max_tokens: None,
+                max_cost_microusd: None,
+                require_pricing: false,
+            },
+            Vec::new(),
+        );
+        let node = test_node();
+        let mut request = test_request();
+        request.provider = "split-leak".into();
+        request.stream = true;
+        let error = gateway
+            .complete(
+                &node,
+                request,
+                &test_routes(&[("split-leak", "test")]),
+                |_| json!({}),
+            )
+            .await
+            .expect_err("split secret must be rejected on completion");
+        assert!(error.to_string().contains("secret `token`"));
+        let journal_text =
+            std::fs::read_to_string(dir.join("journal.jsonl")).expect("journal should be readable");
+        assert!(
+            !journal_text.contains("secret-value"),
+            "split deltas must not persist recoverable secrets"
+        );
+        // Reconstructing every published delta must still not yield the secret,
+        // including across a publish boundary withheld by the holdback window.
+        let deltas: String = journal_text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| event["t"] == "llm_delta")
+            .filter_map(|event| event["text"].as_str().map(str::to_string))
+            .collect();
+        assert!(
+            !deltas.contains("secret-value"),
+            "published delta concatenation must not reconstruct the secret"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn safe_stream_still_publishes_deltas_with_secrets_configured() {
+        let dir = Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
+            "qcg-llm-safe-split-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        )))
+        .expect("temporary path must be UTF-8");
+        let journal = JournalWriter::create(&dir.join("journal.jsonl"), "safe-split", false, None)
+            .expect("journal should be created");
+        // Unrelated secret: holdback applies but clean text must keep streaming.
+        let secrets =
+            SecretStore::from_values(BTreeMap::from([("token".into(), "secret-value".into())]));
+        let gateway = LlmGateway::new(
+            Arc::new(SafeSplitStreamProvider),
+            &secrets,
+            &journal,
+            CancellationToken::new(),
+            LlmCostBudget {
+                max_tokens: None,
+                max_cost_microusd: None,
+                require_pricing: false,
+            },
+            Vec::new(),
+        );
+        let node = test_node();
+        let mut request = test_request();
+        request.provider = "safe-split".into();
+        request.stream = true;
+        let response = gateway
+            .complete(
+                &node,
+                request,
+                &test_routes(&[("safe-split", "test")]),
+                |_| json!({}),
+            )
+            .await
+            .expect("clean stream must succeed");
+        assert!(matches!(
+            response.content.first(),
+            Some(qcg_llm::ChatContent::Text(text)) if text == "hello world"
+        ));
+        let journal_text =
+            std::fs::read_to_string(dir.join("journal.jsonl")).expect("journal should be readable");
+        let deltas: String = journal_text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| event["t"] == "llm_delta")
+            .filter_map(|event| event["text"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(deltas, "hello world");
+        assert!(journal_text.contains("llm_call"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

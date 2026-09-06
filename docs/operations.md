@@ -34,7 +34,12 @@ for trust domains that require isolation. The default `exclusive` run store
 takes one directory lock. `shared-filesystem` enables active-active services
 when the underlying storage provides reliable advisory locks: run-level leases
 prevent duplicate execution, abandoned work is rescanned every 5 seconds, and
-non-owner services follow the durable journal for SSE delivery.
+non-owner services follow the durable journal for SSE delivery (roughly
+250 ms poll granularity rather than the 5 second rescan). Each process
+carries an owner id; answers, approvals, and cancel requests are journaled
+durably (`user_answered`, `user_confirmed`, `user_cancel_requested`) so the
+owner merges peer progress on refresh and resumes answered prompts. Cancel
+from a non-owner is observed within the 5 second refresh window.
 
 The server default is eight concurrently executing API runs. Set
 `--max-active-runs` or `QCG_MAX_ACTIVE_RUNS` to change the process-local limit.
@@ -258,7 +263,8 @@ curl -fsSN "$BASE/api/runs/$RUN/events" -H "Last-Event-ID: 0" \
 
 A reused `Idempotency-Key` with identical content replays the original result
 instead of starting a duplicate run; the same key with different content is
-rejected with `409 Conflict`. If a run still reaches `Waiting` or
+rejected with `409 Conflict`. Records persist for 24 hours under
+`<runs-dir>/idempotency/` and survive restarts and shared-store peers. If a run still reaches `Waiting` or
 `Confirming`, answer mechanically with
 `PUT /api/runs/{id}/questions/{qid}` or
 `PUT /api/runs/{id}/confirmations/{cid}`. `GET /healthz` and `GET /metrics`

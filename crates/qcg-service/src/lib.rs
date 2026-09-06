@@ -85,6 +85,7 @@ mod tests {
                 cancellation: CancellationToken::new(),
                 task: Arc::new(Mutex::new(None)),
                 queued_at: at,
+                owner_id: String::new(),
             };
             write_run_event(
                 &record,
@@ -1408,6 +1409,35 @@ command_timeout_seconds = 300
             .await
             .expect("preempted snapshot should load");
         assert_eq!(snapshot.queue_position, Some(2));
+        // The preempted writer must have exited before the requeue append:
+        // seqs stay unique and monotonic across the handoff.
+        let journal = service
+            .read_journal(running.clone())
+            .await
+            .expect("preempted journal should be readable");
+        let seqs: Vec<u64> = journal
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<Value>(line)
+                    .expect("journal line should be JSON")
+                    .get("seq")
+                    .and_then(Value::as_u64)
+                    .expect("event should carry seq")
+            })
+            .collect();
+        assert!(!seqs.is_empty());
+        let mut deduped = seqs.clone();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            seqs.len(),
+            "preempted journal seqs must be unique across the writer handoff"
+        );
+        assert!(
+            seqs.windows(2).all(|pair| pair[0] < pair[1]),
+            "preempted journal seqs must stay monotonic"
+        );
         // Finishing the urgent run resumes equals in FIFO order.
         service
             .cancel(urgent.clone())
@@ -2464,5 +2494,462 @@ content = "{{ inputs.marker }}"
         let answer = json!(payload.values);
         assert_eq!(answer["decision"], "keep");
         assert_eq!(answer["reason"], "required context");
+    }
+
+    #[tokio::test]
+    async fn unknown_admission_time_sorts_last() {
+        let root = temp_run_dir("queue-unknown-last");
+        let _ = std::fs::remove_dir_all(&root);
+        write_generator_package(&root.join("generators"), "queue-gen");
+        let service = LocalQcgService::new(root.join("generators"), root.join("runs"), None)
+            .expect("service should initialize");
+        let contract = service
+            .load_generator("queue-gen")
+            .expect("fixture generator should load");
+        let first_at = chrono::Utc::now();
+        for (run_id, at) in [("q-first", Some(first_at)), ("q-unknown", None)] {
+            let run_dir = root.join("runs").join(run_id);
+            prepare_api_run_directory(&run_dir).expect("run directory should prepare");
+            let (events, _) = broadcast::channel(512);
+            let record = RunRecord {
+                contract: contract.clone(),
+                contract_sha256: contract.sha256.clone(),
+                inputs: BTreeMap::new(),
+                answers: BTreeMap::new(),
+                confirmations: BTreeMap::new(),
+                priority: 0,
+                parent_run_id: None,
+                preempted: false,
+                state: RunStatus::Queued,
+                run_dir: run_dir.clone(),
+                artifacts: None,
+                question: None,
+                confirm: None,
+                events,
+                cancellation: CancellationToken::new(),
+                task: Arc::new(Mutex::new(None)),
+                queued_at: at,
+                owner_id: String::new(),
+            };
+            write_run_event(
+                &record,
+                "run_queued",
+                json!({
+                    "run_id": run_id,
+                    "generator": "queue-gen@0.1.0",
+                    "generator_path": contract.root,
+                    "contract_sha256": contract.sha256,
+                    "inputs": {},
+                    "qcg": env!("CARGO_PKG_VERSION"),
+                    "schema_version": 1,
+                }),
+            )
+            .expect("queued event should append");
+            service
+                .inner
+                .runs
+                .write()
+                .await
+                .insert(run_id.into(), record);
+        }
+        let first = service
+            .snapshot("q-first".into())
+            .await
+            .expect("first snapshot should load");
+        assert_eq!(first.queue_position, Some(1));
+        let unknown = service
+            .snapshot("q-unknown".into())
+            .await
+            .expect("unknown snapshot should load");
+        assert_eq!(
+            unknown.queue_position,
+            Some(2),
+            "runs without admission time must sort after dated equals"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn synthetic_hitl_record(root: &Utf8Path, run_id: &str) -> RunRecord {
+        let generators =
+            Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+        let service = LocalQcgService::new(generators, root.join("runs"), None)
+            .expect("service should initialize");
+        let contract = service
+            .load_generator("ask-user")
+            .expect("ask-user fixture should load");
+        let run_dir = root.join("runs").join(run_id);
+        prepare_api_run_directory(&run_dir).expect("run directory should prepare");
+        let (events, _) = broadcast::channel(512);
+        let record = RunRecord {
+            contract: contract.clone(),
+            contract_sha256: contract.sha256.clone(),
+            inputs: BTreeMap::new(),
+            answers: BTreeMap::new(),
+            confirmations: BTreeMap::new(),
+            priority: 0,
+            parent_run_id: None,
+            preempted: false,
+            state: RunStatus::Queued,
+            run_dir: run_dir.clone(),
+            artifacts: None,
+            question: None,
+            confirm: None,
+            events,
+            cancellation: CancellationToken::new(),
+            task: Arc::new(Mutex::new(None)),
+            queued_at: Some(chrono::Utc::now()),
+            owner_id: String::new(),
+        };
+        write_run_event(
+            &record,
+            "run_queued",
+            json!({
+                "run_id": run_id,
+                "generator": "ask-user@0.1.0",
+                "generator_path": contract.root,
+                "contract_sha256": contract.sha256,
+                "inputs": {},
+                "answers": {},
+                "confirmations": {},
+                "qcg": env!("CARGO_PKG_VERSION"),
+                "schema_version": 1,
+            }),
+        )
+        .expect("queued event should append");
+        record
+    }
+
+    fn synthetic_question() -> qcg_api::FormSpec {
+        qcg_api::FormSpec {
+            id: "q1".into(),
+            title: "Question".into(),
+            title_i18n: Default::default(),
+            fields: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn rehydrate_restores_accepted_answers_from_journal() {
+        let root = temp_run_dir("hitl-rehydrate");
+        let _ = std::fs::remove_dir_all(&root);
+        let run_id = format!("synth-{}", uuid::Uuid::now_v7());
+        let record = synthetic_hitl_record(&root, &run_id);
+        let question = synthetic_question();
+        write_run_event(
+            &record,
+            "run_waiting",
+            json!({ "question_id": "q1", "question": question }),
+        )
+        .expect("waiting event should append");
+        let runs_dir = root.join("runs");
+        let pending =
+            rehydrate_runs(&runs_dir, DEFAULT_MAX_TRACKED_RUNS).expect("rehydrate should succeed");
+        let waiting = pending.get(&run_id).expect("run should rehydrate");
+        assert_eq!(waiting.state, RunStatus::Waiting);
+        assert!(waiting.answers.is_empty());
+        write_run_event(
+            &record,
+            "user_answered",
+            json!({ "question_id": "q1", "values": { "answer": "brief" } }),
+        )
+        .expect("answer event should append");
+        let pending =
+            rehydrate_runs(&runs_dir, DEFAULT_MAX_TRACKED_RUNS).expect("rehydrate should succeed");
+        let queued = pending.get(&run_id).expect("run should rehydrate");
+        assert_eq!(queued.state, RunStatus::Queued);
+        assert_eq!(
+            queued.answers.get("q1"),
+            Some(&json!({ "answer": "brief" })),
+            "accepted answer must survive a restart before the engine consumes it"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn mcp_pending_continuation_roundtrips_through_journal() {
+        let root = temp_run_dir("mcp-pending");
+        let _ = std::fs::remove_dir_all(&root);
+        let run_id = format!("synth-{}", uuid::Uuid::now_v7());
+        let record = synthetic_hitl_record(&root, &run_id);
+        write_run_event(
+            &record,
+            "mcp_input_pending",
+            json!({
+                "node": "fetch",
+                "pending_key": "fetch:mcpcont:server/tool:abc123#__mcp_pending",
+                "question_id": "fetch:mcp:server/tool:deadbeef",
+                "server": "server",
+                "tool": "tool",
+                "arguments": { "q": "x" },
+                "request_state": "state-1",
+                "input_requests": {},
+            }),
+        )
+        .expect("pending event should append");
+        let pending = read_persisted_mcp_pending(&root.join("runs").join(&run_id))
+            .expect("pending continuation should be readable");
+        let descriptor = pending
+            .get("fetch:mcpcont:server/tool:abc123#__mcp_pending")
+            .expect("pending descriptor should be keyed by reservation");
+        assert_eq!(
+            descriptor.get("request_state").and_then(Value::as_str),
+            Some("state-1")
+        );
+        assert_eq!(
+            descriptor.get("question_id").and_then(Value::as_str),
+            Some("fetch:mcp:server/tool:deadbeef")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn shared_peer_answer_is_adopted_without_duplicate_execution() {
+        let generators =
+            Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+        let runs = temp_run_dir("shared-peer-answer");
+        let _ = std::fs::remove_dir_all(&runs);
+        let make_service = || {
+            LocalQcgService::with_generator_roots_max_active_runs_and_store_mode(
+                vec![generators.clone()],
+                runs.clone(),
+                None,
+                qcg_policy::DEFAULT_MAX_ACTIVE_RUNS,
+                DEFAULT_MAX_TRACKED_RUNS,
+                RunStoreMode::SharedFilesystem,
+            )
+            .expect("shared service should initialize")
+        };
+        let owner = make_service();
+        let id = owner
+            .start_run(StartRun {
+                generator_id: "ask-user".into(),
+                inputs: BTreeMap::new(),
+                ..Default::default()
+            })
+            .await
+            .expect("interactive run should start");
+        let question = wait_for_snapshot(&owner, &id, RunStatus::Waiting)
+            .await
+            .question
+            .expect("run should be waiting");
+        // A peer attached to the same store observes the waiting run and
+        // answers it; the durable journal carries the decision over.
+        let peer = make_service();
+        let peer_snapshot = peer
+            .snapshot(id.clone())
+            .await
+            .expect("peer should observe the waiting run");
+        assert_eq!(peer_snapshot.state, RunStatus::Waiting);
+        peer.answer(
+            id.clone(),
+            question.id.clone(),
+            AnswerPayload {
+                values: BTreeMap::from([("answer".into(), json!("brief"))]),
+            },
+        )
+        .await
+        .expect("peer answer should be accepted");
+        let terminal = wait_for_terminal_snapshot(&peer, &id).await;
+        assert_eq!(terminal.state, RunStatus::Succeeded);
+        let journal = peer
+            .read_journal(id.clone())
+            .await
+            .expect("journal should be readable");
+        assert!(
+            journal.contains("\"t\":\"user_answered\""),
+            "peer decision must be journaled for the owner to adopt"
+        );
+        assert_eq!(
+            journal.matches("\"t\":\"run_finished\"").count(),
+            1,
+            "takeover must settle the run exactly once"
+        );
+        drop(owner);
+        drop(peer);
+        let _ = std::fs::remove_dir_all(&runs);
+    }
+
+    #[tokio::test]
+    async fn concurrent_conflicting_answers_journal_once() {
+        let runs = temp_run_dir("answer-race");
+        let _ = std::fs::remove_dir_all(&runs);
+        let generators =
+            Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+        let service = LocalQcgService::new(generators, runs.clone(), None)
+            .expect("service should initialize");
+        let id = service
+            .start_run(StartRun {
+                generator_id: "ask-user".into(),
+                inputs: BTreeMap::new(),
+                ..Default::default()
+            })
+            .await
+            .expect("interactive run should start");
+        let question = wait_for_snapshot(&service, &id, RunStatus::Waiting)
+            .await
+            .question
+            .expect("run should be waiting");
+        let answer = |value: &str| {
+            service.answer(
+                id.clone(),
+                question.id.clone(),
+                AnswerPayload {
+                    values: BTreeMap::from([("answer".into(), json!(value))]),
+                },
+            )
+        };
+        let (first, second) = tokio::join!(answer("brief"), answer("detailed"));
+        let succeeded = [&first, &second].iter().filter(|r| r.is_ok()).count();
+        assert_eq!(succeeded, 1, "exactly one conflicting answer must win");
+        for result in [&first, &second] {
+            if let Err(error) = result {
+                assert!(
+                    error.to_string().contains("different values"),
+                    "loser must see a conflict, got {error}"
+                );
+            }
+        }
+        let journal = service
+            .read_journal(id.clone())
+            .await
+            .expect("journal should be readable");
+        assert_eq!(
+            journal.matches("\"t\":\"user_answered\"").count(),
+            1,
+            "conflicting answers must not both persist with last-wins"
+        );
+        drop(service);
+        let _ = std::fs::remove_dir_all(&runs);
+    }
+
+    #[tokio::test]
+    async fn shutdown_converges_when_executor_ignores_cancellation() {
+        let root = temp_run_dir("shutdown-deadline");
+        let _ = std::fs::remove_dir_all(&root);
+        write_generator_package(&root.join("generators"), "queue-gen");
+        let service = LocalQcgService::new(root.join("generators"), root.join("runs"), None)
+            .expect("service should initialize");
+        let contract = service
+            .load_generator("queue-gen")
+            .expect("fixture generator should load");
+        let run_id = "stuck-run";
+        let run_dir = root.join("runs").join(run_id);
+        prepare_api_run_directory(&run_dir).expect("run directory should prepare");
+        let (events, _) = broadcast::channel(512);
+        // An executor that never observes cancellation, as with a wedged
+        // container runtime client.
+        let stuck = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+        let record = RunRecord {
+            contract: contract.clone(),
+            contract_sha256: contract.sha256.clone(),
+            inputs: BTreeMap::new(),
+            answers: BTreeMap::new(),
+            confirmations: BTreeMap::new(),
+            priority: 0,
+            parent_run_id: None,
+            preempted: false,
+            state: RunStatus::Running,
+            run_dir: run_dir.clone(),
+            artifacts: None,
+            question: None,
+            confirm: None,
+            events,
+            cancellation: CancellationToken::new(),
+            task: Arc::new(Mutex::new(Some(stuck))),
+            queued_at: None,
+            owner_id: String::new(),
+        };
+        write_run_event(
+            &record,
+            "run_queued",
+            json!({
+                "run_id": run_id,
+                "generator": "queue-gen@0.1.0",
+                "generator_path": contract.root,
+                "contract_sha256": contract.sha256,
+                "inputs": {},
+                "qcg": env!("CARGO_PKG_VERSION"),
+                "schema_version": 1,
+            }),
+        )
+        .expect("queued event should append");
+        service
+            .inner
+            .runs
+            .write()
+            .await
+            .insert(run_id.to_string(), record);
+        let started = std::time::Instant::now();
+        service
+            .shutdown_active_runs()
+            .await
+            .expect("shutdown must converge despite the stuck executor");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(25),
+            "shutdown deadline must bound the wait"
+        );
+        let journal = service
+            .read_journal(run_id.to_string())
+            .await
+            .expect("journal should be readable");
+        assert!(
+            journal.contains("run_interrupted"),
+            "abandoned work must be marked interrupted for restart triage"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn non_owned_runs_follow_journal_for_sse() {
+        let generators =
+            Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+        let runs = temp_run_dir("sse-ownership");
+        let _ = std::fs::remove_dir_all(&runs);
+        let make_service = || {
+            LocalQcgService::with_generator_roots_max_active_runs_and_store_mode(
+                vec![generators.clone()],
+                runs.clone(),
+                None,
+                qcg_policy::DEFAULT_MAX_ACTIVE_RUNS,
+                DEFAULT_MAX_TRACKED_RUNS,
+                RunStoreMode::SharedFilesystem,
+            )
+            .expect("shared service should initialize")
+        };
+        let owner = make_service();
+        let id = owner
+            .start_run(StartRun {
+                generator_id: "ask-user".into(),
+                inputs: BTreeMap::new(),
+                ..Default::default()
+            })
+            .await
+            .expect("interactive run should start");
+        wait_for_snapshot(&owner, &id, RunStatus::Waiting).await;
+        // Claim local ownership as if this process drove execution.
+        {
+            let mut records = owner.inner.runs.write().await;
+            let record = records.get_mut(&id).expect("run should be tracked");
+            record.owner_id = owner.inner.owner_id.clone();
+        }
+        assert!(
+            owner.owns_live_stream(&id).await,
+            "the owning process must keep its live broadcast"
+        );
+        let peer = make_service();
+        assert!(
+            !peer.owns_live_stream(&id).await,
+            "a non-owning peer must follow the durable journal instead of a stale broadcast"
+        );
+        // Exclusive stores always own their (single-process) broadcast.
+        let exclusive = LocalQcgService::new(generators, runs.clone(), None)
+            .expect("exclusive service should initialize");
+        assert!(exclusive.owns_live_stream(&id).await);
+        drop(owner);
+        drop(peer);
+        drop(exclusive);
+        let _ = std::fs::remove_dir_all(&runs);
     }
 }

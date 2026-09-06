@@ -14,6 +14,7 @@ axum.workspace = true
 camino.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
+hex.workspace = true
 qcg-policy = { path = "../qcg-policy" }
 qcg-api = { path = "../qcg-api" }
 qcg-service = { path = "../qcg-service" }

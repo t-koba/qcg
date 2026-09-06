@@ -55,6 +55,17 @@ Generated from the OpenAPI `RunEvent` schema. Every event uses the required enve
 | `lagged` | `action` |
 <!-- qcg-run-events:end -->
 
+## Durability records
+
+The following journal records are not typed `RunEvent` variants; they travel
+as opaque `Unknown` kinds and exist so restarts and shared-store peers resume
+identical work. `user_answered` carries `question_id` and `values`,
+`user_confirmed` carries `confirmation_id` and `approved`, and
+`user_cancel_requested` carries `run_id`. `mcp_input_pending` carries `node`,
+`pending_key`, `question_id`, `server`/`tool` (direct calls) or `alias`
+(agent calls), `arguments`, `request_state`, and `input_requests` so a resumed
+MCP call answers the original remote request instead of starting a new one.
+
 ## Cost metrics
 
 Every terminal event (`run_finished`, `run_error`, `run_canceled`,

@@ -59,6 +59,7 @@ pub async fn serve_with_listener(
         .map(|origin| format!("{origin}/api/mcp/oauth/callback"));
     let state = Arc::new(AppState {
         service,
+        runs_dir: config.runs_dir.clone(),
         oauth_origin,
         oauth_allowed_origins,
         oauth_callback_url,

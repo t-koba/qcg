@@ -4,6 +4,8 @@ use qcg_engine::{ResultExt, StepContext, StepError, tool_call_sources};
 use qcg_llm::ChatToolCall;
 use qcg_mcp::McpCallOutcome;
 use serde_json::{Value, json};
+use sha2::Digest;
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use crate::mcp_forms::{mcp_form_spec, mcp_input_responses, mcp_question_id};
@@ -182,7 +184,13 @@ pub(crate) async fn execute_mcp_tool(
     args: Value,
 ) -> Result<AgentToolOutcome, StepError> {
     let mut input_responses = None;
-    let mut request_state = None;
+    let mut request_state: Option<String> = None;
+    if let Some((resumed_state, resumed_responses)) =
+        find_resumed_agent_mcp_continuation(ctx, alias, &args)
+    {
+        request_state = resumed_state;
+        input_responses = resumed_responses;
+    }
     for _round in 0..10 {
         match mcp
             .call(
@@ -196,19 +204,40 @@ pub(crate) async fn execute_mcp_tool(
         {
             McpCallOutcome::Complete(value) => return Ok(AgentToolOutcome::Result(value)),
             McpCallOutcome::InputRequired(required) => {
-                request_state = required.request_state.clone();
+                let loop_state = required.request_state.clone();
                 if required.input_requests.is_empty() {
+                    request_state = loop_state;
                     tokio::task::yield_now().await;
                     continue;
                 }
                 let question_id = mcp_question_id(&node.id, alias, &required);
                 let Some(answer) = ctx.run.answers.get(&question_id) else {
+                    ctx.journal
+                        .event(
+                            "mcp_input_pending",
+                            json!({
+                                "node": node.id,
+                                "pending_key": format!("{node_id}:agentmcp:{alias}:{args_hash}#__mcp_pending",
+                                    node_id = node.id,
+                                    alias = alias,
+                                    args_hash = &hex::encode(sha2::Sha256::digest(
+                                        serde_json::to_vec(&args).unwrap_or_default()
+                                    ))[..16]),
+                                "question_id": question_id,
+                                "alias": alias,
+                                "arguments": args,
+                                "request_state": required.request_state,
+                                "input_requests": required.input_requests,
+                            }),
+                        )
+                        .step_err(&node.id)?;
                     return Ok(AgentToolOutcome::NeedsUser(mcp_form_spec(
                         question_id,
                         alias,
                         &required,
                     )?));
                 };
+                request_state = loop_state;
                 input_responses = Some(mcp_input_responses(&required, answer)?);
             }
         }
@@ -218,3 +247,50 @@ pub(crate) async fn execute_mcp_tool(
         format!("MCP tool `{alias}` exceeded 10 input-required rounds"),
     ))
 }
+
+fn find_resumed_agent_mcp_continuation(
+    ctx: &StepContext<'_>,
+    alias: &str,
+    args: &Value,
+) -> Option<ResumedMcpContinuation> {
+    for pending in ctx
+        .run
+        .answers
+        .iter()
+        .filter(|(key, _)| key.ends_with("#__mcp_pending"))
+        .map(|(_, value)| value)
+    {
+        if pending.get("alias").and_then(Value::as_str) != Some(alias) {
+            continue;
+        }
+        if pending.get("arguments") != Some(args) {
+            continue;
+        }
+        let question_id = pending.get("question_id").and_then(Value::as_str)?;
+        let answer = ctx.run.answers.get(question_id)?;
+        let request_state = pending
+            .get("request_state")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let input_requests = pending
+            .get("input_requests")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let values = answer.as_object()?;
+        let mut sorted_ids: Vec<&String> = input_requests.keys().collect();
+        sorted_ids.sort();
+        let mut responses = BTreeMap::new();
+        for (index, id) in sorted_ids.into_iter().enumerate() {
+            let field = format!("response_{index}");
+            let value = values.get(&field)?.clone();
+            responses.insert(id.clone(), json!({ "action": "accept", "content": value }));
+        }
+        return Some((request_state, Some(responses)));
+    }
+    None
+}
+
+/// Stored request_state plus user-derived input_responses for continuing the
+/// original remote MCP request after a HITL restart.
+type ResumedMcpContinuation = (Option<String>, Option<BTreeMap<String, Value>>);

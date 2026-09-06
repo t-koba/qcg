@@ -199,6 +199,18 @@ impl McpSession {
         let result = match result {
             ToolCallResult::Complete(result) => result,
             ToolCallResult::InputRequired(input) => {
+                let value = serde_json::to_value(&input)
+                    .map_err(|error| McpError::Transport(error.to_string()))?;
+                let encoded = serde_json::to_vec(&value)
+                    .map_err(|error| McpError::Transport(error.to_string()))?;
+                if encoded.len() > self.profile.spec.max_response_bytes {
+                    return Err(McpError::Transport(format!(
+                        "MCP server `{}` input request exceeded {} bytes",
+                        self.profile.id(),
+                        self.profile.spec.max_response_bytes
+                    )));
+                }
+                reject_credential_reflection(&value, &sensitive_values)?;
                 return Ok(McpCallOutcome::InputRequired(input));
             }
         };
@@ -251,10 +263,21 @@ impl McpSession {
                             .map_err(|error| McpError::Transport(error.to_string()))
                     })
                     .collect::<Result<_, _>>()?;
-                return Ok(ToolCallResult::InputRequired(McpInputRequired {
+                let input = McpInputRequired {
                     input_requests,
                     request_state: result.request_state,
-                }));
+                };
+                let encoded = serde_json::to_vec(&input)
+                    .map_err(|error| McpError::Transport(error.to_string()))?;
+                if encoded.len() > self.profile.spec.max_response_bytes {
+                    return Err(McpError::Transport(format!(
+                        "MCP server `{}` input request exceeded {} bytes",
+                        self.profile.id(),
+                        self.profile.spec.max_response_bytes
+                    )));
+                }
+                reject_credential_reflection(&input, sensitive_values)?;
+                return Ok(ToolCallResult::InputRequired(input));
             }
             CallToolResponse::Task(task) => task.task,
             _ => {

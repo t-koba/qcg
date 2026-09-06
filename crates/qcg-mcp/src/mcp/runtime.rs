@@ -62,6 +62,33 @@ pub struct McpRuntime {
     inner: Arc<McpRuntimeInner>,
 }
 
+// RAII reservation so a dropped or failed connect future still returns the
+// active session count. Ownership moves to McpSession on success via disarm.
+struct ActiveSessionReservation {
+    counter: Option<Arc<AtomicUsize>>,
+}
+
+impl ActiveSessionReservation {
+    fn acquire(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self {
+            counter: Some(counter),
+        }
+    }
+
+    fn disarm(mut self) -> Arc<AtomicUsize> {
+        self.counter.take().expect("reservation holds a counter")
+    }
+}
+
+impl Drop for ActiveSessionReservation {
+    fn drop(&mut self) {
+        if let Some(counter) = self.counter.take() {
+            counter.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
 impl std::fmt::Debug for McpRuntime {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -405,7 +432,7 @@ impl McpRuntime {
             lifecycle = lifecycle_gate.lock() => lifecycle,
         };
         let active_sessions = self.active_sessions(server_id);
-        active_sessions.fetch_add(1, Ordering::AcqRel);
+        let reservation = ActiveSessionReservation::acquire(active_sessions);
         drop(_lifecycle);
         let session_cancellation = cancellation.child_token();
         let cancellation_wait = session_cancellation.clone();
@@ -426,12 +453,10 @@ impl McpRuntime {
         };
         let mut session = match session_result {
             Ok(session) => session,
-            Err(error) => {
-                active_sessions.fetch_sub(1, Ordering::AcqRel);
-                return Err(error);
-            }
+            // Reservation Drop returns the count on failure or future drop.
+            Err(error) => return Err(error),
         };
-        session.active_sessions = Some(active_sessions);
+        session.active_sessions = Some(reservation.disarm());
         Ok(session)
     }
 
@@ -584,11 +609,11 @@ impl McpRuntime {
             .command
             .split_first()
             .expect("validated stdio command");
-        let mut command = match permission.isolation {
+        let command = match permission.isolation {
             McpCommandIsolation::TrustedHost => {
                 let mut command = tokio::process::Command::new(bin);
                 command.args(args);
-                command
+                (command, None)
             }
             McpCommandIsolation::Container => {
                 let (runtime, runtime_args) = permission
@@ -613,8 +638,18 @@ impl McpRuntime {
                 );
                 let mut command = tokio::process::Command::new(runtime);
                 command.args(runtime_args);
+                // cidfile stays outside the mounted workspace so the
+                // container cannot tamper with the tracked container id.
+                let cidfile = std::env::temp_dir().join(format!(
+                    ".qcg-mcp-container-{}-{}.cid",
+                    profile.id(),
+                    uuid::Uuid::now_v7().as_simple()
+                ));
                 command.args([
                     "--rm",
+                    "-i",
+                    "--cidfile",
+                    cidfile.to_string_lossy().as_ref(),
                     "--network",
                     "none",
                     "--read-only",
@@ -633,9 +668,10 @@ impl McpRuntime {
                     command.args(["--env", name]);
                 }
                 command.arg(image).arg(bin).args(args);
-                command
+                (command, Some((runtime.to_string(), cidfile)))
             }
         };
+        let (mut command, container_cleanup) = command;
         command
             .current_dir(&access.workspace)
             .env_clear()
@@ -652,8 +688,11 @@ impl McpRuntime {
             command.env(target, &value);
             sensitive_values.push(value);
         }
-        let transport = BoundedChildTransport::spawn(command, profile.spec.max_response_bytes)
+        let mut transport = BoundedChildTransport::spawn(command, profile.spec.max_response_bytes)
             .map_err(|error| McpError::Transport(error.to_string()))?;
+        if let Some((runtime, cidfile)) = container_cleanup {
+            transport = transport.with_container_cleanup(runtime, cidfile);
+        }
         McpSession::serve(
             profile,
             transport,
@@ -696,4 +735,32 @@ fn public_default_specs() -> Vec<McpServerSpec> {
         max_response_bytes: DEFAULT_MCP_MAX_RESPONSE_BYTES,
     })
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn reservation_returns_count_on_drop() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        {
+            let _reservation = ActiveSessionReservation::acquire(Arc::clone(&counter));
+            assert_eq!(counter.load(Ordering::Acquire), 1);
+            // Dropping the future (or failing to connect) must not leak the count.
+        }
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn disarmed_reservation_keeps_count_for_session() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let reservation = ActiveSessionReservation::acquire(Arc::clone(&counter));
+        let owned = reservation.disarm();
+        assert_eq!(counter.load(Ordering::Acquire), 1);
+        // Session Drop returns the count instead.
+        owned.fetch_sub(1, Ordering::AcqRel);
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+    }
 }

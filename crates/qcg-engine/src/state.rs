@@ -330,6 +330,14 @@ impl RunState {
                     self.pending = Some(Interaction::Question { question });
                 }
             }
+            "user_answered" | "user_confirmed" => {
+                // Durability record for an accepted HITL response. The engine
+                // consumes the persisted answers map on resume, so the
+                // pending prompt is cleared here and rehydrate restores the
+                // values from the same events.
+                self.pending = None;
+                self.terminal = None;
+            }
             "run_finished" => {
                 self.pending = None;
                 self.terminal = Some(

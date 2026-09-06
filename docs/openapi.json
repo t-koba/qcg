@@ -2569,6 +2569,18 @@
       "RunStartedEventData": {
         "additionalProperties": false,
         "properties": {
+          "answers": {
+            "additionalProperties": true,
+            "default": {},
+            "type": "object"
+          },
+          "confirmations": {
+            "additionalProperties": {
+              "type": "boolean"
+            },
+            "default": {},
+            "type": "object"
+          },
           "contract_sha256": {
             "type": "string"
           },

@@ -56,7 +56,11 @@ impl StepExecutor for LlmGenerateStep {
         if let Some(output_file) = &params.output_file {
             let output_file = ctx.render_inline(node, output_file)?;
             let path = ctx.run.fs.resolve_write(&output_file).step_err(&node.id)?;
-            tokio::fs::write(&path, &response).await?;
+            ctx.run
+                .fs
+                .write_file_atomic(&path, response.as_bytes())
+                .await
+                .map_err(|error| StepError::from_gateway(&node.id, error))?;
             files.push(path);
         }
         Ok(StepOutcome::Success {

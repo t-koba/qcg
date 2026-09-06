@@ -44,6 +44,7 @@ impl JournalWriter {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        repair_truncated_tail(path)?;
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         let state_path = path.with_file_name("state.json");
         let scan = read_journal_values(path, limits)?;
@@ -191,5 +192,58 @@ pub(crate) fn validate_limits(limits: JournalLimits) -> Result<(), JournalError>
             return Err(JournalError::InvalidLimit { resource });
         }
     }
+    Ok(())
+}
+
+/// Repair a torn trailing line before appending.
+///
+/// The reader ignores an incomplete final line without a newline, but
+/// appending after it would fuse two JSON objects into one invalid line.
+/// Only newline-terminated lines are durable: a trailing fragment without
+/// a newline is either committed (valid complete JSON gains its newline)
+/// or truncated to the last newline boundary. Middle-line corruption is
+/// never silently dropped and still surfaces as `InvalidLine` on read.
+fn repair_truncated_tail(path: &Utf8Path) -> Result<(), JournalError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let bytes = std::fs::read(path)?;
+    if bytes.is_empty() || bytes.last() == Some(&b'\n') {
+        return Ok(());
+    }
+    let last_newline = bytes.iter().rposition(|byte| *byte == b'\n');
+    let tail_start = last_newline.map(|pos| pos + 1).unwrap_or(0);
+    let tail = &bytes[tail_start..];
+    if tail.iter().all(u8::is_ascii_whitespace) {
+        // Trailing whitespace without a newline carries no event; truncate
+        // it so the next append starts on a clean line.
+        truncate_to(path, tail_start)?;
+        return Ok(());
+    }
+    match serde_json::from_slice::<serde_json::Value>(tail) {
+        Ok(_) => {
+            // Complete JSON without its newline: commit it so the event is
+            // preserved with the same semantics as a clean shutdown.
+            let file = OpenOptions::new().append(true).open(path)?;
+            use std::io::Write as _;
+            let mut file = file;
+            file.write_all(b"\n")?;
+            file.sync_data()?;
+            Ok(())
+        }
+        Err(_) => {
+            // Torn JSON, partial UTF-8, or over-long fragment: drop only the
+            // trailing fragment so prior newline-terminated events survive
+            // and the next append does not fuse lines.
+            truncate_to(path, tail_start)?;
+            Ok(())
+        }
+    }
+}
+
+fn truncate_to(path: &Utf8Path, len: usize) -> Result<(), JournalError> {
+    let file = OpenOptions::new().write(true).open(path)?;
+    file.set_len(len as u64)?;
+    file.sync_data()?;
     Ok(())
 }

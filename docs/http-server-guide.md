@@ -12,6 +12,13 @@ qcg listens on the selected address without forcing authentication. When
 `--api-token` or `QCG_API_TOKEN` is set, clients send `Authorization: Bearer
 <token>`. This authenticates an instance boundary, not individual run ownership.
 
+The bundled generator UI has no bearer token input and sends no
+`Authorization` header (including `EventSource` streams and artifact
+downloads). Combining the UI directly with the embedded bearer token is
+therefore unsupported. When browser access must be authenticated, place the
+UI and API behind qpx and let qpx inject the `Authorization` header after
+validating the caller. Never put tokens in URL query strings.
+
 ## Responsibilities
 
 | qid | qpx | qcg |
@@ -93,8 +100,10 @@ event, artifact, and journal routes. Principal paths include:
 `priority` (integer, default 0, higher runs first) orders the queue and may
 preempt lower-priority running runs, which resume from their journals.
 An
-`Idempotency-Key` header makes retries deterministic for 24 hours within the
-service process. The same header is accepted by `POST /api/runs/{id}/fork`,
+`Idempotency-Key` header makes retries deterministic for 24 hours. Records
+are persisted under `<runs-dir>/idempotency/` so the same key returns the
+same run across process restarts and shared-store peers; TTL and entry caps
+still apply. The same header is accepted by `POST /api/runs/{id}/fork`,
 `PUT /api/runs/{id}/questions/{qid}`,
 `PUT /api/runs/{id}/confirmations/{cid}`, and `POST /api/runs/{id}:cancel`:
 a reused key with identical content replays the original result instead of

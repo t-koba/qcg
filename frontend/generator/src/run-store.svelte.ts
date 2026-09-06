@@ -31,6 +31,8 @@ export interface RunTab {
   pendingAction: PendingAction | null;
   lastSnapshotSeq: number;
   snapshotVersion: number;
+  /** Operation token owning pendingAction, independent of snapshotVersion. */
+  pendingOp: string | null;
   /** Stable idempotency key for the start request. */
   startKey: string | null;
   /** Stable idempotency key reused across cancel retries. */
@@ -53,6 +55,7 @@ function emptyTab(runId: string, generatorId: string, generatorName: string): Ru
     pendingAction: null,
     lastSnapshotSeq: 0,
     snapshotVersion: 0,
+    pendingOp: null,
     startKey: null,
     cancelKey: null,
   };
@@ -88,6 +91,7 @@ export class RunStore {
   #cancelController: AbortController | null = null;
   #selectionVersion = 0;
   #fieldVersion = 0;
+  #restoring = false;
   #hashListener: ((event: HashChangeEvent) => void) | null = null;
 
   orderedTabs(): RunTab[] {
@@ -97,9 +101,16 @@ export class RunStore {
   }
 
   async initialize(): Promise<void> {
-    await this.loadGenerators();
-    await this.withError(() => this.refreshRuns());
-    await this.withError(() => this.restorePersistedView());
+    // Suppress view persistence until the saved screen is restored so the
+    // initial generator selection cannot overwrite stored tabs with empty state.
+    this.#restoring = true;
+    try {
+      await this.loadGenerators();
+      await this.withError(() => this.refreshRuns());
+      await this.withError(() => this.restorePersistedView());
+    } finally {
+      this.#restoring = false;
+    }
     const hashRunId = readHashRunId();
     if (hashRunId) {
       await this.withError(() => this.openRun(hashRunId));
@@ -209,9 +220,20 @@ export class RunStore {
   }
 
   async refreshRuns(): Promise<void> {
-    const query = this.historyState ? { state: this.historyState } : undefined;
-    const response = await this.api.listRuns(query);
-    this.runs = response.items || [];
+    // Follow pagination cursors so history beyond the first page stays
+    // reachable; cap pages to avoid unbounded fetches on huge stores.
+    const items: RunListResponse["items"] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 10; page++) {
+      const query = this.historyState ? { state: this.historyState } : undefined;
+      const response = await this.api.listRuns({ ...query, cursor, limit: 200 });
+      items.push(...(response.items || []));
+      const next = (response as RunListResponse).next_cursor ?? null;
+      if (!next) break;
+      cursor = next;
+    }
+    // Newest first for the history view; server order is run_id ascending.
+    this.runs = [...items].reverse();
   }
 
   setHistoryFilter(state: string): void {
@@ -222,12 +244,23 @@ export class RunStore {
   /** Fork the selected run from its latest snapshot sequence. */
   async forkCurrentRun(): Promise<void> {
     const tab = this.currentTab();
-    if (!tab || tab.runId.startsWith("pending-") || tab.lastSnapshotSeq === 0) return;
+    if (!tab || tab.pendingAction || tab.runId.startsWith("pending-") || tab.lastSnapshotSeq === 0) return;
+    tab.pendingAction = "starting";
+    const op = randomId();
+    tab.pendingOp = op;
     this.saveCurrentView();
-    const snapshot = await this.api.forkRun(tab.runId, tab.lastSnapshotSeq);
-    this.applySnapshot(snapshot);
-    this.selectTab(snapshot.run_id);
-    void this.withError(() => this.refreshRuns());
+    try {
+      const snapshot = await this.api.forkRun(tab.runId, tab.lastSnapshotSeq, randomId());
+      this.applySnapshot(snapshot);
+      this.selectTab(snapshot.run_id);
+      void this.withError(() => this.refreshRuns());
+    } finally {
+      if (tab.pendingOp === op) {
+        tab.pendingAction = null;
+        tab.pendingOp = null;
+        if (this.currentRun === tab.runId) this.pendingAction = null;
+      }
+    }
   }
 
   async openRun(runId: string): Promise<void> {
@@ -296,7 +329,9 @@ export class RunStore {
     this.saveCurrentView();
     this.errorText = "";
     const inputs = overrideInputs ? { ...overrideInputs } : this.#collectInputs();
-    const startKey = await sha256Hex(canonicalJson({ generator_id: generatorId, inputs }));
+    // Each user gesture gets a fresh operation id. Retries of the same
+    // gesture reuse it; an identical later gesture must start a new run.
+    const startKey = randomId();
     const tab = emptyTab("", generatorId, this.generators.find((candidate) => candidate.id === generatorId)?.name || generatorId);
     tab.pendingAction = "starting";
     tab.startKey = startKey;
@@ -339,6 +374,8 @@ export class RunStore {
     const key = await sha256Hex(canonicalJson({ run: tab.runId, question: this.question.id, values }));
     tab.pendingAction = "answering";
     this.pendingAction = "answering";
+    const op = randomId();
+    tab.pendingOp = op;
     tab.snapshotVersion += 1;
     const version = tab.snapshotVersion;
     try {
@@ -350,8 +387,9 @@ export class RunStore {
       if (version !== tab.snapshotVersion) return;
       this.applySnapshot(snapshot);
     } finally {
-      if (tab.snapshotVersion === version) {
+      if (tab.pendingOp === op) {
         tab.pendingAction = null;
+        tab.pendingOp = null;
         if (this.currentRun === tab.runId) this.pendingAction = null;
       }
     }
@@ -364,6 +402,8 @@ export class RunStore {
     const key = await sha256Hex(canonicalJson({ run: tab.runId, confirmation: this.confirm.id, decision }));
     tab.pendingAction = action;
     this.pendingAction = action;
+    const op = randomId();
+    tab.pendingOp = op;
     tab.snapshotVersion += 1;
     const version = tab.snapshotVersion;
     try {
@@ -375,8 +415,9 @@ export class RunStore {
       if (version !== tab.snapshotVersion) return;
       this.applySnapshot(snapshot);
     } finally {
-      if (tab.snapshotVersion === version) {
+      if (tab.pendingOp === op) {
         tab.pendingAction = null;
+        tab.pendingOp = null;
         if (this.currentRun === tab.runId) this.pendingAction = null;
       }
     }
@@ -387,6 +428,8 @@ export class RunStore {
     if (!tab || tab.pendingAction || !isCancelable(tab.runState)) return;
     tab.pendingAction = "canceling";
     this.pendingAction = "canceling";
+    const op = randomId();
+    tab.pendingOp = op;
     tab.snapshotVersion += 1;
     const version = tab.snapshotVersion;
     if (!tab.cancelKey) {
@@ -413,8 +456,9 @@ export class RunStore {
     } finally {
       clearTimeout(timeout);
       if (this.#cancelController === controller) this.#cancelController = null;
-      if (tab.snapshotVersion === version) {
+      if (tab.pendingOp === op) {
         tab.pendingAction = null;
+        tab.pendingOp = null;
         if (this.currentRun === tab.runId) this.pendingAction = null;
       }
     }
@@ -533,7 +577,7 @@ export class RunStore {
         this.errorText = typeof data.error === "string" ? data.error : JSON.stringify(data);
       }
     }
-    if (["run_finished", "run_canceled", "run_failed", "run_waiting", "confirm_request"].includes(event.kind)) {
+    if (["run_finished", "run_canceled", "run_failed", "run_error", "run_started", "run_interrupted", "run_waiting", "confirm_request"].includes(event.kind)) {
       void this.withError(() => this.refreshRun(runId));
     }
   }
@@ -550,7 +594,7 @@ export class RunStore {
 
   /** Persist the workspace screen so a revisit restores tabs and selection. */
   private persistView(): void {
-    if (typeof localStorage === "undefined") return;
+    if (this.#restoring || typeof localStorage === "undefined") return;
     try {
       const tabOrder = this.tabOrder
         .filter((id) => !id.startsWith("pending-"))
@@ -577,7 +621,6 @@ export class RunStore {
     }
     const persisted = decodeView(raw);
     if (!persisted) return;
-    const knownIds = new Set(this.runs.map((run) => run.run_id));
     if (
       persisted.selected &&
       persisted.selected !== this.selected &&
@@ -585,9 +628,10 @@ export class RunStore {
     ) {
       await this.selectGenerator(persisted.selected);
     }
-    // Snapshots are independent per run, so fetch them concurrently.
+    // Restore each saved tab by direct snapshot fetch so tabs outside the
+    // first history page still come back; skip runs that are gone.
     const pending = persisted.tabOrder.filter((runId) =>
-      !(this.tabs as Record<string, RunTab | undefined>)[runId] && knownIds.has(runId)
+      !(this.tabs as Record<string, RunTab | undefined>)[runId]
     );
     const snapshots = await Promise.all(pending.map(async (runId) => {
       try {

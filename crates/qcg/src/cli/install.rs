@@ -150,7 +150,7 @@ fn install_registry_package<'a>(
     visiting: &'a mut BTreeSet<String>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
     Box::pin(async move {
-        if !visiting.insert(id.to_string()) {
+        if visiting.contains(id) {
             anyhow::bail!("dependency cycle detected at generator `{id}`");
         }
         if let Some(installed) = installed_generator_version(generators_dir, id)? {
@@ -164,52 +164,94 @@ fn install_registry_package<'a>(
                 );
             }
         }
-        let home = crate::registry::home_dir()?;
-        let config = crate::registry::load_registries(&home)?;
-        let keys = crate::registry::load_trusted_keys(&home)?;
-        let resolved = crate::registry::resolve(&config, id, requirement).await?;
-        println!(
-            "resolved `{}` to version {} from registry `{}`",
-            id, resolved.entry.version, resolved.registry
-        );
-        crate::registry::verify_package(&resolved.entry, &keys)?;
-        let public_key = resolved.entry.key_id.as_ref().and_then(|key_id| {
-            keys.iter()
-                .find(|key| &key.id == key_id)
-                .map(|key| hex::encode(&key.public_key))
-        });
-        let staged = stage_install_source(
-            &resolved.entry.url,
-            Some(&resolved.entry.sha256),
-            resolved
-                .entry
-                .signature
-                .as_deref()
-                .zip(public_key.as_deref()),
+        visiting.insert(id.to_string());
+        let result = install_registry_package_inner(
+            providers_path,
+            id,
+            requirement,
+            generators_dir,
+            yes,
+            force,
             limits,
+            visiting,
+        )
+        .await;
+        visiting.remove(id);
+        result
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn install_registry_package_inner<'a>(
+    providers_path: Option<&'a Utf8Path>,
+    id: &'a str,
+    requirement: &'a semver::VersionReq,
+    generators_dir: &'a Utf8Path,
+    yes: bool,
+    force: bool,
+    limits: &'a qcg_service::PackageLimits,
+    visiting: &'a mut BTreeSet<String>,
+) -> Result<String> {
+    let home = crate::registry::home_dir()?;
+    let config = crate::registry::load_registries(&home)?;
+    let keys = crate::registry::load_trusted_keys(&home)?;
+    let resolved = crate::registry::resolve(&config, id, requirement).await?;
+    println!(
+        "resolved `{}` to version {} from registry `{}`",
+        id, resolved.entry.version, resolved.registry
+    );
+    crate::registry::verify_package(&resolved.entry, &keys)?;
+    let public_key = resolved.entry.key_id.as_ref().and_then(|key_id| {
+        keys.iter()
+            .find(|key| &key.id == key_id)
+            .map(|key| hex::encode(&key.public_key))
+    });
+    let staged = stage_install_source(
+        &resolved.entry.url,
+        Some(&resolved.entry.sha256),
+        resolved
+            .entry
+            .signature
+            .as_deref()
+            .zip(public_key.as_deref()),
+        limits,
+    )
+    .await?;
+    // Verify the staged content matches the resolved registry identity
+    // before committing. Hash and signature alone prove byte integrity,
+    // not that the archive claims the requested id and version.
+    let staged_contract = Contract::load(&staged.path)?;
+    if staged_contract.manifest.generator.id != id {
+        anyhow::bail!(
+            "registry package id mismatch: requested `{id}` but archive contains `{}`",
+            staged_contract.manifest.generator.id
+        );
+    }
+    if staged_contract.manifest.generator.version != resolved.entry.version {
+        anyhow::bail!(
+            "registry package version mismatch for `{id}`: resolved `{}` but archive contains `{}`",
+            resolved.entry.version,
+            staged_contract.manifest.generator.version
+        );
+    }
+    let installed_id = finish_install(providers_path, staged, generators_dir, yes, force, limits)?;
+    let manifest = Contract::load(generators_dir.join(&installed_id))?.manifest;
+    for (dependency, requirement) in &manifest.dependencies {
+        let requirement = semver::VersionReq::parse(requirement)
+            .with_context(|| format!("dependency `{dependency}` version requirement is invalid"))?;
+        install_registry_package(
+            providers_path,
+            dependency,
+            &requirement,
+            generators_dir,
+            yes,
+            force,
+            limits,
+            visiting,
         )
         .await?;
-        let installed_id =
-            finish_install(providers_path, staged, generators_dir, yes, true, limits)?;
-        let manifest = Contract::load(generators_dir.join(&installed_id))?.manifest;
-        for (dependency, requirement) in &manifest.dependencies {
-            let requirement = semver::VersionReq::parse(requirement).with_context(|| {
-                format!("dependency `{dependency}` version requirement is invalid")
-            })?;
-            install_registry_package(
-                providers_path,
-                dependency,
-                &requirement,
-                generators_dir,
-                yes,
-                force,
-                limits,
-                visiting,
-            )
-            .await?;
-        }
-        Ok(installed_id)
-    })
+    }
+    Ok(installed_id)
 }
 
 fn installed_generator_version(

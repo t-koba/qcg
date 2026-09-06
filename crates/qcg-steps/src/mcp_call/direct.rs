@@ -2,7 +2,7 @@ use qcg_api::{FormSpec, ToolCallErrorCode, ToolCallPhase, ToolCallStatus};
 use qcg_api::{ToolCallError, ToolCallEventData, ToolCallSource};
 use qcg_contract::InputField;
 use qcg_contract::{FieldType, NodeDef};
-use qcg_engine::{StepContext, StepError, tool_call_sources};
+use qcg_engine::{ResultExt, StepContext, StepError, tool_call_sources};
 use qcg_mcp::{McpCallOutcome, McpError, McpInputRequired, McpSession};
 use qcg_policy::validate_bounded_json_schema;
 use serde_json::{Value, json};
@@ -81,7 +81,18 @@ pub(crate) async fn execute_direct_mcp_call(
         })
         .transpose()?;
     let mut input_responses = None;
-    let mut request_state = None;
+    let mut request_state: Option<String> = None;
+    // Resume a previously interrupted input-required round instead of
+    // starting a new remote request. The service injects the journaled
+    // pending descriptor into answers under a reserved key (see
+    // mcp_pending_reserved_key), so a HITL restart continues the same
+    // remote call with its original request_state.
+    if let Some((resumed_state, resumed_responses)) =
+        find_resumed_mcp_continuation(ctx, session.server_id(), tool_name, &arguments)
+    {
+        request_state = resumed_state;
+        input_responses = resumed_responses;
+    }
     for _ in 0..10 {
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_seconds),
@@ -140,19 +151,43 @@ pub(crate) async fn execute_direct_mcp_call(
                 return Ok(DirectMcpCallOutcome::Complete(value));
             }
             McpCallOutcome::InputRequired(required) => {
-                request_state = required.request_state.clone();
+                // Preserve current state for the next loop round so an empty
+                // follow-up (server awaiting only) continues correctly.
+                let loop_state = required.request_state.clone();
                 if required.input_requests.is_empty() {
+                    request_state = loop_state;
                     continue;
                 }
                 let question_id =
                     direct_mcp_question_id(&node.id, session.server_id(), tool_name, &required);
                 let Some(answer) = ctx.run.answers.get(&question_id) else {
+                    // Durably record the continuation before suspending so a
+                    // restart resumes this remote call instead of starting a
+                    // new one with request_state=None.
+                    let cont_key =
+                        mcp_continuation_key(&node.id, session.server_id(), tool_name, &arguments);
+                    ctx.journal
+                        .event(
+                            "mcp_input_pending",
+                            json!({
+                                "node": node.id,
+                                "pending_key": mcp_pending_reserved_key(&cont_key),
+                                "question_id": question_id,
+                                "server": session.server_id(),
+                                "tool": tool_name,
+                                "arguments": arguments,
+                                "request_state": required.request_state,
+                                "input_requests": required.input_requests,
+                            }),
+                        )
+                        .step_err(&node.id)?;
                     return Ok(DirectMcpCallOutcome::NeedsUser(direct_mcp_form_spec(
                         question_id,
                         &format!("{}/{}", session.server_id(), tool_name),
                         &required,
                     )?));
                 };
+                request_state = loop_state;
                 input_responses = Some(direct_mcp_input_responses(&required, answer, node)?);
             }
         }
@@ -305,6 +340,87 @@ fn direct_mcp_input_responses(
         })
         .collect::<Result<BTreeMap<_, _>, StepError>>()?;
     Ok(responses)
+}
+
+fn mcp_continuation_key(node_id: &str, server: &str, tool: &str, arguments: &Value) -> String {
+    let bytes = serde_json::to_vec(&json!({
+        "node": node_id,
+        "server": server,
+        "tool": tool,
+        "arguments": arguments,
+    }))
+    .unwrap_or_default();
+    let digest = hex::encode(Sha256::digest(bytes));
+    format!("{node_id}:mcpcont:{server}/{tool}:{}", &digest[..16])
+}
+
+fn mcp_pending_reserved_key(continuation_key: &str) -> String {
+    format!("{continuation_key}#__mcp_pending")
+}
+
+/// Stored request_state plus user-derived input_responses for continuing the
+/// original remote MCP request after a HITL restart.
+type ResumedMcpContinuation = (Option<String>, Option<BTreeMap<String, Value>>);
+
+/// Find a journaled continuation matching this exact remote call.
+///
+/// Returns the stored request_state and the user-derived input_responses so
+/// the next transport call continues the original remote request instead of
+/// starting a duplicate one.
+fn find_resumed_mcp_continuation(
+    ctx: &StepContext<'_>,
+    server: &str,
+    tool: &str,
+    arguments: &Value,
+) -> Option<ResumedMcpContinuation> {
+    for pending in ctx
+        .run
+        .answers
+        .iter()
+        .filter(|(key, _)| key.ends_with("#__mcp_pending"))
+        .map(|(_, value)| value)
+    {
+        let Some(pending_server) = pending.get("server").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(pending_tool) = pending.get("tool").and_then(Value::as_str) else {
+            continue;
+        };
+        if pending_server != server || pending_tool != tool {
+            continue;
+        }
+        if pending.get("arguments") != Some(arguments) {
+            continue;
+        }
+        let Some(question_id) = pending.get("question_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(answer) = ctx.run.answers.get(question_id) else {
+            continue;
+        };
+        let request_state = pending
+            .get("request_state")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        // Rebuild input_responses from the stored input_requests shape and
+        // the user's answer values.
+        let input_requests = pending
+            .get("input_requests")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let values = answer.as_object()?;
+        let mut responses = BTreeMap::new();
+        let mut sorted_ids: Vec<&String> = input_requests.keys().collect();
+        sorted_ids.sort();
+        for (index, id) in sorted_ids.into_iter().enumerate() {
+            let field = format!("response_{index}");
+            let value = values.get(&field)?.clone();
+            responses.insert(id.clone(), json!({ "action": "accept", "content": value }));
+        }
+        return Some((request_state, Some(responses)));
+    }
+    None
 }
 
 fn direct_mcp_requests(required: &McpInputRequired) -> Vec<(&String, &Value)> {

@@ -79,6 +79,7 @@ impl LocalQcgService {
             cancellation: cancellation.clone(),
             task: task.clone(),
             queued_at: Some(queued_at),
+            owner_id: self.inner.owner_id.clone(),
         };
         if let Err(error) = write_run_event(
             &staged,
@@ -89,6 +90,8 @@ impl LocalQcgService {
                 "generator_path": &contract.root,
                 "contract_sha256": &contract.sha256,
                 "inputs": &inputs,
+                "answers": &answers,
+                "confirmations": &confirmations,
                 "qcg": env!("CARGO_PKG_VERSION"),
                 "schema_version": 1,
                 "retain_days": contract.manifest.journal.retain_days,
@@ -220,6 +223,7 @@ impl LocalQcgService {
             cancellation: cancellation.clone(),
             task: task.clone(),
             queued_at: Some(chrono::Utc::now()),
+            owner_id: self.inner.owner_id.clone(),
         };
         if let Err(error) = write_run_event(
             &staged,
@@ -230,6 +234,8 @@ impl LocalQcgService {
                 "generator_path": &contract.root,
                 "contract_sha256": &contract.sha256,
                 "inputs": &staged.inputs,
+                "answers": &staged.answers,
+                "confirmations": &staged.confirmations,
                 "qcg": env!("CARGO_PKG_VERSION"),
                 "schema_version": 1,
                 "retain_days": contract.manifest.journal.retain_days,
@@ -471,7 +477,15 @@ impl LocalQcgService {
 
     pub async fn subscribe(&self, id: String) -> Result<BoxStream<'static, RunEvent>, ApiError> {
         let run_dir = self.run_dir_for(&id).await?;
-        let live_receiver = self.live_receiver(&id).await.ok();
+        // A memory-resident record does not imply local execution: in shared
+        // mode another process may own the run while this one only mirrors
+        // it. Non-owned runs follow the durable journal (~250ms poll) so
+        // subscribers observe peer progress instead of a stale broadcast.
+        let live_receiver = if self.owns_live_stream(&id).await {
+            self.live_receiver(&id).await.ok()
+        } else {
+            None
+        };
         let history = read_run_events(&run_dir).map_err(ApiError::from)?;
         let history_last_seq = history.last().map_or(0, |event| event.seq);
         let history_stream = futures_util::stream::iter(history);
@@ -513,6 +527,12 @@ impl LocalQcgService {
         payload: AnswerPayload,
     ) -> Result<(), ApiError> {
         let answer = json!(payload.values);
+        // Validate, persist, and mutate under one write lock so concurrent
+        // answers cannot both journal conflicting values with last-wins.
+        // Journal I/O is a short local append; the engine spawn below stays
+        // outside the lock. Durable acceptance precedes the success report,
+        // so a restart before the engine consumes the queue still resumes
+        // with the same values.
         let (
             contract,
             inputs,
@@ -530,6 +550,8 @@ impl LocalQcgService {
                 .ok_or_else(|| api_not_found(format!("run `{id}` was not found")))?;
             if let Some(existing) = record.answers.get(&question_id) {
                 return if existing == &answer {
+                    // Idempotent replay: the first call already journaled and
+                    // scheduled the engine, so report success without duplicating.
                     Ok(())
                 } else {
                     Err(ApiError::Conflict {
@@ -546,7 +568,7 @@ impl LocalQcgService {
             }
             let question = record
                 .question
-                .as_ref()
+                .clone()
                 .ok_or_else(|| api_bad_request(format!("run `{id}` has no question")))?;
             if question.id != question_id {
                 return Err(api_bad_request(format!(
@@ -558,12 +580,29 @@ impl LocalQcgService {
                 .map_err(|error| {
                     ApiError::invalid_field("values", format!("invalid form answer: {error}"))
                 })?;
+            let persist = record.clone();
+            write_run_event(
+                &persist,
+                "user_answered",
+                json!({
+                    "question_id": question_id,
+                    "values": answer,
+                }),
+            )
+            .map_err(api_internal)?;
+            // Merge journaled MCP continuations so the resumed step continues
+            // the original remote request with its request_state.
+            let mcp_pending =
+                crate::summaries::read_persisted_mcp_pending(&persist.run_dir).unwrap_or_default();
             record.answers.insert(question_id, answer);
             record.state = RunStatus::Queued;
             record.queued_at = Some(chrono::Utc::now());
             record.question = None;
             record.confirm = None;
             record.artifacts = None;
+            for (key, value) in mcp_pending {
+                record.answers.insert(key, value);
+            }
             let cancellation = CancellationToken::new();
             record.cancellation = cancellation.clone();
             (
@@ -599,24 +638,27 @@ impl LocalQcgService {
         confirmation_id: String,
         decision: ConfirmDecision,
     ) -> Result<(), ApiError> {
-        let (
-            contract,
-            inputs,
-            answers,
-            confirmations,
-            priority,
-            run_dir,
-            events,
-            cancellation,
-            task,
-        ) = {
+        let approved = decision.decision == ConfirmationDecision::Approve;
+        // Validate, persist, and mutate under one write lock so concurrent
+        // decisions cannot both journal conflicting values with last-wins.
+        // Journal I/O is a short local append; engine scheduling and terminal
+        // settlement stay outside the lock.
+        enum AfterLock {
+            Deny {
+                denied: Box<RunRecord>,
+                confirm: Box<qcg_api::ConfirmSpec>,
+            },
+            Spawn(Box<SpawnRun>),
+        }
+        let after = {
             let mut runs = self.inner.runs.write().await;
             let record = runs
                 .get_mut(&id)
                 .ok_or_else(|| api_not_found(format!("run `{id}` was not found")))?;
-            let approved = decision.decision == ConfirmationDecision::Approve;
             if let Some(existing) = record.confirmations.get(&confirmation_id) {
                 return if *existing == approved {
+                    // Idempotent replay: the first call already journaled and
+                    // settled or scheduled, so report success without duplicating.
                     Ok(())
                 } else {
                     Err(ApiError::Conflict {
@@ -643,14 +685,50 @@ impl LocalQcgService {
                     ),
                 });
             }
-            if decision.decision == ConfirmationDecision::Deny {
+            let persist = record.clone();
+            write_run_event(
+                &persist,
+                "user_confirmed",
+                json!({
+                    "confirmation_id": confirmation_id,
+                    "approved": approved,
+                }),
+            )
+            .map_err(api_internal)?;
+            if !approved {
                 record.confirmations.insert(confirm.id.clone(), false);
                 record.state = RunStatus::Failed;
                 record.confirm = None;
-                let denied = record.clone();
-                drop(runs);
-                // Journal appends happen outside the map lock; the record is
-                // already terminally Failed so no other writer can interleave.
+                AfterLock::Deny {
+                    denied: Box::new(record.clone()),
+                    confirm: Box::new(confirm),
+                }
+            } else {
+                record.confirmations.insert(confirmation_id, true);
+                record.state = RunStatus::Queued;
+                record.queued_at = Some(chrono::Utc::now());
+                record.confirm = None;
+                record.artifacts = None;
+                let cancellation = CancellationToken::new();
+                record.cancellation = cancellation.clone();
+                AfterLock::Spawn(Box::new(SpawnRun {
+                    run_id: id.clone(),
+                    contract: record.contract.clone(),
+                    inputs: record.inputs.clone(),
+                    run_dir: record.run_dir.clone(),
+                    events: record.events.clone(),
+                    answers: record.answers.clone(),
+                    confirmations: record.confirmations.clone(),
+                    priority: record.priority,
+                    cancellation,
+                    task: record.task.clone(),
+                }))
+            }
+        };
+        match after {
+            AfterLock::Deny { denied, confirm } => {
+                // The record is already terminally Failed in memory, so no
+                // other writer can interleave these settlement appends.
                 write_run_event(
                     &denied,
                     "side_effect",
@@ -673,43 +751,30 @@ impl LocalQcgService {
                     }),
                 )
                 .map_err(api_internal)?;
-                return Ok(());
+                Ok(())
             }
-            record.confirmations.insert(confirm.id, true);
-            record.state = RunStatus::Queued;
-            record.queued_at = Some(chrono::Utc::now());
-            record.confirm = None;
-            record.artifacts = None;
-            let cancellation = CancellationToken::new();
-            record.cancellation = cancellation.clone();
-            (
-                record.contract.clone(),
-                record.inputs.clone(),
-                record.answers.clone(),
-                record.confirmations.clone(),
-                record.priority,
-                record.run_dir.clone(),
-                record.events.clone(),
-                cancellation,
-                record.task.clone(),
-            )
-        };
-        self.spawn_engine_run(SpawnRun {
-            run_id: id,
-            contract,
-            inputs,
-            run_dir,
-            events,
-            answers,
-            confirmations,
-            priority,
-            cancellation,
-            task,
-        });
-        Ok(())
+            AfterLock::Spawn(request) => {
+                self.spawn_engine_run(*request);
+                Ok(())
+            }
+        }
     }
 
     pub async fn cancel(&self, id: String) -> Result<(), ApiError> {
+        // Durable cross-process cancel signal first so a peer owner observes
+        // the request via shared-store refresh even if this process owns no
+        // local task for the run.
+        let signal_record = {
+            let runs = self.inner.runs.read().await;
+            runs.get(&id).cloned()
+        };
+        if let Some(signal_record) = signal_record {
+            let _ = write_run_event(
+                &signal_record,
+                "user_cancel_requested",
+                json!({ "run_id": id }),
+            );
+        }
         let (task, settled) = {
             let mut runs = self.inner.runs.write().await;
             let record = runs
@@ -773,25 +838,10 @@ impl LocalQcgService {
             let runs = self.inner.runs.read().await;
             let running = runs
                 .iter()
-                .filter(|(_, record)| {
-                    record.state == RunStatus::Running && record.priority < priority
-                })
-                .count();
-            if running >= self.inner.max_active_runs {
-                runs.iter()
-                    .filter(|(_, record)| {
-                        record.state == RunStatus::Running && record.priority < priority
-                    })
-                    .min_by(|left, right| {
-                        left.1
-                            .priority
-                            .cmp(&right.1.priority)
-                            .then_with(|| right.0.cmp(left.0))
-                    })
-                    .map(|(run_id, _)| run_id.clone())
-            } else {
-                None
-            }
+                .filter(|(_, record)| record.state == RunStatus::Running)
+                .map(|(run_id, record)| (run_id.as_str(), record.priority))
+                .collect::<Vec<_>>();
+            crate::queue::select_preemption_victim(&running, self.inner.max_active_runs, priority)
         };
         if let Some(victim) = victim
             && let Err(error) = self.preempt_run(&victim).await
@@ -827,6 +877,7 @@ impl LocalQcgService {
                 cancellation: CancellationToken::new(),
                 task: Arc::clone(&record.task),
                 queued_at: Some(chrono::Utc::now()),
+                owner_id: self.inner.owner_id.clone(),
             };
             record.cancellation.cancel();
             record.state = RunStatus::Queued;
@@ -843,6 +894,15 @@ impl LocalQcgService {
             (handle, requeue)
         };
         let staged = requeue;
+        // Single-writer rule: wait for the preempted engine task and its
+        // journal writer to exit before appending requeue state. Writing
+        // run_queued earlier races with cancel-time events from the old
+        // writer, producing duplicate seq and last-writer-wins state.json.
+        if let Some(handle) = handle {
+            handle.await.map_err(|error| {
+                api_internal(format!("run `{id}` task failed during preemption: {error}"))
+            })?;
+        }
         write_run_event(
             &staged,
             "run_queued",
@@ -852,6 +912,8 @@ impl LocalQcgService {
                 "generator_path": &staged.contract.root,
                 "contract_sha256": &staged.contract_sha256,
                 "inputs": &staged.inputs,
+                "answers": &staged.answers,
+                "confirmations": &staged.confirmations,
                 "qcg": env!("CARGO_PKG_VERSION"),
                 "schema_version": 1,
                 "retain_days": staged.contract.manifest.journal.retain_days,
@@ -860,11 +922,6 @@ impl LocalQcgService {
             }),
         )
         .map_err(api_internal)?;
-        if let Some(handle) = handle {
-            handle.await.map_err(|error| {
-                api_internal(format!("run `{id}` task failed during preemption: {error}"))
-            })?;
-        }
         let resume = {
             let mut runs = self.inner.runs.write().await;
             match runs.get_mut(id) {
@@ -904,35 +961,75 @@ impl LocalQcgService {
     }
 
     pub async fn shutdown_active_runs(&self) -> Result<(), ApiError> {
-        let active = self
-            .inner
-            .runs
-            .read()
-            .await
-            .iter()
-            .filter(|(_, record)| !record.state.is_terminal())
-            .map(|(id, record)| (id.clone(), Arc::clone(&record.task)))
-            .collect::<Vec<_>>();
-        for (id, _) in &active {
-            self.cancel(id.clone()).await?;
-        }
-        for (id, task) in active {
-            let Some(handle) = task.lock().unwrap_or_else(PoisonError::into_inner).take() else {
-                continue;
+        // Phase 1: signal all cancellations first without awaiting any task,
+        // so one unresponsive executor cannot block the deadline for others.
+        let active: Vec<(String, RunRecord)> = {
+            let mut runs = self.inner.runs.write().await;
+            let mut active = Vec::new();
+            for (id, record) in runs.iter_mut() {
+                if record.state.is_terminal() {
+                    continue;
+                }
+                record.cancellation.cancel();
+                // Durable cross-process signal for shared-store peers.
+                let signal = record.clone();
+                let _ = write_run_event(&signal, "user_cancel_requested", json!({ "run_id": id }));
+                record.state = RunStatus::Canceled;
+                record.preempted = false;
+                record.question = None;
+                record.confirm = None;
+                record.artifacts = None;
+                active.push((id.clone(), record.clone()));
+            }
+            active
+        };
+        // Phase 2: wait concurrently with a shared per-run deadline, so N
+        // stuck runs still converge in about 5 seconds instead of 5 x N.
+        // Expired waits abandon the task (its journal tail is repaired on
+        // next open) and record Interrupted for restart triage.
+        let waits = active.into_iter().map(|(id, record)| async move {
+            let handle_opt = record
+                .task
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            let Some(handle) = handle_opt else {
+                // No local engine task (queued/waiting): settle durably.
+                let _ = write_run_event(
+                    &record,
+                    "run_interrupted",
+                    json!({
+                        "reason": FailureDetail::new(
+                            FailureCode::Canceled,
+                            "service shutdown",
+                        ),
+                    }),
+                );
+                return Ok(());
             };
             match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    return Err(api_internal(format!(
-                        "run `{id}` task failed during shutdown: {error}"
-                    )));
-                }
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(api_internal(format!(
+                    "run `{id}` task failed during shutdown: {error}"
+                ))),
                 Err(_) => {
-                    return Err(api_internal(format!(
-                        "run `{id}` did not stop within the shutdown deadline"
-                    )));
+                    tracing::warn!(run_id = %id, "run did not stop within shutdown deadline; recording interrupted");
+                    let _ = write_run_event(
+                        &record,
+                        "run_interrupted",
+                        json!({
+                            "reason": FailureDetail::new(
+                                FailureCode::Canceled,
+                                "shutdown deadline exceeded",
+                            ),
+                        }),
+                    );
+                    Ok(())
                 }
             }
+        });
+        for result in futures_util::future::join_all(waits).await {
+            result?;
         }
         Ok(())
     }

@@ -69,7 +69,11 @@ pub(crate) async fn execute_agent_tool(
                 ));
             }
             let target = ctx.run.fs.resolve_write(path).step_err(&node.id)?;
-            tokio::fs::write(&target, content).await?;
+            ctx.run
+                .fs
+                .write_file_atomic(&target, content.as_bytes())
+                .await
+                .map_err(|error| StepError::from_gateway(&node.id, error))?;
             Ok(AgentToolOutcome::Result(json!({ "file": path })))
         }
         ToolDecl::Command { command, .. } => {
