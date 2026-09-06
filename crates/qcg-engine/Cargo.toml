@@ -14,6 +14,8 @@ camino.workspace = true
 chrono.workspace = true
 dunce.workspace = true
 minijinja.workspace = true
+qcg-policy = { path = "../qcg-policy" }
+qcg-api = { path = "../qcg-api" }
 qcg-contract = { path = "../qcg-contract" }
 regex.workspace = true
 qcg-llm = { path = "../qcg-llm" }
@@ -27,7 +29,7 @@ hex.workspace = true
 jsonschema.workspace = true
 libc.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt", "sync", "time"] }
 tokio-util.workspace = true
 tracing.workspace = true
 url.workspace = true

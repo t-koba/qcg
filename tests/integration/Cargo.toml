@@ -9,16 +9,16 @@ readme.workspace = true
 publish = false
 
 [dependencies]
-async-trait.workspace = true
 camino.workspace = true
 qcg-contract = { path = "../../crates/qcg-contract" }
 qcg-engine = { path = "../../crates/qcg-engine" }
+qcg-policy = { path = "../../crates/qcg-policy" }
 qcg-server = { path = "../../crates/qcg-server" }
 qcg-service = { path = "../../crates/qcg-service" }
+qcg-types = { path = "../../crates/qcg-types" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time"] }
 walkdir.workspace = true
-tokio-util.workspace = true
 toml.workspace = true

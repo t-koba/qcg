@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+aws-lc-rs.workspace = true
 camino.workspace = true
 chrono.workspace = true
 clap.workspace = true
@@ -24,19 +25,19 @@ jsonschema.workspace = true
 qcg-api = { path = "../qcg-api" }
 qcg-contract = { path = "../qcg-contract" }
 qcg-engine = { path = "../qcg-engine" }
-qcg-llm = { path = "../qcg-llm" }
-qcg-llm-steps = { path = "../qcg-llm-steps" }
 qcg-service = { path = "../qcg-service" }
+qcg-policy = { path = "../qcg-policy" }
 qcg-server = { path = "../qcg-server" }
-qcg-steps = { path = "../qcg-steps" }
 qcg-types = { path = "../qcg-types" }
 reqwest.workspace = true
 regex.workspace = true
-ring.workspace = true
 serde.workspace = true
-sha2.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+semver.workspace = true
+sha2.workspace = true
+url.workspace = true
+tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "time"] }
+toml.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 walkdir.workspace = true

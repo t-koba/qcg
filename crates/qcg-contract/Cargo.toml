@@ -14,6 +14,7 @@ hex.workspace = true
 jsonschema.workspace = true
 mime.workspace = true
 regex.workspace = true
+qcg-policy = { path = "../qcg-policy" }
 qcg-types = { path = "../qcg-types" }
 schemars.workspace = true
 serde.workspace = true

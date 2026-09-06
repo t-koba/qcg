@@ -15,7 +15,6 @@ pub use engine::*;
 pub use gateway::*;
 pub use journal::*;
 pub use llm_gateway::*;
-pub use qcg_types::*;
 pub use resource::*;
 pub use secret::*;
 pub use sources::*;

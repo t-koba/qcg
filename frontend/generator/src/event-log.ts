@@ -18,6 +18,7 @@ function toolCallStatus(status: unknown, messages: Messages): string {
   switch (status) {
     case "succeeded": return messages.eventToolSucceeded;
     case "failed": return messages.eventToolFailed;
+    case "degraded": return messages.eventToolDegraded;
     case "needs_user": return messages.eventToolNeedsUser;
     case "needs_confirmation":
     case "needs_confirm":

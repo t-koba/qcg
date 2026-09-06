@@ -15,11 +15,13 @@ futures-util.workspace = true
 jsonschema.workspace = true
 libc.workspace = true
 reqwest.workspace = true
+qcg-policy = { path = "../qcg-policy" }
 qcg-types = { path = "../qcg-types" }
 qcg-mcp = { path = "../qcg-mcp" }
 serde.workspace = true
 serde_json.workspace = true
 sse-stream.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 toml.workspace = true
+url.workspace = true

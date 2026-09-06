@@ -298,3 +298,67 @@ expected = true
 [[cases]]
 expr = "inputs.zero < -1"
 expected = false
+
+[[cases]]
+expr = "empty(inputs.missing)"
+expected = true
+
+[[cases]]
+expr = "empty(inputs.name)"
+expected = false
+
+[[cases]]
+expr = "default(inputs.missing, 'x') == 'x'"
+expected = true
+
+[[cases]]
+expr = "upper(inputs.name) == 'ALPHA'"
+expected = true
+
+[[cases]]
+expr = "lower(inputs.name) == 'alpha'"
+expected = true
+
+[[cases]]
+expr = "trim('  a  ') == 'a'"
+expected = true
+
+[[cases]]
+expr = "starts_with(inputs.name, 'alp')"
+expected = true
+
+[[cases]]
+expr = "ends_with(inputs.name, 'pha')"
+expected = true
+
+[[cases]]
+expr = "replace(inputs.name, 'lph', 'LP') == 'aLPa'"
+expected = true
+
+[[cases]]
+expr = "join(split(inputs.name, 'l'), '-') == 'a-pha'"
+expected = true
+
+[[cases]]
+expr = "len(split(inputs.name, 'l')) == 2"
+expected = true
+
+[[cases]]
+expr = "join(keys(inputs.object), ',') == 'rank,ready'"
+expected = true
+
+[[cases]]
+expr = "sum([1, 2]) == 3"
+expected = true
+
+[[cases]]
+expr = "first(sort([2, 1])) == 1"
+expected = true
+
+[[cases]]
+expr = "starts_with(item.name, 'site')"
+expected = true
+
+[[cases]]
+expr = "inputs.count == sum([1, 1, 1])"
+expected = true

@@ -1,719 +1,131 @@
-use qcg_types::Expr;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::collections::BTreeMap;
+mod bag;
+mod error;
+mod eval;
+mod lexer;
+mod parser;
 
-/// Maximum UTF-8 byte length accepted for one expression.
-pub const MAX_EXPRESSION_BYTES: usize = 64 * 1024;
-/// Maximum number of lexer tokens accepted for one expression, including `End`.
-pub const MAX_EXPRESSION_TOKENS: usize = 4096;
-/// Maximum recursive expression nesting accepted by the parser.
-pub const MAX_EXPRESSION_DEPTH: usize = 128;
-/// Maximum number of AST nodes accepted for one expression.
-pub const MAX_EXPRESSION_NODES: usize = 2048;
-
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum ExprError {
-    #[error("expression input is {bytes} bytes, exceeding the {limit}-byte limit")]
-    InputTooLarge { bytes: usize, limit: usize },
-    #[error("expression token count exceeds the {limit}-token limit")]
-    TooManyTokens { limit: usize },
-    #[error("expression nesting depth exceeds the {limit}-level limit")]
-    TooDeep { limit: usize },
-    #[error("expression AST node count exceeds the {limit}-node limit")]
-    TooManyNodes { limit: usize },
-    #[error("{0}")]
-    Syntax(String),
-    #[error("{0}")]
-    Evaluation(String),
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ValueBag {
-    #[serde(default)]
-    inputs: BTreeMap<String, Value>,
-    #[serde(default)]
-    steps: BTreeMap<String, Value>,
-    #[serde(default)]
-    statuses: BTreeMap<String, Value>,
-    #[serde(default)]
-    item: Option<Value>,
-}
-
-impl ValueBag {
-    pub fn with_inputs(inputs: BTreeMap<String, Value>) -> Self {
-        Self {
-            inputs,
-            steps: BTreeMap::new(),
-            statuses: BTreeMap::new(),
-            item: None,
-        }
-    }
-
-    pub fn set_step_output(&mut self, id: impl Into<String>, value: Value) {
-        self.steps.insert(id.into(), value);
-    }
-
-    pub fn set_inputs(&mut self, inputs: BTreeMap<String, Value>) {
-        self.inputs = inputs;
-    }
-
-    pub fn set_step_status(&mut self, id: impl Into<String>, status: impl Into<String>) {
-        self.statuses
-            .insert(id.into(), Value::String(status.into()));
-    }
-
-    pub fn set_item(&mut self, value: Option<Value>) {
-        self.item = value;
-    }
-
-    pub fn patch_inputs(&mut self, values: BTreeMap<String, Value>) {
-        self.inputs.extend(values);
-    }
-
-    pub fn patch_step_outputs(&mut self, values: BTreeMap<String, Value>) {
-        self.steps.extend(values);
-    }
-
-    pub fn patch_step_statuses(&mut self, values: BTreeMap<String, String>) {
-        self.statuses.extend(
-            values
-                .into_iter()
-                .map(|(key, value)| (key, Value::String(value))),
-        );
-    }
-
-    pub fn item(&self) -> Option<&Value> {
-        self.item.as_ref()
-    }
-
-    pub fn inputs(&self) -> &BTreeMap<String, Value> {
-        &self.inputs
-    }
-
-    pub fn to_json(&self) -> Value {
-        let mut ids = self
-            .steps
-            .keys()
-            .chain(self.statuses.keys())
-            .collect::<Vec<_>>();
-        ids.sort();
-        ids.dedup();
-        let steps = ids
-            .into_iter()
-            .map(|key| {
-                let mut value = serde_json::Map::new();
-                if let Some(output) = self.steps.get(key) {
-                    value.insert("output".into(), output.clone());
-                }
-                if let Some(status) = self.statuses.get(key) {
-                    value.insert("status".into(), status.clone());
-                }
-                (key.clone(), Value::Object(value))
-            })
-            .collect::<BTreeMap<_, _>>();
-        serde_json::json!({
-            "inputs": self.inputs,
-            "steps": steps,
-            "item": self.item,
-        })
-    }
-
-    pub fn get_path(&self, path: &str) -> Option<&Value> {
-        let parts: Vec<&str> = path.split('.').collect();
-        match parts.first().copied()? {
-            "inputs" => Self::descend(self.inputs.get(parts.get(1).copied()?)?, &parts[2..]),
-            "steps" => {
-                let id = parts.get(1).copied()?;
-                match parts.get(2).copied() {
-                    Some("output") => Self::descend(self.steps.get(id)?, &parts[3..]),
-                    Some("status") => Self::descend(self.statuses.get(id)?, &parts[3..]),
-                    _ => None,
-                }
-            }
-            "item" => {
-                let item = self.item.as_ref()?;
-                Self::descend(item, &parts[1..])
-            }
-            _ => None,
-        }
-    }
-
-    fn descend<'a>(mut value: &'a Value, parts: &[&str]) -> Option<&'a Value> {
-        for part in parts {
-            value = value.get(part)?;
-        }
-        Some(value)
-    }
-
-    pub fn eval_bool(&self, expr: Option<&Expr>) -> Result<bool, String> {
-        self.eval_bool_typed(expr)
-            .map_err(|error| error.to_string())
-    }
-
-    pub fn eval_bool_typed(&self, expr: Option<&Expr>) -> Result<bool, ExprError> {
-        let Some(expr) = expr else {
-            return Ok(true);
-        };
-        eval_expression(&expr.0, self)
-    }
-}
-
-fn eval_expression(src: &str, bag: &ValueBag) -> Result<bool, ExprError> {
-    ensure_expression_bytes(src)?;
-    if src.trim().is_empty() {
-        return Ok(false);
-    }
-    let mut parser = Parser::new(tokenize(src)?);
-    let expression = parser.parse_expression(0)?;
-    parser.expect_end()?;
-    Ok(truthy(
-        &expression.evaluate(bag).map_err(ExprError::Evaluation)?,
-    ))
-}
-
-fn ensure_expression_bytes(source: &str) -> Result<(), ExprError> {
-    if source.len() > MAX_EXPRESSION_BYTES {
-        return Err(ExprError::InputTooLarge {
-            bytes: source.len(),
-            limit: MAX_EXPRESSION_BYTES,
-        });
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum Token {
-    Identifier(String),
-    String(String),
-    Number(f64),
-    Bool(bool),
-    Null,
-    Operator(&'static str),
-    LeftParen,
-    RightParen,
-    Comma,
-    End,
-}
-
-fn tokenize(source: &str) -> Result<Vec<Token>, ExprError> {
-    ensure_expression_bytes(source)?;
-    let chars = source.chars().collect::<Vec<_>>();
-    let mut tokens = Vec::new();
-    let mut index = 0;
-    while index < chars.len() {
-        let ch = chars[index];
-        if ch.is_whitespace() {
-            index += 1;
-            continue;
-        }
-        if matches!(ch, '\'' | '"') {
-            let quote = ch;
-            index += 1;
-            let mut value = String::new();
-            let mut closed = false;
-            while index < chars.len() {
-                match chars[index] {
-                    current if current == quote => {
-                        index += 1;
-                        closed = true;
-                        break;
-                    }
-                    '\\' => {
-                        index += 1;
-                        let escaped = chars.get(index).copied().ok_or_else(|| {
-                            ExprError::Syntax("unterminated string escape".into())
-                        })?;
-                        value.push(match escaped {
-                            'n' => '\n',
-                            'r' => '\r',
-                            't' => '\t',
-                            '\\' => '\\',
-                            '\'' => '\'',
-                            '"' => '"',
-                            other => {
-                                return Err(ExprError::Syntax(format!(
-                                    "unsupported string escape `\\{other}`"
-                                )));
-                            }
-                        });
-                        index += 1;
-                    }
-                    current => {
-                        value.push(current);
-                        index += 1;
-                    }
-                }
-            }
-            if !closed {
-                return Err(ExprError::Syntax("unterminated string literal".into()));
-            }
-            push_token(&mut tokens, Token::String(value))?;
-            continue;
-        }
-        if ch.is_ascii_digit()
-            || (ch == '.' && chars.get(index + 1).is_some_and(char::is_ascii_digit))
-        {
-            let start = index;
-            index += 1;
-            while index < chars.len()
-                && (chars[index].is_ascii_digit()
-                    || matches!(chars[index], '.' | 'e' | 'E' | '+' | '-'))
-            {
-                if matches!(chars[index], '+' | '-')
-                    && !chars
-                        .get(index.wrapping_sub(1))
-                        .is_some_and(|previous| matches!(*previous, 'e' | 'E'))
-                {
-                    break;
-                }
-                index += 1;
-            }
-            let literal = chars[start..index].iter().collect::<String>();
-            let value = literal
-                .parse::<f64>()
-                .map_err(|_| ExprError::Syntax(format!("invalid number literal `{literal}`")))?;
-            if !value.is_finite() {
-                return Err(ExprError::Syntax("number literal is not finite".into()));
-            }
-            push_token(&mut tokens, Token::Number(value))?;
-            continue;
-        }
-        if ch.is_ascii_alphabetic() || ch == '_' {
-            let start = index;
-            index += 1;
-            while index < chars.len()
-                && (chars[index].is_ascii_alphanumeric() || matches!(chars[index], '_' | '.' | '-'))
-            {
-                index += 1;
-            }
-            let identifier = chars[start..index].iter().collect::<String>();
-            push_token(
-                &mut tokens,
-                match identifier.as_str() {
-                    "true" => Token::Bool(true),
-                    "false" => Token::Bool(false),
-                    "null" => Token::Null,
-                    _ => Token::Identifier(identifier),
-                },
-            )?;
-            continue;
-        }
-        let pair = chars
-            .get(index + 1)
-            .map(|next| [ch, *next].iter().collect::<String>());
-        if let Some(operator) = pair.as_deref().and_then(|pair| match pair {
-            "||" => Some("||"),
-            "&&" => Some("&&"),
-            "==" => Some("=="),
-            "!=" => Some("!="),
-            ">=" => Some(">="),
-            "<=" => Some("<="),
-            _ => None,
-        }) {
-            push_token(&mut tokens, Token::Operator(operator))?;
-            index += 2;
-            continue;
-        }
-        push_token(
-            &mut tokens,
-            match ch {
-                '!' => Token::Operator("!"),
-                '>' => Token::Operator(">"),
-                '<' => Token::Operator("<"),
-                '+' => Token::Operator("+"),
-                '-' => Token::Operator("-"),
-                '*' => Token::Operator("*"),
-                '/' => Token::Operator("/"),
-                '%' => Token::Operator("%"),
-                '(' => Token::LeftParen,
-                ')' => Token::RightParen,
-                ',' => Token::Comma,
-                _ => {
-                    return Err(ExprError::Syntax(format!(
-                        "unexpected character `{ch}` at position {index}"
-                    )));
-                }
-            },
-        )?;
-        index += 1;
-    }
-    push_token(&mut tokens, Token::End)?;
-    Ok(tokens)
-}
-
-fn push_token(tokens: &mut Vec<Token>, token: Token) -> Result<(), ExprError> {
-    if tokens.len() >= MAX_EXPRESSION_TOKENS {
-        return Err(ExprError::TooManyTokens {
-            limit: MAX_EXPRESSION_TOKENS,
-        });
-    }
-    tokens.push(token);
-    Ok(())
-}
-
-#[derive(Debug, Clone)]
-enum ExpressionNode {
-    Literal(Value),
-    Path(String),
-    Unary {
-        operator: &'static str,
-        value: Box<Self>,
-    },
-    Binary {
-        operator: &'static str,
-        left: Box<Self>,
-        right: Box<Self>,
-    },
-    Call {
-        name: String,
-        arguments: Vec<Self>,
-    },
-}
-
-impl ExpressionNode {
-    fn evaluate(&self, bag: &ValueBag) -> Result<Value, String> {
-        match self {
-            Self::Literal(value) => Ok(value.clone()),
-            Self::Path(path) => Ok(bag.get_path(path).cloned().unwrap_or(Value::Null)),
-            Self::Unary { operator, value } => {
-                let value = value.evaluate(bag)?;
-                match *operator {
-                    "!" => Ok(Value::Bool(!truthy(&value))),
-                    "-" => number_value(-as_number(&value, "unary -")?),
-                    _ => Err(format!("unknown unary operator `{operator}`")),
-                }
-            }
-            Self::Binary {
-                operator,
-                left,
-                right,
-            } => {
-                let left = left.evaluate(bag)?;
-                match *operator {
-                    "||" if truthy(&left) => return Ok(Value::Bool(true)),
-                    "&&" if !truthy(&left) => return Ok(Value::Bool(false)),
-                    _ => {}
-                }
-                let right = right.evaluate(bag)?;
-                evaluate_binary(operator, &left, &right)
-            }
-            Self::Call { name, arguments } => {
-                let values = arguments
-                    .iter()
-                    .map(|argument| argument.evaluate(bag))
-                    .collect::<Result<Vec<_>, _>>()?;
-                evaluate_call(name, &values)
-            }
-        }
-    }
-}
-
-struct Parser {
-    tokens: Vec<Token>,
-    cursor: usize,
-    nodes: usize,
-}
-
-impl Parser {
-    fn new(tokens: Vec<Token>) -> Self {
-        Self {
-            tokens,
-            cursor: 0,
-            nodes: 0,
-        }
-    }
-
-    fn parse_expression(&mut self, min_binding_power: u8) -> Result<ExpressionNode, ExprError> {
-        self.parse_expression_at(min_binding_power, 0)
-    }
-
-    fn parse_expression_at(
-        &mut self,
-        min_binding_power: u8,
-        depth: usize,
-    ) -> Result<ExpressionNode, ExprError> {
-        self.ensure_depth(depth)?;
-        let mut left = self.parse_prefix(depth)?;
-        while let Token::Operator(operator) = self.peek() {
-            let Some((left_power, right_power)) = infix_binding_power(operator) else {
-                break;
-            };
-            if left_power < min_binding_power {
-                break;
-            }
-            let operator = *operator;
-            self.cursor += 1;
-            let right = self.parse_expression_at(right_power, self.next_depth(depth)?)?;
-            self.reserve_node()?;
-            left = ExpressionNode::Binary {
-                operator,
-                left: Box::new(left),
-                right: Box::new(right),
-            };
-        }
-        Ok(left)
-    }
-
-    fn parse_prefix(&mut self, depth: usize) -> Result<ExpressionNode, ExprError> {
-        self.ensure_depth(depth)?;
-        let token = self.next().clone();
-        match token {
-            Token::Bool(value) => {
-                self.reserve_node()?;
-                Ok(ExpressionNode::Literal(Value::Bool(value)))
-            }
-            Token::Null => {
-                self.reserve_node()?;
-                Ok(ExpressionNode::Literal(Value::Null))
-            }
-            Token::String(value) => {
-                self.reserve_node()?;
-                Ok(ExpressionNode::Literal(Value::String(value)))
-            }
-            Token::Number(value) => {
-                let value = number_value(value).map_err(ExprError::Syntax)?;
-                self.reserve_node()?;
-                Ok(ExpressionNode::Literal(value))
-            }
-            Token::Identifier(identifier) => {
-                if matches!(self.peek(), Token::LeftParen) {
-                    self.cursor += 1;
-                    self.parse_call(identifier, self.next_depth(depth)?)
-                } else if identifier.starts_with("inputs.")
-                    || identifier.starts_with("steps.")
-                    || identifier == "item"
-                    || identifier.starts_with("item.")
-                {
-                    if identifier.split('.').count() > MAX_EXPRESSION_DEPTH {
-                        return Err(ExprError::TooDeep {
-                            limit: MAX_EXPRESSION_DEPTH,
-                        });
-                    }
-                    self.reserve_node()?;
-                    Ok(ExpressionNode::Path(identifier))
-                } else {
-                    Err(ExprError::Syntax(format!(
-                        "unsupported literal `{identifier}`"
-                    )))
-                }
-            }
-            Token::Operator(operator @ ("!" | "-")) => {
-                let value = self.parse_expression_at(13, self.next_depth(depth)?)?;
-                self.reserve_node()?;
-                Ok(ExpressionNode::Unary {
-                    operator,
-                    value: Box::new(value),
-                })
-            }
-            Token::LeftParen => {
-                let expression = self.parse_expression_at(0, self.next_depth(depth)?)?;
-                match self.next() {
-                    Token::RightParen => Ok(expression),
-                    token => Err(ExprError::Syntax(format!("expected `)`, found {token:?}"))),
-                }
-            }
-            token => Err(ExprError::Syntax(format!(
-                "expected expression, found {token:?}"
-            ))),
-        }
-    }
-
-    fn parse_call(&mut self, name: String, depth: usize) -> Result<ExpressionNode, ExprError> {
-        self.ensure_depth(depth)?;
-        let mut arguments = Vec::new();
-        if matches!(self.peek(), Token::RightParen) {
-            self.cursor += 1;
-            self.reserve_node()?;
-            return Ok(ExpressionNode::Call { name, arguments });
-        }
-        loop {
-            arguments.push(self.parse_expression_at(0, self.next_depth(depth)?)?);
-            match self.next() {
-                Token::Comma => {}
-                Token::RightParen => break,
-                token => {
-                    return Err(ExprError::Syntax(format!(
-                        "expected `,` or `)`, found {token:?}"
-                    )));
-                }
-            }
-        }
-        self.reserve_node()?;
-        Ok(ExpressionNode::Call { name, arguments })
-    }
-
-    fn ensure_depth(&self, depth: usize) -> Result<(), ExprError> {
-        if depth > MAX_EXPRESSION_DEPTH {
-            return Err(ExprError::TooDeep {
-                limit: MAX_EXPRESSION_DEPTH,
-            });
-        }
-        Ok(())
-    }
-
-    fn next_depth(&self, depth: usize) -> Result<usize, ExprError> {
-        depth.checked_add(1).ok_or(ExprError::TooDeep {
-            limit: MAX_EXPRESSION_DEPTH,
-        })
-    }
-
-    fn reserve_node(&mut self) -> Result<(), ExprError> {
-        if self.nodes >= MAX_EXPRESSION_NODES {
-            return Err(ExprError::TooManyNodes {
-                limit: MAX_EXPRESSION_NODES,
-            });
-        }
-        self.nodes += 1;
-        Ok(())
-    }
-
-    fn peek(&self) -> &Token {
-        self.tokens.get(self.cursor).unwrap_or(&Token::End)
-    }
-
-    fn next(&mut self) -> &Token {
-        let index = self.cursor;
-        self.cursor = self.cursor.saturating_add(1);
-        self.tokens.get(index).unwrap_or(&Token::End)
-    }
-
-    fn expect_end(&self) -> Result<(), ExprError> {
-        match self.peek() {
-            Token::End => Ok(()),
-            token => Err(ExprError::Syntax(format!(
-                "unexpected trailing token {token:?}"
-            ))),
-        }
-    }
-}
-
-fn infix_binding_power(operator: &str) -> Option<(u8, u8)> {
-    Some(match operator {
-        "||" => (1, 2),
-        "&&" => (3, 4),
-        "==" | "!=" => (5, 6),
-        ">" | "<" | ">=" | "<=" => (7, 8),
-        "+" | "-" => (9, 10),
-        "*" | "/" | "%" => (11, 12),
-        _ => return None,
-    })
-}
-
-fn evaluate_binary(operator: &str, left: &Value, right: &Value) -> Result<Value, String> {
-    match operator {
-        "||" => Ok(Value::Bool(truthy(left) || truthy(right))),
-        "&&" => Ok(Value::Bool(truthy(left) && truthy(right))),
-        "==" => Ok(Value::Bool(values_equal(left, right))),
-        "!=" => Ok(Value::Bool(!values_equal(left, right))),
-        ">" | "<" | ">=" | "<=" => compare_order(left, operator, right).map(Value::Bool),
-        "+" | "-" | "*" | "/" | "%" => {
-            let left = as_number(left, operator)?;
-            let right = as_number(right, operator)?;
-            let value = match operator {
-                "+" => left + right,
-                "-" => left - right,
-                "*" => left * right,
-                "/" if right == 0.0 => return Err("division by zero".into()),
-                "/" => left / right,
-                "%" if right == 0.0 => return Err("remainder by zero".into()),
-                "%" => left % right,
-                _ => return Err(format!("unknown arithmetic operator `{operator}`")),
-            };
-            number_value(value)
-        }
-        _ => Err(format!("unknown operator `{operator}`")),
-    }
-}
-
-fn values_equal(left: &Value, right: &Value) -> bool {
-    match (left, right) {
-        (Value::Number(left), Value::Number(right)) => left.as_f64() == right.as_f64(),
-        _ => left == right,
-    }
-}
-
-fn compare_order(left: &Value, operator: &str, right: &Value) -> Result<bool, String> {
-    match (left, right) {
-        (Value::String(left), Value::String(right)) => compare_ordered(left, operator, right),
-        (Value::Number(left), Value::Number(right)) => compare_ordered(
-            left.as_f64()
-                .ok_or_else(|| "invalid left number".to_string())?,
-            operator,
-            right
-                .as_f64()
-                .ok_or_else(|| "invalid right number".to_string())?,
-        ),
-        (Value::Bool(_), Value::Bool(_)) => {
-            Err(format!("operator `{operator}` is not valid for booleans"))
-        }
-        (Value::Null, Value::Null) => Err(format!("operator `{operator}` is not valid for null")),
-        _ => Err(format!(
-            "type mismatch in expression with operator `{operator}`"
-        )),
-    }
-}
-
-fn compare_ordered<T: PartialOrd>(left: T, operator: &str, right: T) -> Result<bool, String> {
-    Ok(match operator {
-        ">" => left > right,
-        "<" => left < right,
-        ">=" => left >= right,
-        "<=" => left <= right,
-        _ => return Err(format!("unknown ordering operator `{operator}`")),
-    })
-}
-
-fn evaluate_call(name: &str, arguments: &[Value]) -> Result<Value, String> {
-    match (name, arguments) {
-        ("len", [value]) => {
-            let length = match value {
-                Value::String(value) => value.chars().count(),
-                Value::Array(value) => value.len(),
-                Value::Object(value) => value.len(),
-                _ => return Err("len() requires a string, array, or object".into()),
-            };
-            Ok(Value::Number((length as u64).into()))
-        }
-        ("contains", [container, needle]) => Ok(Value::Bool(match (container, needle) {
-            (Value::String(container), Value::String(needle)) => container.contains(needle),
-            (Value::Array(container), needle) => container.contains(needle),
-            (Value::Object(container), Value::String(needle)) => container.contains_key(needle),
-            _ => return Err("contains() received incompatible arguments".into()),
-        })),
-        ("len", _) => Err("len() requires exactly one argument".into()),
-        ("contains", _) => Err("contains() requires exactly two arguments".into()),
-        _ => Err(format!("unknown expression function `{name}`")),
-    }
-}
-
-fn truthy(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(value) => *value,
-        Value::Number(value) => value.as_f64().is_some_and(|value| value != 0.0),
-        Value::String(value) => !value.is_empty(),
-        Value::Array(value) => !value.is_empty(),
-        Value::Object(value) => !value.is_empty(),
-    }
-}
-
-fn as_number(value: &Value, operator: &str) -> Result<f64, String> {
-    value
-        .as_f64()
-        .ok_or_else(|| format!("operator `{operator}` requires numbers"))
-}
-
-fn number_value(value: f64) -> Result<Value, String> {
-    serde_json::Number::from_f64(value)
-        .map(Value::Number)
-        .ok_or_else(|| "numeric expression result is not finite".to_string())
-}
+pub use bag::*;
+pub use error::*;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
+    use std::collections::BTreeMap;
+
+    fn value_bag() -> ValueBag {
+        let mut inputs = BTreeMap::new();
+        inputs.insert("name".into(), Value::String("  Mixed Case  ".into()));
+        inputs.insert(
+            "tags".into(),
+            Value::Array(vec![
+                Value::String("b".into()),
+                Value::String("a".into()),
+                Value::String("b".into()),
+            ]),
+        );
+        inputs.insert(
+            "scores".into(),
+            Value::Array(vec![json!(3), json!(1), json!(2)]),
+        );
+        inputs.insert("nested".into(), json!({"rows": [{"v": 1}, {"v": 2}]}));
+        ValueBag::with_inputs(inputs)
+    }
+
+    fn eval_value(case: &str) -> Value {
+        value_bag()
+            .eval_value(case)
+            .unwrap_or_else(|error| panic!("expression `{case}` should evaluate: {error}"))
+    }
+
+    #[test]
+    fn expression_paths_support_array_indices() {
+        assert_eq!(eval_value("inputs.tags.0"), json!("b"));
+        assert_eq!(eval_value("inputs.tags.2"), json!("b"));
+        assert_eq!(eval_value("inputs.nested.rows.1.v"), json!(2));
+        assert_eq!(eval_value("inputs.tags.9"), Value::Null);
+        assert_eq!(eval_value("inputs.name.0"), Value::Null);
+    }
+
+    #[test]
+    fn expression_string_functions_evaluate() {
+        assert_eq!(eval_value("upper(inputs.name)"), json!("  MIXED CASE  "));
+        assert_eq!(eval_value("lower(inputs.name)"), json!("  mixed case  "));
+        assert_eq!(eval_value("trim(inputs.name)"), json!("Mixed Case"));
+        assert_eq!(
+            eval_value("starts_with(inputs.name, '  Mix')"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_value("ends_with(inputs.name, 'Case  ')"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_value("replace(inputs.name, 'Mixed', 'Plain')"),
+            json!("  Plain Case  ")
+        );
+        assert_eq!(eval_value("split('a,b,c', ',')"), json!(["a", "b", "c"]));
+        assert_eq!(eval_value("join(split('a,b', ','), '-')"), json!("a-b"));
+        assert_eq!(eval_value("join(inputs.tags, ',')"), json!("b,a,b"));
+    }
+
+    #[test]
+    fn expression_collection_functions_evaluate() {
+        assert_eq!(eval_value("first(inputs.tags)"), json!("b"));
+        assert_eq!(eval_value("last(inputs.tags)"), json!("b"));
+        assert_eq!(eval_value("first(split('', ','))"), json!(""));
+        assert_eq!(eval_value("keys(inputs.nested)"), json!(["rows"]));
+        assert_eq!(eval_value("reverse(inputs.tags)"), json!(["b", "a", "b"]));
+        assert_eq!(eval_value("unique(inputs.tags)"), json!(["b", "a"]));
+        assert_eq!(eval_value("sort(inputs.tags)"), json!(["a", "b", "b"]));
+        assert_eq!(eval_value("sort(inputs.scores)"), json!([1, 2, 3]));
+        assert_eq!(
+            eval_value("flatten([inputs.tags, ['c']])"),
+            json!(["b", "a", "b", "c"])
+        );
+        assert_eq!(
+            eval_value("values(inputs.nested)"),
+            json!([[{"v": 1}, {"v": 2}]])
+        );
+    }
+
+    #[test]
+    fn expression_scalar_helpers_evaluate() {
+        assert_eq!(eval_value("empty('')"), Value::Bool(true));
+        assert_eq!(eval_value("empty(inputs.tags)"), Value::Bool(false));
+        assert_eq!(eval_value("empty(inputs.missing)"), Value::Bool(true));
+        assert_eq!(
+            eval_value("default(inputs.missing, 'fallback')"),
+            json!("fallback")
+        );
+        assert_eq!(
+            eval_value("default(inputs.name, 'fallback')"),
+            json!("  Mixed Case  ")
+        );
+        assert_eq!(eval_value("sum(inputs.scores)"), json!(6.0));
+        assert_eq!(eval_value("min(inputs.scores)"), json!(1.0));
+        assert_eq!(eval_value("max(inputs.scores)"), json!(3.0));
+        assert_eq!(eval_value("min([])"), Value::Null);
+    }
+
+    #[test]
+    fn expression_function_arity_and_type_errors_are_explicit() {
+        for case in [
+            "upper(1)",
+            "first(inputs.name)",
+            "keys(inputs.tags)",
+            "sort([1, 'a'])",
+            "sum(['a'])",
+            "join([1, 2], ',')",
+            "unknown_fn(1)",
+            "len()",
+        ] {
+            assert!(
+                value_bag().eval_value(case).is_err(),
+                "expression `{case}` should fail"
+            );
+        }
+    }
 
     #[test]
     fn evaluates_contract_expression_subset() {
@@ -1203,8 +615,8 @@ mod tests {
         "type mismatch"
     );
     error_case!(
-        expr_corpus_unknown_operator_literal_errors,
-        "inputs.name == [1]",
+        expr_corpus_unexpected_character_errors,
+        "inputs.name == {1}",
         "unexpected character"
     );
 

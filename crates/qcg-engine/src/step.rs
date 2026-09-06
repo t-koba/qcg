@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use camino::Utf8PathBuf;
 use minijinja::{Environment, ErrorKind};
+use qcg_api::{ConfirmSpec, FormSpec};
 use qcg_contract::{Contract, NodeDef, RuntimeLimits, StepType};
-use qcg_types::{ConfirmSpec, Finding, FormSpec};
+use qcg_types::Finding;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -115,6 +116,16 @@ pub trait StepExecutor: Send + Sync {
 pub struct StepTraits {
     pub parallel_safe: bool,
     pub control_flow: StepControlFlow,
+}
+
+impl StepTraits {
+    /// Traits for executors that are safe to run in parallel waves.
+    pub fn parallel() -> Self {
+        Self {
+            parallel_safe: true,
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -265,7 +276,7 @@ impl StepContext<'_> {
         node: &NodeDef,
         argv: &[String],
         timeout_seconds: u64,
-        output_limit_bytes: usize,
+        output_limit_bytes: Option<usize>,
     ) -> Result<crate::CommandOutput, StepError> {
         self.run
             .cmd
@@ -309,12 +320,15 @@ impl TemplateService {
         limits: &RuntimeLimits,
     ) -> Result<String, minijinja::Error> {
         validate_template_limits(limits)?;
-        if source.len() > limits.template_source_limit_bytes {
+        if limits
+            .template_source_limit_bytes
+            .is_some_and(|limit| source.len() > limit)
+        {
             return Err(minijinja::Error::new(
                 ErrorKind::InvalidOperation,
                 format!(
                     "template source exceeds {} bytes",
-                    limits.template_source_limit_bytes
+                    limits.template_source_limit_bytes.unwrap_or(usize::MAX)
                 ),
             ));
         }
@@ -357,7 +371,7 @@ fn validate_template_limits(limits: &RuntimeLimits) -> Result<(), minijinja::Err
             limits.template_output_limit_bytes,
         ),
     ] {
-        if value == 0 {
+        if value == Some(0) {
             return Err(minijinja::Error::new(
                 ErrorKind::InvalidOperation,
                 format!("runtime.{name} must be greater than zero"),
@@ -373,7 +387,20 @@ fn validate_template_limits(limits: &RuntimeLimits) -> Result<(), minijinja::Err
     Ok(())
 }
 
-fn validate_template_context(context: &Value, limit: usize) -> Result<(), minijinja::Error> {
+fn validate_template_context(
+    context: &Value,
+    limit: Option<usize>,
+) -> Result<(), minijinja::Error> {
+    let Some(limit) = limit else {
+        // No mechanistic limit: still ensure serializability.
+        serde_json::to_value(context).map_err(|error| {
+            minijinja::Error::new(
+                ErrorKind::InvalidOperation,
+                format!("template context serialization failed: {error}"),
+            )
+        })?;
+        return Ok(());
+    };
     let mut writer = CountingTemplateWriter::new(limit);
     serde_json::to_writer(&mut writer, context).map_err(|error| {
         if writer.exceeded {
@@ -430,11 +457,11 @@ impl io::Write for CountingTemplateWriter {
 
 struct BoundedTemplateWriter {
     bytes: Vec<u8>,
-    limit: usize,
+    limit: Option<usize>,
 }
 
 impl BoundedTemplateWriter {
-    fn new(limit: usize) -> Self {
+    fn new(limit: Option<usize>) -> Self {
         Self {
             bytes: Vec::new(),
             limit,
@@ -453,10 +480,10 @@ impl io::Write for BoundedTemplateWriter {
             .len()
             .checked_add(bytes.len())
             .ok_or_else(|| io::Error::other("template output size overflowed"))?;
-        if next > self.limit {
+        if self.limit.is_some_and(|limit| next > limit) {
             return Err(io::Error::other(format!(
                 "template output exceeds {} bytes",
-                self.limit
+                self.limit.unwrap_or(usize::MAX)
             )));
         }
         self.bytes.extend_from_slice(bytes);
@@ -491,7 +518,7 @@ mod tests {
     fn template_service_rejects_source_larger_than_runtime_limit() {
         let service = TemplateService;
         let limits = RuntimeLimits {
-            template_source_limit_bytes: 8,
+            template_source_limit_bytes: Some(8),
             ..RuntimeLimits::default()
         };
         let error = service
@@ -508,7 +535,7 @@ mod tests {
     fn template_service_rejects_context_larger_than_runtime_limit() {
         let service = TemplateService;
         let limits = RuntimeLimits {
-            template_context_limit_bytes: 8,
+            template_context_limit_bytes: Some(8),
             ..RuntimeLimits::default()
         };
         let error = service
@@ -525,7 +552,7 @@ mod tests {
     fn template_service_rejects_output_larger_than_runtime_limit() {
         let service = TemplateService;
         let limits = RuntimeLimits {
-            template_output_limit_bytes: 8,
+            template_output_limit_bytes: Some(8),
             ..RuntimeLimits::default()
         };
         let error = service

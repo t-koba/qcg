@@ -182,8 +182,9 @@ CORS is off by default. Explicit origins may send `content-type` and
 
 ## File inputs and outputs
 
-File inputs use the inline `FileValue` JSON shape and are limited to 16 MiB
-after decoding. The canonical input is recorded in the journal before it is
+File inputs use the inline `FileValue` JSON shape and are bounded only by an
+explicit `[runtime] file_input_limit_bytes` in the generator contract.
+The canonical input is recorded in the journal before it is
 materialized below the run workspace. Journals therefore contain file contents
 and must be protected like other run data.
 

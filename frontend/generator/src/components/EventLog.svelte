@@ -108,3 +108,88 @@
     </ol>
   </details>
 {/if}
+
+<style>
+  /* Technical run details scoped to the event log. */
+  .run-details {
+    border-top: 1px solid var(--line);
+    margin-top: 28px;
+    padding-top: 18px;
+  }
+
+  .run-details summary {
+    align-items: center;
+    color: var(--muted);
+    cursor: pointer;
+    display: flex;
+    font-size: 12px;
+    font-weight: 650;
+    gap: var(--space-sm);
+    list-style: none;
+    width: fit-content;
+  }
+
+  .run-details summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .run-details summary::before {
+    content: "›";
+    font-size: 18px;
+    line-height: 1;
+    transition: transform .15s ease;
+  }
+
+  .run-details[open] summary::before {
+    transform: rotate(90deg);
+  }
+
+  .run-details summary span {
+    background: var(--surface-muted);
+    border-radius: 999px;
+    font-size: 10px;
+    padding: 2px 7px;
+  }
+
+  .event-log {
+    display: grid;
+    gap: 0;
+    list-style: none;
+    margin: 14px 0 0;
+    max-height: 280px;
+    overflow: auto;
+    padding: 0;
+  }
+
+  .event-log li {
+    align-items: baseline;
+    border-top: 1px solid var(--line);
+    color: var(--gray-600);
+    display: grid;
+    font-size: 12px;
+    gap: var(--space-md);
+    grid-template-columns: 28px 1fr;
+    padding: 8px 2px;
+  }
+
+  .event-seq {
+    color: var(--gray-400);
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+  }
+
+  .event-sources {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 10px;
+    margin-top: 4px;
+  }
+
+  .event-sources a {
+    color: var(--accent-dark);
+    max-width: 360px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+</style>

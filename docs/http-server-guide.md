@@ -75,16 +75,33 @@ event, artifact, and journal routes. Principal paths include:
 - `GET /api/mcp/oauth/callback`
 - `GET, POST /api/runs`
 - `GET /api/runs/{id}`
+- `DELETE /api/runs/{id}` (terminal runs only; active runs need cancel first)
 - `PUT /api/runs/{id}/questions/{qid}`
 - `PUT /api/runs/{id}/confirmations/{cid}`
 - `POST /api/runs/{id}:cancel`
 - `GET /api/runs/{id}/events`
 - `GET /api/runs/{id}/artifacts`, `GET /api/runs/{id}/artifacts/{path...}`, and `GET /api/runs/{id}/artifacts.zip`
+- `GET /api/runs/{id}/bundle` (self-contained zip: snapshot, inputs, journal, outputs, verified artifacts)
 - `GET /api/runs/{id}/journal`
+- `GET /api/runs/{id}/metrics` returns cost totals (`tokens_*`,
+  `llm_calls`, `cost_microusd`, `cost_usd`, `duration_ms`) with a `priced`
+  flag that is false when billed calls lacked contract pricing
 
-`POST /api/runs` accepts `generator_id` and an `inputs` object. An
+`POST /api/runs` accepts `generator_id`, an `inputs` object, and optional
+`answers` (pre-provisioned answers keyed by question id) and `confirmations`
+(pre-provisioned decisions keyed by confirmation id) for unattended runs.
+`priority` (integer, default 0, higher runs first) orders the queue and may
+preempt lower-priority running runs, which resume from their journals.
+An
 `Idempotency-Key` header makes retries deterministic for 24 hours within the
-service process.
+service process. The same header is accepted by `POST /api/runs/{id}/fork`,
+`PUT /api/runs/{id}/questions/{qid}`,
+`PUT /api/runs/{id}/confirmations/{cid}`, and `POST /api/runs/{id}:cancel`:
+a reused key with identical content replays the original result instead of
+forking a duplicate run, while a reused key with different content is
+rejected with `409 Conflict`.
+Snapshots of a `Queued` run additionally expose `queued_at` (RFC 3339) and
+`queue_position` (1-based admission order) for queue observability.
 The cancel response is returned after the active engine task has stopped. If a
 run committed completion before the cancellation request won the race, the
 response preserves that completed state instead of writing a second terminal
@@ -128,8 +145,11 @@ or:
 ```
 
 `name` must be one safe filename component. `text` and `content_base64` are
-mutually exclusive. Decoded content is limited to 16 MiB and is supplied inline
-with the run request.
+mutually exclusive. Decoded content is limited only when the generator
+contract sets an explicit `[runtime] file_input_limit_bytes`; otherwise there
+is no mechanistic limit. Values are supplied inline with the run request.
+`qcg serve` additionally accepts an explicit `--max-request-bytes`
+(`QCG_MAX_REQUEST_BYTES`) bound for the whole request body.
 
 ## Assets and frontend development
 

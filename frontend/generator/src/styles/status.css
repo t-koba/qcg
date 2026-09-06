@@ -1,0 +1,20 @@
+/* Shared status helpers. Component-specific styles live in Svelte scoped blocks. */
+.queue-note {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 8px 0 0;
+}
+
+.spinner {
+  animation: spin .8s linear infinite;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  display: block;
+  height: 22px;
+  width: 22px;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}

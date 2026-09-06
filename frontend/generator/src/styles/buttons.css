@@ -1,0 +1,51 @@
+/* Shared button primitives. Component-specific placement lives in components. */
+.primary-btn,
+.secondary-btn,
+.cancel-btn {
+  align-items: center;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  display: inline-flex;
+  font-weight: 700;
+  justify-content: center;
+  min-height: var(--control-height);
+  padding: 9px 16px;
+  text-decoration: none;
+  transition: background-color .15s ease, border-color .15s ease, transform .1s ease;
+}
+
+.primary-btn {
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  color: var(--accent-contrast);
+  min-width: 150px;
+}
+
+.primary-btn:hover:not(:disabled) {
+  background: var(--accent-dark);
+  border-color: var(--accent-dark);
+}
+
+.secondary-btn {
+  background: var(--surface);
+  border: 1px solid var(--input-border);
+  color: var(--gray-700);
+}
+
+.secondary-btn:hover:not(:disabled) {
+  background: var(--surface-muted);
+  border-color: var(--input-border-hover);
+}
+
+.cancel-btn {
+  background: transparent;
+  border: 1px solid var(--input-border);
+  color: var(--gray-600);
+  margin-left: auto;
+}
+
+.cancel-btn:hover:not(:disabled) {
+  background: var(--danger-soft);
+  border-color: var(--danger);
+  color: var(--danger);
+}

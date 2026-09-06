@@ -14,15 +14,19 @@ axum.workspace = true
 camino.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
+qcg-policy = { path = "../qcg-policy" }
 qcg-api = { path = "../qcg-api" }
 qcg-service = { path = "../qcg-service" }
 qcg-types = { path = "../qcg-types" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-tokio.workspace = true
+tokio = { version = "1", features = ["fs", "macros", "net", "rt", "signal", "sync", "time"] }
 tokio-stream.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 tower-http.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

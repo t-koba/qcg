@@ -9,6 +9,8 @@ readme.workspace = true
 publish.workspace = true
 
 [dependencies]
+chrono.workspace = true
+qcg-contract = { path = "../qcg-contract" }
 qcg-types = { path = "../qcg-types" }
 schemars.workspace = true
 serde.workspace = true

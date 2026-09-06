@@ -16,6 +16,7 @@ Generated from the OpenAPI `RunEvent` schema. Every event uses the required enve
 | `graph_resolved` | `nodes` |
 | `resource` | `name`, `type`, `source`, `sha256`, `bytes`, `cache`, `trust`, `llm_visible` |
 | `step_started` | `type`, `attempt` |
+| `step_retry` | `attempt`, `max_attempts`, `error` |
 | `step_finished` | `status` |
 | `step_replayed` | `status` |
 | `step_skipped` | `reason` |
@@ -53,3 +54,21 @@ Generated from the OpenAPI `RunEvent` schema. Every event uses the required enve
 | `run_finished` | `status`, `metrics` |
 | `lagged` | `action` |
 <!-- qcg-run-events:end -->
+
+## Cost metrics
+
+Every terminal event (`run_finished`, `run_error`, `run_canceled`,
+`run_interrupted`) carries a `metrics` object with accumulated step counts,
+`llm_calls`, `tokens_input`, `tokens_output`, `tokens_cached_input`,
+`tokens_total`, `cost_microusd`, and `duration_ms`. Totals on failed or
+canceled runs therefore stay queryable without replaying `llm_call` rows.
+
+`llm_call.tokens` reports `input`, `output`, `reasoning` (included in
+`output`), and `cached_input` (included in `input`) as parsed from the
+provider response. Costs are `microUSD` integers computed per call from the
+contract unit prices (`input_cost_per_million_usd` /
+`output_cost_per_million_usd`, USD per 1M tokens): `USD = cost_microusd /
+1_000_000`. Cached input is billed at the input rate; cache discounts are not
+modeled. Unit prices are contract-declared estimates, not provider invoices.
+Calls without resolvable pricing contribute `0` unless a cost budget forces an
+error, so totals mixing priced and unpriced calls may understate spend.

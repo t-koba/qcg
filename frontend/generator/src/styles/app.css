@@ -1,0 +1,187 @@
+/* Application shell: sidebar, navigation, connections, workspace. */
+.app-shell {
+  display: grid;
+  grid-template-columns: 272px minmax(0, 1fr);
+  min-height: 100vh;
+}
+
+.sidebar {
+  background: var(--sidebar);
+  color: #fff;
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  padding: 24px 16px;
+  position: sticky;
+  top: 0;
+}
+
+.brand {
+  align-items: center;
+  display: flex;
+  gap: var(--space-md);
+  padding: 0 8px 28px;
+}
+
+.brand .mark {
+  align-items: center;
+  background: linear-gradient(145deg, #32b67f, #147757);
+  border-radius: 11px;
+  box-shadow: 0 8px 24px rgba(22, 128, 93, .3);
+  display: flex;
+  font-size: 21px;
+  font-weight: 800;
+  height: 42px;
+  justify-content: center;
+  width: 42px;
+}
+
+.brand strong,
+.brand span {
+  display: block;
+}
+
+.brand strong {
+  font-size: 18px;
+  letter-spacing: -.02em;
+}
+
+.brand span {
+  color: var(--sidebar-faint);
+  font-size: 11px;
+  letter-spacing: .04em;
+}
+
+.generator-nav {
+  display: grid;
+  gap: var(--space-xs);
+}
+
+.nav-label {
+  color: var(--sidebar-faint);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  margin: 0 10px 6px;
+  text-transform: uppercase;
+}
+
+.generator-nav button {
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-md);
+  color: var(--sidebar-fg);
+  cursor: pointer;
+  display: grid;
+  gap: 2px;
+  padding: 11px 12px;
+  text-align: left;
+  transition: background-color .16s ease, color .16s ease;
+  width: 100%;
+}
+
+.generator-nav button:hover:not(:disabled) {
+  background: var(--sidebar-hover);
+  color: #fff;
+}
+
+.generator-nav button.active {
+  background: rgba(47, 180, 124, .18);
+  box-shadow: inset 3px 0 0 #5bd6a0;
+  color: #fff;
+}
+
+.generator-nav button:disabled {
+  cursor: not-allowed;
+  opacity: .55;
+}
+
+.generator-nav button span {
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.generator-nav button small {
+  color: var(--sidebar-faint);
+  display: -webkit-box;
+  font-size: 11px;
+  line-height: 1.35;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.theme-switch {
+  border-top: 1px solid rgba(152, 162, 179, .2);
+  margin-top: 16px;
+  padding: 16px 8px 0;
+}
+
+.theme-switch button {
+  background: transparent;
+  border: 1px solid rgba(152, 162, 179, .35);
+  border-radius: var(--radius-sm);
+  color: var(--sidebar-fg);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 6px 10px;
+  width: 100%;
+}
+
+.theme-switch button:hover {
+  background: rgba(255, 255, 255, .08);
+  border-color: var(--sidebar-faint);
+  color: #fff;
+}
+
+/* MCP connection styles live in McpConnections.svelte. */
+.theme-switch + .mcp-connections {
+  border-top: 0;
+  margin-top: 0;
+}
+
+.workspace {
+  min-width: 0;
+  padding: 52px clamp(24px, 5vw, 72px) 80px;
+}
+
+.workspace-inner {
+  margin: 0 auto;
+  max-width: 980px;
+}
+
+.workspace-header {
+  align-items: flex-start;
+  display: flex;
+  gap: var(--space-xl);
+  justify-content: space-between;
+  margin-bottom: 28px;
+}
+
+.workspace-header h1 {
+  font-size: clamp(28px, 4vw, 40px);
+  letter-spacing: -.045em;
+  line-height: 1.1;
+  margin: 3px 0 0;
+}
+
+.eyebrow {
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 750;
+  letter-spacing: .11em;
+  margin: 0;
+  text-transform: uppercase;
+}
+
+:root[data-theme="dark"] .eyebrow {
+  color: var(--accent);
+}
+
+.generator-description {
+  color: var(--muted);
+  font-size: 15px;
+  margin: 12px 0 0;
+  max-width: 650px;
+}

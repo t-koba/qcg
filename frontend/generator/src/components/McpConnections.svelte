@@ -89,3 +89,138 @@
     {#if snapshot.errorText}<p class="mcp-error" role="alert">{snapshot.errorText}</p>{/if}
   </section>
 {/if}
+
+<style>
+  /* Connection list scoped to the sidebar footer. */
+  .mcp-connections {
+    border-top: 1px solid rgba(152, 162, 179, .2);
+    margin-top: auto;
+    padding: 20px 8px 0;
+  }
+
+  .mcp-heading {
+    align-items: center;
+    display: flex;
+    justify-content: space-between;
+    min-height: 18px;
+  }
+
+  .mcp-heading .nav-label {
+    margin: 0;
+  }
+
+  .mcp-loading {
+    color: var(--sidebar-faint);
+    font-size: 10px;
+  }
+
+  .mcp-server-list {
+    display: grid;
+    gap: var(--space-sm);
+    margin-top: 10px;
+  }
+
+  .mcp-server-row {
+    align-items: center;
+    display: flex;
+    gap: var(--space-sm);
+    justify-content: space-between;
+    min-width: 0;
+  }
+
+  .mcp-server-copy {
+    display: grid;
+    gap: 1px;
+    min-width: 0;
+  }
+
+  .mcp-server-copy strong {
+    color: var(--sidebar-bright);
+    font-size: 12px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .mcp-server-copy small {
+    color: var(--sidebar-faint);
+    font-size: 10px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .mcp-connect,
+  .mcp-cancel,
+  .mcp-disconnect {
+    background: transparent;
+    border: 1px solid rgba(152, 162, 179, .35);
+    border-radius: var(--radius-sm);
+    color: var(--sidebar-fg);
+    cursor: pointer;
+    flex: 0 0 auto;
+    font-size: 10px;
+    font-weight: 700;
+    padding: 4px 7px;
+  }
+
+  .mcp-connect:hover:not(:disabled),
+  .mcp-cancel:hover:not(:disabled),
+  .mcp-disconnect:hover:not(:disabled) {
+    background: rgba(255, 255, 255, .08);
+    border-color: var(--sidebar-faint);
+    color: #fff;
+  }
+
+  .mcp-disconnect {
+    color: #fda4af;
+  }
+
+  .mcp-disconnect:hover:not(:disabled) {
+    border-color: #fda4af;
+    color: #fff;
+  }
+
+  .mcp-server-action {
+    align-items: center;
+    display: flex;
+    flex: 0 0 auto;
+    gap: var(--space-xs);
+  }
+
+  .mcp-status {
+    font-size: 10px;
+    font-weight: 700;
+    white-space: nowrap;
+  }
+
+  .mcp-status.connected { color: #6ce0b1; }
+  .mcp-status.pending { color: #9fe3c2; }
+
+  .mcp-notice,
+  .mcp-error {
+    font-size: 11px;
+    margin: 10px 0 0;
+  }
+
+  .mcp-notice { color: #9fe3c2; }
+  .mcp-error { color: #fda4af; }
+
+  @media (max-width: 820px) {
+    .mcp-connections {
+      margin-top: 16px;
+      padding: 14px 4px 0;
+    }
+
+    .mcp-server-list {
+      display: flex;
+      gap: 14px;
+      overflow-x: auto;
+    }
+
+    .mcp-server-row {
+      flex: 0 0 auto;
+      min-width: 190px;
+    }
+  }
+</style>

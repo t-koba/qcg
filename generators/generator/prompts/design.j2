@@ -48,9 +48,10 @@ Step types for `package.manifest.flow` (each item: id, type, params; optional ne
 - `check.schema` / `check.format` / `check.contract`: structural validators.
 - `check.tool`: logical tool validator; backend resolution is declared in the target manifest.
 - `mcp.call`: direct MCP call using a declared server/tool, bounded by the target runtime and network permissions.
-- `foreach`: items (dotted path to an array or object) + subflow naming a `blocks.<name>` group; block params see the current array entry as `item`. Object entries use the generic `{key, value}` shape, exposed as `item.key` and `item.value`.
+- `foreach`: items (a dotted path to an array or object, or a value-producing expression such as `sort(inputs.tags)`) + subflow naming a `blocks.<name>` group; block params see the current array entry as `item`. Numeric path segments index arrays (`inputs.sites.0`). Object entries use the generic `{key, value}` shape, exposed as `item.key` and `item.value`.
+- `await`: runs (array of run ids to join) + optional timeout_secs; succeeds with an id-to-state map once every listed run is terminal. Use after `fork` or for fan-in across runs.
 
-Control fields: `when` (boolean expr over inputs/steps), `on_deps` ("all_succeeded" default, "any_succeeded", "none_failed"), `needs`, `output`, `artifact` ({label, description, preview, mime, required}).
+Control fields: `when` (boolean expr over inputs/steps; paths support numeric array indices; functions available: `len`, `contains`, `empty`, `default`, `upper`, `lower`, `trim`, `split`, `join`, `replace`, `starts_with`, `ends_with`, `first`, `last`, `keys`, `values`, `reverse`, `flatten`, `unique`, `sort`, `sum`, `min`, `max`; array literals like `[1, 2]` are allowed), `on_deps` ("all_succeeded" default, "any_succeeded", "none_failed"), `needs`, `output`, `artifact` ({label, description, preview, mime, required}). Nodes may declare `retry = { max_attempts = 1..16, backoff_ms, timeout_secs }` for execution retries.
 
 Modern harness rules:
 - Use trusted `[resources]` plus node `context` for reusable instructions or specifications; set `llm_visible = true` explicitly. Treat web and user material as untrusted.

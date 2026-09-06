@@ -32,6 +32,20 @@ Optional:
 - `authors`
 - `qcg_version`
 
+## `[dependencies]`
+
+Optional map of generator id to semver requirement, resolved at install time
+from configured registries:
+
+```toml
+[dependencies]
+report-charts = "^1.2"
+```
+
+Dependencies install as independent generators alongside the dependent; no
+code or state is shared at runtime. Self-dependencies and invalid
+requirements are rejected at validation.
+
 ## `[llm]`
 
 The whole section is optional. If omitted, LLM steps are invalid and non-LLM
@@ -62,8 +76,10 @@ Fields:
 - `max_context_bytes`
 - `max_context_tokens`
 - `max_media_bytes`: required aggregate byte limit when an LLM node declares
-  image, audio, or file `params.media` input. Media paths remain confined to
-  the run workspace and are encoded only after this bound is checked.
+  image, audio, file, or video `params.media` input. Media paths remain confined to
+  the run workspace and are encoded only after this bound is checked. Video
+  inputs require a `video/` MIME type, request the `file_input` capability,
+  and travel as file parts.
 - `context_overflow`: `error` by default, or explicitly `truncate_head` /
   `truncate_tail`. Truncation is UTF-8 safe, visibly marked, deterministic,
   and recorded as `context_compacted`; no silent compaction occurs.
@@ -175,19 +191,19 @@ Fields:
 - `llm_visible`: required before an LLM context can include the resource
 - `pin_sha256`: optional hash pin for snapshotted URL/OpenAPI resources
 - `cache_ttl_seconds`: optional remote snapshot TTL
-- `params`: bounded settings for the selected built-in resource type.
+- `params`: optional explicit bounds for the selected built-in resource type.
   `file`, `url`, and `openapi` resources accept a positive
-  `max_bytes` limit, defaulting to 16 MiB. Built-in `dir` and `skill` resources
-  accept positive `max_files`, `max_bytes`, and `max_selected_bytes`, defaulting
-  to 100,000 files, 1 GiB total, and 16 MiB per selected text file. Reads stop
-  at the bound; limit violations and directory walk failures are explicit
-  errors.
+  `max_bytes` limit; built-in `dir` and `skill` resources
+  accept positive `max_files`, `max_bytes`, `max_depth`, `max_entries`, and
+  `max_selected_bytes`. Unset means no mechanistic limit. Reads stop
+  at an explicit bound; limit violations and directory walk failures are
+  explicit errors.
 
 An `exec` resource is the stock declarative extension boundary for an external
 data source. It forbids `path` and `url`, requires
 `params.command = ["program", "arg", ...]`, and accepts an optional positive
-`params.max_bytes`, defaulting to and never exceeding
-`runtime.command_output_limit_bytes`. The complete command shape must also be
+`params.max_bytes` (unbounded when omitted; otherwise checked against an
+explicit `runtime.command_output_limit_bytes` when one is set). The complete command shape must also be
 present in `permissions.commands`. qcg runs it through the ordinary isolated command
 gateway before the flow starts, bounds stdout, snapshots it under run metadata,
 checks `pin_sha256` when declared, and then exposes the immutable UTF-8 snapshot
@@ -309,6 +325,7 @@ Common node fields:
 - `artifact`
 - `on_fail`
 - `failure`
+- `retry` (optional execution retry policy, see below)
 - `params` (closed, step-specific table)
 
 Root-level `parallel = ["lint", "test"]` explicitly identifies a contiguous
@@ -328,9 +345,54 @@ context = [
 ]
 ```
 
+### `retry`
+
+Declares per-node execution retries. Counts and waits are policy declared by
+the generator; the engine only executes them:
+
+```toml
+[[flow]]
+id = "fetch_report"
+type = "http"
+needs = []
+retry = { max_attempts = 3, backoff_ms = 1000, timeout_secs = 60 }
+```
+
+- `max_attempts`: total attempts including the first, 1 to 16 (default 1,
+  meaning no retry).
+- `backoff_ms`: fixed wait between attempts, up to 60000 (default 0).
+- `timeout_secs`: per-attempt execution timeout, at least 1 when set
+  (omitted means no timeout).
+
+Only execution failures are retried. Contract, budget, and cancellation
+errors fail fast, and cancellation during backoff aborts the wait. Each
+failed attempt emits a `step_retry` journal event with `attempt`,
+`max_attempts`, and `error`. `retry` applies to scheduler-dispatched nodes;
+`foreach` iterations and repair/regenerate cycles keep their own semantics.
+
 Step-specific fields such as `prompt`, `output_file`, `command`, or `expect`
 must appear under `[flow.params]`. Unknown fields and invalid types are rejected
 during contract loading with a source line.
+
+### Expressions
+
+`when` accepts a boolean expression over `inputs.*`, `steps.<id>.output`,
+`steps.<id>.status`, and (inside `foreach`) `item`. Paths resolve dotted
+fields with numeric array indices (`inputs.sites.0`). Missing paths read as
+`null`. Operators are `!`, `-` (unary), `||`, `&&`, `==`, `!=`, `>`, `<`,
+`>=`, `<=`, `+`, `-`, `*`, `/`, `%`, with parentheses and array literals
+(`[1, 2]`). Available functions:
+
+- predicates: `len`, `contains`, `empty`, `starts_with`, `ends_with`
+- defaults: `default(value, fallback)` (fallback only for `null`)
+- strings: `upper`, `lower`, `trim`, `split`, `join`, `replace`
+- collections: `first`, `last`, `keys`, `values`, `reverse`, `flatten`,
+  `unique`, `sort` (numbers, strings, or booleans only)
+- numbers: `sum`, `min`, `max` (empty arrays yield `null` for `min`/`max`)
+
+`foreach.items` accepts a plain dotted path or any value-producing
+expression such as `sort(inputs.tags)`. Unknown functions and type mismatches
+are explicit errors.
 
 ## Step Types
 
@@ -385,6 +447,19 @@ during contract loading with a source line.
 
 `check.contract`
 : Load and validate a generated qcg package.
+
+`await`
+: Wait for other runs to reach a terminal state. Params: `runs` (run id
+  array, at least one) and optional `timeout_secs` (at least 1 when set).
+  Succeeds with an object mapping each run id to its terminal state; unknown
+  runs and timeouts fail explicitly. Needs server execution with sibling run
+  visibility.
+
+`mcp.call`
+: Call a tool on a configured MCP server. Transport failures (connect and
+  call) fail the run unless `optional = true`, which degrades to a null
+  output and records a `degraded` tool call. Validation, elicitation, and
+  confirmation paths still fail.
 
 `llm.generate`
 : Produce text, optionally writing it to `output_file`.
@@ -460,6 +535,31 @@ metadata. Update it with `qcg docs step-schemas`.
   },
   "required": [
     "content"
+  ],
+  "type": "object"
+}
+```
+
+### `await`
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "runs": {
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "timeout_secs": {
+      "minimum": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "runs"
   ],
   "type": "object"
 }
@@ -959,17 +1059,14 @@ metadata. Update it with `qcg docs step-schemas`.
       "type": "array"
     },
     "max_iterations": {
-      "maximum": 32,
       "minimum": 1,
       "type": "integer"
     },
     "max_tokens_total": {
-      "maximum": 100000000,
       "minimum": 1,
       "type": "integer"
     },
     "max_tool_calls_total": {
-      "maximum": 4096,
       "minimum": 1,
       "type": "integer"
     },
@@ -988,7 +1085,8 @@ metadata. Update it with `qcg docs step-schemas`.
             "enum": [
               "image",
               "audio",
-              "file"
+              "file",
+              "video"
             ]
           },
           "media_type": {
@@ -1067,17 +1165,14 @@ metadata. Update it with `qcg docs step-schemas`.
           ]
         },
         "max_context_bytes": {
-          "maximum": 1073741824,
           "minimum": 1,
           "type": "integer"
         },
         "max_context_tokens": {
-          "maximum": 268435456,
           "minimum": 1,
           "type": "integer"
         },
         "max_media_bytes": {
-          "maximum": 1073741824,
           "minimum": 1,
           "type": "integer"
         },
@@ -1457,12 +1552,10 @@ metadata. Update it with `qcg docs step-schemas`.
                 "type": "integer"
               },
               "max_tokens_total": {
-                "maximum": 100000000,
                 "minimum": 1,
                 "type": "integer"
               },
               "max_tool_calls_total": {
-                "maximum": 4096,
                 "minimum": 1,
                 "type": "integer"
               },
@@ -1585,17 +1678,14 @@ metadata. Update it with `qcg docs step-schemas`.
                     ]
                   },
                   "max_context_bytes": {
-                    "maximum": 1073741824,
                     "minimum": 1,
                     "type": "integer"
                   },
                   "max_context_tokens": {
-                    "maximum": 268435456,
                     "minimum": 1,
                     "type": "integer"
                   },
                   "max_media_bytes": {
-                    "maximum": 1073741824,
                     "minimum": 1,
                     "type": "integer"
                   },
@@ -1827,12 +1917,10 @@ metadata. Update it with `qcg docs step-schemas`.
       "type": "array"
     },
     "max_iterations": {
-      "maximum": 32,
       "minimum": 1,
       "type": "integer"
     },
     "max_tokens_total": {
-      "maximum": 100000000,
       "minimum": 1,
       "type": "integer"
     },
@@ -1851,7 +1939,8 @@ metadata. Update it with `qcg docs step-schemas`.
             "enum": [
               "image",
               "audio",
-              "file"
+              "file",
+              "video"
             ]
           },
           "media_type": {
@@ -1936,17 +2025,14 @@ metadata. Update it with `qcg docs step-schemas`.
           ]
         },
         "max_context_bytes": {
-          "maximum": 1073741824,
           "minimum": 1,
           "type": "integer"
         },
         "max_context_tokens": {
-          "maximum": 268435456,
           "minimum": 1,
           "type": "integer"
         },
         "max_media_bytes": {
-          "maximum": 1073741824,
           "minimum": 1,
           "type": "integer"
         },
@@ -2163,12 +2249,10 @@ metadata. Update it with `qcg docs step-schemas`.
       "type": "array"
     },
     "max_iterations": {
-      "maximum": 32,
       "minimum": 1,
       "type": "integer"
     },
     "max_tokens_total": {
-      "maximum": 100000000,
       "minimum": 1,
       "type": "integer"
     },
@@ -2187,7 +2271,8 @@ metadata. Update it with `qcg docs step-schemas`.
             "enum": [
               "image",
               "audio",
-              "file"
+              "file",
+              "video"
             ]
           },
           "media_type": {
@@ -2266,17 +2351,14 @@ metadata. Update it with `qcg docs step-schemas`.
           ]
         },
         "max_context_bytes": {
-          "maximum": 1073741824,
           "minimum": 1,
           "type": "integer"
         },
         "max_context_tokens": {
-          "maximum": 268435456,
           "minimum": 1,
           "type": "integer"
         },
         "max_media_bytes": {
-          "maximum": 1073741824,
           "minimum": 1,
           "type": "integer"
         },
@@ -2506,7 +2588,8 @@ metadata. Update it with `qcg docs step-schemas`.
             "enum": [
               "image",
               "audio",
-              "file"
+              "file",
+              "video"
             ]
           },
           "media_type": {
@@ -2585,17 +2668,14 @@ metadata. Update it with `qcg docs step-schemas`.
           ]
         },
         "max_context_bytes": {
-          "maximum": 1073741824,
           "minimum": 1,
           "type": "integer"
         },
         "max_context_tokens": {
-          "maximum": 268435456,
           "minimum": 1,
           "type": "integer"
         },
         "max_media_bytes": {
-          "maximum": 1073741824,
           "minimum": 1,
           "type": "integer"
         },
@@ -2823,7 +2903,8 @@ metadata. Update it with `qcg docs step-schemas`.
             "enum": [
               "image",
               "audio",
-              "file"
+              "file",
+              "video"
             ]
           },
           "media_type": {
@@ -2902,17 +2983,14 @@ metadata. Update it with `qcg docs step-schemas`.
           ]
         },
         "max_context_bytes": {
-          "maximum": 1073741824,
           "minimum": 1,
           "type": "integer"
         },
         "max_context_tokens": {
-          "maximum": 268435456,
           "minimum": 1,
           "type": "integer"
         },
         "max_media_bytes": {
-          "maximum": 1073741824,
           "minimum": 1,
           "type": "integer"
         },
@@ -3058,6 +3136,9 @@ metadata. Update it with `qcg docs step-schemas`.
       "type": "object"
     },
     "input_schema": {},
+    "optional": {
+      "type": "boolean"
+    },
     "output_schema": {},
     "server": {
       "type": "string"
@@ -3443,23 +3524,12 @@ fields are rejected when their structs define a closed schema.
    evaluation. `file_input_limit_bytes` bounds every individual input value
    (including `file`, `json`, and schema-backed custom fields), while
    `input_total_limit_bytes` bounds the sum of encoded input values. These
-   limits apply to initial inputs and interactive form answers. The defaults
-   are `input_total_limit_bytes = 268435456` (256 MiB),
-   `output_file_limit_bytes = 67108864` (64 MiB),
-   `output_total_limit_bytes = 268435456` (256 MiB),
-   `output_artifact_limit = 10000`, `template_source_limit_bytes = 1048576`
-   (1 MiB), `template_context_limit_bytes = 16777216` (16 MiB),
-   `journal_event_limit_bytes = 16777216` (16 MiB),
-   `journal_total_limit_bytes = 268435456` (256 MiB),
-   `journal_event_count_limit = 100000`, `state_limit_bytes = 67108864`
-   (64 MiB),
-   `template_output_limit_bytes = 16777216` (16 MiB), and
-   `template_fuel = 1000000` instructions.
-   Manifests cannot disable bounding by supplying extreme values: timeouts are
-   capped at 604800 seconds, byte limits at 1073741824 (1 GiB), count limits at
-   1000000, redirects at 32, and template fuel at 100000000. Run budgets are
-   capped at 1000000 steps, 10000000000 tokens, and 2592000 elapsed seconds.
-   Values above a hard ceiling are rejected rather than clamped.
+   limits apply to initial inputs and interactive form answers.
+   There is no mechanistic size limit: every byte/count limit is optional and
+   unbounded when omitted (`None`). Set an explicit max in `qcg.toml`
+   `[runtime]` only when a bound is wanted; `http_redirect_limit = 0` follows
+   no redirects. Timeouts, `template_fuel`, and budget counters keep
+   greater-than-zero sanity checks but no hard ceiling.
    Confirmation plans display the command limits used by execution.
 
 `[budget]`

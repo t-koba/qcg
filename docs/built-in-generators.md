@@ -74,6 +74,31 @@ qcg run generators/generator \
 After building the frontend, the same application is available at
 `/api/generators/generator/assets/ui/index.html` from `qcg serve`.
 
+## Re-entering a previous package
+
+A previously built package is re-entered as an ordinary `type = "file"`
+input; there is no separate package-upload API. A `.qcg` ZIP, a
+`blueprint-package.json`, or any other file travels through the standard
+`FileValue` input, is materialized under the run workspace, and is expanded
+or interpreted by the generator's own steps (for example a declared `command`
+that unpacks the archive, plus `check.schema` / `check.contract` gates).
+Additional information for re-editing arrives as further inputs or answers in
+the same run. `fixtures/generators/package-reinput` demonstrates the pattern:
+
+```bash
+qcg package fixtures/generators/file-input -o /tmp/file-input.qcg
+qcg run fixtures/generators/package-reinput \
+  --input-file package_file=/tmp/file-input.qcg \
+  --input extra_note="second edit" \
+  --output /tmp/reinput-out \
+  --yes
+```
+
+The Web UI follows the same path: attach the previous package to a `file`
+field and fill in the extra fields. Size bounds are explicit-only: set
+`[runtime] file_input_limit_bytes` in `qcg.toml` when a bound is wanted,
+otherwise file inputs are unbounded.
+
 Run the real-provider two-generation equivalence check with:
 
 ```bash

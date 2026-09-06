@@ -1,0 +1,115 @@
+/* Card and surface primitives shared across workspace sections. */
+.surface {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-2xl);
+  box-shadow: var(--shadow-sm);
+  margin-bottom: 20px;
+}
+
+.input-surface,
+.run-surface,
+.artifacts-surface,
+.empty-surface,
+.loading-surface {
+  padding: clamp(22px, 4vw, 36px);
+}
+
+.error-banner {
+  align-items: flex-start;
+  background: var(--danger-soft);
+  border: 1px solid var(--danger);
+  border-radius: var(--radius-lg);
+  color: var(--danger);
+  display: flex;
+  font-size: 14px;
+  gap: var(--space-lg);
+  justify-content: space-between;
+  margin-bottom: 20px;
+  padding: 13px 14px 13px 16px;
+}
+
+.error-banner button {
+  background: transparent;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+  font-size: 20px;
+  line-height: 1;
+  padding: 1px 4px;
+}
+
+.skeleton {
+  animation: pulse 1.4s ease-in-out infinite;
+  background: var(--gray-200);
+  border-radius: var(--radius-sm);
+  height: 14px;
+  margin: 12px 0;
+  width: 60%;
+}
+
+.skeleton.wide { height: 22px; width: 80%; }
+.skeleton.short { width: 38%; }
+
+.zero-input {
+  align-items: center;
+  display: grid;
+  gap: 18px;
+  grid-template-columns: auto 1fr auto;
+}
+
+.zero-input-icon,
+.status-icon {
+  align-items: center;
+  border-radius: var(--radius-xl);
+  display: flex;
+  height: 52px;
+  justify-content: center;
+  width: 52px;
+}
+
+.zero-input-icon {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.zero-input-icon svg,
+.status-icon svg,
+.file-icon svg {
+  fill: none;
+  height: 24px;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+  width: 24px;
+}
+
+.zero-input strong {
+  display: block;
+  font-size: 15px;
+}
+
+.zero-input p {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 3px 0 0;
+}
+
+.section-heading {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 22px;
+}
+
+.section-heading h2,
+.status-copy h2 {
+  font-size: 20px;
+  letter-spacing: -.025em;
+  margin: 3px 0 0;
+}
+
+@keyframes pulse {
+  50% { opacity: .55; }
+}

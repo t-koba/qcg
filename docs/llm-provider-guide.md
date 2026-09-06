@@ -97,9 +97,14 @@ Fields:
   credential-like query names, and credential placeholders are rejected.
 - `timeout_seconds`: timeout for each completion attempt. The default is 120
   seconds; retryable failures may start another independently timed attempt.
+- `retry_attempts`: attempts per completion call including the first, 1 to 10.
+  The default is 3. Only retryable failures (timeouts, 5xx, 429, empty
+  responses) retry; other errors fail fast.
+- `retry_base_backoff_ms`: base wait between retries in milliseconds, up to
+  60000. The default is 200; waits grow exponentially from there.
 - `response_body_limit_bytes`: maximum response body size. The default is
   16 MiB; larger responses fail before JSON parsing instead of growing memory
-  without a bound.
+  without a bound. An explicit value has no mechanistic ceiling.
 - `max_concurrency` and `requests_per_minute`: optional provider-local admission
   limits. Requests wait for capacity instead of creating an unbounded burst.
 - `circuit_breaker_failures` and `circuit_breaker_cooldown_seconds`: consecutive

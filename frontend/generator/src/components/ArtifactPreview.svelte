@@ -129,3 +129,112 @@
     {/if}
   </section>
 {/if}
+
+<style>
+  /* Preview pane scoped to the selected artifact. */
+  .artifact-preview {
+    border: 1px solid var(--line);
+    border-radius: var(--radius-xl);
+    margin-top: 18px;
+    overflow: hidden;
+  }
+
+  .artifact-preview header {
+    align-items: center;
+    background: var(--surface-subtle);
+    border-bottom: 1px solid var(--line);
+    display: flex;
+    justify-content: space-between;
+    padding: 10px 14px;
+  }
+
+  .artifact-preview header strong {
+    font-size: 12px;
+  }
+
+  .artifact-preview header small {
+    color: var(--muted);
+    display: block;
+    font-size: 10px;
+    margin-top: 3px;
+  }
+
+  .artifact-preview header p {
+    color: var(--muted);
+    font-size: 11px;
+    line-height: 1.4;
+    margin: 3px 0 0;
+  }
+
+  .artifact-preview header button {
+    background: transparent;
+    border: 0;
+    color: inherit;
+    cursor: pointer;
+    font-size: 20px;
+    line-height: 1;
+    padding: 1px 4px;
+  }
+
+  .artifact-preview pre {
+    background: var(--code-bg);
+    color: var(--code-fg);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    margin: 0;
+    max-height: 460px;
+    overflow: auto;
+    padding: 18px;
+    white-space: pre-wrap;
+  }
+
+  .artifact-preview img,
+  .artifact-preview iframe {
+    background: #fff;
+    border: 0;
+    display: block;
+    height: 460px;
+    object-fit: contain;
+    width: 100%;
+  }
+
+  .artifact-preview audio,
+  .artifact-preview video {
+    display: block;
+    max-height: 460px;
+    width: 100%;
+  }
+
+  .artifact-preview audio {
+    padding: 18px;
+  }
+
+  .preview-loading {
+    align-items: center;
+    color: var(--accent);
+    display: flex;
+    height: 140px;
+    justify-content: center;
+  }
+
+  .preview-loading .spinner {
+    animation: spin .8s linear infinite;
+    border: 2px solid currentColor;
+    border-right-color: transparent;
+    border-radius: 50%;
+    display: block;
+    height: 22px;
+    width: 22px;
+  }
+
+  .preview-error {
+    color: var(--danger);
+    font-size: 13px;
+    margin: 0;
+    padding: 18px;
+  }
+
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+</style>

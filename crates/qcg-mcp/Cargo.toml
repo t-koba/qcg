@@ -30,6 +30,7 @@ keyring.workspace = true
 libc.workspace = true
 oauth2.workspace = true
 pin-project-lite.workspace = true
+qcg-policy = { path = "../qcg-policy" }
 qcg-types = { path = "../qcg-types" }
 reqwest.workspace = true
 rmcp.workspace = true
@@ -37,7 +38,7 @@ serde.workspace = true
 serde_json.workspace = true
 sse-stream.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "rt-multi-thread", "sync", "time"] }
 tokio-util.workspace = true
 url.workspace = true
 

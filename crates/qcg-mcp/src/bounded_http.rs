@@ -254,7 +254,7 @@ fn apply_custom_headers(
     headers: HashMap<HeaderName, HeaderValue>,
 ) -> Result<reqwest::RequestBuilder, StreamableHttpError<reqwest::Error>> {
     for (name, value) in headers {
-        if crate::reserved_transport_header(name.as_str()) {
+        if crate::mcp::validate::reserved_transport_header(name.as_str()) {
             return Err(StreamableHttpError::ReservedHeaderConflict(
                 name.to_string(),
             ));

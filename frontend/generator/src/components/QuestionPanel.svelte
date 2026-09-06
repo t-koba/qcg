@@ -50,3 +50,50 @@
     </form>
   </section>
 {/if}
+
+<style>
+  /* Question card scoped to user interaction. */
+  .interaction-card {
+    background: var(--surface-subtle);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-xl);
+    margin-top: 28px;
+    padding: 22px;
+  }
+
+  .interaction-heading {
+    align-items: center;
+    display: flex;
+    gap: 11px;
+    margin-bottom: 20px;
+  }
+
+  .interaction-heading h2 {
+    font-size: 17px;
+    margin: 0;
+  }
+
+  .interaction-index {
+    align-items: center;
+    background: var(--accent);
+    border-radius: var(--space-sm);
+    color: var(--accent-contrast);
+    display: inline-flex;
+    font-size: 13px;
+    font-weight: 800;
+    height: 28px;
+    justify-content: center;
+    width: 28px;
+  }
+
+  .answer-form .primary-btn {
+    justify-self: end;
+  }
+
+  @media (max-width: 600px) {
+    .answer-form .primary-btn {
+      justify-self: stretch;
+      width: 100%;
+    }
+  }
+</style>

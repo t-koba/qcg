@@ -10,6 +10,7 @@ publish.workspace = true
 
 [dependencies]
 chrono.workspace = true
+qcg-policy = { path = "../qcg-policy" }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

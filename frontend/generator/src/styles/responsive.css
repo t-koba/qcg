@@ -1,0 +1,153 @@
+/* Responsive overrides. Breakpoints: 820px (sidebar collapse), 600px (single column). */
+@media (max-width: 820px) {
+  .app-shell {
+    display: block;
+  }
+
+  .sidebar {
+    min-height: auto;
+    padding: 14px;
+    position: static;
+  }
+
+  .brand {
+    padding: 0 4px 14px;
+  }
+
+  .brand .mark {
+    height: 36px;
+    width: 36px;
+  }
+
+  .generator-nav {
+    display: flex;
+    gap: var(--space-xs);
+    overflow-x: auto;
+    padding-bottom: 2px;
+  }
+
+  .nav-label {
+    display: none;
+  }
+
+  .generator-nav button {
+    flex: 0 0 auto;
+    min-width: 140px;
+  }
+
+  .generator-nav button small {
+    display: none;
+  }
+
+  .theme-switch {
+    border-top: 0;
+    margin-top: 12px;
+    padding: 0 4px;
+  }
+
+  .theme-switch button {
+    width: auto;
+  }
+
+  .mcp-connections {
+    margin-top: 16px;
+    padding: 14px 4px 0;
+  }
+
+  .mcp-server-list {
+    display: flex;
+    gap: 14px;
+    overflow-x: auto;
+  }
+
+  .mcp-server-row {
+    flex: 0 0 auto;
+    min-width: 190px;
+  }
+
+  .workspace {
+    padding: 30px 18px 56px;
+  }
+}
+
+@media (max-width: 600px) {
+  .workspace-header {
+    align-items: flex-start;
+    display: grid;
+    gap: var(--space-md);
+  }
+
+  .workspace-header h1 {
+    font-size: 30px;
+  }
+
+  .input-surface,
+  .run-surface,
+  .artifacts-surface,
+  .empty-surface,
+  .loading-surface {
+    padding: 20px;
+  }
+
+  .field-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .zero-input {
+    align-items: start;
+    grid-template-columns: auto 1fr;
+  }
+
+  .zero-input .primary-btn {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
+
+  .run-summary {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .cancel-btn {
+    margin-left: 0;
+    width: 100%;
+  }
+
+  .answer-form .primary-btn,
+  .completion-actions .primary-btn {
+    justify-self: stretch;
+    width: 100%;
+  }
+
+  .confirm-actions {
+    display: grid;
+  }
+
+  .section-heading {
+    align-items: flex-start;
+    gap: 14px;
+  }
+
+  .artifact {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .artifact-actions {
+    grid-column: 1 / -1;
+    justify-content: flex-end;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: .01ms !important;
+  }
+
+  .spinner,
+  .skeleton {
+    animation-duration: 1.8s;
+  }
+}

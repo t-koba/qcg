@@ -39,10 +39,12 @@ export class ApiClient {
     return parseResponse<T>(response);
   }
 
-  async put<T>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
+  async put<T>(path: string, body: unknown, idempotencyKey?: string, signal?: AbortSignal): Promise<T> {
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    if (idempotencyKey) headers["idempotency-key"] = idempotencyKey;
     const response = await fetch(`${this.base}${path}`, {
       method: "PUT",
-      headers: { "content-type": "application/json" },
+      headers,
       body: JSON.stringify(body),
       signal,
     });
@@ -76,6 +78,27 @@ export class ApiClient {
 
   clearMcpAuthorization(serverId: string, signal?: AbortSignal): Promise<void> {
     return this.delete<void>(`/api/mcp/servers/${encodeURIComponent(serverId)}/authorization`, signal);
+  }
+
+  listRuns(
+    query?: { state?: string; generator_id?: string; since?: string },
+    signal?: AbortSignal,
+  ): Promise<RunListResponse> {
+    const params = new URLSearchParams();
+    if (query?.state) params.set("state", query.state);
+    if (query?.generator_id) params.set("generator_id", query.generator_id);
+    if (query?.since) params.set("since", query.since);
+    const suffix = params.size > 0 ? `?${params.toString()}` : "";
+    return this.get<RunListResponse>(`/api/runs${suffix}`, signal);
+  }
+
+  forkRun(runId: string, atSeq: number, signal?: AbortSignal): Promise<RunSnapshot> {
+    return this.post<RunSnapshot>(
+      `/api/runs/${encodeURIComponent(runId)}/fork`,
+      { at_seq: atSeq, state_patch: {} },
+      undefined,
+      signal,
+    );
   }
 
   artifactUrl(runId: string, path: string): string {

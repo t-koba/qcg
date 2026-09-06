@@ -286,6 +286,54 @@
         ],
         "type": "string"
       },
+      "CommandIsolation": {
+        "enum": [
+          "container",
+          "trusted_host"
+        ],
+        "type": "string"
+      },
+      "CommandPermission": {
+        "additionalProperties": false,
+        "properties": {
+          "args": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "bin": {
+            "type": "string"
+          },
+          "image": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "isolation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CommandIsolation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "purpose": {
+            "default": "",
+            "type": "string"
+          }
+        },
+        "required": [
+          "bin"
+        ],
+        "type": "object"
+      },
       "ConfirmDecision": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
@@ -349,6 +397,49 @@
         "enum": [
           "approve",
           "deny"
+        ],
+        "type": "string"
+      },
+      "ContainerPermission": {
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "default": false,
+            "type": "boolean"
+          },
+          "images": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "on_missing": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "runtime": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ContainerRuntime"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "type": "object"
+      },
+      "ContainerRuntime": {
+        "enum": [
+          "docker",
+          "podman",
+          "docker_runsc"
         ],
         "type": "string"
       },
@@ -629,10 +720,33 @@
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "additionalProperties": false,
         "properties": {
+          "answers": {
+            "additionalProperties": true,
+            "default": {},
+            "description": "Pre-provisioned answers keyed by question id, consumed without interaction.",
+            "type": "object"
+          },
           "at_seq": {
             "format": "uint64",
             "minimum": 0,
             "type": "integer"
+          },
+          "confirmations": {
+            "additionalProperties": {
+              "type": "boolean"
+            },
+            "default": {},
+            "description": "Pre-provisioned confirmation decisions keyed by confirmation id.",
+            "type": "object"
+          },
+          "priority": {
+            "default": null,
+            "description": "Scheduling priority, higher runs first. Defaults to 0.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "state_patch": {
             "$ref": "#/components/schemas/ForkStatePatch",
@@ -713,12 +827,16 @@
           },
           "inputs": {
             "$ref": "#/components/schemas/InputSpec"
+          },
+          "permissions": {
+            "$ref": "#/components/schemas/Permissions"
           }
         },
         "required": [
           "generator",
           "inputs",
-          "assets"
+          "assets",
+          "permissions"
         ],
         "title": "GeneratorDetail",
         "type": "object"
@@ -1316,6 +1434,13 @@
             "minimum": 0,
             "type": "integer"
           },
+          "fallback_index": {
+            "default": 0,
+            "description": "Zero-based index into the declared route list (0 is the primary route).",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
           "kind": {
             "$ref": "#/components/schemas/LlmRouteFailureKind"
           },
@@ -1324,6 +1449,13 @@
           },
           "provider": {
             "type": "string"
+          },
+          "routes_total": {
+            "default": 0,
+            "description": "Number of declared routes available for this invocation.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
           }
         },
         "required": [
@@ -1514,6 +1646,53 @@
         "title": "OutputManifest",
         "type": "object"
       },
+      "Permissions": {
+        "additionalProperties": false,
+        "properties": {
+          "commands": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/CommandPermission"
+            },
+            "type": "array"
+          },
+          "containers": {
+            "$ref": "#/components/schemas/ContainerPermission",
+            "default": {
+              "enabled": false,
+              "images": [],
+              "on_missing": null,
+              "runtime": null
+            }
+          },
+          "fs_read": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "fs_write": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "network": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "side_effects": {
+            "$ref": "#/components/schemas/SideEffects",
+            "default": "none"
+          }
+        },
+        "type": "object"
+      },
       "ProblemDetails": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
@@ -1575,6 +1754,26 @@
       "ReasonEventData": {
         "additionalProperties": false,
         "properties": {
+          "metrics": {
+            "$ref": "#/components/schemas/RunMetrics",
+            "default": {
+              "cost_microusd": 0,
+              "duration_ms": 0,
+              "llm_calls": 0,
+              "regenerate_attempts": 0,
+              "repair_attempts": 0,
+              "steps_executed": 0,
+              "steps_failed": 0,
+              "steps_skipped": 0,
+              "steps_succeeded": 0,
+              "steps_total": 0,
+              "tokens_cached_input": 0,
+              "tokens_input": 0,
+              "tokens_output": 0,
+              "tokens_total": 0
+            },
+            "description": "Accumulated cost metrics, present when the writer attached them."
+          },
           "reason": {
             "$ref": "#/components/schemas/FailureDetail"
           }
@@ -1817,11 +2016,64 @@
         ],
         "type": "string"
       },
+      "RunCostMetrics": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Per-run cost metrics with a USD estimate for display.",
+        "properties": {
+          "cost_usd": {
+            "description": "`cost_microusd / 1_000_000`, for display only.",
+            "format": "double",
+            "type": "number"
+          },
+          "metrics": {
+            "$ref": "#/components/schemas/RunMetrics"
+          },
+          "priced": {
+            "description": "False when any billed call lacked contract pricing, so the total may\nunderstate the true spend.",
+            "type": "boolean"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/RunStatus"
+          }
+        },
+        "required": [
+          "run_id",
+          "state",
+          "metrics",
+          "cost_usd",
+          "priced"
+        ],
+        "title": "RunCostMetrics",
+        "type": "object"
+      },
       "RunErrorEventData": {
         "additionalProperties": false,
         "properties": {
           "error": {
             "type": "string"
+          },
+          "metrics": {
+            "$ref": "#/components/schemas/RunMetrics",
+            "default": {
+              "cost_microusd": 0,
+              "duration_ms": 0,
+              "llm_calls": 0,
+              "regenerate_attempts": 0,
+              "repair_attempts": 0,
+              "steps_executed": 0,
+              "steps_failed": 0,
+              "steps_skipped": 0,
+              "steps_succeeded": 0,
+              "steps_total": 0,
+              "tokens_cached_input": 0,
+              "tokens_input": 0,
+              "tokens_output": 0,
+              "tokens_total": 0
+            },
+            "description": "Accumulated cost metrics, present when the writer attached them."
           }
         },
         "required": [
@@ -1901,6 +2153,9 @@
           },
           {
             "$ref": "#/components/schemas/StepStartedEventData"
+          },
+          {
+            "$ref": "#/components/schemas/StepRetryEventData"
           },
           {
             "$ref": "#/components/schemas/StepFinishedEventData"
@@ -2163,6 +2418,13 @@
             "minimum": 0,
             "type": "integer"
           },
+          "tokens_cached_input": {
+            "default": 0,
+            "description": "Input tokens served from provider cache, included in `tokens_input`.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "tokens_input": {
             "default": 0,
             "format": "uint64",
@@ -2230,6 +2492,32 @@
               "null"
             ]
           },
+          "metrics": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunMetrics"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Cost totals: exact terminal metrics when finished, otherwise a live\nsynthesis from the folded budget. Absent only before any activity."
+          },
+          "parent_run_id": {
+            "default": null,
+            "description": "Parent run id for runs created by fork.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "priority": {
+            "default": 0,
+            "description": "Scheduling priority, higher runs first.",
+            "format": "int32",
+            "type": "integer"
+          },
           "question": {
             "anyOf": [
               {
@@ -2238,6 +2526,24 @@
               {
                 "type": "null"
               }
+            ]
+          },
+          "queue_position": {
+            "default": null,
+            "description": "1-based position among queued runs, present only while `Queued`.",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "queued_at": {
+            "default": null,
+            "description": "RFC 3339 timestamp of the last transition to `Queued`, if any.",
+            "type": [
+              "string",
+              "null"
             ]
           },
           "run_id": {
@@ -2275,6 +2581,20 @@
           "inputs": {
             "additionalProperties": true,
             "type": "object"
+          },
+          "parent_run_id": {
+            "default": null,
+            "description": "Parent run id for runs created by fork.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "priority": {
+            "default": 0,
+            "description": "Scheduling priority recorded when the run was (re)queued.",
+            "format": "int32",
+            "type": "integer"
           },
           "qcg": {
             "type": "string"
@@ -2384,15 +2704,47 @@
         ],
         "type": "object"
       },
+      "SideEffects": {
+        "enum": [
+          "none",
+          "confirm",
+          "dry_run_first",
+          "allowed"
+        ],
+        "type": "string"
+      },
       "StartRun": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
+          "answers": {
+            "additionalProperties": true,
+            "default": {},
+            "description": "Pre-provisioned answers keyed by question id, consumed without interaction.\nSame semantics as eval suite answers.",
+            "type": "object"
+          },
+          "confirmations": {
+            "additionalProperties": {
+              "type": "boolean"
+            },
+            "default": {},
+            "description": "Pre-provisioned confirmation decisions keyed by confirmation id.",
+            "type": "object"
+          },
           "generator_id": {
             "type": "string"
           },
           "inputs": {
             "additionalProperties": true,
             "type": "object"
+          },
+          "priority": {
+            "default": null,
+            "description": "Scheduling priority, higher runs first. Defaults to 0.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
@@ -2490,6 +2842,30 @@
         ],
         "type": "object"
       },
+      "StepRetryEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "attempt": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "error": {
+            "type": "string"
+          },
+          "max_attempts": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "attempt",
+          "max_attempts",
+          "error"
+        ],
+        "type": "object"
+      },
       "StepStartedEventData": {
         "additionalProperties": false,
         "properties": {
@@ -2540,6 +2916,13 @@
       "TokenUsageEventData": {
         "additionalProperties": false,
         "properties": {
+          "cached_input": {
+            "default": 0,
+            "description": "Input tokens served from provider cache, included in `input`.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "input": {
             "format": "uint64",
             "minimum": 0,
@@ -2719,7 +3102,8 @@
           "succeeded",
           "failed",
           "needs_user",
-          "needs_confirmation"
+          "needs_confirmation",
+          "degraded"
         ],
         "type": "string"
       },
@@ -3402,6 +3786,54 @@
       }
     },
     "/api/runs/{id}": {
+      "delete": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Run deleted"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Resource not found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Resource conflict"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Delete a terminal run"
+      },
       "get": {
         "parameters": [
           {
@@ -3695,6 +4127,64 @@
         "summary": "Read an artifact"
       }
     },
+    "/api/runs/{id}/bundle": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/zip": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Run bundle zip"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Resource not found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Download a self-contained run bundle as zip"
+      }
+    },
     "/api/runs/{id}/confirmations/{cid}": {
       "put": {
         "parameters": [
@@ -3710,6 +4200,15 @@
             "in": "path",
             "name": "cid",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Retries with the same key and request body return the original run.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -3876,6 +4375,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Retries with the same key and request body return the original run.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -4028,6 +4536,63 @@
         "summary": "Read run journal"
       }
     },
+    "/api/runs/{id}/metrics": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunCostMetrics"
+                }
+              }
+            },
+            "description": "Run cost metrics with USD estimate"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Resource not found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Read run cost metrics"
+      }
+    },
     "/api/runs/{id}/questions/{qid}": {
       "put": {
         "parameters": [
@@ -4043,6 +4608,15 @@
             "in": "path",
             "name": "qid",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Retries with the same key and request body return the original run.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -4140,6 +4714,15 @@
             "in": "path",
             "name": "id",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Retries with the same key and request body return the original run.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
             "schema": {
               "type": "string"
             }

@@ -1,6 +1,6 @@
+use qcg_contract::Expr;
 use qcg_contract::ValueBag;
 use qcg_contract::expr::MAX_EXPRESSION_BYTES;
-use qcg_types::Expr;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;

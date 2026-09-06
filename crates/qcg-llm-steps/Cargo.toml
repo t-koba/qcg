@@ -14,6 +14,8 @@ base64.workspace = true
 camino.workspace = true
 hex.workspace = true
 jsonschema.workspace = true
+qcg-api = { path = "../qcg-api" }
+qcg-policy = { path = "../qcg-policy" }
 qcg-contract = { path = "../qcg-contract" }
 qcg-engine = { path = "../qcg-engine" }
 qcg-llm = { path = "../qcg-llm" }
@@ -24,7 +26,7 @@ regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-tokio.workspace = true
+tokio = { version = "1", features = ["fs", "macros", "rt", "time"] }
 thiserror.workspace = true
 url.workspace = true
 

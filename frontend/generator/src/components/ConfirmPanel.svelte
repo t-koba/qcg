@@ -35,3 +35,74 @@
     </div>
   </section>
 {/if}
+
+<style>
+  /* Confirmation card scoped to approval requests. */
+  .interaction-card {
+    background: var(--surface-subtle);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-xl);
+    margin-top: 28px;
+    padding: 22px;
+  }
+
+  .interaction-card.confirmation {
+    background: var(--warning-soft);
+    border-color: var(--warning);
+  }
+
+  .interaction-heading {
+    align-items: center;
+    display: flex;
+    gap: 11px;
+    margin-bottom: 20px;
+  }
+
+  .interaction-heading h2 {
+    font-size: 17px;
+    margin: 0;
+  }
+
+  .interaction-index {
+    align-items: center;
+    background: var(--warning);
+    border-radius: var(--space-sm);
+    color: #1d1407;
+    display: inline-flex;
+    font-size: 13px;
+    font-weight: 800;
+    height: 28px;
+    justify-content: center;
+    width: 28px;
+  }
+
+  .confirmation-target {
+    color: var(--warning);
+    font-size: 13px;
+    margin: -8px 0 14px;
+  }
+
+  .interaction-card pre {
+    background: var(--confirm-code-bg);
+    border-radius: var(--radius-md);
+    color: var(--confirm-code-fg);
+    font-size: 12px;
+    margin: 0;
+    max-height: 260px;
+    overflow: auto;
+    padding: 14px;
+    white-space: pre-wrap;
+  }
+
+  .confirm-actions {
+    display: flex;
+    gap: 10px;
+    margin-top: 18px;
+  }
+
+  @media (max-width: 600px) {
+    .confirm-actions {
+      display: grid;
+    }
+  }
+</style>

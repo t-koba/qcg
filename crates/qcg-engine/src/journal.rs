@@ -1,547 +1,17 @@
-use camino::{Utf8Path, Utf8PathBuf};
-use chrono::Utc;
-use qcg_contract::RuntimeLimits;
-use qcg_types::RunEvent;
-use serde::Serialize;
-use serde_json::{Value, json};
-use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Read as _, Write};
-use std::sync::{Arc, Mutex, PoisonError};
-use tokio::sync::broadcast;
+mod read;
+mod serialize;
+mod types;
+mod writer;
 
-const DEFAULT_JOURNAL_EVENT_LIMIT_BYTES: usize = 16 * 1024 * 1024;
-const DEFAULT_JOURNAL_TOTAL_LIMIT_BYTES: usize = 256 * 1024 * 1024;
-const DEFAULT_JOURNAL_EVENT_COUNT_LIMIT: usize = 100_000;
-const DEFAULT_STATE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct JournalLimits {
-    pub max_event_bytes: usize,
-    pub max_total_bytes: usize,
-    pub max_event_count: usize,
-    pub max_state_bytes: usize,
-}
-
-impl Default for JournalLimits {
-    fn default() -> Self {
-        Self {
-            max_event_bytes: DEFAULT_JOURNAL_EVENT_LIMIT_BYTES,
-            max_total_bytes: DEFAULT_JOURNAL_TOTAL_LIMIT_BYTES,
-            max_event_count: DEFAULT_JOURNAL_EVENT_COUNT_LIMIT,
-            max_state_bytes: DEFAULT_STATE_LIMIT_BYTES,
-        }
-    }
-}
-
-impl From<&RuntimeLimits> for JournalLimits {
-    fn from(runtime: &RuntimeLimits) -> Self {
-        Self {
-            max_event_bytes: runtime.journal_event_limit_bytes,
-            max_total_bytes: runtime.journal_total_limit_bytes,
-            max_event_count: runtime.journal_event_count_limit,
-            max_state_bytes: runtime.state_limit_bytes,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct JournalStats {
-    pub bytes: usize,
-    pub events: usize,
-}
-
-#[derive(Debug)]
-pub struct JournalScan {
-    pub events: Vec<Value>,
-    pub stats: JournalStats,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum JournalError {
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-    #[error(transparent)]
-    Json(#[from] serde_json::Error),
-    #[error("invalid journal JSON at line {line}: {source}")]
-    InvalidLine {
-        line: usize,
-        source: serde_json::Error,
-    },
-    #[error("journal event payload must serialize to an object")]
-    InvalidPayload,
-    #[error("invalid run event: {0}")]
-    InvalidEvent(String),
-    #[error("journal {resource} exceeds {limit} bytes (attempted {actual})")]
-    LimitExceeded {
-        resource: &'static str,
-        actual: usize,
-        limit: usize,
-    },
-    #[error("journal event count exceeds {limit} (attempted {actual})")]
-    EventCountExceeded { actual: usize, limit: usize },
-    #[error("invalid journal limit: {resource} must be greater than zero")]
-    InvalidLimit { resource: &'static str },
-}
-
-pub struct JournalWriter {
-    run_id: String,
-    file: Arc<Mutex<File>>,
-    state: Arc<Mutex<crate::RunState>>,
-    state_path: Utf8PathBuf,
-    mirror_stdout: bool,
-    event_sender: Option<broadcast::Sender<RunEvent>>,
-    limits: JournalLimits,
-    stats: Arc<Mutex<JournalStats>>,
-}
-
-#[derive(Debug, Default, Clone, Serialize)]
-struct JournalMetrics {
-    steps_total: u64,
-    steps_succeeded: u64,
-    steps_failed: u64,
-    steps_skipped: u64,
-    repair_attempts: u64,
-    regenerate_attempts: u64,
-    llm_calls: u64,
-    tokens_input: u64,
-    tokens_output: u64,
-    steps_executed: u64,
-    tokens_total: u64,
-    cost_microusd: u64,
-    duration_ms: u64,
-}
-
-impl JournalWriter {
-    pub fn create(
-        path: &Utf8Path,
-        run_id: impl Into<String>,
-        mirror_stdout: bool,
-        event_sender: Option<broadcast::Sender<RunEvent>>,
-    ) -> Result<Self, JournalError> {
-        Self::create_with_limits(
-            path,
-            run_id,
-            mirror_stdout,
-            event_sender,
-            JournalLimits::default(),
-        )
-    }
-
-    pub fn create_with_limits(
-        path: &Utf8Path,
-        run_id: impl Into<String>,
-        mirror_stdout: bool,
-        event_sender: Option<broadcast::Sender<RunEvent>>,
-        limits: JournalLimits,
-    ) -> Result<Self, JournalError> {
-        validate_limits(limits)?;
-        let run_id = run_id.into();
-        if run_id.trim().is_empty() {
-            return Err(JournalError::InvalidEvent(
-                "journal run_id must be non-empty".into(),
-            ));
-        }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
-        let state_path = path.with_file_name("state.json");
-        let scan = read_journal_values(path, limits)?;
-        let state = crate::RunState::fold_journal_with_limits(path, limits)?;
-        if let Some(existing) = state.run_id.as_deref()
-            && existing != run_id
-        {
-            return Err(JournalError::InvalidEvent(format!(
-                "journal run_id mismatch: expected `{run_id}`, found `{existing}`"
-            )));
-        }
-        state.persist_atomic_with_limits(&state_path, limits.max_state_bytes)?;
-        Ok(Self {
-            run_id,
-            file: Arc::new(Mutex::new(file)),
-            state: Arc::new(Mutex::new(state)),
-            state_path,
-            mirror_stdout,
-            event_sender,
-            limits,
-            stats: Arc::new(Mutex::new(scan.stats)),
-        })
-    }
-
-    pub fn event(&self, kind: &str, payload: impl Serialize) -> Result<(), JournalError> {
-        let payload = serialize_bounded(&payload, self.limits.max_event_bytes, "event")?;
-        let mut value = serde_json::from_slice::<Value>(&payload)?;
-        if !value.is_object() {
-            value = json!({ "value": value });
-        }
-        let object = value.as_object_mut().ok_or(JournalError::InvalidPayload)?;
-        if kind == "run_finished" {
-            let metrics = journal_metrics(
-                &self
-                    .state
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .budget,
-            )?;
-            object.insert("metrics".into(), serde_json::to_value(metrics)?);
-        }
-        let (line, event) = {
-            let mut file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
-            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            let mut stats = self.stats.lock().unwrap_or_else(PoisonError::into_inner);
-            let seq = state.last_seq.saturating_add(1);
-            if let Some(payload_run_id) = object.get("run_id").and_then(Value::as_str)
-                && payload_run_id != self.run_id
-            {
-                return Err(JournalError::InvalidEvent(format!(
-                    "journal event run_id mismatch: expected `{}`, found `{payload_run_id}`",
-                    self.run_id
-                )));
-            }
-            let event_run_id = self.run_id.clone();
-            object.insert("t".into(), Value::String(kind.into()));
-            object.insert("ts".into(), Value::String(Utc::now().to_rfc3339()));
-            object.insert("seq".into(), Value::Number(seq.into()));
-            object.insert("run_id".into(), Value::String(event_run_id.clone()));
-            object.insert(
-                "trace_id".into(),
-                Value::String(qcg_types::trace_id_for_run(&event_run_id)),
-            );
-            object.insert(
-                "span_id".into(),
-                Value::String(qcg_types::span_id_for_seq(seq)),
-            );
-            let parent_scope = object
-                .get("node")
-                .and_then(Value::as_str)
-                .map(|node| format!("step:{node}"))
-                .unwrap_or_else(|| "run".to_string());
-            if !matches!(kind, "run_queued" | "run_started") {
-                object.insert(
-                    "parent_span_id".into(),
-                    Value::String(qcg_types::span_id_for_scope(&event_run_id, &parent_scope)),
-                );
-            }
-            let event = RunEvent::from_flat(&value).map_err(JournalError::InvalidEvent)?;
-            let mut next_state = state.clone();
-            next_state.apply(&value)?;
-            let state_bytes = serialize_bounded(&next_state, self.limits.max_state_bytes, "state")?;
-            let bytes = serialize_bounded(&value, self.limits.max_event_bytes, "event")?;
-            let line = String::from_utf8(bytes.clone()).map_err(|error| {
-                JournalError::InvalidEvent(format!("journal event is not UTF-8: {error}"))
-            })?;
-            append_serialized_json_line(&mut *file, bytes, &mut stats, self.limits)?;
-            if matches!(kind, "run_finished" | "run_error" | "run_canceled") {
-                file.sync_data()?;
-            }
-            *state = next_state;
-            crate::RunState::persist_serialized_atomic(&self.state_path, &state_bytes)?;
-            (line, event)
-        };
-        if self.mirror_stdout {
-            println!("{line}");
-        }
-        if let Some(sender) = &self.event_sender {
-            let _ = sender.send(event);
-        }
-        Ok(())
-    }
-
-    pub fn clone_for_parallel(&self) -> Result<Self, JournalError> {
-        Ok(Self {
-            run_id: self.run_id.clone(),
-            file: Arc::clone(&self.file),
-            state: Arc::clone(&self.state),
-            state_path: self.state_path.clone(),
-            mirror_stdout: self.mirror_stdout,
-            event_sender: self.event_sender.clone(),
-            limits: self.limits,
-            stats: Arc::clone(&self.stats),
-        })
-    }
-
-    pub fn state(&self) -> crate::RunState {
-        self.state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-    }
-}
-
-fn validate_limits(limits: JournalLimits) -> Result<(), JournalError> {
-    for (resource, value) in [
-        ("max_event_bytes", limits.max_event_bytes),
-        ("max_total_bytes", limits.max_total_bytes),
-        ("max_event_count", limits.max_event_count),
-        ("max_state_bytes", limits.max_state_bytes),
-    ] {
-        if value == 0 {
-            return Err(JournalError::InvalidLimit { resource });
-        }
-    }
-    Ok(())
-}
-
-pub fn serialize_bounded<T: Serialize>(
-    value: &T,
-    limit: usize,
-    resource: &'static str,
-) -> Result<Vec<u8>, JournalError> {
-    if limit == 0 {
-        return Err(JournalError::InvalidLimit { resource });
-    }
-    let mut writer = BoundedBytesWriter::new(limit);
-    match serde_json::to_writer(&mut writer, value) {
-        Ok(()) => Ok(writer.bytes),
-        Err(_error) if writer.exceeded => Err(JournalError::LimitExceeded {
-            resource,
-            actual: limit.saturating_add(1),
-            limit,
-        }),
-        Err(error) => Err(JournalError::Json(error)),
-    }
-}
-
-struct BoundedBytesWriter {
-    bytes: Vec<u8>,
-    limit: usize,
-    exceeded: bool,
-}
-
-impl BoundedBytesWriter {
-    fn new(limit: usize) -> Self {
-        Self {
-            bytes: Vec::with_capacity(limit.min(64 * 1024)),
-            limit,
-            exceeded: false,
-        }
-    }
-}
-
-impl Write for BoundedBytesWriter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        let Some(next) = self.bytes.len().checked_add(bytes.len()) else {
-            self.exceeded = true;
-            return Err(std::io::Error::other(
-                "bounded JSON serialization overflowed",
-            ));
-        };
-        if next > self.limit {
-            self.exceeded = true;
-            return Err(std::io::Error::other(
-                "bounded JSON serialization exceeded limit",
-            ));
-        }
-        self.bytes.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-pub fn append_serialized_json_line<W: Write>(
-    writer: &mut W,
-    mut bytes: Vec<u8>,
-    stats: &mut JournalStats,
-    limits: JournalLimits,
-) -> Result<(), JournalError> {
-    validate_limits(limits)?;
-    if stats.events >= limits.max_event_count {
-        return Err(JournalError::EventCountExceeded {
-            actual: stats.events.saturating_add(1),
-            limit: limits.max_event_count,
-        });
-    }
-    if bytes.len() > limits.max_event_bytes {
-        return Err(JournalError::LimitExceeded {
-            resource: "event",
-            actual: bytes.len(),
-            limit: limits.max_event_bytes,
-        });
-    }
-    let line_bytes = bytes
-        .len()
-        .checked_add(1)
-        .ok_or(JournalError::LimitExceeded {
-            resource: "total journal",
-            actual: usize::MAX,
-            limit: limits.max_total_bytes,
-        })?;
-    let total = stats
-        .bytes
-        .checked_add(line_bytes)
-        .ok_or(JournalError::LimitExceeded {
-            resource: "total journal",
-            actual: usize::MAX,
-            limit: limits.max_total_bytes,
-        })?;
-    if total > limits.max_total_bytes {
-        return Err(JournalError::LimitExceeded {
-            resource: "total journal",
-            actual: total,
-            limit: limits.max_total_bytes,
-        });
-    }
-    bytes.push(b'\n');
-    writer.write_all(&bytes)?;
-    stats.bytes = total;
-    stats.events = stats.events.saturating_add(1);
-    Ok(())
-}
-
-pub fn read_journal_values(
-    path: &Utf8Path,
-    limits: JournalLimits,
-) -> Result<JournalScan, JournalError> {
-    read_journal_values_through(path, None, limits)
-}
-
-pub fn read_journal_values_through(
-    path: &Utf8Path,
-    through_seq: Option<u64>,
-    limits: JournalLimits,
-) -> Result<JournalScan, JournalError> {
-    validate_limits(limits)?;
-    if !path.exists() {
-        return Ok(JournalScan {
-            events: Vec::new(),
-            stats: JournalStats::default(),
-        });
-    }
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let mut line = Vec::new();
-    let mut line_number = 0_usize;
-    let mut stats = JournalStats::default();
-    let mut events = Vec::new();
-    let line_read_limit =
-        limits
-            .max_event_bytes
-            .checked_add(2)
-            .ok_or(JournalError::LimitExceeded {
-                resource: "event",
-                actual: usize::MAX,
-                limit: limits.max_event_bytes,
-            })?;
-    loop {
-        line.clear();
-        let read = (&mut reader)
-            .take(
-                u64::try_from(line_read_limit).map_err(|_| JournalError::LimitExceeded {
-                    resource: "event",
-                    actual: usize::MAX,
-                    limit: limits.max_event_bytes,
-                })?,
-            )
-            .read_until(b'\n', &mut line)?;
-        if read == 0 {
-            break;
-        }
-        line_number = line_number.saturating_add(1);
-        stats.bytes = stats
-            .bytes
-            .checked_add(read)
-            .ok_or(JournalError::LimitExceeded {
-                resource: "total journal",
-                actual: usize::MAX,
-                limit: limits.max_total_bytes,
-            })?;
-        if stats.bytes > limits.max_total_bytes {
-            return Err(JournalError::LimitExceeded {
-                resource: "total journal",
-                actual: stats.bytes,
-                limit: limits.max_total_bytes,
-            });
-        }
-        let has_newline = line.last() == Some(&b'\n');
-        if !has_newline && read == line_read_limit {
-            return Err(JournalError::LimitExceeded {
-                resource: "event",
-                actual: read,
-                limit: limits.max_event_bytes,
-            });
-        }
-        let body_len = line.len().saturating_sub(usize::from(has_newline));
-        if body_len > limits.max_event_bytes {
-            return Err(JournalError::LimitExceeded {
-                resource: "event",
-                actual: body_len,
-                limit: limits.max_event_bytes,
-            });
-        }
-        let body = &line[..body_len];
-        if body.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
-        if stats.events >= limits.max_event_count {
-            return Err(JournalError::EventCountExceeded {
-                actual: stats.events.saturating_add(1),
-                limit: limits.max_event_count,
-            });
-        }
-        let event = match serde_json::from_slice::<Value>(body) {
-            Ok(event) => event,
-            Err(source) if !has_newline && source.is_eof() && reader.fill_buf()?.is_empty() => {
-                break;
-            }
-            Err(source) => {
-                return Err(JournalError::InvalidLine {
-                    line: line_number,
-                    source,
-                });
-            }
-        };
-        if through_seq.is_some_and(|limit| {
-            event
-                .get("seq")
-                .and_then(Value::as_u64)
-                .is_some_and(|seq| seq > limit)
-        }) {
-            break;
-        }
-        stats.events = stats.events.saturating_add(1);
-        events.push(event);
-    }
-    Ok(JournalScan { events, stats })
-}
-
-fn journal_metrics(budget: &crate::BudgetState) -> Result<JournalMetrics, JournalError> {
-    let steps_executed = u64::try_from(budget.steps_executed).map_err(|_| {
-        JournalError::InvalidEvent("executed step count exceeds journal metric range".into())
-    })?;
-    let started_at = budget.started_at.as_deref().ok_or_else(|| {
-        JournalError::InvalidEvent("run start time is required before finishing a run".into())
-    })?;
-    let started_at = chrono::DateTime::parse_from_rfc3339(started_at)
-        .map_err(|error| JournalError::InvalidEvent(format!("invalid run start time: {error}")))?;
-    let duration_ms = Utc::now()
-        .signed_duration_since(started_at)
-        .num_milliseconds();
-    let duration_ms = u64::try_from(duration_ms).map_err(|_| {
-        JournalError::InvalidEvent("run start time is later than its finish time".into())
-    })?;
-    Ok(JournalMetrics {
-        steps_total: steps_executed,
-        steps_succeeded: budget.steps_succeeded,
-        steps_failed: budget.steps_failed,
-        steps_skipped: budget.steps_skipped,
-        repair_attempts: budget.repair_attempts,
-        regenerate_attempts: budget.regenerate_attempts,
-        llm_calls: budget.llm_calls,
-        tokens_input: budget.tokens_input,
-        tokens_output: budget.tokens_output,
-        steps_executed,
-        tokens_total: budget.tokens_input.saturating_add(budget.tokens_output),
-        cost_microusd: budget.cost_microusd,
-        duration_ms,
-    })
-}
+pub use read::*;
+pub use serialize::*;
+pub use types::*;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use camino::Utf8PathBuf;
+    use serde_json::{Value, json};
 
     fn test_limits(
         max_event_bytes: usize,
@@ -550,10 +20,10 @@ mod tests {
         max_state_bytes: usize,
     ) -> JournalLimits {
         JournalLimits {
-            max_event_bytes,
-            max_total_bytes,
-            max_event_count,
-            max_state_bytes,
+            max_event_bytes: Some(max_event_bytes),
+            max_total_bytes: Some(max_total_bytes),
+            max_event_count: Some(max_event_count),
+            max_state_bytes: Some(max_state_bytes),
         }
     }
 
@@ -727,7 +197,7 @@ mod tests {
         let path = Utf8PathBuf::from_path_buf(dir.join("journal.jsonl"))
             .expect("temporary path must be UTF-8");
         let limits = test_limits(8, 64, 4, 64);
-        std::fs::write(&path, vec![b'x'; limits.max_event_bytes + 2])
+        std::fs::write(&path, vec![b'x'; limits.max_event_bytes.unwrap_or(8) + 2])
             .expect("the oversized newline-free record should be written");
 
         let error = read_journal_values(&path, limits)
@@ -857,6 +327,68 @@ mod tests {
         assert_eq!(event["metrics"]["tokens_total"], 10);
         assert_eq!(event["metrics"]["cost_microusd"], 25);
         assert!(event["metrics"]["duration_ms"].as_u64().is_some());
+    }
+
+    #[test]
+    fn terminal_error_and_cancel_events_include_accumulated_metrics() {
+        for (kind, payload) in [
+            ("run_error", json!({ "error": "boom" })),
+            (
+                "run_canceled",
+                json!({ "reason": qcg_types::FailureDetail::new(
+                    qcg_types::FailureCode::Canceled,
+                    "user canceled",
+                ) }),
+            ),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "qcg-journal-terminal-{}-{}",
+                kind,
+                uuid::Uuid::now_v7()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = camino::Utf8PathBuf::from_path_buf(dir.join("journal.jsonl")).unwrap();
+            let journal = JournalWriter::create(&path, "terminal-run", false, None).unwrap();
+            journal
+                .event(
+                    "run_started",
+                    json!({
+                        "generator": "terminal@1.0.0",
+                        "generator_path": "terminal",
+                        "contract_sha256": "abc",
+                        "inputs": {},
+                        "resource_hashes": [],
+                        "qcg": "0.1.0",
+                        "schema_version": 1,
+                    }),
+                )
+                .unwrap();
+            journal
+                .event(
+                    "llm_call",
+                    json!({
+                        "node": "r",
+                        "provider": "fake",
+                        "model": "fake",
+                        "max_tokens": 128,
+                        "tokens": { "input": 7, "output": 3, "cached_input": 2 },
+                        "cost_microusd": 25,
+                    }),
+                )
+                .unwrap();
+            journal.event(kind, payload).unwrap();
+
+            let source = std::fs::read_to_string(&path).unwrap();
+            let last = source.lines().last().unwrap();
+            let event: Value = serde_json::from_str(last).unwrap();
+            assert_eq!(event["t"], kind);
+            assert_eq!(event["metrics"]["llm_calls"], 1);
+            assert_eq!(event["metrics"]["tokens_input"], 7);
+            assert_eq!(event["metrics"]["tokens_output"], 3);
+            assert_eq!(event["metrics"]["tokens_cached_input"], 2);
+            assert_eq!(event["metrics"]["tokens_total"], 10);
+            assert_eq!(event["metrics"]["cost_microusd"], 25);
+        }
     }
 
     #[test]

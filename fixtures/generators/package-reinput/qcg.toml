@@ -1,0 +1,54 @@
+[generator]
+id = "package-reinput"
+name = "Package Reinput"
+version = "0.1.0"
+qcg_version = "^0.1"
+description = "Accepts a prior package file plus extra info and re-emits an edited summary."
+
+[[inputs.stages]]
+id = "basic"
+
+[[inputs.stages.fields]]
+id = "package_file"
+required = true
+type = "file"
+
+[[inputs.stages.fields]]
+id = "extra_note"
+required = false
+type = "string"
+
+[[flow]]
+id = "expand_package"
+type = "command"
+
+[flow.params]
+command = [
+    "python3",
+    "-c",
+    "import zipfile, json, pathlib, sys; src = pathlib.Path('{{ inputs.package_file }}'); out = pathlib.Path('package-inventory.json'); inv = {}; p = pathlib.Path(src); inv['input_path'] = str(src); inv['size'] = p.stat().st_size if p.exists() else 0; inv['is_zip'] = zipfile.is_zipfile(p) if p.exists() else False; inv['entries'] = zipfile.ZipFile(p).namelist() if inv['is_zip'] else []; out.write_text(json.dumps(inv, indent=2))",
+]
+
+[[flow]]
+id = "render_summary"
+needs = ["expand_package"]
+type = "render"
+artifact = { label = "Reinput Summary", required = true }
+
+[flow.params]
+output_file = "reinput-summary.md"
+template = "templates/summary.md.j2"
+
+[permissions]
+fs_read = ["workspace"]
+fs_write = ["workspace"]
+side_effects = "allowed"
+
+[[permissions.commands]]
+bin = "python3"
+args = ["-c", "*"]
+purpose = "expand a prior package file input for re-editing"
+isolation = "trusted_host"
+
+[runtime]
+# No mechanistic limits by default. Set explicit max only when desired.

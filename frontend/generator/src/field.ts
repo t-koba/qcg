@@ -17,7 +17,9 @@ export function isBlockingSchemaIssue(issue: SchemaIssue): boolean {
 
 export const MAX_SCHEMA_DEPTH = 12;
 export const MAX_SCHEMA_NODES = 256;
-export const MAX_FILE_INPUT_BYTES = 16 * 1024 * 1024;
+// No mechanistic file size limit in the frontend. Size bounds are set
+// explicitly via qcg.toml [runtime] and enforced by the server.
+export const MAX_FILE_INPUT_BYTES: number | undefined = undefined;
 const FALSE_SCHEMA_MARKER = "__qcg_false_schema";
 
 const BUILTIN_KINDS = new Set([
@@ -42,10 +44,11 @@ export function isSafeFileName(name: string): boolean {
     && !name.includes("\0");
 }
 
-export function validateFileInput(file: File | undefined): void {
+export function validateFileInput(file: File | undefined, maxBytes?: number): void {
   if (!file) return;
-  if (file.size > MAX_FILE_INPUT_BYTES) {
-    throw new Error(`file input exceeds the ${MAX_FILE_INPUT_BYTES} byte limit`);
+  const limit = maxBytes ?? MAX_FILE_INPUT_BYTES;
+  if (limit !== undefined && file.size > limit) {
+    throw new Error(`file input exceeds the ${limit} byte limit`);
   }
   if (!isSafeFileName(file.name)) {
     throw new Error(`file name must be one safe path component: ${file.name}`);

@@ -1,7 +1,8 @@
 use crate::{JournalLimits, read_journal_values_through, serialize_bounded};
 use camino::{Utf8Path, Utf8PathBuf};
+use qcg_api::{ConfirmSpec, FormSpec};
 use qcg_contract::ValueBag;
-use qcg_types::{ConfirmSpec, FailureCode, FailureDetail, FormSpec, NodePath};
+use qcg_types::{FailureCode, FailureDetail, NodePath};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -71,6 +72,8 @@ pub struct BudgetState {
     pub tokens_input: u64,
     #[serde(default)]
     pub tokens_output: u64,
+    #[serde(default)]
+    pub tokens_cached_input: u64,
     #[serde(default)]
     pub cost_microusd: u64,
     #[serde(default)]
@@ -153,7 +156,7 @@ impl RunState {
     ) -> Result<Self, crate::JournalError> {
         let mut state = Self::default();
         for event in read_journal_values_through(path, through_seq, limits)?.events {
-            let parsed = qcg_types::RunEvent::from_flat(&event).map_err(|message| {
+            let parsed = qcg_api::RunEvent::from_flat(&event).map_err(|message| {
                 crate::JournalError::InvalidEvent(format!("invalid journal event: {message}"))
             })?;
             if through_seq.is_some_and(|limit| parsed.seq > limit) {
@@ -220,6 +223,13 @@ impl RunState {
                             .and_then(Value::as_u64)
                             .unwrap_or_default(),
                     );
+                    self.budget.tokens_cached_input =
+                        self.budget.tokens_cached_input.saturating_add(
+                            tokens
+                                .get("cached_input")
+                                .and_then(Value::as_u64)
+                                .unwrap_or_default(),
+                        );
                 }
                 self.budget.cost_microusd = self.budget.cost_microusd.saturating_add(
                     event
@@ -404,7 +414,7 @@ impl RunState {
     pub fn persist_atomic_with_limits(
         &self,
         path: &Utf8Path,
-        max_bytes: usize,
+        max_bytes: Option<usize>,
     ) -> Result<(), crate::JournalError> {
         let bytes = serialize_bounded(self, max_bytes, "state")?;
         Self::persist_serialized_atomic(path, &bytes)

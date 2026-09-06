@@ -1,5 +1,5 @@
 use camino::{Utf8Path, Utf8PathBuf};
-use qcg_types::is_safe_relative_path;
+use qcg_policy::is_safe_relative_path;
 use std::path::PathBuf;
 
 /// Errors returned while resolving a path declared by a generator package.

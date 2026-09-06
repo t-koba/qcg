@@ -32,7 +32,10 @@ does not reveal conditional stages.
 
 The bundled `generator` demonstrates generator discovery, staged forms,
 FileValue inputs, SSE progress, questions, confirmations, artifact previews,
-and ZIP download.
+and ZIP download. Its workspace keeps one tab per run: tabs subscribe
+independently, survive generator switching, and are addressable through the
+`#/runs/<id>` URL hash, while the sidebar run history opens any known run
+from `GET /api/runs`.
 
 ## Content Security Policy
 

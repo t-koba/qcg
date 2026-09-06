@@ -51,6 +51,28 @@
         </fieldset>
       {/each}
     </div>
+    {#if store.detail}
+      {@const permissions = store.detail.permissions}
+      <details class="permission-summary">
+        <summary>{messages.permissions}</summary>
+        <dl>
+          <div><dt>fs_read</dt><dd>{permissions.fs_read.join(", ") || "—"}</dd></div>
+          <div><dt>fs_write</dt><dd>{permissions.fs_write.join(", ") || "—"}</dd></div>
+          <div><dt>network</dt><dd>{permissions.network.join(", ") || "—"}</dd></div>
+          <div>
+            <dt>commands</dt>
+            <dd>
+              {#if permissions.commands.length === 0}—{:else}
+                {#each permissions.commands as command}
+                  <span class="permission-command">{command.bin} {command.args.join(" ")}</span>
+                {/each}
+              {/if}
+            </dd>
+          </div>
+          <div><dt>{messages.permissionSideEffects}</dt><dd>{permissions.side_effects}</dd></div>
+        </dl>
+      </details>
+    {/if}
     <div class="form-actions">
       <button class="primary-btn" type="submit" disabled={!store.selected || store.pendingAction !== null}>
         {store.pendingAction === "starting" ? messages.starting : messages.run}

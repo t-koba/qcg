@@ -1,4 +1,5 @@
 use qcg_contract::SecretRef;
+use qcg_policy::MAX_CREDENTIAL_FILE_BYTES;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
@@ -6,8 +7,6 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::Path;
-
-const MAX_SECRET_FILE_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone, Default)]
 pub struct SecretStore {
@@ -124,9 +123,9 @@ fn read_secret_file(secret_name: &str, path: &Path) -> Result<String, String> {
             path.display()
         ));
     }
-    if metadata.len() > MAX_SECRET_FILE_BYTES {
+    if metadata.len() > MAX_CREDENTIAL_FILE_BYTES {
         return Err(format!(
-            "secret `{secret_name}` file exceeds {MAX_SECRET_FILE_BYTES} bytes"
+            "secret `{secret_name}` file exceeds {MAX_CREDENTIAL_FILE_BYTES} bytes"
         ));
     }
     #[cfg(unix)]
@@ -174,13 +173,13 @@ fn read_open_secret_file(secret_name: &str, path: &Path, file: File) -> Result<S
             path.display()
         )
     })?;
-    if !metadata.is_file() || metadata.len() > MAX_SECRET_FILE_BYTES {
+    if !metadata.is_file() || metadata.len() > MAX_CREDENTIAL_FILE_BYTES {
         return Err(format!(
-            "secret `{secret_name}` file must be a regular file no larger than {MAX_SECRET_FILE_BYTES} bytes"
+            "secret `{secret_name}` file must be a regular file no larger than {MAX_CREDENTIAL_FILE_BYTES} bytes"
         ));
     }
     let mut bytes = Vec::new();
-    file.take(MAX_SECRET_FILE_BYTES + 1)
+    file.take(MAX_CREDENTIAL_FILE_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| {
             format!(
@@ -188,9 +187,9 @@ fn read_open_secret_file(secret_name: &str, path: &Path, file: File) -> Result<S
                 path.display()
             )
         })?;
-    if bytes.len() as u64 > MAX_SECRET_FILE_BYTES {
+    if bytes.len() as u64 > MAX_CREDENTIAL_FILE_BYTES {
         return Err(format!(
-            "secret `{secret_name}` file exceeds {MAX_SECRET_FILE_BYTES} bytes"
+            "secret `{secret_name}` file exceeds {MAX_CREDENTIAL_FILE_BYTES} bytes"
         ));
     }
     let value = String::from_utf8(bytes)

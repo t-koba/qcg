@@ -1,4 +1,4 @@
-use qcg_types::credential_like_name;
+use qcg_policy::credential_like_name;
 use serde_json::{Value, json};
 use url::Url;
 
