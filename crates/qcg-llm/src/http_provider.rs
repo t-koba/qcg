@@ -463,6 +463,11 @@ impl HttpProvider {
         let mut stream = SseStream::from_bytes_stream(response.bytes_stream());
         let mut total_bytes = 0_usize;
         let mut accumulator = HttpStreamAccumulator::new(self.api);
+        // Decoded concatenation window for split/escaped credential
+        // reflection (A08). Raw `data.contains(key)` misses credentials
+        // split across deltas or JSON-escaped; decoded JSON inspection per
+        // chunk plus this running window closes both gaps.
+        let mut decoded_window = String::new();
         while let Some(event) = stream.next().await {
             let event = event.map_err(|_| {
                 LlmError::invalid_response(format!("{} provider returned invalid SSE", self.id))
@@ -500,6 +505,30 @@ impl HttpProvider {
                     self.id
                 ))
             })?;
+            if let Some(key) = credential.as_deref().filter(|key| !key.is_empty()) {
+                // Decoded JSON inspection covers Unicode escapes and string
+                // fragmentation inside one chunk (A08).
+                if json_contains_string_fragment(&value, key) {
+                    return Err(LlmError::new(format!(
+                        "{} provider stream contained its configured credential",
+                        self.id
+                    )));
+                }
+                collect_string_leaves(&value, &mut decoded_window);
+                // Bound the window to credential length + 8 KiB of context
+                // so a long stream cannot grow it without bound.
+                let keep = key.len().saturating_add(8 * 1024);
+                if decoded_window.len() > keep {
+                    decoded_window =
+                        decoded_window[decoded_window.len().saturating_sub(keep)..].to_string();
+                }
+                if decoded_window.contains(key) {
+                    return Err(LlmError::new(format!(
+                        "{} provider stream contained its configured credential",
+                        self.id
+                    )));
+                }
+            }
             if value
                 .get("type")
                 .and_then(Value::as_str)
@@ -513,6 +542,18 @@ impl HttpProvider {
                 )));
             }
             if let Some(response) = accumulator.ingest(value, &events).await? {
+                if credential.as_deref().is_some_and(|key| {
+                    !key.is_empty()
+                        && json_contains_string_fragment(
+                            &serde_json::to_value(&response).unwrap_or(Value::Null),
+                            key,
+                        )
+                }) {
+                    return Err(LlmError::new(format!(
+                        "{} provider stream contained its configured credential",
+                        self.id
+                    )));
+                }
                 events
                     .send(ChatStreamEvent::Completed { response })
                     .await
@@ -521,10 +562,46 @@ impl HttpProvider {
             }
         }
         let response = accumulator.finish()?;
+        if credential.as_deref().is_some_and(|key| {
+            !key.is_empty()
+                && json_contains_string_fragment(
+                    &serde_json::to_value(&response).unwrap_or(Value::Null),
+                    key,
+                )
+        }) {
+            return Err(LlmError::new(format!(
+                "{} provider stream contained its configured credential",
+                self.id
+            )));
+        }
         events
             .send(ChatStreamEvent::Completed { response })
             .await
             .map_err(|_| LlmError::new("LLM stream receiver closed"))
+    }
+}
+
+/// Appends every decoded string value of a stream chunk to the running
+/// window so credentials split across SSE deltas are still detected.
+/// Object keys are excluded: they are schema field names, and interleaving
+/// them would break a key split exactly at a chunk boundary. Values
+/// concatenate without separators; over-matching fails closed.
+fn collect_string_leaves(value: &Value, out: &mut String) {
+    match value {
+        Value::String(text) => {
+            out.push_str(text);
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_string_leaves(value, out);
+            }
+        }
+        Value::Object(values) => {
+            for (_, value) in values {
+                collect_string_leaves(value, out);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
 }
 
@@ -670,5 +747,34 @@ impl LlmProvider for HttpProvider {
         let result = self.send_stream(payload, &req.model, events).await;
         self.record_request_result(&result);
         result
+    }
+}
+
+#[cfg(test)]
+mod stream_credential_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn split_and_escaped_credential_reflection_is_detected() {
+        // A08: single-chunk raw matching misses split and escaped reflection.
+        let key = "sk-secret-credential-12345";
+        // Split across two decoded chunks: neither chunk alone contains the
+        // key, but the running window does.
+        let first = json!({"delta": "sk-secret-"});
+        let second = json!({"delta": "credential-12345"});
+        assert!(!json_contains_string_fragment(&first, key));
+        assert!(!json_contains_string_fragment(&second, key));
+        let mut window = String::new();
+        collect_string_leaves(&first, &mut window);
+        assert!(!window.contains(key));
+        collect_string_leaves(&second, &mut window);
+        assert!(window.contains(key));
+        // JSON-escaped reflection decodes before inspection.
+        let escaped = serde_json::from_str::<Value>(
+            r#"{"text": "prefix \u0073k-secret-credential-12345 suffix"}"#,
+        )
+        .unwrap();
+        assert!(json_contains_string_fragment(&escaped, key));
     }
 }

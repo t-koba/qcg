@@ -22,9 +22,7 @@ mod tests {
     #[cfg(unix)]
     use fs2::FileExt as _;
     use futures_util::StreamExt as _;
-    #[cfg(unix)]
     use qcg_api::ConfirmDecision;
-    #[cfg(unix)]
     use qcg_api::ConfirmationDecision;
     use qcg_api::{
         AnswerPayload, ApiError, ForkRun, ForkStatePatch, RunSnapshot, RunStatus, StartRun,
@@ -44,6 +42,21 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("qcg-service-test-{name}-{}", uuid::Uuid::now_v7()));
         Utf8PathBuf::from_path_buf(dir).expect("temporary directory path must be UTF-8")
+    }
+
+    async fn read_journal_string(service: &LocalQcgService, id: String) -> String {
+        use tokio::io::AsyncReadExt as _;
+        let mut opened = service
+            .open_journal_stream(id)
+            .await
+            .expect("journal should open");
+        let mut bytes = Vec::new();
+        opened
+            .file
+            .read_to_end(&mut bytes)
+            .await
+            .expect("journal should read");
+        String::from_utf8(bytes).expect("journal should be UTF-8")
     }
 
     #[tokio::test]
@@ -86,6 +99,7 @@ mod tests {
                 task: Arc::new(Mutex::new(None)),
                 queued_at: at,
                 owner_id: String::new(),
+                ephemeral: false,
             };
             write_run_event(
                 &record,
@@ -114,13 +128,23 @@ mod tests {
             .expect("first snapshot should load");
         assert_eq!(first.state, RunStatus::Queued);
         assert_eq!(first.queue_position, Some(1));
-        assert_eq!(first.queued_at, Some(first_at.to_rfc3339()));
+        // Display follows the durable journal instant, not the memory value,
+        // so every process reports identical admission order.
+        let first_journal_at =
+            crate::summaries::read_last_queued_at(&root.join("runs").join("q-first"))
+                .expect("journal should carry admission time")
+                .to_rfc3339();
+        assert_eq!(first.queued_at, Some(first_journal_at));
         let second = service
             .snapshot("q-second".into())
             .await
             .expect("second snapshot should load");
         assert_eq!(second.queue_position, Some(2));
-        assert_eq!(second.queued_at, Some(second_at.to_rfc3339()));
+        let second_journal_at =
+            crate::summaries::read_last_queued_at(&root.join("runs").join("q-second"))
+                .expect("journal should carry admission time")
+                .to_rfc3339();
+        assert_eq!(second.queued_at, Some(second_journal_at));
         let running = service
             .snapshot("q-running".into())
             .await
@@ -594,7 +618,10 @@ content = "{{ inputs.marker }}"
             );
         }
 
-        let listed = service.list_runs().await.expect("runs should be listable");
+        let listed = service
+            .list_run_items()
+            .await
+            .expect("runs should be listable");
         assert_eq!(
             listed
                 .iter()
@@ -1109,6 +1136,10 @@ content = "unexpected"
                 .join("must-not-exist.txt")
                 .exists()
         );
+        assert!(
+            !crate::run_dirs::has_pending_cancel_control(&run_dir),
+            "settled cancellation must consume its mailbox control files"
+        );
     }
 
     #[tokio::test]
@@ -1220,10 +1251,7 @@ content = "complete"
             .expect("confirmation should resume run");
         let snapshot = wait_for_terminal_snapshot(&service, &id).await;
         assert_eq!(snapshot.state, RunStatus::Succeeded);
-        let journal = service
-            .read_journal(id)
-            .await
-            .expect("journal should be readable");
+        let journal = read_journal_string(&service, id).await;
         let approved_effects = journal
             .lines()
             .filter(|line| {
@@ -1411,10 +1439,7 @@ command_timeout_seconds = 300
         assert_eq!(snapshot.queue_position, Some(2));
         // The preempted writer must have exited before the requeue append:
         // seqs stay unique and monotonic across the handoff.
-        let journal = service
-            .read_journal(running.clone())
-            .await
-            .expect("preempted journal should be readable");
+        let journal = read_journal_string(&service, running.clone()).await;
         let seqs: Vec<u64> = journal
             .lines()
             .map(|line| {
@@ -1509,6 +1534,86 @@ command_timeout_seconds = 300
             )
             .await
             .expect("fork should start");
+        let snapshot = wait_for_terminal_snapshot(&service, &fork).await;
+        assert_eq!(snapshot.state, RunStatus::Succeeded);
+        assert_eq!(snapshot.parent_run_id.as_deref(), Some(source.as_str()));
+        let _ = std::fs::remove_dir_all(&runs);
+    }
+
+    #[tokio::test]
+    async fn partial_fork_is_not_mistaken_for_completed_admission() {
+        // A03: a crash between checkpoint copy and the fork's own
+        // `run_queued` leaves a journal whose (rewritten) source
+        // `run_queued` predates `run_forked`. Adoption must wipe it for a
+        // deterministic redo instead of resuming the partial fork.
+        let runs = temp_run_dir("fork-partial-adopt");
+        let _ = std::fs::remove_dir_all(&runs);
+        let generators =
+            Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+        let service = LocalQcgService::new(generators, runs.clone(), None)
+            .expect("service should initialize");
+        let source = service
+            .start_run(StartRun {
+                generator_id: "ask-user".into(),
+                inputs: BTreeMap::new(),
+                answers: BTreeMap::from([("choose_mode".into(), json!("brief"))]),
+                ..Default::default()
+            })
+            .await
+            .expect("source run should start");
+        assert_eq!(
+            wait_for_terminal_snapshot(&service, &source).await.state,
+            RunStatus::Succeeded
+        );
+        let source_dir = service
+            .run_dir_for(&source)
+            .await
+            .expect("source dir should resolve");
+        let checkpoint = read_journal_events(&source_dir)
+            .expect("source journal")
+            .into_iter()
+            .filter_map(|event| {
+                (event.get("t").and_then(Value::as_str) == Some("step_finished"))
+                    .then(|| event.get("seq").and_then(Value::as_u64))
+                    .flatten()
+            })
+            .max()
+            .expect("source should have a finished step");
+        let fork_id = format!("ask-user-fork-{}", uuid::Uuid::now_v7());
+        let fork_dir = runs.join(&fork_id);
+        // Simulate the crash window: checkpoint copy done, own `run_queued`
+        // never appended.
+        crate::run_dirs::prepare_checkpoint_fork(
+            &source_dir,
+            &source,
+            &fork_dir,
+            &fork_id,
+            checkpoint,
+            &ForkStatePatch::default(),
+        )
+        .expect("checkpoint copy should succeed");
+        assert!(
+            !crate::run_dirs::try_adopt_run_dir(&fork_dir, &fork_id)
+                .expect("adoption check should succeed"),
+            "partial fork must not adopt"
+        );
+        assert!(
+            !fork_dir.exists(),
+            "partial fork must be wiped for a deterministic redo"
+        );
+        // The same reserved id now converges through a fresh fork.
+        let fork = service
+            .fork_run_with_id(
+                &source,
+                ForkRun {
+                    at_seq: checkpoint,
+                    ..Default::default()
+                },
+                Some(fork_id.clone()),
+            )
+            .await
+            .expect("fork redo should start");
+        assert_eq!(fork, fork_id);
         let snapshot = wait_for_terminal_snapshot(&service, &fork).await;
         assert_eq!(snapshot.state, RunStatus::Succeeded);
         assert_eq!(snapshot.parent_run_id.as_deref(), Some(source.as_str()));
@@ -1764,7 +1869,7 @@ fs_write = ["workspace"]
     }
 
     #[tokio::test]
-    async fn preprovisioned_confirmations_complete_run_without_interaction() {
+    async fn digest_bound_confirmation_authorizes_the_exact_operation() {
         let runs = temp_run_dir("preprovisioned-confirmations");
         let _ = std::fs::remove_dir_all(&runs);
         let generators =
@@ -1775,25 +1880,41 @@ fs_write = ["workspace"]
             .start_run(StartRun {
                 generator_id: "side-effect-confirm".into(),
                 inputs: BTreeMap::new(),
-                confirmations: BTreeMap::from([("effect:command".into(), true)]),
                 ..Default::default()
             })
             .await
-            .expect("pre-provisioned run should start");
+            .expect("run should start");
+        // Legacy node-wide `effect:command` approvals no longer exist: only
+        // the digest-bound confirmation journaled for this exact operation
+        // authorizes it.
+        let snapshot = wait_for_snapshot(&service, &id, RunStatus::Confirming).await;
+        let confirm = snapshot.confirm.expect("run should request confirmation");
+        assert!(
+            confirm.id.starts_with("effect:command:"),
+            "confirmation must bind the operation digest"
+        );
+        service
+            .confirm(
+                id.clone(),
+                confirm.id.clone(),
+                ConfirmDecision {
+                    decision: ConfirmationDecision::Approve,
+                },
+            )
+            .await
+            .expect("confirmation should resume run");
         let snapshot = wait_for_terminal_snapshot(&service, &id).await;
         assert_eq!(snapshot.state, RunStatus::Succeeded);
         assert!(snapshot.confirm.is_none());
-        let journal = service
-            .read_journal(id)
-            .await
-            .expect("journal should be readable");
+        let journal = read_journal_string(&service, id).await;
         assert!(
             journal
                 .lines()
                 .any(|line| line.contains("\"t\":\"side_effect\"")
                     && line.contains("\"node\":\"effect\"")
-                    && line.contains("\"decision\":\"approved_by_user\"")),
-            "pre-approved side effect must execute"
+                    && line.contains("\"decision\":\"approved_by_user\"")
+                    && !line.contains("approved_by_bulk")),
+            "approved side effect must execute"
         );
         let _ = std::fs::remove_dir_all(&runs);
     }
@@ -1901,8 +2022,18 @@ isolation = "trusted_host"
             let confirm = snapshot
                 .confirm
                 .expect("iteration should request side-effect confirmation");
-            assert_eq!(confirm.id, format!("each[{index}]/effect:command"));
+            assert!(
+                confirm
+                    .id
+                    .starts_with(&format!("each[{index}]/effect:command:")),
+                "confirm id must bind the operation digest, got `{}`",
+                confirm.id
+            );
             assert_eq!(confirm.target, format!("echo {item}"));
+            assert!(
+                !confirm.operation_digest.is_empty(),
+                "confirm must carry the operation digest"
+            );
             service
                 .confirm(
                     id.clone(),
@@ -1917,10 +2048,7 @@ isolation = "trusted_host"
 
         let snapshot = wait_for_terminal_snapshot(&service, &id).await;
         assert_eq!(snapshot.state, RunStatus::Succeeded);
-        let journal = service
-            .read_journal(id)
-            .await
-            .expect("journal should be readable");
+        let journal = read_journal_string(&service, id).await;
         for index in 0..2 {
             let node = format!("\"node\":\"each[{index}]/effect\"");
             assert_eq!(
@@ -2164,10 +2292,7 @@ commands = [{ bin = "sh", args = ["-c", "sleep 30"], purpose = "hold resumed run
         }
         let snapshot = wait_for_snapshot(&service, &id, RunStatus::Canceled).await;
         assert_eq!(snapshot.state, RunStatus::Canceled);
-        let journal = service
-            .read_journal(id)
-            .await
-            .expect("journal should be readable");
+        let journal = read_journal_string(&service, id).await;
         assert_eq!(journal.matches("\"t\":\"run_canceled\"").count(), 1);
         assert!(!journal.contains("\"status\":\"success\",\"t\":\"run_finished\""));
     }
@@ -2250,10 +2375,7 @@ commands = [{ bin = "echo", args = ["effect"], purpose = "resume safety proof", 
             .expect("answer should trigger a guarded resume");
         let snapshot = wait_for_terminal_snapshot(&service, &id).await;
         assert_eq!(snapshot.state, RunStatus::Failed);
-        let journal = service
-            .read_journal(id)
-            .await
-            .expect("journal should be readable");
+        let journal = read_journal_string(&service, id).await;
         assert_eq!(
             journal
                 .lines()
@@ -2530,6 +2652,7 @@ content = "{{ inputs.marker }}"
                 task: Arc::new(Mutex::new(None)),
                 queued_at: at,
                 owner_id: String::new(),
+                ephemeral: false,
             };
             write_run_event(
                 &record,
@@ -2599,6 +2722,7 @@ content = "{{ inputs.marker }}"
             task: Arc::new(Mutex::new(None)),
             queued_at: Some(chrono::Utc::now()),
             owner_id: String::new(),
+            ephemeral: false,
         };
         write_run_event(
             &record,
@@ -2680,15 +2804,19 @@ content = "{{ inputs.marker }}"
                 "question_id": "fetch:mcp:server/tool:deadbeef",
                 "server": "server",
                 "tool": "tool",
+                "call_id": "call-1",
                 "arguments": { "q": "x" },
                 "request_state": "state-1",
                 "input_requests": {},
             }),
         )
         .expect("pending event should append");
-        let pending = read_persisted_mcp_pending(&root.join("runs").join(&run_id))
-            .expect("pending continuation should be readable");
-        let descriptor = pending
+        // The typed journal store (not the answers map) carries the
+        // descriptor, including the invocation binding.
+        let state = crate::summaries::fold_run_state(&root.join("runs").join(&run_id))
+            .expect("journal should fold");
+        let descriptor = state
+            .mcp_pending
             .get("fetch:mcpcont:server/tool:abc123#__mcp_pending")
             .expect("pending descriptor should be keyed by reservation");
         assert_eq!(
@@ -2698,6 +2826,29 @@ content = "{{ inputs.marker }}"
         assert_eq!(
             descriptor.get("question_id").and_then(Value::as_str),
             Some("fetch:mcp:server/tool:deadbeef")
+        );
+        assert_eq!(
+            descriptor.get("call_id").and_then(Value::as_str),
+            Some("call-1")
+        );
+        // Completion consumes the continuation so later identical calls
+        // start fresh instead of resuming it.
+        write_run_event(
+            &record,
+            "mcp_continuation_consumed",
+            json!({
+                "node": "fetch",
+                "pending_key": "fetch:mcpcont:server/tool:abc123#__mcp_pending",
+            }),
+        )
+        .expect("consume event should append");
+        let state = crate::summaries::fold_run_state(&root.join("runs").join(&run_id))
+            .expect("journal should fold");
+        assert!(
+            !state
+                .mcp_pending
+                .contains_key("fetch:mcpcont:server/tool:abc123#__mcp_pending"),
+            "consumed continuation must leave the store"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2751,10 +2902,7 @@ content = "{{ inputs.marker }}"
         .expect("peer answer should be accepted");
         let terminal = wait_for_terminal_snapshot(&peer, &id).await;
         assert_eq!(terminal.state, RunStatus::Succeeded);
-        let journal = peer
-            .read_journal(id.clone())
-            .await
-            .expect("journal should be readable");
+        let journal = read_journal_string(&peer, id.clone()).await;
         assert!(
             journal.contains("\"t\":\"user_answered\""),
             "peer decision must be journaled for the owner to adopt"
@@ -2809,10 +2957,7 @@ content = "{{ inputs.marker }}"
                 );
             }
         }
-        let journal = service
-            .read_journal(id.clone())
-            .await
-            .expect("journal should be readable");
+        let journal = read_journal_string(&service, id.clone()).await;
         assert_eq!(
             journal.matches("\"t\":\"user_answered\"").count(),
             1,
@@ -2860,6 +3005,7 @@ content = "{{ inputs.marker }}"
             task: Arc::new(Mutex::new(Some(stuck))),
             queued_at: None,
             owner_id: String::new(),
+            ephemeral: false,
         };
         write_run_event(
             &record,
@@ -2890,10 +3036,7 @@ content = "{{ inputs.marker }}"
             started.elapsed() < std::time::Duration::from_secs(25),
             "shutdown deadline must bound the wait"
         );
-        let journal = service
-            .read_journal(run_id.to_string())
-            .await
-            .expect("journal should be readable");
+        let journal = read_journal_string(&service, run_id.to_string()).await;
         assert!(
             journal.contains("run_interrupted"),
             "abandoned work must be marked interrupted for restart triage"
@@ -2950,6 +3093,249 @@ content = "{{ inputs.marker }}"
         drop(owner);
         drop(peer);
         drop(exclusive);
+        let _ = std::fs::remove_dir_all(&runs);
+    }
+
+    #[tokio::test]
+    async fn start_run_persists_canonical_default_inputs() {
+        // A10: admission resolves defaults once and persists the canonical
+        // inputs to the journal, the memory record, and the engine.
+        let root = temp_run_dir("canonical-inputs");
+        let _ = std::fs::remove_dir_all(&root);
+        let generator = root.join("generator");
+        let runs = root.join("runs");
+        std::fs::create_dir_all(&generator).expect("generator directory should be created");
+        std::fs::write(
+            generator.join("qcg.toml"),
+            r#"
+[generator]
+id = "generator"
+name = "Canonical Inputs"
+version = "0.1.0"
+qcg_version = "^0.1"
+
+[[inputs.stages]]
+id = "main"
+
+[[inputs.stages.fields]]
+id = "name"
+type = "string"
+default = "world"
+
+[[flow]]
+id = "out"
+type = "write"
+
+[flow.params]
+content = "hello {{ inputs.name }}"
+output_file = "out.txt"
+
+[permissions]
+fs_write = ["workspace"]
+"#,
+        )
+        .expect("generator manifest should be written");
+        let service = LocalQcgService::new(root.clone(), runs.clone(), None)
+            .expect("service should initialize");
+        let id = service
+            .start_run(StartRun {
+                generator_id: "generator".into(),
+                inputs: BTreeMap::new(),
+                ..Default::default()
+            })
+            .await
+            .expect("run should start");
+        let snapshot = wait_for_terminal_snapshot(&service, &id).await;
+        assert_eq!(snapshot.state, RunStatus::Succeeded);
+        let journal = read_journal_string(&service, id.clone()).await;
+        assert!(
+            journal.contains("\"name\":\"world\"") || journal.contains("\"name\": \"world\""),
+            "canonical default input must reach the journal, got: {journal}"
+        );
+        let run_dir = service
+            .run_dir_for(&id)
+            .await
+            .expect("run dir should resolve");
+        let state = crate::summaries::fold_run_state(&run_dir).expect("fold should succeed");
+        assert_eq!(
+            state.inputs.as_ref().and_then(|inputs| inputs.get("name")),
+            Some(&json!("world")),
+            "folded inputs must carry the resolved default"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn cancel_mailbox_reaches_disk_only_peer_owner() {
+        // A02: a peer tracking no local record still delivers cancellation
+        // through the durable mailbox.
+        let root = temp_run_dir("cancel-mailbox");
+        let _ = std::fs::remove_dir_all(&root);
+        let generator = root.join("generator");
+        let runs = root.join("runs");
+        std::fs::create_dir_all(&generator).expect("generator directory should be created");
+        std::fs::write(
+            generator.join("qcg.toml"),
+            r#"
+[generator]
+id = "generator"
+name = "Cancel Mailbox"
+version = "0.1.0"
+qcg_version = "^0.1"
+
+[[flow]]
+id = "ask"
+type = "ask_user"
+
+[flow.params]
+content = "Continue?"
+options = ["yes"]
+
+[permissions]
+fs_write = ["workspace"]
+"#,
+        )
+        .expect("generator manifest should be written");
+        let owner = LocalQcgService::new(root.clone(), runs.clone(), None)
+            .expect("service should initialize");
+        let id = owner
+            .start_run(StartRun {
+                generator_id: "generator".into(),
+                inputs: BTreeMap::new(),
+                ..Default::default()
+            })
+            .await
+            .expect("run should start");
+        wait_for_snapshot(&owner, &id, RunStatus::Waiting).await;
+        // Simulate a peer process sharing the runs directory but tracking
+        // nothing in memory: dropping its memory record must not drop the
+        // durable cancel signal.
+        let peer = LocalQcgService::with_generator_roots_max_active_runs_and_store_mode(
+            vec![root.clone()],
+            runs.clone(),
+            None,
+            qcg_policy::DEFAULT_MAX_ACTIVE_RUNS,
+            DEFAULT_MAX_TRACKED_RUNS,
+            RunStoreMode::SharedFilesystem,
+        )
+        .expect("peer should initialize");
+        peer.inner.runs.write().await.remove(&id);
+        peer.cancel(id.clone())
+            .await
+            .expect("disk-only peer cancel should succeed");
+        let run_dir = owner
+            .run_dir_for(&id)
+            .await
+            .expect("run dir should resolve");
+        assert!(
+            crate::summaries::has_remote_cancel_request(&run_dir)
+                .expect("cancel check should succeed"),
+            "mailbox cancel must be observable by the owner"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn cancel_acceptance_is_not_settlement_until_terminal_is_journaled() {
+        // A02: a mailbox cancel observed by a non-owning peer reports
+        // `CancelRequested`, never `Canceled`. Only a journaled terminal
+        // outcome settles the display.
+        let root = temp_run_dir("cancel-acceptance");
+        let _ = std::fs::remove_dir_all(&root);
+        let generator = root.join("generator");
+        let runs = root.join("runs");
+        std::fs::create_dir_all(&generator).expect("generator directory should be created");
+        std::fs::write(
+            generator.join("qcg.toml"),
+            r#"
+[generator]
+id = "generator"
+name = "Cancel Acceptance"
+version = "0.1.0"
+qcg_version = "^0.1"
+
+[[flow]]
+id = "ask"
+type = "ask_user"
+
+[flow.params]
+content = "Continue?"
+options = ["yes"]
+
+[permissions]
+fs_write = ["workspace"]
+"#,
+        )
+        .expect("generator manifest should be written");
+        let owner = LocalQcgService::new(root.clone(), runs.clone(), None)
+            .expect("service should initialize");
+        let id = owner
+            .start_run(StartRun {
+                generator_id: "generator".into(),
+                inputs: BTreeMap::new(),
+                ..Default::default()
+            })
+            .await
+            .expect("run should start");
+        wait_for_snapshot(&owner, &id, RunStatus::Waiting).await;
+        // A non-owning peer shares the directory but tracks nothing.
+        let peer = LocalQcgService::with_generator_roots_max_active_runs_and_store_mode(
+            vec![root.clone()],
+            runs.clone(),
+            None,
+            qcg_policy::DEFAULT_MAX_ACTIVE_RUNS,
+            DEFAULT_MAX_TRACKED_RUNS,
+            RunStoreMode::SharedFilesystem,
+        )
+        .expect("peer should initialize");
+        let run_dir = peer.run_dir_for(&id).await.expect("run dir should resolve");
+        crate::run_dirs::request_remote_cancel(&run_dir, &id, "peer-test")
+            .expect("mailbox write should succeed");
+        // No terminal outcome exists: nothing settled.
+        let folded = crate::summaries::fold_run_state(&run_dir).expect("fold should succeed");
+        assert!(
+            folded.terminal.is_none(),
+            "mailbox acceptance must not journal a terminal outcome by itself"
+        );
+        peer.refresh_shared_runs()
+            .await
+            .expect("refresh should succeed");
+        assert_eq!(
+            peer.snapshot(id.clone())
+                .await
+                .expect("snapshot should be available")
+                .state,
+            RunStatus::CancelRequested,
+            "mailbox acceptance must display as requested, not canceled"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn snapshot_exposes_generator_id_without_parsing_run_id() {
+        // C03: snapshots carry the generator id explicitly so UUID hyphens
+        // never leak into parsed ids.
+        let runs = temp_run_dir("snapshot-generator-id");
+        let _ = std::fs::remove_dir_all(&runs);
+        let generators =
+            Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+        let service = LocalQcgService::new(generators, runs.clone(), None)
+            .expect("service should initialize");
+        let id = service
+            .start_run(StartRun {
+                generator_id: "ask-user".into(),
+                inputs: BTreeMap::new(),
+                answers: BTreeMap::from([("choose_mode".into(), json!("brief"))]),
+                ..Default::default()
+            })
+            .await
+            .expect("run should start");
+        let snapshot = wait_for_terminal_snapshot(&service, &id).await;
+        assert_eq!(snapshot.generator_id.as_str(), "ask-user");
+        assert!(
+            !snapshot.generator_id.contains('-') || snapshot.generator_id == "ask-user",
+            "generator id must not contain UUID fragments"
+        );
         let _ = std::fs::remove_dir_all(&runs);
     }
 }

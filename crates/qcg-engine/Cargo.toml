@@ -13,9 +13,11 @@ async-trait.workspace = true
 camino.workspace = true
 chrono.workspace = true
 dunce.workspace = true
+fs2.workspace = true
 minijinja.workspace = true
 qcg-policy = { path = "../qcg-policy" }
 qcg-api = { path = "../qcg-api" }
+qcg-container = { path = "../qcg-container" }
 qcg-contract = { path = "../qcg-contract" }
 regex.workspace = true
 qcg-llm = { path = "../qcg-llm" }

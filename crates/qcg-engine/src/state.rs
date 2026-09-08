@@ -5,7 +5,7 @@ use qcg_contract::ValueBag;
 use qcg_types::{FailureCode, FailureDetail, NodePath};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(unix)]
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -87,6 +87,11 @@ pub struct RunState {
     pub run_id: Option<String>,
     #[serde(default)]
     pub contract_sha256: Option<String>,
+    /// Owning generator id derived from the journal identity event, so
+    /// disk-only snapshots never parse it out of the run id string.
+    /// Required on read: persisted state without an owner is corrupt and
+    /// must fail instead of silently degrading to ownerless.
+    pub generator_id: Option<String>,
     #[serde(default)]
     pub last_seq: u64,
     /// The canonical inputs recorded by `run_started`; retained for replay.
@@ -104,10 +109,52 @@ pub struct RunState {
     pub resource_pins: BTreeMap<String, String>,
     #[serde(default)]
     pub pending: Option<Interaction>,
+    /// Journal seq of the event that installed the current `pending` prompt.
+    /// Answer and confirm acceptance must match this generation, not just
+    /// the prompt id, so a stale observation cannot accept a prompt that a
+    /// peer already regenerated (A02).
+    #[serde(default)]
+    pub pending_seq: Option<u64>,
     #[serde(default)]
     pub terminal: Option<TerminalState>,
     #[serde(default)]
     pub execution_started: bool,
+    /// External side-effect operations by operation_id: `started` means the
+    /// remote may have executed while the result is unknown, `finished`
+    /// means the result was durably recorded. Retried executions with the
+    /// same id reuse the recorded result instead of duplicating the remote
+    /// effect; started-without-finished refuses automatic replay.
+    #[serde(default)]
+    pub operations: BTreeMap<String, String>,
+    /// Guard generations by operation_id: counts `operation_started` events
+    /// so each guard journals a truthful attempt number derived from durable
+    /// state instead of a caller-supplied constant.
+    #[serde(default)]
+    pub operation_attempts: BTreeMap<String, u32>,
+    /// Durably accepted HITL answers by question id. Later `user_answered`
+    /// events win; consulted under the journal lock so exactly one of two
+    /// racing answers is accepted per question.
+    #[serde(default)]
+    pub answers: BTreeMap<String, Value>,
+    /// Durably accepted HITL decisions by confirmation id.
+    #[serde(default)]
+    pub confirmations: BTreeMap<String, bool>,
+    /// Whether any `user_cancel_requested` was journaled. Consulted under
+    /// the journal lock so a concurrent answer cannot revive a canceled run.
+    #[serde(default)]
+    pub cancel_requested: bool,
+    /// Journaled cancel operation ids for mailbox deduplication.
+    #[serde(default)]
+    pub cancel_operations: BTreeSet<String>,
+    /// Journaled MCP continuation descriptors by reserved pending key.
+    #[serde(default)]
+    pub mcp_pending: BTreeMap<String, Value>,
+    /// Continuation resumptions by pending key to last resumed question id.
+    /// A restart that finds its own pending key already resumed for the same
+    /// question proves a crash mid-remote-call with an indeterminate remote
+    /// outcome, and must fail instead of blindly resuming.
+    #[serde(default)]
+    pub mcp_resumed: BTreeMap<String, String>,
 }
 
 impl Default for RunState {
@@ -116,6 +163,7 @@ impl Default for RunState {
             schema_version: RUN_STATE_SCHEMA_VERSION,
             run_id: None,
             contract_sha256: None,
+            generator_id: None,
             last_seq: 0,
             inputs: None,
             vars: ValueBag::default(),
@@ -124,10 +172,31 @@ impl Default for RunState {
             budget: BudgetState::default(),
             resource_pins: BTreeMap::new(),
             pending: None,
+            pending_seq: None,
             terminal: None,
             execution_started: false,
+            operations: BTreeMap::new(),
+            operation_attempts: BTreeMap::new(),
+            answers: BTreeMap::new(),
+            confirmations: BTreeMap::new(),
+            cancel_requested: false,
+            cancel_operations: BTreeSet::new(),
+            mcp_pending: BTreeMap::new(),
+            mcp_resumed: BTreeMap::new(),
         }
     }
+}
+
+/// Stable operation id for an external side effect. Binds run, node, and
+/// the canonical operation digest so retries of the same logical operation
+/// reuse the id as the remote idempotency key, while regenerated operations
+/// get a fresh id. Retries deliberately share the id; started/finished
+/// events track the latest status per id.
+pub fn operation_id_for(run_id: &str, node_id: &str, operation_digest: &str) -> String {
+    format!(
+        "{run_id}:{node_id}:{}",
+        &operation_digest[..16.min(operation_digest.len())]
+    )
 }
 
 impl RunState {
@@ -167,9 +236,38 @@ impl RunState {
         Ok(state)
     }
 
+    /// Folds already-read journal values with the same validation as
+    /// [`Self::fold_journal`]: every event is type-checked before it
+    /// affects state, so readers that already hold the values never
+    /// re-read the file to fold.
+    pub fn fold_values(events: &[Value]) -> Result<Self, crate::JournalError> {
+        let mut state = Self::default();
+        for event in events {
+            qcg_api::RunEvent::from_flat(event).map_err(|message| {
+                crate::JournalError::InvalidEvent(format!("invalid journal event: {message}"))
+            })?;
+            state.apply(event)?;
+        }
+        Ok(state)
+    }
+
     pub fn apply(&mut self, event: &Value) -> Result<(), crate::JournalError> {
         if let Some(seq) = event.get("seq").and_then(Value::as_u64) {
-            self.last_seq = self.last_seq.max(seq);
+            // Strict monotonicity: duplicate or rewound seq values indicate
+            // concurrent writers or journal corruption and must fail closed
+            // instead of silently keeping last-writer-wins state (A01).
+            if seq == 0 {
+                return Err(crate::JournalError::InvalidEvent(
+                    "journal event seq must be greater than zero".into(),
+                ));
+            }
+            if seq <= self.last_seq {
+                return Err(crate::JournalError::InvalidEvent(format!(
+                    "journal event seq {seq} is not greater than last_seq {}",
+                    self.last_seq
+                )));
+            }
+            self.last_seq = seq;
         }
         let kind = event
             .get("t")
@@ -185,6 +283,18 @@ impl RunState {
                     .get("contract_sha256")
                     .and_then(Value::as_str)
                     .map(str::to_string);
+                if self.generator_id.is_none() {
+                    self.generator_id =
+                        event
+                            .get("generator")
+                            .and_then(Value::as_str)
+                            .map(|generator| {
+                                generator
+                                    .split_once('@')
+                                    .map(|(id, _)| id.to_string())
+                                    .unwrap_or_else(|| generator.to_string())
+                            });
+                }
                 if let Some(inputs) = event.get("inputs").and_then(Value::as_object) {
                     let inputs = inputs
                         .iter()
@@ -197,6 +307,22 @@ impl RunState {
                 if self.budget.started_at.is_none() {
                     self.budget.started_at =
                         event.get("ts").and_then(Value::as_str).map(str::to_string);
+                }
+                // Pre-provided answers and confirmations ride on run_queued
+                // for unattended runs; later events win on the same key.
+                if kind == "run_queued" {
+                    if let Some(map) = event.get("answers").and_then(Value::as_object) {
+                        for (key, value) in map {
+                            self.answers.insert(key.clone(), value.clone());
+                        }
+                    }
+                    if let Some(map) = event.get("confirmations").and_then(Value::as_object) {
+                        for (key, value) in map {
+                            if let Some(approved) = value.as_bool() {
+                                self.confirmations.insert(key.clone(), approved);
+                            }
+                        }
+                    }
                 }
                 if kind == "run_started" {
                     self.execution_started = true;
@@ -318,6 +444,7 @@ impl RunState {
                         ))
                     })?;
                     self.pending = Some(Interaction::Confirmation { confirm });
+                    self.pending_seq = event.get("seq").and_then(Value::as_u64);
                 }
             }
             "run_waiting" => {
@@ -328,18 +455,85 @@ impl RunState {
                         ))
                     })?;
                     self.pending = Some(Interaction::Question { question });
+                    self.pending_seq = event.get("seq").and_then(Value::as_u64);
                 }
             }
             "user_answered" | "user_confirmed" => {
                 // Durability record for an accepted HITL response. The engine
                 // consumes the persisted answers map on resume, so the
                 // pending prompt is cleared here and rehydrate restores the
-                // values from the same events.
+                // values from the same events. Later events win on the same
+                // key, matching read_persisted_hitl.
+                if kind == "user_answered" {
+                    if let (Some(id), Some(values)) = (
+                        event.get("question_id").and_then(Value::as_str),
+                        event.get("values").cloned(),
+                    ) {
+                        self.answers.insert(id.to_string(), values);
+                    }
+                } else if let (Some(id), Some(approved)) = (
+                    event.get("confirmation_id").and_then(Value::as_str),
+                    event.get("approved").and_then(Value::as_bool),
+                ) {
+                    self.confirmations.insert(id.to_string(), approved);
+                }
                 self.pending = None;
+                self.pending_seq = None;
                 self.terminal = None;
+            }
+            "user_cancel_requested" => {
+                self.cancel_requested = true;
+                // Only operation-bound cancels join the mailbox dedup set.
+                // Pre-mailbox events carry no operation id and are observed
+                // through cancel_requested instead.
+                if let Some(operation_id) = event.get("operation_id").and_then(Value::as_str) {
+                    self.cancel_operations.insert(operation_id.to_string());
+                }
+            }
+            "mcp_input_pending" => {
+                // Same filtered shape as the service-side pending reader so
+                // both paths observe identical descriptors.
+                if let Some(key) = event.get("pending_key").and_then(Value::as_str) {
+                    let mut pending = serde_json::Map::new();
+                    for field in [
+                        "node",
+                        "question_id",
+                        "server",
+                        "tool",
+                        "alias",
+                        "call_id",
+                        "arguments",
+                        "request_state",
+                        "input_requests",
+                    ] {
+                        if let Some(value) = event.get(field).cloned() {
+                            pending.insert(field.to_string(), value);
+                        }
+                    }
+                    self.mcp_pending
+                        .insert(key.to_string(), Value::Object(pending));
+                }
+            }
+            "mcp_continuation_consumed" => {
+                if let Some(key) = event.get("pending_key").and_then(Value::as_str) {
+                    self.mcp_pending.remove(key);
+                    self.mcp_resumed.remove(key);
+                    self.operations
+                        .insert(format!("mcp:{key}"), "finished:consumed".to_string());
+                }
+            }
+            "mcp_continuation_resumed" => {
+                if let (Some(key), Some(question_id)) = (
+                    event.get("pending_key").and_then(Value::as_str),
+                    event.get("question_id").and_then(Value::as_str),
+                ) {
+                    self.mcp_resumed
+                        .insert(key.to_string(), question_id.to_string());
+                }
             }
             "run_finished" => {
                 self.pending = None;
+                self.pending_seq = None;
                 self.terminal = Some(
                     if event.get("status").and_then(Value::as_str) == Some("success") {
                         TerminalState::Succeeded
@@ -350,15 +544,41 @@ impl RunState {
             }
             "run_error" => {
                 self.pending = None;
+                self.pending_seq = None;
                 self.terminal = Some(TerminalState::Failed);
             }
             "run_canceled" => {
                 self.pending = None;
+                self.pending_seq = None;
                 self.terminal = Some(TerminalState::Canceled);
             }
             "run_interrupted" => {
                 self.pending = None;
+                self.pending_seq = None;
                 self.terminal = Some(TerminalState::Interrupted);
+            }
+            "operation_started" => {
+                if let Some(id) = event.get("operation_id").and_then(Value::as_str) {
+                    self.operations
+                        .insert(id.to_string(), "started".to_string());
+                    let attempts = self.operation_attempts.entry(id.to_string()).or_default();
+                    *attempts = attempts.saturating_add(1);
+                }
+            }
+            "operation_finished" => {
+                if let Some(id) = event.get("operation_id").and_then(Value::as_str) {
+                    // A finished event without a status is corrupt: every
+                    // writer records one. Defaulting to success would refuse
+                    // replays of an indeterminate outcome, so fail toward
+                    // error, which retries under the same remote idempotency
+                    // key instead of wedging.
+                    let status = event
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("error");
+                    self.operations
+                        .insert(id.to_string(), format!("finished:{status}"));
+                }
             }
             _ => {}
         }
@@ -404,6 +624,7 @@ impl RunState {
                 .insert(NodePath::root(path), NodeOutcome::Success { output, files });
             self.checkpoints.remove(&NodePath::root(path));
             self.pending = None;
+            self.pending_seq = None;
         } else if !matches!(status, "needs_user" | "needs_confirm") {
             self.budget.steps_failed = self.budget.steps_failed.saturating_add(1);
             let reason = failure_detail(event, FailureCode::ExecutionFailed, status)?;
@@ -462,4 +683,94 @@ fn failure_detail(
     serde_json::from_value(reason.clone()).map_err(|error| {
         crate::JournalError::InvalidEvent(format!("invalid structured failure detail: {error}"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn operation_event(seq: u64, kind: &str, id: &str, status: Option<&str>) -> Value {
+        let mut event = json!({
+            "t": kind,
+            "seq": seq,
+            "operation_id": id,
+        });
+        if let Some(status) = status {
+            event["status"] = json!(status);
+        }
+        event
+    }
+
+    #[test]
+    fn operation_attempts_count_guards_per_id() {
+        let mut state = RunState::default();
+        state
+            .apply(&operation_event(1, "operation_started", "op-a", None))
+            .expect("first guard should fold");
+        state
+            .apply(&operation_event(2, "operation_started", "op-b", None))
+            .expect("other id should fold");
+        state
+            .apply(&operation_event(
+                3,
+                "operation_finished",
+                "op-a",
+                Some("error"),
+            ))
+            .expect("finish should fold");
+        state
+            .apply(&operation_event(4, "operation_started", "op-a", None))
+            .expect("retry guard should fold");
+        assert_eq!(state.operation_attempts.get("op-a"), Some(&2));
+        assert_eq!(state.operation_attempts.get("op-b"), Some(&1));
+        assert_eq!(
+            state.operations.get("op-a").map(String::as_str),
+            Some("started")
+        );
+    }
+
+    #[test]
+    fn pending_seq_tracks_prompt_generation() {
+        let mut state = RunState::default();
+        assert_eq!(state.pending_seq, None);
+        state
+            .apply(&json!({
+                "t": "run_waiting",
+                "seq": 1,
+                "question": {"id": "q1", "title": "first", "fields": []},
+            }))
+            .expect("waiting should fold");
+        assert_eq!(state.pending_seq, Some(1));
+        // A regenerated prompt advances the generation even for the same id.
+        state
+            .apply(&json!({
+                "t": "run_waiting",
+                "seq": 2,
+                "question": {"id": "q1", "title": "second", "fields": []},
+            }))
+            .expect("regenerated waiting should fold");
+        assert_eq!(state.pending_seq, Some(2));
+        state
+            .apply(&json!({
+                "t": "user_answered",
+                "seq": 3,
+                "question_id": "q1",
+                "values": {"answer": "yes"},
+            }))
+            .expect("answer should fold");
+        assert_eq!(state.pending_seq, None);
+        state
+            .apply(&json!({
+                "t": "confirm_request",
+                "seq": 4,
+                "confirm": {"id": "c1", "title": "go", "kind": "k", "target": "t", "dry_run": false},
+            }))
+            .expect("confirm request should fold");
+        assert_eq!(state.pending_seq, Some(4));
+        state
+            .apply(&json!({"t": "run_canceled", "seq": 5}))
+            .expect("cancel should fold");
+        assert_eq!(state.pending_seq, None);
+    }
 }

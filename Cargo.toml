@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/qcg-types",
+  "crates/qcg-container",
   "crates/qcg-contract",
   "crates/qcg-expr-wasm",
   "crates/qcg-engine",

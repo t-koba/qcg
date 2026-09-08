@@ -239,15 +239,28 @@ effects are denied unless explicitly declared.
   explicitly grants execution under the qcg OS identity and cannot name an
   image.
 - `containers`: `{ enabled, runtime, images, on_missing }`. Enabled containers
-  must select `docker`, `podman`, or `docker_runsc`; runtime auto-detection is
-  deliberately forbidden. Every image must be digest-pinned.
+  must select `docker`, `podman`, `docker_runsc`, `incus`, `lxd`, or `lxc`;
+  runtime auto-detection is deliberately forbidden. Image pin forms follow
+  the runtime: `docker`, `podman`, and `docker_runsc` require
+  `name@sha256:<hex>`; `incus` and `lxd` require
+  `<remote>:<path>@sha256:<fingerprint>` and launch by fingerprint so
+  exactly the pinned bits run (pre-pull the fingerprint with
+  `image copy`); `lxc` requires `<dist>:<release>` (for example
+  `alpine:3.20`) verified through the signed download index.
 - `side_effects`: `none`, `confirm`, `dry_run_first`, or `allowed`.
 
-Container commands run without a shell in Docker or Podman with no network, a
-read-only root, all capabilities dropped, no-new-privileges, a PID limit, and
-only the run workspace mounted at `/work`. Trusted-host commands run without a
-shell with a cleared environment, timeout, process-tree cancellation, and
-output limits. Stdio MCP processes use the same declared isolation mode.
+Container commands run without a shell with no network and only the run
+workspace mounted at `/work`. Docker-compatible runtimes add a read-only
+root, all capabilities dropped, no-new-privileges, a PID limit, and a
+bounded `/tmp`. Incus-like runtimes (`incus`, `lxd`) launch by image
+fingerprint with no NIC, a workspace-only disk device, and unprivileged
+confinement. Legacy `lxc` runtimes use a generated config with no network,
+workspace-only bind mounts, dropped capabilities, and no-new-privileges.
+The declared runtime is recorded in the command plan, and every backend
+family guarantees cleanup on cancel and timeout, including when the
+awaiting future is dropped. Trusted-host commands run without a shell with
+a cleared environment, timeout, process-tree cancellation, and output
+limits. Stdio MCP processes use the same declared isolation mode.
 
 ## `[tools.<name>]`
 
@@ -3433,6 +3446,10 @@ defaults to `true`; set it to `false` only for a known read-only operation. A
 true value routes the call through the
 contract's `[permissions].side_effects` policy: `none` denies it, `confirm`
 and `dry_run_first` create the normal HITL boundary, and `allowed` permits it.
+Each confirmation id binds the exact operation digest (`node:kind:digest`),
+so approving target A never authorizes a regenerated target B. Node-wide
+bulk approvals do not exist: every approval authorizes exactly one
+operation digest.
 
 For Streamable HTTP, every host in the profile's `allowed_hosts` must also be
 listed in `permissions.network`. For stdio, the complete profile `command`

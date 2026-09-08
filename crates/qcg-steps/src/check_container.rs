@@ -11,8 +11,8 @@ use serde_json::{Value, json};
 
 use super::common::render_command;
 use super::container_backend::{
-    ContainerMountSpec, ToolBackendCandidate, container_runtime_command,
-    execute_container_backend_candidate,
+    ContainerMountSpec, ToolBackendCandidate, execute_container_backend_candidate,
+    resolve_tool_backend,
 };
 pub(crate) struct CheckContainerStep;
 
@@ -118,7 +118,7 @@ impl StepExecutor for CheckContainerStep {
         ctx: &mut StepContext<'_>,
         node: &NodeDef,
     ) -> Result<StepOutcome, StepError> {
-        if container_runtime_command(&ctx.run.contract.manifest.permissions.containers).is_none() {
+        if resolve_tool_backend(&ctx.run.contract.manifest.permissions.containers).is_none() {
             let on_missing = ctx
                 .run
                 .contract

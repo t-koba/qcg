@@ -21,7 +21,7 @@ pub(crate) struct BoundedChildTransport {
         BoundedLineReader<tokio::process::ChildStdout>,
         tokio::process::ChildStdin,
     >,
-    container_cleanup: Option<(String, std::path::PathBuf)>,
+    container_cleanup: Option<qcg_container::Session>,
 }
 
 impl BoundedChildTransport {
@@ -62,12 +62,8 @@ impl BoundedChildTransport {
         })
     }
 
-    pub(crate) fn with_container_cleanup(
-        mut self,
-        runtime: String,
-        cidfile: std::path::PathBuf,
-    ) -> Self {
-        self.container_cleanup = Some((runtime, cidfile));
+    pub(crate) fn with_container_cleanup(mut self, session: qcg_container::Session) -> Self {
+        self.container_cleanup = Some(session);
         self
     }
 }
@@ -139,26 +135,12 @@ impl BoundedChildTransport {
     }
 
     fn kill_container_blocking(&mut self) {
-        let Some((runtime, cidfile)) = self.container_cleanup.take() else {
+        let Some(session) = self.container_cleanup.take() else {
             return;
         };
-        let id = std::fs::read_to_string(&cidfile)
-            .map(|id| id.trim().to_string())
-            .unwrap_or_default();
-        let _ = std::fs::remove_file(&cidfile);
-        if id.is_empty() {
-            return;
-        }
-        // Best effort: stop the daemon-side container when the CLI wrapper
-        // is gone. Timeouts are short because this also runs on Drop.
-        for args in [vec!["kill", &id], vec!["rm", "-f", &id]] {
-            let _ = std::process::Command::new(&runtime)
-                .args(&args)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-        }
+        // Best effort across every backend family. Timeouts are short
+        // because this also runs on Drop.
+        qcg_container::teardown_sync(&session);
     }
 }
 

@@ -20,7 +20,10 @@ pub(crate) fn validate_web_search_tool(
         ..
     } = tool
     else {
-        unreachable!("web search validation requires a web.search tool")
+        return Err(StepError::failed(
+            &node.id,
+            "web search validation requires a web.search tool",
+        ));
     };
     let profile = search_runtime
         .resolve(provider.as_deref())
@@ -75,7 +78,10 @@ pub(crate) async fn execute_web_search(
         ..
     } = tool
     else {
-        unreachable!("web search execution requires a web.search tool")
+        return Err(StepError::failed(
+            &node.id,
+            "web search execution requires a web.search tool",
+        ));
     };
     let profile = search_runtime
         .resolve(provider.as_deref())
@@ -204,6 +210,7 @@ pub(crate) async fn execute_web_search(
             sensitive_query,
             body: body.map(String::into_bytes),
             follow_redirects: false,
+            idempotency_key: None,
         })
         .await
         .map_err(|error| StepError::from_gateway(&node.id, error))?;

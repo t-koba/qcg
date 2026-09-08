@@ -1,8 +1,7 @@
-use super::common::{bounded_file_bytes, bounded_sha256_file};
-use qcg_contract::{ContainerRuntime, NodeDef, ToolBackendKind, ToolDef, ToolWorkspace};
+use super::common::bounded_sha256_file;
+use qcg_contract::{NodeDef, ToolBackendKind, ToolDef, ToolWorkspace};
 use qcg_engine::{StepContext, StepError};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 pub(crate) struct ToolBackendCandidate {
     pub(crate) kind: ToolBackendKind,
     pub(crate) argv: Vec<String>,
@@ -82,9 +81,7 @@ pub(crate) fn build_tool_backend_candidate(
                 .container
                 .as_ref()
                 .ok_or_else(|| "container backend is not declared".to_string())?;
-            if container_runtime_command(&ctx.run.contract.manifest.permissions.containers)
-                .is_none()
-            {
+            if resolve_tool_backend(&ctx.run.contract.manifest.permissions.containers).is_none() {
                 return Err("container runtime was not found".into());
             }
             let mounted_input = if matches!(tool.workspace, ToolWorkspace::None) {
@@ -192,88 +189,55 @@ pub(crate) async fn execute_container_backend_candidate(
     tool: &ToolDef,
     candidate: ToolBackendCandidate,
 ) -> Result<ContainerOutput, StepError> {
-    let (runtime, mut args) =
-        container_runtime_command(&ctx.run.contract.manifest.permissions.containers)
-            .ok_or_else(|| StepError::failed(&node.id, "container runtime was not found"))?;
+    let backend = resolve_tool_backend(&ctx.run.contract.manifest.permissions.containers)
+        .ok_or_else(|| StepError::failed(&node.id, "container runtime was not found"))?;
     let image = candidate
         .container_image
         .ok_or_else(|| StepError::failed(&node.id, "container image was not resolved"))?;
-    args.extend([
-        "--rm".to_string(),
-        "--network".to_string(),
-        "none".to_string(),
-        "--read-only".to_string(),
-        "--cap-drop".to_string(),
-        "ALL".to_string(),
-        "--security-opt".to_string(),
-        "no-new-privileges".to_string(),
-        "--pids-limit".to_string(),
-        "256".to_string(),
-        "--tmpfs".to_string(),
-        "/tmp:rw,noexec,nosuid,size=64m".to_string(),
-    ]);
-    let cidfile_name = format!(
-        ".qcg-container-{}.cid",
-        hex::encode(Sha256::digest(node.id.as_bytes()))
-    );
-    let cidfile = ctx.run.fs.workspace().join(&cidfile_name);
-    args.push("--cidfile".into());
-    args.push(cidfile.to_string());
-    for mount in &candidate.container_mounts {
-        args.push("-v".into());
-        args.push(format!(
-            "{}:{}:{}",
-            ctx.run.fs.workspace(),
-            mount.target,
-            mount.mode
-        ));
-    }
-    args.push(image);
-    args.extend(candidate.argv);
-    let argv = std::iter::once(runtime.clone())
-        .chain(args)
+    // Tool backends carry no workdir override today: the workload argv
+    // already references absolute guest paths, so managed families enter
+    // the first mount instead of inventing a directory.
+    let mounts = candidate
+        .container_mounts
+        .iter()
+        .map(|mount| {
+            (
+                ctx.run.fs.workspace().to_owned(),
+                mount.target.clone(),
+                mount.mode == "ro",
+            )
+        })
         .collect::<Vec<_>>();
-    let result = ctx
-        .spawn_process(
-            node,
-            &argv,
+    let output = ctx
+        .run
+        .cmd
+        .run_container_workload(
+            qcg_engine::ContainerWorkload {
+                image: &image,
+                mounts: &mounts,
+                workdir: None,
+                workload_argv: &candidate.argv,
+                stdin: None,
+            },
             tool.timeout_seconds,
             Some(tool.output_limit_bytes),
         )
-        .await;
-    if result.as_ref().is_err_and(StepError::is_cancelled)
-        && let Ok(bytes) = bounded_file_bytes(&cidfile, Some(1024)).await
-        && let Ok(container_id) = String::from_utf8(bytes)
-    {
-        ctx.kill_container(&runtime, container_id.trim()).await;
-    }
-    let _ = tokio::fs::remove_file(&cidfile).await;
-    let output = result?;
+        .await
+        .map_err(|error| StepError::from_gateway(&node.id, error))?;
     Ok(ContainerOutput {
-        runtime,
+        runtime: backend.display_name().to_string(),
         status: output.status,
         stdout: output.stdout,
         stderr: output.stderr,
     })
 }
 
-pub(crate) fn container_runtime_command(
+/// Resolves the declared tool container runtime to an available backend.
+/// `None` preserves the contract `on_missing` skip/error semantics; no
+/// technology is ever substituted silently.
+pub(crate) fn resolve_tool_backend(
     permission: &qcg_contract::ContainerPermission,
-) -> Option<(String, Vec<String>)> {
+) -> Option<qcg_container::Backend> {
     let runtime = permission.runtime.as_ref()?;
-    let (binary, runtime_arg) = match runtime {
-        ContainerRuntime::Docker => ("docker", None),
-        ContainerRuntime::Podman => ("podman", None),
-        ContainerRuntime::DockerRunsc => ("docker", Some("runsc")),
-    };
-    let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
-        .any(|dir| dir.join(binary).is_file())
-        .then(|| {
-            let mut args = vec!["run".to_string()];
-            if let Some(runtime) = runtime_arg {
-                args.extend(["--runtime".into(), runtime.into()]);
-            }
-            (binary.to_string(), args)
-        })
+    qcg_container::resolve_backend(runtime)
 }

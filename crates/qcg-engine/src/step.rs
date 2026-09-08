@@ -285,10 +285,6 @@ impl StepContext<'_> {
             .map_err(|error| StepError::from_gateway(&node.id, error))
     }
 
-    pub async fn kill_container(&self, runtime: &str, container_id: &str) {
-        self.run.cmd.kill_container(runtime, container_id).await;
-    }
-
     pub fn render_inline(&self, node: &NodeDef, source: &str) -> Result<String, StepError> {
         self.run
             .templates

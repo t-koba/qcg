@@ -55,6 +55,9 @@ pub struct SideEffectEventData {
     pub dry_run: bool,
     #[serde(default)]
     pub details: Option<Value>,
+    /// Canonical digest binding the approval to the exact operation (A06).
+    #[serde(default)]
+    pub operation_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize, JsonSchema)]
@@ -64,6 +67,8 @@ pub struct DryRunEventData {
     pub target: String,
     #[serde(default)]
     pub details: Option<Value>,
+    #[serde(default)]
+    pub operation_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize, JsonSchema)]

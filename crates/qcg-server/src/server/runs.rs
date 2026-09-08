@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use super::config::AppState;
 use super::error::ApiHttpError;
-use super::idempotency::with_idempotency;
+use super::idempotency::{IdempotentCall, with_idempotency};
 
 pub(crate) async fn list_runs(
     State(state): State<Arc<AppState>>,
@@ -39,6 +39,36 @@ pub(crate) async fn list_runs(
         .list_run_items()
         .await
         .map_err(ApiHttpError::from_api)?;
+    // Stable chronological order across generators comes from
+    // list_run_items as (started_at, run_id); run_id alone embeds the
+    // generator prefix and never sorts globally by time (C01).
+    // Cursor is `started_at|run_id` for the new order. Bare run_id cursors
+    // are rejected instead of silently misordered.
+    let cursor_position = match query.cursor.as_deref() {
+        None => None,
+        Some(cursor) => match cursor.split_once('|') {
+            Some((started_at, run_id)) => Some((started_at.to_string(), run_id.to_string())),
+            None => {
+                return Err(ApiHttpError::bad_request_field(
+                    "cursor",
+                    "cursor must have form `started_at|run_id`",
+                ));
+            }
+        },
+    };
+    // A run with an unparseable started_at is journal corruption: gc fails
+    // on the same condition, so listing must fail closed as well instead of
+    // silently dropping the run from filtered results.
+    if since.is_some() {
+        for item in &items {
+            if let Err(error) = chrono::DateTime::parse_from_rfc3339(&item.started_at) {
+                return Err(ApiHttpError::internal(format!(
+                    "run `{}` has invalid started_at: {error}",
+                    item.run_id
+                )));
+            }
+        }
+    }
     items.retain(|item| {
         query.state.is_none_or(|run_state| item.state == run_state)
             && query
@@ -49,13 +79,16 @@ pub(crate) async fn list_runs(
                 chrono::DateTime::parse_from_rfc3339(&item.started_at)
                     .is_ok_and(|started_at| started_at >= since)
             })
-            && query
-                .cursor
+            && cursor_position
                 .as_ref()
-                .is_none_or(|cursor| &item.run_id > cursor)
+                .is_none_or(|(cursor_started, cursor_id)| {
+                    (&item.started_at, &item.run_id) > (cursor_started, cursor_id)
+                })
     });
-    items.sort_by(|left, right| left.run_id.cmp(&right.run_id));
-    let next_cursor = (items.len() > limit).then(|| items[limit - 1].run_id.clone());
+    let next_cursor = (items.len() > limit).then(|| {
+        let last = &items[limit - 1];
+        format!("{}|{}", last.started_at, last.run_id)
+    });
     items.truncate(limit);
     Ok(Json(RunListResponse { items, next_cursor }))
 }
@@ -66,8 +99,22 @@ pub(crate) async fn start_run(
     Json(req): Json<StartRun>,
 ) -> Result<Response, ApiHttpError> {
     let body = serde_json::to_vec(&req).map_err(ApiHttpError::internal)?;
-    with_idempotency(&state, &headers, "start_run", "", &body, true, || async {
-        state.service.start_run(req).await
+    // Reserve the run id before the claim so a crash between run creation
+    // and Ready commit retries into the same run.
+    let reserved = state
+        .service
+        .reserve_start_run_id(&req.generator_id)
+        .map_err(ApiHttpError::from_api)?;
+    let service = state.service.clone();
+    with_idempotency(IdempotentCall {
+        state: &state,
+        headers: &headers,
+        scope: "start_run",
+        target: "",
+        body: &body,
+        created: true,
+        reserved_run_id: Some(reserved),
+        execute: |reserved| async move { service.start_run_with_id(req, reserved).await },
     })
     .await
 }
@@ -90,15 +137,27 @@ pub(crate) async fn fork_run(
     Json(request): Json<ForkRun>,
 ) -> Result<Response, ApiHttpError> {
     let body = serde_json::to_vec(&request).map_err(ApiHttpError::internal)?;
-    with_idempotency(
-        &state,
-        &headers,
-        "fork_run",
-        &source_id,
-        &body,
-        true,
-        || async { state.service.fork_run(&source_id, request).await },
-    )
+    let reserved = state
+        .service
+        .reserve_fork_run_id(&source_id)
+        .await
+        .map_err(ApiHttpError::from_api)?;
+    let service = state.service.clone();
+    let source_id_query = source_id.clone();
+    with_idempotency(IdempotentCall {
+        state: &state,
+        headers: &headers,
+        scope: "fork_run",
+        target: &source_id,
+        body: &body,
+        created: true,
+        reserved_run_id: Some(reserved),
+        execute: |reserved| async move {
+            service
+                .fork_run_with_id(&source_id_query, request, reserved)
+                .await
+        },
+    })
     .await
 }
 

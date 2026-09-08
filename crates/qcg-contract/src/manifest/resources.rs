@@ -269,6 +269,73 @@ pub enum ContainerRuntime {
     Docker,
     Podman,
     DockerRunsc,
+    Incus,
+    Lxd,
+    Lxc,
+}
+
+impl ContainerRuntime {
+    /// Stable display name shared by plans, logs, and journal audit fields.
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Self::Docker => "docker",
+            Self::Podman => "podman",
+            Self::DockerRunsc => "docker+runsc",
+            Self::Incus => "incus",
+            Self::Lxd => "lxd",
+            Self::Lxc => "lxc",
+        }
+    }
+}
+
+/// Validates a container image reference for the declared runtime.
+///
+/// Docker-compatible runtimes require a `name@sha256:` digest pin, enforced
+/// by the daemon itself. Incus-like runtimes require
+/// `<remote>:<path>@sha256:<fingerprint>`; execution launches by
+/// fingerprint so exactly the pinned bits run. Legacy LXC addresses
+/// `dist:release` series verified through the signed download index, which
+/// is weaker than a digest pin and documented as such.
+pub fn validate_container_image(runtime: &ContainerRuntime, image: &str) -> Result<(), String> {
+    match runtime {
+        ContainerRuntime::Docker | ContainerRuntime::Podman | ContainerRuntime::DockerRunsc => {
+            if image.contains("@sha256:") {
+                Ok(())
+            } else {
+                Err("image must be pinned by digest (`name@sha256:<hex>`)".into())
+            }
+        }
+        ContainerRuntime::Incus | ContainerRuntime::Lxd => match image.split_once("@sha256:") {
+            Some((reference, fingerprint))
+                if !reference.is_empty()
+                    && !reference.contains(char::is_whitespace)
+                    && fingerprint.len() == 64
+                    && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+            {
+                Ok(())
+            }
+            _ => Err("image must have form `<remote>:<path>@sha256:<fingerprint>`".into()),
+        },
+        ContainerRuntime::Lxc => match image.split_once(':') {
+            Some((dist, release))
+                if !dist.is_empty()
+                    && !release.is_empty()
+                    && !image.contains('@')
+                    && !image.contains('/')
+                    && dist.bytes().all(|byte| {
+                        byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || matches!(byte, b'.' | b'-' | b'_')
+                    })
+                    && release.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')
+                    }) =>
+            {
+                Ok(())
+            }
+            _ => Err("image must have form `<dist>:<release>` (for example `alpine:3.20`)".into()),
+        },
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -335,4 +402,44 @@ impl Default for RetryPolicy {
 
 fn default_retry_attempts() -> u32 {
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn container_image_rules_follow_the_declared_runtime() {
+        let digest =
+            "example/tool@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        for runtime in [
+            ContainerRuntime::Docker,
+            ContainerRuntime::Podman,
+            ContainerRuntime::DockerRunsc,
+        ] {
+            assert!(validate_container_image(&runtime, digest).is_ok());
+            assert!(validate_container_image(&runtime, "example/tool:latest").is_err());
+        }
+        let fp = "images:alpine/3.20@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        for runtime in [ContainerRuntime::Incus, ContainerRuntime::Lxd] {
+            assert!(validate_container_image(&runtime, fp).is_ok());
+            assert!(validate_container_image(&runtime, "images:alpine/3.20").is_err());
+            assert!(validate_container_image(&runtime, digest).is_ok());
+        }
+        assert!(validate_container_image(&ContainerRuntime::Lxc, "alpine:3.20").is_ok());
+        assert!(validate_container_image(&ContainerRuntime::Lxc, "ubuntu:jammy").is_ok());
+        assert!(validate_container_image(&ContainerRuntime::Lxc, digest).is_err());
+        assert!(validate_container_image(&ContainerRuntime::Lxc, "Alpine:3.20").is_err());
+        assert!(validate_container_image(&ContainerRuntime::Lxc, "alpine").is_err());
+    }
+
+    #[test]
+    fn container_runtime_display_names_are_stable() {
+        assert_eq!(ContainerRuntime::Docker.display_name(), "docker");
+        assert_eq!(ContainerRuntime::Podman.display_name(), "podman");
+        assert_eq!(ContainerRuntime::DockerRunsc.display_name(), "docker+runsc");
+        assert_eq!(ContainerRuntime::Incus.display_name(), "incus");
+        assert_eq!(ContainerRuntime::Lxd.display_name(), "lxd");
+        assert_eq!(ContainerRuntime::Lxc.display_name(), "lxc");
+    }
 }

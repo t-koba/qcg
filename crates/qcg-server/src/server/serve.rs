@@ -46,9 +46,45 @@ pub async fn serve_with_listener(
         config.run_store_mode,
     )?;
     service.resume_recovered_runs().await;
+    // Host-resolved operational policy lives here, not inside the service:
+    // automatic GC, priority preemption, and idempotency retention are
+    // startup choices with explicit environment overrides (3.2). Invalid
+    // idempotency knobs refuse to boot instead of degrading silently.
+    let idempotency_ttl = super::idempotency::effective_idempotency_ttl().map_err(|detail| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid idempotency configuration: {detail}"),
+        )
+    })?;
+    let idempotency_max_entries =
+        super::idempotency::effective_idempotency_max_entries().map_err(|detail| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid idempotency configuration: {detail}"),
+            )
+        })?;
+    tracing::info!(
+        idempotency_ttl_secs = idempotency_ttl.as_secs(),
+        idempotency_max_entries,
+        max_request_bytes = config.max_request_bytes,
+        "effective server policy",
+    );
+    if std::env::var("QCG_PREEMPTION")
+        .map(|value| matches!(value.as_str(), "0" | "false" | "off"))
+        .unwrap_or(false)
+    {
+        service.set_preemption_enabled(false);
+    }
     let _shared_recovery_task = service.start_shared_store_recovery();
     let _queued_resumer_task = service.start_queued_resumer();
-    let _gc_task = service.start_retention_gc();
+    let _gc_task = if std::env::var("QCG_AUTO_GC")
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+        .unwrap_or(true)
+    {
+        service.start_retention_gc()
+    } else {
+        None
+    };
     let oauth_origin = actual_addr
         .ip()
         .is_loopback()
@@ -70,6 +106,7 @@ pub async fn serve_with_listener(
             max_entries: config.max_artifact_entries,
         },
         asset_limit: config.max_asset_bytes,
+        max_request_bytes: config.max_request_bytes,
     });
     let shutdown_service = state.service.clone();
     let app = build_router(&state, &config)?;
@@ -126,8 +163,16 @@ pub(crate) fn build_router(state: &Arc<AppState>, config: &ServerConfig) -> Resu
             require_api_auth,
         ))
         .with_state(Arc::clone(state));
-    if let Some(max_request_bytes) = config.max_request_bytes {
-        app = app.layer(DefaultBodyLimit::max(max_request_bytes));
+    // None means no mechanistic limit: disable Axum's 2 MiB default so the
+    // documented `Explicit max only. Omitted means no mechanistic limit.`
+    // holds for the JSON extractor as well as FileValue limits (A12).
+    match config.max_request_bytes {
+        Some(max_request_bytes) => {
+            app = app.layer(DefaultBodyLimit::max(max_request_bytes));
+        }
+        None => {
+            app = app.layer(DefaultBodyLimit::disable());
+        }
     }
     let app = if !config.cors_origins.is_empty() {
         let origins = config
@@ -157,6 +202,10 @@ pub(crate) fn build_router(state: &Arc<AppState>, config: &ServerConfig) -> Resu
     Ok(app)
 }
 
+/// Waits for a shutdown signal, settles active runs, and returns control
+/// to the caller. The library never calls `process::exit`: exiting is the
+/// CLI/host responsibility so embedded servers observe graceful HTTP drain
+/// and run their own cleanup (A09).
 pub(crate) async fn shutdown_signal(service: LocalQcgService) {
     #[cfg(unix)]
     {
@@ -193,5 +242,4 @@ pub(crate) async fn shutdown_signal(service: LocalQcgService) {
     if let Err(error) = service.shutdown_active_runs().await {
         tracing::error!(%error, "failed to stop active runs");
     }
-    std::process::exit(0);
 }

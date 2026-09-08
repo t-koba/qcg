@@ -42,4 +42,7 @@ pub(crate) struct AppState {
     pub(crate) api_token_digest: Option<[u8; 32]>,
     pub(crate) artifact_limits: qcg_service::ArtifactZipLimits,
     pub(crate) asset_limit: Option<usize>,
+    /// Effective request body limit surfaced by /healthz. None means no
+    /// mechanistic limit.
+    pub(crate) max_request_bytes: Option<usize>,
 }

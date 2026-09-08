@@ -54,6 +54,41 @@ pub(crate) struct AgentCheckpoint {
     pub(crate) tool_call_counts: BTreeMap<String, usize>,
     #[serde(default)]
     pub(crate) pending_side_effect: Option<ChatToolCall>,
+    /// Confirmation awaiting user decision for the pending call. Stored so
+    /// resume re-emits the same operation instead of regenerating a
+    /// different target with the same approval (A06).
+    #[serde(default)]
+    pub(crate) pending_confirm: Option<qcg_api::ConfirmSpec>,
+    /// Suspended MCP input-required call. Stored so resume re-issues the
+    /// exact call (same call id) instead of regenerating one that would
+    /// miss the journaled continuation and duplicate the remote call (A07).
+    #[serde(default)]
+    pub(crate) pending_mcp_call: Option<McpSuspendedCall>,
+}
+
+/// An MCP tool call suspended for user input, identified exactly as the
+/// journaled continuation key identifies it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct McpSuspendedCall {
+    pub(crate) name: String,
+    pub(crate) id: String,
+    pub(crate) args: Value,
+    pub(crate) question_id: String,
+}
+
+/// Selects the suspended MCP call to re-issue without an LLM round-trip.
+/// Only an answered suspension qualifies: anything else (no checkpoint, no
+/// suspension, no answer yet) stays on the model flow so regeneration can
+/// never steal another call's continuation.
+fn resumed_mcp_call(
+    checkpoint: Option<&AgentCheckpoint>,
+    answers: &std::collections::BTreeMap<String, Value>,
+) -> Option<McpSuspendedCall> {
+    let suspended = checkpoint?.pending_mcp_call.clone()?;
+    answers
+        .contains_key(&suspended.question_id)
+        .then_some(suspended)
 }
 
 #[async_trait]
@@ -220,8 +255,12 @@ impl StepExecutor for LlmAgentStep {
             &json!({ "prompt": &prompt }),
         )
         .await?;
-        let max_turns = params.max_iterations.expect("validated max_iterations");
-        let max_tokens_total = params.max_tokens_total.expect("validated max_tokens_total");
+        let max_turns = params
+            .max_iterations
+            .ok_or_else(|| StepError::failed(&node.id, "agent max_iterations is required"))?;
+        let max_tokens_total = params
+            .max_tokens_total
+            .ok_or_else(|| StepError::failed(&node.id, "agent max_tokens_total is required"))?;
         let max_tool_calls_total = params.max_tool_calls_total.unwrap_or(32);
         let checkpoint = ctx
             .journal
@@ -234,17 +273,40 @@ impl StepExecutor for LlmAgentStep {
             .map_err(|error| {
                 StepError::failed(&node.id, format!("invalid agent checkpoint: {error}"))
             })?;
-        if let Some(pending) = checkpoint
-            .as_ref()
-            .and_then(|checkpoint| checkpoint.pending_side_effect.as_ref())
-        {
-            return Err(StepError::failed(
-                &node.id,
-                format!(
-                    "agent side effect `{}` has an indeterminate result after interruption; refusing automatic replay",
-                    pending.name
-                ),
-            ));
+        if let Some(stored) = checkpoint.as_ref() {
+            if let (Some(_pending), Some(confirm)) = (
+                stored.pending_side_effect.as_ref(),
+                stored.pending_confirm.as_ref(),
+            ) {
+                // Waiting-for-confirmation resume: re-emit the exact stored
+                // operation when still unapproved, so the model never
+                // substitutes a different target under the same approval.
+                // Approved resumes fall through to execute the stored call
+                // below instead of regenerating via the LLM (A06).
+                let approved = ctx
+                    .run
+                    .confirmations
+                    .get(&confirm.id)
+                    .copied()
+                    .unwrap_or(false);
+                if !approved {
+                    return Ok(StepOutcome::NeedsConfirm {
+                        confirm: confirm.clone(),
+                    });
+                }
+                // Approved: continue to execute the stored pending call.
+                // The main loop below detects this via the checkpoint and
+                // executes it directly without an LLM round-trip. Mark by
+                // falling through; the turn loop handles it first.
+            } else if let Some(pending) = stored.pending_side_effect.as_ref() {
+                return Err(StepError::failed(
+                    &node.id,
+                    format!(
+                        "agent side effect `{}` has an indeterminate result after interruption; refusing automatic replay",
+                        pending.name
+                    ),
+                ));
+            }
         }
         let first_turn = checkpoint
             .as_ref()
@@ -272,50 +334,148 @@ impl StepExecutor for LlmAgentStep {
             .map(|checkpoint| checkpoint.tool_calls_total)
             .unwrap_or_default();
         let mut tool_call_counts = checkpoint
-            .map(|checkpoint| checkpoint.tool_call_counts)
+            .as_ref()
+            .map(|checkpoint| checkpoint.tool_call_counts.clone())
             .unwrap_or_default();
+        // Approved pending call resumes without an LLM round-trip so the
+        // approved operation executes exactly once (A06).
+        let resumed_pending: Option<ChatToolCall> = checkpoint.as_ref().and_then(|stored| {
+            let pending = stored.pending_side_effect.clone()?;
+            let confirm = stored.pending_confirm.clone()?;
+            let approved = ctx
+                .run
+                .confirmations
+                .get(&confirm.id)
+                .copied()
+                .unwrap_or(false);
+            approved.then_some(pending)
+        });
+        // Answered MCP call resumes without an LLM round-trip so the exact
+        // suspended call (same call id) continues its journaled
+        // continuation instead of regenerating a fresh remote call (A07).
+        // Without an answer the model flow stays in charge.
+        let resumed_mcp = resumed_mcp_call(checkpoint.as_ref(), &ctx.run.answers);
         let mut last_validation_error = None;
         for turn in first_turn..max_turns {
             enforce_agent_transcript_limit(ctx, node, &mut messages, None)?;
             let turn_start_messages = messages.clone();
             let turn_start_tool_calls_total = tool_calls_total;
             let turn_start_tool_call_counts = tool_call_counts.clone();
-            let request = build_request_with_messages(
-                ctx,
-                node,
-                &self.runtime,
-                messages.clone(),
-                MessageRequestOptions {
-                    response_schema: response_schema.clone(),
-                    tools: &tool_specs,
-                    model: None,
-                    policy: None,
-                },
-            )?;
-            let response = complete_llm(ctx, node, request, |usage| {
-                let next_total = tokens_total
+            // When resuming an approved pending call, execute it directly.
+            let resumed_this_turn = turn == first_turn && resumed_pending.is_some();
+            // When resuming an answered MCP call, re-issue it directly.
+            let resumed_mcp_this_turn =
+                turn == first_turn && !resumed_this_turn && resumed_mcp.is_some();
+            if resumed_this_turn {
+                // Clear the pending marker before execution so a crash
+                // during execution becomes an indeterminate-result error
+                // instead of silent replay.
+                record_agent_checkpoint(
+                    ctx,
+                    node,
+                    turn,
+                    "resuming_approved_side_effect",
+                    &AgentCheckpoint {
+                        messages: turn_start_messages.clone(),
+                        next_turn: turn,
+                        tokens_total,
+                        tool_calls_total: turn_start_tool_calls_total,
+                        tool_call_counts: turn_start_tool_call_counts.clone(),
+                        pending_side_effect: resumed_pending.clone(),
+                        pending_confirm: None,
+                        pending_mcp_call: None,
+                    },
+                )?;
+            }
+            if resumed_mcp_this_turn {
+                // Keep the suspension marker across execution: a crash from
+                // here on is an indeterminate remote result, detected via
+                // the journaled resumption record on the next resume.
+                record_agent_checkpoint(
+                    ctx,
+                    node,
+                    turn,
+                    "resuming_answered_mcp_call",
+                    &AgentCheckpoint {
+                        messages: turn_start_messages.clone(),
+                        next_turn: turn,
+                        tokens_total,
+                        tool_calls_total: turn_start_tool_calls_total,
+                        tool_call_counts: turn_start_tool_call_counts.clone(),
+                        pending_side_effect: None,
+                        pending_confirm: None,
+                        pending_mcp_call: resumed_mcp.clone(),
+                    },
+                )?;
+            }
+            let (text_parts, tool_calls, stop, next_provider_state) = if resumed_this_turn {
+                // Execute the exact approved operation without asking the
+                // model to regenerate it (A06).
+                (
+                    Vec::new(),
+                    vec![resumed_pending.clone().ok_or_else(|| {
+                        StepError::failed(&node.id, "resumed turn has no pending call")
+                    })?],
+                    qcg_llm::StopReason::ToolUse,
+                    None,
+                )
+            } else if resumed_mcp_this_turn {
+                // Re-issue the exact suspended MCP call without asking the
+                // model to regenerate it (A07).
+                let suspended = resumed_mcp.clone().ok_or_else(|| {
+                    StepError::failed(&node.id, "resumed turn has no suspended MCP call")
+                })?;
+                (
+                    Vec::new(),
+                    vec![ChatToolCall {
+                        id: suspended.id,
+                        name: suspended.name,
+                        args: suspended.args,
+                    }],
+                    qcg_llm::StopReason::ToolUse,
+                    None,
+                )
+            } else {
+                let request = build_request_with_messages(
+                    ctx,
+                    node,
+                    &self.runtime,
+                    messages.clone(),
+                    MessageRequestOptions {
+                        response_schema: response_schema.clone(),
+                        tools: &tool_specs,
+                        model: None,
+                        policy: None,
+                    },
+                )?;
+                let response = complete_llm(ctx, node, request, |usage| {
+                    let next_total = tokens_total
+                        .saturating_add(usage.input)
+                        .saturating_add(usage.output);
+                    json!({ "turn": turn, "tokens_total": next_total, "max_tokens_total": max_tokens_total })
+                })
+                .await?;
+                let usage = response.usage.clone();
+                tokens_total = tokens_total
                     .saturating_add(usage.input)
                     .saturating_add(usage.output);
-                json!({ "turn": turn, "tokens_total": next_total, "max_tokens_total": max_tokens_total })
-            })
-            .await?;
-            let usage = response.usage.clone();
-            tokens_total = tokens_total
-                .saturating_add(usage.input)
-                .saturating_add(usage.output);
 
-            let stop = response.stop;
-            let next_provider_state = response.provider_state;
-            let mut text_parts = Vec::new();
-            let mut tool_calls = Vec::new();
-            for content in response.content {
-                match content {
-                    ChatContent::Text(text) => text_parts.push(text),
-                    ChatContent::ToolCall { id, name, args } => {
-                        tool_calls.push(ChatToolCall { id, name, args });
+                let stop = response.stop;
+                let next_provider_state = response.provider_state;
+                let mut text_parts = Vec::new();
+                let mut tool_calls = Vec::new();
+                for content in response.content {
+                    match content {
+                        ChatContent::Text(text) => text_parts.push(text),
+                        ChatContent::ToolCall { id, name, args } => {
+                            tool_calls.push(ChatToolCall { id, name, args });
+                        }
                     }
                 }
-            }
+                (text_parts, tool_calls, stop, next_provider_state)
+            };
+            // Non-resumed turns validated stop below; resumed turns skip it
+            // because they execute a previously validated approved call.
             if tokens_total > max_tokens_total {
                 let error = StepError::failed(
                     &node.id,
@@ -371,6 +531,8 @@ impl StepExecutor for LlmAgentStep {
                                 tool_calls_total,
                                 tool_call_counts: tool_call_counts.clone(),
                                 pending_side_effect: None,
+                                pending_confirm: None,
+                                pending_mcp_call: None,
                             },
                         )?;
                         continue;
@@ -630,6 +792,8 @@ impl StepExecutor for LlmAgentStep {
                             tool_calls_total,
                             tool_call_counts: tool_call_counts.clone(),
                             pending_side_effect: Some(call.clone()),
+                            pending_confirm: None,
+                            pending_mcp_call: None,
                         },
                     )
                 {
@@ -779,6 +943,19 @@ impl StepExecutor for LlmAgentStep {
                             ),
                         )?;
                         ctx.journal.event("tool_call", event).step_err(&node.id)?;
+                        // Persist the exact suspended MCP call so resume
+                        // re-issues it (same call id) instead of regenerating
+                        // one that would miss the journaled continuation
+                        // (A07). Only MCP aliases suspend through the
+                        // continuation store; built-in tools resume through
+                        // the model flow.
+                        let pending_mcp_call =
+                            mcp_tools.server_for(&call.name).map(|_| McpSuspendedCall {
+                                name: call.name.clone(),
+                                id: call.id.clone(),
+                                args: call.args.clone(),
+                                question_id: question.id.clone(),
+                            });
                         record_agent_checkpoint(
                             ctx,
                             node,
@@ -791,6 +968,8 @@ impl StepExecutor for LlmAgentStep {
                                 tool_calls_total: turn_start_tool_calls_total,
                                 tool_call_counts: turn_start_tool_call_counts.clone(),
                                 pending_side_effect: None,
+                                pending_confirm: None,
+                                pending_mcp_call,
                             },
                         )?;
                         return Ok(StepOutcome::NeedsUser { question });
@@ -810,6 +989,9 @@ impl StepExecutor for LlmAgentStep {
                             ),
                         )?;
                         ctx.journal.event("tool_call", event).step_err(&node.id)?;
+                        // Persist the exact approved call so resume executes
+                        // the same operation instead of regenerating a
+                        // different target with the same approval (A06).
                         record_agent_checkpoint(
                             ctx,
                             node,
@@ -821,7 +1003,9 @@ impl StepExecutor for LlmAgentStep {
                                 tokens_total,
                                 tool_calls_total: turn_start_tool_calls_total,
                                 tool_call_counts: turn_start_tool_call_counts.clone(),
-                                pending_side_effect: None,
+                                pending_side_effect: Some(call.clone()),
+                                pending_confirm: Some(confirm.clone()),
+                                pending_mcp_call: None,
                             },
                         )?;
                         return Ok(StepOutcome::NeedsConfirm { confirm });
@@ -955,6 +1139,8 @@ impl StepExecutor for LlmAgentStep {
                     tool_calls_total,
                     tool_call_counts: tool_call_counts.clone(),
                     pending_side_effect: None,
+                    pending_confirm: None,
+                    pending_mcp_call: None,
                 },
             )?;
         }
@@ -1076,4 +1262,76 @@ pub(crate) fn agent_command_allowed(
     command: &[String],
 ) -> bool {
     agent_command_permission(permissions, command).is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    fn suspended_call(question_id: &str) -> AgentCheckpoint {
+        AgentCheckpoint {
+            messages: Vec::new(),
+            next_turn: 1,
+            tokens_total: 0,
+            tool_calls_total: 0,
+            tool_call_counts: BTreeMap::new(),
+            pending_side_effect: None,
+            pending_confirm: None,
+            pending_mcp_call: Some(McpSuspendedCall {
+                name: "search".into(),
+                id: "call-1".into(),
+                args: json!({"query": "x"}),
+                question_id: question_id.into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn answered_mcp_suspension_resumes_with_the_same_call_id() {
+        let checkpoint = suspended_call("q-1");
+        let answers = BTreeMap::from([("q-1".to_string(), json!({"response_0": "go"}))]);
+        let resumed = resumed_mcp_call(Some(&checkpoint), &answers)
+            .expect("answered suspension should resume");
+        assert_eq!(resumed.id, "call-1");
+        assert_eq!(resumed.name, "search");
+        assert_eq!(resumed.question_id, "q-1");
+    }
+
+    #[test]
+    fn unanswered_mcp_suspension_stays_on_the_model_flow() {
+        let checkpoint = suspended_call("q-1");
+        assert!(resumed_mcp_call(Some(&checkpoint), &BTreeMap::new()).is_none());
+        let mut other_answered = BTreeMap::new();
+        other_answered.insert("q-2".to_string(), json!({}));
+        assert!(resumed_mcp_call(Some(&checkpoint), &other_answered).is_none());
+    }
+
+    #[test]
+    fn missing_suspension_never_resumes() {
+        let mut checkpoint = suspended_call("q-1");
+        checkpoint.pending_mcp_call = None;
+        let answers = BTreeMap::from([("q-1".to_string(), json!({}))]);
+        assert!(resumed_mcp_call(Some(&checkpoint), &answers).is_none());
+        assert!(resumed_mcp_call(None, &answers).is_none());
+    }
+
+    #[test]
+    fn checkpoint_without_mcp_field_still_parses() {
+        // Checkpoints journaled before the MCP suspension field existed
+        // must not brick resume.
+        let old = json!({
+            "messages": [],
+            "next_turn": 1,
+            "tokens_total": 0,
+            "tool_calls_total": 0,
+            "tool_call_counts": {},
+            "pending_side_effect": null,
+            "pending_confirm": null,
+        });
+        let checkpoint: AgentCheckpoint =
+            serde_json::from_value(old).expect("old checkpoint should parse");
+        assert!(checkpoint.pending_mcp_call.is_none());
+    }
 }

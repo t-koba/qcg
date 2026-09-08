@@ -30,6 +30,38 @@ pub enum McpContainerRuntime {
     Docker,
     Podman,
     DockerRunsc,
+    Incus,
+    Lxd,
+    Lxc,
+}
+
+impl McpContainerRuntime {
+    /// Maps to the shared backend descriptor. Availability is probed
+    /// separately so missing clients keep the existing skip/error behavior.
+    pub fn backend(&self) -> qcg_container::Backend {
+        use qcg_container::Backend;
+        match self {
+            Self::Docker => Backend::Docker {
+                binary: "docker".into(),
+                runtime_flag: None,
+            },
+            Self::Podman => Backend::Docker {
+                binary: "podman".into(),
+                runtime_flag: None,
+            },
+            Self::DockerRunsc => Backend::Docker {
+                binary: "docker".into(),
+                runtime_flag: Some("runsc".into()),
+            },
+            Self::Incus => Backend::Incus {
+                binary: "incus".into(),
+            },
+            Self::Lxd => Backend::Incus {
+                binary: "lxc".into(),
+            },
+            Self::Lxc => Backend::Lxc,
+        }
+    }
 }
 
 impl McpCommandAccess {
@@ -73,16 +105,20 @@ impl McpAccess {
     }
 }
 
-pub(crate) fn mcp_container_runtime_command(
+/// Resolves a declared MCP container runtime to an available backend.
+/// `None` preserves the existing missing-client behavior; no technology is
+/// ever substituted silently.
+pub(crate) fn mcp_container_backend(
     runtime: &McpContainerRuntime,
-) -> Option<(&'static str, Vec<&'static str>)> {
-    let path = std::env::var_os("PATH")?;
-    let (binary, args) = match runtime {
-        McpContainerRuntime::Docker => ("docker", vec!["run"]),
-        McpContainerRuntime::Podman => ("podman", vec!["run"]),
-        McpContainerRuntime::DockerRunsc => ("docker", vec!["run", "--runtime", "runsc"]),
+) -> Option<qcg_container::Backend> {
+    let backend = runtime.backend();
+    let binaries = match &backend {
+        qcg_container::Backend::Docker { binary, .. } => vec![binary.as_str()],
+        qcg_container::Backend::Incus { binary } => vec![binary.as_str()],
+        qcg_container::Backend::Lxc => vec!["lxc-create"],
     };
-    std::env::split_paths(&path)
-        .any(|directory| directory.join(binary).is_file())
-        .then_some((binary, args))
+    binaries
+        .iter()
+        .all(|binary| qcg_container::binary_available(binary))
+        .then_some(backend)
 }

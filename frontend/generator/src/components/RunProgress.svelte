@@ -4,7 +4,7 @@
   import type { RunStore } from "../run-store.svelte";
   let { store, messages }: { store: RunStore; messages: Messages } = $props();
 
-  let active = $derived(["queued", "running", "waiting", "confirming"].includes(store.runState));
+  let active = $derived(["queued", "running", "waiting", "confirming", "cancel_requested"].includes(store.runState));
   let done = $derived(store.nodeProgress.filter((node) => node.status === "succeeded" || node.status === "skipped").length);
   let total = $derived(store.nodeProgress.length);
   let percent = $derived(total ? Math.round((done / total) * 100) : store.runState === "succeeded" ? 100 : 8);
@@ -19,6 +19,7 @@
       case "succeeded": return messages.statusSucceeded;
       case "failed": return messages.statusFailed;
       case "canceled": return messages.statusCanceled;
+      case "cancel_requested": return messages.statusCancelRequested;
       case "interrupted": return messages.statusInterrupted;
       default: return "";
     }
@@ -31,7 +32,7 @@
 
 <div id="run-state" class="run-summary {store.runState}">
   <div class="status-icon" aria-hidden="true">
-    {#if store.runState === "queued" || store.runState === "running"}
+    {#if store.runState === "queued" || store.runState === "running" || store.runState === "cancel_requested"}
       <span class="spinner"></span>
     {:else if store.runState === "succeeded"}
       <svg viewBox="0 0 24 24"><path d="m7 12 3 3 7-7"/></svg>
@@ -103,6 +104,7 @@
   }
 
   .run-summary.canceled .status-icon,
+  .run-summary.cancel_requested .status-icon,
   .run-summary.interrupted .status-icon {
     background: var(--surface-muted);
     color: var(--gray-500);

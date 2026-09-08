@@ -21,7 +21,6 @@ function toolCallStatus(status: unknown, messages: Messages): string {
     case "degraded": return messages.eventToolDegraded;
     case "needs_user": return messages.eventToolNeedsUser;
     case "needs_confirmation":
-    case "needs_confirm":
       return messages.eventToolNeedsConfirmation;
     default: return status;
   }

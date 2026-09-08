@@ -28,6 +28,9 @@ pub struct HttpRequest {
     pub sensitive_query: BTreeMap<String, String>,
     pub body: Option<Vec<u8>>,
     pub follow_redirects: bool,
+    /// Stable operation id for remote deduplication. Sent as
+    /// `Idempotency-Key` when present; receivers without support ignore it.
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +113,13 @@ impl HttpGateway {
                 .timeout(self.timeout);
             for (key, value) in &request.headers {
                 builder = builder.header(key, value);
+            }
+            if let Some(key) = request
+                .idempotency_key
+                .as_deref()
+                .filter(|key| !key.is_empty())
+            {
+                builder = builder.header("Idempotency-Key", key);
             }
             if let Some(body) = &request.body {
                 builder = builder.body(body.clone());

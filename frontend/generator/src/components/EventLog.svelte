@@ -63,6 +63,9 @@
       case "run_finished": return messages.eventRunFinished;
       case "run_canceled": return messages.eventRunCanceled;
       case "run_error": return messages.eventRunError;
+      case "run_waiting": return messages.eventRunWaiting;
+      case "run_interrupted": return messages.eventRunInterrupted;
+      case "run_resumed": return messages.eventRunResumed;
       default: return event.kind;
     }
   }

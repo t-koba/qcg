@@ -9,9 +9,10 @@
 # Remote providers below ship commented out. Enable one by deleting the
 # leading "# " from its block; the URLs are fixed constants, so uncommenting
 # is the only edit needed before setting the credential variable. Rows with
-# variable endpoints (Azure OpenAI, Cloudflare) resolve placeholders such as
-# {QCG_AZURE_OPENAI_API_VERSION} or {QCG_CLOUDFLARE_ACCOUNT_ID} from the
-# environment and fail validation while they stay unresolved.
+# variable endpoints (Cloudflare) resolve placeholders such as
+# {QCG_CLOUDFLARE_ACCOUNT_ID} from the environment and fail validation while
+# they stay unresolved. Azure OpenAI takes its full endpoint root (including
+# /openai/v1) from QCG_AZURE_OPENAI_BASE_URL instead.
 #
 # Local endpoints (ollama, lmstudio, openai_compat) are active by default and
 # only connect when a run reaches them. Ollama and LM Studio need no credential;

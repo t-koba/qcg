@@ -106,6 +106,9 @@ impl McpAgentTools {
                                 qcg_contract::ContainerRuntime::DockerRunsc => {
                                     McpContainerRuntime::DockerRunsc
                                 }
+                                qcg_contract::ContainerRuntime::Incus => McpContainerRuntime::Incus,
+                                qcg_contract::ContainerRuntime::Lxd => McpContainerRuntime::Lxd,
+                                qcg_contract::ContainerRuntime::Lxc => McpContainerRuntime::Lxc,
                             }),
                     },
                 });
@@ -149,9 +152,12 @@ impl McpAgentTools {
 
         let mut resolved = BTreeMap::new();
         for (server, bindings) in requested {
-            let tools = discovered
-                .get(&server)
-                .expect("discovery result exists for connected server");
+            let tools = discovered.get(&server).ok_or_else(|| {
+                StepError::failed(
+                    &node.id,
+                    format!("MCP server `{server}` discovery result is missing"),
+                )
+            })?;
             for (alias, remote_name, override_description) in bindings {
                 let tool = tools
                     .iter()

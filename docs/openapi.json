@@ -377,6 +377,11 @@
           "kind": {
             "type": "string"
           },
+          "operation_digest": {
+            "default": "",
+            "description": "Canonical digest of target + details binding this approval to the\nexact operation content (A06). Approvals never transfer across\ndifferent digests even for the same node and kind.",
+            "type": "string"
+          },
           "target": {
             "type": "string"
           },
@@ -439,7 +444,10 @@
         "enum": [
           "docker",
           "podman",
-          "docker_runsc"
+          "docker_runsc",
+          "incus",
+          "lxd",
+          "lxc"
         ],
         "type": "string"
       },
@@ -581,6 +589,13 @@
           },
           "kind": {
             "type": "string"
+          },
+          "operation_digest": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "target": {
             "type": "string"
@@ -2492,6 +2507,10 @@
               "null"
             ]
           },
+          "generator_id": {
+            "description": "Owning generator id so clients never parse it from run_id (C03).\nRequired: a snapshot without an owner is corrupt, never something\nto guess from the run id.",
+            "type": "string"
+          },
           "metrics": {
             "anyOf": [
               {
@@ -2561,7 +2580,8 @@
         },
         "required": [
           "run_id",
-          "state"
+          "state",
+          "generator_id"
         ],
         "title": "RunSnapshot",
         "type": "object"
@@ -2583,6 +2603,24 @@
           },
           "contract_sha256": {
             "type": "string"
+          },
+          "effective_max_total_steps": {
+            "default": null,
+            "description": "Effective step budget after resolving the deployment ceiling.",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "effective_policy_origin": {
+            "default": null,
+            "description": "Origin of the effective budget for audit display.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "generator": {
             "type": "string"
@@ -2644,17 +2682,26 @@
         "type": "object"
       },
       "RunStatus": {
-        "enum": [
-          "queued",
-          "running",
-          "waiting",
-          "confirming",
-          "succeeded",
-          "failed",
-          "canceled",
-          "interrupted"
-        ],
-        "type": "string"
+        "oneOf": [
+          {
+            "enum": [
+              "queued",
+              "running",
+              "waiting",
+              "confirming",
+              "succeeded",
+              "failed",
+              "canceled",
+              "interrupted"
+            ],
+            "type": "string"
+          },
+          {
+            "const": "cancel_requested",
+            "description": "A cancel request was accepted into the mailbox but no terminal\noutcome is journaled yet. This is acceptance, not settlement: only\na journaled terminal state may report `Canceled` (A02).",
+            "type": "string"
+          }
+        ]
       },
       "RunWaitingEventData": {
         "additionalProperties": false,
@@ -2697,6 +2744,14 @@
           },
           "kind": {
             "type": "string"
+          },
+          "operation_digest": {
+            "default": null,
+            "description": "Canonical digest binding the approval to the exact operation (A06).",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "policy": {
             "default": null,

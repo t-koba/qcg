@@ -74,6 +74,10 @@ pub enum RunStatus {
     Running,
     Waiting,
     Confirming,
+    /// A cancel request was accepted into the mailbox but no terminal
+    /// outcome is journaled yet. This is acceptance, not settlement: only
+    /// a journaled terminal state may report `Canceled` (A02).
+    CancelRequested,
     Succeeded,
     Failed,
     Canceled,
@@ -96,6 +100,7 @@ impl std::fmt::Display for RunStatus {
             Self::Running => "running",
             Self::Waiting => "waiting",
             Self::Confirming => "confirming",
+            Self::CancelRequested => "cancel_requested",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
             Self::Canceled => "canceled",
@@ -122,6 +127,11 @@ pub struct ConfirmSpec {
     pub dry_run: bool,
     #[serde(default)]
     pub details: Option<Value>,
+    /// Canonical digest of target + details binding this approval to the
+    /// exact operation content (A06). Approvals never transfer across
+    /// different digests even for the same node and kind.
+    #[serde(default)]
+    pub operation_digest: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -132,6 +142,10 @@ pub struct RunSnapshot {
     pub seq: u64,
     #[serde(default)]
     pub contract_sha256: Option<String>,
+    /// Owning generator id so clients never parse it from run_id (C03).
+    /// Required: a snapshot without an owner is corrupt, never something
+    /// to guess from the run id.
+    pub generator_id: String,
     pub artifacts: Option<OutputManifest>,
     pub question: Option<FormSpec>,
     pub confirm: Option<ConfirmSpec>,

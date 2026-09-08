@@ -28,6 +28,12 @@ pub struct RunStartedEventData {
     /// Parent run id for runs created by fork.
     #[serde(default)]
     pub parent_run_id: Option<String>,
+    /// Effective step budget after resolving the deployment ceiling.
+    #[serde(default)]
+    pub effective_max_total_steps: Option<usize>,
+    /// Origin of the effective budget for audit display.
+    #[serde(default)]
+    pub effective_policy_origin: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize, JsonSchema)]

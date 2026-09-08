@@ -16,7 +16,7 @@
       <div
         class="run-tab"
         class:selected={store.currentRun === tab.runId}
-        class:run-active={["queued", "running", "waiting", "confirming"].includes(tab.runState)}
+        class:run-active={["queued", "running", "waiting", "confirming", "cancel_requested"].includes(tab.runState)}
         role="tab"
         aria-selected={store.currentRun === tab.runId}
       >
@@ -106,7 +106,8 @@
     width: 8px;
   }
 
-  .run-tab-dot-queued { background: var(--warning); }
+  .run-tab-dot-queued,
+  .run-tab-dot-cancel_requested { background: var(--warning); }
   .run-tab-dot-running { background: var(--accent); }
   .run-tab-dot-waiting,
   .run-tab-dot-confirming { background: var(--warning); }

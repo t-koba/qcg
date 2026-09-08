@@ -35,6 +35,8 @@ export interface RunTab {
   pendingOp: string | null;
   /** Stable idempotency key for the start request. */
   startKey: string | null;
+  /** Inputs for retrying the same start operation with the same key. */
+  pendingInputs: Record<string, unknown> | null;
   /** Stable idempotency key reused across cancel retries. */
   cancelKey: string | null;
 }
@@ -57,6 +59,7 @@ function emptyTab(runId: string, generatorId: string, generatorName: string): Ru
     snapshotVersion: 0,
     pendingOp: null,
     startKey: null,
+    pendingInputs: null,
     cancelKey: null,
   };
 }
@@ -74,6 +77,10 @@ export class RunStore {
   /** Run history from the server list API. */
   runs = $state<RunListResponse["items"]>([]);
   historyState = $state("");
+  /** True when the server reports more history beyond the fetched pages. */
+  historyHasMore = $state(false);
+  /** Client-side visible count; Load more raises it without refetching. */
+  historyLimit = $state(20);
   currentRun = $state("");
   runState = $state<RunStatus | "idle" | "loading">("idle");
   events = $state<RunEvent[]>([]);
@@ -222,23 +229,34 @@ export class RunStore {
   async refreshRuns(): Promise<void> {
     // Follow pagination cursors so history beyond the first page stays
     // reachable; cap pages to avoid unbounded fetches on huge stores.
+    // The cap is surfaced via historyHasMore so the UI offers Load more
+    // instead of silently truncating at 2000 entries (C01).
     const items: RunListResponse["items"] = [];
     let cursor: string | undefined;
+    let truncated = false;
     for (let page = 0; page < 10; page++) {
       const query = this.historyState ? { state: this.historyState } : undefined;
       const response = await this.api.listRuns({ ...query, cursor, limit: 200 });
       items.push(...(response.items || []));
-      const next = (response as RunListResponse).next_cursor ?? null;
+      const next = response.next_cursor ?? null;
       if (!next) break;
       cursor = next;
+      if (page === 9) truncated = true;
     }
-    // Newest first for the history view; server order is run_id ascending.
+    this.historyHasMore = truncated;
+    // Newest first for the history view; server order is (started_at, run_id).
     this.runs = [...items].reverse();
   }
 
   setHistoryFilter(state: string): void {
     this.historyState = state;
+    this.historyLimit = 20;
     void this.withError(() => this.refreshRuns());
+  }
+
+  /** Reveal more fetched history entries without refetching. */
+  loadMoreHistory(): void {
+    this.historyLimit += 20;
   }
 
   /** Fork the selected run from its latest snapshot sequence. */
@@ -319,7 +337,9 @@ export class RunStore {
     this.queuePosition = null;
     this.queuedAt = null;
     this.pendingAction = null;
-    writeHashRunId(null);
+    // During initial restore the URL deep link owns the hash; clearing it
+    // here would lose `#/runs/<id>` before it is opened (C02).
+    if (!this.#restoring) writeHashRunId(null);
     this.persistView();
   }
 
@@ -343,16 +363,16 @@ export class RunStore {
     this.currentRun = placeholderId;
     this.restoreView(tab);
     this.runState = "running";
+    const pendingTab = this.tabs[placeholderId];
+    if (pendingTab) pendingTab.pendingInputs = inputs;
     try {
-      const response = await this.api.post<RunSnapshot>("/api/runs", {
-        generator_id: generatorId,
-        inputs,
-      }, startKey);
+      const response = await this.retryPendingStart(generatorId, inputs, startKey);
       const started = this.tabs[placeholderId];
       if (started) {
         // The start request settled; progress now arrives via snapshots and
         // events, so the optimistic placeholder must not block actions.
         started.pendingAction = null;
+        started.pendingInputs = null;
       }
       if (this.currentRun === placeholderId) {
         this.pendingAction = null;
@@ -362,9 +382,74 @@ export class RunStore {
       this.selectTab(response.run_id);
       void this.withError(() => this.refreshRuns());
     } catch (error) {
-      this.closeTab(placeholderId);
+      // Keep the placeholder with its startKey so an ambiguous failure
+      // (server created the run but the response was lost) retries with the
+      // same idempotency key instead of starting a duplicate run (C06).
+      const failed = this.tabs[placeholderId];
+      if (failed) {
+        failed.pendingAction = null;
+        failed.startKey = startKey;
+        failed.pendingInputs = inputs;
+      }
+      if (this.currentRun === placeholderId) this.pendingAction = null;
       throw error;
     }
+  }
+
+  /** Placeholder tab id whose start failed but keeps its idempotency key. */
+  failedPlaceholderId(): string | null {
+    const tab = this.currentTab();
+    if (
+      tab &&
+      tab.runId.startsWith("pending-") &&
+      tab.startKey &&
+      tab.pendingInputs &&
+      !tab.pendingAction
+    ) {
+      return tab.runId;
+    }
+    return null;
+  }
+
+  /** Retry a failed placeholder start with its original key and inputs. */
+  async retryFailedStart(placeholderId: string): Promise<void> {
+    const tab = this.tabs[placeholderId];
+    if (!tab || !tab.startKey || !tab.pendingInputs) return;
+    tab.pendingAction = "starting";
+    try {
+      const response = await this.retryPendingStart(
+        tab.generatorId,
+        tab.pendingInputs,
+        tab.startKey,
+      );
+      tab.pendingAction = null;
+      tab.pendingInputs = null;
+      this.adoptTab(placeholderId, response);
+      this.applySnapshot(response);
+      this.selectTab(response.run_id);
+      void this.withError(() => this.refreshRuns());
+    } catch (error) {
+      const failed = this.tabs[placeholderId];
+      if (failed) failed.pendingAction = null;
+      throw error;
+    }
+  }
+
+  /**
+   * Reuses the placeholder's idempotency key so a retry of the same start
+   * operation converges to one run even when the first response was lost.
+   * A genuinely new run must call startRun for a fresh key (C06).
+   */
+  async retryPendingStart(
+    generatorId: string,
+    inputs: Record<string, unknown>,
+    startKey: string,
+  ): Promise<RunSnapshot> {
+    return this.api.post<RunSnapshot>(
+      "/api/runs",
+      { generator_id: generatorId, inputs },
+      startKey,
+    );
   }
 
   async answerQuestion(overrideValues?: Record<string, unknown>): Promise<void> {
@@ -496,7 +581,12 @@ export class RunStore {
   applySnapshot(snapshot: RunSnapshot): void {
     let tab = this.tabs[snapshot.run_id];
     if (!tab) {
-      const generatorId = generatorIdFromRunId(snapshot.run_id);
+      // Snapshots always carry generator_id; a snapshot without one is a
+      // server bug, never something to guess from the run id (C03).
+      const generatorId = snapshot.generator_id;
+      if (!generatorId) {
+        throw new Error(`snapshot for run ${snapshot.run_id} omits generator_id`);
+      }
       tab = emptyTab(
         snapshot.run_id,
         generatorId,
@@ -577,7 +667,7 @@ export class RunStore {
         this.errorText = typeof data.error === "string" ? data.error : JSON.stringify(data);
       }
     }
-    if (["run_finished", "run_canceled", "run_failed", "run_error", "run_started", "run_interrupted", "run_waiting", "confirm_request"].includes(event.kind)) {
+    if (["run_finished", "run_canceled", "run_error", "run_started", "run_interrupted", "run_waiting", "run_resumed", "run_queued", "confirm_request"].includes(event.kind)) {
       void this.withError(() => this.refreshRun(runId));
     }
   }
@@ -702,19 +792,11 @@ export class RunStore {
 }
 
 function isActive(state: RunStatus | "idle" | "loading"): boolean {
-  return state === "queued" || state === "running" || state === "waiting" || state === "confirming";
+  return state === "queued" || state === "running" || state === "waiting" || state === "confirming" || state === "cancel_requested";
 }
 
 function isCancelable(state: RunStatus | "idle" | "loading"): boolean {
-  return state === "queued" || state === "running" || state === "waiting" || state === "confirming";
-}
-
-function generatorIdFromRunId(runId: string): string {
-  const forkMarker = "-fork-";
-  const forkIndex = runId.indexOf(forkMarker);
-  const base = forkIndex >= 0 ? runId.slice(0, forkIndex) : runId;
-  const dash = base.lastIndexOf("-");
-  return dash > 0 ? base.slice(0, dash) : base;
+  return state === "queued" || state === "running" || state === "waiting" || state === "confirming" || state === "cancel_requested";
 }
 
 function canonicalJson(value: unknown): string {

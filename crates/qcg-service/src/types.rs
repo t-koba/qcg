@@ -78,6 +78,10 @@ pub(crate) struct LocalQcgServiceInner {
     pub(crate) queue_notify: Arc<tokio::sync::Notify>,
     /// Stable identity of this service process for shared-store ownership.
     pub(crate) owner_id: String,
+    /// Whether a higher-priority arrival may preempt a running run.
+    /// Priority-ordered admission always applies; forced interruption of
+    /// running jobs is a separate operational choice (3.2).
+    pub(crate) preemption_enabled: std::sync::Mutex<bool>,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct RunRecord {
@@ -103,6 +107,20 @@ pub(crate) struct RunRecord {
     /// Owning service process for shared-store coordination. Empty means
     /// unowned (recovered); the first process to spawn claims ownership.
     pub(crate) owner_id: String,
+    /// Direct-execution placeholder registered only for unified queue
+    /// ordering. The inline direct driver owns execution, so the queue
+    /// resumres must never adopt it into a second engine task.
+    pub(crate) ephemeral: bool,
+}
+
+/// Open journal handle for constant-memory HTTP delivery. The configured
+/// total bound (when any) was already enforced against the file size before
+/// the first byte is served.
+#[derive(Debug)]
+pub struct JournalStream {
+    pub file: tokio::fs::File,
+    pub len: u64,
+    pub limit: Option<usize>,
 }
 
 /// Owned inputs for a self-contained run bundle export.
@@ -129,15 +147,58 @@ impl qcg_engine::RunSnapshotSource for ServiceSnapshotSource {
             return Some(record.state);
         }
         let run_dir = self.service.run_dir_for(run_id).await.ok()?;
-        fold_run_state(&run_dir)
-            .ok()?
-            .terminal
-            .map(|terminal| match terminal {
-                qcg_engine::TerminalState::Succeeded => RunStatus::Succeeded,
-                qcg_engine::TerminalState::Failed => RunStatus::Failed,
-                qcg_engine::TerminalState::Canceled => RunStatus::Canceled,
-                qcg_engine::TerminalState::Interrupted => RunStatus::Interrupted,
-            })
+        // Unknown run status blocks awaiters instead of proceeding: a
+        // failed fold must never read as terminated. An unsettled run reads
+        // as queued so awaiters keep waiting instead of proceeding on a
+        // possibly live run misreported as dead.
+        Some(
+            fold_run_state(&run_dir)
+                .ok()?
+                .terminal
+                .map(|terminal| match terminal {
+                    qcg_engine::TerminalState::Succeeded => RunStatus::Succeeded,
+                    qcg_engine::TerminalState::Failed => RunStatus::Failed,
+                    qcg_engine::TerminalState::Canceled => RunStatus::Canceled,
+                    qcg_engine::TerminalState::Interrupted => RunStatus::Interrupted,
+                })
+                .unwrap_or(RunStatus::Queued),
+        )
+    }
+}
+
+/// Effective execution policy resolved once at admission from the contract
+/// request and the deployment ceiling (3.4). Values are never silently
+/// truncated: when the ceiling caps the contract, the origin records it so
+/// CLI plan output, API snapshots, and the journal agree on the enforced
+/// value instead of each layer reinterpreting environment or constants.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedExecutionPolicy {
+    pub(crate) max_total_steps: usize,
+    pub(crate) max_parallel_steps: usize,
+    pub(crate) origin: String,
+}
+
+impl ResolvedExecutionPolicy {
+    pub(crate) fn resolve(contract_max_steps: usize) -> Self {
+        let ceiling = qcg_engine::RunOptions::default_max_total_steps();
+        let effective = ceiling.min(contract_max_steps);
+        let origin = if effective < contract_max_steps {
+            format!("service-ceiling:{ceiling} caps contract:{contract_max_steps}")
+        } else {
+            format!("contract:{contract_max_steps}")
+        };
+        if effective < contract_max_steps {
+            tracing::warn!(
+                ceiling,
+                contract_max_steps,
+                "deployment ceiling caps the contract step budget; effective value is reported, not silently applied"
+            );
+        }
+        Self {
+            max_total_steps: effective,
+            max_parallel_steps: qcg_engine::RunOptions::default_max_parallel_steps().max(1),
+            origin,
+        }
     }
 }
 

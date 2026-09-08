@@ -227,6 +227,7 @@ mod tests {
         let runtime = McpRuntime::from_specs(vec![remote_spec()]).expect("runtime should load");
         runtime
             .active_sessions("tinyfish")
+            .expect("test registry has the counter")
             .store(1, Ordering::Release);
         let error = runtime
             .clear_authorization("tinyfish")

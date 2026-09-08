@@ -64,14 +64,18 @@ impl StepExecutor for CheckToolStep {
             .manifest
             .tools
             .get(tool_name)
-            .expect("validated tool");
+            .ok_or_else(|| {
+                StepError::failed(&node.id, format!("tool `{tool_name}` is not declared"))
+            })?;
         let input = ctx.render_inline(
             node,
             params
                 .input
                 .as_deref()
                 .or(tool.input.as_deref())
-                .expect("validated input"),
+                .ok_or_else(|| {
+                    StepError::failed(&node.id, format!("tool `{tool_name}` declares no input"))
+                })?,
         )?;
         if !matches!(tool.workspace, ToolWorkspace::None) {
             let input_path = ctx.run.fs.resolve_read(&input).map_err(|error| {
@@ -108,7 +112,19 @@ impl StepExecutor for CheckToolStep {
                 }
             };
             if requires_tool_backend_confirmation(&tool.resolution.fallback, index) {
-                let confirm_id = format!("{}:tool_backend:{}", node.id, candidate.kind);
+                let target = format!("{tool_name}:{}", candidate.kind);
+                let details = Some(json!({
+                    "tool": tool_name,
+                    "backend": candidate.kind.to_string(),
+                    "unavailable": unavailable,
+                }));
+                let digest = qcg_engine::RunContext::operation_digest(&target, &details)?;
+                let confirm_id = format!(
+                    "{}:tool_backend:{}:{}",
+                    node.id,
+                    candidate.kind,
+                    &digest[..16]
+                );
                 if !ctx
                     .run
                     .confirmations
@@ -124,13 +140,10 @@ impl StepExecutor for CheckToolStep {
                                 candidate.kind
                             ),
                             kind: "tool_backend_fallback".into(),
-                            target: format!("{tool_name}:{}", candidate.kind),
+                            target: target.clone(),
                             dry_run: false,
-                            details: Some(json!({
-                                "tool": tool_name,
-                                "backend": candidate.kind.to_string(),
-                                "unavailable": unavailable,
-                            })),
+                            details: details.clone(),
+                            operation_digest: digest,
                         },
                     });
                 }

@@ -56,6 +56,7 @@ pub(crate) async fn snapshot_remote_or_local_resource(
                     sensitive_query: BTreeMap::new(),
                     body: None,
                     follow_redirects: true,
+                    idempotency_key: None,
                 })
                 .await?;
             let bytes = response.body;

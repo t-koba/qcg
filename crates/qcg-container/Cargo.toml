@@ -1,0 +1,17 @@
+[package]
+name = "qcg-container"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
+publish.workspace = true
+
+[dependencies]
+qcg-contract = { path = "../qcg-contract" }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = ["macros", "process", "sync", "time"] }
+tokio-util.workspace = true
+uuid.workspace = true

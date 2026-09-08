@@ -6,6 +6,7 @@ use qcg_engine::{
 };
 use qcg_policy::{params_schema, string_schema};
 use serde_json::{Value, json};
+use sha2::Digest as _;
 
 use super::direct::{
     DirectMcpToolEvent, execute_direct_mcp_call, record_direct_mcp_tool_event,
@@ -114,8 +115,21 @@ impl StepExecutor for McpCallStep {
                     "tool": params.tool,
                     "argument_names": arguments
                         .as_object()
-                        .map(|object| object.keys().cloned().collect::<Vec<_>>())
+                        .map(|object| {
+                            let mut names: Vec<String> =
+                                object.keys().cloned().collect();
+                            names.sort();
+                            names
+                        })
                         .unwrap_or_default(),
+                    // The approval binds the full argument value, not just
+                    // names: approving one call must never authorize a
+                    // regenerated different payload.
+                    "arguments_sha256": hex::encode(
+                        sha2::Sha256::digest(
+                            serde_json::to_vec(&arguments).unwrap_or_default()
+                        )
+                    ),
                 })),
             )?
         {

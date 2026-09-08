@@ -17,6 +17,7 @@ hex.workspace = true
 jsonschema.workspace = true
 qcg-policy = { path = "../qcg-policy" }
 qcg-api = { path = "../qcg-api" }
+qcg-container = { path = "../qcg-container" }
 qcg-contract = { path = "../qcg-contract" }
 qcg-engine = { path = "../qcg-engine" }
 qcg-mcp = { path = "../qcg-mcp" }

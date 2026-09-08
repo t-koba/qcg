@@ -158,7 +158,12 @@ mutually exclusive. Decoded content is limited only when the generator
 contract sets an explicit `[runtime] file_input_limit_bytes`; otherwise there
 is no mechanistic limit. Values are supplied inline with the run request.
 `qcg serve` additionally accepts an explicit `--max-request-bytes`
-(`QCG_MAX_REQUEST_BYTES`) bound for the whole request body.
+(`QCG_MAX_REQUEST_BYTES`) bound for the whole request body. The bound is
+explicit-max-only: when omitted, the server disables Axum's built-in 2 MiB
+JSON limit so FileValue and contract limits govern. The effective bound is
+the configured value when set, otherwise no mechanistic HTTP limit. The
+startup log reports the effective policy, and `GET /healthz` exposes it as
+`max_request_bytes` (`null` means unlimited).
 
 ## Assets and frontend development
 

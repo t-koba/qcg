@@ -172,7 +172,10 @@ fn default_foreach_parallelism() -> usize {
     1
 }
 
-pub(crate) fn canonical_file_inputs(
+/// Normalizes file inputs to canonical `FileValue` form at admission so
+/// the journal, memory records, and engine execution observe identical
+/// inputs on every path.
+pub fn canonical_file_inputs(
     contract: &Contract,
     mut inputs: BTreeMap<String, Value>,
 ) -> Result<BTreeMap<String, Value>, EngineError> {
@@ -202,10 +205,10 @@ pub(crate) fn canonical_file_inputs(
     Ok(inputs)
 }
 
-pub(crate) fn materialize_file_inputs(
+pub(crate) async fn materialize_file_inputs(
     contract: &Contract,
     inputs: &BTreeMap<String, Value>,
-    workspace: &camino::Utf8Path,
+    fs: &crate::FsGateway,
 ) -> Result<BTreeMap<String, Value>, EngineError> {
     let mut materialized = inputs.clone();
     for field in contract
@@ -219,6 +222,14 @@ pub(crate) fn materialize_file_inputs(
         let Some(value) = inputs.get(&field.id) else {
             continue;
         };
+        // Field ids participate in workspace paths and must satisfy the same
+        // relative-path invariant as file names (A04).
+        if !qcg_policy::is_safe_relative_path(&field.id) || field.id.contains('/') {
+            return Err(EngineError::Failed(format!(
+                "invalid file input `{}`: field id is not a safe relative path",
+                field.id
+            )));
+        }
         let file = FileValue::from_value_optional_limit(
             value,
             contract.manifest.runtime.file_input_limit_bytes,
@@ -227,17 +238,17 @@ pub(crate) fn materialize_file_inputs(
             EngineError::Failed(format!("invalid file input `{}`: {error}", field.id))
         })?;
         let relative = format!("files/{}/{}", field.id, file.name);
-        let target = workspace.join(&relative);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(
-            &target,
-            file.decode_optional_limit(contract.manifest.runtime.file_input_limit_bytes)
-                .map_err(|error| {
-                    EngineError::Failed(format!("invalid file input `{}`: {error}", field.id))
-                })?,
-        )?;
+        // Route internal input placement through the same workspace I/O
+        // isolation as ordinary writes: parent/terminal symlink checks and
+        // atomic replace (A04). Privileged placement shares the isolation
+        // invariant without sharing the general fs_write permission.
+        let target = fs.resolve_internal_write(&relative)?;
+        let bytes = file
+            .decode_optional_limit(contract.manifest.runtime.file_input_limit_bytes)
+            .map_err(|error| {
+                EngineError::Failed(format!("invalid file input `{}`: {error}", field.id))
+            })?;
+        fs.write_file_atomic(&target, &bytes).await?;
         materialized.insert(field.id.clone(), Value::String(relative));
     }
     Ok(materialized)

@@ -6,6 +6,13 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
+
+/// Grace period for a timed-out node to settle cooperatively after its
+/// node-scoped stop signal before the future is abandoned. Matches the
+/// service shutdown and cancel deadlines so every layer converges on the
+/// same bound (A09).
+const NODE_TIMEOUT_GRACE_SECS: u64 = 5;
 
 use super::checkpoint::pin_files;
 use super::repair_support::failure_from_findings;
@@ -54,19 +61,70 @@ impl Engine {
 
         let mut outcomes = BTreeMap::new();
         let mut join_error = None;
-        while let Some(result) = tasks.join_next().await {
-            match result {
-                Ok((node, outcome)) => {
-                    outcomes.insert(node.id.clone(), (node, outcome));
+        // Fail-fast with deterministic settlement: the first terminal
+        // failure or HITL suspension aborts siblings promptly instead of
+        // letting side effects continue in the background. Aborted tasks
+        // report cancellation and are ignored; completed steps replay on
+        // resume. External cancellation aborts the whole wave.
+        let mut abort_on_settle = false;
+        // Full-quiescence invariant: this loop never exits while tasks
+        // remain, on any path. Settlement below assumes no live writer can
+        // still append, so a break-on-timeout here would let a wedged
+        // sibling race settlement. Aborted tasks are drained to resolution;
+        // late completions win explicitly through the outcome map, and a
+        // missing outcome journals a scheduler failure instead of silently
+        // dropping the node.
+        loop {
+            if tasks.is_empty() {
+                break;
+            }
+            tokio::select! {
+                biased;
+                _ = context.cancellation.cancelled() => {
+                    tasks.abort_all();
+                    while let Some(result) = tasks.join_next().await {
+                        if let Ok((node, _)) = result {
+                            states.insert(
+                                node.id.clone(),
+                                NodeState::Failed(FailureDetail::new(
+                                    FailureCode::Canceled,
+                                    "parallel wave canceled",
+                                )),
+                            );
+                        }
+                    }
+                    return Err(EngineError::Canceled);
                 }
-                Err(error) => {
-                    join_error.get_or_insert_with(|| {
-                        EngineError::Step(StepError::failed(
-                            "scheduler",
-                            format!("parallel task failed: {error}"),
-                        ))
-                    });
+                result = tasks.join_next(), if !tasks.is_empty() => {
+                    let Some(result) = result else { break };
+                    match result {
+                        Ok((node, outcome)) => {
+                            let terminal = !matches!(&outcome, Ok(StepOutcome::Success { .. }));
+                            outcomes.insert(node.id.clone(), (node, outcome));
+                            if terminal && !abort_on_settle {
+                                abort_on_settle = true;
+                                tasks.abort_all();
+                            }
+                        }
+                        Err(error) => {
+                            if error.is_cancelled() {
+                                // Sibling aborted after fail-fast; ignore.
+                                continue;
+                            }
+                            join_error.get_or_insert_with(|| {
+                                EngineError::Step(StepError::failed(
+                                    "scheduler",
+                                    format!("parallel task failed: {error}"),
+                                ))
+                            });
+                            if !abort_on_settle {
+                                abort_on_settle = true;
+                                tasks.abort_all();
+                            }
+                        }
+                    }
                 }
+                else => break,
             }
         }
 
@@ -199,17 +257,32 @@ impl Engine {
         loop {
             attempt += 1;
             let result = if let Some(timeout_secs) = retry.timeout_secs {
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(timeout_secs),
-                    self.execute_node_after_budget(context, journal, vars, budget, node),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => Err(EngineError::Step(StepError::failed(
-                        &node.id,
-                        format!("node `{}` timed out after {timeout_secs}s", node.id),
-                    ))),
+                // Node-scoped stop signal: timing out must not cancel the
+                // whole run, so the inner execution observes a child token
+                // on a cloned context. On timeout the child is cancelled and
+                // the node gets a bounded grace period to settle
+                // cooperatively; only then is the future abandoned and the
+                // timeout recorded. Explicit wait and settlement live in this
+                // layer instead of a bare inner-future drop (A09).
+                let node_stop = CancellationToken::new();
+                let mut node_context = context.clone();
+                node_context.cancellation = node_stop.clone();
+                let mut execution =
+                    self.execute_node_after_budget(&node_context, journal, vars, budget, node);
+                tokio::select! {
+                    result = &mut execution => result,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
+                        node_stop.cancel();
+                        tokio::select! {
+                            result = &mut execution => result,
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(
+                                NODE_TIMEOUT_GRACE_SECS,
+                            )) => Err(EngineError::Step(StepError::failed(
+                                &node.id,
+                                format!("node `{}` timed out after {timeout_secs}s", node.id),
+                            ))),
+                        }
+                    }
                 }
             } else {
                 self.execute_node_after_budget(context, journal, vars, budget, node)

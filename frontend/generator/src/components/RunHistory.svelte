@@ -4,7 +4,11 @@
   let { store, messages }: { store: RunStore; messages: Messages } = $props();
 
   const openIds = $derived(new Set(store.tabOrder));
-  const history = $derived(store.runs.filter((run) => !openIds.has(run.run_id)).slice(0, 20));
+  // Single scan: both the visible slice and the hidden count derive from
+  // the same closed-run list instead of filtering twice.
+  const closedRuns = $derived(store.runs.filter((run) => !openIds.has(run.run_id)));
+  const history = $derived(closedRuns.slice(0, store.historyLimit));
+  const hiddenCount = $derived(closedRuns.length - history.length);
   const states = [
     "",
     "queued",
@@ -26,6 +30,7 @@
       case "succeeded": return messages.statusSucceeded;
       case "failed": return messages.statusFailed;
       case "canceled": return messages.statusCanceled;
+      case "cancel_requested": return messages.statusCancelRequested;
       case "interrupted": return messages.statusInterrupted;
       default: return messages.filterAllStates;
     }
@@ -53,6 +58,14 @@
         <small>{run.state} · {run.started_at}</small>
       </button>
     {/each}
+    {#if hiddenCount > 0}
+      <button type="button" class="secondary-btn" onclick={() => store.loadMoreHistory()}>
+        {messages.loadMore} ({hiddenCount})
+      </button>
+    {/if}
+    {#if store.historyHasMore}
+      <p class="run-history-empty">More history remains on the server. Refine the filter or use the API cursor.</p>
+    {/if}
   {/if}
 </nav>
 

@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use super::access::{McpAccess, McpCommandIsolation, mcp_container_runtime_command};
+use super::access::{McpAccess, McpCommandIsolation, mcp_container_backend};
 use super::error::McpError;
 use super::profile::{
     AllowedOAuthHttpClient, CredentialGuard, KeyringCredentialStore, McpProfile,
@@ -212,7 +212,7 @@ impl McpRuntime {
         {
             return Ok(true);
         }
-        self.store(profile)
+        self.store(profile)?
             .load()
             .await
             .map(|credentials| credentials.is_some())
@@ -230,7 +230,7 @@ impl McpRuntime {
                 "MCP server `{server_id}` does not use OAuth"
             )));
         }
-        let lifecycle_gate = self.lifecycle_gate(server_id);
+        let lifecycle_gate = self.lifecycle_gate(server_id)?;
         let _lifecycle = lifecycle_gate.lock().await;
         if self
             .inner
@@ -319,7 +319,7 @@ impl McpRuntime {
             .get(&csrf)
             .map(|authorization| authorization.server_id.clone())
             .ok_or_else(|| McpError::Authorization("OAuth state is unknown or expired".into()))?;
-        let lifecycle_gate = self.lifecycle_gate(&server_id);
+        let lifecycle_gate = self.lifecycle_gate(&server_id)?;
         let _lifecycle = lifecycle_gate.lock().await;
         let mut authorization = self
             .inner
@@ -356,14 +356,14 @@ impl McpRuntime {
                 "MCP server `{server_id}` does not use OAuth"
             )));
         }
-        let lifecycle_gate = self.lifecycle_gate(server_id);
+        let lifecycle_gate = self.lifecycle_gate(server_id)?;
         let _lifecycle = lifecycle_gate.lock().await;
-        if self.active_sessions(server_id).load(Ordering::Acquire) != 0 {
+        if self.active_sessions(server_id)?.load(Ordering::Acquire) != 0 {
             return Err(McpError::Configuration(format!(
                 "MCP server `{server_id}` authorization cannot be cleared while sessions are active"
             )));
         }
-        self.store(profile).clear().await.map_err(auth_error)?;
+        self.store(profile)?.clear().await.map_err(auth_error)?;
         self.inner.authorized_clients.lock().await.remove(server_id);
         self.inner
             .pending
@@ -380,7 +380,7 @@ impl McpRuntime {
                 "MCP server `{server_id}` does not use OAuth"
             )));
         }
-        let lifecycle_gate = self.lifecycle_gate(server_id);
+        let lifecycle_gate = self.lifecycle_gate(server_id)?;
         let _lifecycle = lifecycle_gate.lock().await;
         self.inner
             .pending
@@ -392,17 +392,17 @@ impl McpRuntime {
 
     async fn authorization_manager(&self, profile: &McpProfile) -> Result<OAuthState, McpError> {
         let oauth_client = Arc::new(AllowedOAuthHttpClient::new(profile)?);
-        let mut manager = AuthorizationManager::new_with_oauth_http_client(
-            profile
-                .url
-                .as_ref()
-                .expect("OAuth profile has a validated URL")
-                .clone(),
-            oauth_client,
-        )
-        .await
-        .map_err(auth_error)?;
-        manager.set_credential_store(self.store(profile));
+        let oauth_url = profile.url.as_ref().ok_or_else(|| {
+            McpError::Configuration(format!(
+                "OAuth profile `{}` has no validated URL",
+                profile.id()
+            ))
+        })?;
+        let mut manager =
+            AuthorizationManager::new_with_oauth_http_client(oauth_url.clone(), oauth_client)
+                .await
+                .map_err(auth_error)?;
+        manager.set_credential_store(self.store(profile)?);
         if manager.initialize_from_store().await.map_err(auth_error)? {
             Ok(OAuthState::Authorized(manager))
         } else {
@@ -410,12 +410,13 @@ impl McpRuntime {
         }
     }
 
-    fn store(&self, profile: &McpProfile) -> ProfileCredentialStore {
-        self.inner
-            .stores
-            .get(profile.id())
-            .expect("profile credential store exists")
-            .clone()
+    fn store(&self, profile: &McpProfile) -> Result<ProfileCredentialStore, McpError> {
+        self.inner.stores.get(profile.id()).cloned().ok_or_else(|| {
+            McpError::Configuration(format!(
+                "MCP server `{}` has no credential store",
+                profile.id()
+            ))
+        })
     }
 
     pub async fn connect(
@@ -426,12 +427,12 @@ impl McpRuntime {
     ) -> Result<McpSession, McpError> {
         let profile = self.resolve(server_id)?.clone();
         access.validate(&profile)?;
-        let lifecycle_gate = self.lifecycle_gate(server_id);
+        let lifecycle_gate = self.lifecycle_gate(server_id)?;
         let _lifecycle = tokio::select! {
             _ = cancellation.cancelled() => return Err(McpError::Canceled),
             lifecycle = lifecycle_gate.lock() => lifecycle,
         };
-        let active_sessions = self.active_sessions(server_id);
+        let active_sessions = self.active_sessions(server_id)?;
         let reservation = ActiveSessionReservation::acquire(active_sessions);
         drop(_lifecycle);
         let session_cancellation = cancellation.child_token();
@@ -460,20 +461,24 @@ impl McpRuntime {
         Ok(session)
     }
 
-    pub(crate) fn active_sessions(&self, server_id: &str) -> Arc<AtomicUsize> {
+    pub(crate) fn active_sessions(&self, server_id: &str) -> Result<Arc<AtomicUsize>, McpError> {
         self.inner
             .active_sessions
             .get(server_id)
-            .expect("profile active session counter exists")
-            .clone()
+            .cloned()
+            .ok_or_else(|| {
+                McpError::Configuration(format!("MCP server `{server_id}` has no session counter"))
+            })
     }
 
-    fn lifecycle_gate(&self, server_id: &str) -> Arc<Mutex<()>> {
+    fn lifecycle_gate(&self, server_id: &str) -> Result<Arc<Mutex<()>>, McpError> {
         self.inner
             .lifecycle_gates
             .get(server_id)
-            .expect("profile lifecycle gate exists")
-            .clone()
+            .cloned()
+            .ok_or_else(|| {
+                McpError::Configuration(format!("MCP server `{server_id}` has no lifecycle gate"))
+            })
     }
 
     async fn connect_http(
@@ -481,14 +486,14 @@ impl McpRuntime {
         profile: McpProfile,
         cancellation: CancellationToken,
     ) -> Result<McpSession, McpError> {
-        let mut config = StreamableHttpClientTransportConfig::with_uri(
-            profile
-                .url
-                .as_ref()
-                .expect("HTTP profile has validated URL")
-                .as_str(),
-        )
-        .max_sse_event_size(profile.spec.max_response_bytes);
+        let http_url = profile.url.as_ref().ok_or_else(|| {
+            McpError::Configuration(format!(
+                "HTTP profile `{}` has no validated URL",
+                profile.id()
+            ))
+        })?;
+        let mut config = StreamableHttpClientTransportConfig::with_uri(http_url.as_str())
+            .max_sse_event_size(profile.spec.max_response_bytes);
         config.allow_stateless = true;
         let mut headers = HashMap::new();
         for (name, value) in &profile.spec.headers {
@@ -502,31 +507,36 @@ impl McpRuntime {
         let credential_guard = match profile.spec.auth {
             McpAuth::None => CredentialGuard::None,
             McpAuth::Bearer => {
-                let credential = required_env(
-                    profile
-                        .spec
-                        .credential_env
-                        .as_deref()
-                        .expect("validated credential env"),
-                )?;
+                let credential =
+                    required_env(profile.spec.credential_env.as_deref().ok_or_else(|| {
+                        McpError::Configuration(format!(
+                            "MCP profile `{}` declares bearer auth without a credential env",
+                            profile.id()
+                        ))
+                    })?)?;
                 config = config.auth_header(credential.clone());
                 CredentialGuard::Static(vec![credential])
             }
             McpAuth::Header => {
-                let credential = required_env(
-                    profile
-                        .spec
-                        .credential_env
-                        .as_deref()
-                        .expect("validated credential env"),
-                )?;
+                let credential =
+                    required_env(profile.spec.credential_env.as_deref().ok_or_else(|| {
+                        McpError::Configuration(format!(
+                            "MCP profile `{}` declares header auth without a credential env",
+                            profile.id()
+                        ))
+                    })?)?;
                 headers.insert(
                     http::HeaderName::from_bytes(
                         profile
                             .spec
                             .auth_header
                             .as_deref()
-                            .expect("validated auth header")
+                            .ok_or_else(|| {
+                                McpError::Configuration(format!(
+                                    "MCP profile `{}` declares header auth without an auth header",
+                                    profile.id()
+                                ))
+                            })?
                             .as_bytes(),
                     )
                     .map_err(|error| McpError::Configuration(error.to_string()))?,
@@ -566,7 +576,7 @@ impl McpRuntime {
         {
             return Ok(client.clone());
         }
-        let lifecycle_gate = self.lifecycle_gate(profile.id());
+        let lifecycle_gate = self.lifecycle_gate(profile.id())?;
         let _lifecycle = lifecycle_gate.lock().await;
         if let Some(client) = self
             .inner
@@ -603,12 +613,18 @@ impl McpRuntime {
             .commands
             .iter()
             .find(|permission| permission.argv == profile.spec.command)
-            .expect("validated stdio command permission");
-        let (bin, args) = profile
-            .spec
-            .command
-            .split_first()
-            .expect("validated stdio command");
+            .ok_or_else(|| {
+                McpError::Configuration(format!(
+                    "MCP server `{}` stdio command is not permitted",
+                    profile.id()
+                ))
+            })?;
+        let (bin, args) = profile.spec.command.split_first().ok_or_else(|| {
+            McpError::Configuration(format!(
+                "MCP server `{}` stdio command is empty",
+                profile.id()
+            ))
+        })?;
         let command = match permission.isolation {
             McpCommandIsolation::TrustedHost => {
                 let mut command = tokio::process::Command::new(bin);
@@ -616,10 +632,10 @@ impl McpRuntime {
                 (command, None)
             }
             McpCommandIsolation::Container => {
-                let (runtime, runtime_args) = permission
+                let backend = permission
                     .runtime
                     .as_ref()
-                    .and_then(mcp_container_runtime_command)
+                    .and_then(mcp_container_backend)
                     .ok_or_else(|| {
                         McpError::Configuration(format!(
                             "MCP server `{}` requires its declared container runtime",
@@ -632,46 +648,131 @@ impl McpRuntime {
                         profile.id()
                     ))
                 })?;
-                let mount = format!(
-                    "type=bind,src={},dst=/work",
-                    access.workspace.to_string_lossy()
-                );
-                let mut command = tokio::process::Command::new(runtime);
-                command.args(runtime_args);
-                // cidfile stays outside the mounted workspace so the
-                // container cannot tamper with the tracked container id.
-                let cidfile = std::env::temp_dir().join(format!(
-                    ".qcg-mcp-container-{}-{}.cid",
-                    profile.id(),
-                    uuid::Uuid::now_v7().as_simple()
-                ));
-                command.args([
-                    "--rm",
-                    "-i",
-                    "--cidfile",
-                    cidfile.to_string_lossy().as_ref(),
-                    "--network",
-                    "none",
-                    "--read-only",
-                    "--cap-drop",
-                    "ALL",
-                    "--security-opt",
-                    "no-new-privileges",
-                    "--pids-limit",
-                    "256",
-                    "--mount",
-                    &mount,
-                    "--workdir",
-                    "/work",
-                ]);
-                for name in profile.spec.env.keys().chain(profile.spec.env_from.keys()) {
-                    command.args(["--env", name]);
+                // Static profile env plus resolved secret-backed env. Secret
+                // values travel in Minted `--env`/`-v` argv for managed
+                // families (documented host-local visibility); Docker-family
+                // `-e` passthrough keeps values out of argv instead.
+                let mut server_env: Vec<(String, String)> = profile
+                    .spec
+                    .env
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect();
+                for (target, source) in &profile.spec.env_from {
+                    server_env.push((target.clone(), required_env(source)?));
                 }
-                command.arg(image).arg(bin).args(args);
-                (command, Some((runtime.to_string(), cidfile)))
+                let workload: Vec<String> = std::iter::once(bin.to_string())
+                    .chain(args.iter().cloned())
+                    .collect();
+                let (command, session) = match &backend {
+                    qcg_container::Backend::Docker {
+                        binary,
+                        runtime_flag,
+                    } => {
+                        let mount = qcg_container::Mount {
+                            host: &access.workspace,
+                            guest: "/work",
+                            readonly: false,
+                        };
+                        // cidfile stays outside the mounted workspace so the
+                        // container cannot tamper with the tracked container id.
+                        let cidfile = std::env::temp_dir().join(format!(
+                            ".qcg-mcp-container-{}-{}.cid",
+                            profile.id(),
+                            uuid::Uuid::now_v7().as_simple()
+                        ));
+                        let env_names: Vec<String> =
+                            server_env.iter().map(|(name, _)| name.clone()).collect();
+                        let argv = qcg_container::docker_run_argv(&qcg_container::DockerRunSpec {
+                            binary,
+                            runtime_flag: runtime_flag.as_deref(),
+                            cidfile: &cidfile,
+                            mounts: &[mount],
+                            workdir: Some("/work"),
+                            env_names: &env_names,
+                            image,
+                            workload: &workload,
+                            stdin_pipe: true,
+                        });
+                        let (bin, args) = argv.split_first().ok_or_else(|| {
+                            McpError::Configuration("MCP server argv is empty".into())
+                        })?;
+                        let mut command = tokio::process::Command::new(bin);
+                        command.args(args);
+                        // `-e NAME` passes the client env value through; the
+                        // values themselves are set by the shared env block
+                        // below, so they never appear in argv.
+                        let session = qcg_container::Session {
+                            backend: backend.clone(),
+                            id: qcg_container::InstanceId::CidFile(cidfile),
+                        };
+                        (command, session)
+                    }
+                    managed => {
+                        let mount = qcg_container::Mount {
+                            host: &access.workspace,
+                            guest: "/work",
+                            readonly: false,
+                        };
+                        let session = qcg_container::provision(
+                            managed,
+                            &qcg_container::Provision {
+                                image,
+                                mounts: &[mount],
+                                id_prefix: "qcg-mcp-container",
+                                cancel: &cancellation,
+                            },
+                        )
+                        .await
+                        .map_err(|error| McpError::Transport(error.to_string()))?;
+                        let name = match &session.id {
+                            qcg_container::InstanceId::Name(name) => name.clone(),
+                            qcg_container::InstanceId::CidFile(_) => {
+                                return Err(McpError::Transport(
+                                    "managed provision returned no instance name".into(),
+                                ));
+                            }
+                        };
+                        let argv = match managed {
+                            qcg_container::Backend::Incus { binary } => {
+                                qcg_container::incus_exec_argv(
+                                    binary,
+                                    &name,
+                                    None,
+                                    &server_env,
+                                    &workload,
+                                )
+                            }
+                            qcg_container::Backend::Lxc => qcg_container::lxc_server_argv(
+                                &name,
+                                qcg_container::LXC_MINIMAL_PATH,
+                                &server_env,
+                                &workload,
+                            ),
+                            qcg_container::Backend::Docker { .. } => {
+                                return Err(McpError::Configuration(
+                                    "docker backends take the one-shot path".into(),
+                                ));
+                            }
+                        };
+                        let (bin, args) = argv.split_first().ok_or_else(|| {
+                            McpError::Configuration("MCP server argv is empty".into())
+                        })?;
+                        let mut command = tokio::process::Command::new(bin);
+                        command.args(args);
+                        (command, session)
+                    }
+                };
+                (command, Some(session))
             }
         };
         let (mut command, container_cleanup) = command;
+        // Docker-family `-e NAME` passthrough reads values from the client
+        // environment; managed families carry values in spawn argv instead,
+        // so profile secrets never touch the client environment there.
+        let passthrough_env = container_cleanup
+            .as_ref()
+            .is_none_or(|session| matches!(session.backend, qcg_container::Backend::Docker { .. }));
         command
             .current_dir(&access.workspace)
             .env_clear()
@@ -679,19 +780,29 @@ impl McpRuntime {
         if let Ok(path) = std::env::var("PATH") {
             command.env("PATH", path);
         }
-        for (name, value) in &profile.spec.env {
-            command.env(name, value);
+        // Daemon clients may need a home directory for their configuration;
+        // workload isolation is unaffected because entered processes start
+        // from explicit env flags.
+        if !passthrough_env && let Ok(home) = std::env::var("HOME") {
+            command.env("HOME", home);
+        }
+        if passthrough_env {
+            for (name, value) in &profile.spec.env {
+                command.env(name, value);
+            }
         }
         let mut sensitive_values = Vec::new();
         for (target, source) in &profile.spec.env_from {
             let value = required_env(source)?;
-            command.env(target, &value);
+            if passthrough_env {
+                command.env(target, &value);
+            }
             sensitive_values.push(value);
         }
         let mut transport = BoundedChildTransport::spawn(command, profile.spec.max_response_bytes)
             .map_err(|error| McpError::Transport(error.to_string()))?;
-        if let Some((runtime, cidfile)) = container_cleanup {
-            transport = transport.with_container_cleanup(runtime, cidfile);
+        if let Some(session) = container_cleanup {
+            transport = transport.with_container_cleanup(session);
         }
         McpSession::serve(
             profile,

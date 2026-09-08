@@ -38,6 +38,8 @@ pub enum GatewayError {
     ContainerRuntimeMissing { bin: String },
     #[error("container-isolated command `{bin}` has no image")]
     ContainerImageMissing { bin: String },
+    #[error(transparent)]
+    Container(#[from] qcg_container::ContainerError),
     #[error("command `{bin}` timed out")]
     CommandTimedOut { bin: String },
     #[error("command `{bin}` output exceeded limit")]

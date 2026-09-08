@@ -239,7 +239,19 @@ impl Engine {
             workspace,
             metadata: metadata_dir.clone(),
         };
-        let canonical_inputs = replay.state.inputs.clone().unwrap_or(inputs);
+        // Durable replay inputs win; admission inputs are only a fallback
+        // for journals that recorded none. The fallback is logged because
+        // silently substituting inputs would diverge from durable replay.
+        let canonical_inputs = match replay.state.inputs.clone() {
+            Some(inputs) => inputs,
+            None => {
+                tracing::warn!(
+                    run_id = %run_id,
+                    "replay has no durable inputs; falling back to admission inputs"
+                );
+                inputs
+            }
+        };
         let resource_hashes = collect_resource_hashes(&context).await?;
         if !replay.state.execution_started {
             journal.event(
@@ -267,14 +279,16 @@ impl Engine {
             journal.event("run_resumed", json!({ "run_id": run_id }))?;
         }
 
-        let materialized_inputs =
-            materialize_file_inputs(&context.contract, &canonical_inputs, &context.workspace)?;
+        // Verify checkpoint pins and resource pins before placing file
+        // inputs: a failed verification must not leave fresh writes behind.
         replay.verify_files(
             &context.workspace,
             &context.contract.manifest.runtime,
             &context.checkpoint_accounting,
         )?;
         verify_resource_pins(&replay.state, &resource_hashes)?;
+        let materialized_inputs =
+            materialize_file_inputs(&context.contract, &canonical_inputs, &context.fs).await?;
 
         let mut vars = if replay.state.run_id.is_some() {
             let mut vars = replay.state.vars.clone();

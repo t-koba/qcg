@@ -8,7 +8,6 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use futures_util::StreamExt as FuturesStreamExt;
 use qcg_api::{AnswerPayload, ConfirmDecision};
 use serde::Serialize;
-use sha2::Digest as _;
 use std::convert::Infallible;
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -17,7 +16,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use super::config::AppState;
 use super::error::ApiHttpError;
-use super::idempotency::with_idempotency;
+use super::idempotency::{IdempotentCall, with_idempotency};
 
 pub(crate) async fn run_snapshot(
     State(state): State<Arc<AppState>>,
@@ -97,12 +96,21 @@ pub(crate) async fn answer_run(
     body.extend_from_slice(question_id.as_bytes());
     body.push(0);
     body.extend_from_slice(&serde_json::to_vec(&payload).map_err(ApiHttpError::internal)?);
-    with_idempotency(&state, &headers, "answer", &id, &body, false, || async {
-        state
-            .service
-            .answer(id.clone(), question_id.clone(), payload)
-            .await
-            .map(|()| id.clone())
+    with_idempotency(IdempotentCall {
+        state: &state,
+        headers: &headers,
+        scope: "answer",
+        target: &id,
+        body: &body,
+        created: false,
+        reserved_run_id: Some(id.clone()),
+        execute: |_| async {
+            state
+                .service
+                .answer(id.clone(), question_id.clone(), payload)
+                .await
+                .map(|()| id.clone())
+        },
     })
     .await
 }
@@ -117,12 +125,21 @@ pub(crate) async fn confirm_run(
     body.extend_from_slice(confirmation_id.as_bytes());
     body.push(0);
     body.extend_from_slice(&serde_json::to_vec(&decision).map_err(ApiHttpError::internal)?);
-    with_idempotency(&state, &headers, "confirm", &id, &body, false, || async {
-        state
-            .service
-            .confirm(id.clone(), confirmation_id.clone(), decision)
-            .await
-            .map(|()| id.clone())
+    with_idempotency(IdempotentCall {
+        state: &state,
+        headers: &headers,
+        scope: "confirm",
+        target: &id,
+        body: &body,
+        created: false,
+        reserved_run_id: Some(id.clone()),
+        execute: |_| async {
+            state
+                .service
+                .confirm(id.clone(), confirmation_id.clone(), decision)
+                .await
+                .map(|()| id.clone())
+        },
     })
     .await
 }
@@ -132,8 +149,15 @@ pub(crate) async fn cancel_run(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Response, ApiHttpError> {
-    with_idempotency(&state, &headers, "cancel", &id, &[], false, || async {
-        state.service.cancel(id.clone()).await.map(|()| id.clone())
+    with_idempotency(IdempotentCall {
+        state: &state,
+        headers: &headers,
+        scope: "cancel",
+        target: &id,
+        body: &[],
+        created: false,
+        reserved_run_id: Some(id.clone()),
+        execute: |_| async { state.service.cancel(id.clone()).await.map(|()| id.clone()) },
     })
     .await
 }
@@ -207,7 +231,13 @@ pub(crate) async fn run_events(
             if event.seq <= after_seq {
                 return None;
             }
-            let data = serde_json::to_string(&event).ok()?;
+            let data = match serde_json::to_string(&event) {
+                Ok(data) => data,
+                Err(error) => {
+                    tracing::warn!(seq = event.seq, %error, "dropping unserializable SSE event");
+                    return None;
+                }
+            };
             let event = Event::default().id(event.seq.to_string()).data(data);
             Some(Ok(event))
         });
@@ -276,21 +306,76 @@ pub(crate) async fn read_artifact(
         .read_artifact(id, path)
         .await
         .map_err(ApiHttpError::from_api)?;
-    // Read once and verify size + hash before serving so a same-size
-    // post-completion swap is rejected like the ZIP/bundle paths.
-    let bytes = tokio::fs::read(&resolved)
+    // Verify size via metadata before allocating, then bound the read by
+    // the manifest size + 1 so a swapped larger file never forces excess
+    // allocation before the configured limits are enforced (C05).
+    let metadata = tokio::fs::metadata(&resolved)
         .await
         .map_err(ApiHttpError::internal)?;
-    verify_artifact_bytes(&artifact, &bytes).map_err(ApiHttpError::internal)?;
+    if metadata.len() != artifact.bytes {
+        return Err(ApiHttpError::internal(format!(
+            "artifact `{}` bytes mismatch: manifest={}, actual={}",
+            artifact.path,
+            artifact.bytes,
+            metadata.len()
+        )));
+    }
+    if let Some(limit) = state.artifact_limits.max_bytes
+        && metadata.len() > limit
+    {
+        return Err(ApiHttpError::from_api(qcg_api::ApiError::TooLarge {
+            actual_bytes: metadata.len() as usize,
+            limit_bytes: limit as usize,
+        }));
+    }
+    // Streamed verification on the open file description (constant
+    // memory): hash and length are checked before delivery, then the SAME
+    // description rewinds for the response body, so a path swap between
+    // verify and serve cannot substitute bytes.
+    let mut file = tokio::fs::File::open(&resolved)
+        .await
+        .map_err(ApiHttpError::internal)?;
+    {
+        use sha2::Digest as _;
+        use tokio::io::AsyncReadExt as _;
+        let mut hasher = sha2::Sha256::new();
+        let mut seen: u64 = 0;
+        // Manifest size + 1 detects post-stat growth without over-allocating.
+        let mut remaining = artifact.bytes.saturating_add(1);
+        let mut chunk = vec![0u8; 64 * 1024];
+        loop {
+            let limit = (chunk.len() as u64).min(remaining) as usize;
+            if limit == 0 {
+                break;
+            }
+            let read = file
+                .read(&mut chunk[..limit])
+                .await
+                .map_err(ApiHttpError::internal)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&chunk[..read]);
+            seen = seen.saturating_add(read as u64);
+            remaining = remaining.saturating_sub(read as u64);
+        }
+        verify_artifact_measurement(&artifact, seen, &hex::encode(hasher.finalize()))
+            .map_err(ApiHttpError::internal)?;
+    }
+    {
+        use tokio::io::AsyncSeekExt as _;
+        file.rewind().await.map_err(ApiHttpError::internal)?;
+    }
     let content_type = artifact
         .mime
         .unwrap_or_else(|| content_type_for_name(&artifact.path).to_string());
+    let stream = tokio_util::io::ReaderStream::new(file);
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CONTENT_DISPOSITION, content_disposition)
         .header(header::CONTENT_LENGTH, artifact.bytes)
-        .body(Body::from(bytes))
+        .body(Body::from_stream(stream))
         .map_err(ApiHttpError::internal)
 }
 
@@ -348,16 +433,39 @@ pub(crate) async fn read_journal(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiHttpError> {
-    let bytes = state
+    // Constant-memory delivery: the bound (when configured) was already
+    // enforced against the file size at open, so no path allocates beyond
+    // its checked bound. Live journals may extend mid-stream; the body is
+    // raw ndjson bytes as written.
+    let stream = state
         .service
-        .read_journal(id)
+        .open_journal_stream(id)
         .await
-        .map_err(ApiHttpError::from_api)?
-        .into_bytes();
+        .map_err(ApiHttpError::from_api)?;
+    let body = match stream.limit {
+        Some(limit) => {
+            use tokio::io::AsyncReadExt as _;
+            let mut bytes = Vec::new();
+            stream
+                .file
+                .take(limit.saturating_add(1) as u64)
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(ApiHttpError::internal)?;
+            if bytes.len() > limit {
+                return Err(ApiHttpError::from_api(qcg_api::ApiError::TooLarge {
+                    actual_bytes: bytes.len(),
+                    limit_bytes: limit,
+                }));
+            }
+            Body::from(bytes)
+        }
+        None => Body::from_stream(tokio_util::io::ReaderStream::new(stream.file)),
+    };
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/x-ndjson")
-        .body(Body::from(bytes))
+        .body(body)
         .map_err(ApiHttpError::internal)
 }
 
@@ -411,19 +519,19 @@ pub(crate) fn content_disposition_attachment(path: &str) -> String {
 /// Verify a singly-served artifact against its manifest before delivery.
 /// Size alone cannot detect a same-length post-completion swap, so the
 /// sha256 is always compared, matching the ZIP/bundle verification.
-pub(crate) fn verify_artifact_bytes(
+/// Single comparison contract for artifact delivery, shared by buffered
+/// and streaming verifiers so the two paths cannot disagree.
+pub(crate) fn verify_artifact_measurement(
     artifact: &qcg_types::OutputArtifact,
-    bytes: &[u8],
+    actual_len: u64,
+    actual_sha256: &str,
 ) -> Result<(), String> {
-    if bytes.len() as u64 != artifact.bytes {
+    if actual_len != artifact.bytes {
         return Err(format!(
             "artifact `{}` bytes mismatch: manifest={}, actual={}",
-            artifact.path,
-            artifact.bytes,
-            bytes.len()
+            artifact.path, artifact.bytes, actual_len
         ));
     }
-    let actual_sha256 = hex::encode(sha2::Sha256::digest(bytes));
     if actual_sha256 != artifact.sha256 {
         return Err(format!(
             "artifact `{}` content mismatch: manifest sha256 does not match file",
@@ -436,6 +544,7 @@ pub(crate) fn verify_artifact_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest as _;
 
     fn artifact_for(bytes: &[u8]) -> qcg_types::OutputArtifact {
         qcg_types::OutputArtifact {
@@ -450,19 +559,26 @@ mod tests {
         }
     }
 
+    fn measured(bytes: &[u8]) -> (u64, String) {
+        (bytes.len() as u64, hex::encode(sha2::Sha256::digest(bytes)))
+    }
+
     #[test]
     fn single_artifact_delivery_rejects_same_size_swap() {
         let original = b"result-v1";
         let artifact = artifact_for(original);
-        verify_artifact_bytes(&artifact, original).expect("matching content should pass");
+        let (len, digest) = measured(original);
+        verify_artifact_measurement(&artifact, len, &digest).expect("matching content should pass");
         let swapped = b"result-v2";
         assert_eq!(swapped.len(), original.len());
-        let error = verify_artifact_bytes(&artifact, swapped)
+        let (swapped_len, swapped_digest) = measured(swapped);
+        let error = verify_artifact_measurement(&artifact, swapped_len, &swapped_digest)
             .expect_err("same-size content swap must be rejected");
         assert!(error.contains("content mismatch"));
         let truncated = b"result-";
-        let error =
-            verify_artifact_bytes(&artifact, truncated).expect_err("size change must be rejected");
+        let (truncated_len, truncated_digest) = measured(truncated);
+        let error = verify_artifact_measurement(&artifact, truncated_len, &truncated_digest)
+            .expect_err("size change must be rejected");
         assert!(error.contains("bytes mismatch"));
     }
 }

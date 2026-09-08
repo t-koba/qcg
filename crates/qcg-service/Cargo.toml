@@ -12,6 +12,7 @@ publish.workspace = true
 async-trait.workspace = true
 camino.workspace = true
 chrono.workspace = true
+dunce.workspace = true
 futures-util.workspace = true
 fs2.workspace = true
 hex.workspace = true

@@ -75,6 +75,7 @@
 
   let showRun = $derived(store.currentRun !== "");
   let terminal = $derived(["succeeded", "failed", "canceled", "interrupted"].includes(store.runState));
+  let retryablePlaceholder = $derived(store.failedPlaceholderId());
   let generatorName = $derived(store.detail?.generator?.name || store.selected || messages.selectGenerator);
 
 </script>
@@ -116,6 +117,9 @@
       {#if store.errorText}
         <div class="error-banner" role="alert">
           <span>{store.errorText}</span>
+          {#if retryablePlaceholder}
+            <button class="secondary-btn" type="button" disabled={store.pendingAction !== null} onclick={() => void store.withError(() => store.retryFailedStart(retryablePlaceholder))}>{messages.retryStart}</button>
+          {/if}
           <button type="button" aria-label={messages.dismissError} onclick={() => store.dismissError()}>×</button>
         </div>
       {/if}

@@ -47,6 +47,13 @@ impl FsGateway {
         self.resolve_workspace_path(path, true)
     }
 
+    /// Privileged internal placement sharing the path-isolation invariant
+    /// without requiring the general fs_write permission (A04). Used only
+    /// for contract-declared file inputs, never for general step writes.
+    pub fn resolve_internal_write(&self, path: &str) -> Result<Utf8PathBuf, GatewayError> {
+        self.resolve_workspace_path(path, true)
+    }
+
     fn resolve_workspace_path(
         &self,
         path: &str,
@@ -233,7 +240,11 @@ impl FsGateway {
                 workspace: self.workspace.clone(),
             });
         }
-        let resolved = canonical_parent.join(target.file_name().unwrap_or_default());
+        let resolved =
+            canonical_parent.join(target.file_name().ok_or_else(|| GatewayError::PathDenied {
+                path: target.to_path_buf(),
+                workspace: self.workspace.clone(),
+            })?);
         if !resolved.starts_with(&workspace) {
             return Err(GatewayError::PathDenied {
                 path: target.to_path_buf(),

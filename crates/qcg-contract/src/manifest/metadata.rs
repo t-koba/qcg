@@ -37,9 +37,11 @@ impl GeneratorMetadataRule {
                     "secret `{secret_name}` must declare exactly one of env or file_env"
                 )));
             }
-            let source = secret
-                .source_env_name()
-                .expect("exactly one secret source was validated");
+            let source = secret.source_env_name().ok_or_else(|| {
+                ContractError::Invalid(format!(
+                    "secret `{secret_name}` declares no usable secret source"
+                ))
+            })?;
             if !is_environment_variable_name(source) {
                 return Err(ContractError::Invalid(format!(
                     "secret `{secret_name}` has an invalid environment variable name `{source}`"
@@ -97,14 +99,14 @@ impl GeneratorMetadataRule {
                 "permissions.containers.runtime requires containers.enabled = true".into(),
             ));
         }
-        if containers
-            .images
-            .iter()
-            .any(|image| !image.contains("@sha256:"))
-        {
-            return Err(ContractError::Invalid(
-                "permissions.containers.images must be pinned by digest".into(),
-            ));
+        if let Some(runtime) = containers.runtime {
+            for image in &containers.images {
+                if let Err(reason) = super::resources::validate_container_image(&runtime, image) {
+                    return Err(ContractError::Invalid(format!(
+                        "permissions.containers.images entry `{image}` is not valid: {reason}"
+                    )));
+                }
+            }
         }
         for (name, value) in [
             (

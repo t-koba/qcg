@@ -44,6 +44,7 @@ mod tests {
             api_token_digest: None,
             artifact_limits: qcg_service::ArtifactZipLimits::default(),
             asset_limit: None,
+            max_request_bytes: None,
         });
         let config = ServerConfig {
             generators_dir: workspace.join("fixtures/generators"),
@@ -194,6 +195,7 @@ mod tests {
             api_token_digest: None,
             artifact_limits: qcg_service::ArtifactZipLimits::default(),
             asset_limit: None,
+            max_request_bytes: None,
         });
         let mut headers = HeaderMap::new();
         headers.insert(IDEMPOTENCY_HEADER, HeaderValue::from_static("same-run"));
@@ -222,7 +224,7 @@ mod tests {
         assert_eq!(
             state
                 .service
-                .list_runs()
+                .list_run_items()
                 .await
                 .expect("runs should be listable")
                 .len(),
@@ -313,6 +315,7 @@ mod tests {
                 api_token_digest: None,
                 artifact_limits: qcg_service::ArtifactZipLimits::default(),
                 asset_limit: None,
+                max_request_bytes: None,
             })
         };
         let state = make_state();
@@ -358,6 +361,7 @@ mod tests {
                             api_token_digest: None,
                             artifact_limits: qcg_service::ArtifactZipLimits::default(),
                             asset_limit: None,
+                            max_request_bytes: None,
                         });
                     }
                     Err(error) if attempts < 100 => {
@@ -380,7 +384,7 @@ mod tests {
         assert_eq!(
             restarted
                 .service
-                .list_runs()
+                .list_run_items()
                 .await
                 .expect("runs should be listable")
                 .len(),
@@ -415,6 +419,7 @@ mod tests {
             api_token_digest: None,
             artifact_limits: qcg_service::ArtifactZipLimits::default(),
             asset_limit: None,
+            max_request_bytes: None,
         });
         let source_id = state
             .service
@@ -496,6 +501,7 @@ mod tests {
             api_token_digest: None,
             artifact_limits: qcg_service::ArtifactZipLimits::default(),
             asset_limit: None,
+            max_request_bytes: None,
         });
         let run_id = state
             .service
@@ -568,6 +574,7 @@ mod tests {
             api_token_digest: None,
             artifact_limits: qcg_service::ArtifactZipLimits::default(),
             asset_limit: None,
+            max_request_bytes: None,
         });
         let run_id = state
             .service
@@ -648,6 +655,7 @@ mod tests {
             api_token_digest: None,
             artifact_limits: qcg_service::ArtifactZipLimits::default(),
             asset_limit: None,
+            max_request_bytes: None,
         });
         let owner_id = uuid::Uuid::now_v7();
         let (completed, _) = tokio::sync::watch::channel(false);

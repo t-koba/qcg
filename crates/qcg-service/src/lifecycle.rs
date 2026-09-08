@@ -1,14 +1,13 @@
 use crate::artifacts::{api_bad_request, api_internal, api_not_found, event_kinds, is_safe_id};
-use crate::queue::{PriorityPermits, queue_head, queue_positions};
+use crate::queue::{PriorityPermits, queue_head};
 use crate::run_dirs::{
-    app_registry, direct_run_id, direct_run_meta_dir, journal_is_empty, lock_direct_run,
-    lock_runs_directory, try_lock_run_execution, try_lock_store_maintenance,
-    warn_if_shared_runs_dir_owned, write_run_event,
+    app_registry, consume_cancel_control, direct_run_id, direct_run_meta_dir,
+    list_pending_cancel_controls, lock_direct_run, lock_runs_directory, try_lock_run_execution,
+    try_lock_store_maintenance, warn_if_shared_runs_dir_owned, write_run_event,
 };
 use crate::summaries::{
     fold_run_state, gc_run_directories, has_remote_cancel_request, read_events_from_meta,
-    read_optional_output_manifest, read_queued_identity, read_run_contract_sha256,
-    read_run_metrics, rehydrate_runs, run_meta_dir, run_summary, run_workspace_dir,
+    read_optional_output_manifest, rehydrate_runs, run_meta_dir, run_workspace_dir,
     status_from_journal,
 };
 use crate::types::{
@@ -18,12 +17,10 @@ use crate::types::{
 use camino::Utf8PathBuf;
 use qcg_api::RunEvent;
 use qcg_api::{
-    ApiError, McpAuthorizationStart, McpServerList, McpServerSummary, RunListItem, RunSnapshot,
-    RunStatus,
+    ApiError, McpAuthorizationStart, McpServerList, McpServerSummary, RunListItem, RunStatus,
 };
 use qcg_contract::Contract;
 use qcg_engine::{Engine, Interaction, Progress, RunFailureKind, RunOptions};
-use qcg_policy::MAX_DIRECTORY_SCAN_ENTRIES;
 use qcg_policy::{DEFAULT_MAX_ACTIVE_RUNS, DEFAULT_MAX_TRACKED_RUNS};
 use qcg_types::{FailureCode, FailureDetail, OutputManifest};
 use serde_json::{Value, json};
@@ -121,17 +118,26 @@ impl LocalQcgService {
                 _runs_lock: runs_lock,
                 queue_notify: Arc::new(tokio::sync::Notify::new()),
                 owner_id: uuid::Uuid::now_v7().as_simple().to_string(),
+                preemption_enabled: std::sync::Mutex::new(true),
             }),
         })
     }
 
+    /// Selects whether higher-priority arrivals preempt running runs.
+    /// Admission order stays priority-ordered regardless; this only toggles
+    /// forced interruption of running jobs (3.2).
+    pub fn set_preemption_enabled(&self, enabled: bool) {
+        *self
+            .inner
+            .preemption_enabled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = enabled;
+    }
+
+    /// Starts the retention GC unconditionally. Hosts decide enablement via
+    /// configuration (for example `QCG_AUTO_GC`) before calling, so the
+    /// service never reinterprets environment policy internally (3.2).
     pub fn start_retention_gc(&self) -> Option<JoinHandle<()>> {
-        let enabled = std::env::var("QCG_AUTO_GC")
-            .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
-            .unwrap_or(true);
-        if !enabled {
-            return None;
-        }
         let service = self.clone();
         Some(tokio::spawn(async move {
             service.collect_retained_runs().await;
@@ -162,7 +168,7 @@ impl LocalQcgService {
         }))
     }
 
-    async fn refresh_shared_runs(&self) -> Result<(), ServiceError> {
+    pub(crate) async fn refresh_shared_runs(&self) -> Result<(), ServiceError> {
         let recovered = rehydrate_runs(&self.inner.runs_dir, self.inner.max_tracked_runs)?;
         let mut runs = self.inner.runs.write().await;
         runs.retain(|_, record| !record.state.is_terminal());
@@ -172,31 +178,36 @@ impl LocalQcgService {
         // Merge durable journal progress into existing records so a browser
         // attached to a non-owning process observes questions, answers, and
         // terminal settlement. Remote cancel requests are honored here.
+        // The owner (task.is_some()) must observe them too: cancel its local
+        // token so the running engine stops, but never journal from here
+        // while the owner writer is live (A01/A02).
         let ids: Vec<String> = runs.keys().cloned().collect();
         for run_id in ids {
             let Some(record) = runs.get_mut(&run_id) else {
                 continue;
             };
-            if record
+            let owns_task = record
                 .task
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .is_some()
-            {
+                .is_some();
+            if owns_task {
+                // Owner path: propagate peer cancel to the local engine task.
+                // The engine task converts the control mailbox to a single
+                // journal event under its own writer; this refresh never
+                // appends while the owner writer is live. Journal I/O
+                // failures propagate instead of silently missing a cancel.
+                if has_remote_cancel_request(&record.run_dir)? {
+                    record.cancellation.cancel();
+                }
                 continue;
             }
             let state = fold_run_state(&record.run_dir)?;
-            if has_remote_cancel_request(&record.run_dir)? {
-                // A peer requested cancellation via the shared journal.
-                // Apply locally: stop any local task and mark canceled.
-                record.cancellation.cancel();
-                record.state = RunStatus::Canceled;
-                record.preempted = false;
-                record.question = None;
-                record.confirm = None;
-                continue;
-            }
-            if let Some(terminal) = state.terminal {
+            // Terminal settlement first: a bare cancel request must never
+            // shadow an owner-acknowledged terminal outcome as a bare
+            // "canceled" display. Cancellation only applies to runs with no
+            // durable terminal state yet.
+            if let Some(terminal) = state.terminal.clone() {
                 record.state = match terminal {
                     qcg_engine::TerminalState::Succeeded => RunStatus::Succeeded,
                     qcg_engine::TerminalState::Failed => RunStatus::Failed,
@@ -205,12 +216,39 @@ impl LocalQcgService {
                 };
                 continue;
             }
+            if has_remote_cancel_request(&record.run_dir)? {
+                // A peer requested cancellation via the shared journal.
+                // Apply locally: stop any local task and mark the request
+                // accepted. Only a journaled terminal state settles this
+                // into `Canceled` (A02).
+                record.cancellation.cancel();
+                record.state = RunStatus::CancelRequested;
+                record.preempted = false;
+                record.question = None;
+                record.confirm = None;
+                continue;
+            }
             // Refresh pending prompts and durable HITL maps from the journal.
+            // Journal I/O failures fail the refresh instead of merging
+            // half-read maps. Requeue instants always derive from the
+            // journal so every process observes identical FIFO order.
             let mut pending = state.pending.clone();
-            let (answers, confirmations) =
-                crate::summaries::read_persisted_hitl(&record.run_dir).unwrap_or_default();
-            let mcp_pending =
-                crate::summaries::read_persisted_mcp_pending(&record.run_dir).unwrap_or_default();
+            let (answers, confirmations) = crate::summaries::read_persisted_hitl(&record.run_dir)?;
+            let journal_queued_at = crate::summaries::read_last_queued_at(&record.run_dir);
+            let requeue = |record: &mut RunRecord| {
+                record.state = RunStatus::Queued;
+                // The durable instant wins; the memory value survives only
+                // when the journal has nothing to say. Nothing here stamps a
+                // fresh local time, so FIFO order is identical everywhere.
+                record.queued_at = journal_queued_at.or(record.queued_at);
+                record.question = None;
+                record.confirm = None;
+            };
+            // An accepted cancel request survives prompt refreshes: the
+            // request stays accepted until a terminal outcome settles it.
+            // Otherwise a peer prompt would silently clear the acceptance
+            // display before settlement (A02).
+            let cancel_accepted = record.state == RunStatus::CancelRequested;
             match pending.take() {
                 Some(Interaction::Question { question }) => {
                     // If the journal already holds an accepted answer for
@@ -218,49 +256,117 @@ impl LocalQcgService {
                     if answers.contains_key(&question.id) {
                         record.answers = answers;
                         record.confirmations = confirmations;
-                        for (key, value) in mcp_pending {
-                            record.answers.insert(key, value);
+                        if !cancel_accepted {
+                            requeue(record);
                         }
-                        record.state = RunStatus::Queued;
-                        record.queued_at = Some(chrono::Utc::now());
-                        record.question = None;
-                        record.confirm = None;
                     } else {
                         record.answers = answers;
                         record.confirmations = confirmations;
-                        record.state = RunStatus::Waiting;
-                        record.question = Some(question);
-                        record.confirm = None;
+                        if !cancel_accepted {
+                            record.state = RunStatus::Waiting;
+                            record.question = Some(question);
+                            record.confirm = None;
+                        }
                     }
                 }
                 Some(Interaction::Confirmation { confirm }) => {
                     if confirmations.contains_key(&confirm.id) {
                         record.answers = answers;
                         record.confirmations = confirmations;
-                        record.state = RunStatus::Queued;
-                        record.queued_at = Some(chrono::Utc::now());
-                        record.question = None;
-                        record.confirm = None;
+                        if !cancel_accepted {
+                            requeue(record);
+                        }
                     } else {
                         record.answers = answers;
                         record.confirmations = confirmations;
-                        record.state = RunStatus::Confirming;
-                        record.question = None;
-                        record.confirm = Some(confirm);
+                        if !cancel_accepted {
+                            record.state = RunStatus::Confirming;
+                            record.question = None;
+                            record.confirm = Some(confirm);
+                        }
                     }
                 }
                 None => {
                     record.answers = answers;
                     record.confirmations = confirmations;
-                    for (key, value) in mcp_pending {
-                        record.answers.insert(key, value);
+                    if !cancel_accepted
+                        && (record.state == RunStatus::Waiting
+                            || record.state == RunStatus::Confirming)
+                    {
+                        requeue(record);
                     }
-                    if record.state == RunStatus::Waiting || record.state == RunStatus::Confirming {
-                        record.state = RunStatus::Queued;
-                        record.queued_at.get_or_insert_with(chrono::Utc::now);
-                        record.question = None;
-                        record.confirm = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Converts pending cancel mailbox files to single
+    /// `user_cancel_requested` journal events. Integrity comes from the
+    /// journal lock with a per-operation re-check, so concurrent drainers
+    /// cannot double-journal. Callers hold (or have awaited the release of)
+    /// the run execution lease as settlement authority, proving no live
+    /// owner writer exists while draining. Each `operation_id` journals
+    /// once; consumed controls are deleted (A02).
+    pub(crate) async fn drain_cancel_controls(
+        &self,
+        run_id: &str,
+        run_dir: &Utf8PathBuf,
+    ) -> Result<(), ServiceError> {
+        let pending = list_pending_cancel_controls(run_dir)?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let snapshot = {
+            let runs = self.inner.runs.read().await;
+            runs.get(run_id).cloned()
+        };
+        let Some(record) = snapshot else {
+            return Ok(());
+        };
+        for (operation_id, control) in pending {
+            let requester = control
+                .get("requester")
+                .and_then(Value::as_str)
+                .unwrap_or("peer")
+                .to_string();
+            // Re-check under the journal lock so two draining peers cannot
+            // journal the same operation twice. An already-journaled
+            // operation only consumes its control file.
+            let result = crate::run_dirs::write_run_event_if(
+                &record,
+                "user_cancel_requested",
+                json!({
+                    "run_id": run_id,
+                    "operation_id": operation_id,
+                    "requester": requester,
+                }),
+                |state| {
+                    if state.cancel_operations.contains(&operation_id) {
+                        return Err(qcg_engine::JournalError::PreconditionFailed(
+                            "cancel operation was already journaled".into(),
+                        ));
                     }
+                    // A run that already settled must not gain a cancel
+                    // event: the request is stale, so consume it without
+                    // journaling (A02).
+                    if state.terminal.is_some() {
+                        return Err(qcg_engine::JournalError::PreconditionFailed(
+                            "run is already terminal".into(),
+                        ));
+                    }
+                    Ok(())
+                },
+            );
+            match result {
+                Ok(()) => consume_cancel_control(run_dir, &operation_id),
+                Err(error) if error.to_string().contains("journal precondition failed") => {
+                    consume_cancel_control(run_dir, &operation_id)
+                }
+                Err(error) => {
+                    // Journal I/O failures keep the control file for the
+                    // next drain instead of dropping the cancel.
+                    tracing::warn!(run_id = %run_id, %error, "cancel drain failed; control retained");
                 }
             }
         }
@@ -275,8 +381,11 @@ impl LocalQcgService {
         let recovered = {
             let runs = self.inner.runs.read().await;
             runs.iter()
+                // Ephemeral direct placeholders are driven inline, never by
+                // a spawned engine task; adopting one would double-execute.
                 .filter(|(_, record)| {
-                    record.state == RunStatus::Queued
+                    !record.ephemeral
+                        && record.state == RunStatus::Queued
                         && record
                             .task
                             .lock()
@@ -323,7 +432,8 @@ impl LocalQcgService {
             let runs = self.inner.runs.read().await;
             runs.iter()
                 .filter(|(_, record)| {
-                    record.state == RunStatus::Queued
+                    !record.ephemeral
+                        && record.state == RunStatus::Queued
                         && record
                             .task
                             .lock()
@@ -497,130 +607,28 @@ impl LocalQcgService {
         Ok(run_dir)
     }
 
-    pub async fn list_runs(&self) -> Result<Vec<RunSnapshot>, ApiError> {
-        let mut runs = Vec::new();
-        if self.inner.runs_dir.exists() {
-            let mut entry_count = 0_usize;
-            for entry in std::fs::read_dir(&self.inner.runs_dir).map_err(api_internal)? {
-                entry_count = entry_count.saturating_add(1);
-                if entry_count > MAX_DIRECTORY_SCAN_ENTRIES {
-                    return Err(api_internal(format!(
-                        "runs directory contains more than {MAX_DIRECTORY_SCAN_ENTRIES} entries"
-                    )));
-                }
-                let entry = entry.map_err(api_internal)?;
-                let path = Utf8PathBuf::from_path_buf(entry.path()).map_err(|path| {
-                    api_internal(format!("run path is not valid UTF-8: {}", path.display()))
-                })?;
-                if !path.is_dir() {
-                    continue;
-                }
-                let journal_path = run_meta_dir(&path).join("journal.jsonl");
-                if !journal_path.is_file()
-                    || journal_is_empty(&journal_path).map_err(api_internal)?
-                {
-                    continue;
-                }
-                let summary = run_summary(&path).map_err(api_internal)?;
-                let run_id = summary.run_id;
-                let artifacts = read_optional_output_manifest(&path).map_err(api_internal)?;
-                let contract_sha256 = Some(read_run_contract_sha256(&path).map_err(api_internal)?);
-                let run_state = fold_run_state(&path).map_err(api_internal)?;
-                runs.push(RunSnapshot {
-                    run_id,
-                    state: status_from_journal(&summary.status).map_err(api_internal)?,
-                    seq: run_state.last_seq,
-                    contract_sha256,
-                    artifacts,
-                    question: None,
-                    confirm: None,
-                    queued_at: None,
-                    queue_position: None,
-                    priority: 0,
-                    parent_run_id: read_queued_identity(&path)
-                        .map(|(_, parent)| parent)
-                        .unwrap_or(None),
-                    metrics: read_run_metrics(&path).map_err(api_internal)?,
-                });
-            }
-            runs.sort_by(|left, right| left.run_id.cmp(&right.run_id));
-        }
-        for memory_run in self.runs_from_memory().await? {
-            // Live memory state (including queue position) wins over the
-            // disk-folded copy of the same run.
-            if let Some(slot) = runs.iter_mut().find(|run| run.run_id == memory_run.run_id) {
-                *slot = memory_run;
-            } else {
-                runs.push(memory_run);
-            }
-        }
-        Ok(runs)
-    }
-
     pub async fn list_run_items(&self) -> Result<Vec<RunListItem>, ApiError> {
-        let mut items = Vec::new();
-        if !self.inner.runs_dir.exists() {
-            return Ok(items);
-        }
-        let mut entry_count = 0_usize;
-        for entry in std::fs::read_dir(&self.inner.runs_dir).map_err(api_internal)? {
-            entry_count = entry_count.saturating_add(1);
-            if entry_count > MAX_DIRECTORY_SCAN_ENTRIES {
-                return Err(api_internal(format!(
-                    "runs directory contains more than {MAX_DIRECTORY_SCAN_ENTRIES} entries"
-                )));
-            }
-            let entry = entry.map_err(api_internal)?;
-            let run_dir = Utf8PathBuf::from_path_buf(entry.path()).map_err(|path| {
-                api_internal(format!("run path is not valid UTF-8: {}", path.display()))
-            })?;
-            let journal_path = run_meta_dir(&run_dir).join("journal.jsonl");
-            if !run_dir.is_dir()
-                || !journal_path.is_file()
-                || journal_is_empty(&journal_path).map_err(api_internal)?
-            {
-                continue;
-            }
-            let summary = run_summary(&run_dir).map_err(api_internal)?;
-            let seq = fold_run_state(&run_dir).map_err(api_internal)?.last_seq;
+        // Single directory scan lives in `list_run_summaries`, which folds
+        // each run exactly once and returns its `last_seq` alongside: this
+        // layer only projects into list items so scan, filter, fold, and
+        // sort never drift apart and no second fold per run exists.
+        let summaries =
+            crate::summaries::list_run_summaries(&self.inner.runs_dir).map_err(api_internal)?;
+        let mut items = Vec::with_capacity(summaries.len());
+        for (summary, seq) in summaries {
             items.push(RunListItem {
                 run_id: summary.run_id,
                 state: status_from_journal(&summary.status).map_err(api_internal)?,
-                generator_id: summary.generator,
+                generator_id: summary
+                    .generator
+                    .split_once('@')
+                    .map(|(id, _)| id.to_string())
+                    .unwrap_or(summary.generator),
                 started_at: summary.started_at,
                 seq,
             });
         }
-        items.sort_by(|left, right| left.run_id.cmp(&right.run_id));
         Ok(items)
-    }
-
-    async fn runs_from_memory(&self) -> Result<Vec<RunSnapshot>, ApiError> {
-        let runs = self.inner.runs.read().await;
-        let positions = queue_positions(&runs);
-        let mut snapshots = Vec::with_capacity(runs.len());
-        for (run_id, record) in runs.iter() {
-            let queued = record.state == RunStatus::Queued;
-            snapshots.push(RunSnapshot {
-                run_id: run_id.clone(),
-                state: record.state,
-                seq: fold_run_state(&record.run_dir)
-                    .map_err(api_internal)?
-                    .last_seq,
-                contract_sha256: Some(record.contract_sha256.clone()),
-                artifacts: record.artifacts.clone(),
-                question: record.question.clone(),
-                confirm: record.confirm.clone(),
-                queued_at: queued
-                    .then(|| record.queued_at.map(|at| at.to_rfc3339()))
-                    .flatten(),
-                queue_position: queued.then(|| positions.get(run_id).copied()).flatten(),
-                priority: record.priority,
-                parent_run_id: record.parent_run_id.clone(),
-                metrics: read_run_metrics(&record.run_dir).map_err(api_internal)?,
-            });
-        }
-        Ok(snapshots)
     }
 
     pub(crate) fn load_generator(&self, id: &str) -> Result<Contract, ApiError> {
@@ -677,15 +685,54 @@ impl LocalQcgService {
             cancellation,
             task,
         } = request;
+        let task_slot = Arc::clone(&task);
         let runtime = Arc::clone(&self.inner.llm_runtime);
         let permits = Arc::clone(&self.inner.execution_permits);
         let queue_notify = Arc::clone(&self.inner.queue_notify);
         let handle = tokio::spawn(async move {
             let _execution_lock = execution_lock;
+            // Convert pending cancel mailbox entries to single journal events
+            // before the engine writer starts. This task holds the execution
+            // lease, so no other owner appends concurrently (A01/A02). A
+            // failed drain refuses to start: the mailbox is retained and a
+            // later spawn retries instead of running past a cancel.
+            if let Err(error) = service.drain_cancel_controls(&run_id, &run_dir).await {
+                tracing::error!(run_id = %run_id, %error, "cancel drain failed; refusing to start execution");
+                *task_slot.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                return;
+            }
             // Priority admission: only the queue head takes a slot, so a
             // freed slot wakes waiters but cannot be taken out of order.
             // Equal priorities keep FIFO order; cancellation aborts the wait.
+            // The notified future is created before the state check so a
+            // notify between check and wait is never lost (A11).
             let _permit = loop {
+                let notified = queue_notify.notified();
+                // A peer cancel observed while queued settles without ever
+                // starting the engine (A02). Journal I/O failures fail
+                // closed: an unreadable cancel state must not start work.
+                let queued_cancel = match crate::summaries::has_remote_cancel_request(&run_dir) {
+                    Ok(cancel) => cancel,
+                    Err(error) => {
+                        tracing::error!(%error, run_id = %run_id, "cancel check failed while queued; settling as canceled");
+                        true
+                    }
+                };
+                if queued_cancel || cancellation.is_cancelled() {
+                    let mut runs = service.inner.runs.write().await;
+                    if let Some(record) = runs.get_mut(&run_id) {
+                        // A settled run never regresses.
+                        if !record.state.is_terminal() {
+                            // Acceptance without settlement: no engine ever
+                            // ran, so no terminal event exists yet (A02).
+                            record.state = RunStatus::CancelRequested;
+                            record.preempted = false;
+                            record.question = None;
+                            record.confirm = None;
+                        }
+                    }
+                    return;
+                }
                 let head = {
                     let runs = service.inner.runs.read().await;
                     queue_head(&runs)
@@ -698,7 +745,7 @@ impl LocalQcgService {
                 }
                 tokio::select! {
                     _ = cancellation.cancelled() => return,
-                    _ = queue_notify.notified() => continue,
+                    _ = notified => continue,
                 }
             };
             {
@@ -706,14 +753,64 @@ impl LocalQcgService {
                 let Some(record) = runs.get_mut(&run_id) else {
                     return;
                 };
-                if record.state == RunStatus::Canceled {
+                // Re-check peer cancel after admission: a cancel that landed
+                // while waiting must win over starting execution (A02).
+                // An unreadable cancel state refuses to start execution:
+                // starting work nobody can observe or stop is the unsafe
+                // direction, so the error arm means cancel.
+                let peer_cancel = match crate::summaries::has_remote_cancel_request(&run_dir) {
+                    Ok(cancel) => cancel,
+                    Err(error) => {
+                        tracing::error!(%error, run_id = %run_id, "cancel check failed; refusing to start execution");
+                        true
+                    }
+                };
+                // A settled run never regresses: only non-terminal records
+                // may move into accepted cancellation.
+                if record.state.is_terminal() {
                     return;
+                }
+                if record.state == RunStatus::CancelRequested
+                    || peer_cancel
+                    || cancellation.is_cancelled()
+                {
+                    // Acceptance without settlement: execution never starts,
+                    // so no terminal event exists yet (A02).
+                    record.state = RunStatus::CancelRequested;
+                    record.preempted = false;
+                    record.question = None;
+                    record.confirm = None;
+                    return;
+                }
+                // Never resume past a durable terminal state: a stale Queued
+                // memory record after a peer settlement must not re-run.
+                match crate::summaries::fold_run_state(&run_dir) {
+                    Ok(state) if state.terminal.is_some() => {
+                        record.state = match state.terminal {
+                            Some(qcg_engine::TerminalState::Succeeded) => RunStatus::Succeeded,
+                            Some(qcg_engine::TerminalState::Failed) => RunStatus::Failed,
+                            Some(qcg_engine::TerminalState::Canceled) => RunStatus::Canceled,
+                            Some(qcg_engine::TerminalState::Interrupted) => RunStatus::Interrupted,
+                            None => RunStatus::Canceled,
+                        };
+                        record.preempted = false;
+                        record.question = None;
+                        record.confirm = None;
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::error!(%error, run_id = %run_id, "state fold failed; refusing to start execution");
+                        return;
+                    }
                 }
                 record.state = RunStatus::Running;
                 // Claim shared-store ownership while holding the execution
                 // lease so peers observe the active owner.
                 record.owner_id = service.inner.owner_id.clone();
             }
+            let policy =
+                crate::types::ResolvedExecutionPolicy::resolve(contract.manifest.budget.max_steps);
             let engine = Engine::new(app_registry(Arc::clone(&runtime))).with_snapshot_source(
                 Arc::new(ServiceSnapshotSource {
                     service: service.clone(),
@@ -732,8 +829,8 @@ impl LocalQcgService {
                         interactive: false,
                         answers,
                         confirmations,
-                        max_total_steps: RunOptions::default_max_total_steps(),
-                        max_parallel_steps: RunOptions::default_max_parallel_steps(),
+                        max_total_steps: policy.max_total_steps,
+                        max_parallel_steps: policy.max_parallel_steps,
                         llm_provider: Some(Arc::clone(&runtime.provider)),
                         llm_seed_override: None,
                         cancellation,
@@ -759,24 +856,113 @@ impl LocalQcgService {
 
     pub async fn run_generator_path(&self, run: DirectRun) -> Result<OutputManifest, ApiError> {
         let contract = Contract::load(&run.generator_path).map_err(api_internal)?;
+        // Admission canonicalization matches the API path so memory records
+        // and journal execution observe identical inputs.
+        let canonical_direct_inputs = match contract.manifest.resolve_inputs(run.inputs.clone()) {
+            Ok(resolved) => qcg_engine::canonical_file_inputs(&contract, resolved)
+                .map_err(|error| ApiError::invalid_field("inputs", error.to_string()))?,
+            Err(qcg_contract::ContractError::PayloadTooLarge {
+                actual_bytes,
+                limit_bytes,
+                ..
+            }) => {
+                return Err(ApiError::TooLarge {
+                    actual_bytes,
+                    limit_bytes,
+                });
+            }
+            Err(error) => return Err(ApiError::invalid_field("inputs", error.to_string())),
+        };
         let runtime = Arc::clone(&self.inner.llm_runtime);
         let run_id = direct_run_id(&run.output_dir);
         let metadata_dir = direct_run_meta_dir(&run.output_dir);
         let _run_lock = lock_direct_run(&metadata_dir).map_err(api_internal)?;
         warn_if_shared_runs_dir_owned(&run.output_dir);
-        // Direct executions share this process's execution permits so embedded
-        // and test use stays coherent with API runs. A server in another
-        // process coordinates only through provider quotas (see warning above).
+        // Unified scheduler: direct executions register an ephemeral Queued
+        // record so the same queue_head ordering governs API and direct runs.
+        // Priority 0, FIFO by admission; removed on completion.
+        let (events, _) = broadcast::channel(512);
+        let ephemeral_dir = metadata_dir
+            .parent()
+            .map(|parent| parent.to_owned())
+            .unwrap_or_else(|| metadata_dir.clone());
+        {
+            let mut runs = self.inner.runs.write().await;
+            // A stale ephemeral from a crashed direct run must not block.
+            if runs
+                .get(&run_id)
+                .is_none_or(|record| record.state.is_terminal())
+            {
+                runs.insert(
+                    run_id.clone(),
+                    RunRecord {
+                        contract: contract.clone(),
+                        contract_sha256: contract.sha256.clone(),
+                        inputs: canonical_direct_inputs.clone(),
+                        answers: run.answers.clone(),
+                        confirmations: run.confirmations.clone(),
+                        priority: 0,
+                        parent_run_id: None,
+                        preempted: false,
+                        state: RunStatus::Queued,
+                        run_dir: ephemeral_dir,
+                        artifacts: None,
+                        question: None,
+                        confirm: None,
+                        events: events.clone(),
+                        cancellation: CancellationToken::new(),
+                        task: Arc::new(Mutex::new(None)),
+                        queued_at: Some(chrono::Utc::now()),
+                        owner_id: self.inner.owner_id.clone(),
+                        ephemeral: true,
+                    },
+                );
+            }
+        }
+        struct RemoveEphemeralOnDrop {
+            service: LocalQcgService,
+            run_id: String,
+        }
+        impl Drop for RemoveEphemeralOnDrop {
+            fn drop(&mut self) {
+                let service = self.service.clone();
+                let run_id = self.run_id.clone();
+                tokio::spawn(async move {
+                    service.inner.runs.write().await.remove(&run_id);
+                    service.inner.queue_notify.notify_waiters();
+                });
+            }
+        }
+        let _ephemeral_guard = RemoveEphemeralOnDrop {
+            service: self.clone(),
+            run_id: run_id.clone(),
+        };
         let _permit = loop {
-            if let Some(permit) = PriorityPermits::try_take(
-                &self.inner.execution_permits,
-                Arc::clone(&self.inner.queue_notify),
-            ) {
+            let notified = self.inner.queue_notify.notified();
+            let head = {
+                let runs = self.inner.runs.read().await;
+                queue_head(&runs)
+            };
+            if head.as_deref() == Some(run_id.as_str())
+                && let Some(permit) = PriorityPermits::try_take(
+                    &self.inner.execution_permits,
+                    Arc::clone(&self.inner.queue_notify),
+                )
+            {
                 break permit;
             }
-            self.inner.queue_notify.notified().await;
+            // Direct runs never preempt API runs; they wait for head.
+            notified.await;
         };
-        Engine::new(app_registry(Arc::clone(&runtime)))
+        {
+            let mut runs = self.inner.runs.write().await;
+            if let Some(record) = runs.get_mut(&run_id) {
+                record.state = RunStatus::Running;
+            }
+        }
+        let policy =
+            crate::types::ResolvedExecutionPolicy::resolve(contract.manifest.budget.max_steps);
+        let result = Engine::new(app_registry(Arc::clone(&runtime)))
             .with_snapshot_source(Arc::new(ServiceSnapshotSource {
                 service: self.clone(),
             }))
@@ -784,7 +970,7 @@ impl LocalQcgService {
                 run_id.clone(),
                 metadata_dir,
                 contract,
-                run.inputs,
+                canonical_direct_inputs.clone(),
                 RunOptions {
                     output_dir: run.output_dir,
                     json_events: run.json_events,
@@ -792,15 +978,18 @@ impl LocalQcgService {
                     interactive: run.interactive,
                     answers: run.answers,
                     confirmations: run.confirmations,
-                    max_total_steps: RunOptions::default_max_total_steps(),
-                    max_parallel_steps: RunOptions::default_max_parallel_steps(),
+                    max_total_steps: policy.max_total_steps,
+                    max_parallel_steps: policy.max_parallel_steps,
                     llm_provider: Some(Arc::clone(&runtime.provider)),
                     llm_seed_override: run.llm_seed_override,
                     cancellation: CancellationToken::new(),
                 },
             )
             .await
-            .map_err(api_internal)
+            .map_err(api_internal);
+        self.inner.runs.write().await.remove(&run_id);
+        self.inner.queue_notify.notify_waiters();
+        result
     }
 
     pub async fn run_generator_path_with_events(
@@ -808,27 +997,111 @@ impl LocalQcgService {
         run: DirectRun,
     ) -> Result<DirectRunEvents, ApiError> {
         let contract = Contract::load(&run.generator_path).map_err(api_internal)?;
+        let canonical_direct_inputs = match contract.manifest.resolve_inputs(run.inputs.clone()) {
+            Ok(resolved) => qcg_engine::canonical_file_inputs(&contract, resolved)
+                .map_err(|error| ApiError::invalid_field("inputs", error.to_string()))?,
+            Err(qcg_contract::ContractError::PayloadTooLarge {
+                actual_bytes,
+                limit_bytes,
+                ..
+            }) => {
+                return Err(ApiError::TooLarge {
+                    actual_bytes,
+                    limit_bytes,
+                });
+            }
+            Err(error) => return Err(ApiError::invalid_field("inputs", error.to_string())),
+        };
         let runtime = Arc::clone(&self.inner.llm_runtime);
         let (events, mut receiver) = broadcast::channel(512);
         let run_id = direct_run_id(&run.output_dir);
         let metadata_dir = direct_run_meta_dir(&run.output_dir);
         let _run_lock = lock_direct_run(&metadata_dir).map_err(api_internal)?;
         warn_if_shared_runs_dir_owned(&run.output_dir);
+        let ephemeral_dir = metadata_dir
+            .parent()
+            .map(|parent| parent.to_owned())
+            .unwrap_or_else(|| metadata_dir.clone());
+        {
+            let mut runs = self.inner.runs.write().await;
+            if runs
+                .get(&run_id)
+                .is_none_or(|record| record.state.is_terminal())
+            {
+                runs.insert(
+                    run_id.clone(),
+                    RunRecord {
+                        contract: contract.clone(),
+                        contract_sha256: contract.sha256.clone(),
+                        inputs: canonical_direct_inputs.clone(),
+                        answers: run.answers.clone(),
+                        confirmations: run.confirmations.clone(),
+                        priority: 0,
+                        parent_run_id: None,
+                        preempted: false,
+                        state: RunStatus::Queued,
+                        run_dir: ephemeral_dir,
+                        artifacts: None,
+                        question: None,
+                        confirm: None,
+                        events: events.clone(),
+                        cancellation: CancellationToken::new(),
+                        task: Arc::new(Mutex::new(None)),
+                        queued_at: Some(chrono::Utc::now()),
+                        owner_id: self.inner.owner_id.clone(),
+                        ephemeral: true,
+                    },
+                );
+            }
+        }
+        struct RemoveEphemeralOnDrop {
+            service: LocalQcgService,
+            run_id: String,
+        }
+        impl Drop for RemoveEphemeralOnDrop {
+            fn drop(&mut self) {
+                let service = self.service.clone();
+                let run_id = self.run_id.clone();
+                tokio::spawn(async move {
+                    service.inner.runs.write().await.remove(&run_id);
+                    service.inner.queue_notify.notify_waiters();
+                });
+            }
+        }
+        let _ephemeral_guard = RemoveEphemeralOnDrop {
+            service: self.clone(),
+            run_id: run_id.clone(),
+        };
         let _permit = loop {
-            if let Some(permit) = PriorityPermits::try_take(
-                &self.inner.execution_permits,
-                Arc::clone(&self.inner.queue_notify),
-            ) {
+            let notified = self.inner.queue_notify.notified();
+            let head = {
+                let runs = self.inner.runs.read().await;
+                queue_head(&runs)
+            };
+            if head.as_deref() == Some(run_id.as_str())
+                && let Some(permit) = PriorityPermits::try_take(
+                    &self.inner.execution_permits,
+                    Arc::clone(&self.inner.queue_notify),
+                )
+            {
                 break permit;
             }
-            self.inner.queue_notify.notified().await;
+            notified.await;
         };
+        {
+            let mut runs = self.inner.runs.write().await;
+            if let Some(record) = runs.get_mut(&run_id) {
+                record.state = RunStatus::Running;
+            }
+        }
+        let policy =
+            crate::types::ResolvedExecutionPolicy::resolve(contract.manifest.budget.max_steps);
         let manifest = Engine::new(app_registry(Arc::clone(&runtime)))
             .run_with_id(
                 run_id.clone(),
                 metadata_dir.clone(),
                 contract,
-                run.inputs,
+                canonical_direct_inputs.clone(),
                 RunOptions {
                     output_dir: run.output_dir.clone(),
                     json_events: false,
@@ -836,8 +1109,8 @@ impl LocalQcgService {
                     interactive: run.interactive,
                     answers: run.answers,
                     confirmations: run.confirmations,
-                    max_total_steps: RunOptions::default_max_total_steps(),
-                    max_parallel_steps: RunOptions::default_max_parallel_steps(),
+                    max_total_steps: policy.max_total_steps,
+                    max_parallel_steps: policy.max_parallel_steps,
                     llm_provider: Some(Arc::clone(&runtime.provider)),
                     llm_seed_override: run.llm_seed_override,
                     cancellation: CancellationToken::new(),
@@ -869,11 +1142,15 @@ impl LocalQcgService {
         if collected.is_empty() {
             collected = journal_events;
         } else if event_kinds(&collected) != event_kinds(&journal_events) {
+            self.inner.runs.write().await.remove(&run_id);
+            self.inner.queue_notify.notify_waiters();
             return Err(api_internal(format!(
                 "direct run event stream diverged from journal in `{}`",
                 run.output_dir
             )));
         }
+        self.inner.runs.write().await.remove(&run_id);
+        self.inner.queue_notify.notify_waiters();
         Ok(DirectRunEvents {
             manifest,
             events: collected,
@@ -892,7 +1169,10 @@ impl LocalQcgService {
                     None => return,
                 }
             };
-            if record.state == RunStatus::Canceled {
+            if matches!(
+                record.state,
+                RunStatus::Canceled | RunStatus::CancelRequested
+            ) {
                 self.finish_canceled_run(&run_id, &record, &progress).await;
                 self.inner.queue_notify.notify_waiters();
                 return;
@@ -935,6 +1215,11 @@ impl LocalQcgService {
             }
             for (kind, payload) in &transition.writes {
                 if let Err(error) = write_run_event(&record, kind, payload.clone()) {
+                    // Journal failure with a finished engine: memory still
+                    // advances so snapshots report the true outcome, and the
+                    // next restart replays the journal and retries these
+                    // settlement appends. Disk failures surface here and in
+                    // every later journal write until repaired.
                     tracing::error!(%error, %run_id, "failed to record run progress event");
                 }
             }
@@ -943,7 +1228,10 @@ impl LocalQcgService {
                 let Some(record) = runs.get_mut(&run_id) else {
                     return;
                 };
-                if record.state == RunStatus::Canceled {
+                if matches!(
+                    record.state,
+                    RunStatus::Canceled | RunStatus::CancelRequested
+                ) {
                     continue;
                 }
                 if let Some(state) = transition.state {
@@ -962,6 +1250,18 @@ impl LocalQcgService {
     /// A completion that won the race with the cancellation request is
     /// preserved instead of writing a second terminal event.
     async fn finish_canceled_run(&self, run_id: &str, record: &RunRecord, progress: &Progress) {
+        // Consume the cancel mailbox before settling: without this drain a
+        // canceled run retains its control files forever and
+        // `has_pending_cancel_control` never clears (A02). Against an
+        // already-terminal journal the drain only consumes. This task holds
+        // the execution lease, so no other owner appends concurrently.
+        if let Err(error) = self.drain_cancel_controls(run_id, &record.run_dir).await {
+            tracing::warn!(
+                %error,
+                %run_id,
+                "cancel drain failed during cancellation settlement; mailbox retained"
+            );
+        }
         let terminal = match fold_run_state(&record.run_dir) {
             Ok(state) => state.terminal,
             Err(error) => {
@@ -1026,8 +1326,12 @@ impl LocalQcgService {
             return;
         };
         // A newer execution (resume after answer/confirm) owns the record now;
-        // never overwrite a non-canceled state observed here.
-        if record.state != RunStatus::Canceled {
+        // never overwrite a non-canceled state observed here. An accepted
+        // cancel request settles through the same terminal path.
+        if !matches!(
+            record.state,
+            RunStatus::Canceled | RunStatus::CancelRequested
+        ) {
             return;
         }
         if let Some(state) = transition.state {

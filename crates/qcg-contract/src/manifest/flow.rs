@@ -29,9 +29,19 @@ impl CommandPermissionRule {
                             command.bin
                         ))
                     })?;
-                    if !image.contains("@sha256:") {
+                    // The declared runtime selects the pin form; without one
+                    // the strict digest rule applies.
+                    let runtime = manifest.permissions.containers.runtime;
+                    let pin_error = match runtime {
+                        Some(runtime) => {
+                            super::resources::validate_container_image(&runtime, image).err()
+                        }
+                        None => (!image.contains("@sha256:"))
+                            .then(|| "image must be pinned by digest".to_string()),
+                    };
+                    if let Some(reason) = pin_error {
                         return Err(ContractError::Invalid(format!(
-                            "container-isolated command `{}` image must be pinned by digest",
+                            "container-isolated command `{}` image is not valid: {reason}",
                             command.bin
                         )));
                     }

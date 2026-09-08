@@ -78,7 +78,8 @@
 }
 
 .run-tab-dot-queued,
-.run-tab-dot-running {
+.run-tab-dot-running,
+.run-tab-dot-cancel_requested {
   background: #e0a63c;
 }
 

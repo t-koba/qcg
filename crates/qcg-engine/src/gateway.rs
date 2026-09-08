@@ -1039,6 +1039,49 @@ mod tests {
     );
 
     #[test]
+    fn command_plan_records_the_declared_container_runtime() {
+        let mut permissions = Permissions::default();
+        permissions.commands.push(CommandPermission {
+            bin: "tool".into(),
+            args: vec![],
+            purpose: "container test".into(),
+            isolation: Some(CommandIsolation::Container),
+            image: Some("example/tool@sha256:abc".into()),
+        });
+        permissions.containers.enabled = true;
+        permissions.containers.runtime = Some(qcg_contract::ContainerRuntime::Incus);
+        let plan = CmdGateway::new(permissions, temp_workspace())
+            .command_plan(&["tool".into()])
+            .expect("declared container command should have a plan");
+        assert_eq!(plan["runtime"], "incus");
+    }
+
+    #[tokio::test]
+    async fn container_workload_without_a_declared_runtime_fails_closed() {
+        let gateway = CmdGateway::new(Permissions::default(), temp_workspace());
+        let mounts: Vec<(Utf8PathBuf, String, bool)> = vec![];
+        let workload = vec!["echo".to_string(), "hi".to_string()];
+        let error = gateway
+            .run_container_workload(
+                ContainerWorkload {
+                    image: "example/tool@sha256:abc",
+                    mounts: &mounts,
+                    workdir: Some("/work"),
+                    workload_argv: &workload,
+                    stdin: None,
+                },
+                5,
+                Some(1024),
+            )
+            .await
+            .expect_err("missing runtime must fail without touching a daemon");
+        assert!(
+            matches!(error, GatewayError::ContainerRuntimeMissing { .. }),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn command_plan_denies_empty_argv() {
         let gateway = CmdGateway::new(Permissions::default(), temp_workspace());
         assert!(matches!(

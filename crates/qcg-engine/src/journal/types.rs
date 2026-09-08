@@ -53,6 +53,11 @@ pub enum JournalError {
     InvalidPayload,
     #[error("invalid run event: {0}")]
     InvalidEvent(String),
+    /// A check-and-append precondition observed a conflicting durable state
+    /// (for example a racing peer already accepted a different answer). The
+    /// caller maps this to Conflict; it is never a corruption signal.
+    #[error("journal precondition failed: {0}")]
+    PreconditionFailed(String),
     #[error("journal {resource} exceeds {limit} bytes (attempted {actual})")]
     LimitExceeded {
         resource: &'static str,
@@ -67,6 +72,7 @@ pub enum JournalError {
 
 pub struct JournalWriter {
     pub(crate) run_id: String,
+    pub(crate) journal_path: Utf8PathBuf,
     pub(crate) file: Arc<Mutex<File>>,
     pub(crate) state: Arc<Mutex<crate::RunState>>,
     pub(crate) state_path: Utf8PathBuf,

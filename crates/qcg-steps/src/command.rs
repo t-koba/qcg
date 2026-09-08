@@ -125,14 +125,21 @@ impl StepExecutor for CommandStep {
             .cmd
             .command_plan(&command)
             .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
-        if let Some(confirm) =
-            ctx.run
-                .require_side_effect(ctx.journal, node, "command", &target, Some(plan))?
-        {
+        if let Some(confirm) = ctx.run.require_side_effect(
+            ctx.journal,
+            node,
+            "command",
+            &target,
+            Some(plan.clone()),
+        )? {
             return Ok(StepOutcome::NeedsConfirm { confirm });
         }
+        let details = Some(plan.clone());
+        let operation_id =
+            ctx.run
+                .guard_external_operation(ctx.journal, node, "command", &target, &details)?;
         let input = command_input(ctx, node, &params).await?;
-        let output = ctx
+        let output = match ctx
             .run
             .cmd
             .run_with_limits_and_stdin(
@@ -142,13 +149,32 @@ impl StepExecutor for CommandStep {
                 input.as_deref(),
             )
             .await
-            .map_err(|error| StepError::from_gateway(&node.id, error))?;
+        {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = ctx.run.finish_external_operation_with_status(
+                    ctx.journal,
+                    node,
+                    &operation_id,
+                    "error",
+                );
+                return Err(StepError::from_gateway(&node.id, error));
+            }
+        };
         if output.status != 0 {
+            let _ = ctx.run.finish_external_operation_with_status(
+                ctx.journal,
+                node,
+                &operation_id,
+                "error",
+            );
             return Err(StepError::failed(
                 &node.id,
                 format!("command exited with {}", output.status),
             ));
         }
+        ctx.run
+            .finish_external_operation(ctx.journal, node, &operation_id)?;
         match params.result {
             CommandResultMode::Process => Ok(StepOutcome::Success {
                 output: Some(json!({

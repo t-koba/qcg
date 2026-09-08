@@ -77,12 +77,51 @@ pub(crate) async fn execute_agent_tool(
             Ok(AgentToolOutcome::Result(json!({ "file": path })))
         }
         ToolDecl::Command { command, .. } => {
-            let output = ctx
+            // Same side-effect gate as ordinary command steps (A05):
+            // command allowlist alone never substitutes for the
+            // permissions.side_effects policy.
+            let target = command.join(" ");
+            let plan = ctx
                 .run
                 .cmd
-                .run(command)
-                .await
-                .map_err(|error| StepError::from_gateway(&node.id, error))?;
+                .command_plan(command)
+                .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
+            let plan_value = Some(serde_json::to_value(&plan).map_err(|error| {
+                StepError::failed(
+                    &node.id,
+                    format!("command plan is not serializable: {error}"),
+                )
+            })?);
+            if let Some(confirm) = ctx.run.require_side_effect(
+                ctx.journal,
+                node,
+                "command",
+                &target,
+                plan_value.clone(),
+            )? {
+                return Ok(AgentToolOutcome::NeedsConfirm(confirm));
+            }
+            let operation_id = ctx.run.guard_external_operation(
+                ctx.journal,
+                node,
+                "command",
+                &target,
+                &plan_value,
+            )?;
+            let output = match ctx.run.cmd.run(command).await {
+                Ok(output) => output,
+                Err(error) => {
+                    let _ = ctx.run.finish_external_operation_with_status(
+                        ctx.journal,
+                        node,
+                        &operation_id,
+                        "error",
+                    );
+                    return Err(StepError::from_gateway(&node.id, error));
+                }
+            };
+            ctx.run
+                .finish_external_operation(ctx.journal, node, &operation_id)?;
             Ok(json!({
                 "status": output.status,
                 "stdout": output.stdout,
@@ -129,14 +168,38 @@ pub(crate) async fn execute_agent_tool(
                 .get("body")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned);
+            let http_details = if matches!(method.as_str(), "GET" | "HEAD") {
+                None
+            } else {
+                use sha2::{Digest as _, Sha256};
+                let body_digest = body
+                    .as_ref()
+                    .map(|body| hex::encode(Sha256::digest(body.as_bytes())));
+                Some(json!({ "method": method, "body_sha256": body_digest }))
+            };
             if !matches!(method.as_str(), "GET" | "HEAD")
-                && let Some(confirm) =
-                    ctx.run
-                        .require_side_effect(ctx.journal, node, "http", url, None)?
+                && let Some(confirm) = ctx.run.require_side_effect(
+                    ctx.journal,
+                    node,
+                    "http",
+                    url,
+                    http_details.clone(),
+                )?
             {
                 return Ok(AgentToolOutcome::NeedsConfirm(confirm));
             }
-            let output = ctx
+            let operation_id = if matches!(method.as_str(), "GET" | "HEAD") {
+                None
+            } else {
+                Some(ctx.run.guard_external_operation(
+                    ctx.journal,
+                    node,
+                    "http",
+                    url,
+                    &http_details,
+                )?)
+            };
+            let output = match ctx
                 .run
                 .http
                 .request(HttpRequest {
@@ -146,9 +209,27 @@ pub(crate) async fn execute_agent_tool(
                     sensitive_query: BTreeMap::new(),
                     body: body.map(String::into_bytes),
                     follow_redirects: false,
+                    idempotency_key: operation_id.clone(),
                 })
                 .await
-                .map_err(|error| StepError::from_gateway(&node.id, error))?;
+            {
+                Ok(output) => output,
+                Err(error) => {
+                    if let Some(operation_id) = operation_id {
+                        let _ = ctx.run.finish_external_operation_with_status(
+                            ctx.journal,
+                            node,
+                            &operation_id,
+                            "error",
+                        );
+                    }
+                    return Err(StepError::from_gateway(&node.id, error));
+                }
+            };
+            if let Some(operation_id) = operation_id {
+                ctx.run
+                    .finish_external_operation(ctx.journal, node, &operation_id)?;
+            }
             Ok(AgentToolOutcome::Result(json!({
                 "status": output.status,
                 "url": output.url,
@@ -248,7 +329,7 @@ pub(crate) async fn execute_agent_tool(
             {
                 return Ok(AgentToolOutcome::NeedsConfirm(confirm));
             }
-            execute_mcp_tool(ctx, node, mcp, name, args.clone()).await
+            execute_mcp_tool(ctx, node, mcp, name, args.clone(), call_id).await
         }
         ToolDecl::Agent {
             instructions,

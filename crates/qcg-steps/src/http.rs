@@ -211,7 +211,12 @@ impl StepExecutor for HttpStep {
                 (Some(bytes), Some("application/octet-stream".to_owned()))
             }
             (None, None, None, None) => (None, None),
-            _ => unreachable!("validated mutually exclusive HTTP body modes"),
+            _ => {
+                return Err(StepError::failed(
+                    &node.id,
+                    "conflicting HTTP body modes; at most one body source is allowed",
+                ));
+            }
         };
         let explicit_content_type = params
             .content_type
@@ -241,26 +246,71 @@ impl StepExecutor for HttpStep {
         {
             headers.insert("Content-Type".into(), content_type);
         }
+        // The approval binds method, URL, and body content: approving one
+        // request must never authorize a regenerated different body.
+        let http_details = if matches!(method.as_str(), "GET" | "HEAD") {
+            None
+        } else {
+            use sha2::{Digest as _, Sha256};
+            let body_digest = body.as_ref().map(|body| hex::encode(Sha256::digest(body)));
+            Some(json!({ "method": method, "body_sha256": body_digest }))
+        };
         if !matches!(method.as_str(), "GET" | "HEAD")
-            && let Some(confirm) =
-                ctx.run
-                    .require_side_effect(ctx.journal, node, "http", &url, None)?
+            && let Some(confirm) = ctx.run.require_side_effect(
+                ctx.journal,
+                node,
+                "http",
+                &url,
+                http_details.clone(),
+            )?
         {
             return Ok(StepOutcome::NeedsConfirm { confirm });
         }
-        let response = ctx
+        // Stable operation id doubles as the remote idempotency key so
+        // retries after a lost result deduplicate server-side. Started
+        // without finished refuses automatic replay (indeterminate result).
+        let operation_id = if matches!(method.as_str(), "GET" | "HEAD") {
+            None
+        } else {
+            Some(ctx.run.guard_external_operation(
+                ctx.journal,
+                node,
+                "http",
+                &url,
+                &http_details,
+            )?)
+        };
+        let response = match ctx
             .run
             .http
             .request(HttpRequest {
                 method,
-                url,
+                url: url.clone(),
                 headers,
                 sensitive_query: std::collections::BTreeMap::new(),
                 body,
                 follow_redirects: true,
+                idempotency_key: operation_id.clone(),
             })
             .await
-            .map_err(|error| StepError::from_gateway(&node.id, error))?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(operation_id) = operation_id {
+                    let _ = ctx.run.finish_external_operation_with_status(
+                        ctx.journal,
+                        node,
+                        &operation_id,
+                        "error",
+                    );
+                }
+                return Err(StepError::from_gateway(&node.id, error));
+            }
+        };
+        if let Some(operation_id) = operation_id {
+            ctx.run
+                .finish_external_operation(ctx.journal, node, &operation_id)?;
+        }
         let mut files = Vec::new();
         let output_mode = match (params.output, params.output_file.is_some()) {
             (Some(mode), _) => mode,

@@ -13,8 +13,13 @@ use super::config::AppState;
 use super::error::ApiHttpError;
 use super::run_detail::{conditional_json, content_type_for_name, weak_etag};
 
-pub(crate) async fn healthz() -> Json<Value> {
-    Json(json!({ "ok": true }))
+pub(crate) async fn healthz(State(state): State<Arc<AppState>>) -> Json<Value> {
+    // Effective request body limit: null means no mechanistic limit
+    // (Axum's default is disabled); a number is the enforced bound.
+    Json(json!({
+        "ok": true,
+        "max_request_bytes": state.max_request_bytes,
+    }))
 }
 
 pub(crate) async fn openapi() -> Json<Value> {

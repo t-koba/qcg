@@ -1247,7 +1247,8 @@ api_key_env = "QCG_SECURE_API_KEY"
             )]),
             request_state: Some("opaque-state".into()),
         };
-        let first = mcp_question_id("research", "search", &required);
+        let args = json!({ "query": "test" });
+        let first = mcp_question_id("research", "search", "call-1", &args, &required);
         let reissued = McpInputRequired {
             input_requests: BTreeMap::from([(
                 "request-2".into(),
@@ -1255,8 +1256,12 @@ api_key_env = "QCG_SECURE_API_KEY"
             )]),
             request_state: Some("different-opaque-state".into()),
         };
-        let second = mcp_question_id("research", "search", &reissued);
+        let second = mcp_question_id("research", "search", "call-1", &args, &reissued);
         assert_eq!(first, second);
+        // Distinct invocations never share a question even with identical
+        // arguments and elicitation shape (A07).
+        let third = mcp_question_id("research", "search", "call-2", &args, &required);
+        assert_ne!(first, third);
 
         let form = mcp_form_spec(first, "search", &required).expect("form");
         assert_eq!(form.fields.len(), 1);

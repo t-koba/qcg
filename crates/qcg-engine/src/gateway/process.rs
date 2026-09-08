@@ -1,5 +1,5 @@
 use camino::Utf8Path;
-use qcg_contract::{CommandPermission, ContainerRuntime};
+use qcg_contract::CommandPermission;
 use qcg_policy::is_safe_relative_path;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -64,24 +64,6 @@ pub(crate) fn resolve_command_program(
     Ok(program)
 }
 
-pub(crate) fn container_runtime_argv(runtime: &ContainerRuntime) -> Option<Vec<String>> {
-    let path = std::env::var_os("PATH")?;
-    let (binary, runtime_arg) = match runtime {
-        ContainerRuntime::Docker => ("docker", None),
-        ContainerRuntime::Podman => ("podman", None),
-        ContainerRuntime::DockerRunsc => ("docker", Some("runsc")),
-    };
-    std::env::split_paths(&path)
-        .any(|dir| dir.join(binary).is_file())
-        .then(|| {
-            let mut argv = vec![binary.to_string(), "run".into()];
-            if let Some(runtime) = runtime_arg {
-                argv.extend(["--runtime".into(), runtime.into()]);
-            }
-            argv
-        })
-}
-
 pub(crate) fn configure_process_group(command: &mut Command) {
     #[cfg(unix)]
     {
@@ -101,6 +83,13 @@ pub(crate) fn configure_process_group(command: &mut Command) {
 pub(crate) struct ProcessTreeGuard {
     #[cfg(windows)]
     job: std::os::windows::io::OwnedHandle,
+    /// Process group id (`child.pid` via `process_group(0)`) killed on drop
+    /// unless disarmed after a clean wait. Covers outer-timeout future drops
+    /// that bypass the explicit cancel/timeout paths.
+    #[cfg(unix)]
+    pgid: Option<i32>,
+    #[cfg(unix)]
+    disarmed: bool,
 }
 
 impl ProcessTreeGuard {
@@ -146,12 +135,25 @@ impl ProcessTreeGuard {
         }
         #[cfg(not(windows))]
         {
-            let _ = child;
-            Ok(Self {})
+            let pgid = child.id().and_then(|pid| i32::try_from(pid).ok());
+            Ok(Self {
+                pgid,
+                disarmed: false,
+            })
         }
     }
 
-    pub(crate) async fn terminate(&self, child: &mut tokio::process::Child, pid: Option<u32>) {
+    /// Marks the tree as cleanly reaped so Drop stays silent. Call after a
+    /// successful wait; without it Drop would signal a possibly recycled
+    /// process group id.
+    pub(crate) fn disarm(&mut self) {
+        #[cfg(unix)]
+        {
+            self.disarmed = true;
+        }
+    }
+
+    pub(crate) async fn terminate(&mut self, child: &mut tokio::process::Child, pid: Option<u32>) {
         #[cfg(unix)]
         if let Some(pid) = pid
             && let Ok(pid) = i32::try_from(pid)
@@ -173,6 +175,34 @@ impl ProcessTreeGuard {
         }
         let _ = child.kill().await;
         let _ = child.wait().await;
+        self.disarm();
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessTreeGuard {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        if let Some(pgid) = self.pgid {
+            // SAFETY: best-effort group kill for paths that never reached an
+            // explicit wait (outer timeout dropping the future). The child
+            // always starts in its own group (`process_group(0)` fails the
+            // spawn otherwise), so our own group can never be the target.
+            // Signal only while the group still contains our child
+            // (`getpgid(child) == pgid` with pgid == child pid): a reaped
+            // child frees the number, and a recycled pid in another group
+            // (or no such pid, ESRCH) skips the kill instead of signaling
+            // strangers. Residual risk is a recycled pid leading a new
+            // group under the same number, which no portable POSIX check
+            // can distinguish (Linux-only pidfd is unavailable here).
+            unsafe {
+                if libc::getpgid(pgid) == pgid {
+                    libc::killpg(pgid, libc::SIGKILL);
+                }
+            }
+        }
     }
 }
 

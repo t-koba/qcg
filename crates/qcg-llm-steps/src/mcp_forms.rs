@@ -6,13 +6,22 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
-pub(crate) fn mcp_question_id(node_id: &str, alias: &str, required: &McpInputRequired) -> String {
+pub(crate) fn mcp_question_id(
+    node_id: &str,
+    alias: &str,
+    call_id: &str,
+    args: &Value,
+    required: &McpInputRequired,
+) -> String {
     let requests = stable_mcp_input_requests(required)
         .into_iter()
         .map(|(_request_id, request)| serde_json::to_vec(request).unwrap_or_default())
         .collect::<Vec<_>>();
     let encoded = serde_json::to_vec(&json!({
+        "node": node_id,
         "alias": alias,
+        "call_id": call_id,
+        "arguments": args,
         "requests": requests,
     }))
     .unwrap_or_default();
@@ -112,8 +121,13 @@ pub(crate) fn mcp_argument_summary(arguments: &Value) -> Value {
         .map(|values| values.keys().cloned().collect::<Vec<_>>())
         .unwrap_or_default();
     names.sort();
+    // The approval binds the full argument value through its digest, not
+    // just names and size: approving one call must never authorize a
+    // regenerated different payload.
+    let bytes = serde_json::to_vec(arguments).unwrap_or_default();
     json!({
         "argument_names": names,
-        "encoded_bytes": serde_json::to_vec(arguments).map_or(0, |value| value.len()),
+        "encoded_bytes": bytes.len(),
+        "arguments_sha256": hex::encode(Sha256::digest(&bytes)),
     })
 }

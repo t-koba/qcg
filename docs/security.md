@@ -53,10 +53,28 @@ effects, runtime, and budget. Side effects require confirmation when declared
 with `side_effects = "confirm"`.
 
 Every command permission must choose `container` or `trusted_host` isolation.
-Container execution requires a digest-pinned allowlisted image and uses no
-network, a read-only root, dropped capabilities, no-new-privileges, a PID limit,
-and a single workspace mount. `trusted_host` grants execution as the qcg OS
-user. Stdio MCP servers follow the same rule.
+`trusted_host` grants execution as the qcg OS user. Stdio MCP servers follow
+the same rule. Container backends share one lifecycle contract but enforce
+isolation with family-specific mechanisms:
+
+| family | runtimes | network | mounts | capabilities | rootfs | env |
+|---|---|---|---|---|---|---|
+| Docker-compatible | `docker`, `podman`, `docker_runsc` | none | workspace only at `/work` | all dropped, no-new-privileges, PID limit | read-only, bounded `/tmp` | cleared (`PATH`, run `TMPDIR`) |
+| Incus-like | `incus`, `lxd` | no NIC device | workspace-only disk device | unprivileged, no nesting | image default | cleared; explicit flags only |
+| legacy LXC | `lxc` | none | workspace-only bind mount | curated drop list, no-new-privileges | image default | cleared, minimal `PATH` |
+
+Digest pinning follows the family: Docker-compatible images use
+`name@sha256:<hex>` enforced by the daemon; Incus-like images use
+`<remote>:<path>@sha256:<fingerprint>` and launch by fingerprint so
+exactly the pinned bits run (pre-pull fingerprints with `image copy`);
+legacy LXC addresses `dist:release` series verified through the signed
+download index, which pins the series rather than exact bits. The declared
+runtime is recorded in the command plan, and cleanup (stop/delete with a
+Drop-path safety net) runs on success, error, cancel, and timeout for
+every family. Managed MCP server processes additionally pass secret-backed
+values through explicit spawn flags, which are briefly visible in the
+host-local process table; prefer Docker-family runtimes for secret-heavy
+MCP servers when that visibility matters.
 
 Provider credentials are read from named environment variables or private
 files selected by `api_key_file_env`; file-backed credentials are re-read per
@@ -165,7 +183,14 @@ Header authentication is preferred. When an upstream API requires query
 authentication, qcg appends the secret only after checking the public endpoint
 against `permissions.network`, disables redirects, removes the sensitive
 parameter from returned URLs and HTTP errors, and rejects credential reflection
-in the decoded response.
+in the decoded response. Streaming responses apply the same decoded and
+concatenated checks: raw SSE chunk matching plus per-chunk decoded JSON
+inspection plus a running decoded window so split or escaped reflections
+cannot bypass the single-chunk test.
+
+`dry_run_first` records a plan confirmation, not a true simulation of
+arbitrary external commands or HTTP calls. Adapters with genuine dry-run
+support remain distinct; the policy name documents the plan-review boundary.
 
 These controls reduce generator capability; they do not authenticate HTTP
 callers or provide run ownership. Review a contract before approving it, keep

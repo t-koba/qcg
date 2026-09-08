@@ -1928,6 +1928,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "qcg-container"
+version = "0.1.0"
+dependencies = [
+ "qcg-contract",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
 name = "qcg-contract"
 version = "0.1.0"
 dependencies = [
@@ -1955,11 +1967,13 @@ dependencies = [
  "camino",
  "chrono",
  "dunce",
+ "fs2",
  "hex",
  "jsonschema",
  "libc",
  "minijinja",
  "qcg-api",
+ "qcg-container",
  "qcg-contract",
  "qcg-llm",
  "qcg-policy",
@@ -2073,6 +2087,7 @@ dependencies = [
  "libc",
  "oauth2",
  "pin-project-lite",
+ "qcg-container",
  "qcg-policy",
  "qcg-types",
  "reqwest",
@@ -2106,6 +2121,7 @@ dependencies = [
  "axum",
  "camino",
  "chrono",
+ "fs2",
  "futures-util",
  "hex",
  "qcg-api",
@@ -2131,6 +2147,7 @@ dependencies = [
  "async-trait",
  "camino",
  "chrono",
+ "dunce",
  "fs2",
  "futures-util",
  "hex",
@@ -2165,6 +2182,7 @@ dependencies = [
  "hex",
  "jsonschema",
  "qcg-api",
+ "qcg-container",
  "qcg-contract",
  "qcg-engine",
  "qcg-mcp",

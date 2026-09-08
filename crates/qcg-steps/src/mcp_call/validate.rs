@@ -145,6 +145,9 @@ pub(crate) fn mcp_access(ctx: &StepContext<'_>, command: &[String]) -> McpAccess
                             qcg_contract::ContainerRuntime::DockerRunsc => {
                                 McpContainerRuntime::DockerRunsc
                             }
+                            qcg_contract::ContainerRuntime::Incus => McpContainerRuntime::Incus,
+                            qcg_contract::ContainerRuntime::Lxd => McpContainerRuntime::Lxd,
+                            qcg_contract::ContainerRuntime::Lxc => McpContainerRuntime::Lxc,
                         })
                     }
                 },

@@ -1,7 +1,7 @@
 use super::super::run_dirs::journal_is_empty;
 use super::super::types::{RunRecord, ServiceError};
 use camino::{Utf8Path, Utf8PathBuf};
-use qcg_api::RunStatus;
+use qcg_api::{RunEvent, RunStatus};
 use qcg_contract::Contract;
 use qcg_engine::{Interaction, RunState, read_output_manifest};
 use qcg_types::OutputManifest;
@@ -10,10 +10,9 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use super::reads::read_persisted_hitl;
-use super::reads::read_persisted_mcp_pending;
-use super::reads::read_queued_identity;
-use super::runs::{read_run_generator_path, read_run_inputs};
+use super::reads::{
+    read_journal_events, read_persisted_hitl_from_values, read_queued_identity_from_values,
+};
 use super::summary::run_meta_dir;
 use qcg_policy::MAX_DIRECTORY_SCAN_ENTRIES;
 
@@ -22,15 +21,50 @@ pub(crate) fn fold_run_state(run_dir: &Utf8Path) -> Result<RunState, ServiceErro
         .map_err(|error| ServiceError::Invalid(error.to_string()))
 }
 
-fn read_last_queued_at(run_dir: &Utf8Path) -> Option<chrono::DateTime<chrono::Utc>> {
-    let events = crate::summaries::read_journal_events(run_dir).ok()?;
+/// Latest durable admission instant: the explicit `queued_at` payload field
+/// when present, else the event timestamp. Memory, display, and recovery
+/// all derive from this single source so requeue order survives restarts
+/// without per-process re-stamping (C04).
+pub(crate) fn read_last_queued_at(run_dir: &Utf8Path) -> Option<chrono::DateTime<chrono::Utc>> {
+    match crate::summaries::read_journal_events(run_dir) {
+        Ok(events) => read_last_queued_at_from_values(&events),
+        // Callers treat absence as "no recorded instant" with a memory
+        // fallback; an unreadable journal is therefore logged, never
+        // silently equated with absence.
+        Err(error) => {
+            tracing::warn!(run_dir = %run_dir, %error, "queued-at scan failed; no durable instant");
+            None
+        }
+    }
+}
+
+/// Latest queue instant from already-read journal values. Malformed
+/// timestamps are skipped toward older events instead of voiding the
+/// whole lookup: one corrupt event must not erase the surviving order.
+pub(crate) fn read_last_queued_at_from_values(
+    events: &[serde_json::Value],
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    // Requeue order must survive restarts. Answers and confirmations resume
+    // execution without appending a fresh run_queued, so their durable
+    // timestamps are the requeue basis together with run_queued (C04).
     events
         .iter()
         .rev()
-        .find(|event| event.get("t").and_then(serde_json::Value::as_str) == Some("run_queued"))
-        .and_then(|event| event.get("ts").and_then(serde_json::Value::as_str))
-        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+        .filter(|event| {
+            matches!(
+                event.get("t").and_then(serde_json::Value::as_str),
+                Some("run_queued" | "user_answered" | "user_confirmed")
+            )
+        })
+        .filter_map(|event| {
+            event
+                .get("queued_at")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| event.get("ts").and_then(serde_json::Value::as_str))
+        })
+        .filter_map(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
         .map(|ts| ts.with_timezone(&chrono::Utc))
+        .next()
 }
 
 pub(crate) fn read_optional_output_manifest(
@@ -86,11 +120,19 @@ pub(crate) fn rehydrate_runs(
         if journal_is_empty(&journal_path)? {
             continue;
         }
-        let mut state = RunState::fold_journal(&journal_path)
+        // One bounded journal read serves the fold and every derivation
+        // below (identity, scheduling, HITL maps, queue instant): a restart
+        // never pays a scan per field per run.
+        let journal_values = read_journal_events(&run_dir)?;
+        let mut state = RunState::fold_values(&journal_values)
             .map_err(|error| ServiceError::Invalid(error.to_string()))?;
         if state.terminal.is_some() {
             continue;
         }
+        let journal_events = journal_values
+            .iter()
+            .map(|event| RunEvent::from_flat(event).map_err(ServiceError::Invalid))
+            .collect::<Result<Vec<_>, _>>()?;
         if records.len() >= max_tracked_runs {
             return Err(ServiceError::Invalid(format!(
                 "run store contains more than {max_tracked_runs} non-terminal runs"
@@ -107,23 +149,29 @@ pub(crate) fn rehydrate_runs(
             }
             None => (RunStatus::Queued, None, None),
         };
-        let generator_path = read_run_generator_path(&run_dir)?;
+        // A mailbox cancel observed at rehydration is acceptance, not
+        // settlement: only a journaled terminal state reports `Canceled`.
+        let record_state = if record_state == RunStatus::Queued
+            && crate::run_dirs::has_pending_cancel_control(&run_dir)
+        {
+            RunStatus::CancelRequested
+        } else {
+            record_state
+        };
+        let generator_path =
+            super::runs::read_run_generator_path_from_events(&run_dir, &journal_events)?;
         let contract = Contract::load(&generator_path)
             .map_err(|error| ServiceError::Invalid(error.to_string()))?;
-        let inputs = read_run_inputs(&run_dir)?;
-        let queued_identity = read_queued_identity(&run_dir).unwrap_or((0, None));
-        let (mut answers, confirmations) =
-            read_persisted_hitl(&run_dir).unwrap_or((BTreeMap::new(), BTreeMap::new()));
-        // Journaled MCP continuations ride along in the answers map under
-        // reserved #__mcp_pending keys so resumed steps can continue the
-        // original remote request.
-        if let Ok(pending) = read_persisted_mcp_pending(&run_dir) {
-            answers.extend(pending);
-        }
+        let inputs = super::runs::read_run_inputs_from_events(&run_dir, &journal_events)?;
+        let queued_identity = read_queued_identity_from_values(&journal_values);
+        // Journal I/O failures fail rehydration instead of recovering with
+        // half-read maps. Continuations live in the typed journal store, so
+        // only user answers join the memory map.
+        let (answers, confirmations) = read_persisted_hitl_from_values(&journal_values)?;
         // Restore FIFO admission order from the last run_queued timestamp so
         // a restart preserves cross-generator submission order instead of
         // falling back to run_id string order.
-        let queued_at = read_last_queued_at(&run_dir);
+        let queued_at = read_last_queued_at_from_values(&journal_values);
         let (events, _) = broadcast::channel(512);
         records.insert(
             run_id,
@@ -146,6 +194,7 @@ pub(crate) fn rehydrate_runs(
                 task: Arc::new(Mutex::new(None)),
                 queued_at,
                 owner_id: String::new(),
+                ephemeral: false,
             },
         );
     }

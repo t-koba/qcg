@@ -5,31 +5,68 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 use super::gc::run_identity_event;
-use super::reads::read_run_events;
+use super::reads::{read_journal_events, read_run_events};
 use super::state::read_optional_output_manifest;
 use super::summary::RunSummary;
+use qcg_api::RunEvent;
 
 pub fn read_run_generator_path(run_dir: &Utf8Path) -> Result<Utf8PathBuf, ServiceError> {
     let events = read_run_events(run_dir)?;
-    let (_, started) = run_identity_event(run_dir, &events)?;
+    read_run_generator_path_from_events(run_dir, &events)
+}
+
+pub fn read_run_generator_path_from_events(
+    run_dir: &Utf8Path,
+    events: &[RunEvent],
+) -> Result<Utf8PathBuf, ServiceError> {
+    let (_, started) = run_identity_event(run_dir, events)?;
     Ok(Utf8PathBuf::from(&started.generator_path))
 }
 
-pub(crate) fn read_run_contract_sha256(run_dir: &Utf8Path) -> Result<String, ServiceError> {
-    let events = read_run_events(run_dir)?;
-    let (_, started) = run_identity_event(run_dir, &events)?;
+pub(crate) fn read_run_contract_sha256(
+    run_dir: &Utf8Path,
+    events: &[RunEvent],
+) -> Result<String, ServiceError> {
+    let (_, started) = run_identity_event(run_dir, events)?;
     Ok(started.contract_sha256.clone())
 }
 
 pub fn read_run_inputs(run_dir: &Utf8Path) -> Result<BTreeMap<String, Value>, ServiceError> {
     let events = read_run_events(run_dir)?;
-    let (_, started) = run_identity_event(run_dir, &events)?;
+    read_run_inputs_from_events(run_dir, &events)
+}
+
+pub fn read_run_inputs_from_events(
+    run_dir: &Utf8Path,
+    events: &[RunEvent],
+) -> Result<BTreeMap<String, Value>, ServiceError> {
+    let (_, started) = run_identity_event(run_dir, events)?;
     Ok(started.inputs.clone())
 }
 
 pub fn run_summary(run_dir: &Utf8Path) -> Result<RunSummary, ServiceError> {
-    let events = read_run_events(run_dir)?;
-    let (started_event, started) = run_identity_event(run_dir, &events)?;
+    run_summary_with_seq(run_dir).map(|(summary, _)| summary)
+}
+
+/// Summary plus the folded `last_seq` from a single journal read: listing
+/// paths use this so one run never costs a summary scan plus a second fold.
+pub fn run_summary_with_seq(run_dir: &Utf8Path) -> Result<(RunSummary, u64), ServiceError> {
+    let values = read_journal_events(run_dir)?;
+    let folded = qcg_engine::RunState::fold_values(&values)
+        .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    let events = values
+        .iter()
+        .map(|event| RunEvent::from_flat(event).map_err(ServiceError::Invalid))
+        .collect::<Result<Vec<_>, _>>()?;
+    let summary = run_summary_from_events(run_dir, &events)?;
+    Ok((summary, folded.last_seq))
+}
+
+fn run_summary_from_events(
+    run_dir: &Utf8Path,
+    events: &[RunEvent],
+) -> Result<RunSummary, ServiceError> {
+    let (started_event, started) = run_identity_event(run_dir, events)?;
     let lifecycle = events
         .iter()
         .rev()

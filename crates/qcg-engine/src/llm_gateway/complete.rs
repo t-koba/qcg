@@ -5,8 +5,29 @@ use qcg_llm::{
 };
 use qcg_policy::LlmCostBudget;
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio_util::sync::CancellationToken;
+
+/// Per-run pending LLM reservations shared across parallel tasks in this
+/// process. Each entry tracks conservatively reserved tokens and cost that
+/// have not yet settled into the journal budget. Reservations prevent
+/// parallel calls from each passing a post-hoc check and jointly overspending
+/// a hard cap (strongest budget guarantee).
+#[derive(Debug, Default, Clone)]
+struct PendingReservation {
+    tokens: u64,
+    cost_microusd: u64,
+}
+
+fn reservations() -> &'static Mutex<BTreeMap<String, PendingReservation>> {
+    static RESERVATIONS: OnceLock<Mutex<BTreeMap<String, PendingReservation>>> = OnceLock::new();
+    RESERVATIONS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn run_id_of(journal: &JournalWriter) -> String {
+    journal.state().run_id.clone().unwrap_or_default()
+}
 
 use super::merge::merge_event_extra;
 use super::types::{LLM_STREAM_CHANNEL_CAPACITY, LlmGateway};
@@ -41,6 +62,163 @@ impl<'a> LlmGateway<'a> {
         F: FnOnce(&TokenUsage) -> Value,
     {
         self.scan_request(node, &request)?;
+        // Hard-cap reservation before spending: estimate worst-case tokens
+        // and cost, then hold them so parallel calls cannot jointly exceed
+        // the cap. Soft post-hoc enforcement alone lets N parallel calls
+        // each pass and overspend N-fold.
+        let reservation = self.estimate_reservation(node, &request)?;
+        self.try_reserve(reservation.clone())?;
+        let complete_result = self
+            .complete_inner(node, request, routes, event_extra)
+            .await;
+        self.release_reservation(reservation);
+        complete_result
+    }
+
+    /// Conservative worst-case estimate for one call: prompt bytes/4 input
+    /// tokens plus the full requested max output, priced when known.
+    /// Unknown pricing with an enforced cost cap fails closed here instead
+    /// of spending blindly.
+    fn estimate_reservation(
+        &self,
+        node: &NodeDef,
+        request: &ChatRequest,
+    ) -> Result<Option<PendingReservation>, StepError> {
+        if self.budget.max_tokens.is_none() && self.budget.max_cost_microusd.is_none() {
+            return Ok(None);
+        }
+        // Non-finite floats (NaN temperature and friends) fail
+        // serialization: under-reserving budget as zero would overspend,
+        // so fail the reservation instead.
+        let prompt_bytes = serde_json::to_vec(request)
+            .map(|bytes| bytes.len())
+            .map_err(|error| {
+                StepError::failed("budget", format!("request is not serializable: {error}"))
+            })?;
+        let input_est = (prompt_bytes as u64).div_ceil(4);
+        let max_output = u64::from(request.max_tokens);
+        let tokens = input_est.saturating_add(max_output);
+        let mut cost_microusd = 0_u64;
+        if self.budget.max_cost_microusd.is_some() {
+            let pricing = self
+                .pricing
+                .iter()
+                .find(|model| model.provider == request.provider && model.model == request.model);
+            match pricing {
+                Some(model) => {
+                    match (
+                        model.input_cost_per_million_usd,
+                        model.output_cost_per_million_usd,
+                    ) {
+                        (Some(input_price), Some(output_price)) => {
+                            let input_cost = (input_est as f64) * input_price / 1_000_000.0;
+                            let output_cost = (max_output as f64) * output_price / 1_000_000.0;
+                            cost_microusd =
+                                ((input_cost + output_cost) * 1_000_000.0).ceil() as u64;
+                        }
+                        _ => {
+                            return Err(StepError::failed(
+                                &node.id,
+                                format!(
+                                    "model `{}/{}` lacks pricing while budget.max_cost_usd is enforced; refusing blind spend",
+                                    request.provider, request.model
+                                ),
+                            ));
+                        }
+                    }
+                }
+                None => {
+                    return Err(StepError::failed(
+                        &node.id,
+                        format!(
+                            "model `{}/{}` has no priced entry while budget.max_cost_usd is enforced; refusing blind spend",
+                            request.provider, request.model
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(Some(PendingReservation {
+            tokens,
+            cost_microusd,
+        }))
+    }
+
+    fn try_reserve(&self, reservation: Option<PendingReservation>) -> Result<(), StepError> {
+        let Some(reservation) = reservation else {
+            return Ok(());
+        };
+        let run_id = run_id_of(self.journal);
+        let state = self.journal.state();
+        let spent_tokens = state
+            .budget
+            .tokens_input
+            .saturating_add(state.budget.tokens_output);
+        let spent_cost = state.budget.cost_microusd;
+        let mut map = reservations()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = map.entry(run_id).or_default();
+        let projected_tokens = spent_tokens
+            .saturating_add(entry.tokens)
+            .saturating_add(reservation.tokens);
+        let projected_cost = spent_cost
+            .saturating_add(entry.cost_microusd)
+            .saturating_add(reservation.cost_microusd);
+        if let Some(limit) = self.budget.max_tokens
+            && projected_tokens > limit
+        {
+            return Err(StepError::BudgetExceeded {
+                resource: "tokens",
+                used: projected_tokens,
+                limit,
+            });
+        }
+        if let Some(limit) = self.budget.max_cost_microusd
+            && projected_cost > limit
+        {
+            return Err(StepError::BudgetExceeded {
+                resource: "cost_microusd",
+                used: projected_cost,
+                limit,
+            });
+        }
+        entry.tokens = entry.tokens.saturating_add(reservation.tokens);
+        entry.cost_microusd = entry
+            .cost_microusd
+            .saturating_add(reservation.cost_microusd);
+        Ok(())
+    }
+
+    fn release_reservation(&self, reservation: Option<PendingReservation>) {
+        let Some(reservation) = reservation else {
+            return;
+        };
+        let run_id = run_id_of(self.journal);
+        let mut map = reservations()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = map.get_mut(&run_id) {
+            entry.tokens = entry.tokens.saturating_sub(reservation.tokens);
+            entry.cost_microusd = entry
+                .cost_microusd
+                .saturating_sub(reservation.cost_microusd);
+            if entry.tokens == 0 && entry.cost_microusd == 0 {
+                map.remove(&run_id);
+            }
+        }
+    }
+
+    async fn complete_inner<F>(
+        &self,
+        node: &NodeDef,
+        request: ChatRequest,
+        routes: &[ModelRef],
+        event_extra: F,
+    ) -> Result<ChatResponse, StepError>
+    where
+        F: FnOnce(&TokenUsage) -> Value,
+    {
         let provider_id = request.provider.clone();
         let model_id = request.model.clone();
         let seed = request.seed;

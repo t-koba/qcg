@@ -437,16 +437,6 @@ function schemaPointer(schema: JsonSchema, reference: string): unknown {
   return current;
 }
 
-export function readPath(value: unknown, path: readonly PathSegment[]): unknown {
-  let current = value;
-  for (const segment of path) {
-    if (Array.isArray(current) && typeof segment === "number") current = current[segment];
-    else if (asJsonObject(current) && typeof segment === "string") current = asJsonObject(current)?.[segment];
-    else return undefined;
-  }
-  return current;
-}
-
 export function setPath(value: unknown, path: readonly PathSegment[], next: unknown): unknown {
   if (path.length === 0) return next;
   const [head, ...tail] = path;
@@ -489,10 +479,6 @@ export function stringifyValue(value: unknown): string {
 
 export function normalizeList(value: string): string[] {
   return value.split("\n").map((item) => item.trim()).filter(Boolean);
-}
-
-export function parseJsonValue(text: string): unknown {
-  return JSON.parse(text);
 }
 
 export function validateInputField(field: InputField, value: unknown): SchemaIssue[] {

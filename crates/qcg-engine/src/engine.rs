@@ -32,7 +32,7 @@ mod tests {
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio_util::sync::CancellationToken;
 
     #[test]
@@ -857,6 +857,99 @@ api_key_env = "QCG_SECURE_API_KEY"
             .expect_err("slow nodes should hit the per-attempt timeout");
         assert!(error.to_string().contains("timed out after 1s"));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[tokio::test]
+    async fn node_timeout_stops_only_the_node_and_adopts_cooperative_settlement() {
+        // A09: a node timeout cancels a node-scoped stop signal, never the
+        // whole run. A cooperatively settling node is adopted instead of
+        // abandoned.
+        struct CooperativeStep {
+            observed_stop: Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl StepExecutor for CooperativeStep {
+            fn type_id(&self) -> &'static str {
+                "test.cooperative"
+            }
+
+            async fn execute(
+                &self,
+                ctx: &mut StepContext<'_>,
+                node: &NodeDef,
+            ) -> Result<StepOutcome, StepError> {
+                tokio::select! {
+                    _ = ctx.run.cancellation.cancelled() => {
+                        self.observed_stop.store(true, Ordering::SeqCst);
+                        Err(StepError::failed(&node.id, "stopped cooperatively"))
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                        Ok(StepOutcome::Success {
+                            output: None,
+                            files: vec![],
+                        })
+                    }
+                }
+            }
+        }
+
+        let observed_stop = Arc::new(AtomicBool::new(false));
+        let manifest = manifest(vec![retry_node(
+            "cooperative",
+            "test.cooperative",
+            1,
+            0,
+            Some(1),
+        )]);
+        let run_dir = temp_run_dir("node-timeout-cooperative");
+        let graph = Graph::build(&manifest).expect("test graph should build");
+        let contract = Contract {
+            root: run_dir.clone(),
+            manifest,
+            graph,
+            sha256: "test".into(),
+        };
+        let mut registry = StepRegistry::new();
+        registry.register(CooperativeStep {
+            observed_stop: Arc::clone(&observed_stop),
+        });
+        let run_cancellation = CancellationToken::new();
+        let error = Engine::new(registry)
+            .run_with_id(
+                "node-timeout-cooperative".into(),
+                run_dir.join("meta"),
+                contract,
+                BTreeMap::new(),
+                RunOptions {
+                    output_dir: run_dir.join("workspace"),
+                    json_events: false,
+                    event_sender: None,
+                    interactive: false,
+                    answers: BTreeMap::new(),
+                    confirmations: BTreeMap::new(),
+                    max_total_steps: 100,
+                    max_parallel_steps: 1,
+                    llm_provider: None,
+                    llm_seed_override: None,
+                    cancellation: run_cancellation.clone(),
+                },
+            )
+            .await
+            .expect_err("cooperative stop still fails the timed-out node");
+        assert!(
+            error.to_string().contains("stopped cooperatively"),
+            "grace-period settlement must be adopted, got: {error}"
+        );
+        assert!(
+            observed_stop.load(Ordering::SeqCst),
+            "node timeout must signal the node-scoped stop"
+        );
+        assert!(
+            !run_cancellation.is_cancelled(),
+            "node timeout must not cancel the whole run"
+        );
         let _ = std::fs::remove_dir_all(&run_dir);
     }
 

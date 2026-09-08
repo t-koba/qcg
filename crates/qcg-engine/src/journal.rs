@@ -6,6 +6,7 @@ mod writer;
 pub use read::*;
 pub use serialize::*;
 pub use types::*;
+pub use writer::{journal_lock_path, read_last_seq_from_tail, repair_truncated_tail_locked};
 
 #[cfg(test)]
 mod tests {
@@ -143,8 +144,14 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("test directory should be created");
         let path = Utf8PathBuf::from_path_buf(dir.join("journal.jsonl"))
             .expect("temporary path must be UTF-8");
-        let empty_state_bytes = serde_json::to_vec(&crate::RunState::default())
-            .expect("the default run state should serialize");
+        // Creation seeds the writer run id into the persisted state, so
+        // the exact-fit baseline carries it too.
+        let seeded_state = crate::RunState {
+            run_id: Some("state-limit-run".into()),
+            ..crate::RunState::default()
+        };
+        let empty_state_bytes =
+            serde_json::to_vec(&seeded_state).expect("the default run state should serialize");
         let limits = test_limits(64 * 1024, 128 * 1024, 8, empty_state_bytes.len());
         let journal =
             JournalWriter::create_with_limits(&path, "state-limit-run", false, None, limits)
@@ -173,7 +180,7 @@ mod tests {
             } if limit == empty_state_bytes.len()
         ));
         let state = journal.state();
-        assert_eq!(state.run_id, None);
+        assert_eq!(state.run_id.as_deref(), Some("state-limit-run"));
         assert_eq!(state.last_seq, 0);
         assert!(state.nodes.is_empty());
         assert!(state.checkpoints.is_empty());
@@ -596,6 +603,62 @@ mod tests {
             .expect("fold after repair must succeed");
         assert!(scan.events.iter().any(|event| event["t"] == "run_started"));
         assert!(scan.events.iter().any(|event| event["t"] == "step_started"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn concurrent_single_appends_keep_seq_unique_and_monotonic() {
+        // A01: service-side single appends and a live engine writer share
+        // the cross-process journal lock, so seq values never duplicate even
+        // when writers interleave create/event boundaries.
+        let dir = std::env::temp_dir().join(format!(
+            "qcg-journal-concurrent-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.join("journal.jsonl")).unwrap();
+        let engine = JournalWriter::create(&path, "concurrent-run", false, None).unwrap();
+        engine
+            .event(
+                "run_started",
+                json!({
+                    "generator": "concurrent@1.0.0",
+                    "generator_path": "concurrent",
+                    "contract_sha256": "abc",
+                    "inputs": {},
+                    "resource_hashes": [],
+                    "qcg": "0.1.0",
+                    "schema_version": 1,
+                }),
+            )
+            .unwrap();
+        // Simulate a service control write racing the engine writer: the
+        // single-append path re-folds under the same lock.
+        JournalWriter::append_single_event(
+            &path,
+            "concurrent-run",
+            "user_cancel_requested",
+            json!({ "run_id": "concurrent-run", "operation_id": "op-1" }),
+            JournalLimits::default(),
+            None,
+        )
+        .unwrap();
+        engine
+            .event(
+                "step_started",
+                json!({ "node": "n", "type": "test", "attempt": 1 }),
+            )
+            .unwrap();
+        let scan = read_journal_values(&path, JournalLimits::default()).unwrap();
+        let mut seqs: Vec<u64> = scan
+            .events
+            .iter()
+            .map(|event| event["seq"].as_u64().unwrap())
+            .collect();
+        seqs.sort_unstable();
+        assert_eq!(seqs, vec![1, 2, 3]);
+        // Strict fold rejects duplicates instead of keeping last-writer-wins.
         let _ = std::fs::remove_dir_all(dir);
     }
 

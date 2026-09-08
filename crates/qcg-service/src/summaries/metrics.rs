@@ -20,10 +20,19 @@ use qcg_policy::JOURNAL_POLL_CHANNEL_CAPACITY;
 /// journal with no recorded activity.
 pub fn read_run_metrics(run_dir: &Utf8Path) -> Result<Option<RunMetrics>, ServiceError> {
     let events = read_run_events(run_dir)?;
-    if let Some(metrics) = terminal_metrics(&events) {
+    let state = fold_run_state(run_dir)?;
+    read_run_metrics_from_view(&events, &state)
+}
+
+/// Metrics from one journal read: typed events plus their fold. Callers
+/// that already hold both never re-read the journal per metric.
+pub fn read_run_metrics_from_view(
+    events: &[RunEvent],
+    state: &qcg_engine::RunState,
+) -> Result<Option<RunMetrics>, ServiceError> {
+    if let Some(metrics) = terminal_metrics(events) {
         return Ok(Some(metrics));
     }
-    let state = fold_run_state(run_dir)?;
     if state.last_seq == 0 {
         return Ok(None);
     }
