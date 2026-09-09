@@ -1730,14 +1730,17 @@ impl LocalQcgService {
         }
         // Detached container cleanups from dropped guards must finish
         // before shutdown reports done; otherwise "stopped" races orphaned
-        // instances still being torn down. A nonzero remainder is surfaced,
-        // never silently equated with a clean stop (B06).
-        let outstanding =
+        // instances still being torn down. A nonzero remainder or failure
+        // count is surfaced, never silently equated with a clean stop:
+        // a finished cleanup thread alone does not prove its instance is
+        // gone (C05).
+        let cleanup =
             qcg_container::await_outstanding_cleanups(std::time::Duration::from_secs(65)).await;
-        if outstanding > 0 {
+        if cleanup.outstanding > 0 || cleanup.failed > 0 {
             tracing::warn!(
-                outstanding,
-                "container cleanups outstanding past shutdown deadline; instances may need operator retry"
+                outstanding = cleanup.outstanding,
+                failed = cleanup.failed,
+                "container cleanups outstanding or failed past shutdown deadline; instances may need operator retry"
             );
         }
         Ok(())

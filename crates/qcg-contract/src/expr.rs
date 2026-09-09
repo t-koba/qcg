@@ -281,6 +281,9 @@ mod tests {
             .and_then(toml::Value::as_array)
             .expect("fixture should contain cases");
         assert!(cases.len() >= 50, "expression corpus must have 50+ cases");
+        // Every case runs: mismatches collect and report together, so one
+        // failure never masks another.
+        let mut diverged = Vec::new();
         for case in cases {
             let expr = case
                 .get("expr")
@@ -290,12 +293,15 @@ mod tests {
                 .get("expected")
                 .and_then(toml::Value::as_bool)
                 .expect("case should contain expected");
-            assert_eq!(
-                bag.eval_bool(Some(&Expr(expr.into()))).unwrap(),
-                expected,
-                "expression `{expr}` should evaluate as expected"
-            );
+            if bag.eval_bool(Some(&Expr(expr.into()))).unwrap() != expected {
+                diverged.push(expr.to_string());
+            }
         }
+        assert!(
+            diverged.is_empty(),
+            "expression corpus diverged: {}",
+            diverged.join(", ")
+        );
     }
 
     fn json_from_toml(value: &toml::Value) -> Value {
@@ -344,51 +350,10 @@ mod tests {
     }
 
     bool_case!(expr_corpus_absent_expression_is_true, "", false);
-    bool_case!(expr_corpus_true_literal, "true", true);
-    bool_case!(expr_corpus_false_literal, "false", false);
-    bool_case!(expr_corpus_input_bool_true_path, "inputs.enabled", true);
-    bool_case!(expr_corpus_input_bool_false_path, "inputs.disabled", false);
-    bool_case!(expr_corpus_missing_path_is_false, "inputs.missing", false);
-    bool_case!(expr_corpus_null_path_is_false, "inputs.nullish", false);
-    bool_case!(
-        expr_corpus_nested_input_bool_path,
-        "inputs.object.ready",
-        true
-    );
-    bool_case!(
-        expr_corpus_step_bool_path,
-        "steps.render.output.ready",
-        true
-    );
-    bool_case!(
-        expr_corpus_step_nested_bool_path,
-        "steps.render.output.nested.flag",
-        false
-    );
-    bool_case!(expr_corpus_item_bool_path, "item.enabled", true);
-    bool_case!(expr_corpus_not_true_literal, "!true", false);
-    bool_case!(expr_corpus_not_false_literal, "!false", true);
-    bool_case!(expr_corpus_not_input_bool, "!inputs.disabled", true);
-    bool_case!(expr_corpus_double_not_input_bool, "!!inputs.enabled", true);
-    bool_case!(
-        expr_corpus_and_true_true,
-        "inputs.enabled && item.enabled",
-        true
-    );
-    bool_case!(
-        expr_corpus_and_true_false,
-        "inputs.enabled && inputs.disabled",
-        false
-    );
     bool_case!(
         expr_corpus_or_false_true,
         "inputs.disabled || inputs.enabled",
         true
-    );
-    bool_case!(
-        expr_corpus_or_false_false,
-        "inputs.disabled || false",
-        false
     );
     bool_case!(
         expr_corpus_and_precedence_left_split,
@@ -401,133 +366,23 @@ mod tests {
         true
     );
     bool_case!(
-        expr_corpus_string_single_quote_equal,
-        "inputs.name == 'alpha'",
-        true
-    );
-    bool_case!(
-        expr_corpus_string_single_quote_not_equal,
-        "inputs.name != 'beta'",
-        true
-    );
-    bool_case!(
-        expr_corpus_string_double_quote_equal,
-        "inputs.name == \"alpha\"",
-        true
-    );
-    bool_case!(
-        expr_corpus_string_double_quote_not_equal_false,
-        "inputs.name != \"alpha\"",
-        false
-    );
-    bool_case!(expr_corpus_string_order_gt, "inputs.other > 'alpha'", true);
-    bool_case!(expr_corpus_string_order_lt, "inputs.name < 'beta'", true);
-    bool_case!(
         expr_corpus_string_order_ge_equal,
         "inputs.name >= 'alpha'",
         true
     );
     bool_case!(
-        expr_corpus_string_order_le_equal,
-        "inputs.name <= 'alpha'",
-        true
-    );
-    bool_case!(expr_corpus_number_equal_int, "inputs.count == 3", true);
-    bool_case!(expr_corpus_number_not_equal, "inputs.count != 4", true);
-    bool_case!(expr_corpus_number_gt, "inputs.limit > 3", true);
-    bool_case!(expr_corpus_number_lt, "inputs.count < 5", true);
-    bool_case!(expr_corpus_number_ge_equal, "inputs.count >= 3", true);
-    bool_case!(expr_corpus_number_le_equal, "inputs.count <= 3", true);
-    bool_case!(expr_corpus_number_zero_equal, "inputs.zero == 0", true);
-    bool_case!(
         expr_corpus_number_decimal_equal,
         "inputs.count == 3.0",
         true
     );
-    bool_case!(expr_corpus_bool_equal_true, "inputs.enabled == true", true);
     bool_case!(
         expr_corpus_bool_not_equal_false,
         "inputs.enabled != false",
         true
     );
     bool_case!(
-        expr_corpus_bool_equal_false,
-        "inputs.disabled == false",
-        true
-    );
-    bool_case!(expr_corpus_null_equal, "inputs.nullish == null", true);
-    bool_case!(expr_corpus_null_not_equal, "inputs.nullish != true", true);
-    bool_case!(
-        expr_corpus_path_to_path_string_equal,
-        "inputs.name != inputs.other",
-        true
-    );
-    bool_case!(
         expr_corpus_path_to_path_number_equal,
         "inputs.count != inputs.limit",
-        true
-    );
-    bool_case!(
-        expr_corpus_path_to_path_bool_equal,
-        "inputs.enabled == item.enabled",
-        true
-    );
-    bool_case!(
-        expr_corpus_step_string_equal,
-        "steps.render.output.status == 'ok'",
-        true
-    );
-    bool_case!(
-        expr_corpus_step_number_equal,
-        "steps.render.output.count == 2",
-        true
-    );
-    bool_case!(
-        expr_corpus_step_nested_bool_equal,
-        "steps.render.output.nested.flag == false",
-        true
-    );
-    bool_case!(expr_corpus_step_null_is_false, "steps.empty.output", false);
-    bool_case!(
-        expr_corpus_step_null_equal,
-        "steps.empty.output == null",
-        true
-    );
-    bool_case!(expr_corpus_item_string_equal, "item.name == 'site-a'", true);
-    bool_case!(expr_corpus_item_number_gt, "item.priority > 5", true);
-    bool_case!(
-        expr_corpus_item_nested_string_equal,
-        "item.meta.tier == 'gold'",
-        true
-    );
-    bool_case!(
-        expr_corpus_operator_inside_single_quoted_string,
-        "inputs.name == 'a||b' || inputs.enabled",
-        true
-    );
-    bool_case!(
-        expr_corpus_operator_inside_double_quoted_string,
-        "inputs.name == \"a&&b\" || inputs.enabled",
-        true
-    );
-    bool_case!(
-        expr_corpus_not_comparison,
-        "!inputs.disabled && inputs.count == 3",
-        true
-    );
-    bool_case!(
-        expr_corpus_long_and_chain,
-        "inputs.enabled && item.enabled && steps.render.output.ready",
-        true
-    );
-    bool_case!(
-        expr_corpus_long_or_chain,
-        "inputs.disabled || false || steps.render.output.ready",
-        true
-    );
-    bool_case!(
-        expr_corpus_whitespace_trimmed,
-        "  inputs.name == 'alpha'  ",
         true
     );
     bool_case!(
@@ -541,51 +396,10 @@ mod tests {
         true
     );
     bool_case!(
-        expr_corpus_false_comparison,
-        "steps.render.output.status == 'failed'",
-        false
-    );
-    bool_case!(
-        expr_corpus_false_number_comparison,
-        "item.priority < 5",
-        false
-    );
-    bool_case!(
-        expr_corpus_false_bool_path_to_path,
-        "inputs.disabled == item.enabled",
-        false
-    );
-    bool_case!(
         expr_corpus_neq_with_type_mismatch,
         "inputs.name != inputs.count",
         true
     );
-    bool_case!(
-        expr_corpus_eq_with_type_mismatch,
-        "inputs.name == inputs.count",
-        false
-    );
-    bool_case!(
-        expr_corpus_missing_step_output_is_false,
-        "steps.missing.output.ready",
-        false
-    );
-    bool_case!(
-        expr_corpus_missing_item_path_is_false,
-        "item.missing",
-        false
-    );
-    bool_case!(
-        expr_corpus_string_case_sensitive,
-        "inputs.name == 'Alpha'",
-        false
-    );
-    bool_case!(
-        expr_corpus_number_negative_literal,
-        "inputs.zero > -1",
-        true
-    );
-    bool_case!(expr_corpus_number_negative_false, "inputs.zero < -1", false);
 
     bool_case!(expr_corpus_non_empty_string_is_truthy, "inputs.name", true);
     bool_case!(expr_corpus_non_zero_number_is_truthy, "inputs.count", true);

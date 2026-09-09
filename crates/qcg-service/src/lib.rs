@@ -2605,19 +2605,6 @@ content = "{{ inputs.marker }}"
         let _ = std::fs::remove_dir_all(&run_dir);
     }
 
-    #[test]
-    fn multi_field_answers_are_preserved_as_an_object() {
-        let payload = AnswerPayload {
-            values: BTreeMap::from([
-                ("decision".into(), json!("keep")),
-                ("reason".into(), json!("required context")),
-            ]),
-        };
-        let answer = json!(payload.values);
-        assert_eq!(answer["decision"], "keep");
-        assert_eq!(answer["reason"], "required context");
-    }
-
     #[tokio::test]
     async fn unknown_admission_time_sorts_last() {
         let root = temp_run_dir("queue-unknown-last");

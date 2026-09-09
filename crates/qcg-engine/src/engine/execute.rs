@@ -279,7 +279,30 @@ impl Engine {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
                         node_stop.cancel();
                         tokio::select! {
-                            result = &mut execution => result,
+                            // The deadline fired and is remembered by this
+                            // branch: a cooperative executor reports the
+                            // child-scope stop as cancellation, which
+                            // normalizes to TimedOut (retryable) unless an
+                            // actual parent cancel wins (C06). Passing the
+                            // raw cancellation through would misreport a
+                            // cooperative timeout as a user cancel and skip
+                            // the retry this policy declares.
+                            result = &mut execution => {
+                                let result = result;
+                                if context.cancellation.is_cancelled() {
+                                    result
+                                } else if result
+                                    .as_ref()
+                                    .is_err_and(EngineError::is_canceled)
+                                {
+                                    Err(EngineError::Step(StepError::TimedOut {
+                                        node: node.id.clone(),
+                                        timeout_secs,
+                                    }))
+                                } else {
+                                    result
+                                }
+                            }
                             _ = tokio::time::sleep(std::time::Duration::from_secs(
                                 NODE_TIMEOUT_GRACE_SECS,
                             )) => {

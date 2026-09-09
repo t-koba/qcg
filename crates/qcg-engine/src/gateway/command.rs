@@ -238,6 +238,12 @@ impl CmdGateway {
                 match teardown(&session).await {
                     Ok(()) => guard.disarm(),
                     Err(error) => {
+                        // Aggregate for shutdown reporting: the workload
+                        // result below stays the workload's own outcome
+                        // (failing it would lose successful work and invite
+                        // duplicate side effects on retry), while the
+                        // cleanup failure stays visible and retried (C05).
+                        qcg_container::record_cleanup_failure();
                         tracing::warn!(%error, "container teardown failed; guard backstop remains armed");
                     }
                 }
@@ -312,6 +318,7 @@ impl CmdGateway {
                     )
                     .await;
                 if let Err(error) = teardown(&provisioned).await {
+                    qcg_container::record_cleanup_failure();
                     tracing::warn!(%error, "managed container teardown failed; guard backstop remains armed");
                 } else {
                     guard.disarm();

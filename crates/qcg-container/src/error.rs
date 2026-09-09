@@ -14,6 +14,15 @@ pub enum ContainerError {
         instance: String,
         detail: String,
     },
+    /// The daemon confirmed the instance itself is absent. Returned only
+    /// when the teardown process spawned, exited non-zero, and named the
+    /// instance in an absence report. Spawn failures, timeouts, and
+    /// connection errors are never this variant (C05).
+    #[error("container {stage} found instance `{instance}` already absent")]
+    InstanceAbsent {
+        stage: &'static str,
+        instance: String,
+    },
     #[error(
         "container {stage} timed out after {timeout_secs}s for instance `{instance}`; daemon-side state is unknown and the instance may still exist"
     )]

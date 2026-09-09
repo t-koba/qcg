@@ -38,6 +38,55 @@ fn pending_path(runs_dir: &Utf8PathBuf, key: &str) -> Utf8PathBuf {
     idempotency_dir(runs_dir).join(format!("{:x}.pending.json", Sha256::digest(key.as_bytes())))
 }
 
+/// The single cross-process lock for one idempotency key space: claim,
+/// expiry reaping, Ready commit, and owner-checked release all serialize
+/// here. Separate claim/store locks cannot order generation checks against
+/// generation changes, and an unlocked read-compare-delete is not a
+/// conditional delete (C01).
+fn acquire_idempotency_lock(runs_dir: &Utf8PathBuf) -> Result<std::fs::File, String> {
+    std::fs::create_dir_all(idempotency_dir(runs_dir).as_std_path())
+        .map_err(|error| format!("failed to persist idempotency record: {error}"))?;
+    let lock_path = idempotency_dir(runs_dir).join(".idempotency.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path.as_std_path())
+        .map_err(|error| format!("failed to persist idempotency record: {error}"))?;
+    {
+        use fs2::FileExt as _;
+        lock_file
+            .lock_exclusive()
+            .map_err(|error| format!("failed to persist idempotency record: {error}"))?;
+    }
+    Ok(lock_file)
+}
+
+/// Removes an expired Ready record. Callers must hold the idempotency
+/// lock: deleting outside it lets an unlockED expiry check remove a Ready
+/// record published after the check (C01).
+fn reap_expired_ready_locked(runs_dir: &Utf8PathBuf, key: &str) -> Result<(), String> {
+    let path = idempotency_path(runs_dir, key);
+    let bytes = match read_bounded_idempotency_file(&path) {
+        BoundedRead::Present(bytes) => bytes,
+        BoundedRead::Absent => return Ok(()),
+        BoundedRead::Unreadable(error) => return Err(error),
+    };
+    if bytes.is_empty() {
+        return Err("idempotency record is empty; writer may be in progress".into());
+    }
+    let record: DurableIdempotencyRecord =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if record.key != key {
+        return Err("idempotency record key mismatch".into());
+    }
+    if now_unix().saturating_sub(record.created_at_unix) >= ttl_secs()? {
+        std::fs::remove_file(path.as_std_path()).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 /// Next claim generation for a key: one past the highest generation among
 /// the live pending and Ready records. Must run under the claim lock with
 /// the predecessor observation so two publishers cannot share a number.
@@ -122,31 +171,21 @@ pub(crate) fn claim_durable_pending(
     digest: &str,
     reserved_run_id: Option<String>,
 ) -> Result<ClaimOutcome, ApiHttpError> {
-    std::fs::create_dir_all(idempotency_dir(runs_dir).as_std_path()).map_err(|error| {
-        ApiHttpError::internal(format!("failed to persist idempotency record: {error}"))
-    })?;
-    // Serialize check-then-publish under a cross-process claim lock: temp +
-    // rename alone cannot arbitrate two concurrent publishers (the second
-    // rename would silently replace the first claim and crown two owners),
-    // so the predecessor read and the publish below are one critical
-    // section. Waiters only read and never take this lock.
-    let lock_path = idempotency_dir(runs_dir).join(".claim.lock");
-    let lock_file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(lock_path.as_std_path())
-        .map_err(|error| {
-            ApiHttpError::internal(format!("failed to persist idempotency record: {error}"))
-        })?;
-    {
-        use fs2::FileExt as _;
-        lock_file.lock_exclusive().map_err(|error| {
-            ApiHttpError::internal(format!("failed to persist idempotency record: {error}"))
-        })?;
+    // Serialize check-then-publish under the single cross-process
+    // idempotency lock: temp + rename alone cannot arbitrate two
+    // concurrent publishers (the second rename would silently replace the
+    // first claim and crown two owners), so the predecessor read and the
+    // publish below are one critical section. Waiters only read and never
+    // take this lock.
+    let _lock_held = acquire_idempotency_lock(runs_dir).map_err(ApiHttpError::internal)?;
+    // Reap an expired Ready record under the same lock before observing:
+    // an unlocked expiry check could delete a Ready record published
+    // after the check (C01).
+    if let Err(error) = reap_expired_ready_locked(runs_dir, key) {
+        return Err(ApiHttpError::internal(format!(
+            "failed to load idempotency record: {error}"
+        )));
     }
-    let _lock_held = lock_file;
     // Unified transition: re-check the Ready record under the same lock
     // before touching the pending claim. A commit landing between the
     // waiter's last look and this claim converges here instead of slipping
@@ -316,12 +355,18 @@ pub(crate) enum ClaimOutcome {
 /// ours. A claim that expired mid-execution may have been adopted and
 /// re-published by a peer; deleting it would break the new owner, so
 /// anything foreign is left alone.
+/// Releases our own pending claim. The owner/generation check and the
+/// delete run under the single idempotency lock: an unlocked
+/// read-compare-delete lets a stale reader remove the claim a successor
+/// published after the read (C01). A lock failure keeps the claim for TTL
+/// expiry and adoption instead of deleting unverified.
 pub(crate) fn release_durable_pending(
     runs_dir: &Utf8PathBuf,
     key: &str,
     owner: &str,
     generation: u64,
-) {
+) -> Result<(), String> {
+    let _lock_held = acquire_idempotency_lock(runs_dir)?;
     let path = pending_path(runs_dir, key);
     let current = std::fs::read(path.as_std_path())
         .ok()
@@ -330,8 +375,9 @@ pub(crate) fn release_durable_pending(
         .as_ref()
         .is_some_and(|record| record.owner == owner && record.generation == generation)
     {
-        let _ = std::fs::remove_file(path.as_std_path());
+        std::fs::remove_file(path.as_std_path()).map_err(|error| error.to_string())?;
     }
+    Ok(())
 }
 
 enum PendingRead {
@@ -436,6 +482,9 @@ fn ttl_secs() -> Result<u64, String> {
 /// Fail-closed load: absent and expired map to Ok(None), while corrupt
 /// content or I/O errors other than NotFound map to Err so callers never
 /// mistake an unreadable record for absence and start a duplicate run.
+/// Pure observation: expiry reaping happens only under the idempotency
+/// lock (claim/store paths), never here. Deleting from a reader would let
+/// an old observation remove a Ready record published after it (C01).
 pub(crate) fn load_durable_ready_result(
     runs_dir: &Utf8PathBuf,
     key: &str,
@@ -458,7 +507,6 @@ pub(crate) fn load_durable_ready_result(
         return Err("idempotency record key mismatch".into());
     }
     if now_unix().saturating_sub(record.created_at_unix) >= ttl_secs()? {
-        let _ = std::fs::remove_file(path.as_std_path());
         return Ok(None);
     }
     Ok(Some(record))
@@ -544,43 +592,67 @@ pub(crate) async fn wait_for_peer_ready(
 /// newer generation's outcome. A superseded commit for the same digest
 /// still converges onto the committed run; anything else fails instead of
 /// replacing it (B02).
+/// Why a Ready commit was refused. The caller branches on the variant,
+/// never on message text: a digest conflict releases the claim and
+/// reports 409, while any storage failure fails closed without
+/// advertising Ready.
+#[derive(Debug)]
+pub(crate) enum StoreReadyError {
+    /// The key already committed a different request digest.
+    DigestConflict,
+    /// I/O, corrupt reads, or a superseded generation: details for the
+    /// 500 path, never a second terminal outcome.
+    Storage(String),
+}
+
+impl std::fmt::Display for StoreReadyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DigestConflict => {
+                write!(
+                    f,
+                    "Idempotency-Key was already used with a different request"
+                )
+            }
+            Self::Storage(detail) => write!(f, "{detail}"),
+        }
+    }
+}
+
+impl From<String> for StoreReadyError {
+    fn from(detail: String) -> Self {
+        Self::Storage(detail)
+    }
+}
+
 pub(crate) fn store_durable_ready(
     runs_dir: &Utf8PathBuf,
     key: &str,
     digest: &str,
     run_id: &str,
     expected_generation: u64,
-) -> Result<(), String> {
+) -> Result<(), StoreReadyError> {
     std::fs::create_dir_all(idempotency_dir(runs_dir).as_std_path())
         .map_err(|error| error.to_string())?;
     let path = idempotency_path(runs_dir, key);
-    // Serialize check-then-publish under a cross-process lock so two owners
-    // never interleave temp writes and renames (A03). Readers use temp +
-    // rename, so they never observe empty or partial files.
-    let lock_path = idempotency_dir(runs_dir).join(".store.lock");
-    let lock_file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(lock_path.as_std_path())
-        .map_err(|error| error.to_string())?;
-    let _lock_held = {
-        use fs2::FileExt as _;
-        lock_file
-            .lock_exclusive()
-            .map_err(|error| error.to_string())?;
-        lock_file
-    };
+    // Serialize check-then-publish under the single cross-process
+    // idempotency lock (shared with claim and release) so generation
+    // checks and generation changes are one ordered history (C01).
+    // Readers use temp + rename, so they never observe empty or partial
+    // files.
+    let _lock_held = acquire_idempotency_lock(runs_dir)?;
+    // Reap an expired Ready record under the same lock: the generation
+    // fence below must observe exactly what it supersedes (C01).
+    reap_expired_ready_locked(runs_dir, key)?;
     match load_durable_ready_result(runs_dir, key) {
         Ok(Some(existing)) => {
             if existing.digest != digest {
-                return Err("Idempotency-Key was already used with a different request".into());
+                return Err(StoreReadyError::DigestConflict);
             }
             return Ok(());
         }
         Ok(None) => {}
-        Err(error) => return Err(error),
+        Err(error) => return Err(error.into()),
     }
     // Generation fence: a claim superseded while executing (expiry
     // adoption, key reuse) must not overwrite the newer generation's
@@ -593,9 +665,9 @@ pub(crate) fn store_durable_ready(
                 match load_durable_ready_result(runs_dir, key) {
                     Ok(Some(committed)) if committed.digest == digest => return Ok(()),
                     _ => {
-                        return Err(format!(
+                        return Err(StoreReadyError::Storage(format!(
                             "idempotency claim superseded by generation {current}; retry converges onto the committed run"
-                        ));
+                        )));
                     }
                 }
             }
@@ -640,6 +712,107 @@ mod tests {
         .expect("temp dir should be UTF-8");
         std::fs::create_dir_all(dir.as_std_path()).expect("temp dir should be created");
         dir
+    }
+
+    #[test]
+    fn stale_release_never_removes_a_successor_claim() {
+        // C01: owner A reads its claim (owner=A, generation=1), stalls,
+        // and owner B adopts and publishes (owner=B, generation=2). A's
+        // late release must compare under the lock and leave B's claim.
+        // The same holds for a superseded generation under the live
+        // owner's own id.
+        let runs_dir = temp_runs_dir("stale-release");
+        let key = "key-1";
+        std::fs::create_dir_all(idempotency_dir(&runs_dir).as_std_path())
+            .expect("idempotency dir should be created");
+        let claim = |owner: &str, generation: u64| DurablePendingRecord {
+            key: key.into(),
+            digest: "d".into(),
+            run_id: None,
+            owner: owner.into(),
+            created_at_unix: now_unix(),
+            generation,
+        };
+        std::fs::write(
+            pending_path(&runs_dir, key).as_std_path(),
+            serde_json::to_vec(&claim("A", 1)).expect("claim should serialize"),
+        )
+        .expect("claim A should be written");
+        // Successor publishes after A's read.
+        std::fs::write(
+            pending_path(&runs_dir, key).as_std_path(),
+            serde_json::to_vec(&claim("B", 2)).expect("claim should serialize"),
+        )
+        .expect("claim B should be written");
+        release_durable_pending(&runs_dir, key, "A", 1).expect("release should not fail");
+        release_durable_pending(&runs_dir, key, "B", 3)
+            .expect("superseded generation should not fail");
+        release_durable_pending(&runs_dir, key, "someone-else", 2)
+            .expect("foreign owner should not fail");
+        let survivor: DurablePendingRecord = serde_json::from_slice(
+            &std::fs::read(pending_path(&runs_dir, key).as_std_path())
+                .expect("claim file should survive"),
+        )
+        .expect("claim should parse");
+        assert_eq!(
+            survivor.owner, "B",
+            "successor claim must survive a stale release"
+        );
+        assert_eq!(survivor.generation, 2);
+        // The matching owner+generation still releases.
+        release_durable_pending(&runs_dir, key, "B", 2).expect("release should not fail");
+        assert!(
+            !pending_path(&runs_dir, key).as_std_path().exists(),
+            "matching release must remove the claim"
+        );
+        let _ = std::fs::remove_dir_all(runs_dir.as_std_path());
+    }
+
+    #[test]
+    fn ready_reap_keeps_a_fresh_record() {
+        // C01: expiry reaping runs under the lock and only removes expired
+        // records. A fresh Ready published after an old observation (real
+        // or simulated) must survive the reap.
+        let runs_dir = temp_runs_dir("ready-reap");
+        let key = "key-1";
+        std::fs::create_dir_all(idempotency_dir(&runs_dir).as_std_path())
+            .expect("idempotency dir should be created");
+        let ready = |age_secs: u64| DurableIdempotencyRecord {
+            key: key.into(),
+            digest: "d".into(),
+            run_id: "run-1".into(),
+            created_at_unix: now_unix().saturating_sub(age_secs),
+            generation: 1,
+        };
+        let expired_age = qcg_policy::IDEMPOTENCY_TTL.as_secs().saturating_add(60);
+        std::fs::write(
+            idempotency_path(&runs_dir, key).as_std_path(),
+            serde_json::to_vec(&ready(expired_age)).expect("record should serialize"),
+        )
+        .expect("expired record should be written");
+        // A fresh record lands (as it would under an interleaved publish).
+        std::fs::write(
+            idempotency_path(&runs_dir, key).as_std_path(),
+            serde_json::to_vec(&ready(0)).expect("record should serialize"),
+        )
+        .expect("fresh record should be written");
+        reap_expired_ready_locked(&runs_dir, key).expect("reap should not fail");
+        assert!(
+            idempotency_path(&runs_dir, key).as_std_path().exists(),
+            "fresh Ready must survive expiry reaping"
+        );
+        // An actually-expired record is reaped.
+        std::fs::write(
+            idempotency_path(&runs_dir, key).as_std_path(),
+            serde_json::to_vec(&ready(expired_age)).expect("record should serialize"),
+        )
+        .expect("expired record should be written");
+        reap_expired_ready_locked(&runs_dir, key).expect("reap should not fail");
+        assert!(
+            !idempotency_path(&runs_dir, key).as_std_path().exists(),
+            "expired Ready must be reaped"
+        );
+        let _ = std::fs::remove_dir_all(runs_dir.as_std_path());
     }
 
     #[test]
@@ -692,6 +865,26 @@ mod tests {
     }
 
     #[test]
+    fn store_refusal_is_typed_not_string_matched() {
+        // The commit caller branches on the variant, never on message
+        // text: a digest conflict releases the claim and reports 409.
+        // (Superseded-generation typing lives with the generation-fence
+        // test that owns that behavior.)
+        let runs_dir = temp_runs_dir("store-typed");
+        let key = "key-1";
+        store_durable_ready(&runs_dir, key, "digest", "run-A", 1)
+            .expect("ready commit should succeed");
+        assert!(
+            matches!(
+                store_durable_ready(&runs_dir, key, "other-digest", "run-B", 1),
+                Err(StoreReadyError::DigestConflict)
+            ),
+            "a committed key with a different digest must type as a conflict"
+        );
+        let _ = std::fs::remove_dir_all(runs_dir.as_std_path());
+    }
+
+    #[test]
     fn committed_ready_converges_claim_without_executing() {
         // B02: a commit landing between the waiter's last look and the
         // claim must converge onto the committed run, never execute again.
@@ -721,36 +914,6 @@ mod tests {
             ClaimOutcome::Ready { .. } => "Ready",
             ClaimOutcome::Conflict => "Conflict",
         }
-    }
-
-    #[test]
-    fn release_only_removes_its_own_claim() {
-        let runs_dir = temp_runs_dir("release-owner");
-        let key = "key-1";
-        let (owner, generation) =
-            match claim_durable_pending(&runs_dir, key, "digest", Some("run-1".into()))
-                .expect("claim should win")
-            {
-                ClaimOutcome::Owner {
-                    owner, generation, ..
-                } => (owner, generation),
-                other => panic!("expected owner, got {}", outcome_name(&other)),
-            };
-        // A stale owner (e.g. expired mid-execution) must not delete the
-        // current owner's claim file, even with the right owner id but a
-        // superseded generation.
-        release_durable_pending(&runs_dir, key, "someone-else", generation);
-        release_durable_pending(&runs_dir, key, &owner, generation + 1);
-        assert!(
-            pending_path(&runs_dir, key).as_std_path().exists(),
-            "foreign release must leave the claim intact"
-        );
-        release_durable_pending(&runs_dir, key, &owner, generation);
-        assert!(
-            !pending_path(&runs_dir, key).as_std_path().exists(),
-            "own release must remove the claim"
-        );
-        let _ = std::fs::remove_dir_all(runs_dir.as_std_path());
     }
 
     #[test]
@@ -825,8 +988,9 @@ mod tests {
         let error = store_durable_ready(&runs_dir, key, "digest", "run-1", gen1)
             .expect_err("superseded commit must not overwrite");
         assert!(
-            error.contains("superseded"),
-            "supersession must be explicit, got: {error}"
+            matches!(error, StoreReadyError::Storage(_))
+                && error.to_string().contains("superseded"),
+            "supersession must type as an explicit storage failure, got: {error}"
         );
         // Once the current generation commits the same digest, the stale
         // owner converges onto it.

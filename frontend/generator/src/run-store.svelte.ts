@@ -230,36 +230,58 @@ export class RunStore {
   historyCursor = $state<string | null>(null);
 
   /**
-   * True while a history page fetch is in flight. Concurrent Load more
-   * presses reuse the running fetch instead of firing the same cursor
-   * twice and appending duplicates.
+   * History view generation, bumped by every refresh/filter change.
+   * Responses carrying an older generation are discarded so a slow
+   * stale fetch can never append old items or reinstall an old cursor
+   * over the newer view (C08). Plain field, not reactive state: only
+   * fetch logic reads it, never the template.
+   */
+  #historyGen = 0;
+
+  /**
+   * True while any history page fetch is in flight. Concurrent Load more
+   * presses for the same generation reuse the running fetch instead of
+   * firing the same cursor twice and appending duplicates.
    */
   historyLoading = $state(false);
 
+  /** Generations with a fetch currently in flight (dup-press guard). */
+  #historyInflightGens = new Set<number>();
+
   /** Fetch one newest-first history page and append it. */
   async fetchHistoryPage(): Promise<void> {
-    if (this.historyLoading) return;
+    const gen = this.#historyGen;
+    if (this.#historyInflightGens.has(gen)) return;
+    this.#historyInflightGens.add(gen);
     this.historyLoading = true;
     try {
       const query = this.historyState ? { state: this.historyState } : undefined;
+      const cursor = this.historyCursor ?? undefined;
       const response = await this.api.listRuns({
         ...query,
-        cursor: this.historyCursor ?? undefined,
+        cursor,
         limit: 200,
         order: "desc",
       });
+      // Stale generation: a newer refresh/filter owns the view now.
+      // Discard items AND cursor alike.
+      if (gen !== this.#historyGen) return;
       this.runs = [...this.runs, ...(response.items || [])];
       this.historyCursor = response.next_cursor ?? null;
       this.historyHasMore = this.historyCursor !== null;
     } finally {
-      this.historyLoading = false;
+      this.#historyInflightGens.delete(gen);
+      if (this.#historyInflightGens.size === 0) this.historyLoading = false;
     }
   }
 
   async refreshRuns(): Promise<void> {
     // Newest-first pages from the server: recent runs can never fall out
     // of a capped fetch window, and Load more advances a real cursor
-    // instead of only raising a display count (B12).
+    // instead of only raising a display count (B12). The generation bump
+    // retires in-flight fetches, and the fetch below always runs (never
+    // dropped as "already loading") so the first page is restored (C08).
+    this.#historyGen++;
     this.runs = [];
     this.historyCursor = null;
     this.historyLimit = 20;

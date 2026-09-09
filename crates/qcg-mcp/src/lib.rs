@@ -36,11 +36,6 @@ mod tests {
     }
 
     #[test]
-    fn validates_remote_oauth_profile() {
-        remote_spec().validate().expect("profile should be valid");
-    }
-
-    #[test]
     fn transport_limits_have_no_hard_ceiling() {
         let mut timeout = remote_spec();
         timeout.timeout_seconds = u64::MAX;

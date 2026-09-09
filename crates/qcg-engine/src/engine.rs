@@ -1051,6 +1051,188 @@ api_key_env = "QCG_SECURE_API_KEY"
     }
 
     #[tokio::test]
+    async fn deadline_cancel_normalizes_to_timed_out_for_retry() {
+        // C06: a cooperative executor reports the child-scope stop as
+        // cancellation. Without a parent cancel that must normalize to
+        // TimedOut (retryable), never to run cancellation. Gateway
+        // executors behave exactly this way on node timeout.
+        struct CancelingStep {
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl StepExecutor for CancelingStep {
+            fn type_id(&self) -> &'static str {
+                "test.canceling"
+            }
+
+            async fn execute(
+                &self,
+                ctx: &mut StepContext<'_>,
+                _node: &NodeDef,
+            ) -> Result<StepOutcome, StepError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                tokio::select! {
+                    _ = ctx.run.cancellation.cancelled() => {
+                        Err(StepError::Cancelled)
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                        Ok(StepOutcome::Success {
+                            output: None,
+                            files: vec![],
+                        })
+                    }
+                }
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let manifest = manifest(vec![retry_node(
+            "canceling",
+            "test.canceling",
+            2,
+            0,
+            Some(1),
+        )]);
+        let run_dir = temp_run_dir("deadline-cancel-normalizes");
+        let graph = Graph::build(&manifest).expect("test graph should build");
+        let contract = Contract {
+            root: run_dir.clone(),
+            manifest,
+            graph,
+            sha256: "test".into(),
+        };
+        let mut registry = StepRegistry::new();
+        registry.register(CancelingStep {
+            calls: Arc::clone(&calls),
+        });
+        let error = Engine::new(registry)
+            .run_with_id(
+                "deadline-cancel-normalizes".into(),
+                run_dir.join("meta"),
+                contract,
+                BTreeMap::new(),
+                RunOptions {
+                    output_dir: run_dir.join("workspace"),
+                    json_events: false,
+                    event_sender: None,
+                    interactive: false,
+                    answers: BTreeMap::new(),
+                    confirmations: BTreeMap::new(),
+                    max_total_steps: 100,
+                    max_parallel_steps: 1,
+                    llm_provider: None,
+                    llm_seed_override: None,
+                    cancellation: CancellationToken::new(),
+                },
+            )
+            .await
+            .expect_err("exhausted timeout retries should fail the run");
+        assert!(
+            matches!(error, EngineError::Step(StepError::TimedOut { .. })),
+            "deadline cooperative cancel must surface as timeout, got: {error}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "timeout must retry per policy instead of stopping as canceled"
+        );
+        let events = journal_events(&run_dir);
+        assert_eq!(
+            retry_event_count(&events, "canceling"),
+            1,
+            "one retry must be journaled"
+        );
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[tokio::test]
+    async fn parent_cancel_during_deadline_stays_canceled() {
+        // C06 counterpart: an actual parent cancel on the deadline path
+        // keeps Cancelled — normalization must not rewrite it to TimedOut.
+        struct CancelingStep;
+
+        #[async_trait]
+        impl StepExecutor for CancelingStep {
+            fn type_id(&self) -> &'static str {
+                "test.cancelingtwo"
+            }
+
+            async fn execute(
+                &self,
+                ctx: &mut StepContext<'_>,
+                _node: &NodeDef,
+            ) -> Result<StepOutcome, StepError> {
+                tokio::select! {
+                    _ = ctx.run.cancellation.cancelled() => {
+                        Err(StepError::Cancelled)
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                        Ok(StepOutcome::Success {
+                            output: None,
+                            files: vec![],
+                        })
+                    }
+                }
+            }
+        }
+
+        let manifest = manifest(vec![retry_node(
+            "canceling-parent",
+            "test.cancelingtwo",
+            2,
+            0,
+            Some(30),
+        )]);
+        let run_dir = temp_run_dir("parent-cancel-during-deadline");
+        let graph = Graph::build(&manifest).expect("test graph should build");
+        let contract = Contract {
+            root: run_dir.clone(),
+            manifest,
+            graph,
+            sha256: "test".into(),
+        };
+        let mut registry = StepRegistry::new();
+        registry.register(CancelingStep);
+        let run_cancellation = CancellationToken::new();
+        let canceller = run_cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            canceller.cancel();
+        });
+        let error = Engine::new(registry)
+            .run_with_id(
+                "parent-cancel-during-deadline".into(),
+                run_dir.join("meta"),
+                contract,
+                BTreeMap::new(),
+                RunOptions {
+                    output_dir: run_dir.join("workspace"),
+                    json_events: false,
+                    event_sender: None,
+                    interactive: false,
+                    answers: BTreeMap::new(),
+                    confirmations: BTreeMap::new(),
+                    max_total_steps: 100,
+                    max_parallel_steps: 1,
+                    llm_provider: None,
+                    llm_seed_override: None,
+                    cancellation: run_cancellation,
+                },
+            )
+            .await
+            .expect_err("parent cancel must stop the run");
+        assert!(
+            matches!(
+                error,
+                EngineError::Canceled | EngineError::Step(StepError::Cancelled)
+            ),
+            "parent cancel must surface as cancellation, got: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[tokio::test]
     async fn sequential_step_records_started_before_execution_finishes() {
         struct GateStep;
 

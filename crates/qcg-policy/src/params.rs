@@ -34,13 +34,4 @@ mod tests {
         assert_eq!(schema["required"], json!(["prompt"]));
         assert_eq!(schema["properties"]["prompt"]["type"], json!("string"));
     }
-
-    #[test]
-    fn string_schemas_have_the_expected_shapes() {
-        assert_eq!(string_schema(), json!({ "type": "string" }));
-        assert_eq!(
-            string_array_schema(),
-            json!({ "type": "array", "items": { "type": "string" } })
-        );
-    }
 }

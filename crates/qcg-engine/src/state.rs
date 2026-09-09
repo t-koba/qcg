@@ -120,10 +120,11 @@ pub struct RunState {
     #[serde(default)]
     pub execution_started: bool,
     /// External side-effect operations by operation_id. Identity binds
-    /// run, node, content digest, AND invocation: distinct invocations
-    /// never share an id even for identical content, while the same
-    /// invocation reuses its id across resends and retries (B07).
-    /// Statuses: `Started` (remote may have executed, result unknown),
+    /// run, node, and invocation ONLY: the content digest lives on the
+    /// record as a compared attribute, never in the key, so distinct
+    /// invocations never share an id even for identical content, while
+    /// the same invocation reuses its id across resends and retries
+    /// (B07, C04). Statuses: `Started` (remote may have executed, result unknown),
     /// `Succeeded` (result durably recorded, resends converge without
     /// re-executing), `FailedClean` (proven nothing applied, retryable),
     /// `FailedIndeterminate` (unknown effects, refused unless the node
@@ -220,6 +221,12 @@ pub struct OperationRecord {
     /// explicit manual recovery instead of silent re-execution.
     #[serde(default)]
     pub result: Option<Value>,
+    /// Invocation this record was admitted with. Current writers always
+    /// set it; pre-upgrade records predate it and read as empty. A
+    /// current-scheme id whose record names a different invocation is
+    /// treated as a lookup miss gone wrong and refused, never executed.
+    #[serde(default)]
+    pub invocation: String,
 }
 
 /// Results larger than this are not cached for resends: replays route to
@@ -234,36 +241,56 @@ pub fn cacheable_operation_result(value: &Value) -> Option<Value> {
     (bytes.len() <= OPERATION_RESULT_MAX_BYTES).then(|| value.clone())
 }
 
-/// Invocation fragment distinguishing tool calls with identical content.
-/// Agent calls use their stable call id; single-shot step executions use a
-/// content-derived identity so restarts keep the same protection.
-pub fn invocation_fragment(invocation_id: &str) -> String {
+/// Stable operation id for an external side effect (ID scheme v3, C04).
+/// The logical key is run, node, and invocation ONLY: the content digest
+/// lives on the record as a compared attribute, never in the key, so a
+/// same-invocation content change reaches the changed-content Refuse
+/// check instead of silently starting a fresh operation. The invocation
+/// binds by its full SHA-256 hex digest: truncated fragments collide
+/// across distinct calls (C04). The invocation that produced the id is
+/// verified against the stored record on lookup.
+pub fn operation_id_for(run_id: &str, node_id: &str, invocation_id: &str) -> String {
     use sha2::{Digest, Sha256};
-    let digest = hex::encode(Sha256::digest(invocation_id.as_bytes()));
-    digest[..8.min(digest.len())].to_string()
+    format!(
+        "{run_id}:{node_id}:{}",
+        hex::encode(Sha256::digest(invocation_id.as_bytes()))
+    )
+}
+
+/// ID scheme v2 (B07 era): run, node, 16-hex content digest, and an
+/// 8-hex invocation fragment. Superseded by [`operation_id_for`];
+/// recognized on lookup so in-flight v2 records keep their protection
+/// across the upgrade instead of silently restarting (C03).
+pub fn operation_id_for_v2(
+    run_id: &str,
+    node_id: &str,
+    operation_digest: &str,
+    invocation_id: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let fragment = hex::encode(Sha256::digest(invocation_id.as_bytes()));
+    format!(
+        "{run_id}:{node_id}:{}:{}",
+        &operation_digest[..16.min(operation_digest.len())],
+        &fragment[..8.min(fragment.len())],
+    )
+}
+
+/// ID scheme v1 (pre-B07): run, node, and 16-hex content digest with no
+/// invocation dimension. Same lookup recognition as v2 (C03): an old
+/// unfinished side effect refuses automatic replay instead of silently
+/// re-executing under a new id.
+pub fn legacy_operation_id_for(run_id: &str, node_id: &str, operation_digest: &str) -> String {
+    format!(
+        "{run_id}:{node_id}:{}",
+        &operation_digest[..16.min(operation_digest.len())]
+    )
 }
 
 /// Content-derived invocation identity for single-shot step executions:
 /// one execution per node per content, stable across restarts.
 pub fn content_invocation_id(operation_digest: &str) -> String {
     format!("content:{operation_digest}")
-}
-
-/// Stable operation id for an external side effect. Binds run, node,
-/// content digest, AND invocation: distinct invocations never share an id
-/// even for identical content, while the same invocation reuses its id
-/// across resends and retries as the remote idempotency key (B07).
-pub fn operation_id_for(
-    run_id: &str,
-    node_id: &str,
-    operation_digest: &str,
-    invocation_id: &str,
-) -> String {
-    format!(
-        "{run_id}:{node_id}:{}:{}",
-        &operation_digest[..16.min(operation_digest.len())],
-        invocation_fragment(invocation_id),
-    )
 }
 
 impl RunState {
@@ -591,6 +618,9 @@ impl RunState {
                             digest: String::new(),
                             status: OperationStatus::Succeeded,
                             result: None,
+                            // MCP continuation records key outside the
+                            // operation-id schemes and carry no invocation.
+                            invocation: String::new(),
                         },
                     );
                 }
@@ -637,6 +667,11 @@ impl RunState {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string();
+                    let invocation = event
+                        .get("invocation_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
                     let record =
                         self.operation_records
                             .entry(id.to_string())
@@ -644,6 +679,7 @@ impl RunState {
                                 digest: digest.clone(),
                                 status: OperationStatus::Started,
                                 result: None,
+                                invocation: invocation.clone(),
                             });
                     // A restarted attempt reuses its record; only the status
                     // motion matters, never a digest rewrite.
@@ -678,6 +714,7 @@ impl RunState {
                                 digest: String::new(),
                                 status,
                                 result: None,
+                                invocation: String::new(),
                             });
                     // The started record carries the authoritative digest;
                     // finished events repeat it, but an absent one must not

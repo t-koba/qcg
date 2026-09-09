@@ -128,7 +128,6 @@ pub(crate) async fn execute_direct_mcp_call(
         None => Some(qcg_engine::operation_id_for(
             &ctx.run.run_id,
             &node.id,
-            &digest,
             &invocation,
         )),
     };

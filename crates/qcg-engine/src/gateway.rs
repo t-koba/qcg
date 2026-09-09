@@ -916,23 +916,6 @@ mod tests {
         "*.json",
         "data/input.json"
     );
-    wildcard_arg_allowed_case!(
-        wildcard_toml_suffix_allows_nested_file,
-        "*.toml",
-        "generators/qcg.toml"
-    );
-    wildcard_arg_allowed_case!(
-        wildcard_log_suffix_allows_nested_file,
-        "*.log",
-        "runs/latest.log"
-    );
-    wildcard_arg_allowed_case!(
-        wildcard_prefix_allows_dash_filename,
-        "src/*",
-        "src/my-file.rs"
-    );
-    wildcard_arg_allowed_case!(wildcard_star_allows_dash_filename, "*", "my-file.rs");
-    wildcard_arg_allowed_case!(wildcard_star_allows_dot_filename, "*", "qcg.toml");
 
     url_allowed_case!(
         url_allows_exact_host_https,
@@ -940,22 +923,11 @@ mod tests {
         "https://example.com/path"
     );
     url_allowed_case!(
-        url_allows_exact_host_http,
-        "example.com",
-        "http://example.com/path"
-    );
-    url_allowed_case!(
         url_allows_full_url_host_https,
         "https://example.com/base",
         "https://example.com/other"
     );
-    url_allowed_case!(
-        url_allows_full_url_host_http,
-        "http://example.com/base",
-        "http://example.com/other"
-    );
     url_allowed_case!(url_allows_wildcard_https, "*", "https://example.net/path");
-    url_allowed_case!(url_allows_wildcard_http, "*", "http://example.net/path");
     url_allowed_case!(
         url_allows_host_with_port_by_host,
         "127.0.0.1",

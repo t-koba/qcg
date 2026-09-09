@@ -1061,7 +1061,9 @@ mod tests {
             .expect("remote credentialed HTTP should be rejected");
         assert!(error.contains("loopback"), "{error}");
 
-        // SAFETY: single-threaded test section; unique variable name.
+        // SAFETY: environment mutation is serialized with ENV_LOCK.
+        let _guard = super::ENV_LOCK.blocking_lock();
+        // SAFETY: lock held; unique variable name.
         unsafe { std::env::set_var("QCG_LLM_HTTP_LOOPBACK_KEY_XYZ", "loopback-secret") };
         let mut loopback = spec_with_base_url("loopback", "http://127.0.0.7:8080/v1");
         loopback.api_key_env = Some("QCG_LLM_HTTP_LOOPBACK_KEY_XYZ".into());
@@ -1076,7 +1078,9 @@ mod tests {
 
     #[test]
     fn credential_env_names_expose_names_without_values() {
-        // SAFETY: single-threaded test section; unique variable name.
+        // SAFETY: environment mutation is serialized with ENV_LOCK.
+        let _guard = super::ENV_LOCK.blocking_lock();
+        // SAFETY: lock held; unique variable name.
         unsafe { std::env::set_var("QCG_LLM_ENV_NAME_ONLY_XYZ", "do-not-expose") };
         let mut spec = spec_with_base_url("keyed", "https://example.test/v1");
         spec.api_key_env = Some("QCG_LLM_ENV_NAME_ONLY_XYZ".into());
@@ -1090,7 +1094,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires loopback socket permissions"]
     async fn redirects_are_not_followed() {
         let (base_url, server) = spawn_http_response(
             302,
@@ -1111,7 +1114,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires loopback socket permissions"]
     async fn non_success_body_is_not_returned_in_error() {
         let (base_url, server) =
             spawn_http_response(401, "sensitive upstream error details".into(), "".into());
@@ -1129,10 +1131,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires loopback socket permissions"]
     async fn reflected_credential_is_never_returned() {
         let key = "qcg<reflected-credential-unique";
-        // SAFETY: single-threaded test section; unique variable name.
+        // SAFETY: environment mutation is serialized with ENV_LOCK.
+        let _guard = super::ENV_LOCK.lock().await;
+        // SAFETY: lock held; unique variable name.
         unsafe { std::env::set_var("QCG_LLM_REFLECTION_KEY_XYZ", key) };
         let body =
             r#"{"choices":[{"message":{"content":"qcg\u003creflected-credential-unique"}}]}"#
@@ -1156,7 +1159,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires loopback socket permissions"]
     async fn oversized_response_body_is_rejected_before_json_parsing() {
         let body = r#"{"oversized":"sensitive upstream body"}"#.to_string();
         let (base_url, server) = spawn_http_response(200, body, "".into());
@@ -1730,7 +1732,11 @@ base_url = "http://127.0.0.1:9/v1"
         std::fs::write(&present, REGISTRY_FIXTURE).expect("registry should be written");
         let missing = dir.join("missing.toml");
 
-        // SAFETY: single-threaded test binary section; restored below.
+        // SAFETY: environment mutation is serialized with ENV_LOCK.
+        // QCG_PROVIDERS is read by production loading paths, so this
+        // shared name must not race any parallel test.
+        let _guard = super::ENV_LOCK.blocking_lock();
+        // SAFETY: lock held; restored below.
         unsafe { std::env::set_var("QCG_PROVIDERS", &present) };
         let router = LlmRouter::load_optional(None)
             .expect("configured env registry should load")

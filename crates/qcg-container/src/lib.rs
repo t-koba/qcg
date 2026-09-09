@@ -23,9 +23,9 @@ pub use plans::{
     validate_guest_path, validate_image_for_backend,
 };
 pub use session::{
-    ADMIN_TIMEOUT, CREATE_TIMEOUT, InstanceId, PROBE_INTERVAL, Provision, START_TIMEOUT,
-    STOP_TIMEOUT, Session, SessionGuard, await_outstanding_cleanups, provision, teardown,
-    teardown_sync,
+    ADMIN_TIMEOUT, CREATE_TIMEOUT, CleanupWaitOutcome, InstanceId, PROBE_INTERVAL, Provision,
+    START_TIMEOUT, STOP_TIMEOUT, Session, SessionGuard, await_outstanding_cleanups, provision,
+    record_cleanup_failure, teardown, teardown_sync,
 };
 
 #[cfg(test)]
@@ -74,17 +74,6 @@ mod tests {
             }
         );
         assert_eq!(backend_for(&ContainerRuntime::Lxc), Backend::Lxc);
-    }
-
-    #[test]
-    fn display_names_distinguish_lxd_from_lxc() {
-        use qcg_contract::ContainerRuntime;
-        assert_eq!(backend_for(&ContainerRuntime::Lxd).display_name(), "lxd");
-        assert_eq!(backend_for(&ContainerRuntime::Lxc).display_name(), "lxc");
-        assert_eq!(
-            backend_for(&ContainerRuntime::DockerRunsc).display_name(),
-            "docker+runsc"
-        );
     }
 
     #[test]

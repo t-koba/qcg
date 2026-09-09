@@ -68,23 +68,53 @@ impl SessionGuard {
 /// of racing detached teardown threads.
 static OUTSTANDING_CLEANUPS: AtomicUsize = AtomicUsize::new(0);
 
-/// Waits until Drop-spawned cleanups finish, up to `timeout`. Returns the
-/// number of cleanups still outstanding so shutdown reports unrecovered
-/// instances instead of claiming a clean stop. Logs the remainder instead
-/// of wedging shutdown forever.
-pub async fn await_outstanding_cleanups(timeout: Duration) -> usize {
+/// Cumulative detached-cleanup failures observed since process start.
+/// A failed backstop retry does not clear when a later attempt succeeds;
+/// shutdown reports the count so unrecovered instances stay visible.
+/// Awaited-path failures are recorded here too by the gateway, so the
+/// shutdown report aggregates every cleanup failure, not just detached
+/// ones.
+static CLEANUP_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
+/// Outcome of awaiting detached cleanups at shutdown. `outstanding`
+/// instances may still exist; `failed` cleanups need operator attention.
+/// Both are cumulative observations, never a proof of a clean stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CleanupWaitOutcome {
+    pub outstanding: usize,
+    pub failed: usize,
+}
+
+/// Records one observed cleanup failure for shutdown aggregation.
+/// Gateways call this when an awaited teardown fails (the guard backstop
+/// stays armed for the retry); detached backstops record internally.
+pub fn record_cleanup_failure() {
+    CLEANUP_FAILURES.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Waits until Drop-spawned cleanups finish, up to `timeout`. Returns
+/// what is still outstanding plus the observed failure count so shutdown
+/// reports unrecovered instances instead of claiming a clean stop. Logs
+/// the remainder instead of wedging shutdown forever.
+pub async fn await_outstanding_cleanups(timeout: Duration) -> CleanupWaitOutcome {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         let remaining = OUTSTANDING_CLEANUPS.load(Ordering::Acquire);
         if remaining == 0 {
-            return 0;
+            return CleanupWaitOutcome {
+                outstanding: 0,
+                failed: CLEANUP_FAILURES.load(Ordering::Acquire),
+            };
         }
         if std::time::Instant::now() >= deadline {
             tracing::warn!(
                 remaining,
                 "container cleanups still outstanding past shutdown deadline"
             );
-            return remaining;
+            return CleanupWaitOutcome {
+                outstanding: remaining,
+                failed: CLEANUP_FAILURES.load(Ordering::Acquire),
+            };
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -102,6 +132,7 @@ fn spawn_detached_cleanup(session: Session, config_path: Option<PathBuf>) {
         .name("qcg-container-teardown".into())
         .spawn(move || {
             if let Err(error) = teardown_sync(&thread_session) {
+                record_cleanup_failure();
                 tracing::warn!(%error, "detached container teardown failed");
             }
             if let Some(path) = &thread_config {
@@ -113,6 +144,7 @@ fn spawn_detached_cleanup(session: Session, config_path: Option<PathBuf>) {
     if !spawned {
         OUTSTANDING_CLEANUPS.fetch_sub(1, Ordering::AcqRel);
         if let Err(error) = teardown_sync(&session) {
+            record_cleanup_failure();
             tracing::warn!(%error, "inline container teardown failed");
         }
         if let Some(path) = config_path {
@@ -327,6 +359,7 @@ async fn provision_incus(binary: &str, spec: &Provision<'_>) -> Result<Session, 
             // stays armed only if this fails, so a settled provision is
             // never torn down twice.
             if teardown(&cleanup()).await.is_err() {
+                record_cleanup_failure();
                 tracing::warn!(
                     instance = name.as_str(),
                     "provision cleanup failed; guard backstop remains armed"
@@ -412,6 +445,7 @@ async fn provision_lxc(spec: &Provision<'_>) -> Result<Session, ContainerError> 
         }
         Err(error) => {
             if let Err(cleanup_error) = teardown(&session).await {
+                record_cleanup_failure();
                 tracing::warn!(
                     %cleanup_error,
                     instance = name.as_str(),
@@ -430,8 +464,9 @@ async fn provision_lxc(spec: &Provision<'_>) -> Result<Session, ContainerError> 
 /// them with the instance identity; the Drop guard re-attempts via
 /// [`teardown_sync`]. Stop/kill failures never abort the subsequent
 /// delete/remove: teardown is idempotent, so "already stopped" must not
-/// strand the instance. A delete/remove reporting the instance absent is
-/// success; any other failure keeps the tracking identity for retry.
+/// strand the instance. A daemon-confirmed absent instance
+/// ([`ContainerError::InstanceAbsent`]) is success; any other failure keeps
+/// the tracking identity for retry.
 pub async fn teardown(session: &Session) -> Result<(), ContainerError> {
     match session {
         Session {
@@ -453,13 +488,7 @@ pub async fn teardown(session: &Session) -> Result<(), ContainerError> {
             match run_admin_timed(&[binary.as_str(), "rm", "-f", &id], STOP_TIMEOUT, &id, "rm")
                 .await
             {
-                Ok(()) => {}
-                Err(error) if is_absent_detail(&error.to_string()) => {
-                    tracing::info!(
-                        instance = id.as_str(),
-                        "container already absent; treating rm as success"
-                    );
-                }
+                Ok(()) | Err(ContainerError::InstanceAbsent { .. }) => {}
                 Err(error) => return Err(error),
             }
             // Remove the tracking file only after successful kill+rm so a
@@ -479,14 +508,7 @@ pub async fn teardown(session: &Session) -> Result<(), ContainerError> {
             )
             .await
             {
-                if is_absent_detail(&error.to_string()) {
-                    tracing::info!(
-                        instance = name.as_str(),
-                        "instance already absent; continuing to delete"
-                    );
-                } else {
-                    tracing::warn!(%error, instance = name.as_str(), "instance stop failed; continuing to delete");
-                }
+                tracing::warn!(%error, instance = name.as_str(), "instance stop failed; continuing to delete");
             }
             match run_admin_timed_vec(
                 &plans::incus_delete_argv(binary, name),
@@ -496,14 +518,7 @@ pub async fn teardown(session: &Session) -> Result<(), ContainerError> {
             )
             .await
             {
-                Ok(()) => Ok(()),
-                Err(error) if is_absent_detail(&error.to_string()) => {
-                    tracing::info!(
-                        instance = name.as_str(),
-                        "instance already absent; treating delete as success"
-                    );
-                    Ok(())
-                }
+                Ok(()) | Err(ContainerError::InstanceAbsent { .. }) => Ok(()),
                 Err(error) => Err(error),
             }
         }
@@ -514,14 +529,7 @@ pub async fn teardown(session: &Session) -> Result<(), ContainerError> {
             if let Err(error) =
                 run_admin_timed_vec(&plans::lxc_stop_argv(name), STOP_TIMEOUT, name, "stop").await
             {
-                if is_absent_detail(&error.to_string()) {
-                    tracing::info!(
-                        instance = name.as_str(),
-                        "instance already absent; continuing to destroy"
-                    );
-                } else {
-                    tracing::warn!(%error, instance = name.as_str(), "instance stop failed; continuing to destroy");
-                }
+                tracing::warn!(%error, instance = name.as_str(), "instance stop failed; continuing to destroy");
             }
             match run_admin_timed_vec(
                 &plans::lxc_destroy_argv(name),
@@ -531,14 +539,7 @@ pub async fn teardown(session: &Session) -> Result<(), ContainerError> {
             )
             .await
             {
-                Ok(()) => Ok(()),
-                Err(error) if is_absent_detail(&error.to_string()) => {
-                    tracing::info!(
-                        instance = name.as_str(),
-                        "instance already absent; treating destroy as success"
-                    );
-                    Ok(())
-                }
+                Ok(()) | Err(ContainerError::InstanceAbsent { .. }) => Ok(()),
                 Err(error) => Err(error),
             }
         }
@@ -546,11 +547,23 @@ pub async fn teardown(session: &Session) -> Result<(), ContainerError> {
     }
 }
 
-/// Daemon "nothing to tear down" reports share no exit code, so match the
-/// human-readable detail instead. Callers only pass daemon stderr tails
-/// here, never unrelated error text.
-fn is_absent_detail(detail: &str) -> bool {
-    let lower = detail.to_lowercase();
+/// Whether daemon stderr proves the instance itself is absent (C05).
+/// Only the daemon's absence report for OUR instance counts: the report
+/// must name the instance and use absence language, and must not be a
+/// client-side failure (missing executable, unreachable socket) which
+/// merely proves the teardown never ran. Spawn failures, timeouts, and
+/// connection errors never reach this function — they are distinct error
+/// variants at the call site — so a match here is a proof of absence,
+/// not a guess.
+fn is_daemon_absent_report(stderr: &str, instance: &str) -> bool {
+    let lower = stderr.to_lowercase();
+    // Client-side failures prove nothing about the instance.
+    if lower.contains("file or directory") || lower.contains("socket") {
+        return false;
+    }
+    if !lower.contains(&instance.to_lowercase()) {
+        return false;
+    }
     [
         "no such",
         "not found",
@@ -584,11 +597,7 @@ pub fn teardown_sync(session: &Session) -> Result<(), ContainerError> {
                 (vec!["rm", "-f", id.as_str()], "rm"),
             ] {
                 if let Err(error) = run_sync_bounded(binary, &args, STOP_TIMEOUT, &id, stage) {
-                    if stage == "rm" && is_absent_detail(&error.to_string()) {
-                        tracing::info!(
-                            instance = id.as_str(),
-                            "container already absent; treating rm as success"
-                        );
+                    if stage == "rm" && matches!(error, ContainerError::InstanceAbsent { .. }) {
                         continue;
                     }
                     if stage == "kill" {
@@ -614,12 +623,7 @@ pub fn teardown_sync(session: &Session) -> Result<(), ContainerError> {
                 };
                 let args: Vec<&str> = args.iter().map(String::as_str).collect();
                 if let Err(error) = run_sync_bounded(bin, &args, STOP_TIMEOUT, name, stage) {
-                    if is_absent_detail(&error.to_string()) {
-                        tracing::info!(
-                            instance = name.as_str(),
-                            stage,
-                            "instance already absent; continuing teardown"
-                        );
+                    if matches!(error, ContainerError::InstanceAbsent { .. }) {
                         continue;
                     }
                     if stage == "stop" {
@@ -644,12 +648,7 @@ pub fn teardown_sync(session: &Session) -> Result<(), ContainerError> {
                 };
                 let args: Vec<&str> = args.iter().map(String::as_str).collect();
                 if let Err(error) = run_sync_bounded(bin, &args, STOP_TIMEOUT, name, stage) {
-                    if is_absent_detail(&error.to_string()) {
-                        tracing::info!(
-                            instance = name.as_str(),
-                            stage,
-                            "instance already absent; continuing teardown"
-                        );
+                    if matches!(error, ContainerError::InstanceAbsent { .. }) {
                         continue;
                     }
                     if stage == "stop" {
@@ -808,6 +807,16 @@ async fn run_admin_timed(
         {
             tracing::warn!(%error, instance = instance.to_string(), "teardown stderr drain failed; detail continues without it");
         }
+        // Only a daemon-confirmed absence report for this instance proves
+        // there is nothing to tear down. Spawn failures and timeouts took
+        // earlier returns, so reaching here means the daemon ran and
+        // refused: anything else is a real failure (C05).
+        if is_daemon_absent_report(&err_text, instance) {
+            return Err(ContainerError::InstanceAbsent {
+                stage,
+                instance: instance.to_string(),
+            });
+        }
         return Err(ContainerError::StageFailed {
             stage,
             instance: instance.to_string(),
@@ -933,6 +942,14 @@ fn run_sync_bounded(
                     let _ = pipe.read_to_string(&mut err_text);
                 }
                 if !status.success() {
+                    // Same proof rule as the async path: only the daemon
+                    // naming this instance absent counts (C05).
+                    if is_daemon_absent_report(&err_text, instance) {
+                        return Err(ContainerError::InstanceAbsent {
+                            stage,
+                            instance: instance.to_string(),
+                        });
+                    }
                     return Err(ContainerError::StageFailed {
                         stage,
                         instance: instance.to_string(),
@@ -1007,19 +1024,14 @@ mod tests {
     #[test]
     fn failed_teardown_keeps_the_tracking_file() {
         // B06: a failed teardown must keep the identity for operator retry
-        // instead of deleting the evidence.
-        let (_guard, session) = bogus_docker_session("deadbeef");
+        // instead of deleting the evidence: the error identifies the
+        // instance and the tracking file survives on disk.
+        let (cid, session) = bogus_docker_session("deadbeef");
         let error = teardown_sync(&session).expect_err("bogus binary must fail teardown");
         assert!(
             error.to_string().contains("deadbeef") || error.to_string().contains("failed to spawn"),
             "failure must identify the instance, got: {error}"
         );
-    }
-
-    #[test]
-    fn failed_teardown_keeps_the_tracking_file_on_disk() {
-        let (cid, session) = bogus_docker_session("deadbeef");
-        let _ = teardown_sync(&session);
         assert!(
             cid.path.exists(),
             "cidfile must survive a failed teardown for operator retry"
@@ -1038,25 +1050,40 @@ mod tests {
 
     #[test]
     fn absent_instance_reports_are_recognized() {
-        // B06: daemon "nothing to tear down" reports must map to success,
-        // while unrelated failures stay failures.
+        // C05: only the daemon naming OUR instance absent proves there is
+        // nothing to tear down. Client-side failures (missing executable,
+        // unreachable socket) and nameless reports stay failures so a
+        // live instance is never declared gone.
         for report in [
             "Error: No such container: qcg-1",
-            "Error response from daemon: No such object",
-            "Instance not found",
-            "error: The instance does not exist",
+            "Error response from daemon: No such container: qcg-1",
+            "Error: Instance \"qcg-1\" not found",
+            "error: The instance qcg-1 does not exist",
             "lxc-destroy: qcg-1: unknown instance",
-            "could not find container abc",
+            "could not find container qcg-1",
         ] {
-            assert!(is_absent_detail(report), "{report} must read as absent");
+            assert!(
+                is_daemon_absent_report(report, "qcg-1"),
+                "{report} must read as absent"
+            );
         }
         for report in [
+            // Audit counterexamples: these prove the teardown never ran.
+            "No such file or directory (os error 2)",
+            "cannot connect to daemon socket: no such file or directory",
             "teardown command failed to spawn",
             "permission denied",
             "exit status: 1: ",
             "daemon timed out",
+            // Nameless or foreign-instance reports prove nothing about ours.
+            "Error response from daemon: No such object",
+            "Instance not found",
+            "Error: No such container: qcg-2",
         ] {
-            assert!(!is_absent_detail(report), "{report} must stay a failure");
+            assert!(
+                !is_daemon_absent_report(report, "qcg-1"),
+                "{report} must stay a failure"
+            );
         }
     }
 
@@ -1083,5 +1110,30 @@ mod tests {
     #[tokio::test]
     async fn idle_cleanup_await_returns_immediately() {
         await_outstanding_cleanups(std::time::Duration::from_secs(5)).await;
+    }
+
+    #[tokio::test]
+    async fn failed_detached_cleanup_is_counted_for_shutdown() {
+        // C05: a finished cleanup thread is not proof the instance is
+        // gone. Failures aggregate separately so shutdown reports them.
+        let before = await_outstanding_cleanups(std::time::Duration::from_secs(5)).await;
+        // Keep the tracking file alive until the detached backstop has
+        // finished: dropping TempCid first would let the cleanup observe a
+        // missing file as success and record nothing.
+        let (_cid, session) = bogus_docker_session("deadbeef");
+        {
+            // Drop the guard: the detached backstop fails on the bogus
+            // binary and must record the failure.
+            let _guard = SessionGuard::new(session);
+        }
+        let after = await_outstanding_cleanups(std::time::Duration::from_secs(30)).await;
+        assert_eq!(
+            after.outstanding, 0,
+            "detached cleanup must complete before shutdown proceeds"
+        );
+        assert!(
+            after.failed > before.failed,
+            "failed backstop cleanup must aggregate for shutdown reporting"
+        );
     }
 }

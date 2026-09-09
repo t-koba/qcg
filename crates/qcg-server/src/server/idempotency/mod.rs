@@ -13,7 +13,7 @@ pub(crate) use config::{
     prune_idempotency,
 };
 pub(crate) use durable::{
-    ClaimOutcome, WaitOutcome, claim_durable_pending, load_durable_ready_result,
+    ClaimOutcome, StoreReadyError, WaitOutcome, claim_durable_pending, load_durable_ready_result,
     release_durable_pending, store_durable_ready, wait_for_peer_ready,
 };
 pub(crate) use guard::PendingIdempotencyGuard;
@@ -257,13 +257,14 @@ where
                     {
                         if let (Some(owner), Some(generation)) =
                             (claim_owner.as_deref(), claim_generation)
-                        {
-                            release_durable_pending(
+                            && let Err(error) = release_durable_pending(
                                 &state.runs_dir,
                                 &idempotency_key,
                                 owner,
                                 generation,
-                            );
+                            )
+                        {
+                            tracing::warn!(%error, "idempotency claim release failed; TTL expiry will adopt it");
                         }
                         return Err(ApiHttpError::service_unavailable(
                             "too many idempotent requests are still in progress",
@@ -330,12 +331,14 @@ where
             };
             pending_guard.disarm();
             // Release the cross-process claim so a retry can become owner.
-            release_durable_pending(
+            if let Err(error) = release_durable_pending(
                 &state.runs_dir,
                 &idempotency_key,
                 &claim_owner,
                 claim_generation,
-            );
+            ) {
+                tracing::warn!(%error, "idempotency claim release failed; TTL expiry will adopt it");
+            }
             if let Some(completed) = completed {
                 let _ = completed.send(true);
             }
@@ -352,13 +355,15 @@ where
         &run_id,
         claim_generation,
     ) {
-        if error.contains("different request") {
-            release_durable_pending(
+        if matches!(error, StoreReadyError::DigestConflict) {
+            if let Err(error) = release_durable_pending(
                 &state.runs_dir,
                 &idempotency_key,
                 &claim_owner,
                 claim_generation,
-            );
+            ) {
+                tracing::warn!(%error, "idempotency claim release failed; TTL expiry will adopt it");
+            }
             return Err(idempotency_conflict());
         }
         // Storage failure fails closed rather than risking duplicate runs.
@@ -420,12 +425,14 @@ where
         );
         completed
     };
-    release_durable_pending(
+    if let Err(error) = release_durable_pending(
         &state.runs_dir,
         &idempotency_key,
         &claim_owner,
         claim_generation,
-    );
+    ) {
+        tracing::warn!(%error, "idempotency claim release failed; TTL expiry will adopt it");
+    }
     pending_guard.disarm();
     if let Some(completed) = completed {
         let _ = completed.send(true);

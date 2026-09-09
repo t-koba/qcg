@@ -237,15 +237,16 @@ pub(crate) async fn execute_mcp_tool(
         None
     };
     // Recompute for finish binding (guard returns the stable id).
+    // The digest computation stays fallible so unserializable arguments
+    // fail closed here exactly as they do in the guard.
     let operation_id = match operation_id {
         Some(id) => Some(id),
         None => {
             let details = Some(args.clone());
-            let digest = RunContext::operation_digest(alias, &details)?;
+            let _digest = RunContext::operation_digest(alias, &details)?;
             Some(qcg_engine::operation_id_for(
                 &ctx.run.run_id,
                 &node.id,
-                &digest,
                 call_id,
             ))
         }

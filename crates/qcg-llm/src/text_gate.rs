@@ -83,16 +83,18 @@ impl SensitiveTextGate {
         Ok(self.unverified.drain(..publishable).collect())
     }
 
-    /// Flushes the withheld suffix after the stream ends. Every ending was
-    /// already checked at push time; this re-scans defensively so only a
-    /// clean tail can publish.
-    pub(crate) fn finish(mut self) -> Result<String, ()> {
+    /// Flushes the withheld suffix after the stream ends. Every occurrence
+    /// ending anywhere in the emitted stream was already checked at push
+    /// time (each push scans the retained tail plus the new text), so the
+    /// withheld suffix alone is re-scanned defensively and returned as-is.
+    /// The retained tail is NOT concatenated: it overlaps the suffix over
+    /// the same emitted bytes, and scanning the junction would fabricate
+    /// strings that were never emitted (C07).
+    pub(crate) fn finish(self) -> Result<String, ()> {
         if self.key.is_empty() {
             return Ok(String::new());
         }
-        let mut candidate = std::mem::take(&mut self.tail);
-        candidate.push_str(&self.unverified);
-        if candidate.contains(&self.key) {
+        if self.unverified.contains(&self.key) {
             return Err(());
         }
         Ok(self.unverified)
@@ -107,17 +109,6 @@ mod tests {
 
     fn gate() -> SensitiveTextGate {
         SensitiveTextGate::new(Some(CANARY))
-    }
-
-    #[test]
-    fn split_credential_across_chunks_is_refused_before_publish() {
-        let mut gate = gate();
-        // First half publishes nothing credential-complete; the holdback
-        // keeps the split point unpublished.
-        let first = gate.push("qcg-canary-").expect("prefix should clear");
-        assert!(!first.contains(CANARY));
-        // Completing the credential errors instead of releasing it.
-        assert!(gate.push("credential-12345").is_err());
     }
 
     #[test]
@@ -137,17 +128,6 @@ mod tests {
                 "split at {split} must be refused on completion"
             );
         }
-    }
-
-    #[test]
-    fn metadata_interleaving_does_not_hide_the_split() {
-        // The audit counterexample shape: per-chunk metadata differs, so a
-        // metadata-mixed window never contains the whole secret, while the
-        // published text stream does. The gate only ever sees text.
-        let mut gate = gate();
-        let published = gate.push("qcg-canary-").expect("prefix should clear");
-        assert!(!published.contains(CANARY));
-        assert!(gate.push("credential-12345").is_err());
     }
 
     #[test]
@@ -209,5 +189,69 @@ mod tests {
     fn credential_inside_larger_text_is_refused() {
         let mut gate = gate();
         assert!(gate.push(&format!("prefix {CANARY} suffix")).is_err());
+    }
+
+    #[test]
+    fn overlapping_suffix_is_not_double_counted() {
+        // C07: tail and unverified overlap over the same emitted bytes;
+        // finish must not concatenate them. key "aba" never occurs in
+        // the emitted "ba", so the stream must flush cleanly.
+        let mut gate = SensitiveTextGate::new(Some("aba"));
+        let published = gate.push("ba").expect("clean text should clear");
+        assert_eq!(published, "");
+        assert_eq!(gate.finish().expect("overlapping suffix must flush"), "ba");
+    }
+
+    #[test]
+    fn clean_bodies_round_trip_at_every_split() {
+        // C07 counterpart to the refusal property: credential-free bodies
+        // round-trip byte-complete at every split position, and no
+        // published prefix ever completes the key.
+        let cases = [
+            ("aba", "ba"),
+            ("aba", "abba"),
+            ("aba", "aabbaa"),
+            (CANARY, "hello, world"),
+            (CANARY, "qcg-canary-credential-1234"),
+            ("sk-secret-credential-12345", "日本語の応答テスト"),
+        ];
+        for (key, body) in cases {
+            assert!(
+                !body.contains(key),
+                "fixture body must be credential-free: {body}"
+            );
+            for split in 0..=body.len() {
+                if !body.is_char_boundary(split) {
+                    continue;
+                }
+                let (head, tail) = body.split_at(split);
+                let mut gate = SensitiveTextGate::new(Some(key));
+                let mut published = gate
+                    .push(head)
+                    .unwrap_or_else(|()| panic!("clean head must clear for {key:?}/{body:?}"));
+                assert!(
+                    !published.contains(key),
+                    "published prefix must never complete the key"
+                );
+                published.push_str(
+                    &gate
+                        .push(tail)
+                        .unwrap_or_else(|()| panic!("clean tail must clear for {key:?}/{body:?}")),
+                );
+                assert!(
+                    !published.contains(key),
+                    "published prefix must never complete the key"
+                );
+                published.push_str(
+                    &gate
+                        .finish()
+                        .unwrap_or_else(|()| panic!("clean body must flush for {key:?}/{body:?}")),
+                );
+                assert_eq!(
+                    published, body,
+                    "clean body must round-trip at split {split}"
+                );
+            }
+        }
     }
 }

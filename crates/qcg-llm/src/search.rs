@@ -543,6 +543,9 @@ mod tests {
     #[test]
     fn registry_resolves_default_and_keeps_credentials_out_of_debug() {
         let env_name = format!("QCG_SEARCH_TEST_KEY_{}", std::process::id());
+        // SAFETY: environment mutation is serialized with the crate ENV_LOCK.
+        let _guard = crate::ENV_LOCK.blocking_lock();
+        // SAFETY: lock held.
         unsafe { std::env::set_var(&env_name, "search-secret") };
         let runtime = parse_runtime(&format!(
             r#"

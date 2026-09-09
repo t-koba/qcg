@@ -103,14 +103,19 @@ mod tests {
         TOOL_EVENT_SOURCE_LIMIT, TOOL_EVENT_SOURCE_SCAN_DEPTH, TOOL_EVENT_SOURCE_SCAN_NODES,
     };
     use qcg_llm::{ChatMessage, ChatToolCall, LlmRuntime, SearchRuntime, StopReason};
-    use qcg_mcp::{McpAccess, McpCallOutcome, McpError, McpInputRequired};
+    use qcg_mcp::{McpCallOutcome, McpError, McpInputRequired};
     use qcg_policy::TOOL_EVENT_VALUE_LIMIT_BYTES;
     use qcg_policy::validate_bounded_json_schema;
     use qcg_types::StructuredOutputMode;
     use serde_json::{Value, json};
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
     use std::io::{Read, Write};
     use std::sync::Arc;
+
+    /// Serializes process-environment mutation in tests: `set_var` is
+    /// process-global, so concurrent readers in other test threads must
+    /// not run while any test mutates it.
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn agent_node() -> NodeDef {
         NodeDef {
@@ -1036,167 +1041,6 @@ api_key_env = "QCG_SECURE_API_KEY"
             .expect("typed tool errors remain recoverable without structured content");
     }
 
-    #[tokio::test]
-    #[ignore = "performs anonymous calls to the public Exa and Parallel MCP endpoints"]
-    async fn public_mcp_tools_accept_real_calls_and_validate_real_results() {
-        use tokio_util::sync::CancellationToken;
-
-        const MAX_ATTEMPTS: u32 = 4;
-
-        fn retryable_public_error(error: &McpError) -> bool {
-            matches!(
-                error,
-                McpError::ToolFailed { .. } | McpError::Transport(_) | McpError::TimedOut { .. }
-            )
-        }
-
-        fn public_error_detail(error: &McpError) -> String {
-            match error {
-                McpError::ToolFailed { result, .. } => format!("{error}; result={result}"),
-                _ => error.to_string(),
-            }
-        }
-
-        async fn call_with_bounded_retries(
-            session: &qcg_mcp::McpSession,
-            tool_name: &str,
-            arguments: &Value,
-        ) -> Result<Value, String> {
-            for attempt in 1..=MAX_ATTEMPTS {
-                match session.call_tool(tool_name, arguments.clone()).await {
-                    Ok(result) => return Ok(result),
-                    Err(error) => {
-                        let detail = public_error_detail(&error);
-                        if !retryable_public_error(&error) || attempt == MAX_ATTEMPTS {
-                            return Err(format!(
-                                "failed after {attempt}/{MAX_ATTEMPTS} attempts: {detail}"
-                            ));
-                        }
-                        tokio::time::sleep(std::time::Duration::from_secs(1 << (attempt - 1)))
-                            .await;
-                    }
-                }
-            }
-            unreachable!("bounded retry loop must return")
-        }
-
-        let runtime = qcg_mcp::McpRuntime::public_defaults();
-        for (server, host, tool_name, arguments) in [
-            (
-                "exa-public",
-                "mcp.exa.ai",
-                "web_search_exa",
-                json!({
-                    "query": "official Model Context Protocol specification",
-                    "numResults": 2
-                }),
-            ),
-            (
-                "parallel-public",
-                "search.parallel.ai",
-                "web_search",
-                json!({
-                    "objective": "Find the official Model Context Protocol specification.",
-                    "search_queries": ["official Model Context Protocol specification"],
-                    "session_id": format!(
-                        "qcg-live-{}-{}",
-                        std::process::id(),
-                        uuid_suffix()
-                    ),
-                    "model_name": "qcg-live-contract-test"
-                }),
-            ),
-        ] {
-            let cancellation = CancellationToken::new();
-            let access = McpAccess {
-                network_hosts: BTreeSet::from([host.to_string()]),
-                commands: vec![],
-                workspace: std::env::temp_dir(),
-            };
-            let mut connect_attempt = 1;
-            let session = loop {
-                match runtime
-                    .connect(server, &access, cancellation.child_token())
-                    .await
-                {
-                    Ok(session) => break session,
-                    Err(error) => {
-                        let detail = public_error_detail(&error);
-                        if !retryable_public_error(&error) || connect_attempt == MAX_ATTEMPTS {
-                            panic!(
-                                "{server} should connect anonymously after {connect_attempt}/{MAX_ATTEMPTS} attempts: {detail}"
-                            );
-                        }
-                        tokio::time::sleep(std::time::Duration::from_secs(
-                            1 << (connect_attempt - 1),
-                        ))
-                        .await;
-                        connect_attempt += 1;
-                    }
-                }
-            };
-            let mut list_attempt = 1;
-            let tools = loop {
-                match session.list_tools().await {
-                    Ok(tools) => break tools,
-                    Err(error) => {
-                        let detail = public_error_detail(&error);
-                        if !retryable_public_error(&error) || list_attempt == MAX_ATTEMPTS {
-                            panic!(
-                                "{server} tools/list should succeed after {list_attempt}/{MAX_ATTEMPTS} attempts: {detail}"
-                            );
-                        }
-                        tokio::time::sleep(std::time::Duration::from_secs(1 << (list_attempt - 1)))
-                            .await;
-                        list_attempt += 1;
-                    }
-                }
-            };
-            let tool = tools
-                .iter()
-                .find(|tool| tool.name == tool_name)
-                .unwrap_or_else(|| panic!("{server} should expose {tool_name}"));
-            validate_bounded_json_schema(&tool.input_schema)
-                .unwrap_or_else(|error| panic!("{server}/{tool_name} input schema: {error}"));
-            let input_validator = jsonschema::validator_for(&tool.input_schema)
-                .unwrap_or_else(|error| panic!("{server}/{tool_name} input schema: {error}"));
-            validate_mcp_value(
-                "live-public-mcp",
-                tool_name,
-                &input_validator,
-                &arguments,
-                "arguments",
-            )
-            .unwrap_or_else(|error| panic!("{server}/{tool_name} arguments: {error}"));
-            let output_validator = tool.output_schema.as_ref().map(|schema| {
-                validate_bounded_json_schema(schema)
-                    .unwrap_or_else(|error| panic!("{server}/{tool_name} output schema: {error}"));
-                jsonschema::validator_for(schema)
-                    .unwrap_or_else(|error| panic!("{server}/{tool_name} output schema: {error}"))
-            });
-            let result = call_with_bounded_retries(&session, tool_name, &arguments)
-                .await
-                .unwrap_or_else(|error| {
-                    panic!("{server}/{tool_name} call should succeed: {error}")
-                });
-            validate_mcp_complete_result(
-                "live-public-mcp",
-                tool_name,
-                output_validator.as_ref(),
-                &result,
-            )
-            .unwrap_or_else(|error| panic!("{server}/{tool_name} result: {error}"));
-            assert!(
-                !tool_call_sources(&result).is_empty(),
-                "{server}/{tool_name} result should expose source URLs"
-            );
-            session
-                .close()
-                .await
-                .unwrap_or_else(|error| panic!("{server} should close cleanly: {error}"));
-        }
-    }
-
     #[test]
     fn mcp_confirmation_summary_never_contains_argument_values() {
         let summary = mcp_argument_summary(&json!({
@@ -1710,6 +1554,9 @@ auth_header = "X-API-Key"
             .expect_err("missing provider credential must fail validation");
         assert!(error.to_string().contains(&credential_env));
 
+        // SAFETY: environment mutation is serialized with ENV_LOCK.
+        let _guard = ENV_LOCK.blocking_lock();
+        // SAFETY: lock held.
         unsafe { std::env::set_var(&credential_env, "search-permission-secret") };
         let error = validate_web_search_tool(&node, &contract, &runtime, &tool)
             .expect_err("missing network permission must fail validation");
@@ -1799,7 +1646,6 @@ auth_header = "X-API-Key"
     }
 
     #[tokio::test]
-    #[ignore = "requires loopback socket permissions"]
     async fn web_search_uses_real_http_with_bounded_query_and_header_auth() {
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("loopback listener should bind");
