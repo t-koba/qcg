@@ -417,7 +417,7 @@ mod tests {
                         .strip_prefix(&dir)
                         .expect("entry lives under root")
                         .as_str()
-                        .to_string(),
+                        .replace(std::path::MAIN_SEPARATOR, "/"),
                     entry.depth(),
                     entry.file_type().is_dir(),
                 )
