@@ -31,11 +31,17 @@ fn idempotency_dir(runs_dir: &Utf8PathBuf) -> Utf8PathBuf {
 }
 
 fn idempotency_path(runs_dir: &Utf8PathBuf, key: &str) -> Utf8PathBuf {
-    idempotency_dir(runs_dir).join(format!("{:x}.json", Sha256::digest(key.as_bytes())))
+    idempotency_dir(runs_dir).join(format!(
+        "{}.json",
+        hex::encode(Sha256::digest(key.as_bytes()))
+    ))
 }
 
 fn pending_path(runs_dir: &Utf8PathBuf, key: &str) -> Utf8PathBuf {
-    idempotency_dir(runs_dir).join(format!("{:x}.pending.json", Sha256::digest(key.as_bytes())))
+    idempotency_dir(runs_dir).join(format!(
+        "{}.pending.json",
+        hex::encode(Sha256::digest(key.as_bytes()))
+    ))
 }
 
 /// The single cross-process lock for one idempotency key space: claim,

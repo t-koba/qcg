@@ -16,6 +16,7 @@ dunce.workspace = true
 fs2.workspace = true
 minijinja.workspace = true
 qcg-policy = { path = "../qcg-policy" }
+qcg-fs = { path = "../qcg-fs" }
 qcg-api = { path = "../qcg-api" }
 qcg-container = { path = "../qcg-container" }
 qcg-contract = { path = "../qcg-contract" }
@@ -26,20 +27,15 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-tempfile.workspace = true
 hex.workspace = true
 jsonschema.workspace = true
 libc.workspace = true
 thiserror.workspace = true
-tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "rt", "sync", "time"] }
 tokio-util.workspace = true
 tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
-walkdir.workspace = true
-
-[dev-dependencies]
-toml.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }

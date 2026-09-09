@@ -35,7 +35,7 @@ pub(crate) fn read_declared_artifact(
             runtime.output_file_limit_bytes.unwrap_or(usize::MAX)
         ));
     }
-    let bytes = qcg_policy::read_bounded(&output_root.join(&artifact.path), Some(declared))
+    let bytes = qcg_fs::read_bounded(&output_root.join(&artifact.path), Some(declared))
         .map_err(|error| format!("artifact `{path}` could not be read: {error}"))?;
     if bytes.len() != declared {
         return Err(format!(

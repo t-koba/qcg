@@ -94,7 +94,7 @@ pub(crate) fn check_verified_artifact_hashes(
     verified: &[VerifiedArtifact],
 ) -> Result<(), ServiceError> {
     for artifact in verified {
-        let (actual_sha256, _) = qcg_policy::hash_file_sha256(&artifact.fs_path, None)?;
+        let (actual_sha256, _) = qcg_fs::hash_file_sha256(&artifact.fs_path, None)?;
         if actual_sha256 != artifact.sha256 {
             return Err(ServiceError::Invalid(format!(
                 "artifact `{}` sha256 mismatch: manifest={}, actual={actual_sha256}",

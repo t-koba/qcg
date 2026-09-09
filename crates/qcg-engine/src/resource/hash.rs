@@ -1,7 +1,6 @@
 use crate::{EngineError, RunContext};
 use camino::Utf8PathBuf;
 use sha2::{Digest, Sha256};
-use walkdir::WalkDir;
 
 use super::snapshot::DirectoryLimits;
 use super::types::{ResourceError, ResourceFileSnapshot};
@@ -39,7 +38,7 @@ pub(crate) fn hash_resource_dir(
     let mut files = Vec::new();
     let mut total_bytes = 0_u64;
     let mut entries = 0_usize;
-    for entry in WalkDir::new(path).follow_links(false).min_depth(1) {
+    for entry in qcg_fs::WalkDir::new(path).min_depth(1) {
         let entry = entry.map_err(std::io::Error::other)?;
         if limits.max_depth.is_some_and(|limit| entry.depth() > limit) {
             return Err(std::io::Error::other(format!(
@@ -75,12 +74,7 @@ pub(crate) fn hash_resource_dir(
                 limits.max_files.unwrap_or(usize::MAX)
             )));
         }
-        let file_path = Utf8PathBuf::from_path_buf(entry.path().to_path_buf()).map_err(|path| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("resource path is not UTF-8: {}", path.display()),
-            )
-        })?;
+        let file_path = entry.path().to_path_buf();
         let relative = file_path
             .strip_prefix(path)
             .map_err(std::io::Error::other)?;

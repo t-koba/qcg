@@ -10,6 +10,9 @@ pub mod state;
 pub mod step;
 pub mod validation;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub use artifact::*;
 pub use engine::*;
 pub use gateway::*;

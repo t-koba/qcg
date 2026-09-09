@@ -276,7 +276,7 @@ pub(crate) fn prepare_checkpoint_fork(
                     "checkpoint blob `{digest}` for `{path}` is unavailable; the source run predates checkpoint snapshots"
                 )));
             }
-            if qcg_policy::hash_file_sha256(&current, None)
+            if qcg_fs::hash_file_sha256(&current, None)
                 .map(|(hex, _)| hex)
                 .map_err(|_| {
                     ServiceError::Invalid(format!(
@@ -290,7 +290,7 @@ pub(crate) fn prepare_checkpoint_fork(
             }
             current
         };
-        if qcg_policy::hash_file_sha256(&source, None).map(|(hex, _)| hex)? != digest {
+        if qcg_fs::hash_file_sha256(&source, None).map(|(hex, _)| hex)? != digest {
             return Err(ServiceError::Invalid(format!(
                 "checkpoint blob `{digest}` for `{path}` failed integrity verification"
             )));
@@ -307,14 +307,14 @@ pub(crate) fn prepare_checkpoint_fork(
             uuid::Uuid::now_v7().as_simple()
         ));
         std::fs::copy(&source, &tmp)?;
-        if qcg_policy::hash_file_sha256(&tmp, None).map(|(hex, _)| hex)? != digest {
+        if qcg_fs::hash_file_sha256(&tmp, None).map(|(hex, _)| hex)? != digest {
             let _ = std::fs::remove_file(&tmp);
             return Err(ServiceError::Invalid(format!(
                 "checkpoint file `{path}` changed while it was copied"
             )));
         }
         std::fs::rename(&tmp, &destination)?;
-        if qcg_policy::hash_file_sha256(&destination, None).map(|(hex, _)| hex)? != digest {
+        if qcg_fs::hash_file_sha256(&destination, None).map(|(hex, _)| hex)? != digest {
             return Err(ServiceError::Invalid(format!(
                 "checkpoint file `{path}` changed while it was committed"
             )));

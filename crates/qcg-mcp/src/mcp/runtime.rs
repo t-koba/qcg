@@ -1,8 +1,10 @@
+#[cfg(feature = "mcp-oauth")]
 use crate::bounded_http::BoundedHttpClient;
 use crate::bounded_stdio::BoundedChildTransport;
 use rmcp::ClientHandler;
 use rmcp::model::{ClientCapabilities, ClientInfo, Implementation, TASKS_EXTENSION_ID};
 use rmcp::transport::StreamableHttpClientTransport;
+#[cfg(feature = "mcp-oauth")]
 use rmcp::transport::auth::{
     AuthClient, AuthorizationManager, AuthorizationRequest, CredentialStore,
     InMemoryCredentialStore, OAuthState,
@@ -11,25 +13,29 @@ use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "mcp-oauth")]
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+#[cfg(feature = "mcp-oauth")]
 use url::Url;
 
 use super::access::{McpAccess, McpCommandIsolation, mcp_container_backend};
 use super::error::McpError;
+#[cfg(feature = "mcp-oauth")]
 use super::profile::{
-    AllowedOAuthHttpClient, CredentialGuard, KeyringCredentialStore, McpProfile,
-    PendingAuthorization, ProfileCredentialStore,
+    AllowedOAuthHttpClient, KeyringCredentialStore, PendingAuthorization, ProfileCredentialStore,
 };
+use super::profile::{CredentialGuard, McpProfile};
 use super::session::{McpSession, mcp_http_client};
 use super::spec::McpServerSpec;
 use super::transport::{McpAuth, McpLifecycle, McpTransport, OAuthCredentialStore};
-use super::validate::{
-    auth_error, is_secure_remote_url, required_env, validate_redirect_uri, validate_remote_url,
-};
+#[cfg(feature = "mcp-oauth")]
+use super::validate::{auth_error, is_secure_remote_url, validate_redirect_uri};
+use super::validate::{required_env, validate_remote_url};
 use qcg_policy::{DEFAULT_MCP_MAX_RESPONSE_BYTES, DEFAULT_MCP_TIMEOUT_SECONDS};
 
+#[cfg(feature = "mcp-oauth")]
 const AUTHORIZATION_TTL: Duration = Duration::from_secs(10 * 60);
 
 pub(crate) struct QcgMcpClient;
@@ -50,8 +56,11 @@ impl ClientHandler for QcgMcpClient {
 
 struct McpRuntimeInner {
     profiles: BTreeMap<String, McpProfile>,
+    #[cfg(feature = "mcp-oauth")]
     stores: BTreeMap<String, ProfileCredentialStore>,
+    #[cfg(feature = "mcp-oauth")]
     authorized_clients: Mutex<HashMap<String, AuthClient<BoundedHttpClient>>>,
+    #[cfg(feature = "mcp-oauth")]
     pending: Mutex<HashMap<String, PendingAuthorization>>,
     active_sessions: BTreeMap<String, Arc<AtomicUsize>>,
     lifecycle_gates: BTreeMap<String, Arc<Mutex<()>>>,
@@ -128,6 +137,7 @@ impl McpRuntime {
 
     pub fn from_specs(specs: Vec<McpServerSpec>) -> Result<Self, String> {
         let mut profiles = BTreeMap::new();
+        #[cfg(feature = "mcp-oauth")]
         let mut stores = BTreeMap::new();
         let mut active_sessions = BTreeMap::new();
         let mut lifecycle_gates = BTreeMap::new();
@@ -137,15 +147,23 @@ impl McpRuntime {
             if profiles.contains_key(&id) {
                 return Err(format!("duplicate MCP server id `{id}`"));
             }
+            #[cfg(not(feature = "mcp-oauth"))]
+            if spec.auth == McpAuth::Oauth {
+                return Err(format!(
+                    "MCP server `{id}` uses OAuth, which requires the `mcp-oauth` cargo feature"
+                ));
+            }
             let url = spec
                 .url
                 .as_deref()
                 .map(|raw| validate_remote_url(&id, raw))
                 .transpose()?;
+            #[cfg(feature = "mcp-oauth")]
             let keyring_account = match spec.url.as_deref() {
                 Some(url) => format!("{}@{url}", spec.id),
                 None => spec.id.clone(),
             };
+            #[cfg(feature = "mcp-oauth")]
             let store = match spec.oauth_store {
                 OAuthCredentialStore::Keyring => {
                     ProfileCredentialStore::Keyring(KeyringCredentialStore::new(keyring_account))
@@ -161,6 +179,7 @@ impl McpRuntime {
                     url,
                 },
             );
+            #[cfg(feature = "mcp-oauth")]
             stores.insert(id.clone(), store);
             active_sessions.insert(id.clone(), Arc::new(AtomicUsize::new(0)));
             lifecycle_gates.insert(id, Arc::new(Mutex::new(())));
@@ -168,8 +187,11 @@ impl McpRuntime {
         Ok(Self {
             inner: Arc::new(McpRuntimeInner {
                 profiles,
+                #[cfg(feature = "mcp-oauth")]
                 stores,
+                #[cfg(feature = "mcp-oauth")]
                 authorized_clients: Mutex::new(HashMap::new()),
+                #[cfg(feature = "mcp-oauth")]
                 pending: Mutex::new(HashMap::new()),
                 active_sessions,
                 lifecycle_gates,
@@ -203,6 +225,15 @@ impl McpRuntime {
         if profile.spec.auth != McpAuth::Oauth {
             return Ok(true);
         }
+        self.oauth_authorization_status(profile, server_id).await
+    }
+
+    #[cfg(feature = "mcp-oauth")]
+    async fn oauth_authorization_status(
+        &self,
+        profile: &McpProfile,
+        server_id: &str,
+    ) -> Result<bool, McpError> {
         if self
             .inner
             .authorized_clients
@@ -219,17 +250,39 @@ impl McpRuntime {
             .map_err(auth_error)
     }
 
+    #[cfg(not(feature = "mcp-oauth"))]
+    async fn oauth_authorization_status(
+        &self,
+        _profile: &McpProfile,
+        server_id: &str,
+    ) -> Result<bool, McpError> {
+        Err(McpError::Configuration(format!(
+            "MCP server `{server_id}` uses OAuth, which requires the `mcp-oauth` cargo feature"
+        )))
+    }
+
     pub async fn start_authorization(
         &self,
         server_id: &str,
         redirect_uri: &str,
     ) -> Result<String, McpError> {
-        let profile = self.resolve(server_id)?.clone();
+        let profile = self.resolve(server_id)?;
         if profile.spec.auth != McpAuth::Oauth {
             return Err(McpError::Configuration(format!(
                 "MCP server `{server_id}` does not use OAuth"
             )));
         }
+        self.start_oauth_authorization(server_id, profile, redirect_uri)
+            .await
+    }
+
+    #[cfg(feature = "mcp-oauth")]
+    async fn start_oauth_authorization(
+        &self,
+        server_id: &str,
+        profile: &McpProfile,
+        redirect_uri: &str,
+    ) -> Result<String, McpError> {
         let lifecycle_gate = self.lifecycle_gate(server_id)?;
         let _lifecycle = lifecycle_gate.lock().await;
         if self
@@ -243,7 +296,7 @@ impl McpRuntime {
                 "MCP server `{server_id}` is already authorized"
             )));
         }
-        let mut state = self.authorization_manager(&profile).await?;
+        let mut state = self.authorization_manager(profile).await?;
         if matches!(state, OAuthState::Authorized(_)) {
             return Err(McpError::Configuration(format!(
                 "MCP server `{server_id}` is already authorized"
@@ -304,7 +357,24 @@ impl McpRuntime {
         Ok(authorization_url)
     }
 
+    #[cfg(not(feature = "mcp-oauth"))]
+    async fn start_oauth_authorization(
+        &self,
+        server_id: &str,
+        _profile: &McpProfile,
+        _redirect_uri: &str,
+    ) -> Result<String, McpError> {
+        Err(McpError::Configuration(format!(
+            "MCP server `{server_id}` uses OAuth, which requires the `mcp-oauth` cargo feature"
+        )))
+    }
+
     pub async fn complete_authorization(&self, callback_url: &str) -> Result<String, McpError> {
+        self.complete_oauth_authorization(callback_url).await
+    }
+
+    #[cfg(feature = "mcp-oauth")]
+    async fn complete_oauth_authorization(&self, callback_url: &str) -> Result<String, McpError> {
         let callback =
             Url::parse(callback_url).map_err(|error| McpError::Authorization(error.to_string()))?;
         let csrf = callback
@@ -349,6 +419,13 @@ impl McpRuntime {
         Ok(authorization.server_id)
     }
 
+    #[cfg(not(feature = "mcp-oauth"))]
+    async fn complete_oauth_authorization(&self, _callback_url: &str) -> Result<String, McpError> {
+        Err(McpError::Configuration(
+            "OAuth authorization requires the `mcp-oauth` cargo feature".into(),
+        ))
+    }
+
     pub async fn clear_authorization(&self, server_id: &str) -> Result<(), McpError> {
         let profile = self.resolve(server_id)?;
         if profile.spec.auth != McpAuth::Oauth {
@@ -356,6 +433,15 @@ impl McpRuntime {
                 "MCP server `{server_id}` does not use OAuth"
             )));
         }
+        self.clear_oauth_authorization(server_id, profile).await
+    }
+
+    #[cfg(feature = "mcp-oauth")]
+    async fn clear_oauth_authorization(
+        &self,
+        server_id: &str,
+        profile: &McpProfile,
+    ) -> Result<(), McpError> {
         let lifecycle_gate = self.lifecycle_gate(server_id)?;
         let _lifecycle = lifecycle_gate.lock().await;
         if self.active_sessions(server_id)?.load(Ordering::Acquire) != 0 {
@@ -373,6 +459,17 @@ impl McpRuntime {
         Ok(())
     }
 
+    #[cfg(not(feature = "mcp-oauth"))]
+    async fn clear_oauth_authorization(
+        &self,
+        server_id: &str,
+        _profile: &McpProfile,
+    ) -> Result<(), McpError> {
+        Err(McpError::Configuration(format!(
+            "MCP server `{server_id}` uses OAuth, which requires the `mcp-oauth` cargo feature"
+        )))
+    }
+
     pub async fn cancel_pending_authorization(&self, server_id: &str) -> Result<(), McpError> {
         let profile = self.resolve(server_id)?;
         if profile.spec.auth != McpAuth::Oauth {
@@ -380,6 +477,15 @@ impl McpRuntime {
                 "MCP server `{server_id}` does not use OAuth"
             )));
         }
+        self.cancel_oauth_authorization(server_id, profile).await
+    }
+
+    #[cfg(feature = "mcp-oauth")]
+    async fn cancel_oauth_authorization(
+        &self,
+        server_id: &str,
+        _profile: &McpProfile,
+    ) -> Result<(), McpError> {
         let lifecycle_gate = self.lifecycle_gate(server_id)?;
         let _lifecycle = lifecycle_gate.lock().await;
         self.inner
@@ -390,6 +496,18 @@ impl McpRuntime {
         Ok(())
     }
 
+    #[cfg(not(feature = "mcp-oauth"))]
+    async fn cancel_oauth_authorization(
+        &self,
+        server_id: &str,
+        _profile: &McpProfile,
+    ) -> Result<(), McpError> {
+        Err(McpError::Configuration(format!(
+            "MCP server `{server_id}` uses OAuth, which requires the `mcp-oauth` cargo feature"
+        )))
+    }
+
+    #[cfg(feature = "mcp-oauth")]
     async fn authorization_manager(&self, profile: &McpProfile) -> Result<OAuthState, McpError> {
         let oauth_client = Arc::new(AllowedOAuthHttpClient::new(profile)?);
         let oauth_url = profile.url.as_ref().ok_or_else(|| {
@@ -410,6 +528,7 @@ impl McpRuntime {
         }
     }
 
+    #[cfg(feature = "mcp-oauth")]
     fn store(&self, profile: &McpProfile) -> Result<ProfileCredentialStore, McpError> {
         self.inner.stores.get(profile.id()).cloned().ok_or_else(|| {
             McpError::Configuration(format!(
@@ -549,11 +668,22 @@ impl McpRuntime {
                 CredentialGuard::Static(vec![credential])
             }
             McpAuth::Oauth => {
-                let auth_client = self.authorized_client(&profile).await?;
-                config = config.custom_headers(headers);
-                let credential_guard = CredentialGuard::OAuth(auth_client.clone());
-                let transport = StreamableHttpClientTransport::with_client(auth_client, config);
-                return McpSession::serve(profile, transport, cancellation, credential_guard).await;
+                #[cfg(feature = "mcp-oauth")]
+                {
+                    let auth_client = self.authorized_client(&profile).await?;
+                    config = config.custom_headers(headers);
+                    let credential_guard = CredentialGuard::OAuth(auth_client.clone());
+                    let transport = StreamableHttpClientTransport::with_client(auth_client, config);
+                    return McpSession::serve(profile, transport, cancellation, credential_guard)
+                        .await;
+                }
+                #[cfg(not(feature = "mcp-oauth"))]
+                {
+                    return Err(McpError::Configuration(format!(
+                        "MCP profile `{}` uses OAuth, which requires the `mcp-oauth` cargo feature",
+                        profile.id()
+                    )));
+                }
             }
         };
         config = config.custom_headers(headers);
@@ -562,6 +692,7 @@ impl McpRuntime {
         McpSession::serve(profile, transport, cancellation, credential_guard).await
     }
 
+    #[cfg(feature = "mcp-oauth")]
     async fn authorized_client(
         &self,
         profile: &McpProfile,

@@ -475,7 +475,7 @@ mod tests {
     fn guard_harness(
         run_id: &str,
     ) -> (
-        tempfile::TempDir,
+        crate::test_support::TestDir,
         camino::Utf8PathBuf,
         RunContext,
         qcg_contract::NodeDef,
@@ -491,7 +491,7 @@ mod tests {
         use std::time::Duration;
         use tokio_util::sync::CancellationToken;
 
-        let dir = tempfile::tempdir().expect("temporary directory should be created");
+        let dir = crate::test_support::TestDir::create("guard");
         let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
             .expect("temporary path must be UTF-8");
         let workspace = root.join("workspace");

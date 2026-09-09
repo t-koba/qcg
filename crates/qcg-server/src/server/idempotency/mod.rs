@@ -93,7 +93,7 @@ where
     digest_input.extend_from_slice(target.as_bytes());
     digest_input.push(0);
     digest_input.extend_from_slice(body);
-    let request_digest = format!("{:x}", Sha256::digest(&digest_input));
+    let request_digest = hex::encode(Sha256::digest(&digest_input));
     let Some(idempotency_key) = idempotency_key(headers)? else {
         let run_id = execute(None).await.map_err(ApiHttpError::from_api)?;
         let snapshot = state

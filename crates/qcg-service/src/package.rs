@@ -1,10 +1,10 @@
 use camino::{Utf8Path, Utf8PathBuf};
-use qcg_policy::{is_safe_relative_path, portable_relative_path, read_bounded};
+use qcg_fs::read_bounded;
+use qcg_policy::{is_safe_relative_path, portable_relative_path};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read as _;
-use walkdir::WalkDir;
 
 use crate::types::ServiceError;
 
@@ -105,7 +105,7 @@ pub fn copy_dir_all(
 ) -> Result<(), ServiceError> {
     let mut entry_count = 0_usize;
     let mut copied_bytes = 0_u64;
-    for entry in WalkDir::new(source) {
+    for entry in qcg_fs::WalkDir::new(source) {
         let entry = entry.map_err(|error| {
             ServiceError::Invalid(format!("failed to walk `{source}`: {error}"))
         })?;
@@ -113,12 +113,10 @@ pub fn copy_dir_all(
         if file_type.is_symlink() {
             return Err(ServiceError::Invalid(format!(
                 "package source contains a symbolic link: {}",
-                entry.path().display()
+                entry.path()
             )));
         }
-        let path = Utf8PathBuf::from_path_buf(entry.path().to_path_buf()).map_err(|path| {
-            ServiceError::Invalid(format!("source path is not UTF-8: {}", path.display()))
-        })?;
+        let path = entry.path().to_path_buf();
         let rel = path
             .strip_prefix(source)
             .map_err(|error| ServiceError::Invalid(error.to_string()))?;
@@ -234,15 +232,13 @@ fn verify_package_inventory(root: &Utf8Path, limits: &PackageLimits) -> Result<(
         }
     }
     let mut actual = BTreeSet::new();
-    for entry in WalkDir::new(root) {
+    for entry in qcg_fs::WalkDir::new(root) {
         let entry = entry
             .map_err(|error| ServiceError::Invalid(format!("failed to walk package: {error}")))?;
         if !entry.file_type().is_file() {
             continue;
         }
-        let path = Utf8PathBuf::from_path_buf(entry.path().to_path_buf()).map_err(|path| {
-            ServiceError::Invalid(format!("package path is not UTF-8: {}", path.display()))
-        })?;
+        let path = entry.path().to_path_buf();
         let relative = portable_relative_path(
             path.strip_prefix(root)
                 .map_err(|error| ServiceError::Invalid(error.to_string()))?,

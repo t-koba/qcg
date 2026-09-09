@@ -1,6 +1,7 @@
 use anyhow::Result;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
+#[cfg(feature = "server-cors")]
 use axum::http::{HeaderValue, Method, header};
 use axum::middleware as axum_middleware;
 use axum::routing::{get, put};
@@ -8,6 +9,7 @@ use qcg_service::LocalQcgService;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+#[cfg(feature = "server-cors")]
 use tower_http::cors::CorsLayer;
 
 use super::config::{AppState, ServerConfig};
@@ -28,6 +30,7 @@ use super::run_detail::{
     run_events, run_snapshot,
 };
 use super::runs::{fork_run, list_runs, start_run};
+#[cfg(feature = "server-cors")]
 use qcg_policy::IDEMPOTENCY_HEADER;
 
 pub async fn serve_with_listener(
@@ -184,31 +187,42 @@ pub(crate) fn build_router(state: &Arc<AppState>, config: &ServerConfig) -> Resu
         }
     }
     let app = if !config.cors_origins.is_empty() {
-        let origins = config
-            .cors_origins
-            .iter()
-            .map(|origin| origin.parse::<HeaderValue>())
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        app.layer(
-            CorsLayer::new()
-                .allow_origin(tower_http::cors::AllowOrigin::list(origins))
-                .allow_headers([
-                    header::AUTHORIZATION,
-                    header::CONTENT_TYPE,
-                    header::HeaderName::from_static(IDEMPOTENCY_HEADER),
-                ])
-                .allow_methods([
-                    Method::GET,
-                    Method::POST,
-                    Method::PUT,
-                    Method::DELETE,
-                    Method::OPTIONS,
-                ]),
-        )
+        apply_cors_layer(app, &config.cors_origins)?
     } else {
         app
     };
     Ok(app)
+}
+
+#[cfg(feature = "server-cors")]
+fn apply_cors_layer(app: Router, cors_origins: &[String]) -> Result<Router> {
+    let origins = cors_origins
+        .iter()
+        .map(|origin| origin.parse::<HeaderValue>())
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(app.layer(
+        CorsLayer::new()
+            .allow_origin(tower_http::cors::AllowOrigin::list(origins))
+            .allow_headers([
+                header::AUTHORIZATION,
+                header::CONTENT_TYPE,
+                header::HeaderName::from_static(IDEMPOTENCY_HEADER),
+            ])
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::DELETE,
+                Method::OPTIONS,
+            ]),
+    ))
+}
+
+#[cfg(not(feature = "server-cors"))]
+fn apply_cors_layer(_app: Router, _cors_origins: &[String]) -> Result<Router> {
+    anyhow::bail!(
+        "CORS origins are configured, but this build disables the `server-cors` cargo feature"
+    );
 }
 
 /// Waits for a shutdown signal, settles active runs, and returns control
@@ -250,5 +264,25 @@ pub(crate) async fn shutdown_signal(service: LocalQcgService) {
     }
     if let Err(error) = service.shutdown_active_runs().await {
         tracing::error!(%error, "failed to stop active runs");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "server-cors")]
+    #[test]
+    fn enabled_cors_accepts_configured_origins() {
+        let _layer = apply_cors_layer(Router::new(), &["https://example.com".to_string()])
+            .expect("configured origins must build a layer");
+    }
+
+    #[cfg(not(feature = "server-cors"))]
+    #[test]
+    fn disabled_cors_rejects_configured_origins_explicitly() {
+        let error = apply_cors_layer(Router::new(), &["https://example.com".to_string()])
+            .expect_err("configured origins without the feature must fail");
+        assert!(error.to_string().contains("server-cors"), "{error}");
     }
 }

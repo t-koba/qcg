@@ -281,9 +281,9 @@ async fn run_async() -> Result<()> {
                 json,
             } => {
                 let state_patch = match state_patch {
-                    Some(path) => serde_json::from_slice::<ForkStatePatch>(
-                        &qcg_policy::read_bounded(&path, None)?,
-                    )
+                    Some(path) => serde_json::from_slice::<ForkStatePatch>(&qcg_fs::read_bounded(
+                        &path, None,
+                    )?)
                     .with_context(|| format!("failed to parse state patch `{path}`"))?,
                     None => ForkStatePatch::default(),
                 };
@@ -385,7 +385,7 @@ async fn run_async() -> Result<()> {
             package(&dir, &output, &limits)?;
             println!("sha256 {}", sha256_file(&output)?);
             if let Some(signing_key) = signing_key {
-                let bytes = qcg_policy::read_bounded(
+                let bytes = qcg_fs::read_bounded(
                     &output,
                     limits
                         .max_archive_bytes

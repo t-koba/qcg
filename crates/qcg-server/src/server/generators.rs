@@ -47,10 +47,9 @@ pub(crate) async fn describe_generator(
         .describe(&id)
         .await
         .map_err(ApiHttpError::from_api)?;
-    let digest = format!(
-        "{:x}",
-        Sha256::digest(serde_json::to_vec(&detail).map_err(ApiHttpError::internal)?)
-    );
+    let digest = hex::encode(Sha256::digest(
+        serde_json::to_vec(&detail).map_err(ApiHttpError::internal)?,
+    ));
     conditional_json(&headers, weak_etag(&format!("generator-{digest}")), &detail)
 }
 

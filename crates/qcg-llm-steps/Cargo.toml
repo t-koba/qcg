@@ -26,9 +26,7 @@ regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-tokio = { version = "1", features = ["fs", "macros", "rt", "time"] }
+tokio = { workspace = true, features = ["fs", "macros", "rt", "time"] }
 thiserror.workspace = true
 tokio-util.workspace = true
 url.workspace = true
-
-[dev-dependencies]

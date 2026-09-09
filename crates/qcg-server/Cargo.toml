@@ -8,6 +8,10 @@ repository.workspace = true
 readme.workspace = true
 publish.workspace = true
 
+[features]
+default = ["server-cors"]
+server-cors = ["dep:tower-http"]
+
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
@@ -23,12 +27,12 @@ qcg-types = { path = "../qcg-types" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-tokio = { version = "1", features = ["fs", "macros", "net", "rt", "signal", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "macros", "net", "rt", "signal", "sync", "time"] }
 tokio-stream.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
-tower-http.workspace = true
+tower-http = { workspace = true, optional = true }
 
 [dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
+tower.workspace = true

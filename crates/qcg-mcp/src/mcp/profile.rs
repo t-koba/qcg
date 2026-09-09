@@ -1,22 +1,31 @@
+#[cfg(feature = "mcp-oauth")]
 use crate::bounded_http::BoundedHttpClient;
+#[cfg(feature = "mcp-oauth")]
 use async_trait::async_trait;
+#[cfg(feature = "mcp-oauth")]
 use keyring::Entry;
+#[cfg(feature = "mcp-oauth")]
 use reqwest::redirect::Policy;
+#[cfg(feature = "mcp-oauth")]
 use rmcp::transport::auth::{
     AuthClient, AuthError, CredentialStore, InMemoryCredentialStore, OAuthHttpClient,
     OAuthHttpClientFuture, OAuthHttpRedirectPolicy, OAuthHttpRequest, OAuthState,
     StoredCredentials,
 };
+#[cfg(feature = "mcp-oauth")]
 use std::collections::BTreeSet;
 use std::sync::Arc;
+#[cfg(feature = "mcp-oauth")]
 use std::time::{Duration, Instant};
 use url::Url;
 
 use super::error::McpError;
 use super::spec::McpServerSpec;
 use super::transport::{McpAuth, McpTransport};
+#[cfg(feature = "mcp-oauth")]
 use super::validate::{auth_error, is_secure_remote_url, validate_oauth_operation_url};
 
+#[cfg(feature = "mcp-oauth")]
 const KEYRING_SERVICE: &str = "qcg.mcp.oauth";
 
 #[derive(Debug, Clone)]
@@ -77,6 +86,7 @@ impl McpProfile {
     }
 }
 
+#[cfg(feature = "mcp-oauth")]
 #[derive(Clone)]
 pub(crate) enum ProfileCredentialStore {
     Keyring(KeyringCredentialStore),
@@ -87,6 +97,7 @@ pub(crate) enum ProfileCredentialStore {
 pub(crate) enum CredentialGuard {
     None,
     Static(Vec<String>),
+    #[cfg(feature = "mcp-oauth")]
     OAuth(AuthClient<BoundedHttpClient>),
 }
 
@@ -95,6 +106,7 @@ impl std::fmt::Debug for CredentialGuard {
         formatter.write_str(match self {
             Self::None => "CredentialGuard::None",
             Self::Static(_) => "CredentialGuard::Static(<redacted>)",
+            #[cfg(feature = "mcp-oauth")]
             Self::OAuth(_) => "CredentialGuard::OAuth(<redacted>)",
         })
     }
@@ -105,6 +117,7 @@ impl CredentialGuard {
         match self {
             Self::None => Ok(Vec::new()),
             Self::Static(values) => Ok(values.clone()),
+            #[cfg(feature = "mcp-oauth")]
             Self::OAuth(client) => client
                 .get_access_token()
                 .await
@@ -114,6 +127,7 @@ impl CredentialGuard {
     }
 }
 
+#[cfg(feature = "mcp-oauth")]
 #[async_trait]
 impl CredentialStore for ProfileCredentialStore {
     async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
@@ -138,11 +152,13 @@ impl CredentialStore for ProfileCredentialStore {
     }
 }
 
+#[cfg(feature = "mcp-oauth")]
 #[derive(Debug, Clone)]
 pub(crate) struct KeyringCredentialStore {
     account: String,
 }
 
+#[cfg(feature = "mcp-oauth")]
 impl KeyringCredentialStore {
     pub(crate) fn new(account: impl Into<String>) -> Self {
         Self {
@@ -151,6 +167,7 @@ impl KeyringCredentialStore {
     }
 }
 
+#[cfg(feature = "mcp-oauth")]
 #[async_trait]
 impl CredentialStore for KeyringCredentialStore {
     async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
@@ -198,12 +215,14 @@ impl CredentialStore for KeyringCredentialStore {
     }
 }
 
+#[cfg(feature = "mcp-oauth")]
 pub(crate) struct PendingAuthorization {
     pub(crate) server_id: String,
     pub(crate) state: OAuthState,
     pub(crate) expires_at: Instant,
 }
 
+#[cfg(feature = "mcp-oauth")]
 #[derive(Debug)]
 pub(crate) struct AllowedOAuthHttpClient {
     client: reqwest::Client,
@@ -212,6 +231,7 @@ pub(crate) struct AllowedOAuthHttpClient {
     max_response_bytes: usize,
 }
 
+#[cfg(feature = "mcp-oauth")]
 impl AllowedOAuthHttpClient {
     pub(crate) fn new(profile: &McpProfile) -> Result<Self, McpError> {
         let allowed_hosts = profile
@@ -258,6 +278,7 @@ impl AllowedOAuthHttpClient {
     }
 }
 
+#[cfg(feature = "mcp-oauth")]
 impl OAuthHttpClient for AllowedOAuthHttpClient {
     fn execute(&self, operation: OAuthHttpRequest) -> OAuthHttpClientFuture<'_> {
         Box::pin(async move {
@@ -305,6 +326,7 @@ impl OAuthHttpClient for AllowedOAuthHttpClient {
     }
 }
 
+#[cfg(feature = "mcp-oauth")]
 async fn bounded_oauth_response(
     response: reqwest::Response,
     max_response_bytes: usize,

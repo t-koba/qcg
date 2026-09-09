@@ -3,7 +3,6 @@ use qcg_contract::{Manifest, RuntimeLimits, ValueBag};
 use qcg_types::{OutputArtifact, OutputManifest};
 use std::collections::BTreeMap;
 use std::io;
-use walkdir::WalkDir;
 
 use super::resolve::{
     ArtifactMetadata, build_artifact, resolve_artifact_path, validate_relative_artifact_path,
@@ -228,7 +227,7 @@ pub(crate) fn matching_files(
     }
     let mut matches = Vec::new();
     let mut entries = 0_usize;
-    for entry in WalkDir::new(workspace).follow_links(false) {
+    for entry in qcg_fs::WalkDir::new(workspace) {
         let entry = entry.map_err(std::io::Error::other)?;
         entries = entries
             .checked_add(1)
@@ -242,12 +241,7 @@ pub(crate) fn matching_files(
         if !entry.file_type().is_file() {
             continue;
         }
-        let path = Utf8PathBuf::from_path_buf(entry.path().to_path_buf()).map_err(|path| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("artifact path is not UTF-8: {}", path.display()),
-            )
-        })?;
+        let path = entry.path().to_path_buf();
         let relative = path
             .strip_prefix(workspace)
             .map_err(std::io::Error::other)?;

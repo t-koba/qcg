@@ -433,7 +433,10 @@ mod tests {
 
     #[test]
     fn run_finished_includes_accumulated_metrics() {
-        let dir = std::env::temp_dir().join(format!("qcg-journal-metrics-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "qcg-journal-metrics-{}",
+            uuid::Uuid::now_v7().as_simple()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = camino::Utf8PathBuf::from_path_buf(dir.join("journal.jsonl")).unwrap();
         let journal = JournalWriter::create(&path, "metrics-run", false, None).unwrap();
@@ -523,6 +526,7 @@ mod tests {
         assert_eq!(event["metrics"]["tokens_total"], 10);
         assert_eq!(event["metrics"]["cost_microusd"], 25);
         assert!(event["metrics"]["duration_ms"].as_u64().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

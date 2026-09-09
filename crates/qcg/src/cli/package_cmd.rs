@@ -7,7 +7,6 @@ use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::Write;
 use std::time::SystemTime;
-use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 
 struct PackageFileEntry {
@@ -48,17 +47,12 @@ pub(crate) fn package(
     let mut directories = Vec::<(String, std::fs::Metadata)>::new();
     let mut entries = Vec::<PackageFileEntry>::new();
     let mut total_bytes = 0_u64;
-    for entry in WalkDir::new(dir) {
+    for entry in qcg_fs::WalkDir::new(dir) {
         let entry = entry?;
         if entry.file_type().is_symlink() {
-            anyhow::bail!(
-                "package input contains a symbolic link: {}",
-                entry.path().display()
-            );
+            anyhow::bail!("package input contains a symbolic link: {}", entry.path());
         }
-        let path = Utf8PathBuf::from_path_buf(entry.path().to_path_buf()).map_err(|path| {
-            anyhow::anyhow!("package path is not valid UTF-8: {}", path.display())
-        })?;
+        let path = entry.path().to_path_buf();
         let relative = path.strip_prefix(dir)?;
         if relative.as_str().is_empty() {
             continue;
@@ -222,7 +216,7 @@ fn with_zip_modified_time(
 }
 
 pub(crate) fn sha256_file(path: &Utf8Path) -> Result<String> {
-    Ok(qcg_policy::hash_file_sha256(path, None)?.0)
+    Ok(qcg_fs::hash_file_sha256(path, None)?.0)
 }
 
 fn copy_file_with_sha256<W: Write>(path: &Utf8Path, writer: &mut W) -> Result<(u64, String)> {

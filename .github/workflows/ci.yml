@@ -33,6 +33,11 @@ jobs:
       - name: Check
         run: cargo check --workspace --locked
 
+      - name: Check minimal features
+        run: |
+          cargo check -p qcg-mcp --no-default-features --locked
+          cargo check -p qcg-server --no-default-features --locked
+
       - name: Check expression WASM
         run: cargo check -p qcg-expr-wasm --target wasm32-unknown-unknown --locked
 
@@ -48,9 +53,18 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      - name: Test minimal features
+        run: |
+          cargo test -p qcg-mcp --no-default-features --locked
+          cargo test -p qcg-server --no-default-features --locked
+
       - name: Test MCP transports against local servers
         if: matrix.os == 'ubuntu-latest'
         run: cargo test -p qcg-mcp --features mcp-test-server --locked -- --test-threads=1
+
+      - name: Test MCP transports without default features
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test -p qcg-mcp --no-default-features --features mcp-test-server --locked -- --test-threads=1
 
       - name: Test anonymous public MCP contracts
         if: matrix.os == 'ubuntu-latest'
@@ -151,15 +165,15 @@ jobs:
         run: node scripts/e2e-ui-playwright.mjs
 
   msrv:
-    name: Rust 1.90 MSRV
+    name: Rust 1.98 MSRV
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Install Rust 1.90
-        uses: dtolnay/rust-toolchain@1.90.0
+      - name: Install Rust 1.98
+        uses: dtolnay/rust-toolchain@1.98.0
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -187,8 +201,14 @@ jobs:
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked
 
+      - name: Install cargo-machete
+        run: cargo install cargo-machete --locked
+
       - name: Cargo audit
         run: cargo audit
 
       - name: Cargo deny
         run: cargo deny check
+
+      - name: Cargo machete (unused dependencies)
+        run: cargo machete

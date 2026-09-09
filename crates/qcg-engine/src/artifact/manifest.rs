@@ -4,7 +4,6 @@ use qcg_types::OutputManifest;
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Read as _, Write as _};
-use tempfile::NamedTempFile;
 
 use super::collect::OutputLimits;
 
@@ -36,29 +35,14 @@ pub fn write_output_manifest_with_limits(
                 }
             })?;
             let path = workspace.join("outputs.json");
-            let parent = path
-                .parent()
-                .ok_or_else(|| io::Error::other("outputs.json has no parent directory"))?;
-            let mut temporary = NamedTempFile::new_in(parent.as_std_path())?;
-            temporary.write_all(writer.bytes())?;
-            temporary.as_file().sync_all()?;
-            temporary
-                .persist(path.as_std_path())
-                .map_err(|error| io::Error::other(error.error))?;
+            qcg_fs::write_file_atomic(&path, |file| file.write_all(writer.bytes()))?;
             Ok(())
         }
         None => {
             let path = workspace.join("outputs.json");
-            let parent = path
-                .parent()
-                .ok_or_else(|| io::Error::other("outputs.json has no parent directory"))?;
-            let mut temporary = NamedTempFile::new_in(parent.as_std_path())?;
-            serde_json::to_writer_pretty(&mut temporary, manifest)
-                .map_err(std::io::Error::other)?;
-            temporary.as_file().sync_all()?;
-            temporary
-                .persist(path.as_std_path())
-                .map_err(|error| io::Error::other(error.error))?;
+            qcg_fs::write_file_atomic(&path, |file| {
+                serde_json::to_writer_pretty(file, manifest).map_err(std::io::Error::other)
+            })?;
             Ok(())
         }
     }

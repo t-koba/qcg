@@ -153,7 +153,7 @@ pub(crate) async fn run_eval(
     baseline_path: Option<&Utf8Path>,
     json_output: bool,
 ) -> Result<()> {
-    let source = qcg_policy::read_bounded(suite_path, None)?;
+    let source = qcg_fs::read_bounded(suite_path, None)?;
     let suite: EvalSuite = serde_json::from_slice(&source)
         .with_context(|| format!("invalid eval suite `{suite_path}`"))?;
     validate_eval_suite(&suite)?;
@@ -349,7 +349,7 @@ fn compare_eval_baseline(
     pass_rate: f64,
     reports: &[EvalCaseReport],
 ) -> Result<EvalBaselineComparison> {
-    let baseline: EvalReport = serde_json::from_slice(&qcg_policy::read_bounded(path, None)?)
+    let baseline: EvalReport = serde_json::from_slice(&qcg_fs::read_bounded(path, None)?)
         .with_context(|| format!("invalid eval baseline `{path}`"))?;
     let baseline_passed = baseline
         .cases

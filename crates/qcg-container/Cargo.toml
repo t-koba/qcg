@@ -10,9 +10,8 @@ publish.workspace = true
 
 [dependencies]
 qcg-contract = { path = "../qcg-contract" }
-serde_json.workspace = true
 thiserror.workspace = true
-tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "sync", "time"] }
 tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true

@@ -268,7 +268,7 @@ mod tests {
     fn reads_bounded_private_secret_file() {
         use std::os::unix::fs::PermissionsExt;
 
-        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let directory = crate::test_support::TestDir::create("secret");
         let path = directory.path().join("token");
         let mut file = File::create(&path).expect("secret file should be created");
         file.write_all(b"secret-value\n")
@@ -287,7 +287,7 @@ mod tests {
     fn rejects_secret_file_with_group_access() {
         use std::os::unix::fs::PermissionsExt;
 
-        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let directory = crate::test_support::TestDir::create("secret-reject");
         let path = directory.path().join("token");
         std::fs::write(&path, "secret-value").expect("secret file should be written");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))

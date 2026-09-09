@@ -89,10 +89,7 @@ fn generator_blueprint() -> Value {
     }
 
     let mut sources = BTreeMap::new();
-    for entry in walkdir::WalkDir::new(&root)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
+    for entry in qcg_fs::WalkDir::new(&root).filter_map(Result::ok) {
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -100,7 +97,7 @@ fn generator_blueprint() -> Value {
         let relative = path
             .strip_prefix(&root)
             .expect("file lives under builder root");
-        if relative == std::path::Path::new("qcg.toml") {
+        if relative.as_str() == "qcg.toml" {
             continue;
         }
         if asset_dirs
@@ -111,7 +108,7 @@ fn generator_blueprint() -> Value {
         }
         let content = fs::read_to_string(path).expect("builder sources are UTF-8 text files");
         sources.insert(
-            relative.to_string_lossy().replace('\\', "/"),
+            relative.as_str().replace('\\', "/"),
             json!({"encoding": "utf8", "content": content}),
         );
     }
@@ -157,17 +154,14 @@ fn manifest_as_json(path: &Utf8Path) -> Value {
 
 fn file_set(root: &Utf8Path) -> Vec<String> {
     let mut files = Vec::new();
-    for entry in walkdir::WalkDir::new(root)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
+    for entry in qcg_fs::WalkDir::new(root).filter_map(Result::ok) {
         if entry.file_type().is_file() {
             files.push(
                 entry
                     .path()
                     .strip_prefix(root)
                     .expect("entry lives under root")
-                    .to_string_lossy()
+                    .as_str()
                     .to_string(),
             );
         }

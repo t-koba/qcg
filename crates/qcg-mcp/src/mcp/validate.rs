@@ -1,3 +1,4 @@
+#[cfg(feature = "mcp-oauth")]
 use rmcp::transport::auth::AuthError;
 use serde::Serialize;
 use url::Url;
@@ -16,6 +17,7 @@ pub(crate) fn required_env(name: &str) -> Result<String, McpError> {
     }
 }
 
+#[cfg(feature = "mcp-oauth")]
 pub(crate) fn auth_error(_error: AuthError) -> McpError {
     // OAuth and credential-store errors may contain token response bodies or
     // platform-specific secret-store details. Keep the public error stable and
@@ -74,6 +76,7 @@ pub(crate) fn valid_env_name(value: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
+#[cfg(feature = "mcp-oauth")]
 pub(crate) fn validate_oauth_operation_url(
     url: &Url,
 ) -> Result<(), rmcp::transport::auth::OAuthHttpClientError> {
@@ -126,10 +129,12 @@ pub(crate) fn validate_remote_url(id: &str, raw: &str) -> Result<Url, String> {
     Ok(url)
 }
 
+#[cfg(feature = "mcp-oauth")]
 pub(crate) fn is_secure_remote_url(url: &Url) -> bool {
     url.scheme() == "https" || (url.scheme() == "http" && url.host_str().is_some_and(is_loopback))
 }
 
+#[cfg(feature = "mcp-oauth")]
 pub(crate) fn validate_redirect_uri(raw: &str) -> Result<Url, McpError> {
     let url = Url::parse(raw).map_err(|error| McpError::Configuration(error.to_string()))?;
     let host = url

@@ -474,7 +474,7 @@ async fn stage_install_source(
         });
     }
     if !source.starts_with("http://") && !source.starts_with("https://") {
-        let bytes = qcg_policy::read_bounded(
+        let bytes = qcg_fs::read_bounded(
             &source_path,
             limits
                 .max_archive_bytes
@@ -520,7 +520,7 @@ pub(crate) fn verify_package_bytes(
 }
 
 pub(crate) fn sign_package(output: &Utf8Path, bytes: &[u8], signing_key: &Utf8Path) -> Result<()> {
-    let pkcs8 = qcg_policy::read_bounded(signing_key, Some(MAX_SIGNING_KEY_BYTES))
+    let pkcs8 = qcg_fs::read_bounded(signing_key, Some(MAX_SIGNING_KEY_BYTES))
         .with_context(|| format!("failed to read Ed25519 PKCS#8 key `{signing_key}`"))?;
     let key = Ed25519KeyPair::from_pkcs8(&pkcs8)
         .map_err(|_| anyhow::anyhow!("`{signing_key}` is not a valid Ed25519 PKCS#8 key"))?;

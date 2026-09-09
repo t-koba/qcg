@@ -12,7 +12,6 @@ publish.workspace = true
 async-trait.workspace = true
 camino.workspace = true
 futures-util.workspace = true
-jsonschema.workspace = true
 libc.workspace = true
 reqwest.workspace = true
 qcg-policy = { path = "../qcg-policy" }
@@ -22,6 +21,6 @@ serde.workspace = true
 serde_json.workspace = true
 sse-stream.workspace = true
 thiserror.workspace = true
-tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 toml.workspace = true
 url.workspace = true

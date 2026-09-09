@@ -11,7 +11,7 @@ pub(crate) fn load_inputs(
     max_inputs_file_bytes: Option<usize>,
 ) -> Result<BTreeMap<String, Value>> {
     let mut values = if let Some(file) = file {
-        let bytes = qcg_policy::read_bounded(&file, max_inputs_file_bytes)?;
+        let bytes = qcg_fs::read_bounded(&file, max_inputs_file_bytes)?;
         serde_json::from_slice::<BTreeMap<String, Value>>(&bytes)?
     } else {
         BTreeMap::new()
@@ -33,7 +33,7 @@ pub(crate) fn load_inputs(
         let name = path
             .file_name()
             .with_context(|| format!("file input path `{path}` has no file name"))?;
-        let bytes = qcg_policy::read_bounded(path, runtime.file_input_limit_bytes)?;
+        let bytes = qcg_fs::read_bounded(path, runtime.file_input_limit_bytes)?;
         let value = qcg_types::FileValue::from_bytes_optional_limit(
             name,
             &bytes,
@@ -61,7 +61,7 @@ pub(crate) fn load_confirmations(
     file: Option<Utf8PathBuf>,
 ) -> Result<BTreeMap<String, bool>> {
     let mut values = if let Some(file) = file {
-        let bytes = qcg_policy::read_bounded(&file, None)?;
+        let bytes = qcg_fs::read_bounded(&file, None)?;
         serde_json::from_slice::<BTreeMap<String, bool>>(&bytes).with_context(|| {
             format!("failed to parse confirmations file `{file}` as a JSON id-to-boolean map")
         })?

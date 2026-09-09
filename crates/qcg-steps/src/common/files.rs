@@ -2,7 +2,6 @@ use qcg_engine::StepError;
 use sha2::{Digest, Sha256};
 use std::io::Read as _;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use walkdir::WalkDir;
 
 use super::unix_mode::apply_unix_mode;
 
@@ -41,7 +40,7 @@ pub(crate) async fn ensure_bounded_file_tree(
         if !path.is_dir() {
             return Err(format!("file input `{path}` is not a file or directory"));
         }
-        for entry in WalkDir::new(&path).follow_links(false) {
+        for entry in qcg_fs::WalkDir::new(&path) {
             let entry = entry.map_err(|error| format!("failed to inspect file input: {error}"))?;
             entries = entries
                 .checked_add(1)

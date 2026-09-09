@@ -4,7 +4,6 @@
 
 pub mod cost;
 pub mod credential;
-pub mod io;
 pub mod limits;
 pub mod params;
 pub mod path;
@@ -12,7 +11,6 @@ pub mod schema;
 
 pub use cost::{LlmCostBudget, PricingRow, select_pricing};
 pub use credential::credential_like_name;
-pub use io::{hash_file_sha256, read_bounded};
 pub use limits::{
     DEFAULT_LLM_CONTEXT_LIMIT_BYTES, DEFAULT_MAX_ACTIVE_RUNS, DEFAULT_MAX_TOTAL_STEPS,
     DEFAULT_MAX_TRACKED_RUNS, DEFAULT_MCP_MAX_RESPONSE_BYTES, DEFAULT_MCP_TIMEOUT_SECONDS,

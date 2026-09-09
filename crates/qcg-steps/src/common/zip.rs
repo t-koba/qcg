@@ -1,5 +1,5 @@
 use qcg_engine::StepError;
-use walkdir::WalkDir;
+use qcg_fs::WalkDir;
 use zip::write::SimpleFileOptions;
 
 use super::files::atomic_replace;
@@ -93,8 +93,7 @@ pub(crate) fn write_zip(
         }
         entries.sort_by(|left, right| left.path().cmp(right.path()));
         for entry in entries {
-            let path = camino::Utf8PathBuf::from_path_buf(entry.path().to_path_buf())
-                .map_err(|_| StepError::failed(node_id, "zip source path must be UTF-8"))?;
+            let path = entry.path().to_path_buf();
             if path == target_path {
                 continue;
             }

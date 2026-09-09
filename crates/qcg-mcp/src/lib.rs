@@ -152,6 +152,15 @@ mod tests {
         assert!(spec.validate().is_err());
     }
 
+    #[cfg(not(feature = "mcp-oauth"))]
+    #[test]
+    fn oauth_specs_are_rejected_without_the_oauth_feature() {
+        let error = McpRuntime::from_specs(vec![remote_spec()])
+            .expect_err("OAuth profiles require the mcp-oauth feature");
+        assert!(error.contains("mcp-oauth"), "{error}");
+    }
+
+    #[cfg(feature = "mcp-oauth")]
     #[tokio::test]
     async fn authorization_status_does_not_perform_network_discovery() {
         let mut spec = remote_spec();
@@ -168,6 +177,7 @@ mod tests {
         assert!(!authorized);
     }
 
+    #[cfg(feature = "mcp-oauth")]
     #[test]
     fn oauth_redirect_requires_https_or_loopback_http() {
         validate_redirect_uri("http://127.0.0.1:43123/callback")
@@ -217,6 +227,7 @@ mod tests {
         assert!(!message.contains("mcp-test-secret-value"));
     }
 
+    #[cfg(feature = "mcp-oauth")]
     #[tokio::test]
     async fn authorization_cannot_be_cleared_while_sessions_are_active() {
         let runtime = McpRuntime::from_specs(vec![remote_spec()]).expect("runtime should load");

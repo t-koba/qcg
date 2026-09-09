@@ -13,6 +13,7 @@ members = [
   "crates/qcg-llm-steps",
   "crates/qcg-server",
   "crates/qcg-policy",
+  "crates/qcg-fs",
   "crates/qcg",
   "tests/integration",
 ]
@@ -23,7 +24,7 @@ edition = "2024"
 description = "Contract-driven harness for bounded, purpose-specialized generation"
 repository = "https://github.com/t-koba/qcg"
 readme = "README.md"
-rust-version = "1.90"
+rust-version = "1.98"
 version = "0.1.0"
 publish = false
 
@@ -42,7 +43,7 @@ futures-util = "0.3"
 fs2 = "0.4"
 hex = "0.4"
 http = "1"
-jsonschema = { version = "0.52", default-features = false }
+jsonschema = { version = "0.55", default-features = false }
 keyring = "4.1.6"
 libc = "0.2"
 minijinja = { version = "2", features = ["loader", "json", "fuel"] }
@@ -51,26 +52,26 @@ oauth2 = { version = "5", default-features = false }
 pin-project-lite = "0.2"
 regex = "1"
 reqwest = { version = "0.13.2", default-features = false, features = ["json", "rustls", "stream"] }
-rmcp = { version = "3.1.4", default-features = false, features = ["auth", "client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
-schemars = { version = "1", features = ["chrono04", "uuid1"] }
+rmcp = { version = "3.1.4", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sse-stream = "0.2"
 semver = "1"
-sha2 = "0.10"
-tempfile = "3.27"
+sha2 = "0.11"
 thiserror = "2"
+tokio = "1"
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["io"] }
-toml = "0.9"
+toml = "1"
+tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2"
 uuid = { version = "1", features = ["v7", "serde"] }
-walkdir = "2"
 wasm-bindgen = "0.2"
-zip = { version = "4", default-features = false, features = ["chrono", "deflate"] }
+zip = { version = "8", default-features = false, features = ["chrono", "deflate-flate2-zlib-rs"] }
 
 [profile.dev]
 # Keep target/ from ballooning: line tables keep backtraces usable while
