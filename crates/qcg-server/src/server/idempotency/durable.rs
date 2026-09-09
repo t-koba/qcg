@@ -5,6 +5,7 @@
 
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -19,6 +20,10 @@ pub(crate) struct DurableIdempotencyRecord {
     pub(crate) digest: String,
     pub(crate) run_id: String,
     pub(crate) created_at_unix: u64,
+    /// Claim generation that committed this record. Missing on pre-upgrade
+    /// files and reads as 0.
+    #[serde(default)]
+    pub(crate) generation: u64,
 }
 
 fn idempotency_dir(runs_dir: &Utf8PathBuf) -> Utf8PathBuf {
@@ -31,6 +36,35 @@ fn idempotency_path(runs_dir: &Utf8PathBuf, key: &str) -> Utf8PathBuf {
 
 fn pending_path(runs_dir: &Utf8PathBuf, key: &str) -> Utf8PathBuf {
     idempotency_dir(runs_dir).join(format!("{:x}.pending.json", Sha256::digest(key.as_bytes())))
+}
+
+/// Next claim generation for a key: one past the highest generation among
+/// the live pending and Ready records. Must run under the claim lock with
+/// the predecessor observation so two publishers cannot share a number.
+/// Absent files count as 0; present-but-unparseable files fail closed
+/// instead of silently restarting the chain at 0, which would let a
+/// superseded owner present a seemingly current generation.
+fn pending_generation(runs_dir: &Utf8PathBuf, key: &str) -> Result<u64, ApiHttpError> {
+    fn generation_of(path: &camino::Utf8Path) -> Result<u64, ApiHttpError> {
+        match read_bounded_idempotency_file(path) {
+            BoundedRead::Absent => Ok(0),
+            BoundedRead::Present(bytes) => serde_json::from_slice::<Value>(&bytes)
+                .ok()
+                .and_then(|value| value.get("generation").and_then(Value::as_u64))
+                .ok_or_else(|| {
+                    ApiHttpError::internal(format!(
+                        "idempotency record `{path}` has no usable claim generation; operator action required"
+                    ))
+                }),
+            BoundedRead::Unreadable(error) => Err(ApiHttpError::internal(format!(
+                "idempotency record `{path}` is unreadable: {error}"
+            ))),
+        }
+    }
+    let pending = generation_of(&pending_path(runs_dir, key))?;
+    let ready = generation_of(&idempotency_path(runs_dir, key));
+    let ready = ready?;
+    Ok(pending.max(ready).saturating_add(1).max(1))
 }
 
 /// Flush a directory entry so a just-published rename survives a crash.
@@ -69,6 +103,11 @@ struct DurablePendingRecord {
     run_id: Option<String>,
     owner: String,
     created_at_unix: u64,
+    /// Monotonic claim generation for this key. A committer holding a
+    /// superseded generation must not overwrite a newer owner's claim or
+    /// Ready record; it converges onto the committed result instead.
+    #[serde(default)]
+    generation: u64,
 }
 
 /// Cross-process claim before execution so two processes with the same key
@@ -108,15 +147,48 @@ pub(crate) fn claim_durable_pending(
         })?;
     }
     let _lock_held = lock_file;
+    // Unified transition: re-check the Ready record under the same lock
+    // before touching the pending claim. A commit landing between the
+    // waiter's last look and this claim converges here instead of slipping
+    // through into a second execution (B02).
+    match load_durable_ready_result(runs_dir, key) {
+        Ok(Some(committed)) => {
+            if committed.digest != digest {
+                return Ok(ClaimOutcome::Conflict);
+            }
+            return Ok(ClaimOutcome::Ready {
+                run_id: committed.run_id,
+            });
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return Err(ApiHttpError::internal(format!(
+                "failed to load idempotency record: {error}"
+            )));
+        }
+    }
     // Reap an expired predecessor first so a dead claim never wedges
     // retries and an adopted run id survives for the same digest. A live
     // (Valid) predecessor means another owner holds the key: report Peer
     // without writing, since the atomic rename below would otherwise
     // replace its claim and crown two owners.
+    // The reaped predecessor's generation survives in memory: the file
+    // is gone by the time the next generation is computed below, and
+    // forgetting it would let an adoption reuse a live number.
+    let mut expired_generation = 0u64;
     let adopted = match read_durable_pending(runs_dir, key) {
         PendingRead::Valid(_) => return Ok(ClaimOutcome::Peer),
-        PendingRead::Expired(record) if record.digest == digest => record.run_id.clone(),
-        PendingRead::Expired(_) | PendingRead::Absent => None,
+        PendingRead::Expired(record) => {
+            // Reap here, under the lock: the waiter path only observes.
+            expired_generation = record.generation;
+            let _ = std::fs::remove_file(pending_path(runs_dir, key).as_std_path());
+            if record.digest == digest {
+                record.run_id.clone()
+            } else {
+                None
+            }
+        }
+        PendingRead::Absent => None,
         PendingRead::Unusable(detail) => {
             return Err(ApiHttpError::internal(format!(
                 "failed to persist idempotency record: {detail}"
@@ -125,12 +197,18 @@ pub(crate) fn claim_durable_pending(
     };
     let path = pending_path(runs_dir, key);
     let run_id = adopted.or(reserved_run_id);
+    let owner = uuid::Uuid::now_v7().to_string();
+    // Next generation after every live record for this key, floored by the
+    // reaped predecessor. Absent files count as 0, so a fresh chain starts
+    // at 1; a superseded owner can never present a current generation.
+    let generation = pending_generation(runs_dir, key)?.max(expired_generation.saturating_add(1));
     let record = DurablePendingRecord {
         key: key.to_string(),
         digest: digest.to_string(),
         run_id: run_id.clone(),
-        owner: uuid::Uuid::now_v7().to_string(),
+        owner: owner.clone(),
         created_at_unix: now_unix(),
+        generation,
     };
     let bytes = serde_json::to_vec(&record).map_err(|error| {
         ApiHttpError::internal(format!("failed to persist idempotency record: {error}"))
@@ -164,7 +242,11 @@ pub(crate) fn claim_durable_pending(
             // Under the claim lock no concurrent publisher exists, so this
             // rename cannot replace a live claim: a Valid predecessor
             // observed above returns Peer before reaching this write.
-            Ok(ClaimOutcome::Owner { run_id })
+            Ok(ClaimOutcome::Owner {
+                run_id,
+                owner,
+                generation,
+            })
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             // Our temp name is unique per attempt; a collision means a
@@ -213,12 +295,43 @@ fn reap_stale_claim_tmps(runs_dir: &Utf8PathBuf) {
 }
 
 pub(crate) enum ClaimOutcome {
-    Owner { run_id: Option<String> },
+    Owner {
+        run_id: Option<String>,
+        owner: String,
+        generation: u64,
+    },
     Peer,
+    /// A Ready record already commits this key: converge onto its run id
+    /// instead of executing. Checked under the claim lock so a commit
+    /// landing between the waiter's last look and this claim cannot slip
+    /// through into a second execution (B02).
+    Ready {
+        run_id: String,
+    },
+    /// The key is committed for a different request digest.
+    Conflict,
 }
 
-pub(crate) fn release_durable_pending(runs_dir: &Utf8PathBuf, key: &str) {
-    let _ = std::fs::remove_file(pending_path(runs_dir, key).as_std_path());
+/// Releases a pending claim only when owner and generation still match
+/// ours. A claim that expired mid-execution may have been adopted and
+/// re-published by a peer; deleting it would break the new owner, so
+/// anything foreign is left alone.
+pub(crate) fn release_durable_pending(
+    runs_dir: &Utf8PathBuf,
+    key: &str,
+    owner: &str,
+    generation: u64,
+) {
+    let path = pending_path(runs_dir, key);
+    let current = std::fs::read(path.as_std_path())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<DurablePendingRecord>(&bytes).ok());
+    if current
+        .as_ref()
+        .is_some_and(|record| record.owner == owner && record.generation == generation)
+    {
+        let _ = std::fs::remove_file(path.as_std_path());
+    }
 }
 
 enum PendingRead {
@@ -300,8 +413,10 @@ fn read_durable_pending(runs_dir: &Utf8PathBuf, key: &str) -> PendingRead {
             "pending claim at key `{key}` belongs to a different key; operator action required"
         ));
     }
+    // Pure observation: expiry reaping happens only under the claim lock
+    // in the claim path. Deleting here would let a waiter destroy a claim
+    // another claimant is about to adopt.
     if now_unix().saturating_sub(record.created_at_unix) >= PENDING_TTL_SECS {
-        let _ = std::fs::remove_file(path.as_std_path());
         return PendingRead::Expired(record);
     }
     PendingRead::Valid(record)
@@ -423,22 +538,22 @@ pub(crate) async fn wait_for_peer_ready(
 /// and peer processes observe the same operation id to run id mapping.
 /// Same key + same digest is idempotent; same key + different digest is a
 /// conflict preserved from the existing record.
+///
+/// `expected_generation` fences stale committers: a publisher whose claim
+/// was superseded (expiry adoption, key reuse) must not overwrite the
+/// newer generation's outcome. A superseded commit for the same digest
+/// still converges onto the committed run; anything else fails instead of
+/// replacing it (B02).
 pub(crate) fn store_durable_ready(
     runs_dir: &Utf8PathBuf,
     key: &str,
     digest: &str,
     run_id: &str,
+    expected_generation: u64,
 ) -> Result<(), String> {
     std::fs::create_dir_all(idempotency_dir(runs_dir).as_std_path())
         .map_err(|error| error.to_string())?;
     let path = idempotency_path(runs_dir, key);
-    let record = DurableIdempotencyRecord {
-        key: key.to_string(),
-        digest: digest.to_string(),
-        run_id: run_id.to_string(),
-        created_at_unix: now_unix(),
-    };
-    let bytes = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
     // Serialize check-then-publish under a cross-process lock so two owners
     // never interleave temp writes and renames (A03). Readers use temp +
     // rename, so they never observe empty or partial files.
@@ -467,6 +582,34 @@ pub(crate) fn store_durable_ready(
         Ok(None) => {}
         Err(error) => return Err(error),
     }
+    // Generation fence: a claim superseded while executing (expiry
+    // adoption, key reuse) must not overwrite the newer generation's
+    // outcome. Same-digest supersession still converges onto whatever the
+    // current generation committed; anything else fails instead.
+    match read_durable_pending(runs_dir, key) {
+        PendingRead::Valid(pending) | PendingRead::Expired(pending) => {
+            let current = pending.generation;
+            if current != expected_generation {
+                match load_durable_ready_result(runs_dir, key) {
+                    Ok(Some(committed)) if committed.digest == digest => return Ok(()),
+                    _ => {
+                        return Err(format!(
+                            "idempotency claim superseded by generation {current}; retry converges onto the committed run"
+                        ));
+                    }
+                }
+            }
+        }
+        PendingRead::Absent | PendingRead::Unusable(_) => {}
+    }
+    let record = DurableIdempotencyRecord {
+        key: key.to_string(),
+        digest: digest.to_string(),
+        run_id: run_id.to_string(),
+        created_at_unix: now_unix(),
+        generation: expected_generation,
+    };
+    let bytes = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
     let tmp = path.with_extension(format!("tmp-{}", uuid::Uuid::now_v7()));
     {
         use std::io::Write as _;
@@ -527,6 +670,7 @@ mod tests {
             run_id: None,
             owner: "o".into(),
             created_at_unix: now_unix(),
+            generation: 1,
         };
         std::fs::write(
             pending_path(&runs_dir, key).as_std_path(),
@@ -544,6 +688,152 @@ mod tests {
             pending_path(&runs_dir, key).as_std_path().exists(),
             "foreign claim must be retained for the operator"
         );
+        let _ = std::fs::remove_dir_all(runs_dir.as_std_path());
+    }
+
+    #[test]
+    fn committed_ready_converges_claim_without_executing() {
+        // B02: a commit landing between the waiter's last look and the
+        // claim must converge onto the committed run, never execute again.
+        let runs_dir = temp_runs_dir("ready-converge");
+        let key = "key-1";
+        store_durable_ready(&runs_dir, key, "digest", "run-A", 1)
+            .expect("ready commit should succeed");
+        match claim_durable_pending(&runs_dir, key, "digest", Some("run-B".into()))
+            .expect("claim should not error")
+        {
+            ClaimOutcome::Ready { run_id } => assert_eq!(run_id, "run-A"),
+            other => panic!("committed key must converge, got {}", outcome_name(&other)),
+        }
+        match claim_durable_pending(&runs_dir, key, "other-digest", Some("run-C".into()))
+            .expect("claim should not error")
+        {
+            ClaimOutcome::Conflict => {}
+            other => panic!("foreign digest must conflict, got {}", outcome_name(&other)),
+        }
+        let _ = std::fs::remove_dir_all(runs_dir.as_std_path());
+    }
+
+    fn outcome_name(outcome: &ClaimOutcome) -> &'static str {
+        match outcome {
+            ClaimOutcome::Owner { .. } => "Owner",
+            ClaimOutcome::Peer => "Peer",
+            ClaimOutcome::Ready { .. } => "Ready",
+            ClaimOutcome::Conflict => "Conflict",
+        }
+    }
+
+    #[test]
+    fn release_only_removes_its_own_claim() {
+        let runs_dir = temp_runs_dir("release-owner");
+        let key = "key-1";
+        let (owner, generation) =
+            match claim_durable_pending(&runs_dir, key, "digest", Some("run-1".into()))
+                .expect("claim should win")
+            {
+                ClaimOutcome::Owner {
+                    owner, generation, ..
+                } => (owner, generation),
+                other => panic!("expected owner, got {}", outcome_name(&other)),
+            };
+        // A stale owner (e.g. expired mid-execution) must not delete the
+        // current owner's claim file, even with the right owner id but a
+        // superseded generation.
+        release_durable_pending(&runs_dir, key, "someone-else", generation);
+        release_durable_pending(&runs_dir, key, &owner, generation + 1);
+        assert!(
+            pending_path(&runs_dir, key).as_std_path().exists(),
+            "foreign release must leave the claim intact"
+        );
+        release_durable_pending(&runs_dir, key, &owner, generation);
+        assert!(
+            !pending_path(&runs_dir, key).as_std_path().exists(),
+            "own release must remove the claim"
+        );
+        let _ = std::fs::remove_dir_all(runs_dir.as_std_path());
+    }
+
+    #[test]
+    fn generations_increase_across_expiry_chains() {
+        // B02: adoption of an expired claim advances the generation, so a
+        // superseded owner can never present a current one.
+        let runs_dir = temp_runs_dir("generations");
+        let key = "key-1";
+        let first = claim_durable_pending(&runs_dir, key, "digest", Some("run-1".into()))
+            .expect("first claim should win");
+        let gen1 = match first {
+            ClaimOutcome::Owner { generation, .. } => generation,
+            other => panic!("expected owner, got {}", outcome_name(&other)),
+        };
+        assert_eq!(gen1, 1, "fresh chain starts at generation 1");
+        // Age the claim past its TTL without touching anything else.
+        let path = pending_path(&runs_dir, key);
+        let mut record: DurablePendingRecord =
+            serde_json::from_slice(&std::fs::read(path.as_std_path()).expect("claim readable"))
+                .expect("claim parses");
+        record.created_at_unix = 0;
+        std::fs::write(
+            path.as_std_path(),
+            serde_json::to_vec(&record).expect("record serializes"),
+        )
+        .expect("aged claim should write");
+        let second = claim_durable_pending(&runs_dir, key, "digest", Some("run-9".into()))
+            .expect("adoption claim should win");
+        match second {
+            ClaimOutcome::Owner {
+                run_id, generation, ..
+            } => {
+                assert_eq!(
+                    run_id.as_deref(),
+                    Some("run-1"),
+                    "adoption reuses the run id"
+                );
+                assert_eq!(generation, 2, "adoption advances the generation");
+            }
+            other => panic!("expected adopting owner, got {}", outcome_name(&other)),
+        }
+        let _ = std::fs::remove_dir_all(runs_dir.as_std_path());
+    }
+
+    #[test]
+    fn superseded_commit_converges_or_fails_without_overwriting() {
+        // B02: a committer whose claim was superseded must not replace the
+        // newer generation's outcome.
+        let runs_dir = temp_runs_dir("superseded-commit");
+        let key = "key-1";
+        let first = claim_durable_pending(&runs_dir, key, "digest", Some("run-1".into()))
+            .expect("first claim should win");
+        let gen1 = match first {
+            ClaimOutcome::Owner { generation, .. } => generation,
+            other => panic!("expected owner, got {}", outcome_name(&other)),
+        };
+        // A newer generation takes over the key for the same digest.
+        let path = pending_path(&runs_dir, key);
+        let mut record: DurablePendingRecord =
+            serde_json::from_slice(&std::fs::read(path.as_std_path()).expect("claim readable"))
+                .expect("claim parses");
+        record.owner = "new-owner".into();
+        record.generation = gen1 + 1;
+        record.created_at_unix = now_unix();
+        std::fs::write(
+            path.as_std_path(),
+            serde_json::to_vec(&record).expect("record serializes"),
+        )
+        .expect("superseding claim should write");
+        // The stale owner commits nothing new: without a Ready record it
+        // fails instead of overwriting.
+        let error = store_durable_ready(&runs_dir, key, "digest", "run-1", gen1)
+            .expect_err("superseded commit must not overwrite");
+        assert!(
+            error.contains("superseded"),
+            "supersession must be explicit, got: {error}"
+        );
+        // Once the current generation commits the same digest, the stale
+        // owner converges onto it.
+        store_durable_ready(&runs_dir, key, "digest", "run-1", gen1 + 1)
+            .expect("current generation should commit");
+        store_durable_ready(&runs_dir, key, "digest", "run-1", gen1)
+            .expect("stale same-digest commit converges");
         let _ = std::fs::remove_dir_all(runs_dir.as_std_path());
     }
 

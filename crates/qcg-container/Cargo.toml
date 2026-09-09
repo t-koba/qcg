@@ -12,6 +12,7 @@ publish.workspace = true
 qcg-contract = { path = "../qcg-contract" }
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { version = "1", features = ["macros", "process", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
 tokio-util.workspace = true
+tracing.workspace = true
 uuid.workspace = true

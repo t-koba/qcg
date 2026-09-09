@@ -33,7 +33,7 @@ pub struct HttpRequest {
     pub idempotency_key: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HttpOutput {
     pub status: u16,
     pub url: String,

@@ -81,7 +81,7 @@ export class ApiClient {
   }
 
   listRuns(
-    query?: { state?: string; generator_id?: string; since?: string; cursor?: string; limit?: number },
+    query?: { state?: string; generator_id?: string; since?: string; cursor?: string; limit?: number; order?: string },
     signal?: AbortSignal,
   ): Promise<RunListResponse> {
     const params = new URLSearchParams();
@@ -90,6 +90,7 @@ export class ApiClient {
     if (query?.since) params.set("since", query.since);
     if (query?.cursor) params.set("cursor", query.cursor);
     if (query?.limit !== undefined) params.set("limit", String(query.limit));
+    if (query?.order) params.set("order", query.order);
     const suffix = params.size > 0 ? `?${params.toString()}` : "";
     return this.get<RunListResponse>(`/api/runs${suffix}`, signal);
   }

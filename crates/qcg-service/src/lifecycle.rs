@@ -30,6 +30,18 @@ use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+/// Maps a durable terminal outcome to its display status. Every memory
+/// convergence from journal truth goes through this one mapping so peers
+/// never disagree on what a terminal journal means (B10).
+fn terminal_status(terminal: &qcg_engine::TerminalState) -> RunStatus {
+    match terminal {
+        qcg_engine::TerminalState::Succeeded => RunStatus::Succeeded,
+        qcg_engine::TerminalState::Failed => RunStatus::Failed,
+        qcg_engine::TerminalState::Canceled => RunStatus::Canceled,
+        qcg_engine::TerminalState::Interrupted => RunStatus::Interrupted,
+    }
+}
+
 impl LocalQcgService {
     /// Creates a service and resolves the providers registry once during
     /// initialization. An explicit path is authoritative; `None` delegates
@@ -119,6 +131,7 @@ impl LocalQcgService {
                 queue_notify: Arc::new(tokio::sync::Notify::new()),
                 owner_id: uuid::Uuid::now_v7().as_simple().to_string(),
                 preemption_enabled: std::sync::Mutex::new(true),
+                max_total_steps: std::sync::Mutex::new(None),
             }),
         })
     }
@@ -132,6 +145,25 @@ impl LocalQcgService {
             .preemption_enabled
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = enabled;
+    }
+
+    /// Sets the deployment ceiling for per-run total steps. The host
+    /// resolves and validates the value (flag or environment); the service
+    /// never reinterprets it (3.2).
+    pub fn set_max_total_steps(&self, ceiling: Option<usize>) {
+        *self
+            .inner
+            .max_total_steps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = ceiling;
+    }
+
+    pub(crate) fn max_total_steps(&self) -> Option<usize> {
+        *self
+            .inner
+            .max_total_steps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Starts the retention GC unconditionally. Hosts decide enablement via
@@ -208,19 +240,17 @@ impl LocalQcgService {
             // "canceled" display. Cancellation only applies to runs with no
             // durable terminal state yet.
             if let Some(terminal) = state.terminal.clone() {
-                record.state = match terminal {
-                    qcg_engine::TerminalState::Succeeded => RunStatus::Succeeded,
-                    qcg_engine::TerminalState::Failed => RunStatus::Failed,
-                    qcg_engine::TerminalState::Canceled => RunStatus::Canceled,
-                    qcg_engine::TerminalState::Interrupted => RunStatus::Interrupted,
-                };
+                record.state = terminal_status(&terminal);
                 continue;
             }
             if has_remote_cancel_request(&record.run_dir)? {
                 // A peer requested cancellation via the shared journal.
                 // Apply locally: stop any local task and mark the request
                 // accepted. Only a journaled terminal state settles this
-                // into `Canceled` (A02).
+                // into `Canceled` (A02). Settlement follows through the
+                // common finalizer: the periodic resumer spawns task-less
+                // accepted runs and the spawned task settles, so refresh
+                // itself never journals while ownership is ambiguous (B10).
                 record.cancellation.cancel();
                 record.state = RunStatus::CancelRequested;
                 record.preempted = false;
@@ -301,6 +331,113 @@ impl LocalQcgService {
         Ok(())
     }
 
+    /// Settles a run canceled before (or without) execution through the one
+    /// terminal path every other settlement uses. Callers hold the run
+    /// execution lease (no live owner writer exists), so draining and the
+    /// terminal append are atomic against peers. Mailbox drain comes first
+    /// so the cancel request itself journals; then a terminal `run_canceled`
+    /// converges memory, task slot, and waiters.
+    ///
+    /// Memory never precedes the journal here (B10): the in-memory state
+    /// becomes `Canceled` only after the terminal event is durably
+    /// appended (or when the fold already shows a terminal outcome, in
+    /// which case memory converges to that exact outcome, never a second
+    /// terminal event). A failed terminal append leaves memory at
+    /// `CancelRequested` with the task slot cleared, so the periodic
+    /// resumer retries settlement instead of wedging on a believed
+    /// terminal state the journal never recorded. A task slot holding a
+    /// completed handle is not a running task, so the slot is always
+    /// cleared here.
+    pub(crate) async fn settle_queued_cancel(
+        &self,
+        run_id: &str,
+        run_dir: &Utf8PathBuf,
+        reason: &str,
+    ) {
+        if let Err(error) = self.drain_cancel_controls(run_id, run_dir).await {
+            tracing::warn!(run_id = %run_id, %error, "cancel drain failed during queued settlement; mailbox retained");
+        }
+        let terminal = match crate::summaries::fold_run_state(run_dir) {
+            Ok(state) => state.terminal.clone(),
+            Err(error) => {
+                tracing::error!(run_id = %run_id, %error, "state fold failed during queued settlement");
+                None
+            }
+        };
+        if let Some(terminal) = terminal {
+            // Already terminal: converge memory to the durable outcome.
+            let mut runs = self.inner.runs.write().await;
+            if let Some(record) = runs.get_mut(run_id) {
+                record.state = terminal_status(&terminal);
+                record.preempted = false;
+                record.question = None;
+                record.confirm = None;
+                record
+                    .task
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take();
+            }
+            self.inner.queue_notify.notify_waiters();
+            return;
+        }
+        let snapshot = {
+            let runs = self.inner.runs.read().await;
+            runs.get(run_id).cloned()
+        };
+        let Some(record) = snapshot else {
+            return;
+        };
+        match crate::run_dirs::write_run_event(
+            &record,
+            "run_canceled",
+            serde_json::json!({
+                "reason": FailureDetail::new(
+                    FailureCode::Canceled,
+                    reason,
+                ),
+            }),
+        ) {
+            Ok(()) => {
+                let mut runs = self.inner.runs.write().await;
+                if let Some(record) = runs.get_mut(run_id) {
+                    // Terminal settlement only moves forward; a
+                    // peer-settled outcome observed meanwhile is preserved.
+                    if !record.state.is_terminal() {
+                        record.state = RunStatus::Canceled;
+                    }
+                    record.preempted = false;
+                    record.question = None;
+                    record.confirm = None;
+                    record
+                        .task
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .take();
+                }
+            }
+            Err(error) => {
+                tracing::error!(run_id = %run_id, %error, "queued cancel settlement failed; acceptance retained for retry");
+                let mut runs = self.inner.runs.write().await;
+                if let Some(record) = runs.get_mut(run_id) {
+                    // Accepted but not settled: report acceptance, never a
+                    // terminal state the journal does not contain.
+                    if !record.state.is_terminal() {
+                        record.state = RunStatus::CancelRequested;
+                    }
+                    record.question = None;
+                    record.confirm = None;
+                    record
+                        .task
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .take();
+                }
+            }
+        }
+        self.inner.queue_notify.notify_waiters();
+    }
+
     /// Converts pending cancel mailbox files to single
     /// `user_cancel_requested` journal events. Integrity comes from the
     /// journal lock with a per-operation re-check, so concurrent drainers
@@ -360,7 +497,7 @@ impl LocalQcgService {
             );
             match result {
                 Ok(()) => consume_cancel_control(run_dir, &operation_id),
-                Err(error) if error.to_string().contains("journal precondition failed") => {
+                Err(crate::types::ServiceError::PreconditionFailed(_)) => {
                     consume_cancel_control(run_dir, &operation_id)
                 }
                 Err(error) => {
@@ -376,7 +513,11 @@ impl LocalQcgService {
     /// Restarts durable runs that were queued or executing when the previous
     /// service process stopped. Completed steps are replayed from the journal;
     /// their pinned files and resources are verified by the engine before any
-    /// remaining work is admitted.
+    /// remaining work is admitted. Runs left in accepted-but-unsettled
+    /// `CancelRequested` (acceptance journaled or observed, terminal event
+    /// never written) are adopted too: the spawned task observes the
+    /// cancellation and settles through the common finalizer instead of
+    /// leaving the acceptance terminally un-converged (B10).
     pub async fn resume_recovered_runs(&self) {
         let recovered = {
             let runs = self.inner.runs.read().await;
@@ -385,7 +526,8 @@ impl LocalQcgService {
                 // a spawned engine task; adopting one would double-execute.
                 .filter(|(_, record)| {
                     !record.ephemeral
-                        && record.state == RunStatus::Queued
+                        && (record.state == RunStatus::Queued
+                            || record.state == RunStatus::CancelRequested)
                         && record
                             .task
                             .lock()
@@ -433,13 +575,17 @@ impl LocalQcgService {
             runs.iter()
                 .filter(|(_, record)| {
                     !record.ephemeral
-                        && record.state == RunStatus::Queued
                         && record
                             .task
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner)
                             .is_none()
-                        && record.queued_at.is_none_or(|at| at <= cutoff)
+                        // Stale queue entries re-enter admission; accepted
+                        // cancellations without a task converge through the
+                        // common finalizer on the next spawn (B10).
+                        && ((record.state == RunStatus::Queued
+                            && record.queued_at.is_none_or(|at| at <= cutoff))
+                            || record.state == RunStatus::CancelRequested)
                 })
                 .map(|(run_id, record)| SpawnRun {
                     run_id: run_id.clone(),
@@ -685,7 +831,6 @@ impl LocalQcgService {
             cancellation,
             task,
         } = request;
-        let task_slot = Arc::clone(&task);
         let runtime = Arc::clone(&self.inner.llm_runtime);
         let permits = Arc::clone(&self.inner.execution_permits);
         let queue_notify = Arc::clone(&self.inner.queue_notify);
@@ -694,11 +839,13 @@ impl LocalQcgService {
             // Convert pending cancel mailbox entries to single journal events
             // before the engine writer starts. This task holds the execution
             // lease, so no other owner appends concurrently (A01/A02). A
-            // failed drain refuses to start: the mailbox is retained and a
-            // later spawn retries instead of running past a cancel.
+            // failed drain refuses to start: settle terminally so the run
+            // converges instead of wedging half-started past a cancel.
             if let Err(error) = service.drain_cancel_controls(&run_id, &run_dir).await {
                 tracing::error!(run_id = %run_id, %error, "cancel drain failed; refusing to start execution");
-                *task_slot.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                service
+                    .settle_queued_cancel(&run_id, &run_dir, "cancel drain failed before execution")
+                    .await;
                 return;
             }
             // Priority admission: only the queue head takes a slot, so a
@@ -719,18 +866,11 @@ impl LocalQcgService {
                     }
                 };
                 if queued_cancel || cancellation.is_cancelled() {
-                    let mut runs = service.inner.runs.write().await;
-                    if let Some(record) = runs.get_mut(&run_id) {
-                        // A settled run never regresses.
-                        if !record.state.is_terminal() {
-                            // Acceptance without settlement: no engine ever
-                            // ran, so no terminal event exists yet (A02).
-                            record.state = RunStatus::CancelRequested;
-                            record.preempted = false;
-                            record.question = None;
-                            record.confirm = None;
-                        }
-                    }
+                    // Terminal settlement through the common finalizer: an
+                    // accepted cancel converges instead of lingering.
+                    service
+                        .settle_queued_cancel(&run_id, &run_dir, "cancellation requested")
+                        .await;
                     return;
                 }
                 let head = {
@@ -744,7 +884,12 @@ impl LocalQcgService {
                     break permit;
                 }
                 tokio::select! {
-                    _ = cancellation.cancelled() => return,
+                    _ = cancellation.cancelled() => {
+                        service
+                            .settle_queued_cancel(&run_id, &run_dir, "cancellation requested")
+                            .await;
+                        return;
+                    }
                     _ = notified => continue,
                 }
             };
@@ -774,12 +919,12 @@ impl LocalQcgService {
                     || peer_cancel
                     || cancellation.is_cancelled()
                 {
-                    // Acceptance without settlement: execution never starts,
-                    // so no terminal event exists yet (A02).
-                    record.state = RunStatus::CancelRequested;
-                    record.preempted = false;
-                    record.question = None;
-                    record.confirm = None;
+                    drop(runs);
+                    // Terminal settlement through the common finalizer:
+                    // execution never starts, so settle without starting it.
+                    service
+                        .settle_queued_cancel(&run_id, &run_dir, "cancellation requested")
+                        .await;
                     return;
                 }
                 // Never resume past a durable terminal state: a stale Queued
@@ -787,10 +932,7 @@ impl LocalQcgService {
                 match crate::summaries::fold_run_state(&run_dir) {
                     Ok(state) if state.terminal.is_some() => {
                         record.state = match state.terminal {
-                            Some(qcg_engine::TerminalState::Succeeded) => RunStatus::Succeeded,
-                            Some(qcg_engine::TerminalState::Failed) => RunStatus::Failed,
-                            Some(qcg_engine::TerminalState::Canceled) => RunStatus::Canceled,
-                            Some(qcg_engine::TerminalState::Interrupted) => RunStatus::Interrupted,
+                            Some(terminal) => terminal_status(&terminal),
                             None => RunStatus::Canceled,
                         };
                         record.preempted = false;
@@ -809,8 +951,10 @@ impl LocalQcgService {
                 // lease so peers observe the active owner.
                 record.owner_id = service.inner.owner_id.clone();
             }
-            let policy =
-                crate::types::ResolvedExecutionPolicy::resolve(contract.manifest.budget.max_steps);
+            let policy = crate::types::ResolvedExecutionPolicy::resolve(
+                contract.manifest.budget.max_steps,
+                service.max_total_steps(),
+            );
             let engine = Engine::new(app_registry(Arc::clone(&runtime))).with_snapshot_source(
                 Arc::new(ServiceSnapshotSource {
                     service: service.clone(),
@@ -960,8 +1104,10 @@ impl LocalQcgService {
                 record.state = RunStatus::Running;
             }
         }
-        let policy =
-            crate::types::ResolvedExecutionPolicy::resolve(contract.manifest.budget.max_steps);
+        let policy = crate::types::ResolvedExecutionPolicy::resolve(
+            contract.manifest.budget.max_steps,
+            self.max_total_steps(),
+        );
         let result = Engine::new(app_registry(Arc::clone(&runtime)))
             .with_snapshot_source(Arc::new(ServiceSnapshotSource {
                 service: self.clone(),
@@ -1094,8 +1240,10 @@ impl LocalQcgService {
                 record.state = RunStatus::Running;
             }
         }
-        let policy =
-            crate::types::ResolvedExecutionPolicy::resolve(contract.manifest.budget.max_steps);
+        let policy = crate::types::ResolvedExecutionPolicy::resolve(
+            contract.manifest.budget.max_steps,
+            self.max_total_steps(),
+        );
         let manifest = Engine::new(app_registry(Arc::clone(&runtime)))
             .run_with_id(
                 run_id.clone(),

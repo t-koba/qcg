@@ -28,6 +28,17 @@ pub enum StepError {
         used: u64,
         limit: u64,
     },
+    /// The operation guard refused execution: resend of changed content,
+    /// uncacheable prior success, or indeterminate outcome without an
+    /// at-least-once opt-in. Never retried automatically; manual recovery
+    /// or a policy decision is required.
+    #[error("step `{node}` refused: {message}")]
+    Refused { node: String, message: String },
+    /// A per-attempt execution timeout fired. Classified distinctly from
+    /// ordinary failures so retry policy can tell an unknown-outcome
+    /// timeout apart from a proven-clean error (B08/B11).
+    #[error("step `{node}` timed out after {timeout_secs}s")]
+    TimedOut { node: String, timeout_secs: u64 },
 }
 
 impl StepError {

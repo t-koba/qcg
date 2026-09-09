@@ -6,6 +6,24 @@ use crate::parse::parse_responses_response;
 use crate::provider::ApiFlavor;
 use crate::types::{ChatContent, ChatResponse, ChatStreamEvent, LlmError, StopReason, TokenUsage};
 
+/// Emits one ingest delta without ever blocking. The gate path drains only
+/// between ingest calls, so a blocking send would deadlock the stream loop
+/// on a fan-out chunk (many tool-call deltas in one SSE value) instead of
+/// failing. A full channel fails closed with a loud error; a closed
+/// receiver keeps its existing error.
+fn send_ingest_event(
+    events: &mpsc::Sender<ChatStreamEvent>,
+    event: ChatStreamEvent,
+) -> Result<(), LlmError> {
+    use tokio::sync::mpsc::error::TrySendError;
+    events.try_send(event).map_err(|error| match error {
+        TrySendError::Closed(_) => LlmError::new("LLM stream receiver closed"),
+        TrySendError::Full(_) => {
+            LlmError::new("LLM provider stream fan-out exceeded the ingest channel capacity")
+        }
+    })
+}
+
 pub(crate) enum HttpStreamAccumulator {
     Chat(ChatCompletionAccumulator),
     Responses,
@@ -106,12 +124,12 @@ impl ChatCompletionAccumulator {
             .filter(|text| !text.is_empty())
         {
             self.text.push_str(text);
-            events
-                .send(ChatStreamEvent::TextDelta {
+            send_ingest_event(
+                events,
+                ChatStreamEvent::TextDelta {
                     text: text.to_string(),
-                })
-                .await
-                .map_err(|_| LlmError::new("LLM stream receiver closed"))?;
+                },
+            )?;
         }
         for call in delta
             .get("tool_calls")
@@ -203,12 +221,12 @@ async fn ingest_responses_stream(
             if let Some(text) = value.get("delta").and_then(Value::as_str)
                 && !text.is_empty()
             {
-                events
-                    .send(ChatStreamEvent::TextDelta {
+                send_ingest_event(
+                    events,
+                    ChatStreamEvent::TextDelta {
                         text: text.to_string(),
-                    })
-                    .await
-                    .map_err(|_| LlmError::new("LLM stream receiver closed"))?;
+                    },
+                )?;
             }
             Ok(None)
         }
@@ -277,12 +295,12 @@ impl AnthropicAccumulator {
                     Some("text_delta") | Some("refusal_delta") => {
                         if let Some(text) = delta.get("text").and_then(Value::as_str) {
                             self.text.push_str(text);
-                            events
-                                .send(ChatStreamEvent::TextDelta {
+                            send_ingest_event(
+                                events,
+                                ChatStreamEvent::TextDelta {
                                     text: text.to_string(),
-                                })
-                                .await
-                                .map_err(|_| LlmError::new("LLM stream receiver closed"))?;
+                                },
+                            )?;
                         }
                     }
                     Some("input_json_delta") => {

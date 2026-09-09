@@ -214,7 +214,11 @@ pub const LXC_CAP_DROP: &str = "sys_module sys_rawio sys_boot sys_time audit_con
 /// isolation, workspace-only bind mounts, dropped capabilities, and
 /// no-new-privileges. Guests are written relative to the container rootfs.
 pub fn lxc_config_text(mounts: &[Mount<'_>]) -> Result<String, ContainerError> {
-    let mut text = String::from("lxc.net.0.type = none\n");
+    // `none` shares the HOST network namespace (it is not isolation);
+    // loopback-only isolation is `empty`. The bare `lxc.net =` first clears
+    // any inherited network stanza so a surrounding default cannot re-add
+    // interfaces behind the explicit setting (B03).
+    let mut text = String::from("lxc.net =\nlxc.net.0.type = empty\n");
     for mount in mounts {
         validate_guest_path(mount.guest)?;
         let relative = mount.guest.trim_start_matches('/');

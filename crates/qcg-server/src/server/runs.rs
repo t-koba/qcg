@@ -69,6 +69,11 @@ pub(crate) async fn list_runs(
             }
         }
     }
+    // Descending order serves newest-first views: the same
+    // `started_at|run_id` cursor compares flipped, and the page is cut
+    // from the newest end so capped fetches never lose recent runs (B12).
+    // Ascending keeps the original contract byte-for-byte.
+    let descending = matches!(query.order, Some(qcg_api::RunListOrder::Desc));
     items.retain(|item| {
         query.state.is_none_or(|run_state| item.state == run_state)
             && query
@@ -82,9 +87,16 @@ pub(crate) async fn list_runs(
             && cursor_position
                 .as_ref()
                 .is_none_or(|(cursor_started, cursor_id)| {
-                    (&item.started_at, &item.run_id) > (cursor_started, cursor_id)
+                    if descending {
+                        (&item.started_at, &item.run_id) < (cursor_started, cursor_id)
+                    } else {
+                        (&item.started_at, &item.run_id) > (cursor_started, cursor_id)
+                    }
                 })
     });
+    if descending {
+        items.reverse();
+    }
     let next_cursor = (items.len() > limit).then(|| {
         let last = &items[limit - 1];
         format!("{}|{}", last.started_at, last.run_id)

@@ -59,12 +59,12 @@
       </button>
     {/each}
     {#if hiddenCount > 0}
-      <button type="button" class="secondary-btn" onclick={() => store.loadMoreHistory()}>
+      <button type="button" class="secondary-btn" disabled={store.historyLoading} onclick={() => store.loadMoreHistory()}>
         {messages.loadMore} ({hiddenCount})
       </button>
     {/if}
     {#if store.historyHasMore}
-      <p class="run-history-empty">More history remains on the server. Refine the filter or use the API cursor.</p>
+      <p class="run-history-empty">More history remains on the server; Load more fetches the next page.</p>
     {/if}
   {/if}
 </nav>

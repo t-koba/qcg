@@ -388,6 +388,26 @@ pub struct RetryPolicy {
     /// Per-attempt execution timeout in seconds. Omitted means no timeout.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// What a retry may do after an indeterminate outcome (started but
+    /// finished unknown: timeout, disconnect, killed process). `fail`
+    /// refuses automatic replay; `repeat` re-executes the same invocation
+    /// and records the acknowledged double-apply risk. Defaults to `fail`.
+    /// Clean failures (remote-declared errors, validation) always retry
+    /// within `max_attempts`; successes never retry.
+    #[serde(default)]
+    pub on_indeterminate: RetryOnIndeterminate,
+}
+
+/// Retry policy for indeterminate operation outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryOnIndeterminate {
+    /// Refuse automatic replay of indeterminate operations (default).
+    #[default]
+    Fail,
+    /// Re-execute the same invocation, acknowledging possible double-apply.
+    /// The choice is journaled with the attempt.
+    Repeat,
 }
 
 impl Default for RetryPolicy {
@@ -396,6 +416,7 @@ impl Default for RetryPolicy {
             max_attempts: default_retry_attempts(),
             backoff_ms: 0,
             timeout_secs: None,
+            on_indeterminate: RetryOnIndeterminate::Fail,
         }
     }
 }

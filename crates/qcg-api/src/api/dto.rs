@@ -197,6 +197,16 @@ pub struct RunListResponse {
     pub next_cursor: Option<String>,
 }
 
+/// Run history sort order. Ascending is the default and preserves the
+/// existing cursor contract; descending serves newest-first views so
+/// recent runs never fall out of a capped fetch window (B12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RunListOrder {
+    Asc,
+    Desc,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct RunListQuery {
     pub limit: Option<usize>,
@@ -204,6 +214,7 @@ pub struct RunListQuery {
     pub state: Option<RunStatus>,
     pub generator_id: Option<String>,
     pub since: Option<String>,
+    pub order: Option<RunListOrder>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

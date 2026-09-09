@@ -3312,6 +3312,223 @@ fs_write = ["workspace"]
     }
 
     #[tokio::test]
+    async fn accepted_cancel_converges_to_terminal_without_a_second_cancel() {
+        // B10: continuing the acceptance scenario, recovery adopts the
+        // task-less accepted run and the common finalizer journals the
+        // terminal outcome. No second cancel is ever issued.
+        let root = temp_run_dir("cancel-converge");
+        let _ = std::fs::remove_dir_all(&root);
+        let generator = root.join("generator");
+        let runs = root.join("runs");
+        std::fs::create_dir_all(&generator).expect("generator directory should be created");
+        std::fs::write(
+            generator.join("qcg.toml"),
+            r#"
+[generator]
+id = "generator"
+name = "Cancel Converge"
+version = "0.1.0"
+qcg_version = "^0.1"
+
+[[flow]]
+id = "ask"
+type = "ask_user"
+
+[flow.params]
+content = "Continue?"
+options = ["yes"]
+
+[permissions]
+fs_write = ["workspace"]
+"#,
+        )
+        .expect("generator manifest should be written");
+        let owner = LocalQcgService::new(root.clone(), runs.clone(), None)
+            .expect("service should initialize");
+        let id = owner
+            .start_run(StartRun {
+                generator_id: "generator".into(),
+                inputs: BTreeMap::new(),
+                ..Default::default()
+            })
+            .await
+            .expect("run should start");
+        wait_for_snapshot(&owner, &id, RunStatus::Waiting).await;
+        let peer = LocalQcgService::with_generator_roots_max_active_runs_and_store_mode(
+            vec![root.clone()],
+            runs.clone(),
+            None,
+            qcg_policy::DEFAULT_MAX_ACTIVE_RUNS,
+            DEFAULT_MAX_TRACKED_RUNS,
+            RunStoreMode::SharedFilesystem,
+        )
+        .expect("peer should initialize");
+        let run_dir = peer.run_dir_for(&id).await.expect("run dir should resolve");
+        crate::run_dirs::request_remote_cancel(&run_dir, &id, "peer-test")
+            .expect("mailbox write should succeed");
+        peer.refresh_shared_runs()
+            .await
+            .expect("refresh should succeed");
+        assert_eq!(
+            peer.snapshot(id.clone())
+                .await
+                .expect("snapshot should be available")
+                .state,
+            RunStatus::CancelRequested,
+            "acceptance must display before settlement"
+        );
+        // Recovery adopts the accepted run; the spawned task settles it.
+        peer.resume_recovered_runs().await;
+        let terminal = wait_for_terminal_snapshot(&peer, &id).await;
+        assert_eq!(
+            terminal.state,
+            RunStatus::Canceled,
+            "accepted cancel must converge to canceled"
+        );
+        // Exactly one terminal outcome is journaled: acceptance never
+        // counted as settlement, settlement never duplicated it.
+        let folded = crate::summaries::fold_run_state(&run_dir).expect("fold should succeed");
+        assert!(
+            folded.terminal.is_some(),
+            "convergence must journal a terminal outcome"
+        );
+        let events = crate::summaries::read_events_from_meta(&crate::run_meta_dir(&run_dir))
+            .expect("events should read");
+        let terminals = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.get("t").and_then(serde_json::Value::as_str),
+                    Some("run_canceled")
+                        | Some("run_finished")
+                        | Some("run_error")
+                        | Some("run_interrupted")
+                )
+            })
+            .count();
+        assert_eq!(terminals, 1, "exactly one terminal event must exist");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn losing_hitl_race_answers_without_deadlocking_the_run_map() {
+        // B01: a peer that loses the journal precondition race must report
+        // the rejection promptly instead of deadlocking the runs map against
+        // itself (write guard held across a lock-taking classify await).
+        // Two services share one runs directory so neither peer's memory
+        // fast path can decide the race; only the durable precondition can.
+        let root = temp_run_dir("hitl-race-no-deadlock");
+        let _ = std::fs::remove_dir_all(&root);
+        let generator = root.join("generator");
+        let runs = root.join("runs");
+        std::fs::create_dir_all(&generator).expect("generator directory should be created");
+        std::fs::write(
+            generator.join("qcg.toml"),
+            r#"
+[generator]
+id = "generator"
+name = "Race"
+version = "0.1.0"
+qcg_version = "^0.1"
+
+[[flow]]
+id = "ask"
+type = "ask_user"
+
+[flow.params]
+content = "Continue?"
+options = ["yes", "no"]
+
+[permissions]
+fs_write = ["workspace"]
+"#,
+        )
+        .expect("generator manifest should be written");
+        let make_service = || {
+            LocalQcgService::with_generator_roots_max_active_runs_and_store_mode(
+                vec![root.clone()],
+                runs.clone(),
+                None,
+                qcg_policy::DEFAULT_MAX_ACTIVE_RUNS,
+                DEFAULT_MAX_TRACKED_RUNS,
+                RunStoreMode::SharedFilesystem,
+            )
+            .expect("shared service should initialize")
+        };
+        let owner = make_service();
+        let peer = make_service();
+        let id = owner
+            .start_run(StartRun {
+                generator_id: "generator".into(),
+                inputs: BTreeMap::new(),
+                ..Default::default()
+            })
+            .await
+            .expect("run should start");
+        let question = wait_for_snapshot(&owner, &id, RunStatus::Waiting)
+            .await
+            .question
+            .expect("run should be waiting");
+        // A second run proves the map stays responsive while the loser is
+        // being classified.
+        let probe = owner
+            .start_run(StartRun {
+                generator_id: "generator".into(),
+                inputs: BTreeMap::new(),
+                ..Default::default()
+            })
+            .await
+            .expect("probe run should start");
+        // The peer observes the waiting generation before the owner wins,
+        // so its memory checks pass later and only the journal precondition
+        // can reject it.
+        peer.refresh_shared_runs()
+            .await
+            .expect("refresh should succeed");
+        owner
+            .answer(
+                id.clone(),
+                question.id.clone(),
+                AnswerPayload {
+                    values: BTreeMap::from([("answer".into(), json!("yes"))]),
+                },
+            )
+            .await
+            .expect("winning answer should be accepted");
+        let (loser, probe_snapshot) = tokio::join!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                peer.answer(
+                    id.clone(),
+                    question.id.clone(),
+                    AnswerPayload {
+                        values: BTreeMap::from([("answer".into(), json!("no"))]),
+                    },
+                )
+            ),
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                peer.snapshot(probe.clone()),
+            ),
+        );
+        let loser = loser
+            .expect("losing answer must respond, not deadlock")
+            .expect_err("losing answer must be rejected");
+        // Either accurate classification proves prompt rejection without
+        // deadlock: a finished run reports terminal, a still-settling run
+        // reports the conflicting acceptance.
+        assert!(
+            loser.to_string().contains("different values")
+                || loser.to_string().contains("already terminal"),
+            "loser should see the conflict, got: {loser}"
+        );
+        probe_snapshot
+            .expect("unrelated snapshot must stay responsive")
+            .expect("probe snapshot should exist");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
     async fn snapshot_exposes_generator_id_without_parsing_run_id() {
         // C03: snapshots carry the generator id explicitly so UUID hyphens
         // never leak into parsed ids.

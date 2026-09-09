@@ -267,6 +267,7 @@ impl McpAgentTools {
         args: Value,
         input_responses: Option<BTreeMap<String, Value>>,
         request_state: Option<String>,
+        cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<McpCallOutcome, StepError> {
         let tool = self.tools.get(alias).ok_or_else(|| {
             StepError::failed(
@@ -280,12 +281,23 @@ impl McpAgentTools {
                 format!("MCP server `{}` has no active session", tool.server),
             )
         })?;
-        let result = agent_mcp_result(
-            session
-                .call_tool_with_input(&tool.remote_name, args, input_responses, request_state)
-                .await,
-        )
-        .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
+        // Observe the caller's scope while the remote call is in flight:
+        // the session carries its connect-time token, but the current
+        // node scope (timeout or parent cancel) must stop the wait even
+        // when the session outlives it.
+        let outcome = tokio::select! {
+            _ = cancellation.cancelled() => {
+                return Err(StepError::Cancelled);
+            }
+            result = session.call_tool_with_input(
+                &tool.remote_name,
+                args,
+                input_responses,
+                request_state,
+            ) => result,
+        };
+        let result = agent_mcp_result(outcome)
+            .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
         let McpCallOutcome::Complete(value) = &result else {
             return Ok(result);
         };

@@ -135,46 +135,93 @@ impl StepExecutor for CommandStep {
             return Ok(StepOutcome::NeedsConfirm { confirm });
         }
         let details = Some(plan.clone());
-        let operation_id =
-            ctx.run
-                .guard_external_operation(ctx.journal, node, "command", &target, &details)?;
-        let input = command_input(ctx, node, &params).await?;
-        let output = match ctx
-            .run
-            .cmd
-            .run_with_limits_and_stdin(
-                &command,
-                ctx.run.contract.manifest.runtime.command_timeout_seconds,
-                ctx.run.contract.manifest.runtime.command_output_limit_bytes,
-                input.as_deref(),
-            )
-            .await
-        {
-            Ok(output) => output,
-            Err(error) => {
-                let _ = ctx.run.finish_external_operation_with_status(
-                    ctx.journal,
-                    node,
-                    &operation_id,
-                    "error",
-                );
-                return Err(StepError::from_gateway(&node.id, error));
-            }
-        };
-        if output.status != 0 {
-            let _ = ctx.run.finish_external_operation_with_status(
+        let digest = qcg_engine::RunContext::operation_digest(&target, &details)?;
+        let invocation = qcg_engine::content_invocation_id(&digest);
+        // Same-invocation resends deserialize the cached native output and
+        // continue through the identical tail below, so outputs, files, and
+        // check decisions match the original execution exactly.
+        let (output, operation_id): (qcg_engine::CommandOutput, Option<String>) =
+            match ctx.run.guard_external_operation(
                 ctx.journal,
                 node,
-                &operation_id,
-                "error",
-            );
+                "command",
+                &target,
+                &details,
+                &invocation,
+            )? {
+                qcg_engine::GuardDecision::Proceed { operation_id } => {
+                    let input = command_input(ctx, node, &params).await?;
+                    let output = match ctx
+                        .run
+                        .cmd
+                        .run_with_limits_and_stdin(
+                            &command,
+                            ctx.run.contract.manifest.runtime.command_timeout_seconds,
+                            ctx.run.contract.manifest.runtime.command_output_limit_bytes,
+                            input.as_deref(),
+                        )
+                        .await
+                    {
+                        Ok(output) => output,
+                        Err(error) => {
+                            // Cancellation finishes nothing: it propagates
+                            // without a completion record.
+                            if !matches!(error, qcg_engine::GatewayError::Canceled) {
+                                ctx.run.finish_external_operation_with_warn(
+                                    ctx.journal,
+                                    node,
+                                    &operation_id,
+                                    qcg_engine::OperationOutcome::gateway_error(&error, false),
+                                );
+                            }
+                            return Err(StepError::from_gateway(&node.id, error));
+                        }
+                    };
+                    let output_value = serde_json::to_value(&output).map_err(|error| {
+                        StepError::failed(
+                            &node.id,
+                            format!("command output is not serializable: {error}"),
+                        )
+                    })?;
+                    ctx.run.finish_external_operation(
+                        ctx.journal,
+                        node,
+                        &operation_id,
+                        Some(output_value),
+                    )?;
+                    (output, Some(operation_id))
+                }
+                qcg_engine::GuardDecision::Resend { result, .. } => {
+                    let output: qcg_engine::CommandOutput = serde_json::from_value(result)
+                        .map_err(|error| {
+                            StepError::failed(
+                                &node.id,
+                                format!("cached command output is corrupt: {error}"),
+                            )
+                        })?;
+                    (output, None)
+                }
+            };
+        if output.status != 0 {
+            // A non-zero exit may have applied effects: indeterminate, never
+            // clean. Retries need an explicit at-least-once opt-in. Cached
+            // outputs always passed this check originally, so the id is
+            // present whenever this arm runs.
+            if let Some(operation_id) = &operation_id {
+                ctx.run.finish_external_operation_with_warn(
+                    ctx.journal,
+                    node,
+                    operation_id,
+                    qcg_engine::OperationOutcome::Indeterminate {
+                        reason: format!("command exited with {}", output.status),
+                    },
+                );
+            }
             return Err(StepError::failed(
                 &node.id,
                 format!("command exited with {}", output.status),
             ));
         }
-        ctx.run
-            .finish_external_operation(ctx.journal, node, &operation_id)?;
         match params.result {
             CommandResultMode::Process => Ok(StepOutcome::Success {
                 output: Some(json!({

@@ -59,7 +59,10 @@ pub(crate) fn write_run_event_if(
         Some(record.events.clone()),
         check,
     )
-    .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    .map_err(|error| match error {
+        JournalError::PreconditionFailed(detail) => ServiceError::PreconditionFailed(detail),
+        error => ServiceError::Invalid(error.to_string()),
+    })?;
     Ok(())
 }
 

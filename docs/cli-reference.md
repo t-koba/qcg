@@ -145,6 +145,10 @@ their execution slot until resumed. The limit and provider runtimes are process-
 search provider HTTP clients and MCP OAuth token managers are shared by runs in
 one service process. Each run still owns an independent MCP protocol session.
 
+`--max-total-steps` (or `QCG_MAX_TOTAL_STEPS`) caps every run below its
+contract budget; omitted means the engine default. The enforced value and its
+origin are recorded per run so admission, snapshots, and the journal agree.
+
 For OAuth MCP profiles, use the loopback server's SPA Connections panel. The
 server exposes the MCP authorization endpoints documented in the
 [HTTP server guide](http-server-guide.md); there is no separate CLI command for

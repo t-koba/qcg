@@ -213,15 +213,26 @@ pub(crate) async fn execute_mcp_tool(
     if fresh {
         supersede_agent_mcp_continuations(ctx, node, server, alias, call_id, &args)?;
     }
+    // Agent invocations identify by call id: the checkpoint re-issues the
+    // exact suspended call on resume, so the recomputed id below matches
+    // the suspend-time guard id without storing it.
     let operation_id = if fresh {
         let details = Some(args.clone());
-        Some(ctx.run.guard_external_operation(
+        match ctx.run.guard_external_operation(
             ctx.journal,
             node,
             &format!("mcp:{alias}"),
             alias,
             &details,
-        )?)
+            call_id,
+        )? {
+            qcg_engine::GuardDecision::Proceed { operation_id } => Some(operation_id),
+            // Same invocation already succeeded: return the cached result
+            // without touching the remote again.
+            qcg_engine::GuardDecision::Resend { result, .. } => {
+                return Ok(AgentToolOutcome::Result(result));
+            }
+        }
     } else {
         None
     };
@@ -235,10 +246,14 @@ pub(crate) async fn execute_mcp_tool(
                 &ctx.run.run_id,
                 &node.id,
                 &digest,
+                call_id,
             ))
         }
     };
     for _round in 0..10 {
+        // The node-scoped token: node timeout stops this wait without
+        // touching the run, and parent cancellation propagates. The
+        // session's older connect-time token cannot cover either.
         let call_result = mcp
             .call(
                 node,
@@ -246,17 +261,25 @@ pub(crate) async fn execute_mcp_tool(
                 args.clone(),
                 input_responses.take(),
                 request_state.take(),
+                &ctx.run.cancellation,
             )
             .await;
         let outcome = match call_result {
             Ok(outcome) => outcome,
             Err(error) => {
-                if let Some(operation_id) = &operation_id {
-                    let _ = ctx.run.finish_external_operation_with_status(
+                // Transport failures may have applied remote effects:
+                // indeterminate, never clean. Cancellation finishes
+                // nothing and propagates without a completion record.
+                if !matches!(error, StepError::Cancelled)
+                    && let Some(operation_id) = &operation_id
+                {
+                    ctx.run.finish_external_operation_with_warn(
                         ctx.journal,
                         node,
                         operation_id,
-                        "error",
+                        qcg_engine::OperationOutcome::Indeterminate {
+                            reason: format!("MCP call failed: {error}"),
+                        },
                     );
                 }
                 return Err(error);
@@ -269,8 +292,12 @@ pub(crate) async fn execute_mcp_tool(
                 // completed one.
                 consume_agent_mcp_continuation(ctx, node, server, alias, call_id, &args)?;
                 if let Some(operation_id) = &operation_id {
-                    ctx.run
-                        .finish_external_operation(ctx.journal, node, operation_id)?;
+                    ctx.run.finish_external_operation(
+                        ctx.journal,
+                        node,
+                        operation_id,
+                        Some(value.clone()),
+                    )?;
                 }
                 return Ok(AgentToolOutcome::Result(value));
             }

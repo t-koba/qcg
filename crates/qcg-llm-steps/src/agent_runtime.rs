@@ -101,33 +101,51 @@ pub(crate) async fn execute_agent_tool(
             )? {
                 return Ok(AgentToolOutcome::NeedsConfirm(confirm));
             }
-            let operation_id = ctx.run.guard_external_operation(
+            // Agent invocations identify by call id: the checkpoint
+            // re-issues the exact suspended call on resume.
+            let operation_id = match ctx.run.guard_external_operation(
                 ctx.journal,
                 node,
                 "command",
                 &target,
                 &plan_value,
-            )?;
+                call_id,
+            )? {
+                qcg_engine::GuardDecision::Proceed { operation_id } => operation_id,
+                // Same invocation already succeeded: return the cached
+                // result without touching the remote again.
+                qcg_engine::GuardDecision::Resend { result, .. } => {
+                    return Ok(AgentToolOutcome::Result(result));
+                }
+            };
             let output = match ctx.run.cmd.run(command).await {
                 Ok(output) => output,
                 Err(error) => {
-                    let _ = ctx.run.finish_external_operation_with_status(
-                        ctx.journal,
-                        node,
-                        &operation_id,
-                        "error",
-                    );
+                    // Cancellation finishes nothing: it propagates
+                    // without a completion record.
+                    if !matches!(error, qcg_engine::GatewayError::Canceled) {
+                        ctx.run.finish_external_operation_with_warn(
+                            ctx.journal,
+                            node,
+                            &operation_id,
+                            qcg_engine::OperationOutcome::gateway_error(&error, false),
+                        );
+                    }
                     return Err(StepError::from_gateway(&node.id, error));
                 }
             };
-            ctx.run
-                .finish_external_operation(ctx.journal, node, &operation_id)?;
-            Ok(json!({
+            let output = json!({
                 "status": output.status,
                 "stdout": output.stdout,
                 "stderr": output.stderr,
-            }))
-            .map(AgentToolOutcome::Result)
+            });
+            ctx.run.finish_external_operation(
+                ctx.journal,
+                node,
+                &operation_id,
+                Some(output.clone()),
+            )?;
+            Ok(AgentToolOutcome::Result(output))
         }
         ToolDecl::Http { methods, hosts, .. } => {
             let method = args
@@ -191,14 +209,25 @@ pub(crate) async fn execute_agent_tool(
             let operation_id = if matches!(method.as_str(), "GET" | "HEAD") {
                 None
             } else {
-                Some(ctx.run.guard_external_operation(
-                    ctx.journal,
-                    node,
-                    "http",
-                    url,
-                    &http_details,
-                )?)
+                Some(
+                    match ctx.run.guard_external_operation(
+                        ctx.journal,
+                        node,
+                        "http",
+                        url,
+                        &http_details,
+                        call_id,
+                    )? {
+                        qcg_engine::GuardDecision::Proceed { operation_id } => operation_id,
+                        // Same invocation already succeeded: return the cached
+                        // result without touching the remote again.
+                        qcg_engine::GuardDecision::Resend { result, .. } => {
+                            return Ok(AgentToolOutcome::Result(result));
+                        }
+                    },
+                )
             };
+            let safe_method = matches!(method.as_str(), "GET" | "HEAD");
             let output = match ctx
                 .run
                 .http
@@ -215,27 +244,36 @@ pub(crate) async fn execute_agent_tool(
             {
                 Ok(output) => output,
                 Err(error) => {
-                    if let Some(operation_id) = operation_id {
-                        let _ = ctx.run.finish_external_operation_with_status(
+                    // Cancellation finishes nothing: it propagates
+                    // without a completion record.
+                    if !matches!(error, qcg_engine::GatewayError::Canceled)
+                        && let Some(operation_id) = operation_id
+                    {
+                        ctx.run.finish_external_operation_with_warn(
                             ctx.journal,
                             node,
                             &operation_id,
-                            "error",
+                            qcg_engine::OperationOutcome::gateway_error(&error, safe_method),
                         );
                     }
                     return Err(StepError::from_gateway(&node.id, error));
                 }
             };
-            if let Some(operation_id) = operation_id {
-                ctx.run
-                    .finish_external_operation(ctx.journal, node, &operation_id)?;
-            }
-            Ok(AgentToolOutcome::Result(json!({
+            let output = json!({
                 "status": output.status,
                 "url": output.url,
                 "headers": output.headers,
                 "body": http_body_value(&output.body),
-            })))
+            });
+            if let Some(operation_id) = operation_id {
+                ctx.run.finish_external_operation(
+                    ctx.journal,
+                    node,
+                    &operation_id,
+                    Some(output.clone()),
+                )?;
+            }
+            Ok(AgentToolOutcome::Result(output))
         }
         ToolDecl::AskUser { .. } => {
             let question_id = format!("{}:{}", node.id, tool.name());

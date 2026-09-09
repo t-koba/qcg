@@ -80,6 +80,11 @@ pub struct JournalWriter {
     pub(crate) event_sender: Option<broadcast::Sender<RunEvent>>,
     pub(crate) limits: JournalLimits,
     pub(crate) stats: Arc<Mutex<JournalStats>>,
+    /// Post-repair journal byte length after this writer's last successful
+    /// append, unset until the first one. Resync fails closed when the
+    /// repaired file is shorter: durable history shrank outside the
+    /// journal lock (B09).
+    pub(crate) floor_len: Arc<Mutex<Option<u64>>>,
 }
 
 #[derive(Debug, Default, Clone, Serialize)]

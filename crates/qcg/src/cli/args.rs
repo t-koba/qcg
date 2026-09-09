@@ -186,6 +186,10 @@ pub(crate) enum Command {
             default_value_t = qcg_policy::DEFAULT_MAX_TRACKED_RUNS
         )]
         max_tracked_runs: usize,
+        /// Deployment ceiling for per-run total steps. Omitted means the
+        /// engine default; caps runs below their contract budget.
+        #[arg(long = "max-total-steps", env = "QCG_MAX_TOTAL_STEPS")]
+        max_total_steps: Option<usize>,
         #[arg(long, env = "QCG_RUN_STORE", value_enum, default_value_t = RunStoreArg::Exclusive)]
         run_store: RunStoreArg,
         #[arg(

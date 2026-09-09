@@ -119,13 +119,21 @@ pub struct RunState {
     pub terminal: Option<TerminalState>,
     #[serde(default)]
     pub execution_started: bool,
-    /// External side-effect operations by operation_id: `started` means the
-    /// remote may have executed while the result is unknown, `finished`
-    /// means the result was durably recorded. Retried executions with the
-    /// same id reuse the recorded result instead of duplicating the remote
-    /// effect; started-without-finished refuses automatic replay.
+    /// External side-effect operations by operation_id. Identity binds
+    /// run, node, content digest, AND invocation: distinct invocations
+    /// never share an id even for identical content, while the same
+    /// invocation reuses its id across resends and retries (B07).
+    /// Statuses: `Started` (remote may have executed, result unknown),
+    /// `Succeeded` (result durably recorded, resends converge without
+    /// re-executing), `FailedClean` (proven nothing applied, retryable),
+    /// `FailedIndeterminate` (unknown effects, refused unless the node
+    /// opts into at-least-once repeat) (B08).
+    /// Replaces the former `operations` status map without migration:
+    /// persisted snapshots drop the old map (no `deny_unknown_fields`)
+    /// and running state rebuilds from the journal fold, which is the
+    /// durable truth.
     #[serde(default)]
-    pub operations: BTreeMap<String, String>,
+    pub operation_records: BTreeMap<String, OperationRecord>,
     /// Guard generations by operation_id: counts `operation_started` events
     /// so each guard journals a truthful attempt number derived from durable
     /// state instead of a caller-supplied constant.
@@ -175,7 +183,7 @@ impl Default for RunState {
             pending_seq: None,
             terminal: None,
             execution_started: false,
-            operations: BTreeMap::new(),
+            operation_records: BTreeMap::new(),
             operation_attempts: BTreeMap::new(),
             answers: BTreeMap::new(),
             confirmations: BTreeMap::new(),
@@ -187,15 +195,74 @@ impl Default for RunState {
     }
 }
 
-/// Stable operation id for an external side effect. Binds run, node, and
-/// the canonical operation digest so retries of the same logical operation
-/// reuse the id as the remote idempotency key, while regenerated operations
-/// get a fresh id. Retries deliberately share the id; started/finished
-/// events track the latest status per id.
-pub fn operation_id_for(run_id: &str, node_id: &str, operation_digest: &str) -> String {
+/// Outcome class of a finished external operation. `Clean` failures prove
+/// nothing was applied (remote-declared errors, validation) and stay
+/// retryable; `Indeterminate` covers timeouts, disconnects, and kills where
+/// effects are unknowable (B08).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationStatus {
+    Started,
+    Succeeded,
+    FailedClean,
+    FailedIndeterminate,
+}
+
+/// Durable record of one external operation invocation: the content digest
+/// it was admitted with, its latest status, and a bounded cached result
+/// for same-invocation resends.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperationRecord {
+    pub digest: String,
+    pub status: OperationStatus,
+    /// Cached success result for resends, or `None` when the result was
+    /// too large to cache or never recorded: resends then route to
+    /// explicit manual recovery instead of silent re-execution.
+    #[serde(default)]
+    pub result: Option<Value>,
+}
+
+/// Results larger than this are not cached for resends: replays route to
+/// explicit manual recovery instead of bloating the journal or returning
+/// truncated results.
+pub const OPERATION_RESULT_MAX_BYTES: usize = 64 * 1024;
+
+/// Returns `Some(value)` when the value serializes within the resend-cache
+/// bound, else `None` (caller routes to manual recovery on resend).
+pub fn cacheable_operation_result(value: &Value) -> Option<Value> {
+    let bytes = serde_json::to_vec(value).ok()?;
+    (bytes.len() <= OPERATION_RESULT_MAX_BYTES).then(|| value.clone())
+}
+
+/// Invocation fragment distinguishing tool calls with identical content.
+/// Agent calls use their stable call id; single-shot step executions use a
+/// content-derived identity so restarts keep the same protection.
+pub fn invocation_fragment(invocation_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = hex::encode(Sha256::digest(invocation_id.as_bytes()));
+    digest[..8.min(digest.len())].to_string()
+}
+
+/// Content-derived invocation identity for single-shot step executions:
+/// one execution per node per content, stable across restarts.
+pub fn content_invocation_id(operation_digest: &str) -> String {
+    format!("content:{operation_digest}")
+}
+
+/// Stable operation id for an external side effect. Binds run, node,
+/// content digest, AND invocation: distinct invocations never share an id
+/// even for identical content, while the same invocation reuses its id
+/// across resends and retries as the remote idempotency key (B07).
+pub fn operation_id_for(
+    run_id: &str,
+    node_id: &str,
+    operation_digest: &str,
+    invocation_id: &str,
+) -> String {
     format!(
-        "{run_id}:{node_id}:{}",
-        &operation_digest[..16.min(operation_digest.len())]
+        "{run_id}:{node_id}:{}:{}",
+        &operation_digest[..16.min(operation_digest.len())],
+        invocation_fragment(invocation_id),
     )
 }
 
@@ -518,8 +585,14 @@ impl RunState {
                 if let Some(key) = event.get("pending_key").and_then(Value::as_str) {
                     self.mcp_pending.remove(key);
                     self.mcp_resumed.remove(key);
-                    self.operations
-                        .insert(format!("mcp:{key}"), "finished:consumed".to_string());
+                    self.operation_records.insert(
+                        format!("mcp:{key}"),
+                        OperationRecord {
+                            digest: String::new(),
+                            status: OperationStatus::Succeeded,
+                            result: None,
+                        },
+                    );
                 }
             }
             "mcp_continuation_resumed" => {
@@ -559,25 +632,61 @@ impl RunState {
             }
             "operation_started" => {
                 if let Some(id) = event.get("operation_id").and_then(Value::as_str) {
-                    self.operations
-                        .insert(id.to_string(), "started".to_string());
+                    let digest = event
+                        .get("operation_digest")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let record =
+                        self.operation_records
+                            .entry(id.to_string())
+                            .or_insert_with(|| OperationRecord {
+                                digest: digest.clone(),
+                                status: OperationStatus::Started,
+                                result: None,
+                            });
+                    // A restarted attempt reuses its record; only the status
+                    // motion matters, never a digest rewrite.
+                    record.status = OperationStatus::Started;
                     let attempts = self.operation_attempts.entry(id.to_string()).or_default();
                     *attempts = attempts.saturating_add(1);
                 }
             }
             "operation_finished" => {
                 if let Some(id) = event.get("operation_id").and_then(Value::as_str) {
-                    // A finished event without a status is corrupt: every
-                    // writer records one. Defaulting to success would refuse
-                    // replays of an indeterminate outcome, so fail toward
-                    // error, which retries under the same remote idempotency
-                    // key instead of wedging.
-                    let status = event
-                        .get("status")
-                        .and_then(Value::as_str)
-                        .unwrap_or("error");
-                    self.operations
-                        .insert(id.to_string(), format!("finished:{status}"));
+                    // One-way migration for pre-split journals, not a
+                    // compatibility shim: legacy writers recorded only
+                    // `success`/`error` without distinguishing clean from
+                    // indeterminate failures, and no current writer emits
+                    // those forms. Success without a cached result and
+                    // every legacy error fail toward explicit handling:
+                    // unknown effects must never read as safely retryable
+                    // (B08). Journals written by this version always carry
+                    // the split statuses and never take this path.
+                    let (status, result) = match event.get("status").and_then(Value::as_str) {
+                        Some("success") => {
+                            (OperationStatus::Succeeded, event.get("result").cloned())
+                        }
+                        Some("clean") => (OperationStatus::FailedClean, None),
+                        Some("indeterminate") => (OperationStatus::FailedIndeterminate, None),
+                        _ => (OperationStatus::FailedIndeterminate, None),
+                    };
+                    let record =
+                        self.operation_records
+                            .entry(id.to_string())
+                            .or_insert_with(|| OperationRecord {
+                                digest: String::new(),
+                                status,
+                                result: None,
+                            });
+                    // The started record carries the authoritative digest;
+                    // finished events repeat it, but an absent one must not
+                    // blank the check that refuses changed-content resends.
+                    if let Some(digest) = event.get("operation_digest").and_then(Value::as_str) {
+                        record.digest = digest.to_string();
+                    }
+                    record.status = status;
+                    record.result = result;
                 }
             }
             _ => {}
@@ -724,10 +833,39 @@ mod tests {
             .expect("retry guard should fold");
         assert_eq!(state.operation_attempts.get("op-a"), Some(&2));
         assert_eq!(state.operation_attempts.get("op-b"), Some(&1));
-        assert_eq!(
-            state.operations.get("op-a").map(String::as_str),
-            Some("started")
-        );
+        assert!(matches!(
+            state
+                .operation_records
+                .get("op-a")
+                .map(|record| record.status),
+            Some(OperationStatus::Started)
+        ));
+    }
+
+    #[test]
+    fn legacy_finished_error_folds_indeterminate() {
+        // Writers that only recorded `error` predate the clean vs
+        // indeterminate split: unknown effects must never read as safely
+        // retryable.
+        let mut state = RunState::default();
+        state
+            .apply(&operation_event(1, "operation_started", "op-a", None))
+            .expect("guard should fold");
+        state
+            .apply(&operation_event(
+                2,
+                "operation_finished",
+                "op-a",
+                Some("error"),
+            ))
+            .expect("finish should fold");
+        assert!(matches!(
+            state
+                .operation_records
+                .get("op-a")
+                .map(|record| record.status),
+            Some(OperationStatus::FailedIndeterminate)
+        ));
     }
 
     #[test]

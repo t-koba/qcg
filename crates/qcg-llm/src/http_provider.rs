@@ -463,11 +463,18 @@ impl HttpProvider {
         let mut stream = SseStream::from_bytes_stream(response.bytes_stream());
         let mut total_bytes = 0_usize;
         let mut accumulator = HttpStreamAccumulator::new(self.api);
-        // Decoded concatenation window for split/escaped credential
-        // reflection (A08). Raw `data.contains(key)` misses credentials
-        // split across deltas or JSON-escaped; decoded JSON inspection per
-        // chunk plus this running window closes both gaps.
-        let mut decoded_window = String::new();
+        // Pre-publication gate for the provider credential (B04): text
+        // deltas pass through it, and only prefixes proven free of the
+        // credential are released downstream. A metadata-mixed window can
+        // hide a split secret while the published text stream reveals it,
+        // so detection runs on the emitted text itself, per channel.
+        let mut credential_gate = crate::text_gate::SensitiveTextGate::new(credential.as_deref());
+        // Decouples ingest from publication without changing ingest.
+        // Ingest emits with non-blocking sends and fails closed on fan-out
+        // overflow, so this capacity is a memory bound, never a liveness
+        // assumption: the loop drains the gate after every ingest, and no
+        // single ingest can block waiting for that drain.
+        let (gate_tx, mut gate_rx) = mpsc::channel::<ChatStreamEvent>(64);
         while let Some(event) = stream.next().await {
             let event = event.map_err(|_| {
                 LlmError::invalid_response(format!("{} provider returned invalid SSE", self.id))
@@ -507,22 +514,9 @@ impl HttpProvider {
             })?;
             if let Some(key) = credential.as_deref().filter(|key| !key.is_empty()) {
                 // Decoded JSON inspection covers Unicode escapes and string
-                // fragmentation inside one chunk (A08).
+                // fragmentation inside one chunk, including metadata (A08).
+                // Cross-chunk text reassembly is the gate's job below.
                 if json_contains_string_fragment(&value, key) {
-                    return Err(LlmError::new(format!(
-                        "{} provider stream contained its configured credential",
-                        self.id
-                    )));
-                }
-                collect_string_leaves(&value, &mut decoded_window);
-                // Bound the window to credential length + 8 KiB of context
-                // so a long stream cannot grow it without bound.
-                let keep = key.len().saturating_add(8 * 1024);
-                if decoded_window.len() > keep {
-                    decoded_window =
-                        decoded_window[decoded_window.len().saturating_sub(keep)..].to_string();
-                }
-                if decoded_window.contains(key) {
                     return Err(LlmError::new(format!(
                         "{} provider stream contained its configured credential",
                         self.id
@@ -541,7 +535,9 @@ impl HttpProvider {
                     self.id
                 )));
             }
-            if let Some(response) = accumulator.ingest(value, &events).await? {
+            if let Some(response) = accumulator.ingest(value, &gate_tx).await? {
+                self.forward_gated_text(&mut gate_rx, &mut credential_gate, &events)
+                    .await?;
                 if credential.as_deref().is_some_and(|key| {
                     !key.is_empty()
                         && json_contains_string_fragment(
@@ -554,12 +550,15 @@ impl HttpProvider {
                         self.id
                     )));
                 }
+                self.flush_gate_tail(&mut credential_gate, &events).await?;
                 events
                     .send(ChatStreamEvent::Completed { response })
                     .await
                     .map_err(|_| LlmError::new("LLM stream receiver closed"))?;
                 return Ok(());
             }
+            self.forward_gated_text(&mut gate_rx, &mut credential_gate, &events)
+                .await?;
         }
         let response = accumulator.finish()?;
         if credential.as_deref().is_some_and(|key| {
@@ -574,34 +573,72 @@ impl HttpProvider {
                 self.id
             )));
         }
+        self.flush_gate_tail(&mut credential_gate, &events).await?;
         events
             .send(ChatStreamEvent::Completed { response })
             .await
             .map_err(|_| LlmError::new("LLM stream receiver closed"))
     }
-}
 
-/// Appends every decoded string value of a stream chunk to the running
-/// window so credentials split across SSE deltas are still detected.
-/// Object keys are excluded: they are schema field names, and interleaving
-/// them would break a key split exactly at a chunk boundary. Values
-/// concatenate without separators; over-matching fails closed.
-fn collect_string_leaves(value: &Value, out: &mut String) {
-    match value {
-        Value::String(text) => {
-            out.push_str(text);
-        }
-        Value::Array(values) => {
-            for value in values {
-                collect_string_leaves(value, out);
+    /// Forwards ingest-emitted deltas through the credential gate, releasing
+    /// only cleared prefixes downstream. Non-text events pass through
+    /// untouched.
+    async fn forward_gated_text(
+        &self,
+        gate_rx: &mut mpsc::Receiver<ChatStreamEvent>,
+        gate: &mut crate::text_gate::SensitiveTextGate,
+        events: &mpsc::Sender<ChatStreamEvent>,
+    ) -> Result<(), LlmError> {
+        while let Ok(event) = gate_rx.try_recv() {
+            match event {
+                ChatStreamEvent::TextDelta { text } => {
+                    let cleared = gate.push(&text).map_err(|()| {
+                        LlmError::new(format!(
+                            "{} provider stream contained its configured credential",
+                            self.id
+                        ))
+                    })?;
+                    if !cleared.is_empty() {
+                        events
+                            .send(ChatStreamEvent::TextDelta { text: cleared })
+                            .await
+                            .map_err(|_| LlmError::new("LLM stream receiver closed"))?;
+                    }
+                }
+                other => {
+                    events
+                        .send(other)
+                        .await
+                        .map_err(|_| LlmError::new("LLM stream receiver closed"))?;
+                }
             }
         }
-        Value::Object(values) => {
-            for (_, value) in values {
-                collect_string_leaves(value, out);
-            }
+        Ok(())
+    }
+
+    /// Releases the gate's withheld suffix after the stream ends. A hit here
+    /// aborts before Completed, so no published prefix ever completes the
+    /// credential.
+    async fn flush_gate_tail(
+        &self,
+        gate: &mut crate::text_gate::SensitiveTextGate,
+        events: &mpsc::Sender<ChatStreamEvent>,
+    ) -> Result<(), LlmError> {
+        // `finish` consumes; rebuild an empty gate in its place.
+        let gate = std::mem::replace(gate, crate::text_gate::SensitiveTextGate::new(None));
+        let tail = gate.finish().map_err(|()| {
+            LlmError::new(format!(
+                "{} provider stream contained its configured credential",
+                self.id
+            ))
+        })?;
+        if !tail.is_empty() {
+            events
+                .send(ChatStreamEvent::TextDelta { text: tail })
+                .await
+                .map_err(|_| LlmError::new("LLM stream receiver closed"))?;
         }
-        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        Ok(())
     }
 }
 
@@ -751,6 +788,178 @@ impl LlmProvider for HttpProvider {
 }
 
 #[cfg(test)]
+mod loopback_stream_tests {
+    use super::*;
+    use crate::types::ChatMessage;
+    use qcg_types::StructuredOutputMode;
+    use serde_json::json;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    const CANARY: &str = "qcg-canary-credential-12345";
+
+    /// Serves one canned SSE stream over loopback: real bytes, real HTTP
+    /// framing, real chunk splits. No mocks.
+    fn spawn_sse_stream(chunks: Vec<String>) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener should have an address");
+        let handle = std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = [0_u8; 8192];
+            let _ = stream.read(&mut request);
+            let mut response =
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n"
+                    .to_vec();
+            for chunk in chunks {
+                response.extend_from_slice(format!("data: {chunk}\n\n").as_bytes());
+            }
+            let _ = stream.write_all(&response);
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    fn chat_chunk(content: &str, finish_reason: Option<&str>) -> String {
+        let mut chunk = json!({
+            "id": "chatcmpl-canarydemo",
+            "object": "chat.completion.chunk",
+            "model": "canary-model",
+            "choices": [{
+                "delta": {"content": content, "role": "assistant"},
+                "finish_reason": finish_reason,
+            }],
+        });
+        if finish_reason.is_some() {
+            chunk["usage"] = json!({"prompt_tokens": 1, "completion_tokens": 2});
+        }
+        chunk.to_string()
+    }
+
+    fn loopback_provider(base_url: String, cred_env: &str) -> HttpProvider {
+        let spec: ProviderSpec = serde_json::from_value(json!({
+            "id": "loopback",
+            "api": "chat_completions",
+            "base_url": base_url,
+            "api_key_env": cred_env,
+            "capabilities": {"streaming": true},
+            "retry_attempts": 1,
+            "timeout_seconds": 30,
+        }))
+        .expect("test provider spec should parse");
+        HttpProvider::from_spec(spec)
+    }
+
+    fn sample_stream_request() -> ChatRequest {
+        ChatRequest {
+            provider: "loopback".into(),
+            model: "canary-model".into(),
+            system: None,
+            messages: vec![ChatMessage::text("user", "hello")],
+            tools: vec![],
+            response_schema: None,
+            structured_output: StructuredOutputMode::Auto,
+            temperature: None,
+            top_p: None,
+            max_tokens: 128,
+            stop_sequences: vec![],
+            seed: None,
+            reasoning_effort: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            verbosity: None,
+            stream: true,
+        }
+    }
+
+    fn collect_text(receiver: &mut mpsc::Receiver<ChatStreamEvent>) -> (String, bool) {
+        let mut text = String::new();
+        let mut completed = false;
+        while let Ok(event) = receiver.try_recv() {
+            match event {
+                ChatStreamEvent::TextDelta { text: delta } => text.push_str(&delta),
+                ChatStreamEvent::Completed { .. } => completed = true,
+            }
+        }
+        (text, completed)
+    }
+
+    #[tokio::test]
+    async fn split_credential_across_chunks_never_publishes() {
+        // B04: the audit counterexample shape — canary split across text
+        // deltas with per-chunk metadata that defeats metadata-mixed
+        // windows. The published stream must never complete the canary,
+        // and the call must fail instead of completing.
+        // SAFETY: environment mutation is serialized with ENV_LOCK; unique variable name.
+        // The guard below lives until the end of the test, so the matching
+        // remove_var runs under the same held guard (re-acquiring here
+        // would self-deadlock: the right side evaluates before the old
+        // guard drops).
+        let _guard = crate::ENV_LOCK.lock().await;
+        // SAFETY: lock held.
+        unsafe {
+            std::env::set_var("QCG_TEST_LOOPBACK_CRED_SPLIT", CANARY);
+        }
+        let (base_url, server) = spawn_sse_stream(vec![
+            chat_chunk("qcg-canary-", None),
+            chat_chunk("credential-12345", Some("stop")),
+        ]);
+        let provider = loopback_provider(base_url, "QCG_TEST_LOOPBACK_CRED_SPLIT");
+        let (events, mut receiver) = mpsc::channel(16);
+        let result = provider.stream(sample_stream_request(), events).await;
+        let (published, completed) = collect_text(&mut receiver);
+        let _ = server.join();
+        // SAFETY: the start-of-test ENV_LOCK guard is still held.
+        unsafe {
+            std::env::remove_var("QCG_TEST_LOOPBACK_CRED_SPLIT");
+        }
+        let error = result.expect_err("split credential must fail the stream");
+        assert!(
+            error.to_string().contains("credential"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !published.contains(CANARY),
+            "published prefixes must never complete the credential, got: {published}"
+        );
+        assert!(!completed, "a refused stream must not report completion");
+    }
+
+    #[tokio::test]
+    async fn clean_stream_publishes_in_full() {
+        // The gate must not disturb honest streams: every byte publishes
+        // and the stream completes.
+        // SAFETY: environment mutation is serialized with ENV_LOCK; unique variable name.
+        // The guard below lives until the end of the test (see above).
+        let _guard = crate::ENV_LOCK.lock().await;
+        // SAFETY: lock held.
+        unsafe {
+            std::env::set_var("QCG_TEST_LOOPBACK_CRED_CLEAN", CANARY);
+        }
+        let (base_url, server) = spawn_sse_stream(vec![
+            chat_chunk("hello, ", None),
+            chat_chunk("world", Some("stop")),
+        ]);
+        let provider = loopback_provider(base_url, "QCG_TEST_LOOPBACK_CRED_CLEAN");
+        let (events, mut receiver) = mpsc::channel(16);
+        provider
+            .stream(sample_stream_request(), events)
+            .await
+            .expect("clean stream should succeed");
+        let (published, completed) = collect_text(&mut receiver);
+        let _ = server.join();
+        // SAFETY: the start-of-test ENV_LOCK guard is still held.
+        unsafe {
+            std::env::remove_var("QCG_TEST_LOOPBACK_CRED_CLEAN");
+        }
+        assert_eq!(published, "hello, world");
+        assert!(completed, "clean stream must report completion");
+    }
+}
+
+#[cfg(test)]
 mod stream_credential_tests {
     use super::*;
     use serde_json::json;
@@ -760,16 +969,11 @@ mod stream_credential_tests {
         // A08: single-chunk raw matching misses split and escaped reflection.
         let key = "sk-secret-credential-12345";
         // Split across two decoded chunks: neither chunk alone contains the
-        // key, but the running window does.
+        // key. Cross-chunk reassembly is the text gate's job now.
         let first = json!({"delta": "sk-secret-"});
         let second = json!({"delta": "credential-12345"});
         assert!(!json_contains_string_fragment(&first, key));
         assert!(!json_contains_string_fragment(&second, key));
-        let mut window = String::new();
-        collect_string_leaves(&first, &mut window);
-        assert!(!window.contains(key));
-        collect_string_leaves(&second, &mut window);
-        assert!(window.contains(key));
         // JSON-escaped reflection decodes before inspection.
         let escaped = serde_json::from_str::<Value>(
             r#"{"text": "prefix \u0073k-secret-credential-12345 suffix"}"#,

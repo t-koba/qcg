@@ -163,6 +163,7 @@ qcg_version = "^0.1"
                 max_attempts: 3,
                 backoff_ms: 100,
                 timeout_secs: Some(30),
+                on_indeterminate: RetryOnIndeterminate::Fail,
             }),
         )]);
         FlowNodeRule
@@ -179,6 +180,7 @@ qcg_version = "^0.1"
                     max_attempts: 0,
                     backoff_ms: 0,
                     timeout_secs: None,
+                    on_indeterminate: RetryOnIndeterminate::Fail,
                 },
             ),
             (
@@ -187,6 +189,7 @@ qcg_version = "^0.1"
                     max_attempts: 17,
                     backoff_ms: 0,
                     timeout_secs: None,
+                    on_indeterminate: RetryOnIndeterminate::Fail,
                 },
             ),
             (
@@ -195,6 +198,7 @@ qcg_version = "^0.1"
                     max_attempts: 2,
                     backoff_ms: 60_001,
                     timeout_secs: None,
+                    on_indeterminate: RetryOnIndeterminate::Fail,
                 },
             ),
             (
@@ -203,6 +207,7 @@ qcg_version = "^0.1"
                     max_attempts: 2,
                     backoff_ms: 0,
                     timeout_secs: Some(0),
+                    on_indeterminate: RetryOnIndeterminate::Fail,
                 },
             ),
         ] {

@@ -125,8 +125,10 @@ impl LocalQcgService {
             owner_id: self.inner.owner_id.clone(),
             ephemeral: false,
         };
-        let effective =
-            crate::types::ResolvedExecutionPolicy::resolve(contract.manifest.budget.max_steps);
+        let effective = crate::types::ResolvedExecutionPolicy::resolve(
+            contract.manifest.budget.max_steps,
+            self.max_total_steps(),
+        );
         // An adopted retry already carries its run_queued event; appending
         // another would fork the journal.
         if !adopted
@@ -721,17 +723,16 @@ impl LocalQcgService {
         // one conflicting acceptance wins (A02). Durable acceptance precedes
         // the success report, so a restart before the engine consumes the
         // queue still resumes with the same values.
-        let (
-            contract,
-            inputs,
-            answers,
-            confirmations,
-            priority,
-            run_dir,
-            events,
-            cancellation,
-            task,
-        ) = {
+        //
+        // The write guard never spans an await: rejection classification
+        // takes run-map locks, so awaiting it under the guard would deadlock
+        // the runs map against itself (B01). The guard returns a decision;
+        // classification and spawning happen outside.
+        enum AnswerDecision {
+            Spawn(Box<crate::lifecycle::SpawnRun>),
+            Reject(crate::types::ServiceError),
+        }
+        let outcome = {
             let mut runs = self.inner.runs.write().await;
             let record = runs
                 .get_mut(&id)
@@ -776,19 +777,17 @@ impl LocalQcgService {
             // regenerated prompt apart, so the lock-held precondition below
             // re-verifies this exact generation (A02).
             let observed = fold_run_state(&persist.run_dir).map_err(api_internal)?;
+            // A stale observation still attempts the atomic write: the
+            // lock-held precondition re-verifies, and classification below
+            // reports the accurate outcome (terminal, answered, or gone)
+            // instead of this spot guessing from possibly old data.
             let check_pending_seq = match &observed.pending {
                 Some(qcg_engine::Interaction::Question { question })
                     if question.id == question_id =>
                 {
-                    observed.pending_seq.ok_or_else(|| {
-                        api_internal(format!("run `{id}` pending question has no generation"))
-                    })?
+                    observed.pending_seq
                 }
-                _ => {
-                    return Err(api_bad_request(format!(
-                        "run `{id}` is not waiting for `{question_id}`"
-                    )));
-                }
+                _ => None,
             };
             // One durable timestamp shared by the journal event and the
             // memory record so restarts observe the same requeue order.
@@ -823,7 +822,7 @@ impl LocalQcgService {
                         }
                     }
                     match (state.pending_seq, check_pending_seq) {
-                        (Some(current), expected) if current == expected => {}
+                        (Some(current), Some(expected)) if current == expected => {}
                         _ => {
                             return Err(JournalError::PreconditionFailed(
                                 "pending prompt generation changed; refresh and retry".into(),
@@ -838,51 +837,49 @@ impl LocalQcgService {
                     Ok(())
                 },
             );
-            if let Err(error) = accepted {
-                // The rejection already happened atomically; re-fold only to
-                // classify which error to report.
-                return self
-                    .classify_answer_rejection(&id, &question_id, &answer, error)
-                    .await;
+            match accepted {
+                // The rejection already happened atomically; re-fold outside
+                // the guard only to classify which error to report.
+                Err(error) => AnswerDecision::Reject(error),
+                Ok(()) => {
+                    // Continuations live in the typed journal store now, so only
+                    // the user answer joins the memory map.
+                    record.answers.insert(question_id.clone(), answer.clone());
+                    record.state = RunStatus::Queued;
+                    record.queued_at = Some(queued_now);
+                    record.question = None;
+                    record.confirm = None;
+                    record.artifacts = None;
+                    let cancellation = CancellationToken::new();
+                    record.cancellation = cancellation.clone();
+                    AnswerDecision::Spawn(Box::new(crate::lifecycle::SpawnRun {
+                        run_id: id.clone(),
+                        contract: record.contract.clone(),
+                        inputs: record.inputs.clone(),
+                        run_dir: record.run_dir.clone(),
+                        events: record.events.clone(),
+                        answers: record.answers.clone(),
+                        confirmations: record.confirmations.clone(),
+                        priority: record.priority,
+                        cancellation,
+                        task: record.task.clone(),
+                    }))
+                }
             }
-            // Continuations live in the typed journal store now, so only
-            // the user answer joins the memory map.
-            record.answers.insert(question_id, answer);
-            record.state = RunStatus::Queued;
-            record.queued_at = Some(queued_now);
-            record.question = None;
-            record.confirm = None;
-            record.artifacts = None;
-            let cancellation = CancellationToken::new();
-            record.cancellation = cancellation.clone();
-            (
-                record.contract.clone(),
-                record.inputs.clone(),
-                record.answers.clone(),
-                record.confirmations.clone(),
-                record.priority,
-                record.run_dir.clone(),
-                record.events.clone(),
-                cancellation,
-                record.task.clone(),
-            )
         };
-        self.spawn_engine_run(SpawnRun {
-            run_id: id,
-            contract,
-            inputs,
-            run_dir,
-            events,
-            answers,
-            confirmations,
-            priority,
-            cancellation,
-            task,
-        });
-        // Wake queue waiters: requeue changes the head and a freed ordering
-        // slot must not wait for an unrelated notification (A11).
-        self.inner.queue_notify.notify_waiters();
-        Ok(())
+        match outcome {
+            AnswerDecision::Spawn(request) => {
+                self.spawn_engine_run(*request);
+                // Wake queue waiters: requeue changes the head and a freed ordering
+                // slot must not wait for an unrelated notification (A11).
+                self.inner.queue_notify.notify_waiters();
+                Ok(())
+            }
+            AnswerDecision::Reject(error) => {
+                self.classify_answer_rejection(&id, &question_id, &answer, error)
+                    .await
+            }
+        }
     }
 
     pub async fn confirm(
@@ -895,13 +892,16 @@ impl LocalQcgService {
         // Validate, persist, and mutate under one write lock so concurrent
         // decisions cannot both journal conflicting values with last-wins.
         // Journal I/O is a short local append; engine scheduling and terminal
-        // settlement stay outside the lock.
+        // settlement stay outside the lock. Rejection classification also
+        // stays outside: it takes run-map locks, so awaiting it under the
+        // guard would deadlock the runs map against itself (B01).
         enum AfterLock {
             Deny {
                 denied: Box<RunRecord>,
                 confirm: Box<qcg_api::ConfirmSpec>,
             },
             Spawn(Box<SpawnRun>),
+            Reject(crate::types::ServiceError),
         }
         let after = {
             let mut runs = self.inner.runs.write().await;
@@ -945,19 +945,17 @@ impl LocalQcgService {
             // regenerated prompt apart, so the lock-held precondition below
             // re-verifies this exact generation (A02).
             let observed = fold_run_state(&persist.run_dir).map_err(api_internal)?;
+            // A stale observation still attempts the atomic write: the
+            // lock-held precondition re-verifies, and classification below
+            // reports the accurate outcome instead of this spot guessing
+            // from possibly old data.
             let check_pending_seq = match &observed.pending {
                 Some(qcg_engine::Interaction::Confirmation { confirm })
                     if confirm.id == confirmation_id =>
                 {
-                    observed.pending_seq.ok_or_else(|| {
-                        api_internal(format!("run `{id}` pending confirmation has no generation"))
-                    })?
+                    observed.pending_seq
                 }
-                _ => {
-                    return Err(api_bad_request(format!(
-                        "run `{id}` is not waiting for `{confirmation_id}`"
-                    )));
-                }
+                _ => None,
             };
             let queued_now = chrono::Utc::now();
             if let Err(error) = crate::run_dirs::write_run_event_if(
@@ -990,7 +988,7 @@ impl LocalQcgService {
                         }
                     }
                     match (state.pending_seq, check_pending_seq) {
-                        (Some(current), expected) if current == expected => {}
+                        (Some(current), Some(expected)) if current == expected => {}
                         _ => {
                             return Err(JournalError::PreconditionFailed(
                                 "pending prompt generation changed; refresh and retry".into(),
@@ -1005,13 +1003,10 @@ impl LocalQcgService {
                     Ok(())
                 },
             ) {
-                // The rejection already happened atomically; re-fold only to
-                // classify which error to report.
-                return self
-                    .classify_confirm_rejection(&id, &confirmation_id, approved, error)
-                    .await;
-            }
-            if !approved {
+                // The rejection already happened atomically; re-fold outside
+                // the guard only to classify which error to report.
+                AfterLock::Reject(error)
+            } else if !approved {
                 record.confirmations.insert(confirm.id.clone(), false);
                 record.state = RunStatus::Failed;
                 record.confirm = None;
@@ -1020,7 +1015,7 @@ impl LocalQcgService {
                     confirm: Box::new(confirm),
                 }
             } else {
-                record.confirmations.insert(confirmation_id, true);
+                record.confirmations.insert(confirmation_id.clone(), true);
                 record.state = RunStatus::Queued;
                 record.queued_at = Some(queued_now);
                 record.confirm = None;
@@ -1077,6 +1072,10 @@ impl LocalQcgService {
                 self.inner.queue_notify.notify_waiters();
                 Ok(())
             }
+            AfterLock::Reject(error) => {
+                self.classify_confirm_rejection(&id, &confirmation_id, approved, error)
+                    .await
+            }
         }
     }
 
@@ -1091,8 +1090,7 @@ impl LocalQcgService {
         answer: &Value,
         error: crate::types::ServiceError,
     ) -> Result<(), ApiError> {
-        let message = error.to_string();
-        if !message.contains("journal precondition failed") {
+        if !matches!(error, crate::types::ServiceError::PreconditionFailed(_)) {
             return Err(api_internal(error));
         }
         let run_dir = self.run_dir_for(id).await?;
@@ -1138,8 +1136,7 @@ impl LocalQcgService {
         approved: bool,
         error: crate::types::ServiceError,
     ) -> Result<(), ApiError> {
-        let message = error.to_string();
-        if !message.contains("journal precondition failed") {
+        if !matches!(error, crate::types::ServiceError::PreconditionFailed(_)) {
             return Err(api_internal(error));
         }
         let run_dir = self.run_dir_for(id).await?;
@@ -1318,26 +1315,20 @@ impl LocalQcgService {
                             detail: format!("run `{id}` is executing elsewhere; cancel was signaled"),
                         });
                     }
-                    self.drain_cancel_controls(&id, &run_dir)
-                        .await
-                        .map_err(api_internal)?;
                     let settled_now = {
                         let runs = self.inner.runs.read().await;
                         runs.get(&id).cloned().ok_or_else(|| {
                             api_internal(format!("run `{id}` vanished during cancellation"))
                         })?
                     };
-                    write_run_event(
-                        &settled_now,
-                        "run_canceled",
-                        json!({
-                            "reason": FailureDetail::new(
-                                FailureCode::Canceled,
-                                "cancellation requested",
-                            ),
-                        }),
-                    )
-                    .map_err(api_internal)?;
+                    // The aborted task may have settled through the queued
+                    // finalizer first: reuse the terminal-checked settlement
+                    // instead of journaling a second terminal outcome.
+                    if !self.settle_canceled_here(&id, &settled_now).await? {
+                        return Err(ApiError::Conflict {
+                            detail: format!("run `{id}` is executing elsewhere; cancel was signaled"),
+                        });
+                    }
                 }
             }
         }
@@ -1617,6 +1608,15 @@ impl LocalQcgService {
                     {
                         tracing::warn!(run_id = %id, %error, "cancel drain failed during shutdown; mailbox retained");
                     }
+                    // A writer may have settled first (e.g. the queued
+                    // finalizer): never journal a second terminal outcome
+                    // over it.
+                    let settled = fold_run_state(&record.run_dir)
+                        .map(|state| state.terminal.is_some())
+                        .map_err(api_internal)?;
+                    if settled {
+                        return Ok::<(), ApiError>(());
+                    }
                     let settled_now = {
                         let runs = service.inner.runs.read().await;
                         runs.get(&id).cloned().unwrap_or(record.clone())
@@ -1687,6 +1687,14 @@ impl LocalQcgService {
                         {
                             tracing::warn!(run_id = %id, %error, "cancel drain failed during shutdown; mailbox retained");
                         }
+                        // A writer may have settled first: never journal a
+                        // second terminal outcome over it.
+                        let settled = fold_run_state(&record.run_dir)
+                            .map(|state| state.terminal.is_some())
+                            .map_err(api_internal)?;
+                        if settled {
+                            return Ok::<(), ApiError>(());
+                        }
                         let settled_now = {
                             let runs = service.inner.runs.read().await;
                             runs.get(&id).cloned().unwrap_or(record.clone())
@@ -1719,6 +1727,18 @@ impl LocalQcgService {
         });
         for result in futures_util::future::join_all(waits).await {
             result?;
+        }
+        // Detached container cleanups from dropped guards must finish
+        // before shutdown reports done; otherwise "stopped" races orphaned
+        // instances still being torn down. A nonzero remainder is surfaced,
+        // never silently equated with a clean stop (B06).
+        let outstanding =
+            qcg_container::await_outstanding_cleanups(std::time::Duration::from_secs(65)).await;
+        if outstanding > 0 {
+            tracing::warn!(
+                outstanding,
+                "container cleanups outstanding past shutdown deadline; instances may need operator retry"
+            );
         }
         Ok(())
     }

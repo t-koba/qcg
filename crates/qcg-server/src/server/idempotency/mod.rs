@@ -105,8 +105,11 @@ where
     };
     // An orphaned run id observed while waiting rides across claim-loop
     // iterations: expiry observation already reaped the pending file, so a
-    // later re-read cannot recover it.
+    // later re-read cannot recover it. The durable claim owner rides along
+    // too, so every release below only ever removes our own claim file.
     let mut carried_adopted: Option<String> = None;
+    let mut claim_owner: Option<String> = None;
+    let mut claim_generation: Option<u64> = None;
     let (owner_id, adopted_run_id) = loop {
         let (wait, owner_id, adopted_run_id) = {
             let mut idempotency = state.idempotency.lock().await;
@@ -217,12 +220,51 @@ where
                                 }
                             }
                         }
-                        ClaimOutcome::Owner { run_id } => run_id,
+                        ClaimOutcome::Owner {
+                            run_id,
+                            owner,
+                            generation,
+                        } => {
+                            claim_owner = Some(owner);
+                            claim_generation = Some(generation);
+                            run_id
+                        }
+                        ClaimOutcome::Ready { run_id } => {
+                            // Committed between our last look and the claim:
+                            // converge without executing.
+                            idempotency.insert(
+                                idempotency_key.clone(),
+                                IdempotencyEntry::Ready {
+                                    digest: request_digest.clone(),
+                                    created_at: Instant::now(),
+                                    run_id: run_id.clone(),
+                                },
+                            );
+                            drop(idempotency);
+                            let snapshot = state
+                                .service
+                                .snapshot(run_id)
+                                .await
+                                .map_err(ApiHttpError::from_api)?;
+                            return respond_with_snapshot(snapshot, created);
+                        }
+                        ClaimOutcome::Conflict => {
+                            return Err(idempotency_conflict());
+                        }
                     };
                     if idempotency.len()
                         >= effective_idempotency_max_entries().map_err(ApiHttpError::internal)?
                     {
-                        release_durable_pending(&state.runs_dir, &idempotency_key);
+                        if let (Some(owner), Some(generation)) =
+                            (claim_owner.as_deref(), claim_generation)
+                        {
+                            release_durable_pending(
+                                &state.runs_dir,
+                                &idempotency_key,
+                                owner,
+                                generation,
+                            );
+                        }
                         return Err(ApiHttpError::service_unavailable(
                             "too many idempotent requests are still in progress",
                         ));
@@ -258,6 +300,12 @@ where
             "idempotency admission must wait or assign an owner",
         ));
     };
+    // The loop only breaks through the Owner arm, which always sets the
+    // claim identity first. Empty fallbacks release nothing (no owner id
+    // is ever empty, generation 0 never matches a live claim) and any
+    // stranded file still expires via TTL.
+    let claim_owner = claim_owner.unwrap_or_default();
+    let claim_generation = claim_generation.unwrap_or(0);
     let mut pending_guard =
         PendingIdempotencyGuard::new(Arc::clone(state), idempotency_key.clone(), owner_id);
     let run_id = match execute(adopted_run_id).await {
@@ -282,7 +330,12 @@ where
             };
             pending_guard.disarm();
             // Release the cross-process claim so a retry can become owner.
-            release_durable_pending(&state.runs_dir, &idempotency_key);
+            release_durable_pending(
+                &state.runs_dir,
+                &idempotency_key,
+                &claim_owner,
+                claim_generation,
+            );
             if let Some(completed) = completed {
                 let _ = completed.send(true);
             }
@@ -292,11 +345,20 @@ where
     // Durable commit before memory publish: a crash after HTTP success
     // must still return the same run_id on retry, and memory must never
     // advertise a Ready record that durable storage rejected (A03).
-    if let Err(error) =
-        store_durable_ready(&state.runs_dir, &idempotency_key, &request_digest, &run_id)
-    {
+    if let Err(error) = store_durable_ready(
+        &state.runs_dir,
+        &idempotency_key,
+        &request_digest,
+        &run_id,
+        claim_generation,
+    ) {
         if error.contains("different request") {
-            release_durable_pending(&state.runs_dir, &idempotency_key);
+            release_durable_pending(
+                &state.runs_dir,
+                &idempotency_key,
+                &claim_owner,
+                claim_generation,
+            );
             return Err(idempotency_conflict());
         }
         // Storage failure fails closed rather than risking duplicate runs.
@@ -358,7 +420,12 @@ where
         );
         completed
     };
-    release_durable_pending(&state.runs_dir, &idempotency_key);
+    release_durable_pending(
+        &state.runs_dir,
+        &idempotency_key,
+        &claim_owner,
+        claim_generation,
+    );
     pending_guard.disarm();
     if let Some(completed) = completed {
         let _ = completed.send(true);

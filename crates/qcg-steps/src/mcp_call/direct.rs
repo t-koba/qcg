@@ -98,66 +98,89 @@ pub(crate) async fn execute_direct_mcp_call(
     }
     let fresh = request_state.is_none() && input_responses.is_none();
     let details = Some(arguments.clone());
+    // Single-shot invocations identify by content: the same digest
+    // recomputes the same id on resume, so no stored id is needed and
+    // restarts keep the same protection.
+    let target = format!("{}/{}", session.server_id(), tool_name);
+    let digest = RunContext::operation_digest(&target, &details)?;
+    let invocation = qcg_engine::content_invocation_id(&digest);
     let operation_id = if fresh {
-        Some(ctx.run.guard_external_operation(
+        match ctx.run.guard_external_operation(
             ctx.journal,
             node,
-            &format!("mcp:{}/{}", session.server_id(), tool_name),
-            &format!("{}/{}", session.server_id(), tool_name),
+            &format!("mcp:{target}"),
+            &target,
             &details,
-        )?)
+            &invocation,
+        )? {
+            qcg_engine::GuardDecision::Proceed { operation_id } => Some(operation_id),
+            // Same invocation already succeeded: return the cached result
+            // without touching the remote again.
+            qcg_engine::GuardDecision::Resend { result, .. } => {
+                return Ok(DirectMcpCallOutcome::Complete(result));
+            }
+        }
     } else {
         None
     };
     let operation_id = match operation_id {
         Some(id) => Some(id),
-        None => {
-            let digest = RunContext::operation_digest(
-                &format!("{}/{}", session.server_id(), tool_name),
-                &details,
-            )?;
-            Some(qcg_engine::operation_id_for(
-                &ctx.run.run_id,
-                &node.id,
-                &digest,
-            ))
-        }
+        None => Some(qcg_engine::operation_id_for(
+            &ctx.run.run_id,
+            &node.id,
+            &digest,
+            &invocation,
+        )),
     };
     for _ in 0..10 {
-        let outcome = match tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_seconds),
-            session.call_tool_with_input(
-                tool_name,
-                arguments.clone(),
-                input_responses.take(),
-                request_state.take(),
-            ),
-        )
-        .await
+        // The node-scoped token stops this wait on timeout or parent
+        // cancel; the session's connect-time token cannot cover a scope
+        // created after it. Cancellation finishes nothing and propagates
+        // without a completion record.
+        let outcome = tokio::select! {
+            _ = ctx.run.cancellation.cancelled() => {
+                return Err(StepError::Cancelled);
+            }
+            outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_seconds),
+                session.call_tool_with_input(
+                    tool_name,
+                    arguments.clone(),
+                    input_responses.take(),
+                    request_state.take(),
+                ),
+            ) => match outcome
         {
             Ok(outcome) => outcome,
             Err(_) => {
                 if let Some(operation_id) = &operation_id {
-                    let _ = ctx.run.finish_external_operation_with_status(
+                    ctx.run.finish_external_operation_with_warn(
                         ctx.journal,
                         node,
                         operation_id,
-                        "error",
+                        qcg_engine::OperationOutcome::Indeterminate {
+                            reason: "MCP tools/call timed out".into(),
+                        },
                     );
                 }
                 return Err(StepError::failed(&node.id, "MCP tools/call timed out"));
             }
+            },
         };
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(McpError::ToolFailed { result, .. }) => McpCallOutcome::Complete(result),
             Err(error) => {
-                if let Some(operation_id) = &operation_id {
-                    let _ = ctx.run.finish_external_operation_with_status(
+                // Cancellation finishes nothing: it propagates without a
+                // completion record.
+                if !matches!(error, McpError::Canceled)
+                    && let Some(operation_id) = &operation_id
+                {
+                    ctx.run.finish_external_operation_with_warn(
                         ctx.journal,
                         node,
                         operation_id,
-                        "error",
+                        direct_mcp_error_outcome(&error),
                     );
                 }
                 return Err(StepError::failed(&node.id, error.to_string()));
@@ -165,13 +188,18 @@ pub(crate) async fn execute_direct_mcp_call(
         };
         match outcome {
             McpCallOutcome::Complete(value) => {
+                // Validation rejects a received result: the remote already
+                // executed, so this is indeterminate, never clean. Retries
+                // need an explicit at-least-once opt-in.
                 let fail = |node: &NodeDef, message: String| {
                     if let Some(operation_id) = &operation_id {
-                        let _ = ctx.run.finish_external_operation_with_status(
+                        ctx.run.finish_external_operation_with_warn(
                             ctx.journal,
                             node,
                             operation_id,
-                            "error",
+                            qcg_engine::OperationOutcome::Indeterminate {
+                                reason: message.clone(),
+                            },
                         );
                     }
                     StepError::failed(&node.id, message)
@@ -220,8 +248,12 @@ pub(crate) async fn execute_direct_mcp_call(
                     &arguments,
                 )?;
                 if let Some(operation_id) = &operation_id {
-                    ctx.run
-                        .finish_external_operation(ctx.journal, node, operation_id)?;
+                    ctx.run.finish_external_operation(
+                        ctx.journal,
+                        node,
+                        operation_id,
+                        Some(value.clone()),
+                    )?;
                 }
                 return Ok(DirectMcpCallOutcome::Complete(value));
             }
@@ -607,6 +639,22 @@ fn resume_direct_mcp_continuation(
                 input_responses: Some(input_responses),
             })
         }
+    }
+}
+
+/// Classifies a direct-call transport failure: refused-before-dispatch is
+/// clean, while timeouts and transport I/O may have applied remote effects.
+fn direct_mcp_error_outcome(error: &McpError) -> qcg_engine::OperationOutcome {
+    match error {
+        McpError::Configuration(_)
+        | McpError::AuthorizationRequired { .. }
+        | McpError::Authorization(_) => qcg_engine::OperationOutcome::CleanError,
+        McpError::Canceled => qcg_engine::OperationOutcome::Indeterminate {
+            reason: "cancelled operation reached error classification".into(),
+        },
+        _ => qcg_engine::OperationOutcome::Indeterminate {
+            reason: format!("MCP transport failure may have applied effects: {error}"),
+        },
     }
 }
 

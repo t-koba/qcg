@@ -39,7 +39,12 @@ fn acquire_journal_lock(journal_path: &Utf8Path) -> Result<File, JournalError> {
 /// backwards for the last newline-terminated JSON line carrying `seq`.
 /// Bounded to the final 64 KiB plus one over-long line so a huge journal
 /// never forces a full read before the configured limits are checked.
-pub fn read_last_seq_from_tail(journal_path: &Utf8Path) -> Result<u64, JournalError> {
+/// `limits` bounds every fallback read: a fixed default would fail closed
+/// on journals that are legal under the caller's configured limits (B09).
+pub fn read_last_seq_from_tail(
+    journal_path: &Utf8Path,
+    limits: JournalLimits,
+) -> Result<u64, JournalError> {
     if !journal_path.exists() {
         return Ok(0);
     }
@@ -62,7 +67,8 @@ pub fn read_last_seq_from_tail(journal_path: &Utf8Path) -> Result<u64, JournalEr
     if start > 0 {
         match slice.iter().position(|byte| *byte == b'\n') {
             Some(pos) => slice = &slice[pos + 1..],
-            None => return Ok(0),
+            // The whole window is one partial line: resolve it below.
+            None => slice = &[][..],
         }
     }
     let mut last_seq = 0_u64;
@@ -78,10 +84,134 @@ pub fn read_last_seq_from_tail(journal_path: &Utf8Path) -> Result<u64, JournalEr
             last_seq = last_seq.max(seq);
         }
     }
-    // When the tail window was truncated mid-history the max above may miss
-    // older seq values, so fall back to state.json as a lower bound. An
-    // unreadable state file is logged, never silently equated with a zero
-    // bound: the window scan above remains the authoritative floor.
+    if start > 0 && last_seq == 0 {
+        // The truncated window yielded no seq: either the final line
+        // alone exceeds the window (B09) or the tail is corrupt. A stale
+        // state.json must not stand in here: the persisted state may lag
+        // a crashed peer's append, so resolve the final line with a
+        // bounded backward scan, falling back to a full scan bounded by
+        // the caller's limits. Limit violations propagate: guessing a seq
+        // here would risk duplicates, so resync fails closed instead.
+        // Seq values grow with file order, so any complete line the
+        // window scan above found would already be the global max; only
+        // the found-nothing case needs this resolution.
+        let huge = match read_huge_tail_seq(journal_path, len, limits) {
+            Ok(seq) => seq,
+            Err(_) => read_journal_values(journal_path, limits)?
+                .events
+                .iter()
+                .filter_map(|event| event.get("seq").and_then(Value::as_u64))
+                .max()
+                .unwrap_or(0),
+        };
+        last_seq = huge;
+    }
+    Ok(last_seq.max(state_json_seq_floor(journal_path)))
+}
+
+/// Seq of a final line larger than the tail window, found by scanning
+/// backwards in bounded chunks. The scan never reads more than one event:
+/// `max_event_bytes` caps it when configured (append enforces the same
+/// cap, so a longer line is corruption or a narrowed limit and fails
+/// closed); without a configured cap the scan stops at the file start.
+/// Returns an error when no complete line exists or the line carries no
+/// seq; the caller falls back to a bounded full scan.
+fn read_huge_tail_seq(
+    journal_path: &Utf8Path,
+    len: u64,
+    limits: JournalLimits,
+) -> Result<u64, JournalError> {
+    use std::io::{Read as _, Seek as _};
+    const CHUNK: u64 = 64 * 1024;
+    let cap = limits
+        .max_event_bytes
+        .map(|cap| cap as u64)
+        .unwrap_or(u64::MAX);
+    let mut file = File::open(journal_path)?;
+    // Locate the start of the last complete line by walking backwards;
+    // then read that one line forward in a single bounded read.
+    let mut cursor = len;
+    let mut scanned = 0_u64;
+    // End offset of the final complete line, fixed on the first
+    // iteration: trailing newlines terminate lines instead of starting
+    // an empty one. The caller repairs a torn (unterminated) tail before
+    // resync, so anything else at the end is durable.
+    let mut line_end: Option<u64> = None;
+    loop {
+        if cursor == 0 {
+            // No newline in the whole file: it is a single line.
+            return read_single_line_seq(&mut file, 0, line_end.unwrap_or(0), cap);
+        }
+        let take = cursor.min(CHUNK);
+        file.seek(std::io::SeekFrom::Start(cursor - take))?;
+        let mut chunk = vec![0_u8; take as usize];
+        file.read_exact(&mut chunk)?;
+        let mut effective = chunk.as_slice();
+        if line_end.is_none() {
+            let stripped = effective
+                .iter()
+                .rev()
+                .take_while(|byte| **byte == b'\n')
+                .count();
+            line_end = Some(cursor - stripped as u64);
+            effective = &effective[..effective.len() - stripped];
+        }
+        if let Some(pos) = effective.iter().rposition(|byte| *byte == b'\n') {
+            // Scanning newest-first, the first newline found starts the
+            // final complete line.
+            let line_start = cursor - take + pos as u64 + 1;
+            return read_single_line_seq(&mut file, line_start, line_end.unwrap_or(cursor), cap);
+        }
+        // No newline in this chunk: the line extends further back.
+        // Fail as soon as the line provably exceeds the cap instead of
+        // reading it to the file start.
+        scanned = scanned.saturating_add(take);
+        if scanned > cap {
+            return Err(JournalError::InvalidEvent(
+                "journal final line exceeds the event size limit".into(),
+            ));
+        }
+        cursor -= take;
+    }
+}
+
+/// Reads `[start, end)` as one journal line and returns its `seq`.
+/// Length is enforced against `cap` before any allocation.
+fn read_single_line_seq(
+    file: &mut File,
+    start: u64,
+    end: u64,
+    cap: u64,
+) -> Result<u64, JournalError> {
+    use std::io::{Read as _, Seek as _};
+    let line_len = end.saturating_sub(start);
+    if line_len == 0 {
+        return Err(JournalError::InvalidEvent(
+            "journal tail holds no complete line".into(),
+        ));
+    }
+    if line_len > cap {
+        return Err(JournalError::InvalidEvent(
+            "journal final line exceeds the event size limit".into(),
+        ));
+    }
+    file.seek(std::io::SeekFrom::Start(start))?;
+    let mut line = vec![0_u8; line_len as usize];
+    file.read_exact(&mut line)?;
+    let value: Value = serde_json::from_slice(&line)
+        .map_err(|_| JournalError::InvalidEvent("journal final line is not JSON".into()))?;
+    value
+        .get("seq")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| JournalError::InvalidEvent("journal final line carries no seq".into()))
+}
+
+/// state.json as a seq lower bound only, combined with the window scan
+/// via max. The persisted state is written after its journal append, so it
+/// is never newer than the journal: staleness only lowers it, which max
+/// absorbs. An unreadable state file is logged, never silently equated
+/// with a zero bound.
+fn state_json_seq_floor(journal_path: &Utf8Path) -> u64 {
     let state_path = journal_path.with_file_name("state.json");
     match std::fs::read(&state_path) {
         Ok(bytes) => {
@@ -89,27 +219,26 @@ pub fn read_last_seq_from_tail(journal_path: &Utf8Path) -> Result<u64, JournalEr
                 .ok()
                 .and_then(|state| state.get("last_seq").and_then(Value::as_u64))
             {
-                Some(seq) => {
-                    last_seq = last_seq.max(seq);
-                }
+                Some(seq) => seq,
                 None => {
                     tracing::warn!(
                         state_path = %state_path,
                         "state.json has no usable last_seq; seq floor comes from the journal window only"
                     );
+                    0
                 }
             }
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
         Err(error) => {
             tracing::warn!(
                 state_path = %state_path,
                 %error,
                 "state.json unreadable; seq floor comes from the journal window only"
             );
+            0
         }
     }
-    Ok(last_seq)
 }
 
 impl JournalWriter {
@@ -183,6 +312,9 @@ impl JournalWriter {
             event_sender,
             limits,
             stats: Arc::new(Mutex::new(scan.stats)),
+            // Unset until the first successful append: creation itself
+            // repairs, so a create-time length is not a valid floor yet.
+            floor_len: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -227,15 +359,45 @@ impl JournalWriter {
             let mut file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             let mut stats = self.stats.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut floor = self
+                .floor_len
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            // Byte-offset checkpoint (B09): every byte this writer ever
+            // observed was a complete line or peer-torn residue the repair
+            // above just stripped. A post-repair file shorter than the
+            // previous checkpoint means something truncated durable history
+            // outside the journal lock; assigning seq on top would reuse
+            // seq values, so fail closed instead.
+            let repaired_len = std::fs::metadata(&self.journal_path)
+                .map(|metadata| metadata.len())
+                .map_err(JournalError::Io)?;
+            if let Some(min_len) = *floor
+                && repaired_len < min_len
+            {
+                return Err(JournalError::InvalidEvent(format!(
+                    "journal truncated outside the journal lock ({} bytes, checkpoint was {min_len}); refusing to assign seq",
+                    repaired_len,
+                )));
+            }
             // A peer writer may have appended while this writer was busy.
             // Resynchronize from durable state so seq stays unique and
             // monotonic even across processes. Any resync failure is
             // fail-closed: continuing with a stale memory seq would risk
             // duplicates and last-writer-wins state.
-            let durable_seq = read_last_seq_from_tail(&self.journal_path)?;
+            let durable_seq = read_last_seq_from_tail(&self.journal_path, self.limits)?;
             if durable_seq > state.last_seq {
                 *state =
                     crate::RunState::fold_journal_with_limits(&self.journal_path, self.limits)?;
+                // Rebuild stats from durable truth: limits below must
+                // enforce against what is on disk, not what this writer
+                // last wrote itself. Otherwise a peer's appends let this
+                // writer exceed configured event/byte caps (B09).
+                stats.bytes = std::fs::metadata(&self.journal_path)
+                    .map(|metadata| metadata.len())
+                    .map(|len| usize::try_from(len).unwrap_or(usize::MAX))
+                    .map_err(JournalError::Io)?;
+                stats.events = usize::try_from(state.last_seq).unwrap_or(usize::MAX);
             }
             let seq = state.last_seq.max(durable_seq).saturating_add(1);
             if let Some(payload_run_id) = object.get("run_id").and_then(Value::as_str)
@@ -284,6 +446,15 @@ impl JournalWriter {
             }
             *state = next_state;
             crate::RunState::persist_serialized_atomic(&self.state_path, &state_bytes)?;
+            // Advance the truncation checkpoint only after the append and
+            // its state persist both succeeded: this length is the new
+            // floor every future resync must meet or exceed. When the
+            // length cannot be observed, the previous floor stands: both
+            // are valid lower bounds, and inventing a length here could
+            // only mask a future truncation.
+            if let Ok(len) = std::fs::metadata(&self.journal_path).map(|metadata| metadata.len()) {
+                *floor = Some(len);
+            }
             (line, event)
         };
         if self.mirror_stdout {
@@ -472,6 +643,7 @@ impl JournalWriter {
             event_sender: self.event_sender.clone(),
             limits: self.limits,
             stats: Arc::clone(&self.stats),
+            floor_len: Arc::clone(&self.floor_len),
         })
     }
 

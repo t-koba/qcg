@@ -14,10 +14,13 @@ pub enum ContainerError {
         instance: String,
         detail: String,
     },
-    #[error("container {stage} timed out for instance `{instance}`")]
+    #[error(
+        "container {stage} timed out after {timeout_secs}s for instance `{instance}`; daemon-side state is unknown and the instance may still exist"
+    )]
     StageTimedOut {
         stage: &'static str,
         instance: String,
+        timeout_secs: u64,
     },
     #[error("container operation was canceled")]
     Canceled,

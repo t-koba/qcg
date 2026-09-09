@@ -24,7 +24,8 @@ pub use plans::{
 };
 pub use session::{
     ADMIN_TIMEOUT, CREATE_TIMEOUT, InstanceId, PROBE_INTERVAL, Provision, START_TIMEOUT,
-    STOP_TIMEOUT, Session, SessionGuard, provision, teardown, teardown_sync,
+    STOP_TIMEOUT, Session, SessionGuard, await_outstanding_cleanups, provision, teardown,
+    teardown_sync,
 };
 
 #[cfg(test)]
@@ -223,7 +224,7 @@ mod tests {
     }
 
     #[test]
-    fn lxc_config_enforces_network_none_mounts_and_caps() {
+    fn lxc_config_enforces_network_empty_mounts_and_caps() {
         let mounts = [
             Mount {
                 host: Path::new("/runs/r1/workspace"),
@@ -237,7 +238,9 @@ mod tests {
             },
         ];
         let config = lxc_config_text(&mounts).expect("valid mounts should render");
-        assert!(config.contains("lxc.net.0.type = none\n"));
+        assert!(config.contains("lxc.net =\n"));
+        assert!(config.contains("lxc.net.0.type = empty\n"));
+        assert!(!config.contains("type = none\n"));
         assert!(
             config.contains("lxc.mount.entry = /runs/r1/workspace work none bind,create=dir 0 0\n")
         );

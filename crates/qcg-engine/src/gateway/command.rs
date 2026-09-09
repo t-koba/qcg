@@ -31,7 +31,7 @@ pub struct CmdGateway {
     cancellation: CancellationToken,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CommandOutput {
     pub status: i32,
     pub stdout: String,
@@ -232,9 +232,15 @@ impl CmdGateway {
                     .await;
                 // Awaited cleanup on every exit path; `--rm` normally removes
                 // the container, but a client-side timeout leaves the daemon
-                // side running without this.
-                teardown(&session).await;
-                guard.disarm();
+                // side running without this. Disarm only on success: a
+                // failed teardown stays armed so the guard backstop retries
+                // it instead of orphaning the container (B06).
+                match teardown(&session).await {
+                    Ok(()) => guard.disarm(),
+                    Err(error) => {
+                        tracing::warn!(%error, "container teardown failed; guard backstop remains armed");
+                    }
+                }
                 result
             }
             managed => {
@@ -305,8 +311,11 @@ impl CmdGateway {
                         spec.stdin,
                     )
                     .await;
-                teardown(&provisioned).await;
-                guard.disarm();
+                if let Err(error) = teardown(&provisioned).await {
+                    tracing::warn!(%error, "managed container teardown failed; guard backstop remains armed");
+                } else {
+                    guard.disarm();
+                }
                 result
             }
         }

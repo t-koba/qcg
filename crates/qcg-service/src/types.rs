@@ -24,6 +24,11 @@ pub enum RunStoreMode {
 pub enum ServiceError {
     #[error("{0}")]
     Invalid(String),
+    /// A journal check-and-append precondition lost a race. Carried typed
+    /// (never string-matched) so rejection classifiers cannot mistake other
+    /// journal failures for a lost race.
+    #[error("journal precondition failed: {0}")]
+    PreconditionFailed(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -82,6 +87,10 @@ pub(crate) struct LocalQcgServiceInner {
     /// Priority-ordered admission always applies; forced interruption of
     /// running jobs is a separate operational choice (3.2).
     pub(crate) preemption_enabled: std::sync::Mutex<bool>,
+    /// Deployment ceiling for per-run total steps, set by the host.
+    /// Omitted means the engine default; never read from the environment
+    /// inside the service (3.2).
+    pub(crate) max_total_steps: std::sync::Mutex<Option<usize>>,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct RunRecord {
@@ -179,8 +188,12 @@ pub(crate) struct ResolvedExecutionPolicy {
 }
 
 impl ResolvedExecutionPolicy {
-    pub(crate) fn resolve(contract_max_steps: usize) -> Self {
-        let ceiling = qcg_engine::RunOptions::default_max_total_steps();
+    /// Resolves the contract request against the deployment ceiling. The
+    /// ceiling comes from explicit host configuration (`None` means the
+    /// engine default), never from environment reads inside the service.
+    pub(crate) fn resolve(contract_max_steps: usize, service_ceiling: Option<usize>) -> Self {
+        let ceiling =
+            service_ceiling.unwrap_or_else(qcg_engine::RunOptions::default_max_total_steps);
         let effective = ceiling.min(contract_max_steps);
         let origin = if effective < contract_max_steps {
             format!("service-ceiling:{ceiling} caps contract:{contract_max_steps}")
@@ -220,5 +233,20 @@ impl FinishTransition {
             confirm: None,
             writes: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::ResolvedExecutionPolicy;
+
+    #[test]
+    fn service_ceiling_caps_contract_with_origin() {
+        let policy = ResolvedExecutionPolicy::resolve(100, Some(40));
+        assert_eq!(policy.max_total_steps, 40);
+        assert_eq!(policy.origin, "service-ceiling:40 caps contract:100");
+        let unlimited = ResolvedExecutionPolicy::resolve(100, None);
+        assert!(unlimited.max_total_steps >= 100);
+        assert_eq!(unlimited.origin, "contract:100");
     }
 }

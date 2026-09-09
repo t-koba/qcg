@@ -135,6 +135,195 @@ mod tests {
     }
 
     #[test]
+    fn resync_rebuilds_stats_from_durable_truth() {
+        // B09: a long-lived writer whose peer appended behind its back must
+        // enforce limits against what is on disk, not its stale counters.
+        // Event cap 2: A writes 1, B writes 1 externally, A's next write
+        // must be rejected (3rd event), not admitted on stale stats.
+        let dir = std::env::temp_dir().join(format!(
+            "qcg-journal-resync-stats-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&dir).expect("test directory should be created");
+        let path = Utf8PathBuf::from_path_buf(dir.join("journal.jsonl"))
+            .expect("temporary path must be UTF-8");
+        let limits = test_limits(64 * 1024, 1024 * 1024, 2, 128 * 1024);
+        let writer_a =
+            crate::JournalWriter::create_with_limits(&path, "resync-stats", false, None, limits)
+                .expect("writer A should open");
+        writer_a
+            .event("note", json!({"n": 1}))
+            .expect("first event should append");
+        // Peer append bypassing A's memory.
+        crate::JournalWriter::append_single_event(
+            &path,
+            "resync-stats",
+            "note",
+            json!({"n": 2}),
+            limits,
+            None,
+        )
+        .expect("peer event should append");
+        let error = writer_a
+            .event("note", json!({"n": 3}))
+            .expect_err("third event must breach the cap of 2");
+        assert!(
+            matches!(error, JournalError::EventCountExceeded { .. }),
+            "stale stats must not admit over-cap appends, got: {error}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn truncation_outside_the_lock_fails_closed() {
+        // B09: durable history that shrinks outside the journal lock must
+        // refuse seq assignment instead of reusing seq values on top of
+        // the truncated file.
+        let dir = std::env::temp_dir().join(format!(
+            "qcg-journal-truncate-guard-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&dir).expect("test directory should be created");
+        let path = Utf8PathBuf::from_path_buf(dir.join("journal.jsonl"))
+            .expect("temporary path must be UTF-8");
+        let writer = crate::JournalWriter::create(&path, "truncate-guard", false, None).unwrap();
+        writer
+            .event("note", json!({"n": 1}))
+            .expect("first event should append");
+        writer
+            .event("note", json!({"n": 2}))
+            .expect("second event should append");
+        // External actor truncates committed history without the lock.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("journal should open")
+            .set_len(0)
+            .expect("truncation should succeed");
+        let error = writer
+            .event("note", json!({"n": 3}))
+            .expect_err("append over truncated history must fail closed");
+        assert!(
+            error.to_string().contains("truncated"),
+            "failure must identify truncation, got: {error}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn huge_tail_seq_follows_the_configured_event_limit() {
+        // B09: the bounded backward scan honors the caller's event limit,
+        // never a fixed default. A final line within the configured limit
+        // resolves; one beyond it fails closed.
+        let dir = std::env::temp_dir().join(format!(
+            "qcg-journal-huge-limit-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&dir).expect("test directory should be created");
+        let path = Utf8PathBuf::from_path_buf(dir.join("journal.jsonl"))
+            .expect("temporary path must be UTF-8");
+        let generous = test_limits(4 * 1024 * 1024, 64 * 1024 * 1024, 100, 128 * 1024);
+        let writer =
+            crate::JournalWriter::create_with_limits(&path, "huge-limit", false, None, generous)
+                .expect("writer should open");
+        writer
+            .event("note", json!({"n": 1}))
+            .expect("first event should append");
+        let big = "x".repeat(2 * 1024 * 1024);
+        crate::JournalWriter::append_single_event(
+            &path,
+            "huge-limit",
+            "note",
+            json!({"blob": big}),
+            generous,
+            None,
+        )
+        .expect("huge peer event should append");
+        assert_eq!(
+            read_last_seq_from_tail(&path, generous).expect("generous limits must resolve"),
+            2
+        );
+        // A narrowed event limit no longer covers the final line: the
+        // backward scan exceeds its cap and the bounded full scan rejects
+        // the oversized event, so resync fails closed instead of guessing.
+        let narrow = test_limits(1024, 64 * 1024 * 1024, 100, 128 * 1024);
+        assert!(
+            read_last_seq_from_tail(&path, narrow).is_err(),
+            "narrowed limits must fail closed on the oversized tail"
+        );
+        // A stale state.json must not stand in for the oversized tail: a
+        // peer that appended then crashed before persisting state leaves
+        // last_seq behind, and only the backward scan finds the truth.
+        let state_path = path.with_file_name("state.json");
+        let mut state: Value =
+            serde_json::from_slice(&std::fs::read(&state_path).expect("state should exist"))
+                .expect("state should parse");
+        state["last_seq"] = Value::from(1);
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec(&state).expect("state should serialize"),
+        )
+        .expect("stale state should persist");
+        assert_eq!(
+            read_last_seq_from_tail(&path, generous).expect("stale state must not hide the tail"),
+            2
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resync_sees_huge_tail_events_for_seq_assignment() {
+        // B09: a final event larger than the tail window must still count
+        // for seq assignment; treating it as absent duplicates its seq.
+        let dir = std::env::temp_dir().join(format!(
+            "qcg-journal-huge-tail-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&dir).expect("test directory should be created");
+        let path = Utf8PathBuf::from_path_buf(dir.join("journal.jsonl"))
+            .expect("temporary path must be UTF-8");
+        let limits = test_limits(4 * 1024 * 1024, 64 * 1024 * 1024, 100, 128 * 1024);
+        let writer_a =
+            crate::JournalWriter::create_with_limits(&path, "huge-tail", false, None, limits)
+                .expect("writer A should open");
+        writer_a
+            .event("note", json!({"n": 1}))
+            .expect("first event should append");
+        // Peer appends a single event larger than the tail window.
+        let big = "x".repeat(2 * 1024 * 1024);
+        crate::JournalWriter::append_single_event(
+            &path,
+            "huge-tail",
+            "note",
+            json!({"blob": big}),
+            limits,
+            None,
+        )
+        .expect("huge peer event should append");
+        writer_a
+            .event("note", json!({"n": 3}))
+            .expect("post-huge-tail append should succeed");
+        let scan = read_journal_values(&path, JournalLimits::default())
+            .expect("journal should be readable");
+        let mut seqs = scan
+            .events
+            .iter()
+            .filter_map(|event| event.get("seq").and_then(Value::as_u64))
+            .collect::<Vec<_>>();
+        seqs.sort_unstable();
+        assert_eq!(
+            seqs,
+            vec![1, 2, 3],
+            "seq values must be unique and monotonic"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn journal_event_rejects_state_at_the_byte_limit() {
         let dir = std::env::temp_dir().join(format!(
             "qcg-journal-state-limit-{}-{}",

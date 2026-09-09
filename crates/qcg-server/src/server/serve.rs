@@ -63,12 +63,21 @@ pub async fn serve_with_listener(
                 format!("invalid idempotency configuration: {detail}"),
             )
         })?;
+    let max_total_steps = super::config::effective_max_total_steps(config.max_total_steps)
+        .map_err(|detail| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid step budget configuration: {detail}"),
+            )
+        })?;
     tracing::info!(
         idempotency_ttl_secs = idempotency_ttl.as_secs(),
         idempotency_max_entries,
         max_request_bytes = config.max_request_bytes,
+        max_total_steps = max_total_steps,
         "effective server policy",
     );
+    service.set_max_total_steps(max_total_steps);
     if std::env::var("QCG_PREEMPTION")
         .map(|value| matches!(value.as_str(), "0" | "false" | "off"))
         .unwrap_or(false)

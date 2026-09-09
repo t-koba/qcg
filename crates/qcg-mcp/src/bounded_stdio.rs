@@ -139,8 +139,11 @@ impl BoundedChildTransport {
             return;
         };
         // Best effort across every backend family. Timeouts are short
-        // because this also runs on Drop.
-        qcg_container::teardown_sync(&session);
+        // because this also runs on Drop. Failures keep the session
+        // identity in the error for operator retry.
+        if let Err(error) = qcg_container::teardown_sync(&session) {
+            tracing::warn!(%error, "container teardown failed");
+        }
     }
 }
 

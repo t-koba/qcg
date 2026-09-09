@@ -226,26 +226,44 @@ export class RunStore {
     this.setValue(id, { name: file.name, content_base64: encodeBase64(bytes) });
   }
 
-  async refreshRuns(): Promise<void> {
-    // Follow pagination cursors so history beyond the first page stays
-    // reachable; cap pages to avoid unbounded fetches on huge stores.
-    // The cap is surfaced via historyHasMore so the UI offers Load more
-    // instead of silently truncating at 2000 entries (C01).
-    const items: RunListResponse["items"] = [];
-    let cursor: string | undefined;
-    let truncated = false;
-    for (let page = 0; page < 10; page++) {
+  /** Next-page cursor for history pagination, null when exhausted. */
+  historyCursor = $state<string | null>(null);
+
+  /**
+   * True while a history page fetch is in flight. Concurrent Load more
+   * presses reuse the running fetch instead of firing the same cursor
+   * twice and appending duplicates.
+   */
+  historyLoading = $state(false);
+
+  /** Fetch one newest-first history page and append it. */
+  async fetchHistoryPage(): Promise<void> {
+    if (this.historyLoading) return;
+    this.historyLoading = true;
+    try {
       const query = this.historyState ? { state: this.historyState } : undefined;
-      const response = await this.api.listRuns({ ...query, cursor, limit: 200 });
-      items.push(...(response.items || []));
-      const next = response.next_cursor ?? null;
-      if (!next) break;
-      cursor = next;
-      if (page === 9) truncated = true;
+      const response = await this.api.listRuns({
+        ...query,
+        cursor: this.historyCursor ?? undefined,
+        limit: 200,
+        order: "desc",
+      });
+      this.runs = [...this.runs, ...(response.items || [])];
+      this.historyCursor = response.next_cursor ?? null;
+      this.historyHasMore = this.historyCursor !== null;
+    } finally {
+      this.historyLoading = false;
     }
-    this.historyHasMore = truncated;
-    // Newest first for the history view; server order is (started_at, run_id).
-    this.runs = [...items].reverse();
+  }
+
+  async refreshRuns(): Promise<void> {
+    // Newest-first pages from the server: recent runs can never fall out
+    // of a capped fetch window, and Load more advances a real cursor
+    // instead of only raising a display count (B12).
+    this.runs = [];
+    this.historyCursor = null;
+    this.historyLimit = 20;
+    await this.fetchHistoryPage();
   }
 
   setHistoryFilter(state: string): void {
@@ -254,8 +272,14 @@ export class RunStore {
     void this.withError(() => this.refreshRuns());
   }
 
-  /** Reveal more fetched history entries without refetching. */
-  loadMoreHistory(): void {
+  /** Reveal more history, fetching the next page when the fetched entries run out. */
+  async loadMoreHistory(): Promise<void> {
+    if (this.historyLimit < this.runs.length) {
+      this.historyLimit += 20;
+      return;
+    }
+    if (this.historyCursor === null) return;
+    await this.withError(() => this.fetchHistoryPage());
     this.historyLimit += 20;
   }
 

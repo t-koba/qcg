@@ -1455,6 +1455,7 @@ async fn http_sse_replays_same_journal_event_sequence_for_run() {
             max_artifact_bytes: None,
             max_artifact_entries: None,
             max_asset_bytes: None,
+            max_total_steps: None,
         },
         listener,
     ));
@@ -1532,6 +1533,7 @@ async fn http_concurrent_runs_keep_artifacts_and_journals_isolated() {
             max_artifact_bytes: None,
             max_artifact_entries: None,
             max_asset_bytes: None,
+            max_total_steps: None,
         },
         listener,
     ));
@@ -1715,6 +1717,7 @@ content = "unexpected"
             max_artifact_bytes: None,
             max_artifact_entries: None,
             max_asset_bytes: None,
+            max_total_steps: None,
         },
         listener,
     ));
@@ -1792,6 +1795,7 @@ async fn http_assets_are_declared_generic_and_metadata_is_verbatim() {
             max_artifact_bytes: None,
             max_artifact_entries: None,
             max_asset_bytes: None,
+            max_total_steps: None,
         },
         listener,
     ));
@@ -1947,6 +1951,7 @@ async fn http_server_is_unauthenticated_and_writes_need_no_extra_headers() {
             max_artifact_bytes: None,
             max_artifact_entries: None,
             max_asset_bytes: None,
+            max_total_steps: None,
         },
         listener,
     ));

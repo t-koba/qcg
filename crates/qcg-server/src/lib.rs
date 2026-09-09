@@ -60,6 +60,7 @@ mod tests {
             max_artifact_bytes: None,
             max_artifact_entries: None,
             max_asset_bytes: None,
+            max_total_steps: None,
         };
         let app = super::server::build_router(&state, &config).expect("router should build");
 
@@ -161,6 +162,7 @@ mod tests {
                 max_artifact_bytes: None,
                 max_artifact_entries: None,
                 max_asset_bytes: None,
+                max_total_steps: None,
             },
             listener,
         )
@@ -390,6 +392,180 @@ mod tests {
                 .len(),
             1,
             "retry must not create a duplicate run"
+        );
+        let _ = std::fs::remove_dir_all(&runs);
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_key_starts_converge_on_one_run() {
+        // B02: two processes racing the same key must converge onto one
+        // run: exactly one execution, identical locations, one run
+        // directory. Separate memories force the durable protocol (no
+        // in-memory short-circuit decides the race).
+        let workspace = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .expect("workspace root should exist")
+            .to_path_buf();
+        let runs = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .expect("temporary directory path should be UTF-8")
+            .join(format!("qcg-idempotency-race-{}", uuid::Uuid::now_v7()));
+        let make_state = || {
+            Arc::new(AppState {
+                service: qcg_service::LocalQcgService::with_generator_roots_max_active_runs_and_store_mode(
+                    vec![workspace.join("fixtures/generators")],
+                    runs.clone(),
+                    None,
+                    qcg_policy::DEFAULT_MAX_ACTIVE_RUNS,
+                    qcg_policy::DEFAULT_MAX_TRACKED_RUNS,
+                    qcg_service::RunStoreMode::SharedFilesystem,
+                )
+                .expect("shared service should initialize"),
+                runs_dir: runs.clone(),
+                oauth_origin: None,
+                oauth_allowed_origins: BTreeSet::new(),
+                oauth_callback_url: None,
+                idempotency: tokio::sync::Mutex::new(BTreeMap::new()),
+                api_token_digest: None,
+                artifact_limits: qcg_service::ArtifactZipLimits::default(),
+                asset_limit: None,
+                max_request_bytes: None,
+            })
+        };
+        let before: std::collections::BTreeSet<String> =
+            std::fs::read_dir(&runs).map_or(BTreeSet::new(), |entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            });
+        let mut headers = HeaderMap::new();
+        headers.insert(IDEMPOTENCY_HEADER, HeaderValue::from_static("race-once"));
+        let request = StartRun {
+            generator_id: "hello-template".into(),
+            inputs: BTreeMap::from([("name".into(), json!("qcg"))]),
+            ..Default::default()
+        };
+        let state_a = make_state();
+        let state_b = make_state();
+        let headers_b = headers.clone();
+        let request_b = request.clone();
+        let (first, second) = tokio::join!(
+            start_run(State(Arc::clone(&state_a)), headers, Json(request)),
+            start_run(State(Arc::clone(&state_b)), headers_b, Json(request_b)),
+        );
+        let first = first.expect("first racer should respond");
+        let second = second.expect("second racer should respond");
+        assert_eq!(
+            first.headers().get(header::LOCATION),
+            second.headers().get(header::LOCATION),
+            "concurrent same-key starts must return the same run"
+        );
+        let after: std::collections::BTreeSet<String> = std::fs::read_dir(&runs)
+            .expect("runs dir should be readable")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            // The idempotency bookkeeping directory is not a run.
+            .filter(|name| name != "idempotency")
+            .collect();
+        let created: Vec<_> = after.difference(&before).collect();
+        assert_eq!(
+            created.len(),
+            1,
+            "concurrent same-key starts must create exactly one run, created: {created:?}"
+        );
+        let _ = std::fs::remove_dir_all(&runs);
+    }
+
+    #[tokio::test]
+    async fn descending_history_pages_cover_newest_runs_without_gaps() {
+        // B12: newest-first pages with a real advancing cursor. Three runs
+        // across two pages must cover every id exactly once in
+        // non-increasing time order.
+        let workspace = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .expect("workspace root should exist")
+            .to_path_buf();
+        let runs = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .expect("temporary directory path should be UTF-8")
+            .join(format!("qcg-history-desc-{}", uuid::Uuid::now_v7()));
+        let state = Arc::new(AppState {
+            service: LocalQcgService::new(
+                workspace.join("fixtures/generators"),
+                runs.clone(),
+                None,
+            )
+            .expect("service should initialize"),
+            runs_dir: runs.clone(),
+            oauth_origin: None,
+            oauth_allowed_origins: BTreeSet::new(),
+            oauth_callback_url: None,
+            idempotency: tokio::sync::Mutex::new(BTreeMap::new()),
+            api_token_digest: None,
+            artifact_limits: qcg_service::ArtifactZipLimits::default(),
+            asset_limit: None,
+            max_request_bytes: None,
+        });
+        for _ in 0..3 {
+            state
+                .service
+                .start_run(StartRun {
+                    generator_id: "hello-template".into(),
+                    inputs: BTreeMap::from([("name".into(), json!("qcg"))]),
+                    ..Default::default()
+                })
+                .await
+                .expect("run should start");
+        }
+        let page = |cursor: Option<String>| {
+            let state = Arc::clone(&state);
+            async move {
+                list_runs(
+                    State(state),
+                    Query(qcg_api::RunListQuery {
+                        limit: Some(2),
+                        cursor,
+                        order: Some(qcg_api::RunListOrder::Desc),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .expect("history page should list")
+                .0
+            }
+        };
+        let first = page(None).await;
+        assert_eq!(first.items.len(), 2, "first page should hold two runs");
+        let cursor = first
+            .next_cursor
+            .clone()
+            .expect("first page should continue");
+        let second = page(Some(cursor)).await;
+        assert_eq!(
+            second.items.len(),
+            1,
+            "second page should hold the last run"
+        );
+        assert!(second.next_cursor.is_none(), "history must end");
+        let mut ids: Vec<_> = first
+            .items
+            .iter()
+            .chain(second.items.iter())
+            .map(|item| item.run_id.clone())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 3, "pages must cover every run exactly once");
+        let times: Vec<_> = first
+            .items
+            .iter()
+            .chain(second.items.iter())
+            .map(|item| item.started_at.clone())
+            .collect();
+        assert!(
+            times.windows(2).all(|pair| pair[0] >= pair[1]),
+            "descending pages must not go back in time"
         );
         let _ = std::fs::remove_dir_all(&runs);
     }

@@ -17,6 +17,7 @@ futures-util.workspace = true
 fs2.workspace = true
 hex.workspace = true
 qcg-api = { path = "../qcg-api" }
+qcg-container = { path = "../qcg-container" }
 qcg-contract = { path = "../qcg-contract" }
 qcg-engine = { path = "../qcg-engine" }
 qcg-llm = { path = "../qcg-llm" }

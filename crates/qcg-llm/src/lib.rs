@@ -7,6 +7,7 @@ mod payload;
 mod provider;
 mod router;
 mod stream;
+pub(crate) mod text_gate;
 mod types;
 mod validate;
 
@@ -24,6 +25,12 @@ pub(crate) use stream::*;
 pub use types::*;
 #[cfg(test)]
 pub(crate) use validate::*;
+
+/// Serializes all process-environment mutation in tests: `set_var` is
+/// process-global, so concurrent readers in other test threads must not
+/// run while any test mutates it.
+#[cfg(test)]
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
 mod tests {
@@ -798,7 +805,9 @@ mod tests {
 
     #[test]
     fn interpolates_known_environment_placeholders() {
-        // SAFETY: single-threaded test binary section; unique variable name.
+        // SAFETY: environment mutation is serialized with ENV_LOCK.
+        let _guard = super::ENV_LOCK.blocking_lock();
+        // SAFETY: lock held; unique variable name.
         unsafe { std::env::set_var("QCG_LLM_INTERP_TEST", "resolved") };
         let resolved = interpolate_env("https://host/{QCG_LLM_INTERP_TEST}/v1")
             .expect("placeholder should resolve");
@@ -863,7 +872,9 @@ mod tests {
         spec.path_template = Some("openai/deployments/{model}/chat/completions".into());
         spec.query
             .insert("api-version".into(), "2024-10-21&unexpected=true".into());
-        // SAFETY: single-threaded test binary section; unique variable name.
+        // SAFETY: environment mutation is serialized with ENV_LOCK; unique variable name.
+        let _guard = super::ENV_LOCK.blocking_lock();
+        // SAFETY: lock held.
         unsafe { std::env::remove_var("QCG_LLM_AZURE_VERSION_TEST") };
 
         let provider = HttpProvider::from_spec(spec);

@@ -6,7 +6,6 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::task::JoinSet;
-use tokio_util::sync::CancellationToken;
 
 /// Grace period for a timed-out node to settle cooperatively after its
 /// node-scoped stop signal before the future is abandoned. Matches the
@@ -256,17 +255,23 @@ impl Engine {
         let mut attempt = 0;
         loop {
             attempt += 1;
+            // Node-scoped execution context, rebuilt every attempt: the
+            // stop signal is always a child of the run token, so parent
+            // cancellation reaches every path uniformly, while a node
+            // timeout cancels only this attempt's scope and never the run
+            // (B11). Gateways observe the same scope, so command, HTTP,
+            // LLM, and MCP paths stop under identical semantics.
+            let node_stop = context.cancellation.child_token();
+            let mut node_context = context.clone();
+            node_context.cancellation = node_stop.clone();
+            node_context.cmd = context.cmd.clone().with_cancellation(node_stop.clone());
+            node_context.http = context.http.clone().with_cancellation(node_stop.clone());
             let result = if let Some(timeout_secs) = retry.timeout_secs {
-                // Node-scoped stop signal: timing out must not cancel the
-                // whole run, so the inner execution observes a child token
-                // on a cloned context. On timeout the child is cancelled and
-                // the node gets a bounded grace period to settle
-                // cooperatively; only then is the future abandoned and the
-                // timeout recorded. Explicit wait and settlement live in this
-                // layer instead of a bare inner-future drop (A09).
-                let node_stop = CancellationToken::new();
-                let mut node_context = context.clone();
-                node_context.cancellation = node_stop.clone();
+                // On timeout the child is cancelled and the node gets a
+                // bounded grace period to settle cooperatively; only then
+                // is the future abandoned and the timeout recorded.
+                // Explicit wait and settlement live in this layer instead
+                // of a bare inner-future drop (A09).
                 let mut execution =
                     self.execute_node_after_budget(&node_context, journal, vars, budget, node);
                 tokio::select! {
@@ -277,28 +282,41 @@ impl Engine {
                             result = &mut execution => result,
                             _ = tokio::time::sleep(std::time::Duration::from_secs(
                                 NODE_TIMEOUT_GRACE_SECS,
-                            )) => Err(EngineError::Step(StepError::failed(
-                                &node.id,
-                                format!("node `{}` timed out after {timeout_secs}s", node.id),
-                            ))),
+                            )) => {
+                                // A parent cancel racing the deadline wins:
+                                // reporting timeout for a canceled run
+                                // would misclassify the outcome.
+                                if context.cancellation.is_cancelled() {
+                                    Err(EngineError::Canceled)
+                                } else {
+                                    Err(EngineError::Step(StepError::TimedOut {
+                                        node: node.id.clone(),
+                                        timeout_secs,
+                                    }))
+                                }
+                            },
                         }
                     }
                 }
             } else {
-                self.execute_node_after_budget(context, journal, vars, budget, node)
+                self.execute_node_after_budget(&node_context, journal, vars, budget, node)
                     .await
             };
+            // Retry ordinary failures and timeouts; the operation guard
+            // on the next attempt enforces the indeterminate policy
+            // (refuse without opt-in) and invocation separation. Refusals
+            // never retry: re-guarding would refuse identically.
             match &result {
-                Err(EngineError::Step(StepError::Failed { message, .. }))
-                    if attempt < max_attempts =>
-                {
+                Err(EngineError::Step(
+                    error @ (StepError::Failed { .. } | StepError::TimedOut { .. }),
+                )) if attempt < max_attempts => {
                     journal.event(
                         "step_retry",
                         json!({
                             "node": node.id,
                             "attempt": attempt,
                             "max_attempts": max_attempts,
-                            "error": message,
+                            "error": error.to_string(),
                         }),
                     )?;
                     if retry.backoff_ms > 0 {

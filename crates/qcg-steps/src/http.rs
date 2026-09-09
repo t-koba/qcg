@@ -269,48 +269,87 @@ impl StepExecutor for HttpStep {
         // Stable operation id doubles as the remote idempotency key so
         // retries after a lost result deduplicate server-side. Started
         // without finished refuses automatic replay (indeterminate result).
-        let operation_id = if matches!(method.as_str(), "GET" | "HEAD") {
-            None
+        // Same-invocation resends deserialize the cached native response
+        // and continue through the identical output tail below.
+        let safe_method = matches!(method.as_str(), "GET" | "HEAD");
+        let response: qcg_engine::HttpOutput = if safe_method {
+            ctx.run
+                .http
+                .request(HttpRequest {
+                    method,
+                    url: url.clone(),
+                    headers,
+                    sensitive_query: std::collections::BTreeMap::new(),
+                    body,
+                    follow_redirects: true,
+                    idempotency_key: None,
+                })
+                .await
+                .map_err(|error| StepError::from_gateway(&node.id, error))?
         } else {
-            Some(ctx.run.guard_external_operation(
+            let digest = qcg_engine::RunContext::operation_digest(&url, &http_details)?;
+            let invocation = qcg_engine::content_invocation_id(&digest);
+            match ctx.run.guard_external_operation(
                 ctx.journal,
                 node,
                 "http",
                 &url,
                 &http_details,
-            )?)
-        };
-        let response = match ctx
-            .run
-            .http
-            .request(HttpRequest {
-                method,
-                url: url.clone(),
-                headers,
-                sensitive_query: std::collections::BTreeMap::new(),
-                body,
-                follow_redirects: true,
-                idempotency_key: operation_id.clone(),
-            })
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                if let Some(operation_id) = operation_id {
-                    let _ = ctx.run.finish_external_operation_with_status(
+                &invocation,
+            )? {
+                qcg_engine::GuardDecision::Proceed { operation_id } => {
+                    let response = match ctx
+                        .run
+                        .http
+                        .request(HttpRequest {
+                            method,
+                            url: url.clone(),
+                            headers,
+                            sensitive_query: std::collections::BTreeMap::new(),
+                            body,
+                            follow_redirects: true,
+                            idempotency_key: Some(operation_id.clone()),
+                        })
+                        .await
+                    {
+                        Ok(response) => response,
+                        Err(error) => {
+                            // Cancellation finishes nothing: it
+                            // propagates without a completion record.
+                            if !matches!(error, qcg_engine::GatewayError::Canceled) {
+                                ctx.run.finish_external_operation_with_warn(
+                                    ctx.journal,
+                                    node,
+                                    &operation_id,
+                                    qcg_engine::OperationOutcome::gateway_error(&error, false),
+                                );
+                            }
+                            return Err(StepError::from_gateway(&node.id, error));
+                        }
+                    };
+                    let response_value = serde_json::to_value(&response).map_err(|error| {
+                        StepError::failed(
+                            &node.id,
+                            format!("HTTP response is not serializable: {error}"),
+                        )
+                    })?;
+                    ctx.run.finish_external_operation(
                         ctx.journal,
                         node,
                         &operation_id,
-                        "error",
-                    );
+                        Some(response_value),
+                    )?;
+                    response
                 }
-                return Err(StepError::from_gateway(&node.id, error));
+                qcg_engine::GuardDecision::Resend { result, .. } => serde_json::from_value(result)
+                    .map_err(|error| {
+                        StepError::failed(
+                            &node.id,
+                            format!("cached HTTP response is corrupt: {error}"),
+                        )
+                    })?,
             }
         };
-        if let Some(operation_id) = operation_id {
-            ctx.run
-                .finish_external_operation(ctx.journal, node, &operation_id)?;
-        }
         let mut files = Vec::new();
         let output_mode = match (params.output, params.output_file.is_some()) {
             (Some(mode), _) => mode,
