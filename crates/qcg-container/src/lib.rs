@@ -380,7 +380,7 @@ mod tests {
         for _ in 0..100 {
             let name = instance_name();
             assert!(name.starts_with("qcg"));
-            assert_eq!(name.len(), 19);
+            assert_eq!(name.len(), 35, "qcg plus the full UUID: {name}");
             assert!(
                 name.bytes()
                     .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()),

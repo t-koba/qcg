@@ -243,16 +243,37 @@ pub fn write_file_atomic(
         let outcome = write(&mut file).and_then(|()| file.sync_all());
         drop(file);
         match outcome {
-            Ok(()) => return std::fs::rename(&staging, path),
-            Err(error) => {
-                let _ = std::fs::remove_file(&staging);
-                return Err(error);
+            Ok(()) => {
+                if let Err(error) = std::fs::rename(&staging, path) {
+                    // The rename failed after the content was staged:
+                    // reclaim the staging file instead of leaving it
+                    // behind (D05). The destination is untouched.
+                    return Err(cleanup_staging(&staging, error));
+                }
+                return Ok(());
             }
+            Err(error) => return Err(cleanup_staging(&staging, error)),
         }
     }
     Err(std::io::Error::other(format!(
         "failed to stage atomic write for `{path}`"
     )))
+}
+
+/// Reclaims a staging file after a failed write. When the removal itself
+/// fails, the leftover path and its error are attached to the returned
+/// error so the remaining file stays observable instead of silently
+/// disappearing (D05).
+fn cleanup_staging(staging: &Utf8Path, error: std::io::Error) -> std::io::Error {
+    match std::fs::remove_file(staging) {
+        Ok(()) => error,
+        Err(cleanup_error) => std::io::Error::new(
+            error.kind(),
+            format!(
+                "{error}; additionally failed to remove staging file `{staging}`: {cleanup_error}"
+            ),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -357,6 +378,29 @@ mod tests {
         assert!(
             staging_files(&dir).is_empty(),
             "failed staging files must be removed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_file_atomic_removes_staging_when_rename_fails() {
+        // D05: a successful callback is not a successful write. When the
+        // rename over the destination fails (here: the destination is a
+        // directory), the staging file must be reclaimed and the
+        // destination left untouched.
+        let dir = test_dir("atomic-rename-fail");
+        let path = dir.join("outputs.json");
+        std::fs::create_dir(&path).expect("destination directory should be created");
+        let error = write_file_atomic(&path, |file| {
+            use std::io::Write as _;
+            file.write_all(b"new")
+        })
+        .expect_err("rename over a directory must fail");
+        assert!(!error.to_string().is_empty());
+        assert!(path.is_dir(), "destination must be unchanged");
+        assert!(
+            staging_files(&dir).is_empty(),
+            "a failed rename must not leave staging files"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

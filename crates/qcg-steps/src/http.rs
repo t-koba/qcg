@@ -307,7 +307,11 @@ impl StepExecutor for HttpStep {
                             headers,
                             sensitive_query: std::collections::BTreeMap::new(),
                             body,
-                            follow_redirects: true,
+                            // A redirected side-effect request would replay
+                            // the approved operation against a new target;
+                            // the gateway would refuse to follow it anyway.
+                            // The 3xx response is the step's result.
+                            follow_redirects: false,
                             idempotency_key: Some(operation_id.clone()),
                         })
                         .await

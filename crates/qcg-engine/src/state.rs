@@ -125,10 +125,11 @@ pub struct RunState {
     /// invocations never share an id even for identical content, while
     /// the same invocation reuses its id across resends and retries
     /// (B07, C04). Statuses: `Started` (remote may have executed, result unknown),
-    /// `Succeeded` (result durably recorded, resends converge without
-    /// re-executing), `FailedClean` (proven nothing applied, retryable),
-    /// `FailedIndeterminate` (unknown effects, refused unless the node
-    /// opts into at-least-once repeat) (B08).
+    /// `Succeeded` (the operation completed; a result is cached only when
+    /// the output checks passed, and an uncached success refuses automatic
+    /// replay instead of re-executing), `FailedClean` (proven nothing
+    /// applied, retryable), `FailedIndeterminate` (unknown effects,
+    /// refused unless the node opts into at-least-once repeat) (B08, D03).
     /// Replaces the former `operations` status map without migration:
     /// persisted snapshots drop the old map (no `deny_unknown_fields`)
     /// and running state rebuilds from the journal fold, which is the
@@ -662,16 +663,26 @@ impl RunState {
             }
             "operation_started" => {
                 if let Some(id) = event.get("operation_id").and_then(Value::as_str) {
-                    let digest = event
-                        .get("operation_digest")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
-                    let invocation = event
-                        .get("invocation_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
+                    // A present-but-non-string field is journal corruption:
+                    // defaulting it to empty could skip the invocation
+                    // mismatch check, so fail closed instead.
+                    let digest = match event.get("operation_digest") {
+                        None => String::new(),
+                        Some(value) => value.as_str().map(str::to_string).ok_or_else(|| {
+                            crate::JournalError::InvalidEvent(
+                                "operation_started operation_digest must be a string".into(),
+                            )
+                        })?,
+                    };
+                    let invocation = match event.get("invocation_id") {
+                        // Pre-invocation journals legitimately omit it.
+                        None => String::new(),
+                        Some(value) => value.as_str().map(str::to_string).ok_or_else(|| {
+                            crate::JournalError::InvalidEvent(
+                                "operation_started invocation_id must be a string".into(),
+                            )
+                        })?,
+                    };
                     let record =
                         self.operation_records
                             .entry(id.to_string())

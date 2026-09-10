@@ -8,7 +8,8 @@ use std::time::Instant;
 
 use crate::agent::{agent_tool_requires_serial_execution, charge_agent_tool_call};
 use crate::agent_runtime::{
-    AgentToolInvocation, AgentToolServices, execute_agent_tool, validate_agent_tool_call_args,
+    AgentToolInvocation, AgentToolServices, execute_agent_tool, finish_rejected_external_operation,
+    validate_agent_tool_call_args,
 };
 use crate::agent_tools::load_agent_output_schema;
 use crate::completion::complete_llm_with_policy;
@@ -419,8 +420,13 @@ pub(crate) async fn execute_specialist_agent(
                     return Err(error);
                 }
             };
-            let value = match outcome {
-                AgentToolOutcome::Result(value) | AgentToolOutcome::Error(value) => value,
+            let (value, mut pending_operation) = match outcome {
+                AgentToolOutcome::Result(value) => (value, None),
+                AgentToolOutcome::OperationResult {
+                    value,
+                    operation_id,
+                } => (value, Some(operation_id)),
+                AgentToolOutcome::Error(value) => (value, None),
                 AgentToolOutcome::Handoff(_) => {
                     let error = StepError::failed(
                         &node.id,
@@ -488,6 +494,7 @@ pub(crate) async fn execute_specialist_agent(
             )
             .await
             {
+                finish_rejected_external_operation(ctx, node, pending_operation.take());
                 record_tool_call_failure(
                     ctx,
                     node,
@@ -522,6 +529,7 @@ pub(crate) async fn execute_specialist_agent(
             )?;
             let encoded = serde_json::to_string(&value)?;
             if let Err(error) = scan_llm_text(ctx, node, &encoded) {
+                finish_rejected_external_operation(ctx, node, pending_operation.take());
                 record_tool_call_failure(
                     ctx,
                     node,
@@ -535,6 +543,16 @@ pub(crate) async fn execute_specialist_agent(
                     ),
                 )?;
                 return Err(error);
+            }
+            // Every output check has passed: the operation may now be
+            // finished with its result available for resend (D03).
+            if let Some(operation_id) = pending_operation.take() {
+                ctx.run.finish_external_operation(
+                    ctx.journal,
+                    node,
+                    &operation_id,
+                    Some(value.clone()),
+                )?;
             }
             ctx.journal.event("tool_call", event).step_err(&node.id)?;
             messages.push(ChatMessage::tool_result(call.id, encoded));

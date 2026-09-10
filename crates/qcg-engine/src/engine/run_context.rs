@@ -113,6 +113,14 @@ impl OperationOutcome {
     /// reclassification.
     pub fn gateway_error(error: &crate::GatewayError, side_effect_free: bool) -> Self {
         use crate::GatewayError;
+        // Send history beats the error's shape: once a side-effect-bearing
+        // request has been dispatched, no later failure proves that
+        // nothing was applied (D02).
+        if let GatewayError::AfterSend(_) = error {
+            return OperationOutcome::Indeterminate {
+                reason: error.to_string(),
+            };
+        }
         if side_effect_free {
             return OperationOutcome::CleanError;
         }
@@ -468,6 +476,26 @@ mod tests {
         }
     }
 
+    /// Parses every journal line strictly: a corrupt line must fail the
+    /// test instead of being silently dropped from the count.
+    fn journal_values(path: &camino::Utf8Path) -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .expect("journal should be readable")
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<Value>(line)
+                    .unwrap_or_else(|error| panic!("journal line must parse: {error}: {line}"))
+            })
+            .collect()
+    }
+
+    fn operation_start_count(path: &camino::Utf8Path) -> usize {
+        journal_values(path)
+            .iter()
+            .filter(|event| event.get("t").and_then(Value::as_str) == Some("operation_started"))
+            .count()
+    }
+
     /// Full guard harness: a live run context plus its journal directory.
     /// The caller opens the journal when ready so pre-existing journal
     /// content (legacy upgrades, crash recovery) folds first.
@@ -706,14 +734,58 @@ mod tests {
         // Exactly two executions happened: two for the shared content
         // (one per invocation). The same-invocation resend and the
         // changed-content resend added no new starts.
-        let source = std::fs::read_to_string(metadata.join("journal.jsonl"))
-            .expect("journal should be readable");
-        let starts = source
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .filter(|event| event.get("t").and_then(Value::as_str) == Some("operation_started"))
-            .count();
+        let starts = operation_start_count(&metadata.join("journal.jsonl"));
         assert_eq!(starts, 2, "refused resends must not start executions");
+    }
+
+    #[test]
+    fn succeeded_without_cached_result_refuses_replay_from_the_journal() {
+        // D03: a secret- or guardrail-rejected result is recorded as a
+        // success with no cached result. A resumed invocation must refuse
+        // instead of re-executing the external operation.
+        let (_dir, metadata, ctx, node) = guard_harness("rejected-result");
+        let journal = crate::JournalWriter::create(
+            &metadata.join("journal.jsonl"),
+            "rejected-result",
+            false,
+            None,
+        )
+        .expect("test journal should open");
+        let details = Some(json!({"argv": ["produce_secret"]}));
+        let first = ctx
+            .guard_external_operation(
+                &journal,
+                &node,
+                "command",
+                "produce_secret",
+                &details,
+                "call-1",
+            )
+            .expect("first invocation should proceed");
+        let GuardDecision::Proceed { operation_id } = first else {
+            panic!("first invocation must proceed");
+        };
+        ctx.finish_external_operation(&journal, &node, &operation_id, None)
+            .expect("success without a cached result should journal");
+        let error = ctx
+            .guard_external_operation(
+                &journal,
+                &node,
+                "command",
+                "produce_secret",
+                &details,
+                "call-1",
+            )
+            .expect_err("a replay of an uncached success must be refused");
+        assert!(
+            matches!(error, crate::StepError::Refused { .. }),
+            "uncached success must refuse automatic replay, got: {error}"
+        );
+        assert_eq!(
+            operation_start_count(&metadata.join("journal.jsonl")),
+            1,
+            "the refused replay must not journal a new start"
+        );
     }
 
     #[test]
@@ -772,13 +844,8 @@ mod tests {
             "legacy started operation must be refused, got: {error}"
         );
         // …and no new execution was journaled.
-        let source = std::fs::read_to_string(&journal_path).expect("journal should be readable");
         assert_eq!(
-            source
-                .lines()
-                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-                .filter(|event| event.get("t").and_then(Value::as_str) == Some("operation_started"))
-                .count(),
+            operation_start_count(&journal_path),
             1,
             "refused replay must not journal a new start"
         );

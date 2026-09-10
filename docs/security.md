@@ -133,7 +133,11 @@ result enters the next LLM turn. External schema references are rejected, so
 schema validation cannot initiate undeclared network or filesystem access.
 Tool results remain untrusted data (the agent
 guardrail tells the model not to treat them as instructions) and are scanned
-for declared secret values before they enter the next LLM turn.
+for declared secret values before they enter the next LLM turn. The resend
+cache for external operations is written only after the tool-output
+guardrails and that scan pass: a rejected result is journaled as a
+successful operation without a reusable result, so a resume refuses
+automatic replay instead of re-executing the tool.
 
 Streaming text is published as `llm_delta` events only after a holdback
 window covering the longest registered secret clears: each arrival is scanned

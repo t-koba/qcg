@@ -217,16 +217,17 @@ pub(crate) fn claim_durable_pending(
     // (Valid) predecessor means another owner holds the key: report Peer
     // without writing, since the atomic rename below would otherwise
     // replace its claim and crown two owners.
-    // The reaped predecessor's generation survives in memory: the file
-    // is gone by the time the next generation is computed below, and
-    // forgetting it would let an adoption reuse a live number.
+    // The expired predecessor is NOT unlinked here. The publication below
+    // replaces it by atomic rename, so a crash at any point leaves either
+    // the old mapping (before rename) or the new mapping adopting the same
+    // run id (after rename). Unlinking first opened a window where both
+    // were gone and a retry started a new run, losing the run association
+    // (D04). The predecessor's generation still floors the next one.
     let mut expired_generation = 0u64;
     let adopted = match read_durable_pending(runs_dir, key) {
         PendingRead::Valid(_) => return Ok(ClaimOutcome::Peer),
         PendingRead::Expired(record) => {
-            // Reap here, under the lock: the waiter path only observes.
             expired_generation = record.generation;
-            let _ = std::fs::remove_file(pending_path(runs_dir, key).as_std_path());
             if record.digest == digest {
                 record.run_id.clone()
             } else {
@@ -244,8 +245,9 @@ pub(crate) fn claim_durable_pending(
     let run_id = adopted.or(reserved_run_id);
     let owner = uuid::Uuid::now_v7().to_string();
     // Next generation after every live record for this key, floored by the
-    // reaped predecessor. Absent files count as 0, so a fresh chain starts
-    // at 1; a superseded owner can never present a current generation.
+    // expired predecessor (still on disk until the rename below). Absent
+    // files count as 0, so a fresh chain starts at 1; a superseded owner
+    // can never present a current generation.
     let generation = pending_generation(runs_dir, key)?.max(expired_generation.saturating_add(1));
     let record = DurablePendingRecord {
         key: key.to_string(),
@@ -258,31 +260,27 @@ pub(crate) fn claim_durable_pending(
     let bytes = serde_json::to_vec(&record).map_err(|error| {
         ApiHttpError::internal(format!("failed to persist idempotency record: {error}"))
     })?;
-    // Atomic publication via temp + rename: readers observe either absence
-    // or a complete claim, never a torn write. A torn read misclassified
-    // as corrupt would delete a live owner's claim and split the key into
-    // two owners (A03).
+    // Atomic publication via temp + rename: readers observe either the
+    // predecessor or a complete new claim, never a torn write. A torn read
+    // misclassified as corrupt would delete a live owner's claim and split
+    // the key into two owners (A03). Staging and replacement are separate
+    // steps: a crash between them leaves the predecessor mapping intact
+    // (D04).
     reap_stale_claim_tmps(runs_dir);
     let tmp = path.with_extension(format!("tmp-{}", uuid::Uuid::now_v7()));
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(tmp.as_std_path())
-    {
-        Ok(mut file) => {
-            use std::io::Write as _;
-            let write_result = file
-                .write_all(&bytes)
-                .and_then(|()| file.sync_data())
-                .and_then(|()| {
-                    std::fs::rename(tmp.as_std_path(), path.as_std_path())?;
-                    sync_dir(&idempotency_dir(runs_dir))
-                });
-            if let Err(error) = write_result {
-                let _ = std::fs::remove_file(tmp.as_std_path());
-                return Err(ApiHttpError::internal(format!(
-                    "failed to persist idempotency record: {error}"
-                )));
+    match stage_pending(&tmp, &bytes) {
+        Ok(()) => {
+            let publish_result =
+                replace_pending(&tmp, &path).and_then(|()| sync_dir(&idempotency_dir(runs_dir)));
+            if let Err(error) = publish_result {
+                return Err(ApiHttpError::internal(
+                    match std::fs::remove_file(tmp.as_std_path()) {
+                        Ok(()) => format!("failed to persist idempotency record: {error}"),
+                        Err(cleanup_error) => format!(
+                            "failed to persist idempotency record: {error}; leftover staging file `{tmp}` could not be removed: {cleanup_error}"
+                        ),
+                    },
+                ));
             }
             // Under the claim lock no concurrent publisher exists, so this
             // rename cannot replace a live claim: a Valid predecessor
@@ -306,6 +304,24 @@ pub(crate) fn claim_durable_pending(
             "failed to persist idempotency record: {error}"
         ))),
     }
+}
+
+/// Writes and syncs a staged claim. Publication is a separate step so a
+/// crash between staging and [`replace_pending`] leaves the predecessor
+/// claim untouched (D04).
+fn stage_pending(tmp: &camino::Utf8Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(tmp.as_std_path())?;
+    file.write_all(bytes)?;
+    file.sync_data()
+}
+
+/// Atomically replaces the predecessor claim with the staged claim.
+fn replace_pending(tmp: &camino::Utf8Path, path: &camino::Utf8Path) -> std::io::Result<()> {
+    std::fs::rename(tmp.as_std_path(), path.as_std_path())
 }
 
 /// Best-effort reaping of claim temp files left by crashed publishers.
@@ -522,8 +538,8 @@ pub(crate) enum WaitOutcome {
     Ready(String),
     /// The owner died before committing: the caller loops back and claims,
     /// adopting the orphaned run id instead of wedging. The id rides along
-    /// because observing expiry already reaped the pending file; re-reading
-    /// it in the claim loop would find nothing and orphan the run (A03).
+    /// so a caller that cannot re-observe the claim still adopts the run
+    /// instead of orphaning it (A03).
     RetryClaim {
         adopted_run_id: Option<String>,
     },
@@ -961,6 +977,139 @@ mod tests {
             }
             other => panic!("expected adopting owner, got {}", outcome_name(&other)),
         }
+        let _ = std::fs::remove_dir_all(runs_dir.as_std_path());
+    }
+
+    #[test]
+    fn staged_adoption_leaves_the_predecessor_until_replacement() {
+        // D04: staging the successor must not touch the predecessor; only
+        // the atomic replacement changes the mapping. This simulates a
+        // crash between stage and replace and works under root, where the
+        // read-only-directory injection below cannot fire.
+        let runs_dir = temp_runs_dir("adopt-stage");
+        let key = "key-1";
+        std::fs::create_dir_all(idempotency_dir(&runs_dir).as_std_path())
+            .expect("idempotency dir should be created");
+        let predecessor = DurablePendingRecord {
+            key: key.into(),
+            digest: "digest".into(),
+            run_id: Some("run-A".into()),
+            owner: "dead-owner".into(),
+            created_at_unix: 0,
+            generation: 1,
+        };
+        let pending = pending_path(&runs_dir, key);
+        std::fs::write(
+            pending.as_std_path(),
+            serde_json::to_vec(&predecessor).expect("record should serialize"),
+        )
+        .expect("predecessor claim should be written");
+        let successor = DurablePendingRecord {
+            key: key.into(),
+            digest: "digest".into(),
+            run_id: Some("run-A".into()),
+            owner: "adopting-owner".into(),
+            created_at_unix: now_unix(),
+            generation: 2,
+        };
+        let tmp = pending.with_extension(format!("tmp-{}", uuid::Uuid::now_v7()));
+        stage_pending(
+            &tmp,
+            &serde_json::to_vec(&successor).expect("record should serialize"),
+        )
+        .expect("staging the successor should succeed");
+        // Crash before replacement: the predecessor mapping is intact.
+        let survivor: DurablePendingRecord = serde_json::from_slice(
+            &std::fs::read(pending.as_std_path()).expect("predecessor should still exist"),
+        )
+        .expect("predecessor should parse");
+        assert_eq!(survivor.run_id.as_deref(), Some("run-A"));
+        assert_eq!(survivor.generation, 1);
+        // Replacement converges onto the same run with the next generation.
+        replace_pending(&tmp, &pending).expect("replacement should succeed");
+        let published: DurablePendingRecord = serde_json::from_slice(
+            &std::fs::read(pending.as_std_path()).expect("successor should exist"),
+        )
+        .expect("successor should parse");
+        assert_eq!(published.run_id.as_deref(), Some("run-A"));
+        assert_eq!(published.generation, 2);
+        assert!(
+            !tmp.as_std_path().exists(),
+            "the replacement must consume the staged file"
+        );
+        let _ = std::fs::remove_dir_all(runs_dir.as_std_path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adoption_keeps_the_predecessor_mapping_until_publication() {
+        // D04: an interrupted adoption must leave the predecessor's run
+        // mapping in place. Publication is an atomic rename over the old
+        // claim; when the rename cannot happen (here: the directory
+        // refuses new files), the old mapping must survive instead of
+        // having been unlinked first. The old code removed it before
+        // publishing, so a crash in that window orphaned the run.
+        use std::os::unix::fs::PermissionsExt as _;
+        let runs_dir = temp_runs_dir("adopt-crash");
+        let key = "key-1";
+        let dir = idempotency_dir(&runs_dir);
+        std::fs::create_dir_all(dir.as_std_path()).expect("idempotency dir should be created");
+        // The lock file must exist before the directory turns read-only.
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(".idempotency.lock").as_std_path())
+            .expect("lock file should be created");
+        let expired = DurablePendingRecord {
+            key: key.into(),
+            digest: "digest".into(),
+            run_id: Some("run-A".into()),
+            owner: "dead-owner".into(),
+            created_at_unix: 0,
+            generation: 1,
+        };
+        let pending = pending_path(&runs_dir, key);
+        std::fs::write(
+            pending.as_std_path(),
+            serde_json::to_vec(&expired).expect("record should serialize"),
+        )
+        .expect("expired claim should be written");
+        let original = std::fs::metadata(dir.as_std_path())
+            .expect("idempotency dir should have metadata")
+            .permissions();
+        let mut readonly = original.clone();
+        readonly.set_mode(0o555);
+        std::fs::set_permissions(dir.as_std_path(), readonly)
+            .expect("idempotency dir should become read-only");
+        // Probe: root ignores directory permissions, so skip rather than
+        // assert on an environment where the fault cannot be injected.
+        let probe = dir.join("probe");
+        if std::fs::write(probe.as_std_path(), b"x").is_ok() {
+            let _ = std::fs::remove_file(probe.as_std_path());
+            std::fs::set_permissions(dir.as_std_path(), original)
+                .expect("permissions should be restored");
+            let _ = std::fs::remove_dir_all(runs_dir.as_std_path());
+            return;
+        }
+        let result = claim_durable_pending(&runs_dir, key, "digest", Some("run-B".into()));
+        std::fs::set_permissions(dir.as_std_path(), original)
+            .expect("permissions should be restored");
+        assert!(
+            result.is_err(),
+            "publication into a read-only directory must fail"
+        );
+        let survivor: DurablePendingRecord = serde_json::from_slice(
+            &std::fs::read(pending.as_std_path())
+                .expect("predecessor mapping must survive the failed publication"),
+        )
+        .expect("surviving claim should parse");
+        assert_eq!(
+            survivor.run_id.as_deref(),
+            Some("run-A"),
+            "the adopted run must stay attributable"
+        );
+        assert_eq!(survivor.generation, 1, "the predecessor is unchanged");
         let _ = std::fs::remove_dir_all(runs_dir.as_std_path());
     }
 

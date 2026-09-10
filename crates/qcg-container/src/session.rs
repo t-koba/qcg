@@ -355,6 +355,13 @@ async fn provision_incus(binary: &str, spec: &Provision<'_>) -> Result<Session, 
             Ok(session)
         }
         Err(error) => {
+            // An already-existing name belongs to another owner: our
+            // create was refused before it made anything, so tearing the
+            // name down would stop or delete a foreign instance (D01).
+            if matches!(error, ContainerError::InstanceExists { .. }) {
+                guard.disarm();
+                return Err(error);
+            }
             // Awaited cleanup first for observability; the guard backstop
             // stays armed only if this fails, so a settled provision is
             // never torn down twice.
@@ -444,6 +451,12 @@ async fn provision_lxc(spec: &Provision<'_>) -> Result<Session, ContainerError> 
             Ok(session)
         }
         Err(error) => {
+            // A refused create with an existing-name report belongs to
+            // another owner and must not be torn down (D01).
+            if matches!(error, ContainerError::InstanceExists { .. }) {
+                guard.disarm();
+                return Err(error);
+            }
             if let Err(cleanup_error) = teardown(&session).await {
                 record_cleanup_failure();
                 tracing::warn!(
@@ -456,6 +469,35 @@ async fn provision_lxc(spec: &Provision<'_>) -> Result<Session, ContainerError> 
             }
             Err(error)
         }
+    }
+}
+
+/// Whether daemon stderr proves the instance itself already exists (D01).
+/// Requires the daemon's existing-name report for OUR instance: a generic
+/// "already exists" about a device, pool, or foreign name proves nothing.
+fn is_instance_exists_report(stderr: &str, instance: &str) -> bool {
+    let lower = stderr.to_lowercase();
+    if !lower.contains(&instance.to_lowercase()) {
+        return false;
+    }
+    ["already exists", "already in use", "exists already"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// Reads a Docker-family tracking file. `Ok(None)` covers the states that
+/// prove no container identity was ever recorded (missing file, empty
+/// content); an unreadable file (invalid UTF-8, permissions, I/O) is an
+/// error so teardown never reports success while the identity is unknown
+/// (D06).
+fn read_cidfile(cidfile: &std::path::Path) -> Result<Option<String>, ContainerError> {
+    match std::fs::read_to_string(cidfile) {
+        Ok(contents) => {
+            let id = contents.trim().to_string();
+            Ok((!id.is_empty()).then_some(id))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(ContainerError::Io(error)),
     }
 }
 
@@ -473,13 +515,10 @@ pub async fn teardown(session: &Session) -> Result<(), ContainerError> {
             backend: Backend::Docker { binary, .. },
             id: InstanceId::CidFile(cidfile),
         } => {
-            let id = std::fs::read_to_string(cidfile)
-                .map(|id| id.trim().to_string())
-                .unwrap_or_default();
-            if id.is_empty() {
+            let Some(id) = read_cidfile(cidfile)? else {
                 let _ = std::fs::remove_file(cidfile);
                 return Ok(());
-            }
+            };
             if let Err(error) =
                 run_admin_timed(&[binary.as_str(), "kill", &id], STOP_TIMEOUT, &id, "kill").await
             {
@@ -585,13 +624,10 @@ pub fn teardown_sync(session: &Session) -> Result<(), ContainerError> {
             backend: Backend::Docker { binary, .. },
             id: InstanceId::CidFile(cidfile),
         } => {
-            let id = std::fs::read_to_string(cidfile)
-                .map(|id| id.trim().to_string())
-                .unwrap_or_default();
-            if id.is_empty() {
+            let Some(id) = read_cidfile(cidfile)? else {
                 let _ = std::fs::remove_file(cidfile);
                 return Ok(());
-            }
+            };
             for (args, stage) in [
                 (vec!["kill", id.as_str()], "kill"),
                 (vec!["rm", "-f", id.as_str()], "rm"),
@@ -664,6 +700,7 @@ pub fn teardown_sync(session: &Session) -> Result<(), ContainerError> {
     }
 }
 
+#[derive(Debug)]
 struct AdminOutput {
     stdout: String,
 }
@@ -726,6 +763,15 @@ async fn run_admin(
             .chars()
             .rev()
             .collect();
+        // Creation stages only: an existing-name report means the name
+        // belongs to another provisioning attempt and must never be
+        // adopted for teardown (D01).
+        if matches!(stage, "init" | "create") && is_instance_exists_report(&stderr, instance) {
+            return Err(ContainerError::InstanceExists {
+                stage,
+                instance: instance.to_string(),
+            });
+        }
         return Err(ContainerError::StageFailed {
             stage,
             instance: instance.to_string(),
@@ -989,6 +1035,10 @@ mod tests {
         tempfile_like::TempCid::create(id_contents)
     }
 
+    fn bogus_docker_session_bytes(id_contents: &[u8]) -> (tempfile_like::TempCid, Session) {
+        tempfile_like::TempCid::create_bytes(id_contents)
+    }
+
     mod tempfile_like {
         use super::*;
 
@@ -998,6 +1048,10 @@ mod tests {
 
         impl TempCid {
             pub(crate) fn create(contents: &str) -> (TempCid, Session) {
+                Self::create_bytes(contents.as_bytes())
+            }
+
+            pub(crate) fn create_bytes(contents: &[u8]) -> (TempCid, Session) {
                 let path = std::env::temp_dir().join(format!(
                     ".qcg-test-cid-{}",
                     uuid::Uuid::now_v7().as_simple()
@@ -1045,6 +1099,95 @@ mod tests {
         assert!(
             !cid.path.exists(),
             "empty tracking file carries no identity and is removed"
+        );
+    }
+
+    #[test]
+    fn unreadable_tracking_file_teardown_fails_and_preserves_evidence() {
+        // D06: invalid UTF-8 must not read as an empty id (success). The
+        // identity is unknown, so teardown fails and keeps the file for
+        // the operator instead of claiming the instance is gone.
+        let (cid, session) = bogus_docker_session_bytes(&[0xff, 0xfe, 0x00]);
+        let error = teardown_sync(&session).expect_err("unreadable id must not read as success");
+        assert!(
+            matches!(error, ContainerError::Io(_)),
+            "unreadable tracking file must surface as an I/O failure, got: {error}"
+        );
+        assert!(
+            cid.path.exists(),
+            "unreadable tracking file must survive for operator recovery"
+        );
+    }
+
+    #[test]
+    fn instance_exists_reports_are_recognized() {
+        // D01: only an existing-name report naming OUR instance classifies;
+        // device, pool, or foreign-name chatter must not adopt another
+        // owner's name for teardown.
+        for report in [
+            "Error: Failed instance creation: The instance \"qcg-1\" already exists",
+            "error: instance qcg-1 already exists",
+            "container qcg-1 exists already",
+            "lxc-create: qcg-1: container already in use",
+        ] {
+            assert!(
+                is_instance_exists_report(report, "qcg-1"),
+                "{report} must read as our instance existing"
+            );
+        }
+        for report in [
+            "Error: Device \"qcgwork0\" already exists",
+            "Error: The instance \"qcg-2\" already exists",
+            "Error: no such instance qcg-1",
+            "Error: pool default already exists",
+        ] {
+            assert!(
+                !is_instance_exists_report(report, "qcg-1"),
+                "{report} must not read as our instance existing"
+            );
+        }
+    }
+
+    async fn run_admin_stage(
+        stage: &'static str,
+        message: &str,
+    ) -> Result<AdminOutput, ContainerError> {
+        let cancel = CancellationToken::new();
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("echo '{message}' >&2; exit 1"),
+        ];
+        run_admin(
+            &argv,
+            std::time::Duration::from_secs(10),
+            &cancel,
+            "qcg-1",
+            stage,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn create_stages_classify_existing_names_without_touching_other_stages() {
+        // D01: only the create/init stages read an existing-name report as
+        // ownership evidence; later stages keep the generic failure so a
+        // device or config failure is never mistaken for another owner.
+        for stage in ["init", "create"] {
+            let error = run_admin_stage(stage, "Error: The instance qcg-1 already exists")
+                .await
+                .expect_err("existing name must fail");
+            assert!(
+                matches!(error, ContainerError::InstanceExists { stage: s, .. } if s == stage),
+                "{stage} must classify as InstanceExists, got: {error}"
+            );
+        }
+        let error = run_admin_stage("start", "Error: The instance qcg-1 already exists")
+            .await
+            .expect_err("start must still fail");
+        assert!(
+            matches!(error, ContainerError::StageFailed { stage: "start", .. }),
+            "non-create stages must keep the generic failure, got: {error}"
         );
     }
 

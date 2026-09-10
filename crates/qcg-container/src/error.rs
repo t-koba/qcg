@@ -23,6 +23,15 @@ pub enum ContainerError {
         stage: &'static str,
         instance: String,
     },
+    /// The daemon refused creation because the instance name already
+    /// exists. With a full UUID name this means the name belongs to
+    /// another provisioning attempt, so ownership must not be adopted and
+    /// no stop/delete may be sent to it (D01).
+    #[error("container {stage} found instance `{instance}` already exists")]
+    InstanceExists {
+        stage: &'static str,
+        instance: String,
+    },
     #[error(
         "container {stage} timed out after {timeout_secs}s for instance `{instance}`; daemon-side state is unknown and the instance may still exist"
     )]

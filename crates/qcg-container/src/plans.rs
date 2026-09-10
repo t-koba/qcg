@@ -81,10 +81,16 @@ pub fn docker_run_argv(spec: &DockerRunSpec<'_>) -> Vec<String> {
 }
 
 /// Unique instance name valid for Incus, LXD, and legacy LXC: lowercase
-/// `qcg` prefix plus hex, no hyphen (LXC identifiers are alphanumeric).
+/// `qcg` prefix plus the full 128-bit UUID as hex, no hyphen (LXC
+/// identifiers are alphanumeric). UUIDv7 encodes its entropy in the low
+/// bits while the high bits are timestamp and counter, so truncating the
+/// prefix makes names created in the same millisecond collide (D01).
 pub fn instance_name() -> String {
-    let hex = uuid::Uuid::now_v7().as_simple().to_string();
-    format!("qcg{}", &hex[..16])
+    instance_name_for(uuid::Uuid::now_v7())
+}
+
+fn instance_name_for(id: uuid::Uuid) -> String {
+    format!("qcg{}", id.as_simple())
 }
 
 /// Splits a pinned `<ref>@sha256:<fingerprint>` image reference. Docker
@@ -455,4 +461,41 @@ pub fn incus_stop_argv(binary: &str, name: &str) -> Vec<String> {
 
 pub fn incus_delete_argv(binary: &str, name: &str) -> Vec<String> {
     vec![binary.into(), "delete".into(), "-f".into(), name.into()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn instance_names_keep_the_full_uuid() {
+        // D01: UUIDv7 values differing only below the truncated 64-bit
+        // prefix must produce distinct names.
+        let first = uuid::Uuid::parse_str("01a088b5-a200-748d-8500-123401020304")
+            .expect("fixture UUID should parse");
+        let second = uuid::Uuid::parse_str("01a088b5-a200-748d-8500-123505060708")
+            .expect("fixture UUID should parse");
+        let first_name = instance_name_for(first);
+        let second_name = instance_name_for(second);
+        assert_ne!(first_name, second_name);
+        assert_eq!(first_name, "qcg01a088b5a200748d8500123401020304");
+        assert_eq!(second_name, "qcg01a088b5a200748d8500123505060708");
+    }
+
+    #[test]
+    fn generated_instance_names_are_distinct_and_lxc_safe() {
+        let names: Vec<String> = (0..64).map(|_| instance_name()).collect();
+        for name in &names {
+            assert_eq!(name.len(), 35, "qcg plus a full UUID is 35 chars: {name}");
+            assert!(
+                name.starts_with("qcg")
+                    && name[3..]
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+                "{name} must stay alphanumeric lowercase for LXC"
+            );
+        }
+        let unique: std::collections::BTreeSet<&String> = names.iter().collect();
+        assert_eq!(unique.len(), names.len(), "names must be distinct");
+    }
 }

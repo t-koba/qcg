@@ -292,15 +292,13 @@ pub(crate) async fn execute_mcp_tool(
                 // call starts a fresh remote request instead of resuming a
                 // completed one.
                 consume_agent_mcp_continuation(ctx, node, server, alias, call_id, &args)?;
-                if let Some(operation_id) = &operation_id {
-                    ctx.run.finish_external_operation(
-                        ctx.journal,
-                        node,
+                return Ok(match operation_id {
+                    Some(operation_id) => AgentToolOutcome::OperationResult {
+                        value,
                         operation_id,
-                        Some(value.clone()),
-                    )?;
-                }
-                return Ok(AgentToolOutcome::Result(value));
+                    },
+                    None => AgentToolOutcome::Result(value),
+                });
             }
             McpCallOutcome::InputRequired(required) => {
                 let loop_state = required.request_state.clone();

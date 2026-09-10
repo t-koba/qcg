@@ -104,9 +104,10 @@ where
         return respond_with_snapshot(snapshot, created);
     };
     // An orphaned run id observed while waiting rides across claim-loop
-    // iterations: expiry observation already reaped the pending file, so a
-    // later re-read cannot recover it. The durable claim owner rides along
-    // too, so every release below only ever removes our own claim file.
+    // iterations: the claim may be replaced or reaped before the loop
+    // re-reads it, so carrying the id preserves the run association. The
+    // durable claim owner rides along too, so every release below only
+    // ever removes our own claim file.
     let mut carried_adopted: Option<String> = None;
     let mut claim_owner: Option<String> = None;
     let mut claim_generation: Option<u64> = None;

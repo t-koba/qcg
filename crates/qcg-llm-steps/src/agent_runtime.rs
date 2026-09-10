@@ -139,13 +139,10 @@ pub(crate) async fn execute_agent_tool(
                 "stdout": output.stdout,
                 "stderr": output.stderr,
             });
-            ctx.run.finish_external_operation(
-                ctx.journal,
-                node,
-                &operation_id,
-                Some(output.clone()),
-            )?;
-            Ok(AgentToolOutcome::Result(output))
+            Ok(AgentToolOutcome::OperationResult {
+                value: output,
+                operation_id,
+            })
         }
         ToolDecl::Http { methods, hosts, .. } => {
             let method = args
@@ -265,15 +262,13 @@ pub(crate) async fn execute_agent_tool(
                 "headers": output.headers,
                 "body": http_body_value(&output.body),
             });
-            if let Some(operation_id) = operation_id {
-                ctx.run.finish_external_operation(
-                    ctx.journal,
-                    node,
-                    &operation_id,
-                    Some(output.clone()),
-                )?;
+            match operation_id {
+                Some(operation_id) => Ok(AgentToolOutcome::OperationResult {
+                    value: output,
+                    operation_id,
+                }),
+                None => Ok(AgentToolOutcome::Result(output)),
             }
-            Ok(AgentToolOutcome::Result(output))
         }
         ToolDecl::AskUser { .. } => {
             let question_id = format!("{}:{}", node.id, tool.name());
@@ -439,6 +434,25 @@ pub(crate) async fn execute_agent_tool(
             }
         }
     }
+}
+
+/// Records a rejected external operation as a success without a reusable
+/// result, so a later replay refuses instead of re-executing the effect
+/// (D03). The original rejection error is never masked.
+pub(crate) fn finish_rejected_external_operation(
+    ctx: &StepContext<'_>,
+    node: &NodeDef,
+    operation_id: Option<String>,
+) {
+    let Some(operation_id) = operation_id else {
+        return;
+    };
+    ctx.run.finish_external_operation_with_warn(
+        ctx.journal,
+        node,
+        &operation_id,
+        qcg_engine::OperationOutcome::Success { result: None },
+    );
 }
 
 pub(crate) fn validate_agent_tool_call_args(

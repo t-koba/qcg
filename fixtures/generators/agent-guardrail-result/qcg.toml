@@ -1,0 +1,50 @@
+[[flow]]
+id = "agent"
+output = "agent_result"
+type = "llm.agent"
+
+[flow.params]
+max_iterations = 3
+max_tokens_total = 4096
+prompt = "prompts/agent.j2"
+
+[[flow.params.guardrails]]
+name = "reject_marker"
+stage = "tool_output"
+kind = "regex_deny"
+tripwire = true
+on_error = "fail"
+
+[flow.params.guardrails.params]
+pattern = "review-required"
+
+[[flow.params.tools]]
+kind = "command"
+name = "produce_marker"
+description = "Produces a marker that the output guardrail rejects."
+command = ["sh", "-c", "echo review-required; echo ran >> ran.txt"]
+
+[generator]
+description = "Negative fixture: an output guardrail rejects the agent tool result before it is cached."
+id = "agent-guardrail-result"
+name = "Agent Guardrail Result"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[llm]
+max_tokens = 256
+temperature = 0.0
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[permissions]
+fs_write = ["workspace"]
+side_effects = "allowed"
+
+[[permissions.commands]]
+args = ["-c", "echo review-required; echo ran >> ran.txt"]
+bin = "sh"
+purpose = "produce a guardrail-rejected marker"
+isolation = "trusted_host"

@@ -14,7 +14,8 @@ use std::time::Instant;
 
 use crate::agent_runtime::{
     AgentToolCallFailure, AgentToolInvocation, AgentToolServices, execute_agent_tool,
-    recover_agent_tool_call_failure, validate_agent_tool_call_args,
+    finish_rejected_external_operation, recover_agent_tool_call_failure,
+    validate_agent_tool_call_args,
 };
 use crate::agent_tools::{validate_agent_delegations, validate_agent_tool};
 use crate::completion::complete_llm;
@@ -847,9 +848,13 @@ impl StepExecutor for LlmAgentStep {
                         return Err(error);
                     }
                 };
-                let (result, returned_agent_error) = match outcome {
-                    AgentToolOutcome::Result(value) => (value, false),
-                    AgentToolOutcome::Error(value) => (value, true),
+                let (result, returned_agent_error, mut pending_operation) = match outcome {
+                    AgentToolOutcome::Result(value) => (value, false, None),
+                    AgentToolOutcome::OperationResult {
+                        value,
+                        operation_id,
+                    } => (value, false, Some(operation_id)),
+                    AgentToolOutcome::Error(value) => (value, true, None),
                     AgentToolOutcome::Handoff(value) => {
                         if let Err(error) = apply_guardrails(
                             ctx,
@@ -1022,6 +1027,10 @@ impl StepExecutor for LlmAgentStep {
                     )
                     .await
                 {
+                    // The external effect already happened; record it as a
+                    // success without a reusable result before surfacing
+                    // the rejection (D03).
+                    finish_rejected_external_operation(ctx, node, pending_operation.take());
                     if let Some(message) = recover_agent_tool_call_failure(
                         ctx,
                         node,
@@ -1055,6 +1064,7 @@ impl StepExecutor for LlmAgentStep {
                     return Err(error);
                 }
                 if let Err(error) = ctx.checkpoint().await {
+                    finish_rejected_external_operation(ctx, node, pending_operation.take());
                     record_tool_call_failure(
                         ctx,
                         node,
@@ -1087,8 +1097,9 @@ impl StepExecutor for LlmAgentStep {
                         tool_started,
                     ),
                 )?;
-                let result = serde_json::to_string(&result)?;
-                if let Err(error) = scan_llm_text(ctx, node, &result) {
+                let encoded = serde_json::to_string(&result)?;
+                if let Err(error) = scan_llm_text(ctx, node, &encoded) {
+                    finish_rejected_external_operation(ctx, node, pending_operation.take());
                     if !returned_agent_error
                         && let Some(message) = recover_agent_tool_call_failure(
                             ctx,
@@ -1123,8 +1134,18 @@ impl StepExecutor for LlmAgentStep {
                     )?;
                     return Err(error);
                 }
+                // Every output check has passed: the operation may now be
+                // finished with its result available for resend (D03).
+                if let Some(operation_id) = pending_operation.take() {
+                    ctx.run.finish_external_operation(
+                        ctx.journal,
+                        node,
+                        &operation_id,
+                        Some(result.clone()),
+                    )?;
+                }
                 ctx.journal.event("tool_call", event).step_err(&node.id)?;
-                messages.push(ChatMessage::tool_result(call.id, result));
+                messages.push(ChatMessage::tool_result(call.id, encoded));
             }
             enforce_agent_transcript_limit(ctx, node, &mut messages, None)?;
             record_agent_checkpoint(

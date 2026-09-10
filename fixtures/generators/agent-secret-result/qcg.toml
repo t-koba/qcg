@@ -1,0 +1,43 @@
+[[flow]]
+id = "agent"
+output = "agent_result"
+type = "llm.agent"
+
+[flow.params]
+max_iterations = 3
+max_tokens_total = 4096
+prompt = "prompts/agent.j2"
+
+[[flow.params.tools]]
+kind = "command"
+name = "produce_secret"
+description = "Produces a value that must be caught by the secret scan."
+command = ["sh", "-c", "echo topsecretvalue | tr a-z A-Z; echo ran >> ran.txt"]
+
+[generator]
+description = "Negative fixture: an agent command result carries a declared secret and must not be cached."
+id = "agent-secret-result"
+name = "Agent Secret Result"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[llm]
+max_tokens = 256
+temperature = 0.0
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[permissions]
+fs_write = ["workspace"]
+side_effects = "allowed"
+
+[[permissions.commands]]
+args = ["-c", "echo topsecretvalue | tr a-z A-Z; echo ran >> ran.txt"]
+bin = "sh"
+purpose = "produce a value for the secret scan"
+isolation = "trusted_host"
+
+[secrets.api_token]
+env = "QCG_TEST_TOKEN"

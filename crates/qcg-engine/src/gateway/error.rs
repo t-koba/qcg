@@ -56,6 +56,11 @@ pub enum GatewayError {
     HttpRequestBodyTooLarge { url: String },
     #[error(transparent)]
     Http(#[from] reqwest::Error),
+    /// A failure raised after this operation already dispatched a request
+    /// that may have applied effects. The underlying error's shape no
+    /// longer proves non-application, whatever its kind (D02).
+    #[error("side-effect-bearing request was already sent when the operation failed: {0}")]
+    AfterSend(Box<GatewayError>),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("execution was canceled")]

@@ -14,6 +14,14 @@ use crate::agent::agent_command_permission;
 
 pub(crate) enum AgentToolOutcome {
     Result(Value),
+    /// A successful external-operation result whose durable record has not
+    /// been finished yet. The caller must finish it only after its output
+    /// guardrails and secret scan pass, so a rejected result is never
+    /// cached for resend (D03).
+    OperationResult {
+        value: Value,
+        operation_id: String,
+    },
     Error(Value),
     Handoff(Value),
     NeedsUser(FormSpec),

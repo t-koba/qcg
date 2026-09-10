@@ -17,6 +17,31 @@ use tokio::sync::{Barrier, Mutex};
 
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
+/// Restores `QCG_TEST_TOKEN` on drop so a panicking assertion cannot leak
+/// the canary into the process environment for later tests. Callers hold
+/// `ENV_LOCK` for the whole mutation window, and the guard is declared
+/// after it so the variable is restored before the lock releases.
+struct TestSecretEnv;
+
+impl TestSecretEnv {
+    fn set(value: &str) -> Self {
+        // SAFETY: the caller holds ENV_LOCK for the whole mutation window.
+        unsafe {
+            std::env::set_var("QCG_TEST_TOKEN", value);
+        }
+        Self
+    }
+}
+
+impl Drop for TestSecretEnv {
+    fn drop(&mut self) {
+        // SAFETY: the caller holds ENV_LOCK for the whole mutation window.
+        unsafe {
+            std::env::remove_var("QCG_TEST_TOKEN");
+        }
+    }
+}
+
 #[tokio::test]
 async fn hello_template_writes_declared_artifact() {
     let run = run_fixture(
@@ -1409,15 +1434,8 @@ async fn llm_context_denied_rejects_non_visible_resource() {
 #[tokio::test]
 async fn secret_leak_rejects_secret_and_keeps_journal_redacted() {
     let _guard = ENV_LOCK.lock().await;
-    // SAFETY: this test serializes all environment mutation with ENV_LOCK and restores the value.
-    unsafe {
-        std::env::set_var("QCG_TEST_TOKEN", "super-secret-token");
-    }
+    let _secret = TestSecretEnv::set("super-secret-token");
     let result = run_fixture("secret-leak", inputs([]), answers([])).await;
-    // SAFETY: this test serializes all environment mutation with ENV_LOCK and restores the value.
-    unsafe {
-        std::env::remove_var("QCG_TEST_TOKEN");
-    }
     let error = result.expect_err("secret-leak should fail");
     assert!(error.contains("secret `api_token`"));
     let run = run_dir("secret-leak");
@@ -1425,6 +1443,218 @@ async fn secret_leak_rejects_secret_and_keeps_journal_redacted() {
         fs::read_to_string(direct_run_meta_dir(&run).join("journal.jsonl")).unwrap_or_default();
     assert!(!journal.contains("super-secret-token"));
     assert!(!run.join("out.txt").exists());
+}
+
+#[tokio::test]
+async fn agent_secret_tool_result_is_not_cached_before_the_output_scan() {
+    // D03: the command tool produces a declared secret on stdout without
+    // any secret in its arguments. The result must be rejected by the
+    // output scan without first entering the journal, state, or resend
+    // cache, and resume must not re-run the command (the operation is
+    // recorded as succeeded without a result).
+    let _guard = ENV_LOCK.lock().await;
+    let canary = "TOPSECRETVALUE";
+    let _secret = TestSecretEnv::set(canary);
+    let result = run_fixture("agent-secret-result", inputs([]), answers([])).await;
+    let error = result.expect_err("a secret tool result must fail the run");
+    assert!(error.contains("secret `api_token`"), "{error}");
+    let run = run_dir("agent-secret-result");
+    let journal =
+        fs::read_to_string(direct_run_meta_dir(&run).join("journal.jsonl")).unwrap_or_default();
+    assert!(
+        !journal.contains(canary),
+        "the rejected result must not enter the journal"
+    );
+    let events = read_journal_events(
+        direct_run_meta_dir(&run)
+            .parent()
+            .expect("direct metadata directory has a run parent"),
+    )
+    .expect("journal should be readable");
+    let finished: Vec<&Value> = events
+        .iter()
+        .filter(|event| event.get("t").and_then(Value::as_str) == Some("operation_finished"))
+        .collect();
+    assert_eq!(
+        finished.len(),
+        1,
+        "the command operation must finish exactly once"
+    );
+    assert!(
+        finished[0].get("result").is_none(),
+        "a rejected result must not be cached for resend: {:?}",
+        finished[0]
+    );
+    assert_eq!(
+        fs::read_to_string(run.join("ran.txt")).unwrap_or_default(),
+        "ran\n",
+        "the external effect must have happened exactly once"
+    );
+}
+
+#[tokio::test]
+async fn agent_secret_tool_result_never_reaches_sse() {
+    // D03: SSE replays the journal; the rejected result must not appear in
+    // any streamed frame.
+    let _guard = ENV_LOCK.lock().await;
+    let canary = "TOPSECRETVALUE";
+    let _secret = TestSecretEnv::set(canary);
+    let runs_dir = run_dir("agent-secret-sse-runs");
+    let _ = fs::remove_dir_all(&runs_dir);
+    let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+        Err(error) => panic!("listener should bind: {error}"),
+    };
+    let port = listener
+        .local_addr()
+        .expect("listener should have addr")
+        .port();
+    let server = tokio::spawn(qcg_server::serve_with_listener(
+        ServerConfig {
+            generators_dir: workspace_root().join("fixtures/generators"),
+            providers_path: None,
+            extra_generators_dirs: vec![],
+            runs_dir: runs_dir.clone(),
+            max_active_runs: qcg_policy::DEFAULT_MAX_ACTIVE_RUNS,
+            max_tracked_runs: qcg_policy::DEFAULT_MAX_TRACKED_RUNS,
+            run_store_mode: qcg_service::RunStoreMode::Exclusive,
+            cors_origins: vec![],
+            api_token: None,
+            max_request_bytes: None,
+            max_artifact_bytes: None,
+            max_artifact_entries: None,
+            max_asset_bytes: None,
+            max_total_steps: None,
+        },
+        listener,
+    ));
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+    let start: Value = client
+        .post(format!("{base}/api/runs"))
+        .json(&json!({ "generator_id": "agent-secret-result", "inputs": {} }))
+        .send()
+        .await
+        .expect("run should start")
+        .error_for_status()
+        .expect("start response should be ok")
+        .json()
+        .await
+        .expect("start response should be JSON");
+    let run_id = start["run_id"].as_str().expect("run_id should exist");
+    let events = read_sse_until_terminal(&client, &base, run_id).await;
+    server.abort();
+    for event in &events {
+        assert!(
+            !event.to_string().contains(canary),
+            "SSE must not publish the rejected secret: {event}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn resumed_agent_secret_result_refuses_replay_without_reexecuting() {
+    // D03: after the secret-rejected run, a resume must not repeat the
+    // external effect. The run is restarted into the same output directory
+    // so the engine folds the previous journal and recovers the state.
+    let _guard = ENV_LOCK.lock().await;
+    let canary = "TOPSECRETVALUE";
+    let _secret = TestSecretEnv::set(canary);
+    let generator_path = workspace_root().join("fixtures/generators/agent-secret-result");
+    let generators_dir = generator_path
+        .parent()
+        .expect("generator path should have a parent")
+        .to_path_buf();
+    let output_dir = run_dir("agent-secret-resume");
+    let _ = fs::remove_dir_all(&output_dir);
+    fs::create_dir_all(&output_dir).expect("output dir should be creatable");
+    let service = LocalQcgService::new(
+        generators_dir,
+        output_dir
+            .parent()
+            .expect("output dir should have a parent")
+            .to_path_buf(),
+        Some(workspace_root().join("providers.toml")),
+    )
+    .expect("service should initialize");
+    let direct = || DirectRun {
+        generator_path: generator_path.clone(),
+        inputs: BTreeMap::new(),
+        output_dir: output_dir.clone(),
+        json_events: false,
+        interactive: false,
+        answers: BTreeMap::new(),
+        confirmations: BTreeMap::new(),
+        llm_seed_override: None,
+    };
+    let first = service.run_generator_path(direct()).await;
+    assert!(first.is_err(), "the secret result must fail the first run");
+    let resumed = service.run_generator_path(direct()).await;
+    let error = resumed
+        .expect_err("the resumed run must refuse automatic replay")
+        .to_string();
+    assert!(
+        error.contains("refusing automatic replay"),
+        "resume must refuse instead of re-executing: {error}"
+    );
+    assert_eq!(
+        fs::read_to_string(output_dir.join("ran.txt")).unwrap_or_default(),
+        "ran\n",
+        "resume must not re-execute the external effect"
+    );
+    let state =
+        qcg_engine::RunState::fold_journal(&direct_run_meta_dir(&output_dir).join("journal.jsonl"))
+            .expect("resumed journal should fold");
+    let record = state
+        .operation_records
+        .values()
+        .next()
+        .expect("the rejected operation must keep a record");
+    assert!(
+        matches!(record.status, qcg_engine::OperationStatus::Succeeded),
+        "the external operation did succeed"
+    );
+    assert!(
+        record.result.is_none(),
+        "the rejected result must not be cached for resend"
+    );
+}
+
+#[tokio::test]
+async fn agent_output_guardrail_rejection_finishes_without_caching() {
+    // D03: an output guardrail rejects the tool result before any caching
+    // happens. The operation still finishes once as a success without a
+    // reusable result, and the command runs exactly once.
+    let result = run_fixture("agent-guardrail-result", inputs([]), answers([])).await;
+    let error = result.expect_err("the output guardrail must fail the run");
+    assert!(error.contains("guardrail"), "{error}");
+    let run = run_dir("agent-guardrail-result");
+    let events = read_journal_events(
+        direct_run_meta_dir(&run)
+            .parent()
+            .expect("direct metadata directory has a run parent"),
+    )
+    .expect("journal should be readable");
+    let finished: Vec<&Value> = events
+        .iter()
+        .filter(|event| event.get("t").and_then(Value::as_str) == Some("operation_finished"))
+        .collect();
+    assert_eq!(
+        finished.len(),
+        1,
+        "the command operation must finish exactly once"
+    );
+    assert!(
+        finished[0].get("result").is_none(),
+        "a guardrail-rejected result must not be cached: {:?}",
+        finished[0]
+    );
+    assert_eq!(
+        fs::read_to_string(run.join("ran.txt")).unwrap_or_default(),
+        "ran\n",
+        "the external effect must have happened exactly once"
+    );
 }
 
 #[tokio::test]
@@ -2548,6 +2778,21 @@ async fn wait_for_success(client: &reqwest::Client, base: &str, run_id: &str) {
 }
 
 async fn read_sse_until_finished(client: &reqwest::Client, base: &str, run_id: &str) -> Vec<Value> {
+    read_sse_until(client, base, run_id, false).await
+}
+
+/// Reads SSE frames until either terminal event. A failed run emits
+/// `run_error` instead of `run_finished`.
+async fn read_sse_until_terminal(client: &reqwest::Client, base: &str, run_id: &str) -> Vec<Value> {
+    read_sse_until(client, base, run_id, true).await
+}
+
+async fn read_sse_until(
+    client: &reqwest::Client,
+    base: &str,
+    run_id: &str,
+    stop_on_error: bool,
+) -> Vec<Value> {
     let response = client
         .get(format!("{base}/api/runs/{run_id}/events"))
         .send()
@@ -2572,11 +2817,12 @@ async fn read_sse_until_finished(client: &reqwest::Client, base: &str, run_id: &
                 if let Some(data) = line.strip_prefix("data: ") {
                     let event: Value =
                         serde_json::from_str(data).expect("SSE event should be JSON");
-                    let done = event
+                    let kind = event
                         .get("kind")
                         .or_else(|| event.get("t"))
-                        .and_then(Value::as_str)
-                        == Some("run_finished");
+                        .and_then(Value::as_str);
+                    let done = kind == Some("run_finished")
+                        || (stop_on_error && kind == Some("run_error"));
                     events.push(event);
                     if done {
                         return events;
@@ -2585,7 +2831,7 @@ async fn read_sse_until_finished(client: &reqwest::Client, base: &str, run_id: &
             }
         }
     }
-    panic!("SSE ended before run_finished");
+    panic!("SSE ended before a terminal event");
 }
 
 fn event_types(events: &[Value]) -> Vec<&str> {
