@@ -1153,10 +1153,19 @@ mod tests {
         message: &str,
     ) -> Result<AdminOutput, ContainerError> {
         let cancel = CancellationToken::new();
+        // Portable failing helper: stderr carries the report, exit is
+        // non-zero. Messages avoid shell metacharacters on both sides.
+        #[cfg(unix)]
         let argv = vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
             format!("echo '{message}' >&2; exit 1"),
+        ];
+        #[cfg(windows)]
+        let argv = vec![
+            "cmd".to_string(),
+            "/C".to_string(),
+            format!("echo {message} 1>&2 & exit 1"),
         ];
         run_admin(
             &argv,
