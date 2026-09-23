@@ -65,7 +65,9 @@ pub fn save_registries(home: &Utf8Path, config: &RegistryConfig) -> Result<()> {
     let mut source =
         String::from("# qcg registries: name to index URL (file:// or https://)\n[registries]\n");
     for (name, url) in &config.registries {
-        source.push_str(&format!("{name} = \"{url}\"\n"));
+        // Debug formatting emits a valid TOML basic string: Windows paths
+        // contribute backslashes that would otherwise parse as escapes.
+        source.push_str(&format!("{name} = {url:?}\n"));
     }
     std::fs::write(registries_path(home), source)
         .with_context(|| format!("failed to write registries under `{home}`"))?;

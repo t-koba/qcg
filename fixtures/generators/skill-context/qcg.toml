@@ -2,7 +2,8 @@
 context = [
     { resource = "local_skill", select = "meta" },
     { resource = "local_skill", select = "instructions" },
-    { resource = "local_skill", select = "file", path = "example.txt" },
+    { resource = "local_skill", select = "tree" },
+    { resource = "local_skill", select = "files", path = "references/guide.md" },
 ]
 id = "draft"
 type = "llm.generate"
@@ -28,8 +29,16 @@ model = "fake"
 provider = "fake"
 
 [permissions]
+fs_read = []
+network = []
+commands = []
+side_effects = "none"
+side_effects_scope = "invocation"
 fs_write = ["workspace"]
 
+
+[permissions.containers]
+enabled = false
 [resources.local_skill]
 llm_visible = true
 path = "resources/demo-skill"

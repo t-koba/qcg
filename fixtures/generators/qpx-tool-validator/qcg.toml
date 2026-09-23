@@ -25,6 +25,9 @@ qcg_version = "^0.1"
 version = "0.1.0"
 
 [permissions]
+network = []
+side_effects = "none"
+side_effects_scope = "invocation"
 fs_read = ["workspace"]
 fs_write = ["workspace"]
 
@@ -68,10 +71,6 @@ mount = "/work"
 
 [tools.qpx_validate.backends.host]
 bin = "qpxd"
-version_command = [
-    "qpxd",
-    "--version",
-]
 
 [tools.qpx_validate.resolution]
 allowed_backends = [

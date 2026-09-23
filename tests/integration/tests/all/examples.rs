@@ -5,7 +5,7 @@ use qcg_contract::{
 };
 use qcg_engine::TemplateService;
 use qcg_server::ServerConfig;
-use qcg_service::{DirectRun, LocalQcgService, direct_run_meta_dir, read_journal_events};
+use qcg_service::{DirectRun, direct_run_meta_dir, read_events_with_audit, read_journal_events};
 use qcg_types::{StructuredOutputMode, ToolChoice};
 use reqwest::header;
 use serde::Deserialize;
@@ -170,6 +170,25 @@ async fn on_fail_ask_user_uses_supplied_answer() {
     .await
     .expect("on-fail-ask-user should run");
     assert_file_eq(&run, "decision.txt", "accepted");
+}
+
+#[tokio::test]
+async fn catalog_selection_drives_form_options_and_efforts() {
+    let run = run_fixture(
+        "catalog-selection",
+        inputs([]),
+        answers([
+            ("ask_provider", json!("fake")),
+            ("ask_model", json!("fake")),
+        ]),
+    )
+    .await
+    .expect("catalog-selection should run");
+    assert_file_eq(&run, "selection.txt", "fake|fake|7");
+    assert_journal_has(&run, |event| {
+        event.get("t").and_then(Value::as_str) == Some("step_finished")
+            && event.get("node").and_then(Value::as_str) == Some("list_efforts")
+    });
 }
 
 #[tokio::test]
@@ -348,9 +367,16 @@ command = ["printf", "resource-from-process"]
 max_bytes = 1024
 
 [permissions]
+fs_read = []
+network = []
+side_effects = "none"
+side_effects_scope = "invocation"
 fs_write = ["workspace"]
 commands = [{ bin = "printf", args = ["resource-from-process"], purpose = "load a deterministic external resource", isolation = "trusted_host" }]
 
+
+[permissions.containers]
+enabled = false
 [[flow]]
 id = "draft"
 type = "llm.generate"
@@ -358,8 +384,7 @@ context = [{ resource = "generated" }]
 
 [flow.params]
 prompt = "prompts/draft.j2"
-output_file = "context.txt"
-"#,
+output_file = "context.txt""#,
     )
     .expect("fixture manifest should be writable");
     fs::write(fixture_root.join("prompts/draft.j2"), "Use the context.")
@@ -404,6 +429,293 @@ async fn llm_context_byte_limit_rejects_oversized_prompt() {
     .await
     .expect_err("oversized context should fail");
     assert!(error.contains("LLM context byte limit exceeded"));
+}
+
+#[tokio::test]
+async fn run_ref_resource_pins_another_runs_declared_artifact() {
+    // The generic run-reference mechanism: a consumer resolves a selector
+    // to a producer run through the shared run store, copies the declared
+    // artifact into the consumer workspace, and pins the revision durably.
+    let root = run_dir("run-ref-store");
+    let _ = fs::remove_dir_all(&root);
+    let generators = root.join("generators");
+    let runs = root.join("runs");
+    fs::create_dir_all(generators.join("run-ref-producer")).expect("producer dir");
+    fs::create_dir_all(generators.join("run-ref-consumer")).expect("consumer dir");
+    fs::create_dir_all(generators.join("run-ref-missing")).expect("missing dir");
+    let manifest = |id: &str, body: &str| {
+        format!(
+            r#"
+[generator]
+id = "{id}"
+name = "{id}"
+version = "0.1.0"
+qcg_version = "^0.1"
+
+[permissions]
+fs_read = ["workspace"]
+fs_write = ["workspace"]
+network = []
+commands = []
+side_effects = "none"
+side_effects_scope = "invocation"
+
+[permissions.containers]
+enabled = false
+{body}
+"#
+        )
+    };
+    fs::write(
+        generators.join("run-ref-producer/qcg.toml"),
+        manifest(
+            "run-ref-producer",
+            r#"
+[[flow]]
+id = "emit"
+type = "write"
+artifact = { label = "Report", required = true, preview = "text" }
+
+[flow.params]
+content = "from-producer"
+output_file = "report.txt"
+"#,
+        ),
+    )
+    .expect("producer manifest");
+    fs::write(
+        generators.join("run-ref-consumer/qcg.toml"),
+        manifest(
+            "run-ref-consumer",
+            r#"
+[resources.prev]
+type = "run_ref"
+llm_visible = false
+
+[resources.prev.params]
+selector = { latest_success = "run-ref-producer" }
+artifact = "report.txt"
+max_bytes = 4096
+"#,
+        ),
+    )
+    .expect("consumer manifest");
+    let service = crate::test_service(generators.clone(), runs.clone(), None)
+        .expect("service should initialize");
+    let start = |generator_id: &str| {
+        let service = service.clone();
+        let generator_id = generator_id.to_string();
+        async move {
+            service
+                .start_run(qcg_api::StartRun {
+                    generator_id,
+                    ..Default::default()
+                })
+                .await
+                .expect("run should start")
+        }
+    };
+    let wait_terminal = |id: String| {
+        let service = service.clone();
+        async move {
+            for _ in 0..200 {
+                let snapshot = service.snapshot(id.clone()).await.expect("snapshot");
+                if matches!(
+                    snapshot.state,
+                    qcg_api::RunStatus::Succeeded
+                        | qcg_api::RunStatus::Failed
+                        | qcg_api::RunStatus::Canceled
+                        | qcg_api::RunStatus::Interrupted
+                ) {
+                    return snapshot;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            panic!("run did not settle");
+        }
+    };
+    let producer = start("run-ref-producer").await;
+    let producer_snapshot = wait_terminal(producer.clone()).await;
+    assert_eq!(producer_snapshot.state, qcg_api::RunStatus::Succeeded);
+    let consumer = start("run-ref-consumer").await;
+    let consumer_snapshot = wait_terminal(consumer.clone()).await;
+    assert_eq!(
+        consumer_snapshot.state,
+        qcg_api::RunStatus::Succeeded,
+        "consumer should resolve the run reference"
+    );
+    assert_eq!(
+        fs::read_to_string(
+            runs.join(&consumer)
+                .join("workspace/run-refs/prev/report.txt")
+        )
+        .expect("the pinned copy should exist in the consumer workspace"),
+        "from-producer"
+    );
+    let consumer_events =
+        read_events_with_audit(&runs.join(&consumer)).expect("consumer journal should read");
+    assert!(
+        consumer_events.iter().any(|event| {
+            event.get("t").and_then(Value::as_str) == Some("resource")
+                && event
+                    .get("source")
+                    .and_then(|source| source.get("kind"))
+                    .and_then(Value::as_str)
+                    == Some("run_ref")
+        }),
+        "the resource event must record the run reference source: {consumer_events:#?}"
+    );
+    assert!(
+        runs.join(&consumer).join("meta/run-refs.json").is_file(),
+        "the resolution must be persisted for resume"
+    );
+
+    // An unresolvable selector fails the run explicitly instead of silently
+    // running without the declared resource.
+    fs::write(
+        generators.join("run-ref-missing/qcg.toml"),
+        manifest(
+            "run-ref-missing",
+            r#"
+[resources.prev]
+type = "run_ref"
+
+[resources.prev.params]
+selector = { latest_success = "no-such-generator" }
+artifact = "report.txt"
+max_bytes = 4096
+"#,
+        ),
+    )
+    .expect("missing manifest");
+    let missing = start("run-ref-missing").await;
+    let missing_snapshot = wait_terminal(missing.clone()).await;
+    assert_eq!(missing_snapshot.state, qcg_api::RunStatus::Failed);
+    let journal = fs::read_to_string(runs.join(&missing).join("meta/journal.jsonl"))
+        .expect("missing journal");
+    assert!(
+        journal.contains("no-such-generator"),
+        "the failure names the missing source: {journal}"
+    );
+    fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn bundled_tool_command_runs_the_structured_protocol() {
+    // A generator-packaged executable runs as a command step without a
+    // `permissions.commands` entry: the declared package sha256 authorizes
+    // the bytes, and the process speaks the structured stdin/stdout protocol.
+    let fixture = run_dir("bundled-tool-command");
+    let _ = fs::remove_dir_all(&fixture);
+    let bin_dir = fixture.join(format!(
+        "resources/bin/{}/{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    ));
+    fs::create_dir_all(&bin_dir).expect("bin directory should be creatable");
+    // Windows cannot execute shell scripts directly: ship a batch file
+    // there while Unix keeps the sh script. Both speak the same
+    // stdin/stdout JSON protocol.
+    let (script_name, script_body) = if cfg!(windows) {
+        (
+            "gen.cmd",
+            "@echo off\r\nset /p input=\r\necho {\"status\":\"success\",\"output\":{\"summary\":\"from-bundled-tool\"},\"files\":[],\"findings\":[]}\r\n",
+        )
+    } else {
+        (
+            "gen.sh",
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{\"status\":\"success\",\"output\":{\"summary\":\"from-bundled-tool\"},\"files\":[],\"findings\":[]}'\n",
+        )
+    };
+    let script = bin_dir.join(script_name);
+    fs::write(&script, script_body).expect("tool script should be writable");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
+            .expect("tool script should be executable");
+    }
+    let (sha256, _) = qcg_fs::hash_file_sha256(&script, None).expect("tool script should hash");
+    fs::write(
+        fixture.join("qcg.toml"),
+        format!(
+            r#"
+[generator]
+id = "bundled-tool-command"
+name = "Bundled Tool Command"
+version = "0.1.0"
+qcg_version = "^0.1"
+
+[permissions]
+fs_read = ["workspace"]
+fs_write = ["workspace"]
+network = []
+commands = []
+side_effects = "none"
+side_effects_scope = "invocation"
+
+[permissions.containers]
+enabled = false
+
+[[inputs.stages]]
+id = "basic"
+
+[[inputs.stages.fields]]
+id = "request"
+required = true
+type = "string"
+
+[[flow]]
+id = "generate"
+type = "command"
+
+[flow.params]
+tool = "echoer"
+input = {{ request = "{{{{ inputs.request }}}}" }}
+result = "structured"
+output_schema = {{ type = "object", required = ["summary"], properties = {{ summary = {{ type = "string" }} }} }}
+
+[tools.echoer]
+kind = "command"
+command = ["{script_name}"]
+workspace = "none"
+
+[tools.echoer.backends.bundled]
+bin = "resources/bin/{{{{ os }}}}/{{{{ arch }}}}/{script_name}"
+sha256 = "{sha256}"
+"#
+        ),
+    )
+    .expect("fixture manifest should be writable");
+
+    let run = run_generator(
+        fixture.clone(),
+        "bundled-tool-command-run",
+        inputs([("request", json!("hello"))]),
+        answers([]),
+    )
+    .await
+    .expect("bundled tool command should run");
+    let events = read_events_with_audit(
+        direct_run_meta_dir(&run)
+            .parent()
+            .expect("direct metadata directory has a run parent"),
+    )
+    .expect("journal should be readable");
+    assert!(
+        events.iter().any(|event| {
+            event.get("t").and_then(Value::as_str) == Some("step_finished")
+                && event.to_string().contains("from-bundled-tool")
+        }),
+        "the structured output must reach the journal: {events:#?}"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event.get("t").and_then(Value::as_str) == Some("tool_backend_resolved")
+        }),
+        "bundled resolution must be journaled"
+    );
+    fs::remove_dir_all(&fixture).expect("fixture directory should be removable");
 }
 
 #[tokio::test]
@@ -674,10 +986,16 @@ version = "0.1.0"
 qcg_version = "^0.1"
 
 [permissions]
+fs_read = []
+network = []
+side_effects_scope = "invocation"
 fs_write = ["workspace"]
 side_effects = "allowed"
 commands = [{ bin = "printf", args = ['{"status":"success","output":{"message":"validated"},"files":[]}'], purpose = "exercise the structured command interface", isolation = "trusted_host" }]
 
+
+[permissions.containers]
+enabled = false
 [[flow]]
 id = "structured"
 output = "structured_out"
@@ -696,8 +1014,7 @@ artifact = { label = "Structured result", required = true, preview = "text" }
 
 [flow.params]
 output_file = "result.txt"
-content = "{{ steps.structured_out.output.output.message }}"
-"#,
+content = "{{ steps.structured_out.output.output.message }}""#,
     )
     .expect("fixture manifest should be written");
 
@@ -781,6 +1098,20 @@ fn generator_research_nodes_deserialize_typed_bounded_mcp_contracts() {
         tag: None,
         path: None,
     })];
+    let expected_design_context = vec![
+        ContextRef::Resource(ResourceContextRef {
+            resource: "authoring_reference".into(),
+            select: None,
+            tag: None,
+            path: None,
+        }),
+        ContextRef::Resource(ResourceContextRef {
+            resource: "skills".into(),
+            select: Some("instructions".into()),
+            tag: None,
+            path: Some("skill-creator".into()),
+        }),
+    ];
     let expected_model = ModelRef {
         provider: "{{ steps.ask_llm_model.output.provider }}".into(),
         model: "{{ steps.ask_llm_model.output.model }}".into(),
@@ -915,9 +1246,9 @@ fn generator_research_nodes_deserialize_typed_bounded_mcp_contracts() {
     assert_eq!(design.prompt, "prompts/design.j2");
     assert_eq!(design.schema.as_deref(), Some("schemas/design.schema.json"));
     assert_model_ref(design.model.as_ref(), &expected_model);
-    assert_eq!(design.context, expected_context);
+    assert_eq!(design.context, expected_design_context);
     assert_eq!(design.max_iterations, Some(5));
-    assert_eq!(design.max_tokens_total, Some(100_000));
+    assert_eq!(design.max_tokens_total, Some(160_000));
     assert_eq!(design.max_tool_calls_total, None);
     assert_eq!(design.request.max_tokens, Some(16_384));
     assert_eq!(
@@ -1247,6 +1578,7 @@ async fn generator_llm_mode_uses_proposal() {
                 "ask_llm_model",
                 json!({"provider": "fake", "model": "fake"}),
             ),
+            ("ask_llm_effort", json!("high")),
             ("ask_research", json!("none")),
             ("ask_authority", write_authority(&[])),
         ]),
@@ -1324,6 +1656,7 @@ async fn generator_llm_mode_requires_a_complete_package() {
                 "ask_llm_model",
                 json!({"provider": "fake", "model": "fake"}),
             ),
+            ("ask_llm_effort", json!("high")),
             ("ask_research", json!("none")),
         ]),
     )
@@ -1339,7 +1672,7 @@ async fn generator_llm_mode_requires_a_complete_package() {
 }
 
 #[tokio::test]
-async fn generator_llm_package_preserves_a_proposed_skill_source() {
+async fn generator_llm_package_preserves_a_proposed_skill_resource() {
     let source = workspace_root().join("generators/generator");
     let generator = run_dir("generator-llm-package-source");
     let _ = fs::remove_dir_all(&generator);
@@ -1363,15 +1696,45 @@ async fn generator_llm_package_preserves_a_proposed_skill_source() {
                 },
                 "runtime": {"command_timeout_seconds": 7},
                 "budget": {"max_steps": 37},
-                "journal": {"retain_days": 5},
-                "flow": [{
-                    "id": "emit",
-                    "type": "write",
-                    "artifact": {"label": "Generated README", "required": true},
-                    "params": {"content": "packaged", "output_file": "README.md"}
-                }]
+                "retention": {"days": 5},
+                "llm": {
+                    "max_tokens": 512,
+                    "temperature": 0.0,
+                    "model": {"provider": "fake", "model": "fake"}
+                },
+                "resources": {
+                    "packaged_skill": {
+                        "type": "skill",
+                        "path": "resources/skills/packaged-skill",
+                        "trust": "trusted",
+                        "llm_visible": true
+                    }
+                },
+                "flow": [
+                    {
+                        "id": "emit",
+                        "type": "write",
+                        "artifact": {"label": "Generated README", "required": true},
+                        "params": {"content": "packaged", "output_file": "README.md"}
+                    },
+                    {
+                        "id": "draft",
+                        "type": "llm.generate",
+                        "context": [{"resource": "packaged_skill", "select": "instructions"}],
+                        "params": {"prompt": "prompts/draft.j2", "output_file": "draft.txt"}
+                    }
+                ]
             },
-            "sources": {"SKILL.md": {"encoding": "utf8", "content": "# Proposed skill\n"}}
+            "sources": {
+                "resources/skills/packaged-skill/SKILL.md": {
+                    "encoding": "utf8",
+                    "content": "---\nname: packaged-skill\ndescription: Preserved skill resource.\n---\n\nBody.\n"
+                },
+                "prompts/draft.j2": {
+                    "encoding": "utf8",
+                    "content": "FAKE_TEXT:\ndraft\n"
+                }
+            }
         }
     });
     let replacement = format!("FAKE_JSON: {}", serde_json::to_string(&payload).unwrap());
@@ -1395,6 +1758,7 @@ async fn generator_llm_package_preserves_a_proposed_skill_source() {
                 "ask_llm_model",
                 json!({"provider": "fake", "model": "fake"}),
             ),
+            ("ask_llm_effort", json!("high")),
             ("ask_research", json!("none")),
             ("ask_authority", write_authority(&[])),
         ]),
@@ -1405,10 +1769,29 @@ async fn generator_llm_package_preserves_a_proposed_skill_source() {
         Contract::load(run.join("generator")).expect("generated package should validate");
     assert_eq!(contract.manifest.runtime.command_timeout_seconds, 7);
     assert_eq!(contract.manifest.budget.max_steps, 37);
-    assert_eq!(contract.manifest.journal.retain_days, Some(5));
+    assert_eq!(contract.manifest.retention.days, Some(5));
+    let resource = contract
+        .manifest
+        .resources
+        .get("packaged_skill")
+        .expect("proposed skill resource should be declared");
+    assert_eq!(resource.kind, qcg_contract::ResourceKind::Skill);
+    let draft = contract
+        .manifest
+        .flow
+        .iter()
+        .find(|node| node.id == "draft")
+        .expect("proposed llm node should exist");
+    assert!(draft.context.iter().any(|context| matches!(
+        context,
+        ContextRef::Resource(reference)
+            if reference.resource == "packaged_skill"
+                && reference.select.as_deref() == Some("instructions")
+    )));
     assert_eq!(
-        fs::read_to_string(run.join("generator/SKILL.md")).expect("proposed skill should exist"),
-        "# Proposed skill\n"
+        fs::read_to_string(run.join("generator/resources/skills/packaged-skill/SKILL.md"))
+            .expect("proposed skill should exist"),
+        "---\nname: packaged-skill\ndescription: Preserved skill resource.\n---\n\nBody.\n"
     );
     let _ = fs::remove_dir_all(&generator);
 }
@@ -1569,7 +1952,7 @@ async fn resumed_agent_secret_result_refuses_replay_without_reexecuting() {
     let output_dir = run_dir("agent-secret-resume");
     let _ = fs::remove_dir_all(&output_dir);
     fs::create_dir_all(&output_dir).expect("output dir should be creatable");
-    let service = LocalQcgService::new(
+    let service = crate::test_service(
         generators_dir,
         output_dir
             .parent()
@@ -1595,7 +1978,7 @@ async fn resumed_agent_secret_result_refuses_replay_without_reexecuting() {
         .expect_err("the resumed run must refuse automatic replay")
         .to_string();
     assert!(
-        error.contains("refusing automatic replay"),
+        error.contains("manual recovery"),
         "resume must refuse instead of re-executing: {error}"
     );
     assert_eq!(
@@ -1727,7 +2110,10 @@ async fn http_sse_replays_same_journal_event_sequence_for_run() {
         .expect("undeclared artifact request should respond");
     assert_eq!(undeclared.status(), reqwest::StatusCode::NOT_FOUND);
 
-    let journal_events = read_journal_events(&runs_dir.join(run_id)).expect("journal should parse");
+    // SSE replays the merged public record view: durable plus observation
+    // records (ADR 0001).
+    let journal_events =
+        read_events_with_audit(&runs_dir.join(run_id)).expect("journal should parse");
     let journal_types = event_types(&journal_events);
     let sse_events = read_sse_until_finished(&client, &base, run_id).await;
     let sse_types = event_types(&sse_events);
@@ -1903,9 +2289,16 @@ version = "0.1.0"
 qcg_version = "^0.1"
 
 [permissions]
+fs_read = []
+fs_write = []
+network = []
+side_effects_scope = "invocation"
 side_effects = "allowed"
 commands = [{ bin = "sh", args = ["-c", "sleep 30"], purpose = "HTTP cancellation test", isolation = "trusted_host" }]
 
+
+[permissions.containers]
+enabled = false
 [[flow]]
 id = "wait"
 type = "command"
@@ -1919,8 +2312,7 @@ needs = ["wait"]
 artifact = { label = "Unexpected", required = false }
 [flow.params]
 output_file = "must-not-exist.txt"
-content = "unexpected"
-"#,
+content = "unexpected""#,
     )
     .expect("generator manifest should be written");
     let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
@@ -2280,7 +2672,7 @@ async fn direct_run_events_match_journal_event_sequence() {
     let output_dir = run_dir("direct-run-events");
     let _ = fs::remove_dir_all(&output_dir);
     fs::create_dir_all(&output_dir).expect("run directory should be creatable");
-    let service = LocalQcgService::new(
+    let service = crate::test_service(
         workspace_root().join("fixtures/generators"),
         output_dir
             .parent()
@@ -2307,7 +2699,7 @@ async fn direct_run_events_match_journal_event_sequence() {
         .iter()
         .map(|event| serde_json::to_value(event).expect("event should serialize"))
         .collect::<Vec<_>>();
-    let journal_events = read_journal_events(
+    let journal_events = read_events_with_audit(
         direct_run_meta_dir(&output_dir)
             .parent()
             .expect("direct metadata directory has a run parent"),
@@ -2321,7 +2713,7 @@ async fn foreach_parallelism_preserves_all_iterations_and_truncates_at_budget() 
     let output_dir = run_dir("foreach-parallel-budget");
     let _ = fs::remove_dir_all(&output_dir);
     fs::create_dir_all(&output_dir).expect("run directory should be creatable");
-    let service = LocalQcgService::new(
+    let service = crate::test_service(
         workspace_root().join("fixtures/generators"),
         output_dir
             .parent()
@@ -2596,35 +2988,89 @@ async fn run_generator(
     answers: BTreeMap<String, Value>,
 ) -> Result<Utf8PathBuf, String> {
     let output_dir = run_dir(name);
-    let _ = fs::remove_dir_all(&output_dir);
+    // Repeated invocations in one process reuse the label directory, so the
+    // first attempt starts clean: dropping the parent removes both the
+    // workspace and the direct-run metadata (`.qcg/runs/direct-<hash>`)
+    // that the engine would otherwise resume from.
+    if let Some(parent) = output_dir.parent() {
+        let _ = fs::remove_dir_all(parent);
+    }
     fs::create_dir_all(&output_dir).expect("run directory should be creatable");
     let generators_dir = generator_path
         .parent()
         .expect("generator path should have a parent")
         .to_path_buf();
-    let service = LocalQcgService::new(
+    let runs_dir = output_dir
+        .parent()
+        .expect("run dir should have parent")
+        .to_path_buf();
+    let service = crate::test_service(
         generators_dir,
-        output_dir
-            .parent()
-            .expect("run dir should have parent")
-            .to_path_buf(),
+        runs_dir,
         Some(workspace_root().join("providers.toml")),
     )
     .expect("service should initialize");
-    service
-        .run_generator_path(DirectRun {
-            generator_path,
-            inputs,
-            output_dir: output_dir.clone(),
-            json_events: false,
-            interactive: false,
-            answers,
-            confirmations: BTreeMap::new(),
-            llm_seed_override: None,
-        })
-        .await
-        .map(|_| output_dir)
-        .map_err(|error| error.to_string())
+    // E08f: `ask_user` question ids bind the resolved question content, so a
+    // provisioned answer keyed by node id is re-keyed to the id the run
+    // reports. Each replay resumes the suspended run in place with the ids
+    // learned so far; the completing replay is the run the caller asserts.
+    let mut provisioned: BTreeMap<String, Value> = BTreeMap::new();
+    for _ in 0..crate::MAX_QUESTION_DISCOVERY_ATTEMPTS {
+        // The direct-run lock guarantees mutual exclusion, but a resume
+        // attempt can momentarily overlap the previous attempt's cleanup
+        // under load. Retry that one transient condition instead of failing
+        // a stateful resume loop the test itself drives.
+        let mut response = None;
+        for _ in 0..50 {
+            match service
+                .run_generator_path(DirectRun {
+                    generator_path: generator_path.clone(),
+                    inputs: inputs.clone(),
+                    output_dir: output_dir.clone(),
+                    json_events: false,
+                    interactive: false,
+                    answers: provisioned.clone(),
+                    confirmations: BTreeMap::new(),
+                    llm_seed_override: None,
+                })
+                .await
+            {
+                Err(error)
+                    if error
+                        .to_string()
+                        .contains("is already active in another qcg run") =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    continue;
+                }
+                other => {
+                    response = Some(other);
+                    break;
+                }
+            }
+        }
+        match response.expect("lock retry loop should produce a result") {
+            Ok(_) => return Ok(output_dir),
+            Err(error) => {
+                let message = error.to_string();
+                let Some(question_id) = message.strip_prefix("run is waiting for user input: ")
+                else {
+                    return Err(message);
+                };
+                let Some(answer) = crate::answer_for_question(&answers, question_id) else {
+                    return Err(message);
+                };
+                if provisioned.contains_key(question_id) {
+                    return Err(message);
+                }
+                provisioned.insert(question_id.to_string(), answer.clone());
+            }
+        }
+    }
+    Err(format!(
+        "generator `{name}` did not settle within {} question-discovery replays",
+        crate::MAX_QUESTION_DISCOVERY_ATTEMPTS
+    ))
 }
 
 fn inputs<const N: usize>(items: [(&str, Value); N]) -> BTreeMap<String, Value> {
@@ -2654,7 +3100,8 @@ fn authority_with_scopes(network: &[&str], fs_read: &[&str], fs_write: &[&str]) 
             "network": network,
             "commands": [],
             "containers": {"enabled": false, "images": [], "on_missing": "error"},
-            "side_effects": "none"
+            "side_effects": "none",
+            "side_effects_scope": "invocation"
         },
         "secrets": {}
     })
@@ -2732,7 +3179,7 @@ fn assert_required_artifact(run: &Utf8Path, path: &str) {
 }
 
 fn assert_journal_has(run: &Utf8Path, predicate: impl Fn(&Value) -> bool) {
-    let events = read_journal_events(
+    let events = read_events_with_audit(
         direct_run_meta_dir(run)
             .parent()
             .expect("direct metadata directory has a run parent"),
@@ -2745,7 +3192,7 @@ fn assert_journal_has(run: &Utf8Path, predicate: impl Fn(&Value) -> bool) {
 }
 
 fn assert_journal_has_none(run: &Utf8Path, predicate: impl Fn(&Value) -> bool) {
-    let events = read_journal_events(
+    let events = read_events_with_audit(
         direct_run_meta_dir(run)
             .parent()
             .expect("direct metadata directory has a run parent"),
@@ -2803,8 +3250,10 @@ async fn read_sse_until(
     let mut buffer = String::new();
     let mut events = Vec::new();
     let mut response = response;
+    // Generous per-chunk bound: the suite runs many servers in parallel, so
+    // this guards against a hung stream without failing on scheduler load.
     while let Some(chunk) =
-        tokio::time::timeout(std::time::Duration::from_secs(2), response.chunk())
+        tokio::time::timeout(std::time::Duration::from_secs(15), response.chunk())
             .await
             .expect("SSE should produce run events")
             .expect("SSE chunk should be readable")
@@ -2844,4 +3293,331 @@ fn event_types(events: &[Value]) -> Vec<&str> {
                 .and_then(Value::as_str)
         })
         .collect()
+}
+
+#[tokio::test]
+async fn skill_context_fixture_renders_spec_metadata_instructions_and_references() {
+    let run = run_fixture("skill-context", inputs([]), answers([]))
+        .await
+        .expect("skill-context should run");
+    let output =
+        fs::read_to_string(run.join("skill-context.txt")).expect("context output should exist");
+    assert!(
+        output.contains(
+            "Demonstrates skill resource context. Use when a generator needs a vendored Agent Skill."
+        ),
+        "{output}"
+    );
+    assert!(output.contains("\"license\": \"Apache-2.0\""), "{output}");
+    assert!(
+        output.contains("\"compatibility\": \"Requires qcg\""),
+        "{output}"
+    );
+    assert!(output.contains("\"author\": \"qcg\""), "{output}");
+    assert!(
+        output.contains("Follow the demo skill instructions."),
+        "{output}"
+    );
+    assert!(output.contains("references/guide.md"), "{output}");
+    assert!(
+        output.contains("Detailed workflow from the demo skill reference."),
+        "{output}"
+    );
+}
+
+#[tokio::test]
+async fn skill_library_fixture_scans_child_skills() {
+    let run = run_fixture("skill-library", inputs([]), answers([]))
+        .await
+        .expect("skill-library should run");
+    let output = fs::read_to_string(run.join("library-context.txt"))
+        .expect("library context output should exist");
+    assert!(
+        output.contains("Alpha workflow for the library fixture."),
+        "{output}"
+    );
+    assert!(
+        output.contains("Beta workflow for the library fixture."),
+        "{output}"
+    );
+    assert!(output.contains("Alpha instructions."), "{output}");
+    assert!(output.contains("references/notes.md"), "{output}");
+    assert!(output.contains("Alpha reference notes."), "{output}");
+}
+
+#[tokio::test]
+async fn agent_skill_tool_activates_a_skill_and_reads_references() {
+    let run = run_fixture("agent-skill", inputs([]), answers([]))
+        .await
+        .expect("agent-skill should run");
+    assert_journal_has(&run, |event| {
+        event.get("t").and_then(Value::as_str) == Some("tool_call")
+            && event.get("tool").and_then(Value::as_str) == Some("use_skill")
+            && event.get("status").and_then(Value::as_str) == Some("succeeded")
+            && event.get("phase").and_then(Value::as_str) == Some("completed")
+    });
+    assert_journal_has(&run, |event| {
+        event
+            .pointer("/result/instructions")
+            .and_then(Value::as_str)
+            == Some("Alpha instructions for the agent.")
+            && event
+                .pointer("/result/file/content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| content.contains("Alpha agent reference notes."))
+            && event.pointer("/result/resources/0").and_then(Value::as_str)
+                == Some("references/notes.md")
+    });
+    // Progressive disclosure dedup: a repeated activation without a file
+    // returns a short marker instead of the instructions again.
+    assert_journal_has(&run, |event| {
+        event.get("t").and_then(Value::as_str) == Some("tool_call")
+            && event.get("tool").and_then(Value::as_str) == Some("use_skill")
+            && event
+                .pointer("/result/already_active")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && event.pointer("/result/instructions").is_none()
+    });
+    // A file request stays meaningful after activation.
+    assert_journal_has(&run, |event| {
+        event
+            .pointer("/result/already_active")
+            .and_then(Value::as_bool)
+            == Some(true)
+            && event.pointer("/result/instructions").is_none()
+            && event
+                .pointer("/result/file/content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| content.contains("Alpha agent reference notes."))
+    });
+}
+
+#[tokio::test]
+async fn skill_resource_without_frontmatter_fails_contract_validation() {
+    let fixture_root = run_dir("skill-invalid-frontmatter-fixture")
+        .parent()
+        .expect("fixture output should have a parent")
+        .join("generator");
+    let _ = fs::remove_dir_all(&fixture_root);
+    fs::create_dir_all(fixture_root.join("prompts")).expect("prompt directory should be created");
+    fs::create_dir_all(fixture_root.join("resources/notes"))
+        .expect("resource directory should be created");
+    fs::write(
+        fixture_root.join("resources/notes/SKILL.md"),
+        "# No frontmatter\n",
+    )
+    .expect("fixture skill should be writable");
+    fs::write(fixture_root.join("prompts/draft.j2"), "Draft.")
+        .expect("fixture prompt should be writable");
+    fs::write(
+        fixture_root.join("qcg.toml"),
+        r#"
+[generator]
+id = "skill-invalid-frontmatter"
+name = "Skill invalid frontmatter"
+version = "0.1.0"
+qcg_version = "^0.1"
+
+[llm]
+max_tokens = 512
+temperature = 0.0
+
+[llm.model]
+provider = "fake"
+model = "fake"
+
+[resources.notes]
+type = "skill"
+path = "resources/notes"
+trust = "untrusted"
+llm_visible = true
+
+[permissions]
+fs_read = []
+fs_write = ["workspace"]
+network = []
+commands = []
+side_effects = "none"
+side_effects_scope = "invocation"
+
+[permissions.containers]
+enabled = false
+
+[[flow]]
+id = "draft"
+type = "llm.generate"
+context = [{ resource = "notes" }]
+
+[flow.params]
+prompt = "prompts/draft.j2"
+output_file = "draft.txt""#,
+    )
+    .expect("fixture manifest should be writable");
+
+    let error = run_generator(
+        fixture_root.clone(),
+        "skill-invalid-frontmatter",
+        inputs([]),
+        answers([]),
+    )
+    .await
+    .expect_err("a skill without frontmatter must fail validation");
+    assert!(error.contains("frontmatter"), "unexpected error: {error}");
+    let _ = fs::remove_dir_all(&fixture_root);
+}
+
+#[tokio::test]
+async fn skill_resource_without_skill_md_fails_contract_validation() {
+    let fixture_root = run_dir("skill-missing-file-fixture")
+        .parent()
+        .expect("fixture output should have a parent")
+        .join("generator");
+    let _ = fs::remove_dir_all(&fixture_root);
+    fs::create_dir_all(fixture_root.join("prompts")).expect("prompt directory should be created");
+    fs::create_dir_all(fixture_root.join("resources/notes"))
+        .expect("resource directory should be created");
+    fs::write(
+        fixture_root.join("resources/notes/README.md"),
+        "No skill here.",
+    )
+    .expect("fixture file should be writable");
+    fs::write(fixture_root.join("prompts/draft.j2"), "Draft.")
+        .expect("fixture prompt should be writable");
+    fs::write(
+        fixture_root.join("qcg.toml"),
+        r#"
+[generator]
+id = "skill-missing-file"
+name = "Skill missing file"
+version = "0.1.0"
+qcg_version = "^0.1"
+
+[llm]
+max_tokens = 512
+temperature = 0.0
+
+[llm.model]
+provider = "fake"
+model = "fake"
+
+[resources.notes]
+type = "skill"
+path = "resources/notes"
+trust = "untrusted"
+llm_visible = true
+
+[permissions]
+fs_read = []
+fs_write = ["workspace"]
+network = []
+commands = []
+side_effects = "none"
+side_effects_scope = "invocation"
+
+[permissions.containers]
+enabled = false
+
+[[flow]]
+id = "draft"
+type = "llm.generate"
+context = [{ resource = "notes" }]
+
+[flow.params]
+prompt = "prompts/draft.j2"
+output_file = "draft.txt""#,
+    )
+    .expect("fixture manifest should be writable");
+
+    let error = run_generator(
+        fixture_root.clone(),
+        "skill-missing-file",
+        inputs([]),
+        answers([]),
+    )
+    .await
+    .expect_err("a skill directory without SKILL.md must fail validation");
+    assert!(error.contains("SKILL.md"), "unexpected error: {error}");
+    let _ = fs::remove_dir_all(&fixture_root);
+}
+
+#[tokio::test]
+async fn skill_library_child_without_description_fails_contract_validation() {
+    let fixture_root = run_dir("skill-library-invalid-child-fixture")
+        .parent()
+        .expect("fixture output should have a parent")
+        .join("generator");
+    let _ = fs::remove_dir_all(&fixture_root);
+    fs::create_dir_all(fixture_root.join("prompts")).expect("prompt directory should be created");
+    fs::create_dir_all(fixture_root.join("resources/skills/good"))
+        .expect("skill directory should be created");
+    fs::create_dir_all(fixture_root.join("resources/skills/bad"))
+        .expect("skill directory should be created");
+    fs::write(
+        fixture_root.join("resources/skills/good/SKILL.md"),
+        "---\nname: good\ndescription: A valid library skill.\n---\n",
+    )
+    .expect("fixture skill should be writable");
+    fs::write(
+        fixture_root.join("resources/skills/bad/SKILL.md"),
+        "---\nname: bad\n---\n",
+    )
+    .expect("fixture skill should be writable");
+    fs::write(fixture_root.join("prompts/draft.j2"), "Draft.")
+        .expect("fixture prompt should be writable");
+    fs::write(
+        fixture_root.join("qcg.toml"),
+        r#"
+[generator]
+id = "skill-library-invalid-child"
+name = "Skill library invalid child"
+version = "0.1.0"
+qcg_version = "^0.1"
+
+[llm]
+max_tokens = 512
+temperature = 0.0
+
+[llm.model]
+provider = "fake"
+model = "fake"
+
+[resources.skills]
+type = "skill_library"
+path = "resources/skills"
+trust = "untrusted"
+llm_visible = true
+
+[permissions]
+fs_read = []
+fs_write = ["workspace"]
+network = []
+commands = []
+side_effects = "none"
+side_effects_scope = "invocation"
+
+[permissions.containers]
+enabled = false
+
+[[flow]]
+id = "draft"
+type = "llm.generate"
+context = [{ resource = "skills", select = "instructions", path = "good" }]
+
+[flow.params]
+prompt = "prompts/draft.j2"
+output_file = "draft.txt""#,
+    )
+    .expect("fixture manifest should be writable");
+
+    let error = run_generator(
+        fixture_root.clone(),
+        "skill-library-invalid-child",
+        inputs([]),
+        answers([]),
+    )
+    .await
+    .expect_err("a library child without a description must fail validation");
+    assert!(error.contains("description"), "unexpected error: {error}");
+    let _ = fs::remove_dir_all(&fixture_root);
 }

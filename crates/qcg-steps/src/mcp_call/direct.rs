@@ -98,12 +98,11 @@ pub(crate) async fn execute_direct_mcp_call(
     }
     let fresh = request_state.is_none() && input_responses.is_none();
     let details = Some(arguments.clone());
-    // Single-shot invocations identify by content: the same digest
-    // recomputes the same id on resume, so no stored id is needed and
-    // restarts keep the same protection.
+    // Single-shot invocations identify by node execution: retries and
+    // restarts recompute the same id until the execution finishes, while a
+    // repair or regenerate is a new invocation (Q1).
     let target = format!("{}/{}", session.server_id(), tool_name);
-    let digest = RunContext::operation_digest(&target, &details)?;
-    let invocation = qcg_engine::content_invocation_id(&digest);
+    let invocation = RunContext::execution_invocation(ctx.journal, node);
     let operation_id = if fresh {
         match ctx.run.guard_external_operation(
             ctx.journal,
@@ -365,7 +364,9 @@ fn direct_mcp_question_id(
     let mut requests = required
         .input_requests
         .values()
-        .map(|request| serde_json::to_vec(request).unwrap_or_default())
+        .map(|request| {
+            serde_json::to_vec(request).expect("MCP input request is always serializable")
+        })
         .collect::<Vec<_>>();
     requests.sort();
     let bytes = serde_json::to_vec(&json!({
@@ -375,9 +376,9 @@ fn direct_mcp_question_id(
         "arguments": arguments,
         "requests": requests,
     }))
-    .unwrap_or_default();
+    .expect("MCP question identity is always serializable");
     let digest = hex::encode(Sha256::digest(bytes));
-    format!("{node_id}:mcp:{server}/{tool}:{}", &digest[..16])
+    format!("{node_id}:mcp:{server}/{tool}:{digest}")
 }
 
 fn direct_mcp_form_spec(
@@ -423,6 +424,7 @@ fn direct_mcp_form_spec(
             min_items: None,
             item_type: None,
             schema: params.get("requestedSchema").cloned(),
+            options_from: None,
             ui: Default::default(),
         });
     }
@@ -463,9 +465,9 @@ fn mcp_continuation_key(node_id: &str, server: &str, tool: &str, arguments: &Val
         "tool": tool,
         "arguments": arguments,
     }))
-    .unwrap_or_default();
+    .expect("MCP continuation identity is always serializable");
     let digest = hex::encode(Sha256::digest(bytes));
-    format!("{node_id}:mcpcont:{server}/{tool}:{}", &digest[..16])
+    format!("{node_id}:mcpcont:{server}/{tool}:{digest}")
 }
 
 fn mcp_pending_reserved_key(continuation_key: &str) -> String {
@@ -566,7 +568,7 @@ fn decide_direct_mcp_continuation(
         .get("input_requests")
         .and_then(Value::as_object)
         .cloned()
-        .unwrap_or_default();
+        .ok_or_else(|| "stored MCP continuation has no input requests".to_string())?;
     let values = answer
         .as_object()
         .ok_or_else(|| "MCP input-required answer must be an object".to_string())?;
@@ -681,7 +683,9 @@ fn consume_direct_mcp_continuation(
 
 fn direct_mcp_requests(required: &McpInputRequired) -> Vec<(&String, &Value)> {
     let mut requests = required.input_requests.iter().collect::<Vec<_>>();
-    requests.sort_by_key(|(_id, request)| serde_json::to_vec(request).unwrap_or_default());
+    // Deterministic order over the serialized request; a JSON value always
+    // serializes, so this cannot silently fall back to empty bytes.
+    requests.sort_by_key(|(_id, request)| request.to_string());
     requests
 }
 
@@ -762,7 +766,7 @@ pub(crate) fn record_direct_mcp_tool_event(
     };
     let id = format!(
         "mcp-{}",
-        &hex::encode(Sha256::digest(format!("{}/{}/{}", node.id, server, tool)))[..24]
+        hex::encode(Sha256::digest(format!("{}/{}/{}", node.id, server, tool)))
     );
     let event = ToolCallEventData {
         server: Some(server.to_owned()),

@@ -1,4 +1,5 @@
-import { ApiClient, type ConfirmSpec, type FormSpec, type GeneratorDetail, type GeneratorSummary, type InputField, type OutputArtifact, type RunEvent, type RunListResponse, type RunSnapshot, type RunStatus } from "./api/client";
+import { ApiClient, ApiProblemError, type ConfirmSpec, type FormSpec, type GeneratorDetail, type GeneratorSummary, type InputField, type OutputArtifact, type RunEvent, type RunListResponse, type RunSnapshot, type RunStatus } from "./api/client";
+import { parseSseFrames } from "./api/sse";
 import { evalWhen } from "./expr/loader";
 import { encodeBase64, validateFileInput } from "./field";
 import { collectNodeProgress, record } from "./progress";
@@ -93,7 +94,7 @@ export class RunStore {
   pendingAction = $state<PendingAction | null>(null);
   nodeProgress = $derived(collectNodeProgress(this.events));
 
-  #sources: Record<string, EventSource> = {};
+  #sources: Record<string, { close(): void }> = {};
   #selectionController: AbortController | null = null;
   #cancelController: AbortController | null = null;
   #selectionVersion = 0;
@@ -529,6 +530,10 @@ export class RunStore {
   async decideConfirmation(decision: "approve" | "deny"): Promise<void> {
     const tab = this.currentTab();
     if (!tab || !this.confirm || tab.pendingAction) return;
+    // Unknown-scope approve is disabled in ConfirmPanel; deny stays enabled
+    // (deny is always safe). A UI bypass is impossible: the server only
+    // accepts the pending confirm.id it minted with a valid scope, so a
+    // forged or unknown-scope id fails as Conflict server-side (Q1).
     const action = decision === "approve" ? "approving" : "denying";
     const key = await sha256Hex(canonicalJson({ run: tab.runId, confirmation: this.confirm.id, decision }));
     tab.pendingAction = action;
@@ -667,21 +672,55 @@ export class RunStore {
   ensureSubscribed(runId: string): void {
     const tab = this.tabs[runId];
     if (!tab || !isActive(tab.runState) || this.#sources[runId]) return;
-    const source = new EventSource(`/api/runs/${encodeURIComponent(runId)}/events`);
-    source.onmessage = (event) => {
+    // Fetch-based SSE: EventSource cannot send the Authorization header an
+    // authenticated instance requires, so the stream is read from the
+    // response body and resumes with Last-Event-ID after a reconnect.
+    const controller = new AbortController();
+    this.#sources[runId] = { close: () => controller.abort() };
+    void this.#readRunEvents(runId, controller);
+  }
+
+  async #readRunEvents(runId: string, controller: AbortController): Promise<void> {
+    while (!controller.signal.aborted) {
+      const tab = this.tabs[runId];
+      if (!tab || !isActive(tab.runState)) break;
+      const last = tab.events.length > 0 ? tab.events[tab.events.length - 1].seq : 0;
       try {
-        this.#applyEvent(runId, JSON.parse(event.data) as RunEvent);
-      } catch {
-        if (runId === this.currentRun) this.errorText = "The server sent an invalid run event.";
+        const response = await this.api.events(runId, last || undefined, controller.signal);
+        const reader = response.body?.getReader();
+        if (!reader) throw new Error("The run event stream is not readable.");
+        const decoder = new TextDecoder();
+        let buffer = "";
+        while (!controller.signal.aborted) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const { frames, rest } = parseSseFrames(buffer);
+          buffer = rest;
+          for (const frame of frames) {
+            try {
+              this.#applyEvent(runId, JSON.parse(frame.data) as RunEvent);
+            } catch {
+              if (runId === this.currentRun) this.errorText = "The server sent an invalid run event.";
+            }
+          }
+        }
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        if (error instanceof ApiProblemError && error.status === 401) {
+          if (runId === this.currentRun) this.errorText = this.tokenRequiredMessage();
+          return;
+        }
       }
-    };
-    source.onerror = () => {
       const current = this.tabs[runId];
-      if (this.#sources[runId] === source && current && isActive(current.runState)) {
-        void this.withError(() => this.refreshRun(runId));
-      }
-    };
-    this.#sources[runId] = source;
+      if (!current || !isActive(current.runState) || controller.signal.aborted) break;
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+  }
+
+  /** Prompt text shown when the server rejects requests without a token. */
+  tokenRequiredMessage(): string {
+    return "A valid API token is required. Enter one in the sidebar.";
   }
 
   currentTab(): RunTab | null {
@@ -783,7 +822,7 @@ export class RunStore {
     if (!readHashRunId() && persisted.currentRun && this.tabs[persisted.currentRun]) {
       this.selectTab(persisted.currentRun);
     }
-    // Rewrite the payload in the current shape, purging any legacy secrets.
+    // Rewrite the payload in the current shape.
     this.persistView();
   }
 

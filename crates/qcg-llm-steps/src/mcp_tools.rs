@@ -116,7 +116,6 @@ impl McpAgentTools {
                                 }
                                 qcg_contract::ContainerRuntime::Incus => McpContainerRuntime::Incus,
                                 qcg_contract::ContainerRuntime::Lxd => McpContainerRuntime::Lxd,
-                                qcg_contract::ContainerRuntime::Lxc => McpContainerRuntime::Lxc,
                             }),
                     },
                 });

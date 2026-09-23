@@ -22,6 +22,15 @@ model = "fake"
 provider = "fake"
 
 [permissions]
+fs_read = []
+fs_write = []
+network = []
+commands = []
+side_effects = "none"
+side_effects_scope = "invocation"
 
+
+[permissions.containers]
+enabled = false
 [secrets.api_token]
 env = "QCG_TEST_TOKEN"

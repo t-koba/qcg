@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use qcg_contract::{Contract, RuntimeLimits};
 use qcg_policy::validate_bounded_json_schema;
-use qcg_service::{DirectRun, LocalQcgService};
+use qcg_service::DirectRun;
 use qcg_types::OutputManifest;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -104,6 +104,20 @@ pub(crate) struct EvalReport {
     cases: Vec<EvalCaseReport>,
 }
 
+impl EvalReport {
+    /// Single-line pass-rate summary shared by the human report and the
+    /// `qcg dev --eval` loop.
+    pub(crate) fn summary_line(&self) -> String {
+        format!(
+            "{}: {}/{} passed ({:.2}%)",
+            self.suite,
+            self.passed,
+            self.total,
+            self.pass_rate * 100.0
+        )
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct EvalCaseSummary {
     pub(crate) name: String,
@@ -144,6 +158,9 @@ pub(crate) struct EvalBaselineComparison {
     duration_ms_p50_delta: i64,
 }
 
+/// Execute the suite, write `report.json`, and print the report. Returns
+/// the report so callers such as the dev loop can summarize the outcome;
+/// threshold and baseline failures still return an error.
 pub(crate) async fn run_eval(
     generator: Utf8PathBuf,
     suite_path: &Utf8Path,
@@ -152,7 +169,7 @@ pub(crate) async fn run_eval(
     providers_path: Option<Utf8PathBuf>,
     baseline_path: Option<&Utf8Path>,
     json_output: bool,
-) -> Result<()> {
+) -> Result<EvalReport> {
     let source = qcg_fs::read_bounded(suite_path, None)?;
     let suite: EvalSuite = serde_json::from_slice(&source)
         .with_context(|| format!("invalid eval suite `{suite_path}`"))?;
@@ -162,7 +179,7 @@ pub(crate) async fn run_eval(
     let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.fZ").to_string();
     let eval_root = output_root.join(&suite.name).join(timestamp);
     std::fs::create_dir_all(&eval_root)?;
-    let service = LocalQcgService::new(Utf8PathBuf::new(), runs_dir, providers_path)?;
+    let service = crate::local_cli_service(Utf8PathBuf::new(), runs_dir, providers_path)?;
     let mut reports = Vec::with_capacity(suite.cases.len() * suite.repetitions);
     for repetition in 0..suite.repetitions {
         for (index, case) in suite.cases.iter().enumerate() {
@@ -238,19 +255,18 @@ pub(crate) async fn run_eval(
         flaky_cases: flaky_cases.clone(),
         cases: reports,
     };
+    let report_path = eval_root.join("report.json");
     let encoded = serde_json::to_vec_pretty(&report)?;
-    std::fs::write(eval_root.join("report.json"), &encoded)?;
+    std::fs::write(&report_path, &encoded)?;
     if json_output {
-        println!("{}", String::from_utf8(encoded).expect("JSON is UTF-8"));
-    } else {
+        // Same fail-closed UTF-8 handling as the trace exporter above.
         println!(
-            "eval {}: {}/{} passed ({:.2}%), report {}",
-            report.suite,
-            report.passed,
-            report.total,
-            report.pass_rate * 100.0,
-            eval_root.join("report.json")
+            "{}",
+            String::from_utf8(encoded)
+                .map_err(|error| anyhow::anyhow!("eval report is not valid UTF-8: {error}"))?
         );
+    } else {
+        println!("eval {}, report {report_path}", report.summary_line());
         for case in &report.cases {
             if !case.passed {
                 for failure in &case.failures {
@@ -278,7 +294,7 @@ pub(crate) async fn run_eval(
             comparison.regressed_cases.join(", ")
         );
     }
-    Ok(())
+    Ok(report)
 }
 
 fn validate_eval_suite(suite: &EvalSuite) -> Result<()> {

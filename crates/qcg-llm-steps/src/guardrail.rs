@@ -300,15 +300,13 @@ impl CommandGuardrail {
             ));
         }
         if let Some(output_limit_bytes) = params.output_limit_bytes
-            && runtime
-                .command_output_limit_bytes
-                .is_some_and(|limit| output_limit_bytes > limit)
+            && let Some(runtime_limit) = runtime.command_output_limit_bytes
+            && output_limit_bytes > runtime_limit
         {
             return Err(GuardrailError::configuration(
                 "output_limit_exceeds_runtime_limit",
                 format!(
-                    "command guardrail output_limit_bytes ({output_limit_bytes}) must not exceed runtime.command_output_limit_bytes ({})",
-                    runtime.command_output_limit_bytes.unwrap_or(usize::MAX)
+                    "command guardrail output_limit_bytes ({output_limit_bytes}) must not exceed runtime.command_output_limit_bytes ({runtime_limit})"
                 ),
             ));
         }

@@ -160,8 +160,11 @@ mod tests {
     }
 
     #[test]
-    fn emoji_and_mixed_text_round_trip() {
-        let text = "ok ✅ done 🎉 mixed ascii";
+    fn symbol_and_mixed_text_round_trip() {
+        // Multibyte boundary coverage without emoji: check mark, star,
+        // hiragana, accented latin, and a 4-byte musical symbol exercise
+        // every UTF-8 length class through the holdback splits.
+        let text = "ok \u{2713} done \u{2605} mixed ascii \u{3042} \u{e9} \u{1d11e}";
         let mut gate = gate();
         let mut published = gate.push(text).expect("clean text should clear");
         published.push_str(&gate.finish().expect("clean stream should flush"));

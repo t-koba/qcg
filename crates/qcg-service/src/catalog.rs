@@ -1,9 +1,12 @@
 use crate::artifacts::{api_bad_request, api_internal, api_not_found};
 use crate::types::LocalQcgService;
 use camino::Utf8PathBuf;
-use qcg_api::{ApiError, GeneratorDetail, GeneratorSummary};
+use qcg_api::{
+    ApiError, GeneratorDetail, GeneratorSummary, LlmCatalogCapabilities, LlmCatalogModel,
+    LlmCatalogProvider, LlmCatalogResponse, LlmCatalogSource,
+};
 use qcg_contract::{Contract, PackagePathError};
-use qcg_policy::MAX_DIRECTORY_SCAN_ENTRIES;
+use qcg_policy::DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES;
 use qcg_policy::is_safe_relative_path;
 use tokio::io::AsyncReadExt as _;
 
@@ -19,9 +22,9 @@ impl LocalQcgService {
             let mut entry_count = 0_usize;
             for entry in entries {
                 entry_count = entry_count.saturating_add(1);
-                if entry_count > MAX_DIRECTORY_SCAN_ENTRIES {
+                if entry_count > DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES {
                     return Err(api_internal(format!(
-                        "generator directory `{root}` contains more than {MAX_DIRECTORY_SCAN_ENTRIES} entries"
+                        "generator directory `{root}` contains more than {DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES} entries"
                     )));
                 }
                 let entry = entry.map_err(api_internal)?;
@@ -121,7 +124,9 @@ impl LocalQcgService {
         if max_bytes.is_none() {
             return tokio::fs::read(&requested).await.map_err(api_internal);
         }
-        let limit = max_bytes.unwrap_or(usize::MAX);
+        let Some(limit) = max_bytes else {
+            return Err(api_internal("generator asset limit is missing"));
+        };
         let file = tokio::fs::File::open(requested)
             .await
             .map_err(api_internal)?;
@@ -141,5 +146,79 @@ impl LocalQcgService {
             });
         }
         Ok(bytes)
+    }
+}
+
+impl LocalQcgService {
+    /// Selectable LLM provider/model metadata. `refresh` re-fetches external
+    /// catalog sources; discovery still runs on demand.
+    pub async fn llm_catalog(&self, refresh: bool) -> Result<LlmCatalogResponse, ApiError> {
+        let view = self.inner.llm_runtime.catalog.view(refresh).await;
+        Ok(map_llm_catalog(view))
+    }
+}
+
+fn map_llm_catalog(view: qcg_llm::CatalogView) -> LlmCatalogResponse {
+    LlmCatalogResponse {
+        fetched_at: view.fetched_at,
+        stale: view.stale,
+        sources: view
+            .sources
+            .into_iter()
+            .map(|source| LlmCatalogSource {
+                kind: source.kind,
+                location: source.location,
+                fetched_at: source.fetched_at,
+                error: source.error,
+            })
+            .collect(),
+        providers: view
+            .providers
+            .into_iter()
+            .map(|provider| LlmCatalogProvider {
+                id: provider.id,
+                label: provider.label,
+                available: provider.available,
+                discovery: provider.discovery,
+                error: provider.error,
+                models: provider
+                    .models
+                    .into_iter()
+                    .map(|model| LlmCatalogModel {
+                        id: model.id,
+                        label: model.label,
+                        enabled: model.enabled,
+                        source: model.source,
+                        reasoning_effort: model
+                            .reasoning_effort
+                            .into_iter()
+                            .map(|effort| effort.as_str().to_string())
+                            .collect(),
+                        input_cost_per_million_usd: model.input_cost_per_million_usd,
+                        output_cost_per_million_usd: model.output_cost_per_million_usd,
+                        context_tokens: model.context_tokens,
+                        max_output_tokens: model.max_output_tokens,
+                        capabilities: LlmCatalogCapabilities {
+                            tool_use: model.capabilities.tool_use,
+                            json_schema: model.capabilities.json_schema,
+                            structured_output_with_tools: model
+                                .capabilities
+                                .structured_output_with_tools,
+                            seed: model.capabilities.seed,
+                            image_input: model.capabilities.image_input,
+                            audio_input: model.capabilities.audio_input,
+                            file_input: model.capabilities.file_input,
+                            streaming: model.capabilities.streaming,
+                            temperature: model.capabilities.temperature,
+                            top_p: model.capabilities.top_p,
+                            stop_sequences: model.capabilities.stop_sequences,
+                            tool_choice: model.capabilities.tool_choice,
+                            parallel_tool_calls: model.capabilities.parallel_tool_calls,
+                            verbosity: model.capabilities.verbosity,
+                        },
+                    })
+                    .collect(),
+            })
+            .collect(),
     }
 }

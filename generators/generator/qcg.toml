@@ -40,6 +40,27 @@ fields = [
 ]
 
 [[flow]]
+id = "list_llm_efforts"
+type = "llm.catalog"
+needs = ["ask_llm_model"]
+
+[flow.params]
+select = "efforts"
+provider = "{{ steps.ask_llm_model.output.provider }}"
+model = "{{ steps.ask_llm_model.output.model }}"
+
+[[flow]]
+id = "ask_llm_effort"
+type = "ask_user"
+needs = ["list_llm_efforts"]
+when = "len(steps.list_llm_efforts.output.options) > 0"
+
+[flow.params]
+content = "Select the reasoning effort for the design work."
+content_i18n = { ja = "設計作業に使う reasoning effort を選択してください。" }
+options_from = "steps.list_llm_efforts.output.options"
+
+[[flow]]
 id = "ask_research"
 needs = ["ask_llm_model"]
 type = "ask_user"
@@ -55,7 +76,7 @@ options = [
     "none",
 ]
 default = "exa-parallel-public"
-option_labels_i18n = { ja = { exa-parallel-public = "Exa + Parallel 公開 MCP（推奨）", exa-public = "Exa 公開 MCP", parallel-public = "Parallel 公開 MCP", none = "外部調査なし" } }
+option_labels_i18n = { ja = { exa-parallel-public = "Exa + Parallel 公開 MCP （推奨）", exa-public = "Exa 公開 MCP", parallel-public = "Parallel 公開 MCP", none = "外部調査なし" } }
 
 [[flow]]
 id = "research_both"
@@ -71,7 +92,7 @@ model = { provider = "{{ steps.ask_llm_model.output.provider }}", model = "{{ st
 max_iterations = 6
 max_tokens_total = 24000
 max_tool_calls_total = 10
-request = { max_tokens = 8192, tool_choice = "auto", parallel_tool_calls = true, stream = true }
+request = { max_tokens = 8192, tool_choice = "auto", parallel_tool_calls = true, stream = true, reasoning_effort = "{{ steps.ask_llm_effort.output }}" }
 guardrails = [
     { name = "reject_prompt_injection", stage = "tool_output", kind = "regex_deny", params = { pattern = "(?i)(ignore (all|any|the|previous) instructions|reveal (the )?system prompt)" }, tripwire = true, on_error = "fail" },
     { name = "require_evidence_object", stage = "output", kind = "json_schema", params = { schema = { type = "object", required = ["summary", "sources", "uncertainties"], properties = { summary = { type = "string" }, sources = { type = "array" }, uncertainties = { type = "array" } } } }, tripwire = true, on_error = "fail" },
@@ -99,7 +120,7 @@ model = { provider = "{{ steps.ask_llm_model.output.provider }}", model = "{{ st
 max_iterations = 5
 max_tokens_total = 16000
 max_tool_calls_total = 3
-request = { max_tokens = 8192, tool_choice = "auto", parallel_tool_calls = true, stream = true }
+request = { max_tokens = 8192, tool_choice = "auto", parallel_tool_calls = true, stream = true, reasoning_effort = "{{ steps.ask_llm_effort.output }}" }
 guardrails = [
     { name = "reject_prompt_injection", stage = "tool_output", kind = "regex_deny", params = { pattern = "(?i)(ignore (all|any|the|previous) instructions|reveal (the )?system prompt)" }, tripwire = true, on_error = "fail" },
     { name = "require_evidence_object", stage = "output", kind = "json_schema", params = { schema = { type = "object", required = ["summary", "sources", "uncertainties"] } }, tripwire = true, on_error = "fail" },
@@ -124,7 +145,7 @@ model = { provider = "{{ steps.ask_llm_model.output.provider }}", model = "{{ st
 max_iterations = 5
 max_tokens_total = 16000
 max_tool_calls_total = 3
-request = { max_tokens = 8192, tool_choice = "auto", parallel_tool_calls = true, stream = true }
+request = { max_tokens = 8192, tool_choice = "auto", parallel_tool_calls = true, stream = true, reasoning_effort = "{{ steps.ask_llm_effort.output }}" }
 guardrails = [
     { name = "reject_prompt_injection", stage = "tool_output", kind = "regex_deny", params = { pattern = "(?i)(ignore (all|any|the|previous) instructions|reveal (the )?system prompt)" }, tripwire = true, on_error = "fail" },
     { name = "require_evidence_object", stage = "output", kind = "json_schema", params = { schema = { type = "object", required = ["summary", "sources", "uncertainties"] } }, tripwire = true, on_error = "fail" },
@@ -142,15 +163,18 @@ on_deps = "none_failed"
 output = "design_out"
 type = "llm.fill"
 when = "steps.ask_design_mode.output == 'llm'"
-context = [{ resource = "authoring_reference" }]
+context = [
+    { resource = "authoring_reference" },
+    { resource = "skills", select = "instructions", path = "skill-creator" },
+]
 
 [flow.params]
 prompt = "prompts/design.j2"
 model = { provider = "{{ steps.ask_llm_model.output.provider }}", model = "{{ steps.ask_llm_model.output.model }}" }
 schema = "schemas/design.schema.json"
 max_iterations = 5
-max_tokens_total = 100000
-request = { max_tokens = 16384, structured_output = "auto", stream = true }
+max_tokens_total = 160000
+request = { max_tokens = 16384, structured_output = "auto", stream = true, reasoning_effort = "{{ steps.ask_llm_effort.output }}" }
 
 [[flow]]
 id = "ask_manual_form"
@@ -175,7 +199,7 @@ on_deps = "none_failed"
 content = "Authorize the complete generated package contract. The LLM proposal cannot supply these values."
 content_i18n = { ja = "生成するパッケージ契約の権限を承認してください。LLM 提案から権限を供給することはできません。" }
 fields = [
-    { id = "permissions", label = "Permissions", label_i18n = { ja = "権限" }, description = "Complete permissions object. It starts at least privilege; edit and approve every capability required by the package.", description_i18n = { ja = "完全な権限オブジェクトです。最小権限で開始するため、パッケージに必要な能力だけを編集して承認してください。" }, type = "json", required = true, default = { fs_read = [], fs_write = [], network = [], commands = [], containers = { enabled = false, images = [], on_missing = "error" }, side_effects = "none" }, ui = { rows = 14, widget = "json", preview = "permission_summary", summary_fields = ["fs_read", "fs_write", "network", "commands", "containers", "side_effects"] }, schema = { type = "object", additionalProperties = false, required = ["fs_read", "fs_write", "network", "commands", "containers", "side_effects"], properties = { fs_read = { type = "array", items = { type = "string", minLength = 1 } }, fs_write = { type = "array", items = { type = "string", minLength = 1 } }, network = { type = "array", items = { type = "string", minLength = 1 } }, commands = { type = "array", items = { type = "object", additionalProperties = false, oneOf = [{ required = ["bin", "isolation"], properties = { isolation = { const = "trusted_host" } }, not = { required = ["image"] } }, { required = ["bin", "isolation", "image"], properties = { isolation = { const = "container" }, image = { type = "string", pattern = "^[A-Za-z0-9./:_-]+@sha256:[0-9a-f]{64}$" } } }], properties = { bin = { type = "string", minLength = 1 }, args = { type = "array", items = { type = "string" } }, purpose = { type = "string" }, isolation = { type = "string", enum = ["container", "trusted_host"] }, image = { type = "string", minLength = 1 } } } }, containers = { type = "object", additionalProperties = false, oneOf = [{ required = ["enabled", "images"], properties = { enabled = { const = false }, images = { type = "array", maxItems = 0 }, on_missing = { type = "string", enum = ["error", "skip", "skip_with_warning"] } }, not = { required = ["runtime"] } }, { required = ["enabled", "runtime", "images"], properties = { enabled = { const = true }, runtime = { type = "string", enum = ["docker", "podman", "docker_runsc"] }, images = { type = "array", items = { type = "string", pattern = "^[A-Za-z0-9./:_-]+@sha256:[0-9a-f]{64}$" } }, on_missing = { type = "string", enum = ["error", "skip", "skip_with_warning"] } } }], properties = { enabled = { type = "boolean" }, runtime = { type = "string", enum = ["docker", "podman", "docker_runsc"] }, images = { type = "array", items = { type = "string" } }, on_missing = { type = "string", enum = ["error", "skip", "skip_with_warning"] } } }, side_effects = { type = "string", enum = ["none", "confirm", "dry_run_first", "allowed"] } } } },
+    { id = "permissions", label = "Permissions", label_i18n = { ja = "権限" }, description = "Complete permissions object. It starts at least privilege; edit and approve every capability required by the package.", description_i18n = { ja = "完全な権限オブジェクトです。最小権限で開始するため、パッケージに必要な能力だけを編集して承認してください。" }, type = "json", required = true, default = { fs_read = [], fs_write = [], network = [], commands = [], containers = { enabled = false, images = [], on_missing = "error" }, side_effects = "none", side_effects_scope = "invocation" }, ui = { rows = 14, widget = "json", preview = "permission_summary", summary_fields = ["fs_read", "fs_write", "network", "commands", "containers", "side_effects", "side_effects_scope"] }, schema = { type = "object", additionalProperties = false, required = ["fs_read", "fs_write", "network", "commands", "containers", "side_effects", "side_effects_scope"], properties = { fs_read = { type = "array", items = { type = "string", minLength = 1 } }, fs_write = { type = "array", items = { type = "string", minLength = 1 } }, network = { type = "array", items = { type = "string", minLength = 1 } }, commands = { type = "array", items = { type = "object", additionalProperties = false, oneOf = [{ required = ["bin", "isolation"], properties = { isolation = { const = "trusted_host" } }, not = { required = ["image"] } }, { required = ["bin", "isolation", "image"], properties = { isolation = { const = "container" }, image = { type = "string", pattern = "^[A-Za-z0-9./:_-]+@sha256:[0-9a-f]{64}$" } } }], properties = { bin = { type = "string", minLength = 1 }, args = { type = "array", items = { type = "string" } }, purpose = { type = "string" }, isolation = { type = "string", enum = ["container", "trusted_host"] }, image = { type = "string", minLength = 1 } } } }, containers = { type = "object", additionalProperties = false, oneOf = [{ required = ["enabled", "images"], properties = { enabled = { const = false }, images = { type = "array", maxItems = 0 }, on_missing = { type = "string", enum = ["error", "skip", "skip_with_warning"] } }, not = { required = ["runtime"] } }, { required = ["enabled", "runtime", "images"], properties = { enabled = { const = true }, runtime = { type = "string", enum = ["docker", "podman", "docker_runsc"] }, images = { type = "array", items = { type = "string", pattern = "^[A-Za-z0-9./:_-]+@sha256:[0-9a-f]{64}$" } }, on_missing = { type = "string", enum = ["error", "skip", "skip_with_warning"] } } }], properties = { enabled = { type = "boolean" }, runtime = { type = "string", enum = ["docker", "podman", "docker_runsc"] }, images = { type = "array", items = { type = "string" } }, on_missing = { type = "string", enum = ["error", "skip", "skip_with_warning"] } } }, side_effects = { type = "string", enum = ["none", "confirm", "dry_run_first", "allowed"] }, side_effects_scope = { type = "string", enum = ["invocation", "content"] } } } },
     { id = "secrets", label = "Secrets", label_i18n = { ja = "シークレット" }, description = "Map each logical secret name to exactly one operator-owned env or file_env source.", description_i18n = { ja = "各論理シークレット名を、運用者が管理する env または file_env のいずれか 1 つへ対応付けます。" }, type = "json", required = true, default = {}, ui = { rows = 10 }, schema = { type = "object", propertyNames = { type = "string", minLength = 1 }, additionalProperties = { type = "object", additionalProperties = false, minProperties = 1, maxProperties = 1, oneOf = [{ required = ["env"] }, { required = ["file_env"] }], properties = { env = { type = "string", pattern = "^[A-Za-z_][A-Za-z0-9_]*$" }, file_env = { type = "string", pattern = "^[A-Za-z_][A-Za-z0-9_]*$" } } } } },
 ]
 
@@ -296,13 +320,25 @@ temperature = 0.0
 structured_output = "auto"
 
 [permissions]
+commands = []
+side_effects = "none"
+side_effects_scope = "invocation"
 fs_read = ["workspace"]
 fs_write = ["workspace"]
 network = ["mcp.exa.ai", "search.parallel.ai"]
 
+
+[permissions.containers]
+enabled = false
 [resources.authoring_reference]
 type = "file"
 path = "resources/authoring-reference.md"
+trust = "trusted"
+llm_visible = true
+
+[resources.skills]
+type = "skill_library"
+path = "resources/skills"
 trust = "trusted"
 llm_visible = true
 
@@ -338,10 +374,9 @@ default = "fail"
 
 [failure.by_kind]
 out_of_contract = "reject"
-permission = "reject"
 
-[journal]
-retain_days = 30
+[retention]
+days = 30
 
 [[outputs.extras]]
 label = "Generated manifest"
@@ -381,7 +416,6 @@ output_file = ".qcg-source-staging/{{ item.key }}.base64"
 
 [[blocks.write_source]]
 id = "decode_base64_source"
-needs = ["stage_base64_source"]
 type = "transform"
 when = "item.value.encoding == 'base64' && !item.value.unix_mode"
 
@@ -393,7 +427,6 @@ remove_source = true
 
 [[blocks.write_source]]
 id = "decode_base64_source_with_mode"
-needs = ["stage_base64_source"]
 type = "transform"
 when = "item.value.encoding == 'base64' && item.value.unix_mode"
 

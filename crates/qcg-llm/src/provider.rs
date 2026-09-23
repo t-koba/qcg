@@ -15,10 +15,18 @@ use crate::config::{
 use crate::parse::{marker_block, marker_line};
 use crate::router::LlmRouter;
 use crate::types::{
-    Capabilities, ChatContent, ChatRequest, ChatResponse, ChatStreamEvent, LlmError, StopReason,
-    TokenUsage,
+    Capabilities, ChatContent, ChatRequest, ChatResponse, ChatStreamEvent, LlmError, PromptCache,
+    StopReason, TokenUsage,
 };
 use crate::validate::validate_chat_request;
+
+/// Default floor between rate-limited (429) and empty-response retries, in
+/// milliseconds. Provider rows may lower it to zero or raise it up to the
+/// mechanistic ceiling of 60000.
+pub const DEFAULT_RETRY_RATE_LIMIT_FLOOR_MS: u64 = 5000;
+/// Default cap on the exponential retry-backoff exponent. Provider rows may
+/// set any cap within the mechanistic range 1..=16.
+pub const DEFAULT_RETRY_BACKOFF_EXPONENT_CAP: u32 = 8;
 
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
@@ -26,6 +34,18 @@ pub trait LlmProvider: Send + Sync {
     fn capabilities(&self) -> Capabilities;
     fn capabilities_for(&self, provider: &str) -> Option<Capabilities> {
         (provider == self.id()).then(|| self.capabilities())
+    }
+    /// Effective capabilities for one model of a provider. Registry rows may
+    /// declare per-model capabilities and effort lists; the default keeps the
+    /// provider-level value, which preserves generic rows that enumerate no
+    /// models.
+    fn model_capabilities_for(&self, provider: &str, _model: &str) -> Option<Capabilities> {
+        self.capabilities_for(provider)
+    }
+    /// Unit prices declared by the model catalog, when any. Contract-level
+    /// prices still win; this only fills the gap for operator-selected models.
+    fn model_pricing_for(&self, _provider: &str, _model: &str) -> Option<ModelPricing> {
+        None
     }
     fn configuration_error_for(&self, _provider: &str) -> Option<String> {
         None
@@ -50,6 +70,33 @@ pub trait LlmProvider: Send + Sync {
     fn retry_base_backoff(&self) -> Duration {
         Duration::from_millis(200)
     }
+    /// Retry attempts for a stream that failed before delivering any event.
+    /// Zero (the default) never retries a stream: once a delta is emitted a
+    /// retry could mix model output, and even before the first delta the
+    /// safe default is to surface the provider error.
+    fn stream_retry_attempts(&self) -> usize {
+        0
+    }
+    /// Minimum wait per attempt for rate-limited (429) and empty-response
+    /// retries, multiplied by the attempt number. Zero disables the floor.
+    fn retry_rate_limit_floor(&self) -> Duration {
+        Duration::from_millis(DEFAULT_RETRY_RATE_LIMIT_FLOOR_MS)
+    }
+    /// Largest exponent applied to the exponential retry backoff.
+    fn retry_backoff_exponent_cap(&self) -> u32 {
+        DEFAULT_RETRY_BACKOFF_EXPONENT_CAP
+    }
+    fn supports_decisions_for(&self, _provider: &str) -> bool {
+        false
+    }
+
+    async fn decide(
+        &self,
+        _req: crate::DecisionRequest,
+    ) -> Result<crate::DecisionResponse, LlmError> {
+        Err(LlmError::new("provider does not support typed decisions"))
+    }
+
     async fn complete(&self, req: ChatRequest) -> Result<ChatResponse, LlmError>;
 
     async fn stream(
@@ -85,6 +132,9 @@ pub struct LlmRuntime {
     pub default_model: Option<ModelSelection>,
     pub search: SearchRuntime,
     pub mcp: qcg_mcp::McpRuntime,
+    /// Registry-derived model catalog shared by validation, the HTTP API, and
+    /// the CLI. External sources and discovery are metadata only.
+    pub catalog: Arc<crate::catalog::CatalogService>,
     /// Whether a providers registry file was resolved for this process. When
     /// false only the built-in `fake` provider is registered, and
     /// validation errors for other ids carry registry-setup guidance.
@@ -102,6 +152,7 @@ impl LlmRuntime {
             default_model: None,
             search: SearchRuntime::unavailable(),
             mcp: qcg_mcp::McpRuntime::public_defaults(),
+            catalog: Arc::new(crate::catalog::CatalogService::empty()),
             registry_present: false,
         }
     }
@@ -114,6 +165,7 @@ impl std::fmt::Debug for LlmRuntime {
             .field("default_model", &self.default_model)
             .field("search", &self.search)
             .field("mcp", &self.mcp)
+            .field("catalog", &self.catalog)
             .field("registry_present", &self.registry_present)
             .finish()
     }
@@ -125,6 +177,7 @@ pub enum ApiFlavor {
     ChatCompletions,
     Responses,
     AnthropicMessages,
+    SystemOne,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -132,6 +185,139 @@ pub enum ApiFlavor {
 pub enum ChatTokenLimitField {
     MaxTokens,
     MaxCompletionTokens,
+}
+
+/// Request-body mechanism carrying prompt-cache hints. Declared per provider
+/// row like `chat_token_limit_field` because API flavors differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheField {
+    /// Anthropic Messages `cache_control` content blocks.
+    CacheControl,
+    /// OpenAI-compatible `prompt_cache_key` request field.
+    PromptCacheKey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelsDiscovery {
+    /// OpenAI-compatible model listing at `{base_url}/models`.
+    Openai,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelPricing {
+    pub input_cost_per_million_usd: Option<f64>,
+    pub output_cost_per_million_usd: Option<f64>,
+}
+
+impl ModelPricing {
+    pub fn is_empty(&self) -> bool {
+        self.input_cost_per_million_usd.is_none() && self.output_cost_per_million_usd.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelSpec {
+    pub id: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Full capability override for this model. When omitted the provider
+    /// capabilities apply.
+    #[serde(default)]
+    pub capabilities: Option<Capabilities>,
+    /// Shorthand that overrides only the provider's `reasoning_effort` list.
+    #[serde(default)]
+    pub reasoning_effort: Option<Vec<ReasoningEffort>>,
+    #[serde(default)]
+    pub input_cost_per_million_usd: Option<f64>,
+    #[serde(default)]
+    pub output_cost_per_million_usd: Option<f64>,
+    #[serde(default)]
+    pub context_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
+    /// Disabled models stay usable by pinned contracts but are hidden from
+    /// the selectable catalog. `None` means enabled.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+impl ModelSpec {
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    pub fn effective_capabilities(&self, provider: &Capabilities) -> Capabilities {
+        let mut effective = self
+            .capabilities
+            .clone()
+            .unwrap_or_else(|| provider.clone());
+        if let Some(reasoning_effort) = &self.reasoning_effort {
+            effective.reasoning_effort = reasoning_effort.clone();
+        }
+        effective
+    }
+
+    pub fn pricing(&self) -> Option<ModelPricing> {
+        let pricing = ModelPricing {
+            input_cost_per_million_usd: self.input_cost_per_million_usd,
+            output_cost_per_million_usd: self.output_cost_per_million_usd,
+        };
+        (!pricing.is_empty()).then_some(pricing)
+    }
+
+    pub(crate) fn validate(&self, provider: &str, api: ApiFlavor) -> Result<(), String> {
+        if self.id.trim().is_empty() || self.id.chars().any(char::is_control) {
+            return Err(format!(
+                "provider `{provider}` has a model with an empty or invalid id"
+            ));
+        }
+        if let Some(capabilities) = &self.capabilities {
+            validate_capabilities_for_api(provider, api, capabilities)
+                .map_err(|error| format!("model `{}`: {error}", self.id))?;
+        }
+        for (field, value) in [
+            (
+                "input_cost_per_million_usd",
+                self.input_cost_per_million_usd,
+            ),
+            (
+                "output_cost_per_million_usd",
+                self.output_cost_per_million_usd,
+            ),
+        ] {
+            if value.is_some_and(|value| !value.is_finite() || value < 0.0) {
+                return Err(format!(
+                    "provider `{provider}` model `{}` {field} must be finite and non-negative",
+                    self.id
+                ));
+            }
+        }
+        for (field, value) in [
+            ("context_tokens", self.context_tokens),
+            ("max_output_tokens", self.max_output_tokens),
+        ] {
+            if value == Some(0) {
+                return Err(format!(
+                    "provider `{provider}` model `{}` {field} must be greater than zero",
+                    self.id
+                ));
+            }
+        }
+        if let Some(efforts) = &self.reasoning_effort {
+            for (index, effort) in efforts.iter().enumerate() {
+                if efforts[index + 1..].contains(effort) {
+                    return Err(format!(
+                        "provider `{provider}` model `{}` advertises duplicate reasoning_effort `{effort}`",
+                        self.id
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -152,6 +338,13 @@ pub struct ProviderSpec {
     #[serde(default)]
     pub capabilities: Capabilities,
     #[serde(default)]
+    pub models: Vec<ModelSpec>,
+    #[serde(default)]
+    pub models_discovery: Option<ModelsDiscovery>,
+    /// External catalog provider key (for example a models.dev provider id).
+    #[serde(default)]
+    pub catalog_id: Option<String>,
+    #[serde(default)]
     pub path_template: Option<String>,
     #[serde(default)]
     pub query: BTreeMap<String, String>,
@@ -163,8 +356,23 @@ pub struct ProviderSpec {
     /// Base backoff between retries in milliseconds (default 200, exponential).
     #[serde(default)]
     pub retry_base_backoff_ms: Option<u64>,
+    /// Retry attempts for a stream that failed before delivering any event.
+    #[serde(default)]
+    pub stream_retry_attempts: Option<u32>,
+    /// Minimum wait per rate-limited (429) or empty-response retry attempt in
+    /// milliseconds (default 5000, multiplied by the attempt number). `0`
+    /// disables the floor.
+    #[serde(default)]
+    pub retry_rate_limit_floor_ms: Option<u64>,
+    /// Cap on the exponential retry-backoff exponent (default 8).
+    #[serde(default)]
+    pub retry_backoff_exponent_cap: Option<u32>,
     #[serde(default)]
     pub chat_token_limit_field: Option<ChatTokenLimitField>,
+    /// How `[llm].cache = "auto"` is expressed for this row. Required when
+    /// the `prompt_cache` capability is enabled and invalid otherwise.
+    #[serde(default)]
+    pub prompt_cache_field: Option<PromptCacheField>,
     #[serde(default)]
     pub response_body_limit_bytes: Option<usize>,
     #[serde(default)]
@@ -176,6 +384,8 @@ pub struct ProviderSpec {
     #[serde(default)]
     pub circuit_breaker_cooldown_seconds: Option<u64>,
 }
+
+const MAX_STREAM_RETRY_ATTEMPTS: u32 = 3;
 
 impl ProviderSpec {
     pub(crate) fn validate(&self) -> Result<(), String> {
@@ -277,6 +487,33 @@ impl ProviderSpec {
                 self.id
             ));
         }
+        match self.stream_retry_attempts {
+            Some(attempts) if attempts > MAX_STREAM_RETRY_ATTEMPTS => {
+                return Err(format!(
+                    "provider `{}` stream_retry_attempts must be between 0 and {MAX_STREAM_RETRY_ATTEMPTS}",
+                    self.id
+                ));
+            }
+            _ => {}
+        }
+        if self
+            .retry_rate_limit_floor_ms
+            .is_some_and(|floor| floor > 60_000)
+        {
+            return Err(format!(
+                "provider `{}` retry_rate_limit_floor_ms must be between 0 and 60000",
+                self.id
+            ));
+        }
+        match self.retry_backoff_exponent_cap {
+            Some(cap) if !(1..=16).contains(&cap) => {
+                return Err(format!(
+                    "provider `{}` retry_backoff_exponent_cap must be between 1 and 16",
+                    self.id
+                ));
+            }
+            _ => {}
+        }
         for (field, name) in [
             ("base_url_env", self.base_url_env.as_deref()),
             ("api_key_env", self.api_key_env.as_deref()),
@@ -321,61 +558,49 @@ impl ProviderSpec {
                 self.id
             ));
         }
-        if self.capabilities.seed && self.api != ApiFlavor::ChatCompletions {
-            return Err(format!(
-                "provider `{}` may only advertise `seed` for chat_completions",
-                self.id
-            ));
-        }
-        if !self.capabilities.reasoning_effort.is_empty()
-            && self.api == ApiFlavor::AnthropicMessages
+        if self.api == ApiFlavor::SystemOne
+            && serde_json::to_value(&self.capabilities).map_err(|error| error.to_string())?
+                != serde_json::to_value(Capabilities::default())
+                    .map_err(|error| error.to_string())?
         {
-            return Err(format!(
-                "provider `{}` may not advertise OpenAI reasoning_effort for anthropic_messages",
-                self.id
-            ));
+            return Err("system_one may not advertise chat capabilities".into());
         }
-        if self.capabilities.structured_output_with_tools
-            && self.api == ApiFlavor::AnthropicMessages
-        {
-            return Err(format!(
-                "provider `{}` may not advertise `structured_output_with_tools` for anthropic_messages because qcg_response must be selected exclusively",
-                self.id
-            ));
-        }
-        if self.capabilities.stop_sequences && self.api == ApiFlavor::Responses {
-            return Err(format!(
-                "provider `{}` may not advertise `stop_sequences` for the Responses API",
-                self.id
-            ));
-        }
-        if self.capabilities.verbosity && self.api != ApiFlavor::Responses {
-            return Err(format!(
-                "provider `{}` may only advertise `verbosity` for the Responses API",
-                self.id
-            ));
-        }
-        if (self.capabilities.tool_choice || self.capabilities.parallel_tool_calls)
-            && !self.capabilities.tool_use
-        {
-            return Err(format!(
-                "provider `{}` may not advertise tool selection controls without `tool_use`",
-                self.id
-            ));
-        }
-        for (index, effort) in self.capabilities.reasoning_effort.iter().enumerate() {
-            if self.capabilities.reasoning_effort[index + 1..].contains(effort) {
-                return Err(format!(
-                    "provider `{}` advertises duplicate reasoning_effort `{effort}`",
-                    self.id
-                ));
-            }
-        }
+        validate_capabilities_for_api(&self.id, self.api, &self.capabilities)?;
         if self.chat_token_limit_field.is_some() && self.api != ApiFlavor::ChatCompletions {
             return Err(format!(
                 "provider `{}` may only set `chat_token_limit_field` for chat_completions",
                 self.id
             ));
+        }
+        match (self.capabilities.prompt_cache, self.prompt_cache_field) {
+            (true, None) => {
+                return Err(format!(
+                    "provider `{}` must set `prompt_cache_field` when `capabilities.prompt_cache` is enabled",
+                    self.id
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(format!(
+                    "provider `{}` may only set `prompt_cache_field` when `capabilities.prompt_cache` is enabled",
+                    self.id
+                ));
+            }
+            (true, Some(field)) => {
+                let supported = matches!(
+                    (self.api, field),
+                    (
+                        ApiFlavor::ChatCompletions | ApiFlavor::Responses,
+                        PromptCacheField::PromptCacheKey
+                    ) | (ApiFlavor::AnthropicMessages, PromptCacheField::CacheControl)
+                );
+                if !supported {
+                    return Err(format!(
+                        "provider `{}` has a `prompt_cache_field` that is not valid for its api",
+                        self.id
+                    ));
+                }
+            }
+            (false, None) => {}
         }
         if self.api == ApiFlavor::ChatCompletions
             && !self.capabilities.reasoning_effort.is_empty()
@@ -383,6 +608,38 @@ impl ProviderSpec {
         {
             return Err(format!(
                 "provider `{}` must set `chat_token_limit_field = \"max_completion_tokens\"` when reasoning_effort is enabled",
+                self.id
+            ));
+        }
+        let mut model_ids = BTreeMap::new();
+        for model in &self.models {
+            model.validate(&self.id, self.api)?;
+            if model_ids.insert(model.id.as_str(), ()).is_some() {
+                return Err(format!(
+                    "provider `{}` declares duplicate model id `{}`",
+                    self.id, model.id
+                ));
+            }
+        }
+        if self.api == ApiFlavor::ChatCompletions
+            && self.chat_token_limit_field != Some(ChatTokenLimitField::MaxCompletionTokens)
+            && self.models.iter().any(|model| {
+                !model
+                    .effective_capabilities(&self.capabilities)
+                    .reasoning_effort
+                    .is_empty()
+            })
+        {
+            return Err(format!(
+                "provider `{}` must set `chat_token_limit_field = \"max_completion_tokens\"` when a declared model advertises reasoning_effort",
+                self.id
+            ));
+        }
+        if let Some(catalog_id) = self.catalog_id.as_deref()
+            && (catalog_id.trim().is_empty() || catalog_id.chars().any(char::is_control))
+        {
+            return Err(format!(
+                "provider `{}` catalog_id must be a non-empty identifier",
                 self.id
             ));
         }
@@ -402,6 +659,78 @@ impl ProviderSpec {
             .map_err(|error| format!("provider `{}` has an invalid `query`: {error}", self.id))?;
         Ok(())
     }
+
+    pub fn model(&self, id: &str) -> Option<&ModelSpec> {
+        self.models.iter().find(|model| model.id == id)
+    }
+
+    /// Effective capabilities for one model, falling back to the provider row
+    /// when the model is not declared (generic OpenAI-compatible rows keep
+    /// working with arbitrary model strings).
+    pub fn capabilities_for_model(&self, id: &str) -> Capabilities {
+        match self.model(id) {
+            Some(model) => model.effective_capabilities(&self.capabilities),
+            None => self.capabilities.clone(),
+        }
+    }
+
+    pub fn pricing_for_model(&self, id: &str) -> Option<ModelPricing> {
+        self.model(id).and_then(ModelSpec::pricing)
+    }
+}
+
+/// API-flavor constraints shared by provider rows and per-model capability
+/// overrides. Keeping one implementation means a model override cannot
+/// advertise a combination the provider row itself would reject.
+fn validate_capabilities_for_api(
+    provider: &str,
+    api: ApiFlavor,
+    capabilities: &Capabilities,
+) -> Result<(), String> {
+    if api == ApiFlavor::SystemOne
+        && serde_json::to_value(capabilities).map_err(|error| error.to_string())?
+            != serde_json::to_value(Capabilities::default()).map_err(|error| error.to_string())?
+    {
+        return Err("system_one may not advertise chat capabilities".into());
+    }
+    if capabilities.seed && api != ApiFlavor::ChatCompletions {
+        return Err(format!(
+            "provider `{provider}` may only advertise `seed` for chat_completions"
+        ));
+    }
+    if !capabilities.reasoning_effort.is_empty() && api == ApiFlavor::AnthropicMessages {
+        return Err(format!(
+            "provider `{provider}` may not advertise OpenAI reasoning_effort for anthropic_messages"
+        ));
+    }
+    if capabilities.structured_output_with_tools && api == ApiFlavor::AnthropicMessages {
+        return Err(format!(
+            "provider `{provider}` may not advertise `structured_output_with_tools` for anthropic_messages because qcg_response must be selected exclusively"
+        ));
+    }
+    if capabilities.stop_sequences && api == ApiFlavor::Responses {
+        return Err(format!(
+            "provider `{provider}` may not advertise `stop_sequences` for the Responses API"
+        ));
+    }
+    if capabilities.verbosity && api != ApiFlavor::Responses {
+        return Err(format!(
+            "provider `{provider}` may only advertise `verbosity` for the Responses API"
+        ));
+    }
+    if (capabilities.tool_choice || capabilities.parallel_tool_calls) && !capabilities.tool_use {
+        return Err(format!(
+            "provider `{provider}` may not advertise tool selection controls without `tool_use`"
+        ));
+    }
+    for (index, effort) in capabilities.reasoning_effort.iter().enumerate() {
+        if capabilities.reasoning_effort[index + 1..].contains(effort) {
+            return Err(format!(
+                "provider `{provider}` advertises duplicate reasoning_effort `{effort}`"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -424,6 +753,8 @@ pub struct ProvidersFile {
     pub search_provider: Vec<SearchProviderSpec>,
     #[serde(default)]
     pub mcp_server: Vec<qcg_mcp::McpServerSpec>,
+    #[serde(default)]
+    pub catalog: Option<crate::catalog::CatalogConfig>,
 }
 
 impl ProvidersFile {
@@ -435,6 +766,9 @@ impl ProvidersFile {
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
+        if let Some(catalog) = &self.catalog {
+            catalog.validate()?;
+        }
         let mut seen = BTreeMap::new();
         for spec in &self.provider {
             spec.validate()?;
@@ -512,6 +846,7 @@ impl LlmProvider for FakeLlmProvider {
             tool_choice: true,
             parallel_tool_calls: true,
             verbosity: true,
+            prompt_cache: false,
             reasoning_effort: vec![
                 ReasoningEffort::None,
                 ReasoningEffort::Minimal,
@@ -526,6 +861,11 @@ impl LlmProvider for FakeLlmProvider {
 
     async fn complete(&self, req: ChatRequest) -> Result<ChatResponse, LlmError> {
         validate_chat_request(&req, ApiFlavor::ChatCompletions)?;
+        if req.prompt_cache == PromptCache::Auto {
+            return Err(LlmError::new(
+                "fake provider does not support prompt caching",
+            ));
+        }
         let prompt = req
             .messages
             .last()

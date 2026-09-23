@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use crate::agent::agent_command_allowed;
 use crate::agent_runtime::normalize_path_prefix;
 use crate::policy::{effective_request_policy, llm_params};
-use crate::prompting::read_bytes_bounded;
+use crate::prompting::read_path_bounded;
 use crate::routes::validate_route_sequence;
 use crate::search::validate_web_search_tool;
 use crate::validation::{
@@ -198,16 +198,22 @@ pub(crate) fn validate_agent_tool(
                     format!("agent tool `{name}` requires non-empty instructions"),
                 ));
             }
-            if *max_calls == 0 {
+            if *max_calls == 0 || *max_calls > qcg_policy::MAX_AGENT_TOOL_CALLS {
                 return Err(StepError::failed(
                     &node.id,
-                    format!("agent tool `{name}` max_calls must be greater than zero"),
+                    format!(
+                        "agent tool `{name}` max_calls must be between 1 and {}",
+                        qcg_policy::MAX_AGENT_TOOL_CALLS
+                    ),
                 ));
             }
-            if *max_iterations == 0 {
+            if *max_iterations == 0 || *max_iterations > qcg_policy::MAX_AGENT_ITERATIONS {
                 return Err(StepError::failed(
                     &node.id,
-                    format!("agent tool `{name}` max_iterations must be greater than zero"),
+                    format!(
+                        "agent tool `{name}` max_iterations must be between 1 and {}",
+                        qcg_policy::MAX_AGENT_ITERATIONS
+                    ),
                 ));
             }
             if *max_tokens_total == 0 {
@@ -238,6 +244,15 @@ pub(crate) fn validate_agent_tool(
                         format!("agent tool `{name}` model cannot be templated"),
                     ));
                 }
+            }
+            if fallback_models.len() > qcg_policy::MAX_FALLBACK_MODELS {
+                return Err(StepError::failed(
+                    &node.id,
+                    format!(
+                        "agent tool `{name}` declares more than {} fallback models",
+                        qcg_policy::MAX_FALLBACK_MODELS
+                    ),
+                ));
             }
             for fallback in fallback_models {
                 if fallback.provider.trim().is_empty() || fallback.model.trim().is_empty() {
@@ -273,6 +288,12 @@ pub(crate) fn validate_agent_tool(
                 &format!("agent tool `{name}` fallback_models"),
             )?;
             let policy = effective_request_policy(node, llm, Some(request))?;
+            crate::validation::validate_effort_templates(
+                node,
+                llm,
+                &parent_params.request,
+                Some(request),
+            )?;
             validate_effective_tool_policy(
                 node,
                 &policy,
@@ -282,7 +303,11 @@ pub(crate) fn validate_agent_tool(
                     .collect::<Vec<_>>(),
             )?;
             let provider = if let Some(model) = model {
-                Some((model.provider.clone(), "specialist LLM provider"))
+                Some((
+                    model.provider.clone(),
+                    Some(model.model.clone()),
+                    "specialist LLM provider",
+                ))
             } else {
                 let params = llm_params(node)?;
                 let dynamic = params.model.as_ref().is_some_and(|model| {
@@ -291,7 +316,8 @@ pub(crate) fn validate_agent_tool(
                 if dynamic {
                     None
                 } else {
-                    Some((resolve_model_static(llm, runtime, node)?.0, "LLM provider"))
+                    let (provider, model) = resolve_model_static(llm, runtime, node)?;
+                    Some((provider, Some(model), "LLM provider"))
                 }
             };
             let required = request_required_capabilities(
@@ -299,8 +325,16 @@ pub(crate) fn validate_agent_tool(
                 output_schema.is_some(),
                 !delegated_tools.is_empty(),
             );
-            if let Some((provider, role)) = provider {
-                validate_provider_requirements(runtime, node, &policy, &provider, role, &required)?;
+            if let Some((provider, model, role)) = provider {
+                validate_provider_requirements(
+                    runtime,
+                    node,
+                    &policy,
+                    &provider,
+                    model.as_deref(),
+                    role,
+                    &required,
+                )?;
             }
             for fallback in fallback_models {
                 validate_provider_requirements(
@@ -308,10 +342,14 @@ pub(crate) fn validate_agent_tool(
                     node,
                     &policy,
                     &fallback.provider,
+                    Some(&fallback.model),
                     "specialist fallback LLM provider",
                     &required,
                 )?;
             }
+        }
+        ToolDecl::Skill { .. } => {
+            crate::skill_tool::validate_skill_tool(node, contract, tool)?;
         }
     }
     Ok(())
@@ -406,7 +444,7 @@ pub(crate) fn load_agent_output_schema(
             ),
         ));
     }
-    let source = read_bytes_bounded(&schema_path, MAX_JSON_SCHEMA_BYTES).map_err(|error| {
+    let source = read_path_bounded(&schema_path, MAX_JSON_SCHEMA_BYTES).map_err(|error| {
         StepError::failed(
             node_id,
             format!("agent tool `{agent_name}` output_schema could not be read: {error}"),
@@ -438,7 +476,7 @@ pub(crate) fn validate_agent_tool_args(
     tool: &ToolDecl,
     args: &Value,
 ) -> Result<(), StepError> {
-    let schema = agent_tool_schema(tool);
+    let schema = agent_tool_schema(tool)?;
     validate_json_schema_step(&node.id, &schema, args, "tool arguments").map_err(|error| {
         StepError::failed(
             &node.id,
@@ -474,11 +512,11 @@ pub(crate) fn validate_agent_tool_args(
     Ok(())
 }
 
-pub(crate) fn agent_tool_schema(tool: &ToolDecl) -> Value {
+pub(crate) fn agent_tool_schema(tool: &ToolDecl) -> Result<Value, StepError> {
     if let Some(schema) = tool.input_schema() {
-        return schema.clone();
+        return Ok(schema.clone());
     }
-    match tool {
+    Ok(match tool {
         ToolDecl::FsWrite { .. } => json!({
             "type": "object",
             "additionalProperties": false,
@@ -489,6 +527,9 @@ pub(crate) fn agent_tool_schema(tool: &ToolDecl) -> Value {
             }
         }),
         ToolDecl::Command { .. } => json!({
+            // Call args are intentionally empty: the executed argv comes
+            // from the declared tool plan, never from model-supplied args,
+            // so there is nothing for the model to pass (E09).
             "type": "object",
             "additionalProperties": false,
             "properties": {}
@@ -501,10 +542,24 @@ pub(crate) fn agent_tool_schema(tool: &ToolDecl) -> Value {
                 "method": { "type": "string" },
                 "url": { "type": "string" },
                 "headers": { "type": "object" },
-                "body": { "type": "string" }
+                "body": { "type": "string" },
+                // Declared sensitive query names: bound into the approval
+                // digest and removed from the journaled target. Must be
+                // schema-visible or callers could never declare it and the
+                // read path below would stay unreachable (E09).
+                "sensitive_query": { "type": "array", "items": { "type": "string" } }
             }
         }),
         ToolDecl::AskUser { .. } => json!({
+            // Agent-tool-only `notes`: material context bound into the
+            // minimized identity (`minimized_builtin_args` keeps
+            // question/options/fields/notes). The plain `ask_user` step
+            // carries no `notes` field by design: it binds `content`
+            // directly as the question, while the agent tool separates the
+            // displayed `question` from caller-supplied `notes` context.
+            // The shapes are intentionally different; `notes` must stay
+            // schema-visible here or a notes-carrying call fails validation
+            // while the identity still binds it (E08a).
             "type": "object",
             "additionalProperties": false,
             "properties": {
@@ -516,7 +571,8 @@ pub(crate) fn agent_tool_schema(tool: &ToolDecl) -> Value {
                 "fields": {
                     "type": "array",
                     "items": { "type": "object" }
-                }
+                },
+                "notes": { "type": "string" }
             }
         }),
         ToolDecl::WebSearch { max_results, .. } => json!({
@@ -528,12 +584,29 @@ pub(crate) fn agent_tool_schema(tool: &ToolDecl) -> Value {
                 "limit": { "type": "integer", "minimum": 1, "maximum": max_results }
             }
         }),
-        ToolDecl::Mcp { .. } => unreachable!("MCP schemas are resolved from the server"),
+        ToolDecl::Mcp { .. } => {
+            // Resolved from the server by the caller (`tool_spec`
+            // dispatches Mcp before reaching here). A direct call is a
+            // programming error that must fail the step, never panic.
+            return Err(StepError::failed(
+                "agent",
+                "MCP schemas are resolved from the server",
+            ));
+        }
         ToolDecl::Agent { .. } => json!({
             "type": "object",
             "additionalProperties": true
         }),
-    }
+        ToolDecl::Skill { .. } => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["skill"],
+            "properties": {
+                "skill": { "type": "string", "minLength": 1 },
+                "file": { "type": "string", "minLength": 1 }
+            }
+        }),
+    })
 }
 
 pub(crate) fn dynamic_form_fields(
@@ -571,4 +644,103 @@ pub(crate) fn dynamic_form_fields(
         }
     }
     Ok(Some(fields))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qcg_contract::{NodeDef, StepType, ToolDecl};
+    use serde_json::json;
+
+    fn agent_node() -> NodeDef {
+        NodeDef {
+            id: "agent".into(),
+            kind: StepType::from("llm.agent"),
+            needs: vec![],
+            when: None,
+            on_deps: qcg_contract::OnDeps::AllSucceeded,
+            context: vec![],
+            output: None,
+            artifact: None,
+            on_fail: None,
+            failure: None,
+            retry: None,
+            params: Default::default(),
+        }
+    }
+
+    fn ask_user_tool() -> ToolDecl {
+        ToolDecl::AskUser {
+            name: "ask".into(),
+            description: None,
+            input_schema: None,
+        }
+    }
+
+    #[test]
+    fn ask_user_schema_accepts_notes_through_real_validation_and_id_path() {
+        // Gap 1 (real bug): the minimized identity binds `notes`, so the
+        // schema must accept it. This drives a notes-carrying call through
+        // the real validation (`validate_agent_tool_args`) plus the real
+        // identity path (`minimized_builtin_args` /
+        // `agent_call_identity_hash_for_tool` / `ask_user_question_id`).
+        // Before the fix this failed at schema validation with
+        // `additionalProperties: false` rejecting `notes`.
+        let node = agent_node();
+        let tool = ask_user_tool();
+        let args = json!({"question": "city?", "notes": "billing"});
+        validate_agent_tool_args(&node, &tool, &args)
+            .expect("notes-carrying call must pass real schema validation");
+        // The identity path binds notes: different notes separate.
+        let canonical = crate::agent_runtime::canonical_agent_registry_args(
+            &tool_decl_for(&tool),
+            "ask",
+            &args,
+        );
+        let hash =
+            crate::agent_runtime::agent_call_identity_hash("agent", "run-test-1", &canonical)
+                .expect("identity hash should build");
+        let other = crate::agent_runtime::canonical_agent_registry_args(
+            &tool_decl_for(&tool),
+            "ask",
+            &json!({"question": "city?", "notes": "shipping"}),
+        );
+        let other_hash =
+            crate::agent_runtime::agent_call_identity_hash("agent", "run-test-1", &other)
+                .expect("identity hash should build");
+        assert_ne!(
+            hash, other_hash,
+            "notes change must alter the identity hash"
+        );
+        let first =
+            crate::agent_runtime::ask_user_question_id("agent", "agent", "ask", "call-1", &args)
+                .expect("question id should build");
+        let second = crate::agent_runtime::ask_user_question_id(
+            "agent",
+            "agent",
+            "ask",
+            "call-1",
+            &json!({"question": "city?", "notes": "shipping"}),
+        )
+        .expect("question id should build");
+        assert_ne!(first, second, "notes change must alter the question id");
+        // No-notes calls still validate, and unknown fields still fail.
+        validate_agent_tool_args(&node, &tool, &json!({"question": "city?"}))
+            .expect("no-notes call must still validate");
+        assert!(
+            validate_agent_tool_args(&node, &tool, &json!({"question": "city?", "bogus": 1}))
+                .is_err(),
+            "unknown fields must still be rejected"
+        );
+        // Non-string notes fail closed.
+        assert!(
+            validate_agent_tool_args(&node, &tool, &json!({"question": "city?", "notes": 42}))
+                .is_err(),
+            "non-string notes must fail schema validation"
+        );
+    }
+
+    fn tool_decl_for(tool: &ToolDecl) -> Vec<ToolDecl> {
+        vec![tool.clone()]
+    }
 }

@@ -52,3 +52,6 @@ Desktop.ini
 /frontend/generator/src/api/types.d.ts
 /frontend/generator/src/expr/pkg/
 /generators/generator/ui/
+
+__pycache__/
+*.pyc

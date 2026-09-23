@@ -49,16 +49,22 @@ pub(crate) fn validate_web_search_tool(
             ),
         ));
     }
-    if *max_results == 0 {
+    if *max_results == 0 || *max_results > qcg_policy::MAX_WEB_SEARCH_RESULTS {
         return Err(StepError::failed(
             &node.id,
-            format!("tool `{name}` max_results must be greater than zero"),
+            format!(
+                "tool `{name}` max_results must be between 1 and {}",
+                qcg_policy::MAX_WEB_SEARCH_RESULTS
+            ),
         ));
     }
-    if *max_calls == 0 {
+    if *max_calls == 0 || *max_calls > qcg_policy::MAX_AGENT_TOOL_CALLS {
         return Err(StepError::failed(
             &node.id,
-            format!("tool `{name}` max_calls must be greater than zero"),
+            format!(
+                "tool `{name}` max_calls must be between 1 and {}",
+                qcg_policy::MAX_AGENT_TOOL_CALLS
+            ),
         ));
     }
     Ok(())

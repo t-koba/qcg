@@ -31,12 +31,15 @@ pub(crate) enum HttpStreamAccumulator {
 }
 
 impl HttpStreamAccumulator {
-    pub(crate) fn new(api: ApiFlavor) -> Self {
-        match api {
+    pub(crate) fn new(api: ApiFlavor) -> Result<Self, LlmError> {
+        Ok(match api {
+            ApiFlavor::SystemOne => {
+                return Err(LlmError::new("system_one does not support streaming"));
+            }
             ApiFlavor::ChatCompletions => Self::Chat(ChatCompletionAccumulator::default()),
             ApiFlavor::Responses => Self::Responses,
             ApiFlavor::AnthropicMessages => Self::Anthropic(AnthropicAccumulator::default()),
-        }
+        })
     }
 
     pub(crate) async fn ingest(

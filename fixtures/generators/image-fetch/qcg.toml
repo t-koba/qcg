@@ -25,5 +25,12 @@ required = true
 type = "string"
 
 [permissions]
+fs_read = []
+commands = []
+side_effects = "none"
+side_effects_scope = "invocation"
 fs_write = ["workspace"]
 network = ["example.com"]
+
+[permissions.containers]
+enabled = false

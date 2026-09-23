@@ -35,6 +35,14 @@ pub struct StartRun {
     /// Scheduling priority, higher runs first. Defaults to 0.
     #[serde(default)]
     pub priority: Option<i32>,
+    /// Free-form run metadata (for example `owner`). Metadata only: it is
+    /// stored and returned with the run, and never confers authorization.
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    /// Requests a higher observation-audit level for this run. The
+    /// deployment floor and the generator policy can only be raised.
+    #[serde(default)]
+    pub audit_level: Option<qcg_policy::AuditLevel>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -129,9 +137,18 @@ pub struct ConfirmSpec {
     pub details: Option<Value>,
     /// Canonical digest of target + details binding this approval to the
     /// exact operation content (A06). Approvals never transfer across
-    /// different digests even for the same node and kind.
-    #[serde(default)]
+    /// different digests even for the same node and kind. Required:
+    /// a confirmation without a digest is corrupt, never an
+    /// invocation-scoped default (Q1-5 fail-closed).
     pub operation_digest: String,
+    /// How far this approval reaches, recorded from the manifest
+    /// permission: `invocation` approves one call, `content` reuses the
+    /// approval for identical content until the run ends (Q1). Required:
+    /// the scope must be stated explicitly, never defaulted silently.
+    /// Wire form: `invocation` confirmations carry 4-part ids
+    /// (`node:kind:digest:invocation-hash`), `content` ones 3-part ids
+    /// (`node:kind:digest`).
+    pub scope: qcg_contract::SideEffectScope,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -165,6 +182,9 @@ pub struct RunSnapshot {
     /// synthesis from the folded budget. Absent only before any activity.
     #[serde(default)]
     pub metrics: Option<RunMetrics>,
+    /// Run metadata admitted with the run; never authorization.
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -267,6 +287,90 @@ pub struct ProblemDetails {
     pub detail: String,
     pub instance: String,
     pub code: String,
+    // New-optional field default (C-3): `errors` was always optional on the
+    // wire (an empty list means no field errors). This is the declared
+    // schema default for a newly optional field, not a rescue for a removed
+    // required field: writers always emit the key, readers accept its
+    // absence as `[]`.
     #[serde(default)]
     pub errors: Vec<ProblemFieldError>,
+}
+
+/// Selectable LLM provider/model catalog. Metadata only: the catalog never
+/// carries credentials and never grants run permissions.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LlmCatalogResponse {
+    /// RFC 3339 timestamp of the last successful external catalog fetch.
+    #[serde(default)]
+    pub fetched_at: Option<String>,
+    /// True while external metadata is missing or stale.
+    #[serde(default)]
+    pub stale: bool,
+    #[serde(default)]
+    pub sources: Vec<LlmCatalogSource>,
+    pub providers: Vec<LlmCatalogProvider>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LlmCatalogSource {
+    pub kind: String,
+    pub location: String,
+    #[serde(default)]
+    pub fetched_at: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LlmCatalogProvider {
+    pub id: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    /// False when the provider needs a credential that is not configured.
+    pub available: bool,
+    /// Whether live `/v1/models` discovery is enabled for this provider.
+    pub discovery: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+    pub models: Vec<LlmCatalogModel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LlmCatalogModel {
+    pub id: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    pub enabled: bool,
+    /// `built-in`, `explicit`, `external`, or `discovery` (combined sources
+    /// are joined with ` + `).
+    pub source: String,
+    #[serde(default)]
+    pub reasoning_effort: Vec<String>,
+    #[serde(default)]
+    pub input_cost_per_million_usd: Option<f64>,
+    #[serde(default)]
+    pub output_cost_per_million_usd: Option<f64>,
+    #[serde(default)]
+    pub context_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
+    pub capabilities: LlmCatalogCapabilities,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LlmCatalogCapabilities {
+    pub tool_use: bool,
+    pub json_schema: bool,
+    pub structured_output_with_tools: bool,
+    pub seed: bool,
+    pub image_input: bool,
+    pub audio_input: bool,
+    pub file_input: bool,
+    pub streaming: bool,
+    pub temperature: bool,
+    pub top_p: bool,
+    pub stop_sequences: bool,
+    pub tool_choice: bool,
+    pub parallel_tool_calls: bool,
+    pub verbosity: bool,
 }

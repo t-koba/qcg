@@ -16,5 +16,12 @@ qcg_version = "^0.1"
 version = "0.1.0"
 
 [permissions]
+fs_read = []
+commands = []
+side_effects = "none"
+side_effects_scope = "invocation"
 fs_write = ["workspace"]
 network = ["example.com"]
+
+[permissions.containers]
+enabled = false

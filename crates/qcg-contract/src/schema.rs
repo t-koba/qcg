@@ -81,6 +81,13 @@ pub struct InputField {
     pub pattern: Option<String>,
     #[serde(default)]
     pub options: Vec<String>,
+    /// Run-variable path supplying this field's options at run time, using
+    /// the same dotted paths as `ask_user.fields_from`. The value is an array
+    /// of strings or of `{ value, label?, label_i18n? }` objects. Mutually
+    /// exclusive with static `options` and valid only for runtime forms
+    /// (`ask_user`), never for pre-run `[inputs]` fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options_from: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub option_labels_i18n: BTreeMap<String, BTreeMap<String, String>>,
     #[serde(default)]

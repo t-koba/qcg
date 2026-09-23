@@ -1,6 +1,8 @@
 use qcg_contract::ContainerRuntime;
 
-/// Resolved container backend: a concrete client binary.
+/// Resolved container backend: a concrete client binary. The LXD runtime
+/// keeps the genuine upstream CLI name `lxc` (like `docker`/`podman` keep
+/// theirs); it is a binary name, not a leftover variant (E-cleanup).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Backend {
     Docker {
@@ -10,7 +12,6 @@ pub enum Backend {
     Incus {
         binary: String,
     },
-    Lxc,
 }
 
 impl Backend {
@@ -36,7 +37,6 @@ impl Backend {
                     "lxd"
                 }
             }
-            Self::Lxc => "lxc",
         }
     }
 }
@@ -63,13 +63,10 @@ pub fn backend_for(runtime: &ContainerRuntime) -> Backend {
         ContainerRuntime::Lxd => Backend::Incus {
             binary: "lxc".into(),
         },
-        ContainerRuntime::Lxc => Backend::Lxc,
     }
 }
 
-/// Binaries that must exist for each backend. The legacy toolset is
-/// reported as a single `lxc-create` probe; the remaining tools ship
-/// together and their absence surfaces as an explicit stage failure.
+/// Binaries that must exist for each backend.
 fn required_binaries(backend: &Backend) -> Vec<&'static str> {
     match backend {
         Backend::Docker { binary, .. } => {
@@ -86,7 +83,6 @@ fn required_binaries(backend: &Backend) -> Vec<&'static str> {
                 vec!["lxc"]
             }
         }
-        Backend::Lxc => vec!["lxc-create"],
     }
 }
 

@@ -239,6 +239,9 @@ fn spec_with_lifecycle(id: &str, url: &str, lifecycle: qcg_mcp::McpLifecycle) ->
         allowed_hosts: vec!["127.0.0.1".into()],
         timeout_seconds: 5,
         max_response_bytes: 64 * 1024,
+        tools_list_page_limit: 100,
+        oauth_state_ttl_seconds: 600,
+        task_poll_interval_ms: 250,
     }
 }
 

@@ -1,4 +1,4 @@
-use super::common::bounded_sha256_file;
+use super::common::hash_opened_bounded;
 use qcg_contract::{NodeDef, ToolBackendKind, ToolDef, ToolWorkspace};
 use qcg_engine::{StepContext, StepError};
 use serde_json::json;
@@ -57,8 +57,10 @@ pub(crate) fn build_tool_backend_candidate(
             if !path.is_file() {
                 return Err(format!("bundled binary `{bin}` was not found"));
             }
-            let sha256 = bounded_sha256_file(
-                &path,
+            let file = std::fs::File::open(&path)
+                .map_err(|error| format!("bundled binary `{bin}` could not be opened: {error}"))?;
+            let sha256 = hash_opened_bounded(
+                file,
                 ctx.run.contract.manifest.runtime.file_input_limit_bytes,
             )?;
             if sha256 != backend.sha256 {

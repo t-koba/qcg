@@ -41,6 +41,9 @@ impl BoundedChildTransport {
             .kill_on_drop(true)
             .spawn()?;
         #[cfg(unix)]
+        // OS pids always fit i32; a conversion failure only skips the
+        // group kill while the owned child handle (kill_on_drop) still
+        // terminates the child itself.
         let process_group_id = child.id().and_then(|pid| i32::try_from(pid).ok());
         let stdout = child
             .stdout

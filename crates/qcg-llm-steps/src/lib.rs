@@ -1,9 +1,11 @@
 mod agent;
 mod agent_runtime;
 mod agent_tools;
+mod catalog_step;
 mod choose;
 mod completion;
 mod context;
+mod decide;
 mod generate;
 mod guardrail;
 mod mcp_forms;
@@ -16,6 +18,7 @@ mod request;
 mod routes;
 mod schemas;
 mod search;
+mod skill_tool;
 mod specialist;
 mod tool_events;
 mod validation;
@@ -53,6 +56,7 @@ use qcg_llm::LlmRuntime;
 
 use crate::agent::LlmAgentStep;
 use crate::choose::LlmChooseStep;
+use crate::decide::LlmDecideStep;
 use crate::generate::{LlmFillStep, LlmGenerateStep};
 use crate::repair::LlmRepairStep;
 
@@ -78,7 +82,13 @@ pub fn register_llm_steps(registry: &mut StepRegistry, runtime: Arc<LlmRuntime>)
     registry.register(LlmChooseStep {
         runtime: Arc::clone(&runtime),
     });
+    registry.register(LlmDecideStep {
+        runtime: Arc::clone(&runtime),
+    });
     registry.register(LlmRepairStep {
+        runtime: Arc::clone(&runtime),
+    });
+    registry.register(catalog_step::LlmCatalogStep {
         runtime: Arc::clone(&runtime),
     });
     registry.register(LlmAgentStep { runtime });
@@ -571,6 +581,7 @@ api_key_env = "QCG_SECURE_API_KEY"
             default_model: None,
             search: SearchRuntime::unavailable(),
             mcp: qcg_mcp::McpRuntime::unavailable(),
+            catalog: Arc::new(qcg_llm::CatalogService::empty()),
             registry_present: true,
         };
         let mut registry = StepRegistry::new();
@@ -581,6 +592,71 @@ api_key_env = "QCG_SECURE_API_KEY"
         let message = error.to_string();
         assert!(
             message.contains("enable its row in your providers.toml registry"),
+            "{message}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn model_specific_effort_lists_reject_unsupported_values() {
+        let root = std::env::temp_dir().join(format!(
+            "qcg-llm-model-effort-{}-{}",
+            std::process::id(),
+            uuid_suffix()
+        ));
+        std::fs::create_dir_all(&root).expect("fixture dir should be created");
+        std::fs::write(
+            root.join("qcg.toml"),
+            r#"
+[generator]
+id = "schema-test"
+name = "Schema Test"
+version = "0.1.0"
+qcg_version = "^0.1"
+
+[llm]
+model = { provider = "local", model = "restricted" }
+reasoning_effort = "high"
+max_tokens = 2048
+
+[[flow]]
+id = "gen"
+type = "llm.generate"
+
+[flow.params]
+prompt = "prompt.j2"
+"#,
+        )
+        .expect("manifest should be written");
+        std::fs::write(root.join("prompt.j2"), "Generate a bounded result.")
+            .expect("prompt should be written");
+        let contract =
+            Contract::load(camino::Utf8PathBuf::from_path_buf(root.clone()).expect("utf-8 dir"))
+                .expect("contract should load");
+        let router = qcg_llm::LlmRouter::parse_text(
+            r#"
+[[provider]]
+id = "local"
+api = "chat_completions"
+base_url = "https://example.test/v1"
+chat_token_limit_field = "max_completion_tokens"
+capabilities = { tool_use = true, reasoning_effort = ["low", "high"] }
+
+[[provider.models]]
+id = "restricted"
+reasoning_effort = ["low"]
+"#,
+        )
+        .expect("registry should parse");
+        let mut registry = StepRegistry::new();
+        register_llm_steps(&mut registry, Arc::new(router.into_runtime()));
+
+        let error = validate_generate_node(&contract, &registry)
+            .expect_err("model-specific effort list must reject a high effort");
+        let message = error.to_string();
+        assert!(
+            message.contains("does not support reasoning_effort `high`"),
             "{message}"
         );
 
@@ -783,6 +859,31 @@ api_key_env = "QCG_SECURE_API_KEY"
         .expect_err("second total call must fail");
         assert!(error.to_string().contains("2 > 1"));
         assert_eq!(counts["two"], 1);
+    }
+
+    #[test]
+    fn agent_http_tool_schema_accepts_sensitive_query_declarations() {
+        // E09: the execution path reads `sensitive_query` from call args,
+        // so the schema must accept it; otherwise declaring sensitivity
+        // would fail validation and the read path would stay unreachable.
+        let tool = ToolDecl::Http {
+            name: "fetch".into(),
+            description: None,
+            input_schema: None,
+            methods: vec!["POST".into()],
+            hosts: vec!["example.test".into()],
+        };
+        let node = agent_node();
+        validate_agent_tool_args(
+            &node,
+            &tool,
+            &json!({
+                "method": "POST",
+                "url": "https://example.test/search?q=x",
+                "sensitive_query": ["q"],
+            }),
+        )
+        .expect("sensitive_query declarations must validate");
     }
 
     #[test]
@@ -1092,7 +1193,8 @@ api_key_env = "QCG_SECURE_API_KEY"
             request_state: Some("opaque-state".into()),
         };
         let args = json!({ "query": "test" });
-        let first = mcp_question_id("research", "search", "call-1", &args, &required);
+        let first = mcp_question_id("research", "search", "call-1", &args, &required)
+            .expect("question id serialization is infallible in tests");
         let reissued = McpInputRequired {
             input_requests: BTreeMap::from([(
                 "request-2".into(),
@@ -1100,12 +1202,24 @@ api_key_env = "QCG_SECURE_API_KEY"
             )]),
             request_state: Some("different-opaque-state".into()),
         };
-        let second = mcp_question_id("research", "search", "call-1", &args, &reissued);
+        let second = mcp_question_id("research", "search", "call-1", &args, &reissued)
+            .expect("question id serialization is infallible in tests");
         assert_eq!(first, second);
         // Distinct invocations never share a question even with identical
         // arguments and elicitation shape (A07).
-        let third = mcp_question_id("research", "search", "call-2", &args, &required);
+        let third = mcp_question_id("research", "search", "call-2", &args, &required)
+            .expect("question id serialization is infallible in tests");
         assert_ne!(first, third);
+        // E08: the identity binds content, so the same logical arguments
+        // with reordered keys must map to one question.
+        let ordered = json!({ "a": 1, "b": 2 });
+        let reordered = json!({ "b": 2, "a": 1 });
+        assert_eq!(
+            mcp_question_id("research", "search", "call-9", &ordered, &required)
+                .expect("question id serialization is infallible in tests"),
+            mcp_question_id("research", "search", "call-9", &reordered, &required)
+                .expect("question id serialization is infallible in tests")
+        );
 
         let form = mcp_form_spec(first, "search", &required).expect("form");
         assert_eq!(form.fields.len(), 1);
@@ -1192,7 +1306,11 @@ api_key_env = "QCG_SECURE_API_KEY"
         assert_eq!(action, AgentFailureAction::ReturnError);
         assert_eq!(limits.max_calls, 3);
         assert_eq!(tools[1].kind(), "agent");
-        assert!(agent_tool_schema(&tools[1]).is_object());
+        assert!(
+            agent_tool_schema(&tools[1])
+                .expect("agent schema")
+                .is_object()
+        );
     }
 
     #[test]
@@ -1797,6 +1915,7 @@ auth_prefix = "Bearer "
             &runtime,
             &node,
             "fake",
+            "test-model",
             StructuredOutputMode::NativeStrict,
             Some(&schema),
             false,
@@ -1816,6 +1935,7 @@ auth_prefix = "Bearer "
                 &runtime,
                 &node,
                 "fake",
+                "test-model",
                 StructuredOutputMode::Auto,
                 Some(&schema),
                 false,
@@ -1827,6 +1947,7 @@ auth_prefix = "Bearer "
             &runtime,
             &node,
             "fake",
+            "test-model",
             StructuredOutputMode::NativeCompatible,
             Some(&schema),
             false,
@@ -1866,6 +1987,7 @@ capabilities = { tool_use = true, json_schema = true, structured_output_with_too
                 &runtime,
                 &node,
                 "limited",
+                "test-model",
                 StructuredOutputMode::Auto,
                 Some(&schema),
                 true,
@@ -1878,6 +2000,7 @@ capabilities = { tool_use = true, json_schema = true, structured_output_with_too
                 &runtime,
                 &node,
                 "limited",
+                "test-model",
                 StructuredOutputMode::NativeCompatible,
                 Some(&schema),
                 true,
@@ -1889,6 +2012,7 @@ capabilities = { tool_use = true, json_schema = true, structured_output_with_too
                 &runtime,
                 &node,
                 "combined",
+                "test-model",
                 StructuredOutputMode::Auto,
                 Some(&schema),
                 true,

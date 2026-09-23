@@ -1,8 +1,34 @@
-use qcg_types::{ResponseVerbosity, StructuredOutputMode, ToolChoice};
+use qcg_types::{ReasoningEffort, ResponseVerbosity, StructuredOutputMode, ToolChoice};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::resources::{default_max_total_steps, default_template_fuel, default_timeout_seconds};
+
+/// A reasoning effort that is either pinned by the contract or rendered from
+/// run variables immediately before the request. Node-level `model.provider`
+/// and `model.model` accept templates too; this is the effort counterpart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum ReasoningEffortSpec {
+    Value(ReasoningEffort),
+    Template(String),
+}
+
+impl ReasoningEffortSpec {
+    pub fn static_value(&self) -> Option<ReasoningEffort> {
+        match self {
+            Self::Value(value) => Some(*value),
+            Self::Template(_) => None,
+        }
+    }
+
+    pub fn template(&self) -> Option<&str> {
+        match self {
+            Self::Value(_) => None,
+            Self::Template(template) => Some(template),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -27,6 +53,10 @@ pub struct LlmConfig {
     pub max_media_bytes: Option<usize>,
     #[serde(default)]
     pub context_overflow: ContextOverflowPolicy,
+    /// Prompt-cache policy. Unset and `off` send no cache instructions;
+    /// `auto` sends the selected provider's cache instructions.
+    #[serde(default)]
+    pub cache: PromptCachePolicy,
     #[serde(default)]
     pub requires: Vec<String>,
     #[serde(default)]
@@ -36,7 +66,7 @@ pub struct LlmConfig {
     #[serde(default)]
     pub seed: Option<u64>,
     #[serde(default)]
-    pub reasoning_effort: Option<qcg_types::ReasoningEffort>,
+    pub reasoning_effort: Option<ReasoningEffortSpec>,
     #[serde(default)]
     pub structured_output: StructuredOutputMode,
     #[serde(default)]
@@ -69,7 +99,7 @@ pub struct LlmRequestPolicy {
     #[serde(default)]
     pub seed: Option<u64>,
     #[serde(default)]
-    pub reasoning_effort: Option<qcg_types::ReasoningEffort>,
+    pub reasoning_effort: Option<ReasoningEffortSpec>,
     #[serde(default)]
     pub structured_output: Option<StructuredOutputMode>,
     #[serde(default)]
@@ -134,6 +164,18 @@ pub enum ContextOverflowPolicy {
     TruncateTail,
 }
 
+/// Declared prompt-cache policy for this contract's LLM requests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCachePolicy {
+    /// Send the provider's cache instructions when the selected provider
+    /// advertises prompt-cache support.
+    Auto,
+    /// Never send cache instructions.
+    #[default]
+    Off,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ModelRef {
@@ -191,6 +233,9 @@ pub struct RuntimeLimits {
     /// Explicit max only. `None` means no mechanistic limit.
     #[serde(default)]
     pub journal_event_limit_bytes: Option<usize>,
+    /// In-memory scan window for journal tail repair and seq recovery.
+    #[serde(default)]
+    pub journal_scan_window_bytes: Option<usize>,
     /// Explicit max only. `None` means no mechanistic limit.
     #[serde(default)]
     pub journal_total_limit_bytes: Option<usize>,
@@ -225,6 +270,7 @@ impl Default for RuntimeLimits {
             template_source_limit_bytes: None,
             template_context_limit_bytes: None,
             journal_event_limit_bytes: None,
+            journal_scan_window_bytes: None,
             journal_total_limit_bytes: None,
             journal_event_count_limit: None,
             state_limit_bytes: None,
@@ -255,5 +301,29 @@ impl Default for RunBudget {
             max_cost_usd: None,
             max_elapsed_seconds: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_cache_policy_requires_an_explicit_value() {
+        let unset: LlmConfig =
+            toml::from_str("max_tokens = 128").expect("unset cache should parse");
+        assert_eq!(unset.cache, PromptCachePolicy::Off);
+
+        let off: LlmConfig =
+            toml::from_str("max_tokens = 128\ncache = \"off\"").expect("off should parse");
+        assert_eq!(off.cache, PromptCachePolicy::Off);
+
+        let auto: LlmConfig =
+            toml::from_str("max_tokens = 128\ncache = \"auto\"").expect("auto should parse");
+        assert_eq!(auto.cache, PromptCachePolicy::Auto);
+
+        let error = toml::from_str::<LlmConfig>("max_tokens = 128\ncache = \"always\"")
+            .expect_err("unknown cache value must fail");
+        assert!(error.to_string().contains("unknown variant"), "{error}");
     }
 }

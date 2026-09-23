@@ -6,6 +6,10 @@ use serde::Serialize;
 #[serde(deny_unknown_fields)]
 pub struct RunErrorEventData {
     pub error: String,
+    /// Structured failure detail carrying the dedicated code (for example
+    /// an elapsed-deadline stop), when the writer attached one.
+    #[serde(default)]
+    pub reason: Option<FailureDetail>,
     /// Accumulated cost metrics, present when the writer attached them.
     #[serde(default)]
     pub metrics: RunMetrics,

@@ -1,8 +1,8 @@
 use qcg_contract::{
     ContextOverflowPolicy, ContextRef, LlmConfig, LlmRequestControl, LlmRequestPolicy, NodeDef,
-    ToolDecl,
+    ReasoningEffortSpec, ToolDecl,
 };
-use qcg_engine::StepError;
+use qcg_engine::{StepContext, StepError};
 use qcg_llm::ImageDetail;
 use qcg_types::{ResponseVerbosity, StructuredOutputMode, ToolChoice};
 use serde::Deserialize;
@@ -72,15 +72,21 @@ pub(crate) struct EffectiveRequestPolicy {
 }
 
 impl EffectiveRequestPolicy {
-    pub(crate) fn from_llm(llm: &LlmConfig) -> Self {
-        Self {
+    pub(crate) fn from_llm(llm: &LlmConfig) -> Result<Self, StepError> {
+        let Some(max_tokens) = llm.max_tokens else {
+            return Err(StepError::failed("llm", "validated max_tokens is missing"));
+        };
+        Ok(Self {
             system: llm.system.clone().into_iter().collect(),
             temperature: llm.temperature,
             top_p: llm.top_p,
-            max_tokens: llm.max_tokens.expect("validated max_tokens"),
+            max_tokens,
             stop_sequences: llm.stop_sequences.clone(),
             seed: llm.seed,
-            reasoning_effort: llm.reasoning_effort,
+            reasoning_effort: llm
+                .reasoning_effort
+                .as_ref()
+                .and_then(ReasoningEffortSpec::static_value),
             structured_output: llm.structured_output,
             tool_choice: llm.tool_choice.clone(),
             parallel_tool_calls: llm.parallel_tool_calls,
@@ -92,7 +98,7 @@ impl EffectiveRequestPolicy {
             max_media_bytes: llm.max_media_bytes,
             context_overflow: llm.context_overflow.clone(),
             retry_prompt: llm.retry_prompt.clone(),
-        }
+        })
     }
 
     fn apply(&mut self, policy: &LlmRequestPolicy) {
@@ -131,7 +137,9 @@ impl EffectiveRequestPolicy {
             self.seed = Some(seed);
             self.reasoning_effort = None;
         }
-        if let Some(reasoning_effort) = policy.reasoning_effort {
+        if let Some(spec) = &policy.reasoning_effort
+            && let Some(reasoning_effort) = spec.static_value()
+        {
             self.reasoning_effort = Some(reasoning_effort);
             self.temperature = None;
             self.top_p = None;
@@ -179,14 +187,78 @@ pub(crate) fn effective_request_policy(
     specialist: Option<&LlmRequestPolicy>,
 ) -> Result<EffectiveRequestPolicy, StepError> {
     let params = llm_params(node)?;
-    let mut effective = EffectiveRequestPolicy::from_llm(llm);
-    validate_request_policy(node, &params.request, llm.max_tokens, &effective)?;
-    effective.apply(&params.request);
+    effective_request_policy_with_request(node, llm, &params.request, specialist)
+}
+
+pub(crate) fn effective_request_policy_with_request(
+    node: &NodeDef,
+    llm: &LlmConfig,
+    request: &LlmRequestPolicy,
+    specialist: Option<&LlmRequestPolicy>,
+) -> Result<EffectiveRequestPolicy, StepError> {
+    let mut effective = EffectiveRequestPolicy::from_llm(llm)?;
+    validate_request_policy(node, request, llm.max_tokens, &effective)?;
+    effective.apply(request);
     if let Some(specialist) = specialist {
         validate_request_policy(node, specialist, llm.max_tokens, &effective)?;
         effective.apply(specialist);
     }
     Ok(effective)
+}
+
+/// Renders effort templates from durable run variables before policy
+/// layering. The resolved value then follows the same documented rules as a
+/// statically declared effort, including incompatibility with sampling
+/// controls and validation against the selected model's advertised list.
+pub(crate) fn resolve_llm_efforts(
+    ctx: &StepContext<'_>,
+    node: &NodeDef,
+    llm: &LlmConfig,
+    request: &LlmRequestPolicy,
+    specialist: Option<&LlmRequestPolicy>,
+) -> Result<(LlmConfig, LlmRequestPolicy, Option<LlmRequestPolicy>), StepError> {
+    let mut render = |template: &str| ctx.render_inline(node, template);
+    let mut llm = llm.clone();
+    llm.reasoning_effort = resolve_effort_spec(node, llm.reasoning_effort.as_ref(), &mut render)?;
+    let mut request = request.clone();
+    request.reasoning_effort =
+        resolve_effort_spec(node, request.reasoning_effort.as_ref(), &mut render)?;
+    let specialist = specialist
+        .map(|specialist| {
+            let mut specialist = specialist.clone();
+            specialist.reasoning_effort =
+                resolve_effort_spec(node, specialist.reasoning_effort.as_ref(), &mut render)?;
+            Ok::<_, StepError>(specialist)
+        })
+        .transpose()?;
+    Ok((llm, request, specialist))
+}
+
+fn resolve_effort_spec(
+    node: &NodeDef,
+    spec: Option<&ReasoningEffortSpec>,
+    render: &mut dyn FnMut(&str) -> Result<String, StepError>,
+) -> Result<Option<ReasoningEffortSpec>, StepError> {
+    let Some(spec) = spec else {
+        return Ok(None);
+    };
+    let Some(template) = spec.template() else {
+        return Ok(Some(spec.clone()));
+    };
+    let rendered = render(template)?;
+    let rendered = rendered.trim();
+    // An empty render explicitly leaves this layer unset so a contract can
+    // ask for an effort only when the selected model offers one.
+    if rendered.is_empty() {
+        return Ok(None);
+    }
+    let value = qcg_types::ReasoningEffort::from_snake_case(rendered).ok_or_else(|| {
+        StepError::failed(
+            &node.id,
+            format!("resolved reasoning_effort `{rendered}` is not a supported effort"),
+        )
+    })?;
+    Ok(Some(ReasoningEffortSpec::Value(value)))
 }
 
 pub(crate) fn validate_request_policy(
@@ -397,4 +469,86 @@ pub(crate) fn llm_params(node: &NodeDef) -> Result<LlmParams, StepError> {
 
 pub(crate) fn require_prompt(node: &NodeDef, params: &LlmParams) -> Result<(), StepError> {
     require(node, params.prompt.as_deref(), "prompt")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qcg_types::ReasoningEffort;
+    use serde_json::json;
+
+    fn node() -> NodeDef {
+        serde_json::from_value(json!({ "id": "n", "type": "llm.generate" }))
+            .expect("minimal node should deserialize")
+    }
+
+    #[test]
+    fn effort_templates_resolve_or_fail_explicitly() {
+        let node = node();
+        let template = ReasoningEffortSpec::Template("{{ inputs.effort }}".into());
+        let resolved = resolve_effort_spec(&node, Some(&template), &mut |_| Ok("high".into()))
+            .expect("valid effort must resolve");
+        assert_eq!(
+            resolved,
+            Some(ReasoningEffortSpec::Value(ReasoningEffort::High))
+        );
+
+        let error = resolve_effort_spec(&node, Some(&template), &mut |_| Ok("hgih".into()))
+            .expect_err("unknown effort must fail");
+        assert!(
+            error.to_string().contains("not a supported effort"),
+            "{error}"
+        );
+
+        let cleared = resolve_effort_spec(&node, Some(&template), &mut |_| Ok("  ".into()))
+            .expect("empty render");
+        assert_eq!(cleared, None, "an empty render leaves the layer unset");
+
+        let pinned = ReasoningEffortSpec::Value(ReasoningEffort::Low);
+        let resolved = resolve_effort_spec(&node, Some(&pinned), &mut |_| {
+            panic!("pinned efforts must not render")
+        })
+        .expect("pinned effort must pass through");
+        assert_eq!(resolved, Some(pinned));
+        assert_eq!(
+            resolve_effort_spec(&node, None, &mut |_| Ok(String::new())).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn resolved_effort_clears_incompatible_sampling_controls() {
+        let node = node();
+        let llm: LlmConfig = serde_json::from_value(json!({
+            "max_tokens": 128,
+            "temperature": 0.5,
+            "seed": 7
+        }))
+        .expect("llm config");
+        let request: LlmRequestPolicy = serde_json::from_value(json!({
+            "reasoning_effort": "high"
+        }))
+        .expect("request policy");
+        let policy =
+            effective_request_policy_with_request(&node, &llm, &request, None).expect("policy");
+        assert_eq!(policy.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(policy.temperature, None);
+        assert_eq!(policy.seed, None);
+    }
+
+    #[test]
+    fn dynamic_effort_conflicts_with_same_layer_sampling_controls() {
+        let node = node();
+        let request: LlmRequestPolicy = serde_json::from_value(json!({
+            "reasoning_effort": "{{ inputs.effort }}",
+            "temperature": 0.5
+        }))
+        .expect("request policy");
+        let llm: LlmConfig =
+            serde_json::from_value(json!({ "max_tokens": 128 })).expect("llm config");
+        let inherited = EffectiveRequestPolicy::from_llm(&llm).expect("inherited policy");
+        let error = validate_request_policy(&node, &request, None, &inherited)
+            .expect_err("dynamic effort with temperature must fail");
+        assert!(error.to_string().contains("cannot be combined"), "{error}");
+    }
 }

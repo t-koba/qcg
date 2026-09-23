@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 camino.workspace = true
+qcg-api = { path = "../../crates/qcg-api" }
 qcg-contract = { path = "../../crates/qcg-contract" }
 qcg-engine = { path = "../../crates/qcg-engine" }
 qcg-fs = { path = "../../crates/qcg-fs" }

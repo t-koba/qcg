@@ -76,7 +76,7 @@
     addProperty: "プロパティを追加",
     removeProperty: "プロパティを削除",
     propertyName: "プロパティ名",
-    propertyNamePlaceholder: "例: options",
+    propertyNamePlaceholder: "例 : options",
     selectOption: "選択してください",
     option: "選択肢",
     preview: "入力値のプレビュー",
@@ -195,11 +195,11 @@
   let valueSizeLimit = $derived(valueLimitReached ?? valueNodeCountExceeded(value));
   let serverPatternNotice = $derived(hasServerPatternConstraint(schema));
   let atLimit = $derived(schemaNodeCount(schema) > MAX_SCHEMA_NODES || nodeCount >= MAX_SCHEMA_NODES || path.length >= MAX_SCHEMA_DEPTH);
-  let usesLegacyList = $derived(canonicalType === "list" && !explicitSchema && ui.widget === undefined);
-  let usesLegacyJson = $derived(canonicalType === "json" && !explicitSchema && ui.widget === undefined);
-  let usesLegacyMultiselect = $derived(canonicalType === "multiselect" && !explicitSchema && ui.widget === undefined);
-  let usesLegacySelect = $derived(canonicalType === "select" && !explicitSchema && ui.widget === undefined);
-  let needsJsonFallback = $derived(atLimit || valueSizeLimit || kind === "json" || usesLegacyJson);
+  let usesImplicitList = $derived(canonicalType === "list" && !explicitSchema && ui.widget === undefined);
+  let usesImplicitJson = $derived(canonicalType === "json" && !explicitSchema && ui.widget === undefined);
+  let usesImplicitMultiselect = $derived(canonicalType === "multiselect" && !explicitSchema && ui.widget === undefined);
+  let usesImplicitSelect = $derived(canonicalType === "select" && !explicitSchema && ui.widget === undefined);
+  let needsJsonFallback = $derived(atLimit || valueSizeLimit || kind === "json" || usesImplicitJson);
 
   function emit(candidate: unknown): void {
     onValue(path, candidate);
@@ -227,7 +227,7 @@
     }
   }
 
-  function updateLegacyList(element: HTMLTextAreaElement): void {
+  function updateImplicitList(element: HTMLTextAreaElement): void {
     emit(element.value.split("\n").map((item) => item.trim()).filter(Boolean));
   }
 
@@ -302,7 +302,7 @@
   }
 
   function currentOptionKey(candidate: unknown): string {
-    return usesLegacySelect || usesLegacyMultiselect ? String(candidate) : optionValueKey(candidate);
+    return usesImplicitSelect || usesImplicitMultiselect ? String(candidate) : optionValueKey(candidate);
   }
 
   function optionForKey(key: string): unknown {
@@ -326,7 +326,7 @@
   }
 
   function canonicalJsonValue(candidate: unknown): string {
-    if (usesLegacyJson || candidate === undefined) return stringifyValue(candidate);
+    if (usesImplicitJson || candidate === undefined) return stringifyValue(candidate);
     try {
       return JSON.stringify(candidate, null, 2) || "";
     } catch {
@@ -525,7 +525,7 @@
     {/if}
     {#if localIssues.length > 0}<SchemaErrorList id={errorId} issues={localIssues} {pathForIssue} />{/if}
   </fieldset>
-{:else if kind === "array" && inputType !== "file" && !usesLegacyList && !usesLegacyMultiselect}
+{:else if kind === "array" && inputType !== "file" && !usesImplicitList && !usesImplicitMultiselect}
   <fieldset class="schema-node schema-array" aria-describedby={describedBy}>
     <legend>{label}{#if required}<span class="schema-required">*</span>{/if}</legend>
     {#if description}<p id={descriptionId} class="schema-description">{description}</p>{/if}
@@ -553,7 +553,7 @@
     {#if constraintHint}<p id={hintId} class="schema-hint">{constraintHint}</p>{/if}
     {#if localIssues.length > 0}<SchemaErrorList id={errorId} issues={localIssues} {pathForIssue} />{/if}
   </fieldset>
-{:else if inputType !== "file" && (kind === "enum" || usesLegacySelect)}
+{:else if inputType !== "file" && (kind === "enum" || usesImplicitSelect)}
   <div class="schema-node schema-scalar">
     <label for={inputId}>{label}{#if required}<span class="schema-required">*</span>{/if}</label>
     {#if description}<p id={descriptionId} class="schema-description">{description}</p>{/if}
@@ -573,7 +573,7 @@
     {#if constraintHint}<p id={hintId} class="schema-hint">{constraintHint}</p>{/if}
     {#if localIssues.length > 0}<SchemaErrorList id={errorId} issues={localIssues} {pathForIssue} />{/if}
   </div>
-{:else if usesLegacyMultiselect}
+{:else if usesImplicitMultiselect}
   <div class="schema-node schema-scalar">
     <label for={inputId}>{label}{#if required}<span class="schema-required">*</span>{/if}</label>
     {#if description}<p id={descriptionId} class="schema-description">{description}</p>{/if}
@@ -613,11 +613,11 @@
     {#if constraintHint}<p id={hintId} class="schema-hint">{constraintHint}</p>{/if}
     {#if localIssues.length > 0}<SchemaErrorList id={errorId} issues={localIssues} {pathForIssue} />{/if}
   </div>
-{:else if usesLegacyList}
+{:else if usesImplicitList}
   <div class="schema-node schema-scalar">
     <label for={inputId}>{label}{#if required}<span class="schema-required">*</span>{/if}</label>
     {#if description}<p id={descriptionId} class="schema-description">{description}</p>{/if}
-    <textarea id={inputId} name={field?.id} required={required} disabled={disabled || readOnly} rows={Math.max(2, Math.min(40, numeric(ui.rows, 4) ?? 4))} placeholder={placeholder || undefined} aria-describedby={describedBy} aria-invalid={localIssues.length > 0} value={Array.isArray(value) ? value.map(String).join("\n") : ""} oninput={(event) => updateLegacyList(event.currentTarget)}></textarea>
+    <textarea id={inputId} name={field?.id} required={required} disabled={disabled || readOnly} rows={Math.max(2, Math.min(40, numeric(ui.rows, 4) ?? 4))} placeholder={placeholder || undefined} aria-describedby={describedBy} aria-invalid={localIssues.length > 0} value={Array.isArray(value) ? value.map(String).join("\n") : ""} oninput={(event) => updateImplicitList(event.currentTarget)}></textarea>
     {#if constraintHint}<p id={hintId} class="schema-hint">{constraintHint}</p>{/if}
     {#if localIssues.length > 0}<SchemaErrorList id={errorId} issues={localIssues} {pathForIssue} />{/if}
   </div>

@@ -25,7 +25,41 @@ fn reservations() -> &'static Mutex<BTreeMap<String, PendingReservation>> {
     RESERVATIONS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+struct DecisionReservationGuard {
+    run_id: String,
+    reservation: PendingReservation,
+}
+
+/// Mutable per-stream accumulators bundled so the event recorder
+/// stays within the argument limit as fields evolve.
+struct StreamAccumulator<'a> {
+    index: &'a mut usize,
+    pending: &'a mut String,
+    published_tail: &'a mut String,
+    response: &'a mut Option<ChatResponse>,
+}
+
+impl Drop for DecisionReservationGuard {
+    fn drop(&mut self) {
+        let mut map = reservations()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = map.get_mut(&self.run_id) {
+            entry.tokens = entry.tokens.saturating_sub(self.reservation.tokens);
+            entry.cost_microusd = entry
+                .cost_microusd
+                .saturating_sub(self.reservation.cost_microusd);
+            if entry.tokens == 0 && entry.cost_microusd == 0 {
+                map.remove(&self.run_id);
+            }
+        }
+    }
+}
+
 fn run_id_of(journal: &JournalWriter) -> String {
+    // Pre-admission journals carry no run id yet; reservations then share
+    // the empty key. That only over-accounts (fail-closed toward earlier
+    // BudgetExceeded), never under-accounts across runs.
     journal.state().run_id.clone().unwrap_or_default()
 }
 
@@ -49,6 +83,108 @@ impl<'a> LlmGateway<'a> {
             budget,
             pricing,
         }
+    }
+
+    pub async fn decide(
+        &self,
+        node: &NodeDef,
+        request: qcg_llm::DecisionRequest,
+        model: &ModelRef,
+        max_tokens: u32,
+    ) -> Result<qcg_llm::DecisionResponse, StepError> {
+        request.validate().step_err(&node.id)?;
+        if request.provider != model.provider
+            || request.model != model.model
+            || max_tokens == 0
+            || model
+                .input_cost_per_million_usd
+                .is_some_and(|price| !price.is_finite() || price < 0.0)
+            || model
+                .output_cost_per_million_usd
+                .is_some_and(|price| !price.is_finite() || price < 0.0)
+        {
+            return Err(StepError::failed(
+                &node.id,
+                "invalid decision model or token budget",
+            ));
+        }
+        self.assert_value_absent(node, &serde_json::to_value(&request)?)?;
+        let routes = std::slice::from_ref(model);
+        let tokens = u64::from(max_tokens);
+        let worst_usage = TokenUsage {
+            input: tokens,
+            output: tokens,
+            ..TokenUsage::default()
+        };
+        let cost_microusd =
+            self.cost_microusd(node, routes, &model.provider, &model.model, &worst_usage)?;
+        let reservation = PendingReservation {
+            tokens,
+            cost_microusd,
+        };
+        self.try_reserve(Some(reservation.clone()))?;
+        let _guard = DecisionReservationGuard {
+            run_id: run_id_of(self.journal),
+            reservation,
+        };
+        let response = tokio::select! {
+            biased;
+            _ = self.cancellation.cancelled() => return Err(StepError::Cancelled),
+            result = self.provider.decide(request.clone()) => result,
+        };
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                self.record_route_failure(node, &model.provider, &model.model, 1, 1, &error)?;
+                return Err(error).step_err(&node.id);
+            }
+        };
+        let usage = response.token_usage();
+        let cost_microusd =
+            self.cost_microusd(node, routes, &model.provider, &model.model, &usage)?;
+        self.journal
+            .event(
+                "llm_call",
+                json!({
+                    "node": node.id, "provider": model.provider, "model": model.model,
+                    "max_tokens": max_tokens, "tokens": usage, "cost_microusd": cost_microusd
+                }),
+            )
+            .step_err(&node.id)?;
+        let used = usage.input.saturating_add(usage.output);
+        if used > tokens {
+            return Err(StepError::BudgetExceeded {
+                resource: "tokens",
+                used,
+                limit: tokens,
+            });
+        }
+        let state = self.journal.state();
+        let used = state
+            .budget
+            .tokens_input
+            .saturating_add(state.budget.tokens_output);
+        if let Some(limit) = self.budget.max_tokens
+            && used > limit
+        {
+            return Err(StepError::BudgetExceeded {
+                resource: "tokens",
+                used,
+                limit,
+            });
+        }
+        if let Some(limit) = self.budget.max_cost_microusd
+            && state.budget.cost_microusd > limit
+        {
+            return Err(StepError::BudgetExceeded {
+                resource: "cost_microusd",
+                used: state.budget.cost_microusd,
+                limit,
+            });
+        }
+        response.validate(&request).step_err(&node.id)?;
+        self.assert_value_absent(node, &serde_json::to_value(&response)?)?;
+        Ok(response)
     }
 
     pub async fn complete<F>(
@@ -400,10 +536,12 @@ impl<'a> LlmGateway<'a> {
                             &provider_id,
                             &model_id,
                             event,
-                            &mut index,
-                            &mut pending,
-                            &mut published_tail,
-                            &mut response,
+                            &mut StreamAccumulator {
+                                index: &mut index,
+                                pending: &mut pending,
+                                published_tail: &mut published_tail,
+                                response: &mut response,
+                            },
                         )?;
                     }
                     if let Err(error) = result {
@@ -426,10 +564,12 @@ impl<'a> LlmGateway<'a> {
                             &provider_id,
                             &model_id,
                             event,
-                            &mut index,
-                            &mut pending,
-                            &mut published_tail,
-                            &mut response,
+                            &mut StreamAccumulator {
+                                index: &mut index,
+                                pending: &mut pending,
+                                published_tail: &mut published_tail,
+                                response: &mut response,
+                            },
                         )?,
                         None => {
                             return response.ok_or_else(|| LlmError::new("LLM stream channel closed before completion"));
@@ -440,24 +580,22 @@ impl<'a> LlmGateway<'a> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Mutable per-stream accumulators bundled so the event recorder
+    /// stays within the argument limit as fields evolve.
     fn record_stream_event(
         &self,
         node: &NodeDef,
         provider: &str,
         model: &str,
         event: ChatStreamEvent,
-        index: &mut usize,
-        pending: &mut String,
-        published_tail: &mut String,
-        response: &mut Option<ChatResponse>,
+        acc: &mut StreamAccumulator<'_>,
     ) -> Result<(), LlmError> {
         match event {
             ChatStreamEvent::TextDelta { text } => {
                 if self.secrets.is_empty() {
                     self.scan_text(node, &text)
                         .map_err(|error| LlmError::new(error.to_string()))?;
-                    self.publish_delta(node, provider, model, &text, index)?;
+                    self.publish_delta(node, provider, model, &text, acc.index)?;
                     return Ok(());
                 }
                 // Buffered publication: only a prefix that no future text
@@ -469,27 +607,27 @@ impl<'a> LlmGateway<'a> {
                 // jointly with the published tail so secrets spanning a
                 // publish boundary are still detected before the bytes that
                 // complete them become visible.
-                pending.push_str(&text);
+                acc.pending.push_str(&text);
                 let holdback = self.secrets.max_value_len().saturating_sub(1);
-                let mut window = published_tail.clone();
-                window.push_str(pending);
+                let mut window = acc.published_tail.clone();
+                window.push_str(acc.pending);
                 self.scan_text(node, &window)
                     .map_err(|error| LlmError::new(error.to_string()))?;
-                let mut publish_len = pending.len().saturating_sub(holdback);
-                while publish_len > 0 && !pending.is_char_boundary(publish_len) {
+                let mut publish_len = acc.pending.len().saturating_sub(holdback);
+                while publish_len > 0 && !acc.pending.is_char_boundary(publish_len) {
                     publish_len = publish_len.saturating_sub(1);
                 }
                 if publish_len == 0 {
                     return Ok(());
                 }
-                let publish = pending[..publish_len].to_string();
+                let publish = acc.pending[..publish_len].to_string();
                 // Drain before I/O so a journal failure cannot double
                 // publish the same bytes on retry.
-                pending.drain(..publish_len);
-                self.publish_delta(node, provider, model, &publish, index)?;
-                published_tail.push_str(&publish);
-                let trimmed = holdback_tail(published_tail.as_str(), holdback);
-                *published_tail = trimmed;
+                acc.pending.drain(..publish_len);
+                self.publish_delta(node, provider, model, &publish, acc.index)?;
+                acc.published_tail.push_str(&publish);
+                let trimmed = holdback_tail(acc.published_tail.as_str(), holdback);
+                *acc.published_tail = trimmed;
             }
             ChatStreamEvent::Completed {
                 response: completed,
@@ -502,17 +640,17 @@ impl<'a> LlmGateway<'a> {
                     // left behind.
                     self.scan_response(node, &completed)
                         .map_err(|error| LlmError::new(error.to_string()))?;
-                    if !pending.is_empty() {
-                        let mut window = published_tail.clone();
-                        window.push_str(pending);
+                    if !acc.pending.is_empty() {
+                        let mut window = acc.published_tail.clone();
+                        window.push_str(acc.pending);
                         self.scan_text(node, &window)
                             .map_err(|error| LlmError::new(error.to_string()))?;
-                        let flush = std::mem::take(pending);
-                        self.publish_delta(node, provider, model, &flush, index)?;
-                        published_tail.clear();
+                        let flush = std::mem::take(acc.pending);
+                        self.publish_delta(node, provider, model, &flush, acc.index)?;
+                        acc.published_tail.clear();
                     }
                 }
-                *response = Some(completed);
+                *acc.response = Some(completed);
             }
         }
         Ok(())
@@ -554,4 +692,252 @@ fn holdback_tail(published: &str, holdback: usize) -> String {
         start = start.saturating_add(1);
     }
     published[start..].to_string()
+}
+
+#[cfg(test)]
+mod decision_tests {
+    use super::*;
+    use camino::Utf8PathBuf;
+    use qcg_llm::{DecisionRequest, LlmRouter};
+
+    struct Fixture {
+        journal: JournalWriter,
+        root: Utf8PathBuf,
+        provider: Arc<dyn LlmProvider>,
+        credential_env: String,
+        secrets: SecretStore,
+        node: NodeDef,
+        model: ModelRef,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let id = uuid::Uuid::now_v7().simple().to_string().to_uppercase();
+            let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+                .unwrap()
+                .join(format!("qcg-decision-gateway-{id}"));
+            let credential_env = format!("QCG_DECISION_MISSING_{id}");
+            assert!(std::env::var_os(&credential_env).is_none());
+            let provider = Arc::new(
+                LlmRouter::parse_text(&format!(
+                    r#"
+[[provider]]
+id = "decisions"
+api = "system_one"
+base_url = "https://example.invalid/v1"
+api_key_env = "{credential_env}"
+"#
+                ))
+                .unwrap(),
+            );
+            Self {
+                journal: JournalWriter::create(&root.join("journal.jsonl"), id, false, None)
+                    .unwrap(),
+                root,
+                provider,
+                credential_env,
+                secrets: SecretStore::from_values(BTreeMap::from([(
+                    "generator".into(),
+                    "generator-secret-value".into(),
+                )])),
+                node: serde_json::from_value(json!({"id": "decide", "type": "llm.decide"}))
+                    .unwrap(),
+                model: ModelRef {
+                    provider: "decisions".into(),
+                    model: "decision-model".into(),
+                    input_cost_per_million_usd: Some(1.0),
+                    output_cost_per_million_usd: Some(1.0),
+                },
+            }
+        }
+
+        fn gateway(&self) -> LlmGateway<'_> {
+            LlmGateway::new(
+                self.provider.clone(),
+                &self.secrets,
+                &self.journal,
+                CancellationToken::new(),
+                LlmCostBudget {
+                    max_tokens: Some(16),
+                    max_cost_microusd: Some(32),
+                    require_pricing: true,
+                },
+                vec![],
+            )
+        }
+
+        fn request(&self) -> DecisionRequest {
+            serde_json::from_value(json!({
+                "provider": self.model.provider, "model": self.model.model,
+                "state": {"ready": true},
+                "questions": {"accept": {"type": "noul", "instructions": "Accept?"}}
+            }))
+            .unwrap()
+        }
+
+        fn assert_released(&self) {
+            assert!(
+                !reservations()
+                    .lock()
+                    .unwrap()
+                    .contains_key(&run_id_of(&self.journal))
+            );
+        }
+
+        fn assert_no_events(&self) {
+            assert_eq!(
+                std::fs::metadata(self.root.join("journal.jsonl"))
+                    .unwrap()
+                    .len(),
+                0
+            );
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn precancelled_decision_releases_reservation() {
+        let fixture = Fixture::new();
+        let gateway = fixture.gateway();
+        gateway.cancellation.cancel();
+        for _ in 0..2 {
+            assert!(matches!(
+                gateway
+                    .decide(&fixture.node, fixture.request(), &fixture.model, 16)
+                    .await,
+                Err(StepError::Cancelled)
+            ));
+            fixture.assert_released();
+        }
+        fixture.assert_no_events();
+    }
+
+    #[tokio::test]
+    async fn insufficient_run_tokens_reject_before_transport() {
+        let fixture = Fixture::new();
+        let mut gateway = fixture.gateway();
+        gateway.budget.max_tokens = Some(15);
+        assert!(matches!(
+            gateway
+                .decide(&fixture.node, fixture.request(), &fixture.model, 16)
+                .await,
+            Err(StepError::BudgetExceeded {
+                resource: "tokens",
+                used: 16,
+                limit: 15
+            })
+        ));
+        fixture.assert_no_events();
+    }
+
+    #[tokio::test]
+    async fn unpriced_decision_refuses_cost_cap() {
+        let fixture = Fixture::new();
+        for (input, output) in [(None, None), (Some(1.0), None), (None, Some(1.0))] {
+            let mut model = fixture.model.clone();
+            model.input_cost_per_million_usd = input;
+            model.output_cost_per_million_usd = output;
+            let error = fixture
+                .gateway()
+                .decide(&fixture.node, fixture.request(), &model, 16)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, StepError::Failed { message, .. } if message.contains("pricing"))
+            );
+            fixture.assert_released();
+        }
+        fixture.assert_no_events();
+    }
+
+    #[tokio::test]
+    async fn nonfinite_decision_prices_reject_before_transport() {
+        let fixture = Fixture::new();
+        for price in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for input in [true, false] {
+                let mut model = fixture.model.clone();
+                if input {
+                    model.input_cost_per_million_usd = Some(price);
+                } else {
+                    model.output_cost_per_million_usd = Some(price);
+                }
+                let error = fixture
+                    .gateway()
+                    .decide(&fixture.node, fixture.request(), &model, 16)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(error, StepError::Failed { message, .. } if !message.contains(&fixture.credential_env))
+                );
+                fixture.assert_released();
+                fixture.assert_no_events();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn generator_secrets_reject_nested_state_keys_and_questions() {
+        let fixture = Fixture::new();
+        let secret = "generator-secret-value";
+        for (pointer, value) in [
+            ("/state", json!({"nested": [{"value": secret}]})),
+            ("/state", json!({"nested": [{(secret): "safe"}]})),
+            (
+                "/questions/accept/instructions",
+                json!({"nested": [secret]}),
+            ),
+            ("/questions/accept/instructions", json!({(secret): "safe"})),
+            (
+                "/questions",
+                json!({(secret): {"type": "noul", "instructions": "Accept?"}}),
+            ),
+            (
+                "/questions/accept",
+                json!({"type": "noul", "instructions": "Accept?", "criteria": {"true": secret}}),
+            ),
+        ] {
+            let mut value_request = serde_json::to_value(fixture.request()).unwrap();
+            *value_request.pointer_mut(pointer).unwrap() = value;
+            let request: DecisionRequest = serde_json::from_value(value_request).unwrap();
+            request.validate().unwrap();
+            let error = fixture
+                .gateway()
+                .decide(&fixture.node, request, &fixture.model, 16)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, StepError::Failed { message, .. }
+                if message == "secret `generator` value was found in LLM context"));
+            fixture.assert_released();
+        }
+        fixture.assert_no_events();
+    }
+
+    #[tokio::test]
+    async fn provider_configuration_failures_release_shared_reservations() {
+        let fixture = Fixture::new();
+        let gateways = [fixture.gateway(), fixture.gateway()];
+        for gateway in gateways.iter().cycle().take(4) {
+            let error = gateway
+                .decide(&fixture.node, fixture.request(), &fixture.model, 16)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, StepError::Failed { message, .. }
+                if message.contains(&format!("set `{}` before running the generator", fixture.credential_env))));
+            fixture.assert_released();
+        }
+        let budget = fixture.journal.state().budget;
+        assert_eq!(
+            (
+                budget.tokens_input,
+                budget.tokens_output,
+                budget.cost_microusd
+            ),
+            (0, 0, 0)
+        );
+    }
 }

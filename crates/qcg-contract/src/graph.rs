@@ -66,7 +66,9 @@ mod tests {
             blocks: Default::default(),
             outputs: OutputSpec::default(),
             failure: Default::default(),
-            journal: Default::default(),
+            retention: Default::default(),
+            audit: Default::default(),
+            hooks: Default::default(),
             assets: Default::default(),
             dependencies: Default::default(),
         };
@@ -657,5 +659,51 @@ type = "check.format"
             retry: None,
             params: Default::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod block_needs_tests {
+    use super::*;
+    use crate::manifest::Manifest;
+
+    #[test]
+    fn foreach_block_children_must_not_declare_needs() {
+        // E10: block children run in declared order gated only by `when`;
+        // a `needs` edge would be silently ignored, so refuse it
+        // fail-closed instead of running a different order than stated.
+        let manifest = toml::from_str::<Manifest>(
+            r#"
+[generator]
+id = "x"
+name = "X"
+version = "0.1.0"
+qcg_version = "^0.1"
+description = "test"
+
+[[flow]]
+id = "loop"
+type = "foreach"
+[flow.params]
+items = "inputs.items"
+subflow = "item"
+max_iterations = 4
+
+[[blocks.item]]
+id = "first"
+type = "write"
+
+[[blocks.item]]
+id = "second"
+needs = ["first"]
+type = "write"
+"#,
+        )
+        .expect("manifest should parse");
+        let error = Graph::build(&manifest).expect_err("block needs must be refused");
+        assert!(
+            error.contains("must not declare `needs`"),
+            "refusal must name the cause: {error}"
+        );
     }
 }

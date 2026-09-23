@@ -12,10 +12,19 @@ pub enum FailureCode {
     NoDependencySucceeded,
     CheckFailed,
     ExecutionFailed,
+    ElapsedExceeded,
+    /// A per-attempt node timeout fired. Distinct from execution failure
+    /// and elapsed exceedance so run cancel, node timeout, and elapsed
+    /// limit stay distinguishable (E11).
+    TimedOut,
     RepairExhausted,
     SchedulerFailed,
     Canceled,
+    Interrupted,
     BudgetExceeded,
+    /// A guard or admission refused the attempt. Distinct from execution
+    /// failure so a refusal never reads as a failed execution (E11).
+    Refused,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

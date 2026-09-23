@@ -56,10 +56,7 @@ pub(crate) fn truncate_trailing_canceled_events(run_dir: &Utf8Path) -> Result<bo
         .read(true)
         .write(true)
         .open(&lock_path)?;
-    {
-        use fs2::FileExt as _;
-        lock_file.lock_exclusive().map_err(ServiceError::Io)?;
-    }
+    lock_file.lock().map_err(ServiceError::Io)?;
     // The open handle itself holds the lock; dropping it at function end
     // releases, so no explicit unlock dance is needed.
     let _lock_held = lock_file;
@@ -137,7 +134,7 @@ pub(crate) fn truncate_trailing_canceled_events(run_dir: &Utf8Path) -> Result<bo
 /// caller must hold the journal lock with no live writer; a torn tail
 /// fragment is repaired first so every scanned line is complete.
 fn truncate_to_last_non_canceled(path: &Utf8Path) -> Result<bool, ServiceError> {
-    qcg_engine::repair_truncated_tail_locked(path)
+    qcg_engine::repair_truncated_tail_locked(path, JournalLimits::default())
         .map_err(|error| ServiceError::Invalid(error.to_string()))?;
     let len = std::fs::metadata(path)?.len();
     if len == 0 {
@@ -246,6 +243,9 @@ pub(crate) fn read_queued_identity_from_values(events: &[Value]) -> (i32, Option
 /// unattended runs, while later `user_answered` / `user_confirmed` events
 /// record interactive acceptance. Later events win on the same key so a
 /// restart resumes with the same values the API already acknowledged.
+/// This wrapper is I/O plus the pure fold below: callers with an
+/// already-read snapshot use `_from_values` directly to avoid a second
+/// journal read (E03).
 pub(crate) fn read_persisted_hitl(run_dir: &Utf8Path) -> Result<PersistedHitlMaps, ServiceError> {
     read_persisted_hitl_from_values(&read_journal_events(run_dir)?)
 }
@@ -310,14 +310,50 @@ pub(crate) fn has_remote_cancel_request(run_dir: &Utf8Path) -> Result<bool, Serv
     Ok(false)
 }
 
+/// Durable records only. Status, HITL, queue order, and folding never need
+/// observation records, so they read one stream (ADR 0001).
 pub(crate) fn read_events_from_meta(meta_dir: &Utf8Path) -> Result<Vec<Value>, ServiceError> {
     read_journal_values(&meta_dir.join("journal.jsonl"), JournalLimits::default())
         .map(|scan| scan.events)
         .map_err(|error| ServiceError::Invalid(error.to_string()))
 }
 
-pub fn read_run_events(run_dir: &Utf8Path) -> Result<Vec<RunEvent>, ServiceError> {
+/// Merged public record view: durable and observation records share one seq
+/// space but live in sibling files. Used by the event stream and history.
+pub(crate) fn read_merged_events_from_meta(
+    meta_dir: &Utf8Path,
+) -> Result<Vec<Value>, ServiceError> {
+    let mut events = read_events_from_meta(meta_dir)?;
+    let audit_path = meta_dir.join("audit.jsonl");
+    if audit_path.exists() {
+        let mut observed = read_journal_values(&audit_path, JournalLimits::default())
+            .map(|scan| scan.events)
+            .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+        if !observed.is_empty() {
+            events.append(&mut observed);
+            // Both streams are append-only and share one seq space, so a
+            // stable sort by seq reproduces the single write order.
+            events.sort_by_key(|event| event.get("seq").and_then(Value::as_u64));
+        }
+    }
+    Ok(events)
+}
+
+/// Merged public record values for one run: durable plus observation.
+pub fn read_events_with_audit(run_dir: &Utf8Path) -> Result<Vec<Value>, ServiceError> {
+    read_merged_events_from_meta(&run_meta_dir(run_dir))
+}
+
+/// Durable records as typed events for summary and metric reads.
+pub(crate) fn read_durable_run_events(run_dir: &Utf8Path) -> Result<Vec<RunEvent>, ServiceError> {
     read_journal_events(run_dir)?
+        .into_iter()
+        .map(|event| RunEvent::from_flat(&event).map_err(ServiceError::Invalid))
+        .collect()
+}
+
+pub fn read_run_events(run_dir: &Utf8Path) -> Result<Vec<RunEvent>, ServiceError> {
+    read_merged_events_from_meta(&run_meta_dir(run_dir))?
         .into_iter()
         .map(|event| RunEvent::from_flat(&event).map_err(ServiceError::Invalid))
         .collect()

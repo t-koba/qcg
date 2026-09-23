@@ -33,4 +33,12 @@ glob = "drafts/result.txt"
 required = true
 
 [permissions]
+fs_read = []
+network = []
+commands = []
+side_effects = "none"
+side_effects_scope = "invocation"
 fs_write = ["workspace"]
+
+[permissions.containers]
+enabled = false

@@ -1,13 +1,15 @@
 use qcg_types::{StructuredOutputMode, ToolChoice, ToolChoiceMode};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
-use crate::provider::ChatTokenLimitField;
-use crate::types::{ChatContentPart, ChatMessage, ChatRequest, ImageDetail, ToolSpec};
+use crate::provider::{ChatTokenLimitField, PromptCacheField};
+use crate::types::{ChatContentPart, ChatMessage, ChatRequest, ImageDetail, PromptCache, ToolSpec};
 
 pub(crate) fn chat_completions_payload(
     req: &ChatRequest,
     send_seed: bool,
     token_limit_field: ChatTokenLimitField,
+    prompt_cache: Option<PromptCacheField>,
 ) -> Value {
     let mut payload = json!({
         "model": req.model,
@@ -50,10 +52,16 @@ pub(crate) fn chat_completions_payload(
             payload["parallel_tool_calls"] = json!(parallel);
         }
     }
+    if wants_prompt_cache(req, prompt_cache, PromptCacheField::PromptCacheKey) {
+        payload["prompt_cache_key"] = json!(prompt_cache_key(req));
+    }
     payload
 }
 
-pub(crate) fn responses_payload(req: &ChatRequest) -> Value {
+pub(crate) fn responses_payload(
+    req: &ChatRequest,
+    prompt_cache: Option<PromptCacheField>,
+) -> Value {
     let mut payload = json!({
         "model": req.model,
         "input": responses_input(req),
@@ -92,10 +100,16 @@ pub(crate) fn responses_payload(req: &ChatRequest) -> Value {
             payload["parallel_tool_calls"] = json!(parallel);
         }
     }
+    if wants_prompt_cache(req, prompt_cache, PromptCacheField::PromptCacheKey) {
+        payload["prompt_cache_key"] = json!(prompt_cache_key(req));
+    }
     payload
 }
 
-pub(crate) fn anthropic_payload(req: &ChatRequest) -> Value {
+pub(crate) fn anthropic_payload(
+    req: &ChatRequest,
+    prompt_cache: Option<PromptCacheField>,
+) -> Value {
     let mut tools: Vec<Value> = req.tools.iter().map(anthropic_tool).collect();
     if let Some((schema, _)) = native_response_schema(req) {
         tools.push(json!({
@@ -110,7 +124,17 @@ pub(crate) fn anthropic_payload(req: &ChatRequest) -> Value {
         "messages": anthropic_messages(req),
     });
     if let Some(system) = &req.system {
-        payload["system"] = Value::String(system.clone());
+        if wants_prompt_cache(req, prompt_cache, PromptCacheField::CacheControl) {
+            // Anthropic caches explicit content blocks; the system block is
+            // the stable prefix, so the marker goes on its text block.
+            payload["system"] = json!([{
+                "type": "text",
+                "text": system,
+                "cache_control": { "type": "ephemeral" },
+            }]);
+        } else {
+            payload["system"] = Value::String(system.clone());
+        }
     }
     if let Some(temperature) = req.temperature {
         payload["temperature"] = json!(temperature);
@@ -157,6 +181,24 @@ fn responses_tool_choice(choice: Option<&ToolChoice>) -> Value {
         ToolChoice::Mode(mode) => json!(mode),
         ToolChoice::Tool { tool } => json!({ "type": "function", "name": tool }),
     }
+}
+
+/// A builder only emits cache instructions when the request asks for them
+/// and the provider row declared the matching mechanism.
+fn wants_prompt_cache(
+    req: &ChatRequest,
+    prompt_cache: Option<PromptCacheField>,
+    expected: PromptCacheField,
+) -> bool {
+    req.prompt_cache == PromptCache::Auto && prompt_cache == Some(expected)
+}
+
+/// Stable routing key for OpenAI-compatible prompt caches. Digesting the
+/// stable system prefix keeps all requests of one contract on one cache
+/// shard without depending on volatile message history.
+fn prompt_cache_key(req: &ChatRequest) -> String {
+    let digest = Sha256::digest(req.system.as_deref().unwrap_or_default().as_bytes());
+    format!("qcg-{}", hex::encode(&digest[..16]))
 }
 
 pub(crate) fn native_response_schema(req: &ChatRequest) -> Option<(&Value, bool)> {
@@ -422,9 +464,11 @@ pub(crate) fn strict_schema_syntax_compatible(schema: &Value) -> bool {
 }
 
 fn strict_schema_node_compatible(schema: &Value) -> bool {
-    let object = schema
-        .as_object()
-        .expect("native-compatible schema is an object");
+    // Callers gate on `native_schema_syntax_compatible` (objects only),
+    // but a non-object here refuses fail-closed instead of panicking.
+    let Some(object) = schema.as_object() else {
+        return false;
+    };
     let object_is_closed = !schema_allows_object(object)
         || (object.get("additionalProperties").and_then(Value::as_bool) == Some(false)
             && object
@@ -733,4 +777,94 @@ fn anthropic_tool(tool: &ToolSpec) -> Value {
         "description": tool.description,
         "input_schema": tool.input_schema,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ChatMessage, PromptCache};
+
+    fn request(system: Option<&str>, prompt_cache: PromptCache) -> ChatRequest {
+        ChatRequest {
+            provider: "test".into(),
+            model: "test-model".into(),
+            system: system.map(str::to_string),
+            messages: vec![ChatMessage::text("user", "hello")],
+            tools: vec![],
+            response_schema: None,
+            structured_output: StructuredOutputMode::Auto,
+            temperature: None,
+            top_p: None,
+            max_tokens: 64,
+            stop_sequences: vec![],
+            seed: None,
+            reasoning_effort: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            verbosity: None,
+            stream: false,
+            prompt_cache,
+        }
+    }
+
+    #[test]
+    fn off_cache_sends_no_cache_instructions() {
+        let req = request(Some("stable system"), PromptCache::Off);
+        let anthropic = anthropic_payload(&req, Some(PromptCacheField::CacheControl));
+        assert_eq!(anthropic["system"], json!("stable system"));
+
+        let chat = chat_completions_payload(
+            &req,
+            true,
+            ChatTokenLimitField::MaxTokens,
+            Some(PromptCacheField::PromptCacheKey),
+        );
+        assert!(chat.get("prompt_cache_key").is_none());
+
+        let responses = responses_payload(&req, Some(PromptCacheField::PromptCacheKey));
+        assert!(responses.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn auto_cache_marks_the_anthropic_system_block() {
+        let req = request(Some("stable system"), PromptCache::Auto);
+        let payload = anthropic_payload(&req, Some(PromptCacheField::CacheControl));
+        let blocks = payload["system"]
+            .as_array()
+            .expect("cached system should be a text block array");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "stable system");
+        assert_eq!(blocks[0]["cache_control"], json!({"type": "ephemeral"}));
+
+        // Without a declared mechanism the builder must not guess.
+        let payload = anthropic_payload(&req, None);
+        assert_eq!(payload["system"], json!("stable system"));
+    }
+
+    #[test]
+    fn auto_cache_adds_a_stable_openai_prompt_cache_key() {
+        let req = request(Some("stable system"), PromptCache::Auto);
+        let chat = chat_completions_payload(
+            &req,
+            true,
+            ChatTokenLimitField::MaxTokens,
+            Some(PromptCacheField::PromptCacheKey),
+        );
+        let key = chat["prompt_cache_key"]
+            .as_str()
+            .expect("auto cache should add prompt_cache_key");
+        assert!(key.starts_with("qcg-"), "{key}");
+        let responses = responses_payload(&req, Some(PromptCacheField::PromptCacheKey));
+        assert_eq!(responses["prompt_cache_key"], key);
+
+        // A cache-control row must not leak the OpenAI routing key.
+        let chat = chat_completions_payload(
+            &req,
+            true,
+            ChatTokenLimitField::MaxTokens,
+            Some(PromptCacheField::CacheControl),
+        );
+        assert!(chat.get("prompt_cache_key").is_none());
+    }
 }

@@ -40,7 +40,6 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 dunce = "1"
 futures-util = "0.3"
-fs2 = "0.4"
 hex = "0.4"
 http = "1"
 jsonschema = { version = "0.55", default-features = false }

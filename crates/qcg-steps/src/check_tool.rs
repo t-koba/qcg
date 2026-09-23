@@ -77,7 +77,13 @@ impl StepExecutor for CheckToolStep {
                     StepError::failed(&node.id, format!("tool `{tool_name}` declares no input"))
                 })?,
         )?;
-        if !matches!(tool.workspace, ToolWorkspace::None) {
+        // Snapshot the input tree to private run metadata before any
+        // external tool process reads it: the validator validated the live
+        // tree handle-relative, but the child process can only open by
+        // pathname, so it must read the immutable snapshot instead of the
+        // swappable workspace (E13).
+        let (effective_input, _snapshot_cleanup) = if !matches!(tool.workspace, ToolWorkspace::None)
+        {
             let input_path = ctx.run.fs.resolve_read(&input).map_err(|error| {
                 StepError::failed(
                     &node.id,
@@ -85,13 +91,35 @@ impl StepExecutor for CheckToolStep {
                 )
             })?;
             ensure_bounded_file_tree(
+                &ctx.run.fs,
                 &input_path,
                 ctx.run.contract.manifest.runtime.file_input_limit_bytes,
                 ctx.run.contract.manifest.runtime.file_count_limit,
             )
-            .await
             .map_err(|error| StepError::failed(&node.id, error))?;
-        }
+            let snapshot_root = ctx
+                .run
+                .metadata
+                .join(format!("check-tool-{}", uuid::Uuid::now_v7()));
+            let snapshot_dest = snapshot_root.join(&input);
+            ctx.run
+                .fs
+                .snapshot_tree_to(
+                    &input_path,
+                    &snapshot_dest,
+                    ctx.run.contract.manifest.runtime.file_input_limit_bytes,
+                    ctx.run.contract.manifest.runtime.file_count_limit,
+                )
+                .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
+            (
+                snapshot_dest.as_str().to_string(),
+                SnapshotCleanup {
+                    path: Some(snapshot_root.clone()),
+                },
+            )
+        } else {
+            (input.clone(), SnapshotCleanup { path: None })
+        };
         if !matches!(tool.network, ToolNetwork::None) {
             return Err(StepError::failed(
                 &node.id,
@@ -101,16 +129,28 @@ impl StepExecutor for CheckToolStep {
         let order = tool_backend_order(tool);
         let mut unavailable = Vec::new();
         for (index, backend) in order.iter().enumerate() {
-            let candidate = match build_tool_backend_candidate(ctx, node, tool, backend, &input) {
-                Ok(candidate) => candidate,
-                Err(reason) => {
-                    unavailable.push(json!({ "backend": backend.to_string(), "reason": reason }));
-                    if matches!(tool.resolution.fallback, ToolFallback::None) {
-                        break;
-                    }
-                    continue;
-                }
+            // Host and bundled processes open host paths directly, so they
+            // receive the snapshot absolute path. Container guests see the
+            // snapshot through their mount, so they keep the workspace-
+            // relative input string and the mount source is swapped to the
+            // snapshot root at execution (E13).
+            let candidate_input = if matches!(backend, ToolBackendKind::Container) {
+                &input
+            } else {
+                &effective_input
             };
+            let candidate =
+                match build_tool_backend_candidate(ctx, node, tool, backend, candidate_input) {
+                    Ok(candidate) => candidate,
+                    Err(reason) => {
+                        unavailable
+                            .push(json!({ "backend": backend.to_string(), "reason": reason }));
+                        if matches!(tool.resolution.fallback, ToolFallback::None) {
+                            break;
+                        }
+                        continue;
+                    }
+                };
             if requires_tool_backend_confirmation(&tool.resolution.fallback, index) {
                 let target = format!("{tool_name}:{}", candidate.kind);
                 let details = Some(json!({
@@ -119,12 +159,7 @@ impl StepExecutor for CheckToolStep {
                     "unavailable": unavailable,
                 }));
                 let digest = qcg_engine::RunContext::operation_digest(&target, &details)?;
-                let confirm_id = format!(
-                    "{}:tool_backend:{}:{}",
-                    node.id,
-                    candidate.kind,
-                    &digest[..16]
-                );
+                let confirm_id = format!("{}:tool_backend:{}:{}", node.id, candidate.kind, digest);
                 if !ctx
                     .run
                     .confirmations
@@ -144,6 +179,7 @@ impl StepExecutor for CheckToolStep {
                             dry_run: false,
                             details: details.clone(),
                             operation_digest: digest,
+                            scope: ctx.run.contract.manifest.permissions.side_effects_scope,
                         },
                     });
                 }
@@ -159,7 +195,10 @@ impl StepExecutor for CheckToolStep {
                     }),
                 )
                 .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
-            return execute_tool_candidate(ctx, node, tool, candidate).await;
+            // Snapshot root for container mount swapping; `None` when the
+            // tool takes no workspace input.
+            let snapshot_source = _snapshot_cleanup.path.clone();
+            return execute_tool_candidate(ctx, node, tool, candidate, snapshot_source).await;
         }
         Ok(StepOutcome::CheckFailed {
             findings: vec![Finding {
@@ -216,11 +255,30 @@ fn requires_tool_backend_confirmation(fallback: &ToolFallback, candidate_index: 
     candidate_index > 0 && matches!(fallback, ToolFallback::Explicit)
 }
 
+/// Removes a check.tool snapshot directory or file. Best effort: snapshot
+/// cleanup must never mask the tool result.
+struct SnapshotCleanup {
+    path: Option<camino::Utf8PathBuf>,
+}
+
+impl Drop for SnapshotCleanup {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
+                let _ = std::fs::remove_dir_all(&path);
+            } else {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+}
+
 async fn execute_tool_candidate(
     ctx: &mut StepContext<'_>,
     node: &NodeDef,
     tool: &ToolDef,
     candidate: ToolBackendCandidate,
+    snapshot_source: Option<camino::Utf8PathBuf>,
 ) -> Result<StepOutcome, StepError> {
     match candidate.kind {
         ToolBackendKind::Host => {
@@ -261,8 +319,48 @@ async fn execute_tool_candidate(
         }
         ToolBackendKind::Container => {
             let kind = candidate.kind.clone();
-            let output = execute_container_backend_candidate(ctx, node, tool, candidate).await?;
-            check_tool_output(node, &kind, output.status, output.stdout, output.stderr)
+            // When the input was snapshotted, mount the snapshot root at
+            // the declared guest mount instead of the live workspace, so a
+            // parent swapped after validation cannot redirect the guest read
+            // (E13). The guest input path (`mount/input`) then resolves to
+            // the immutable copy.
+            if let Some(snapshot_root) = snapshot_source {
+                let image = candidate.container_image.clone().ok_or_else(|| {
+                    StepError::failed(&node.id, "container image was not resolved")
+                })?;
+                let mounts = candidate
+                    .container_mounts
+                    .iter()
+                    .map(|mount| {
+                        (
+                            snapshot_root.clone(),
+                            mount.target.clone(),
+                            mount.mode == "ro",
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let output = ctx
+                    .run
+                    .cmd
+                    .run_container_workload(
+                        qcg_engine::ContainerWorkload {
+                            image: &image,
+                            mounts: &mounts,
+                            workdir: None,
+                            workload_argv: &candidate.argv,
+                            stdin: None,
+                        },
+                        tool.timeout_seconds,
+                        Some(tool.output_limit_bytes),
+                    )
+                    .await
+                    .map_err(|error| StepError::from_gateway(&node.id, error))?;
+                check_tool_output(node, &kind, output.status, output.stdout, output.stderr)
+            } else {
+                let output =
+                    execute_container_backend_candidate(ctx, node, tool, candidate).await?;
+                check_tool_output(node, &kind, output.status, output.stdout, output.stderr)
+            }
         }
     }
 }

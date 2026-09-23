@@ -1,6 +1,10 @@
 mod search;
 
+mod catalog;
 mod config;
+pub use catalog::*;
+mod decision;
+pub use decision::*;
 mod http_provider;
 mod parse;
 mod payload;
@@ -68,6 +72,7 @@ mod tests {
             parallel_tool_calls: None,
             verbosity: None,
             stream: false,
+            prompt_cache: PromptCache::Off,
         }
     }
 
@@ -204,10 +209,12 @@ mod tests {
     fn chat_completions_payload_gates_seed_by_capability() {
         let request = sample_request();
 
-        let payload = chat_completions_payload(&request, true, ChatTokenLimitField::MaxTokens);
+        let payload =
+            chat_completions_payload(&request, true, ChatTokenLimitField::MaxTokens, None);
         assert_eq!(payload["seed"], 42);
 
-        let payload = chat_completions_payload(&request, false, ChatTokenLimitField::MaxTokens);
+        let payload =
+            chat_completions_payload(&request, false, ChatTokenLimitField::MaxTokens, None);
         assert!(payload.get("seed").is_none());
     }
 
@@ -222,7 +229,8 @@ mod tests {
             input_schema: json!({ "type": "object" }),
         }];
 
-        let payload = chat_completions_payload(&request, false, ChatTokenLimitField::MaxTokens);
+        let payload =
+            chat_completions_payload(&request, false, ChatTokenLimitField::MaxTokens, None);
 
         assert!(payload.get("temperature").is_none());
         assert_eq!(payload["max_tokens"], 128);
@@ -241,19 +249,27 @@ mod tests {
             "properties": { "answer": { "type": "string" } },
             "required": ["answer"]
         }));
-        let auto =
-            chat_completions_payload(&request, false, ChatTokenLimitField::MaxCompletionTokens);
+        let auto = chat_completions_payload(
+            &request,
+            false,
+            ChatTokenLimitField::MaxCompletionTokens,
+            None,
+        );
         assert_eq!(auto["response_format"]["json_schema"]["strict"], true);
 
         request.structured_output = StructuredOutputMode::NativeCompatible;
-        let compatible = responses_payload(&request);
+        let compatible = responses_payload(&request, None);
         assert_eq!(compatible["text"]["format"]["strict"], false);
 
         request.structured_output = StructuredOutputMode::Prompt;
-        let prompt =
-            chat_completions_payload(&request, false, ChatTokenLimitField::MaxCompletionTokens);
+        let prompt = chat_completions_payload(
+            &request,
+            false,
+            ChatTokenLimitField::MaxCompletionTokens,
+            None,
+        );
         assert!(prompt.get("response_format").is_none());
-        let anthropic = anthropic_payload(&request);
+        let anthropic = anthropic_payload(&request, None);
         assert!(anthropic.get("tool_choice").is_none());
     }
 
@@ -392,16 +408,16 @@ mod tests {
                 },
             ],
         )];
-        let chat = chat_completions_payload(&request, true, ChatTokenLimitField::MaxTokens);
+        let chat = chat_completions_payload(&request, true, ChatTokenLimitField::MaxTokens, None);
         assert_eq!(chat["messages"][1]["content"][1]["type"], "image_url");
         assert_eq!(
             chat["messages"][1]["content"][1]["image_url"]["url"],
             "data:image/png;base64,aGVsbG8="
         );
-        let responses = responses_payload(&request);
+        let responses = responses_payload(&request, None);
         assert_eq!(responses["input"][1]["content"][2]["type"], "input_file");
         assert_eq!(responses["input"][1]["content"][2]["filename"], "input.pdf");
-        let anthropic = anthropic_payload(&request);
+        let anthropic = anthropic_payload(&request, None);
         assert_eq!(anthropic["messages"][0]["content"][1]["type"], "image");
         assert_eq!(
             anthropic["messages"][0]["content"][2]["source"]["media_type"],
@@ -430,20 +446,20 @@ mod tests {
 
         validate_chat_request(&request, ApiFlavor::ChatCompletions)
             .expect("portable request policy should validate");
-        let chat = chat_completions_payload(&request, true, ChatTokenLimitField::MaxTokens);
+        let chat = chat_completions_payload(&request, true, ChatTokenLimitField::MaxTokens, None);
         assert_eq!(chat["top_p"], 0.25);
         assert_eq!(chat["stop"], json!(["END"]));
         assert_eq!(chat["tool_choice"], "required");
         assert_eq!(chat["parallel_tool_calls"], false);
 
-        let responses = responses_payload(&request);
+        let responses = responses_payload(&request, None);
         assert_eq!(responses["top_p"], 0.25);
         assert!(responses.get("stop").is_none());
         assert_eq!(responses["tool_choice"], "required");
         assert_eq!(responses["parallel_tool_calls"], false);
         assert_eq!(responses["text"]["verbosity"], "high");
 
-        let anthropic = anthropic_payload(&request);
+        let anthropic = anthropic_payload(&request, None);
         assert_eq!(anthropic["top_p"], 0.25);
         assert_eq!(anthropic["stop_sequences"], json!(["END"]));
         assert_eq!(anthropic["tool_choice"]["type"], "any");
@@ -453,12 +469,18 @@ mod tests {
             tool: "lookup".into(),
         });
         assert_eq!(
-            chat_completions_payload(&request, true, ChatTokenLimitField::MaxTokens)["tool_choice"]
+            chat_completions_payload(&request, true, ChatTokenLimitField::MaxTokens, None)["tool_choice"]
                 ["function"]["name"],
             "lookup"
         );
-        assert_eq!(responses_payload(&request)["tool_choice"]["name"], "lookup");
-        assert_eq!(anthropic_payload(&request)["tool_choice"]["name"], "lookup");
+        assert_eq!(
+            responses_payload(&request, None)["tool_choice"]["name"],
+            "lookup"
+        );
+        assert_eq!(
+            anthropic_payload(&request, None)["tool_choice"]["name"],
+            "lookup"
+        );
     }
 
     #[test]
@@ -539,8 +561,12 @@ mod tests {
         request.seed = None;
         request.reasoning_effort = Some(ReasoningEffort::High);
 
-        let payload =
-            chat_completions_payload(&request, false, ChatTokenLimitField::MaxCompletionTokens);
+        let payload = chat_completions_payload(
+            &request,
+            false,
+            ChatTokenLimitField::MaxCompletionTokens,
+            None,
+        );
 
         assert_eq!(payload["reasoning_effort"], "high");
         assert_eq!(payload["max_completion_tokens"], 128);
@@ -554,7 +580,7 @@ mod tests {
         request.seed = None;
         request.reasoning_effort = Some(ReasoningEffort::Max);
 
-        let payload = responses_payload(&request);
+        let payload = responses_payload(&request, None);
 
         assert_eq!(payload["reasoning"]["effort"], "max");
         assert_eq!(payload["max_output_tokens"], 128);
@@ -686,7 +712,7 @@ mod tests {
         let mut request = sample_request();
         request.response_schema = Some(json!({ "type": "object" }));
 
-        let payload = anthropic_payload(&request);
+        let payload = anthropic_payload(&request, None);
 
         assert_eq!(payload["tool_choice"]["name"], "qcg_response");
         assert_eq!(payload["system"], "system");
@@ -840,12 +866,19 @@ mod tests {
             api_key_file_env: None,
             auth_header: None,
             capabilities,
+            models: Vec::new(),
+            models_discovery: None,
+            catalog_id: None,
             path_template: None,
             query: BTreeMap::new(),
             timeout_seconds: None,
             retry_attempts: None,
             retry_base_backoff_ms: None,
+            stream_retry_attempts: None,
+            retry_rate_limit_floor_ms: None,
+            retry_backoff_exponent_cap: None,
             chat_token_limit_field: None,
+            prompt_cache_field: None,
             response_body_limit_bytes: None,
             max_concurrency: None,
             requests_per_minute: None,
@@ -921,6 +954,7 @@ mod tests {
                 provider: vec![spec],
                 search_provider: vec![],
                 mcp_server: vec![],
+                catalog: None,
             }
             .validate()
             .expect_err("credential query interpolation must be rejected");
@@ -1292,6 +1326,121 @@ api = "chat_completions"
     }
 
     #[test]
+    fn provider_models_declare_per_model_capabilities_and_pricing() {
+        let file = ProvidersFile::parse(
+            r#"
+[[provider]]
+id = "openai"
+api = "chat_completions"
+base_url = "https://example.invalid"
+chat_token_limit_field = "max_completion_tokens"
+capabilities = { tool_use = true, reasoning_effort = ["low", "high"] }
+
+[[provider.models]]
+id = "gpt-5"
+label = "GPT-5"
+reasoning_effort = ["none", "high"]
+input_cost_per_million_usd = 1.25
+output_cost_per_million_usd = 10.0
+context_tokens = 400000
+max_output_tokens = 128000
+
+[[provider.models]]
+id = "gpt-5-mini"
+enabled = false
+"#,
+        )
+        .expect("model declarations must validate");
+        let provider = &file.provider[0];
+        let capabilities = provider.capabilities_for_model("gpt-5");
+        assert_eq!(
+            capabilities.reasoning_effort,
+            vec![ReasoningEffort::None, ReasoningEffort::High]
+        );
+        assert!(capabilities.tool_use);
+        let pricing = provider.pricing_for_model("gpt-5").expect("pricing");
+        assert_eq!(pricing.input_cost_per_million_usd, Some(1.25));
+        assert_eq!(pricing.output_cost_per_million_usd, Some(10.0));
+        assert!(
+            !provider
+                .model("gpt-5-mini")
+                .expect("declared model")
+                .is_enabled()
+        );
+        // Generic rows keep provider capabilities for undeclared models.
+        assert_eq!(
+            provider
+                .capabilities_for_model("undeclared")
+                .reasoning_effort,
+            vec![ReasoningEffort::Low, ReasoningEffort::High]
+        );
+        assert!(provider.pricing_for_model("undeclared").is_none());
+    }
+
+    #[test]
+    fn provider_models_reject_invalid_declarations() {
+        for (source, expected) in [
+            (
+                r#"
+[[provider]]
+id = "openai"
+api = "chat_completions"
+base_url = "https://example.invalid"
+
+[[provider.models]]
+id = "dup"
+
+[[provider.models]]
+id = "dup"
+"#,
+                "duplicate model id",
+            ),
+            (
+                r#"
+[[provider]]
+id = "openai"
+api = "chat_completions"
+base_url = "https://example.invalid"
+
+[[provider.models]]
+id = "bad-price"
+input_cost_per_million_usd = -1.0
+"#,
+                "non-negative",
+            ),
+            (
+                r#"
+[[provider]]
+id = "openai"
+api = "responses"
+base_url = "https://example.invalid"
+
+[[provider.models]]
+id = "bad-effort"
+capabilities = { stop_sequences = true }
+"#,
+                "Responses",
+            ),
+            (
+                r#"
+[[provider]]
+id = "chat-model-effort"
+api = "chat_completions"
+base_url = "https://example.invalid"
+
+[[provider.models]]
+id = "reasoner"
+reasoning_effort = ["high"]
+"#,
+                "max_completion_tokens",
+            ),
+        ] {
+            let error = ProvidersFile::parse(source).expect_err("invalid model must be rejected");
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
     fn providers_file_rejects_invalid_capability_and_transport_combinations() {
         for (source, expected) in [
             (
@@ -1429,6 +1578,36 @@ retry_base_backoff_ms = 60001
 "#,
                 "retry_base_backoff_ms",
             ),
+            (
+                r#"
+[[provider]]
+id = "retry-bounds"
+api = "chat_completions"
+base_url = "https://example.invalid"
+retry_rate_limit_floor_ms = 60001
+"#,
+                "retry_rate_limit_floor_ms",
+            ),
+            (
+                r#"
+[[provider]]
+id = "retry-bounds"
+api = "chat_completions"
+base_url = "https://example.invalid"
+retry_backoff_exponent_cap = 0
+"#,
+                "retry_backoff_exponent_cap",
+            ),
+            (
+                r#"
+[[provider]]
+id = "retry-bounds"
+api = "chat_completions"
+base_url = "https://example.invalid"
+retry_backoff_exponent_cap = 17
+"#,
+                "retry_backoff_exponent_cap",
+            ),
         ] {
             let error = ProvidersFile::parse(source)
                 .expect_err("invalid provider registry invariants must fail");
@@ -1514,7 +1693,7 @@ api_key_env = "QCG_LLM_MISSING_KEY_XYZ"
             panic!("workspace providers.toml must exist at {}", path);
         }
         let router = LlmRouter::from_file(&path).expect("providers.toml should be valid");
-        for id in ["fake", "ollama", "lmstudio", "openai_compat"] {
+        for id in ["fake", "ollama", "lmstudio", "openai_client"] {
             assert!(
                 router.capabilities_for(id).is_some(),
                 "{id} should stay active by default"
@@ -1604,7 +1783,7 @@ api_key_env = "QCG_LLM_MISSING_KEY_XYZ"
             "openai_responses",
             "ollama",
             "lmstudio",
-            "openai_compat",
+            "openai_client",
             "openrouter",
             "gemini",
             "sakura",
@@ -1805,6 +1984,124 @@ base_url = "http://127.0.0.1:9/v1"
         }
     }
 
+    struct StreamRetryProvider {
+        calls: AtomicUsize,
+        emit_before_failure: bool,
+    }
+
+    #[async_trait]
+    impl LlmProvider for StreamRetryProvider {
+        fn id(&self) -> &str {
+            "stream-retry"
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+
+        fn stream_retry_attempts(&self) -> usize {
+            1
+        }
+
+        async fn complete(&self, _req: ChatRequest) -> Result<ChatResponse, LlmError> {
+            Err(LlmError::new("complete is unused in stream tests"))
+        }
+
+        async fn stream(
+            &self,
+            _req: ChatRequest,
+            events: mpsc::Sender<ChatStreamEvent>,
+        ) -> Result<(), LlmError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                if self.emit_before_failure {
+                    let _ = events
+                        .send(ChatStreamEvent::TextDelta {
+                            text: "partial".into(),
+                        })
+                        .await;
+                }
+                return Err(LlmError::new("stream failed"));
+            }
+            let _ = events
+                .send(ChatStreamEvent::TextDelta {
+                    text: "recovered".into(),
+                })
+                .await;
+            Ok(())
+        }
+    }
+
+    fn stream_request() -> ChatRequest {
+        ChatRequest {
+            provider: "stream-retry".into(),
+            model: "test".into(),
+            system: None,
+            messages: vec![],
+            tools: vec![],
+            response_schema: None,
+            structured_output: StructuredOutputMode::Auto,
+            temperature: None,
+            top_p: None,
+            max_tokens: 8,
+            stop_sequences: vec![],
+            seed: None,
+            reasoning_effort: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            verbosity: None,
+            stream: true,
+            prompt_cache: PromptCache::Off,
+        }
+    }
+
+    fn stream_router(provider: Arc<StreamRetryProvider>) -> LlmRouter {
+        let mut router = LlmRouter {
+            providers: BTreeMap::new(),
+            default_model: None,
+            search: SearchRuntime::unavailable(),
+            mcp: qcg_mcp::McpRuntime::unavailable(),
+            catalog: Arc::new(CatalogService::empty()),
+        };
+        router.register(provider);
+        router
+    }
+
+    #[tokio::test]
+    async fn stream_retries_only_before_the_first_delta() {
+        // A failure before any event is retried within the configured
+        // attempts.
+        let provider = Arc::new(StreamRetryProvider {
+            calls: AtomicUsize::new(0),
+            emit_before_failure: false,
+        });
+        let observed = Arc::clone(&provider);
+        let router = stream_router(provider);
+        let (events, mut receiver) = mpsc::channel(4);
+        router
+            .stream(stream_request(), events)
+            .await
+            .expect("a pre-delta failure must retry");
+        assert_eq!(observed.calls.load(Ordering::SeqCst), 2);
+        let event = receiver.recv().await.expect("a delta should be forwarded");
+        assert!(matches!(event, ChatStreamEvent::TextDelta { text } if text == "recovered"));
+
+        // Once an event is delivered, a retry would interleave two model
+        // responses and is refused.
+        let provider = Arc::new(StreamRetryProvider {
+            calls: AtomicUsize::new(0),
+            emit_before_failure: true,
+        });
+        let observed = Arc::clone(&provider);
+        let router = stream_router(provider);
+        let (events, _receiver) = mpsc::channel(4);
+        router
+            .stream(stream_request(), events)
+            .await
+            .expect_err("a post-delta failure must not retry");
+        assert_eq!(observed.calls.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn router_retries_retryable_provider_error() {
         let provider = Arc::new(RetryProvider {
@@ -1816,6 +2113,7 @@ base_url = "http://127.0.0.1:9/v1"
             default_model: None,
             search: SearchRuntime::unavailable(),
             mcp: qcg_mcp::McpRuntime::unavailable(),
+            catalog: Arc::new(CatalogService::empty()),
         };
         router.register(provider);
         let response = router
@@ -1837,6 +2135,7 @@ base_url = "http://127.0.0.1:9/v1"
                 parallel_tool_calls: None,
                 verbosity: None,
                 stream: false,
+                prompt_cache: PromptCache::Off,
             })
             .await
             .expect("router should retry once and succeed");
@@ -1847,10 +2146,101 @@ base_url = "http://127.0.0.1:9/v1"
     #[test]
     fn retry_backoff_is_exponential_and_capped() {
         let base = Duration::from_millis(200);
-        assert_eq!(retry_backoff(1, base), Duration::from_millis(200));
-        assert_eq!(retry_backoff(2, base), Duration::from_millis(400));
-        assert_eq!(retry_backoff(3, base), Duration::from_millis(800));
-        assert_eq!(retry_backoff(100, base), Duration::from_millis(51_200));
+        let default_cap = DEFAULT_RETRY_BACKOFF_EXPONENT_CAP;
+        assert_eq!(
+            retry_backoff(1, base, default_cap),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            retry_backoff(2, base, default_cap),
+            Duration::from_millis(400)
+        );
+        assert_eq!(
+            retry_backoff(3, base, default_cap),
+            Duration::from_millis(800)
+        );
+        assert_eq!(
+            retry_backoff(100, base, default_cap),
+            Duration::from_millis(51_200)
+        );
+        assert_eq!(retry_backoff(4, base, 2), Duration::from_millis(800));
+        assert_eq!(retry_backoff(10, base, 16), Duration::from_millis(102_400));
+    }
+
+    #[test]
+    fn default_retry_bounds_preserve_legacy_floor_and_cap() {
+        let provider = HttpProvider::from_spec(spec_with_base_url("defaults", "http://host/v1"));
+        assert_eq!(
+            provider.retry_rate_limit_floor(),
+            Duration::from_millis(5000)
+        );
+        assert_eq!(provider.retry_backoff_exponent_cap(), 8);
+        let base = provider.retry_base_backoff();
+        let floor = provider.retry_rate_limit_floor();
+        let cap = provider.retry_backoff_exponent_cap();
+        assert_eq!(
+            retry_delay(1, base, floor, cap, true),
+            Duration::from_millis(5000)
+        );
+        assert_eq!(
+            retry_delay(2, base, floor, cap, true),
+            Duration::from_millis(10_000)
+        );
+        assert_eq!(
+            retry_delay(3, base, floor, cap, true),
+            Duration::from_millis(15_000)
+        );
+        assert_eq!(
+            retry_delay(1, base, floor, cap, false),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            retry_delay(100, base, floor, cap, false),
+            Duration::from_millis(51_200)
+        );
+    }
+
+    #[test]
+    fn explicit_retry_bounds_override_defaults() {
+        let mut spec = spec_with_base_url("tuned", "http://host/v1");
+        spec.retry_base_backoff_ms = Some(100);
+        spec.retry_rate_limit_floor_ms = Some(0);
+        spec.retry_backoff_exponent_cap = Some(2);
+        spec.validate()
+            .expect("in-range retry bounds must validate");
+        let provider = HttpProvider::from_spec(spec);
+        assert_eq!(provider.retry_rate_limit_floor(), Duration::ZERO);
+        assert_eq!(provider.retry_backoff_exponent_cap(), 2);
+        let base = provider.retry_base_backoff();
+        let floor = provider.retry_rate_limit_floor();
+        let cap = provider.retry_backoff_exponent_cap();
+        assert_eq!(
+            retry_delay(2, base, floor, cap, true),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            retry_delay(5, base, floor, cap, false),
+            Duration::from_millis(400)
+        );
+    }
+
+    #[test]
+    fn provider_retry_bounds_accept_range_endpoints() {
+        for (floor, cap) in [(60_000_u64, 16_u32), (0_u64, 1_u32)] {
+            let parsed = ProvidersFile::parse(&format!(
+                r#"
+[[provider]]
+id = "bounded"
+api = "chat_completions"
+base_url = "https://example.invalid"
+retry_rate_limit_floor_ms = {floor}
+retry_backoff_exponent_cap = {cap}
+"#
+            ))
+            .expect("range endpoints must parse");
+            assert_eq!(parsed.provider[0].retry_rate_limit_floor_ms, Some(floor));
+            assert_eq!(parsed.provider[0].retry_backoff_exponent_cap, Some(cap));
+        }
     }
 
     #[test]

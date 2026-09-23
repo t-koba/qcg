@@ -2,9 +2,23 @@ use qcg_policy::credential_like_name;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
+pub(crate) const TOOLS_LIST_PAGE_LIMIT_MIN: usize = 1;
+
+pub(crate) const TOOLS_LIST_PAGE_LIMIT_MAX: usize = 1_000;
+
+const OAUTH_STATE_TTL_SECONDS_MIN: u64 = 60;
+
+const OAUTH_STATE_TTL_SECONDS_MAX: u64 = 3_600;
+
+pub(crate) const TASK_POLL_INTERVAL_MS_MIN: u64 = 50;
+
+pub(crate) const TASK_POLL_INTERVAL_MS_MAX: u64 = 5_000;
+
 use super::transport::{
     McpAuth, McpLifecycle, McpTransport, OAuthCredentialStore, default_auth, default_lifecycle,
-    default_max_response_bytes, default_oauth_store, default_timeout_seconds, default_transport,
+    default_max_response_bytes, default_oauth_state_ttl_seconds, default_oauth_store,
+    default_task_poll_interval_ms, default_timeout_seconds, default_tools_list_page_limit,
+    default_transport,
 };
 use super::validate::{
     dangerous_process_env_name, reserved_transport_header, valid_env_name, valid_id, validate_host,
@@ -51,6 +65,12 @@ pub struct McpServerSpec {
     pub timeout_seconds: u64,
     #[serde(default = "default_max_response_bytes")]
     pub max_response_bytes: usize,
+    #[serde(default = "default_tools_list_page_limit")]
+    pub tools_list_page_limit: usize,
+    #[serde(default = "default_oauth_state_ttl_seconds")]
+    pub oauth_state_ttl_seconds: u64,
+    #[serde(default = "default_task_poll_interval_ms")]
+    pub task_poll_interval_ms: u64,
 }
 
 impl std::fmt::Debug for McpServerSpec {
@@ -80,6 +100,9 @@ impl std::fmt::Debug for McpServerSpec {
             .field("allowed_hosts", &self.allowed_hosts)
             .field("timeout_seconds", &self.timeout_seconds)
             .field("max_response_bytes", &self.max_response_bytes)
+            .field("tools_list_page_limit", &self.tools_list_page_limit)
+            .field("oauth_state_ttl_seconds", &self.oauth_state_ttl_seconds)
+            .field("task_poll_interval_ms", &self.task_poll_interval_ms)
             .finish()
     }
 }
@@ -102,6 +125,30 @@ impl McpServerSpec {
             return Err(format!(
                 "MCP server `{}` max_response_bytes must be greater than zero",
                 self.id
+            ));
+        }
+        if !(TOOLS_LIST_PAGE_LIMIT_MIN..=TOOLS_LIST_PAGE_LIMIT_MAX)
+            .contains(&self.tools_list_page_limit)
+        {
+            return Err(format!(
+                "MCP server `{}` tools_list_page_limit must be in {TOOLS_LIST_PAGE_LIMIT_MIN}..={TOOLS_LIST_PAGE_LIMIT_MAX} (got {})",
+                self.id, self.tools_list_page_limit
+            ));
+        }
+        if !(OAUTH_STATE_TTL_SECONDS_MIN..=OAUTH_STATE_TTL_SECONDS_MAX)
+            .contains(&self.oauth_state_ttl_seconds)
+        {
+            return Err(format!(
+                "MCP server `{}` oauth_state_ttl_seconds must be in {OAUTH_STATE_TTL_SECONDS_MIN}..={OAUTH_STATE_TTL_SECONDS_MAX} (got {})",
+                self.id, self.oauth_state_ttl_seconds
+            ));
+        }
+        if !(TASK_POLL_INTERVAL_MS_MIN..=TASK_POLL_INTERVAL_MS_MAX)
+            .contains(&self.task_poll_interval_ms)
+        {
+            return Err(format!(
+                "MCP server `{}` task_poll_interval_ms must be in {TASK_POLL_INTERVAL_MS_MIN}..={TASK_POLL_INTERVAL_MS_MAX} (got {})",
+                self.id, self.task_poll_interval_ms
             ));
         }
         for (name, value) in &self.headers {

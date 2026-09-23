@@ -74,9 +74,11 @@ allowed_hosts = ["agent.tinyfish.ai", "clerk.tinyfish.ai"]
 Fields:
 
 - `id`: unique identifier referenced by contracts.
-- `api`: request protocol: `chat_completions`, `responses`, or
-  `anthropic_messages`. The value selects the payload format and endpoint path
-  (`chat/completions`, `responses`, or `messages`).
+- `api`: request protocol: `chat_completions`, `responses`,
+  `anthropic_messages`, or `system_one`. The value selects the payload format
+  and endpoint path (`chat/completions`, `responses`, `messages`, or
+  `systemone`). System One uses typed decisions through `llm.decide`, not chat;
+  its provider rows must not advertise chat capabilities.
 - `base_url`: literal endpoint root. `{ENV_VAR}` placeholders are resolved
   from the environment before use. The configured `api_key_env` placeholder,
   other credential-like placeholders, URL userinfo, queries, and fragments are
@@ -102,6 +104,13 @@ Fields:
   responses) retry; other errors fail fast.
 - `retry_base_backoff_ms`: base wait between retries in milliseconds, up to
   60000. The default is 200; waits grow exponentially from there.
+- `retry_rate_limit_floor_ms`: minimum wait per retry attempt for rate-limited
+  (429) and empty-body responses, multiplied by the attempt number; 0 to 60000.
+  The default is 5000; `0` disables the floor. Other retryable failures only
+  use the exponential backoff.
+- `retry_backoff_exponent_cap`: largest exponent applied to the exponential
+  backoff, 1 to 16. The default is 8; a higher cap grows waits further per
+  attempt before they level off.
 - `response_body_limit_bytes`: maximum response body size. The default is
   16 MiB; larger responses fail before JSON parsing instead of growing memory
   without a bound. An explicit value has no mechanistic ceiling.
@@ -113,10 +122,19 @@ Fields:
 - `chat_token_limit_field`: Chat Completions output-limit field. It defaults
   to `max_tokens`; use `max_completion_tokens` for current OpenAI and Azure
   reasoning endpoints. It is rejected for other API flavors.
+- `stream_retry_attempts`: retry attempts for a stream that fails before
+  delivering any event (default `0`, range `0..=3`). A retry is refused once
+  any delta was delivered, so two model responses can never interleave;
+  `0` surfaces the provider error immediately.
+- `prompt_cache_field`: prompt-cache mechanism for this row. `prompt_cache_key`
+  is valid for `chat_completions` and `responses`; `cache_control` is valid for
+  `anthropic_messages`. It is required exactly when `capabilities.prompt_cache`
+  is enabled and rejected otherwise, so a contract `[llm].cache = "auto"`
+  never silently degrades. Rows without prompt caching stay unchanged.
 - `capabilities`: advertised support for `tool_use`, `json_schema`,
   `structured_output_with_tools`, `seed`, `image_input`, `audio_input`,
   `file_input`, `streaming`, `temperature`, `top_p`, `stop_sequences`,
-  `tool_choice`, `parallel_tool_calls`, and `verbosity`, plus the exact
+  `tool_choice`, `parallel_tool_calls`, `prompt_cache`, and `verbosity`, plus the exact
   `reasoning_effort` values
   accepted by the model or deployment used through this row. Set
   `structured_output_with_tools` only when the endpoint can combine native
@@ -170,6 +188,91 @@ variable, or an unresolved `{ENV_VAR}` placeholder fails validation before the
 corresponding capability runs with the message `set <VAR> before running the
 generator`.
 
+## Model catalog
+
+Provider rows may declare models so operators and clients can select a
+provider, model, and reasoning effort without hardcoding them in every
+contract. Declarations are metadata: they never grant network, command, or
+side-effect permission.
+
+```toml
+[[provider]]
+id = "openai"
+api = "chat_completions"
+base_url = "https://api.openai.com/v1"
+api_key_env = "QCG_OPENAI_API_KEY"
+chat_token_limit_field = "max_completion_tokens"
+catalog_id = "openai"            # optional external-catalog provider key
+capabilities = { tool_use = true, json_schema = true }
+
+[[provider.models]]
+id = "gpt-5.2"
+label = "GPT-5.2"
+reasoning_effort = ["none", "low", "medium", "high", "xhigh"]
+input_cost_per_million_usd = 1.75
+output_cost_per_million_usd = 14.0
+context_tokens = 400000
+max_output_tokens = 128000
+
+[[provider.models]]
+id = "legacy-model"
+enabled = false                  # hidden from selection, still usable when pinned
+```
+
+Fields:
+
+- `id` / `label`: catalog identity and display name.
+- `capabilities`: optional full per-model override of the provider row. It is
+  validated against the same API-flavor rules as a provider row.
+- `reasoning_effort`: shorthand that overrides only the provider's advertised
+  effort list, without restating every capability.
+- `input_cost_per_million_usd` / `output_cost_per_million_usd`: unit prices
+  used by `budget.max_cost_usd` when the contract itself declares no price.
+- `context_tokens` / `max_output_tokens`: selection metadata.
+- `enabled`: `false` hides the model from `qcg models` and the catalog API.
+
+A provider that declares no `models` list keeps the generic behavior: any
+model string is accepted and the provider-level capabilities apply. Effective
+capabilities resolve as provider row, then model `capabilities` (full
+replace), then model `reasoning_effort` (list override).
+
+### Discovery
+
+`models_discovery = "openai"` enables live `GET {base_url}/models` discovery
+with the provider's configured credentials. Discovered ids appear in the
+catalog for selection and inherit provider capabilities; they never change
+run validation and never grant permission. Discovery failures are reported
+per provider in the catalog view instead of silently emptying it.
+
+### External catalog
+
+An optional `[catalog]` section fetches model metadata from an external
+source. The `models_dev` kind accepts a models.dev `api.json` URL or a
+vendored file and maps `reasoning_options[type=effort]`, tool/structured
+output/attachment capabilities, context and output limits, and unit prices.
+Explicit `[[provider.models]]` entries win field by field.
+
+```toml
+[catalog]
+cache = "~/.qcg/cache/llm-catalog.json"   # default under $QCG_HOME
+refresh_seconds = 86400
+
+[[catalog.source]]
+kind = "models_dev"
+url = "https://models.dev/api.json"
+sha256 = "..."                            # optional pin
+```
+
+The cache is loaded at process start so validation stays deterministic
+offline. `qcg serve` refreshes stale sources in the background (failures are
+logged and retried, never fatal), and `qcg models --refresh` or
+`GET /api/llm/catalog?refresh=true` re-fetch on demand. The view marks stale
+metadata and reports fetch errors.
+
+`GET /api/llm/catalog` and `qcg models` list providers, models, efforts,
+prices, and limits. Credentials and environment-variable values are never
+returned.
+
 ## MCP server profiles
 
 An `[[mcp_server]]` row describes one generic MCP endpoint. The registry owns
@@ -191,6 +294,9 @@ oauth_store = "keyring"
 allowed_hosts = ["agent.tinyfish.ai", "clerk.tinyfish.ai"]
 timeout_seconds = 120
 max_response_bytes = 4194304
+tools_list_page_limit = 100
+oauth_state_ttl_seconds = 600
+task_poll_interval_ms = 250
 ```
 
 `transport` defaults to `streamable_http`. The URL must be an HTTP(S) URL
@@ -265,14 +371,21 @@ qcg is bound to loopback. qcg exposes `GET /api/mcp/servers`,
 `DELETE /api/mcp/servers/{id}/authorization`, and the callback
 `GET /api/mcp/oauth/callback`. The authorization URL is returned only after
 its host has passed the profile allowlist. Callback state is single-use and
-expires after ten minutes. TinyFish's bundled `tinyfish` profile uses this
-OAuth flow, does not use `TINYFISH_API_KEY`, and requires one-time authorization
-from the loopback Connections panel.
+expires after `oauth_state_ttl_seconds`. TinyFish's bundled `tinyfish` profile
+uses this OAuth flow, does not use `TINYFISH_API_KEY`, and requires one-time
+authorization from the loopback Connections panel.
 
 `timeout_seconds` defaults to `120` and applies to connection and MCP
 operations. `max_response_bytes` defaults to `4194304` and bounds MCP response
-and OAuth metadata bodies. The runtime also bounds tool discovery to 100 pages
-and rejects an individual discovered input or output schema larger than 256 KiB.
+and OAuth metadata bodies. `tools_list_page_limit` defaults to `100` and caps
+the `tools/list` pages fetched per connection (1 to 1000).
+`oauth_state_ttl_seconds` defaults to `600` and bounds the lifetime of a
+pending OAuth authorization state (60 to 3600). `task_poll_interval_ms`
+defaults to `250` and is the poll cadence for asynchronous MCP tasks when the
+server does not suggest one (50 to 5000); server suggestions are clamped into
+the same hard range. These ranges are mechanism: an out-of-range configuration
+fails registry validation instead of being silently adjusted. The runtime also
+rejects an individual discovered input or output schema larger than 256 KiB.
 Schema depth, node count, object width, and string length are bounded before
 compilation. Reserved MCP transport headers and credential-like static header
 names are rejected during registry validation.
@@ -322,8 +435,9 @@ verbosity = "low"
 stream = true
 ```
 
-The same typed `request` object is accepted by every LLM node and by an
-agent-as-tool declaration. Settings layer as `[llm]`, node `request`, then
+The same typed `request` object is accepted by chat LLM nodes and by an
+agent-as-tool declaration. `llm.decide` uses its separate typed decision params
+and does not accept `request`. Settings layer as `[llm]`, node `request`, then
 specialist `request`. Node and specialist resource limits may only tighten the
 global ceilings. An empty specialist `fallback_models` list explicitly means
 no fallback; it never borrows the parent node's routes. `request.clear` can
@@ -377,16 +491,112 @@ different capability sets, and prefer the Responses API for current OpenAI
 reasoning models with tools. The upstream service remains authoritative for
 model-specific combinations.
 
+## System One decisions
+
+`llm.decide` sends `model`, `state`, and a map of typed `questions` to the
+System One endpoint, `POST /v1/systemone`. It requires an explicit
+`params.model` selecting a `system_one` provider. It is independent of `[llm]`:
+no `[llm]` or registry default model, chat controls, or chat output ceiling is
+inherited, and there is no model or provider fallback. Run-wide budgets still
+apply. Chat parameters (including `prompt`, `request`, tools, and streaming),
+templates, and node `context` are rejected rather than ignored. A System One
+profile cannot serve chat requests.
+
+This flow fragment uses the active `typesafe` profile:
+
+```toml
+[[flow]]
+id = "classify"
+type = "llm.decide"
+
+[flow.params]
+model = { provider = "typesafe", model = "jev-1.13.0", input_cost_per_million_usd = 0.042, output_cost_per_million_usd = 0.0 }
+state = "Help! My payouts have been failing for three days."
+max_tokens = 4096
+
+[flow.params.questions.department]
+type = "choice"
+instructions = "Which team should review this request?"
+criteria = { billing = "Payments, invoicing, refunds", technical = "Bugs, outages, integrations", sales = "Pricing, upgrades, new accounts" }
+
+[flow.params.questions.urgent]
+type = "noul"
+instructions = "Does this request convey urgency?"
+
+[flow.params.questions.frustration]
+type = "score"
+instructions = "How frustrated is the customer?"
+criteria = ["Calm", "Frustrated", "Very angry"]
+```
+
+Specify exactly one of literal `state` or `state_from`. The example uses a
+string; state also accepts an object or array. For runtime input, replace the
+`state` line with `state_from = "inputs.name"` or a dotted ValueBag path such as
+`state_from = "steps.node.output.message"` (and declare that node in `needs`).
+The path resolves at execution without template rendering; missing paths or
+values other than strings, objects, or arrays fail explicitly.
+
+`questions` is a map keyed by question ID, represented by a Rust `BTreeMap`,
+not a list or chat schema. Its typed variants are:
+
+- Noul (`type = "noul"`): yes/no probability, with optional `criteria` containing
+  string descriptions under `true` and/or `false`.
+- Choice (`type = "choice"`): a `criteria` map of 2–255 option names to string
+  descriptions or null (the Rust representation is a `BTreeMap`). TOML has no
+  null literal, so the example uses descriptions.
+- Score (`type = "score"`): an ordered `criteria` array of 2–255 level
+  descriptions.
+
+All question types require `instructions`, which accepts a string, object, or
+array. The step returns the full typed response under `steps.classify.output`:
+`model`, `answers` keyed by the original question IDs, and
+`usage.input_tokens` / `usage.output_tokens`. Choice answers preserve `choice`,
+`probabilities`, and `confidence`; Score preserves `score`, `legend`,
+`probabilities`, and `confidence`. Noul returns `noul` and has no `confidence`
+field. Each answer also preserves its `type`.
+
+For a downstream review node with `needs = ["classify"]`, a branch expression
+can inspect both the department choice and confidence:
+
+```toml
+when = "steps.classify.output.answers.department.confidence >= 0.8 && steps.classify.output.answers.department.choice == 'billing'"
+```
+
+This only selects a workflow branch. Confidence must not automatically grant
+authorization or trigger side effects; existing human approval and permission
+policy remains in force, regardless of the score.
+
+`max_tokens = 4096` is a required positive local ceiling on total input plus
+output usage, not a chat output limit, and is not sent upstream. The upstream
+System One API has no token-cap parameter. Local reservation and post-hoc
+accounting cannot guarantee that the provider never exceeds this ceiling;
+retry attempts can also incur usage that is not reported in the final response.
+Do not treat the local ceiling as an upstream spending guarantee. Explicit
+input and output prices are required when `budget.max_cost_usd` is set.
+
+The example declares USD 0.042 per million input tokens and USD 0 per million
+output tokens, as listed in the official [Models](https://docs.typesafe.ai/models)
+reference. Pin a version when thresholds depend on its behavior; `jev-latest`
+is a moving alias. See the official [API reference](https://docs.typesafe.ai/api)
+for request and response details. No live API validation was performed for
+this integration; documentation review is not an end-to-end provider test.
+
 ## Bundled providers
 
-The shipped registry follows an opt-in format. Local LLM endpoints are active
-by default, and every remote LLM provider ships as a commented template.
-Ollama and LM Studio are credential-free; `openai_compat` requires its declared
-environment variable. MCP servers and REST search profiles are opt-in: they
-are contacted only after a contract declares the corresponding tool and grants
-the required permission.
+The shipped registry follows an opt-in execution model. Local LLM endpoints
+and the remote `typesafe` System One profile are active configuration rows;
+other remote LLM providers ship as commented templates. Unlike those templates,
+`typesafe` needs no uncommenting and is remote, not a local endpoint. Like the
+local rows, it only contacts its endpoint when execution reaches a request
+using that profile; loading the registry does not contact it.
+Ollama and LM Studio are credential-free; `openai_client` requires its declared
+environment variable. `typesafe` requires `TYPESAFE_API_KEY` and permits the
+explicit `QCG_TYPESAFE_BASE_URL` override. MCP servers and REST search profiles
+are opt-in: they are contacted only after a contract declares the corresponding
+tool and grants the required permission.
 
-Active by default: `fake` (built in), `ollama`, `lmstudio`, `openai_compat`.
+Active by default: `fake` (built in), `ollama`, `lmstudio`, `openai_client`,
+`typesafe` (remote System One; no chat capabilities).
 
 Bundled MCP profile: `tinyfish` (Streamable HTTP + OAuth; no
 `TINYFISH_API_KEY`; one-time loopback Connections-panel authorization; OAuth
@@ -402,9 +612,10 @@ Commented templates: `anthropic`, `openai`, `openai_responses`, `openrouter`,
 | `anthropic` | `anthropic_messages` | `QCG_ANTHROPIC_API_KEY` | none |
 | `openai` | `chat_completions` | `QCG_OPENAI_API_KEY` | none |
 | `openai_responses` | `responses` | `QCG_OPENAI_API_KEY` | none |
-| `openai_compat` (active) | `chat_completions` | `QCG_OPENAI_COMPAT_API_KEY` | none |
+| `openai_client` (active) | `chat_completions` | `QCG_OPENAI_CLIENT_API_KEY` | none |
 | `ollama` (active) | `chat_completions` | none | none |
 | `lmstudio` (active) | `chat_completions` | none | none |
+| `typesafe` (active, remote) | `system_one` | `TYPESAFE_API_KEY` | none |
 | `openrouter` | `chat_completions` | `QCG_OPENROUTER_API_KEY` | none |
 | `gemini` | `chat_completions` | `QCG_GEMINI_API_KEY` | none |
 | `sakura` | `chat_completions` | `QCG_SAKURA_API_KEY` | none |

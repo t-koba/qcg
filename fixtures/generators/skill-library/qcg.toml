@@ -1,0 +1,46 @@
+[[flow]]
+context = [
+    { resource = "skills", select = "catalog" },
+    { resource = "skills", select = "instructions", path = "alpha" },
+    { resource = "skills", select = "tree", path = "alpha" },
+    { resource = "skills", select = "files", path = "alpha/references/notes.md" },
+]
+id = "draft"
+type = "llm.generate"
+artifact = { label = "Skill Library Context", required = true }
+
+[flow.params]
+output_file = "library-context.txt"
+prompt = "prompts/draft.j2"
+
+[generator]
+description = "Checks that a declared skill library auto-scans SKILL.md directories."
+id = "skill-library"
+name = "Skill Library"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[llm]
+max_tokens = 512
+temperature = 0.0
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[permissions]
+fs_read = []
+fs_write = ["workspace"]
+network = []
+commands = []
+side_effects = "none"
+side_effects_scope = "invocation"
+
+[permissions.containers]
+enabled = false
+
+[resources.skills]
+llm_visible = true
+path = "resources/skills"
+trust = "trusted"
+type = "skill_library"

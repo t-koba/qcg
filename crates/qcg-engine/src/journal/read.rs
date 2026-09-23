@@ -45,66 +45,95 @@ pub fn read_journal_values_through(
     loop {
         line.clear();
         let read = match line_read_limit {
-            Some(limit) => (&mut reader)
-                .take(
-                    u64::try_from(limit).map_err(|_| JournalError::LimitExceeded {
+            Some(limit) => {
+                // An unrepresentable over-read window fails closed instead
+                // of clamping the detection bound (E13).
+                let over_read = u64::try_from(limit).map_err(|_| {
+                    let actual = limit.saturating_add(1);
+                    JournalError::LimitExceeded {
                         resource: "event",
-                        actual: usize::MAX,
-                        limit: limits.max_event_bytes.unwrap_or(usize::MAX),
-                    })?,
-                )
-                .read_until(b'\n', &mut line)?,
+                        actual,
+                        limit,
+                    }
+                })?;
+                (&mut reader).take(over_read).read_until(b'\n', &mut line)?
+            }
             None => reader.read_until(b'\n', &mut line)?,
         };
         if read == 0 {
             break;
         }
-        line_number = line_number.saturating_add(1);
-        stats.bytes = stats
-            .bytes
-            .checked_add(read)
-            .ok_or(JournalError::LimitExceeded {
-                resource: "total journal",
-                actual: usize::MAX,
-                limit: limits.max_total_bytes.unwrap_or(usize::MAX),
-            })?;
-        if limits
-            .max_total_bytes
-            .is_some_and(|limit| stats.bytes > limit)
+        // Read-path counters overflow fail closed instead of wrapping the
+        // reported line number or stats (E13).
+        line_number = line_number
+            .checked_add(1)
+            .ok_or(JournalError::InvalidEvent(
+                "journal line number overflowed".into(),
+            ))?;
+        stats.bytes =
+            stats
+                .bytes
+                .checked_add(read)
+                .ok_or_else(|| match limits.max_total_bytes {
+                    Some(limit) => JournalError::LimitExceeded {
+                        resource: "total journal",
+                        actual: limit.saturating_add(1),
+                        limit,
+                    },
+                    None => JournalError::LimitExceeded {
+                        resource: "total journal",
+                        actual: usize::MAX,
+                        limit: usize::MAX,
+                    },
+                })?;
+        if let Some(limit) = limits.max_total_bytes
+            && stats.bytes > limit
         {
             return Err(JournalError::LimitExceeded {
                 resource: "total journal",
                 actual: stats.bytes,
-                limit: limits.max_total_bytes.unwrap_or(usize::MAX),
+                limit,
             });
         }
         let has_newline = line.last() == Some(&b'\n');
-        if !has_newline && line_read_limit.is_some_and(|limit| read == limit) {
+        if !has_newline
+            && let Some(read_limit) = line_read_limit
+            && read == read_limit
+        {
+            // Report the configured event limit, not the two-byte read
+            // cap used to detect the overrun (E06).
+            let limit = read_limit.saturating_sub(2);
             return Err(JournalError::LimitExceeded {
                 resource: "event",
                 actual: read,
-                limit: limits.max_event_bytes.unwrap_or(usize::MAX),
+                limit,
             });
         }
         let body_len = line.len().saturating_sub(usize::from(has_newline));
-        if limits.max_event_bytes.is_some_and(|limit| body_len > limit) {
+        if let Some(limit) = limits.max_event_bytes
+            && body_len > limit
+        {
             return Err(JournalError::LimitExceeded {
                 resource: "event",
                 actual: body_len,
-                limit: limits.max_event_bytes.unwrap_or(usize::MAX),
+                limit,
             });
         }
         let body = &line[..body_len];
         if body.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        if limits
-            .max_event_count
-            .is_some_and(|limit| stats.events >= limit)
+        if let Some(limit) = limits.max_event_count
+            && stats.events >= limit
         {
             return Err(JournalError::EventCountExceeded {
-                actual: stats.events.saturating_add(1),
-                limit: limits.max_event_count.unwrap_or(usize::MAX),
+                actual: stats
+                    .events
+                    .checked_add(1)
+                    .ok_or(JournalError::InvalidEvent(
+                        "journal event count overflowed".into(),
+                    ))?,
+                limit,
             });
         }
         let event = match serde_json::from_slice::<Value>(body) {
@@ -127,7 +156,12 @@ pub fn read_journal_values_through(
         }) {
             break;
         }
-        stats.events = stats.events.saturating_add(1);
+        stats.events = stats
+            .events
+            .checked_add(1)
+            .ok_or(JournalError::InvalidEvent(
+                "journal event count overflowed".into(),
+            ))?;
         events.push(event);
     }
     Ok(JournalScan { events, stats })
@@ -160,7 +194,10 @@ pub(crate) fn journal_metrics(budget: &crate::BudgetState) -> Result<JournalMetr
         tokens_output: budget.tokens_output,
         tokens_cached_input: budget.tokens_cached_input,
         steps_executed,
-        tokens_total: budget.tokens_input.saturating_add(budget.tokens_output),
+        tokens_total: budget
+            .tokens_input
+            .checked_add(budget.tokens_output)
+            .ok_or(JournalError::InvalidEvent("token total overflowed".into()))?,
         cost_microusd: budget.cost_microusd,
         duration_ms,
     })

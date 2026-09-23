@@ -5,13 +5,13 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 use super::gc::run_identity_event;
-use super::reads::{read_journal_events, read_run_events};
+use super::reads::{read_durable_run_events, read_journal_events};
 use super::state::read_optional_output_manifest;
 use super::summary::RunSummary;
 use qcg_api::RunEvent;
 
 pub fn read_run_generator_path(run_dir: &Utf8Path) -> Result<Utf8PathBuf, ServiceError> {
-    let events = read_run_events(run_dir)?;
+    let events = read_durable_run_events(run_dir)?;
     read_run_generator_path_from_events(run_dir, &events)
 }
 
@@ -32,7 +32,7 @@ pub(crate) fn read_run_contract_sha256(
 }
 
 pub fn read_run_inputs(run_dir: &Utf8Path) -> Result<BTreeMap<String, Value>, ServiceError> {
-    let events = read_run_events(run_dir)?;
+    let events = read_durable_run_events(run_dir)?;
     read_run_inputs_from_events(run_dir, &events)
 }
 
@@ -101,11 +101,11 @@ fn run_summary_from_events(
     let artifacts = read_optional_output_manifest(run_dir)?
         .map(|manifest| manifest.artifacts)
         .unwrap_or_default();
-    let retain_days = started
-        .retain_days
+    let retention_days = started
+        .retention_days
         .map(u32::try_from)
         .transpose()
-        .map_err(|_| ServiceError::Invalid("retain_days exceeds u32".into()))?;
+        .map_err(|_| ServiceError::Invalid("retention_days exceeds u32".into()))?;
     Ok(RunSummary {
         run_id: run_dir
             .file_name()
@@ -120,6 +120,6 @@ fn run_summary_from_events(
         finished_at: matches!(status, "success" | "failed" | "canceled" | "interrupted")
             .then(|| lifecycle.ts.clone()),
         artifacts,
-        retain_days,
+        retention_days,
     })
 }

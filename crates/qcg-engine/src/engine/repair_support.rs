@@ -38,6 +38,7 @@ pub(crate) fn exhausted_question(
             min_items: None,
             item_type: None,
             schema: None,
+            options_from: None,
             ui: Default::default(),
         }]
     } else {

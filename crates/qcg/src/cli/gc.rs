@@ -40,8 +40,8 @@ pub(crate) fn gc_runs_impl(
         if !matches!(summary.status.as_str(), "success" | "failed" | "canceled") {
             continue;
         }
-        let retain_days = run_retain_days(&summary)?;
-        let expired_by_retain = retain_days
+        let retention_days = run_retention_days(&summary)?;
+        let expired_by_retain = retention_days
             .map(|days| run_is_older_than(&summary.started_at, days))
             .transpose()?
             .unwrap_or(false);
@@ -81,9 +81,8 @@ pub(crate) fn gc_runs_impl(
 }
 
 pub(crate) fn auto_gc_runs(runs_dir: &Utf8Path) -> Result<()> {
-    let enabled = std::env::var("QCG_AUTO_GC")
-        .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
-        .unwrap_or(true);
+    let enabled = qcg_policy::parse_bool_env("QCG_AUTO_GC", true)
+        .map_err(|detail| anyhow::anyhow!("invalid GC configuration: {detail}"))?;
     if enabled {
         gc_runs_impl(runs_dir, 50, 10, true, false)?;
     }
@@ -97,9 +96,9 @@ struct RunGcCandidate {
     expired_by_retain: bool,
 }
 
-fn run_retain_days(summary: &qcg_service::RunSummary) -> Result<Option<u32>> {
-    if summary.retain_days.is_some() {
-        return Ok(summary.retain_days);
+fn run_retention_days(summary: &qcg_service::RunSummary) -> Result<Option<u32>> {
+    if summary.retention_days.is_some() {
+        return Ok(summary.retention_days);
     }
     let contract =
         Contract::load(Utf8PathBuf::from(&summary.generator_path)).with_context(|| {
@@ -108,16 +107,16 @@ fn run_retain_days(summary: &qcg_service::RunSummary) -> Result<Option<u32>> {
                 summary.generator_path, summary.run_id
             )
         })?;
-    Ok(contract.manifest.journal.retain_days)
+    Ok(contract.manifest.retention.days)
 }
 
-fn run_is_older_than(started_at: &str, retain_days: u32) -> Result<bool> {
+fn run_is_older_than(started_at: &str, retention_days: u32) -> Result<bool> {
     if started_at.trim().is_empty() {
         return Ok(false);
     }
     let started = chrono::DateTime::parse_from_rfc3339(started_at)
         .with_context(|| format!("failed to parse run timestamp `{started_at}`"))?
         .with_timezone(&chrono::Utc);
-    let cutoff = chrono::Utc::now() - chrono::Duration::days(i64::from(retain_days));
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(i64::from(retention_days));
     Ok(started < cutoff)
 }

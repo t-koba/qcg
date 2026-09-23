@@ -14,7 +14,9 @@ use qcg_policy::DEFAULT_LLM_CONTEXT_LIMIT_BYTES;
 
 pub(crate) fn render_prompt(ctx: &StepContext<'_>, node: &NodeDef) -> Result<String, StepError> {
     let params = llm_params(node)?;
-    let prompt = params.prompt.as_deref().expect("validated prompt");
+    let Some(prompt) = params.prompt.as_deref() else {
+        return Err(StepError::failed(&node.id, "validated prompt is missing"));
+    };
     let source = load_prompt_source(&ctx.run.contract, node, prompt)?;
     let mut rendered = ctx.render_inline(node, &source)?;
     if !params.context.is_empty() {
@@ -75,7 +77,14 @@ pub(crate) fn manage_context_limits(
         ContextOverflowPolicy::TruncateTail => {
             format!("{}{marker}", utf8_head(prompt, content_limit))
         }
-        ContextOverflowPolicy::Error => unreachable!(),
+        // Guarded by the early return above; a future refactor reaching
+        // here must fail the step, never panic.
+        ContextOverflowPolicy::Error => {
+            return Err(StepError::failed(
+                &node.id,
+                "LLM context overflow policy is Error but the limit check was bypassed",
+            ));
+        }
     };
     *prompt = compacted;
     ctx.journal
@@ -122,8 +131,18 @@ pub(crate) fn render_repair_prompt(
     if let Some(source) = &params.source {
         let source = ctx.render_inline(node, source)?;
         let source_path = resolve_workspace_read(ctx, node, &source)?;
+        let source_file = ctx
+            .run
+            .fs
+            .open_read_resolved(&source_path)
+            .map_err(|error| {
+                StepError::failed(
+                    &node.id,
+                    format!("repair source `{source}` could not be opened: {error}"),
+                )
+            })?;
         let source_limit = prompt_source_byte_limit(&ctx.run.contract);
-        let source_bytes = read_bytes_bounded(&source_path, source_limit).map_err(|error| {
+        let source_bytes = read_bytes_bounded(source_file, source_limit).map_err(|error| {
             StepError::failed(
                 &node.id,
                 format!(
@@ -148,12 +167,11 @@ pub(crate) fn render_repair_prompt(
 }
 
 pub(crate) fn read_bytes_bounded(
-    path: &camino::Utf8Path,
+    file: std::fs::File,
     limit: usize,
 ) -> Result<Vec<u8>, std::io::Error> {
     let mut bytes = Vec::new();
-    std::fs::File::open(path)?
-        .take(limit.saturating_add(1) as u64)
+    file.take(limit.saturating_add(1) as u64)
         .read_to_end(&mut bytes)?;
     if bytes.len() > limit {
         return Err(std::io::Error::new(
@@ -164,13 +182,35 @@ pub(crate) fn read_bytes_bounded(
     Ok(bytes)
 }
 
+/// Reads a trusted package-owned path (prompt package or bundled schema)
+/// with a byte bound. Workspace reads go through the gateway's
+/// handle-relative open instead (E13a).
+pub(crate) fn read_path_bounded(
+    path: &camino::Utf8Path,
+    limit: usize,
+) -> Result<Vec<u8>, std::io::Error> {
+    read_bytes_bounded(std::fs::File::open(path)?, limit)
+}
+
 pub(crate) fn resolve_workspace_read(
     ctx: &StepContext<'_>,
     node: &NodeDef,
     path: &str,
 ) -> Result<camino::Utf8PathBuf, StepError> {
     let full_path = ctx.run.fs.resolve_read(path).step_err(&node.id)?;
-    if !full_path.is_file() {
+    // Verify through a handle-relative open instead of a pathname check so
+    // a parent swapped after resolution cannot redirect the later read
+    // (E13).
+    let opened = ctx
+        .run
+        .fs
+        .open_read_resolved(&full_path)
+        .step_err(&node.id)?;
+    if !opened
+        .metadata()
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
+    {
         return Err(StepError::failed(
             &node.id,
             format!("source path `{path}` was not found"),
@@ -197,7 +237,7 @@ pub(crate) fn load_prompt_source(
 ) -> Result<String, StepError> {
     let prompt_path = resolve_prompt_path(contract, node, path)?;
     let limit = prompt_source_byte_limit(contract);
-    let bytes = read_bytes_bounded(&prompt_path, limit).map_err(|error| {
+    let bytes = read_path_bounded(&prompt_path, limit).map_err(|error| {
         StepError::failed(
             &node.id,
             format!("LLM prompt source `{path}` could not be read within {limit} bytes: {error}"),
@@ -239,12 +279,14 @@ pub(crate) fn resolve_prompt_path(
 
 pub(crate) fn prompt_source_byte_limit(contract: &Contract) -> usize {
     // Explicit contract values are honored as-is; the default applies only
-    // when the contract sets no bound.
+    // when the contract sets no bound. A missing max_tokens fails closed
+    // elsewhere; here fall back to the default limit without panicking.
     contract
         .manifest
         .llm
         .as_ref()
-        .map(|llm| effective_context_byte_limit(&EffectiveRequestPolicy::from_llm(llm)))
+        .and_then(|llm| EffectiveRequestPolicy::from_llm(llm).ok())
+        .map(|policy| effective_context_byte_limit(&policy))
         .unwrap_or(DEFAULT_LLM_CONTEXT_LIMIT_BYTES)
 }
 
@@ -267,7 +309,7 @@ pub(crate) fn load_response_schema(
             format!("LLM response schema `{path}` exceeds {MAX_JSON_SCHEMA_BYTES} bytes"),
         ));
     }
-    let source = read_bytes_bounded(&schema_path, MAX_JSON_SCHEMA_BYTES)?;
+    let source = read_path_bounded(&schema_path, MAX_JSON_SCHEMA_BYTES)?;
     let schema: Value = serde_json::from_slice(&source).map_err(|error| {
         StepError::failed(
             &node.id,
@@ -434,6 +476,18 @@ pub(crate) fn structured_resource_selector(
             })?;
             Ok(Some(ResourceSelector::File { path }))
         }
+        "meta" | "instructions" | "tree" if reference.tag.is_none() => {
+            match reference.path.as_deref() {
+                Some(path) if !path.is_empty() => {
+                    Ok(Some(ResourceSelector::Named(format!("{select}/{path}"))))
+                }
+                Some(_) => Err(StepError::failed(
+                    &node.id,
+                    format!("resource selector `{select}` path is empty"),
+                )),
+                None => Ok(Some(ResourceSelector::Named(select.to_string()))),
+            }
+        }
         _ if reference.tag.is_none() && reference.path.is_none() => {
             Ok(Some(ResourceSelector::Named(select.to_string())))
         }
@@ -500,7 +554,12 @@ pub(crate) fn balanced_json_candidates(text: &str) -> Vec<(usize, usize)> {
             b'[' => stack.push((index, b']')),
             b'}' | b']' => {
                 if stack.last().is_some_and(|(_, close)| *close == byte) {
-                    let (start, _) = stack.pop().expect("matching opener exists");
+                    // Guarded by the check above: the pop cannot fail.
+                    // Use a let-else to fail closed without panicking.
+                    let Some((start, _)) = stack.pop() else {
+                        stack.clear();
+                        continue;
+                    };
                     candidates.push((start, index));
                 } else {
                     // A prose brace can interrupt an otherwise unrelated

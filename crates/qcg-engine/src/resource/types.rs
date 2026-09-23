@@ -7,7 +7,8 @@ use serde::Serialize;
 use super::file_loaders::{DirResourceLoader, FileResourceLoader};
 use super::hash::{resolve_resource_path, resolve_resource_path_for_engine};
 use super::remote_exec::{ExecResourceLoader, RemoteResourceLoader};
-use super::skill::SkillResourceLoader;
+use super::run_ref::RunRefResourceLoader;
+use super::skill::{SkillLibraryResourceLoader, SkillResourceLoader};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourceSelector {
@@ -33,14 +34,29 @@ pub struct ResourceSnapshot {
     pub pin_sha256: Option<String>,
     pub trust: String,
     pub llm_visible: bool,
+    /// Lenient specification violations found while inspecting the resource.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ResourceSnapshotSource {
-    Path { path: Utf8PathBuf },
-    Url { url: String, final_url: String },
-    Command { command: Vec<String> },
+    Path {
+        path: Utf8PathBuf,
+    },
+    Url {
+        url: String,
+        final_url: String,
+    },
+    Command {
+        command: Vec<String>,
+    },
+    /// Snapshot copied from another run's declared artifact.
+    RunRef {
+        run_id: String,
+        artifact: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -101,6 +117,8 @@ pub enum ResourceError {
     },
     #[error("resource `{resource}` has invalid configuration: {message}")]
     InvalidConfiguration { resource: String, message: String },
+    #[error("skill resource `{resource}` is invalid: {message}")]
+    InvalidSkill { resource: String, message: String },
     #[error("failed to read resource `{path}`: {source}")]
     Read {
         path: Utf8PathBuf,
@@ -122,18 +140,22 @@ pub enum ResourceError {
 static FILE_RESOURCE_LOADER: FileResourceLoader = FileResourceLoader;
 static DIR_RESOURCE_LOADER: DirResourceLoader = DirResourceLoader;
 static SKILL_RESOURCE_LOADER: SkillResourceLoader = SkillResourceLoader;
+static SKILL_LIBRARY_RESOURCE_LOADER: SkillLibraryResourceLoader = SkillLibraryResourceLoader;
 static URL_RESOURCE_LOADER: RemoteResourceLoader = RemoteResourceLoader { type_id: "url" };
 static OPENAPI_RESOURCE_LOADER: RemoteResourceLoader = RemoteResourceLoader { type_id: "openapi" };
 static EXEC_RESOURCE_LOADER: ExecResourceLoader = ExecResourceLoader;
+static RUN_REF_RESOURCE_LOADER: RunRefResourceLoader = RunRefResourceLoader;
 
 fn resource_loader(kind: ResourceKind) -> &'static dyn ResourceLoader {
     match kind {
         ResourceKind::File => &FILE_RESOURCE_LOADER,
         ResourceKind::Dir => &DIR_RESOURCE_LOADER,
         ResourceKind::Skill => &SKILL_RESOURCE_LOADER,
+        ResourceKind::SkillLibrary => &SKILL_LIBRARY_RESOURCE_LOADER,
         ResourceKind::Url => &URL_RESOURCE_LOADER,
         ResourceKind::Openapi => &OPENAPI_RESOURCE_LOADER,
         ResourceKind::Exec => &EXEC_RESOURCE_LOADER,
+        ResourceKind::RunRef => &RUN_REF_RESOURCE_LOADER,
     }
 }
 

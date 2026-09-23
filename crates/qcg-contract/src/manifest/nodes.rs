@@ -224,6 +224,20 @@ fn validate_step_type(value: &str) -> Result<(), String> {
     }
 }
 
+/// Rejects colons in node ids at contract validation (Q1): confirmation ids
+/// join `node_id:kind:digest:invocation` with `:` separators, so a colon in
+/// the id would make 3/4-part confirmation ids ambiguous. Empty ids are
+/// rejected by the caller with its own message; this helper only enforces
+/// the colon rule so all call sites share one explicit error.
+pub(crate) fn validate_node_id(id: &str) -> Result<(), String> {
+    if id.contains(':') {
+        return Err(format!(
+            "node id `{id}` must not contain `:`; confirmation ids use `:` as a separator"
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OnDeps {

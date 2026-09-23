@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::common::{
-    bounded_file_bytes, package_file, parse_unix_mode, require, validate_unix_mode_template,
+    package_file, parse_unix_mode, read_opened_bounded, require, validate_unix_mode_template,
     write_atomic,
 };
 pub(crate) struct RenderStep;
@@ -53,8 +53,15 @@ impl StepExecutor for RenderStep {
         let output_file = ctx.render_inline(node, &params.output_file)?;
         let template_path = package_file(&ctx.run.contract, node, &params.template, "template")?;
         let input_limit = ctx.run.contract.manifest.runtime.file_input_limit_bytes;
-        let source = bounded_file_bytes(&template_path, input_limit)
-            .await
+        // Package sources are service-trusted generator content, not
+        // workspace input: only workspace paths go through the gateway.
+        let template = std::fs::File::open(&template_path).map_err(|error| {
+            StepError::failed(
+                &node.id,
+                format!("template `{}` is not readable: {error}", params.template),
+            )
+        })?;
+        let source = read_opened_bounded(template, input_limit, "template")
             .map_err(|error| StepError::failed(&node.id, error))?;
         let source = String::from_utf8(source).map_err(|error| {
             StepError::failed(
@@ -76,7 +83,7 @@ impl StepExecutor for RenderStep {
             .fs
             .resolve_write(&output_file)
             .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
-        write_atomic(&path, rendered.as_bytes(), None).await?;
+        write_atomic(&ctx.run.fs, &path, rendered.as_bytes(), None).await?;
         Ok(StepOutcome::Success {
             output: Some(json!({ "file": output_file })),
             files: vec![path],
@@ -150,7 +157,7 @@ impl StepExecutor for WriteStep {
             .map(|mode| ctx.render_inline(node, mode))
             .transpose()?;
         let unix_mode = parse_unix_mode(node, unix_mode.as_deref())?;
-        write_atomic(&path, content.as_bytes(), unix_mode).await?;
+        write_atomic(&ctx.run.fs, &path, content.as_bytes(), unix_mode).await?;
         Ok(StepOutcome::Success {
             output: Some(json!({ "file": output_file })),
             files: vec![path],
@@ -216,12 +223,15 @@ impl StepExecutor for CopyStep {
             .resolve_write(&target_name)
             .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
         let input_limit = ctx.run.contract.manifest.runtime.file_input_limit_bytes;
-        let bytes = bounded_file_bytes(&source, input_limit)
-            .await
+        // Package sources are service-trusted generator content; the
+        // target below is written through the gateway (E13).
+        let source_file = std::fs::File::open(&source)
+            .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
+        let bytes = read_opened_bounded(source_file, input_limit, "copy source")
             .map_err(|error| StepError::failed(&node.id, error))?;
         let source_mode = source_unix_mode(&source)
             .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
-        write_atomic(&target, &bytes, source_mode).await?;
+        write_atomic(&ctx.run.fs, &target, &bytes, source_mode).await?;
         Ok(StepOutcome::Success {
             output: Some(json!({ "file": target_name })),
             files: vec![target],
@@ -249,18 +259,5 @@ fn source_unix_mode(path: &camino::Utf8Path) -> Result<Option<u32>, std::io::Err
     {
         let _ = path;
         Ok(None)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-
-    #[cfg(not(unix))]
-    #[test]
-    fn unix_mode_is_rejected_instead_of_being_silently_ignored() {
-        use crate::common::unix_mode::apply_unix_mode;
-        let error = apply_unix_mode(camino::Utf8Path::new("unused"), Some(0o750))
-            .expect_err("non-Unix platforms cannot satisfy Unix permission constraints");
-        assert_eq!(error, "unix_mode is unsupported on non-Unix platforms");
     }
 }

@@ -3,22 +3,6 @@ use qcg_api::RunStatus;
 use std::collections::BTreeMap;
 use std::sync::{Arc, PoisonError};
 
-/// 1-based positions of queued runs in schedule order: higher priority
-/// first, then earlier admission, then run id.
-/// Runs without a recorded admission time sort last, ties break by run id.
-pub(crate) fn queue_positions(runs: &BTreeMap<String, RunRecord>) -> BTreeMap<String, usize> {
-    let mut queued: Vec<(&String, &RunRecord)> = runs
-        .iter()
-        .filter(|(_, record)| record.state == RunStatus::Queued)
-        .collect();
-    queued.sort_by(|left, right| queue_order(left.1, left.0).cmp(&queue_order(right.1, right.0)));
-    queued
-        .into_iter()
-        .enumerate()
-        .map(|(index, (run_id, _))| (run_id.clone(), index.saturating_add(1)))
-        .collect()
-}
-
 /// Queue order: higher priority first, then earlier admission, then run id.
 /// Waiting behind a higher-priority run is normal scheduling, not starvation
 /// of equals: equal priorities keep FIFO order.
@@ -31,12 +15,28 @@ fn queue_order<'a>(
     Option<chrono::DateTime<chrono::Utc>>,
     &'a str,
 ) {
+    queue_key(record.priority, record.queued_at, run_id)
+}
+
+/// Shared queue-sort key used by [`queue_order`] and the snapshot queue
+/// position merge in `runs_api`, so the two can never sort differently
+/// (E12/E16).
+pub(crate) fn queue_key(
+    priority: i32,
+    queued_at: Option<chrono::DateTime<chrono::Utc>>,
+    run_id: &str,
+) -> (
+    std::cmp::Reverse<i32>,
+    bool,
+    Option<chrono::DateTime<chrono::Utc>>,
+    &str,
+) {
     // Runs without a recorded admission time sort last; Option's default
     // ordering would put None first, contradicting the documented FIFO rule.
     (
-        std::cmp::Reverse(record.priority),
-        record.queued_at.is_none(),
-        record.queued_at,
+        std::cmp::Reverse(priority),
+        queued_at.is_none(),
+        queued_at,
         run_id,
     )
 }

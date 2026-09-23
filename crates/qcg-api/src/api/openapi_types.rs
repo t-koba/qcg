@@ -3,8 +3,9 @@ use serde_json::{Value, json};
 
 use super::dto::{
     AnswerPayload, ConfirmDecision, ForkRun, ForkStatePatch, GeneratorDetail, GeneratorSummary,
-    McpAuthorizationStart, McpServerList, McpServerSummary, ProblemDetails, RunCostMetrics,
-    RunListItem, RunListResponse, RunSnapshot, StartRun,
+    LlmCatalogCapabilities, LlmCatalogModel, LlmCatalogProvider, LlmCatalogResponse,
+    LlmCatalogSource, McpAuthorizationStart, McpServerList, McpServerSummary, ProblemDetails,
+    RunCostMetrics, RunListItem, RunListOrder, RunListResponse, RunSnapshot, StartRun,
 };
 use super::openapi_doc::{insert_schema, openapi_paths};
 use crate::events::RunEvent;
@@ -13,6 +14,11 @@ pub fn openapi_components() -> Value {
     let mut schemas = serde_json::Map::new();
     insert_schema::<GeneratorSummary>(&mut schemas, "GeneratorSummary");
     insert_schema::<GeneratorDetail>(&mut schemas, "GeneratorDetail");
+    insert_schema::<LlmCatalogSource>(&mut schemas, "LlmCatalogSource");
+    insert_schema::<LlmCatalogCapabilities>(&mut schemas, "LlmCatalogCapabilities");
+    insert_schema::<LlmCatalogModel>(&mut schemas, "LlmCatalogModel");
+    insert_schema::<LlmCatalogProvider>(&mut schemas, "LlmCatalogProvider");
+    insert_schema::<LlmCatalogResponse>(&mut schemas, "LlmCatalogResponse");
     insert_schema::<StartRun>(&mut schemas, "StartRun");
     insert_schema::<ForkStatePatch>(&mut schemas, "ForkStatePatch");
     insert_schema::<ForkRun>(&mut schemas, "ForkRun");
@@ -20,6 +26,7 @@ pub fn openapi_components() -> Value {
     insert_schema::<RunCostMetrics>(&mut schemas, "RunCostMetrics");
     insert_schema::<RunListItem>(&mut schemas, "RunListItem");
     insert_schema::<RunListResponse>(&mut schemas, "RunListResponse");
+    insert_schema::<RunListOrder>(&mut schemas, "RunListOrder");
     insert_schema::<qcg_types::FileValue>(&mut schemas, "FileValue");
     insert_schema::<RunEvent>(&mut schemas, "RunEvent");
     insert_schema::<AnswerPayload>(&mut schemas, "AnswerPayload");
@@ -74,6 +81,7 @@ pub struct ApiHeader {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParameterSchema {
     String,
+    Boolean,
     DateTime,
     Integer {
         minimum: Option<u64>,

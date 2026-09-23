@@ -32,6 +32,9 @@ mod tests {
             allowed_hosts: vec!["agent.tinyfish.ai".into()],
             timeout_seconds: 30,
             max_response_bytes: 1024,
+            tools_list_page_limit: default_tools_list_page_limit(),
+            oauth_state_ttl_seconds: default_oauth_state_ttl_seconds(),
+            task_poll_interval_ms: default_task_poll_interval_ms(),
         }
     }
 
@@ -48,6 +51,75 @@ mod tests {
         response
             .validate()
             .expect("explicit large response limit must validate");
+    }
+
+    #[test]
+    fn mcp_policy_defaults_match_previous_mechanism_values() {
+        let spec: McpServerSpec = serde_json::from_str(
+            r#"{"id":"defaults","transport":"stdio","command":["demo-server"]}"#,
+        )
+        .expect("minimal stdio profile should deserialize");
+        assert_eq!(spec.tools_list_page_limit, 100);
+        assert_eq!(spec.oauth_state_ttl_seconds, 600);
+        assert_eq!(spec.task_poll_interval_ms, 250);
+    }
+
+    #[test]
+    fn tools_list_page_limit_is_bounded() {
+        for value in [1, 1_000] {
+            let mut spec = remote_spec();
+            spec.tools_list_page_limit = value;
+            spec.validate()
+                .unwrap_or_else(|error| panic!("page limit {value} must validate: {error}"));
+        }
+        for value in [0, 1_001] {
+            let mut spec = remote_spec();
+            spec.tools_list_page_limit = value;
+            let error = spec
+                .validate()
+                .expect_err("out-of-range page limit must be rejected");
+            assert!(error.contains("tools_list_page_limit"), "{error}");
+            assert!(error.contains("1..=1000"), "{error}");
+        }
+    }
+
+    #[test]
+    fn oauth_state_ttl_seconds_is_bounded() {
+        for value in [60, 3_600] {
+            let mut spec = remote_spec();
+            spec.oauth_state_ttl_seconds = value;
+            spec.validate()
+                .unwrap_or_else(|error| panic!("OAuth state TTL {value} must validate: {error}"));
+        }
+        for value in [59, 3_601] {
+            let mut spec = remote_spec();
+            spec.oauth_state_ttl_seconds = value;
+            let error = spec
+                .validate()
+                .expect_err("out-of-range OAuth state TTL must be rejected");
+            assert!(error.contains("oauth_state_ttl_seconds"), "{error}");
+            assert!(error.contains("60..=3600"), "{error}");
+        }
+    }
+
+    #[test]
+    fn task_poll_interval_ms_is_bounded() {
+        for value in [50, 5_000] {
+            let mut spec = remote_spec();
+            spec.task_poll_interval_ms = value;
+            spec.validate().unwrap_or_else(|error| {
+                panic!("task poll interval {value} must validate: {error}")
+            });
+        }
+        for value in [49, 5_001] {
+            let mut spec = remote_spec();
+            spec.task_poll_interval_ms = value;
+            let error = spec
+                .validate()
+                .expect_err("out-of-range task poll interval must be rejected");
+            assert!(error.contains("task_poll_interval_ms"), "{error}");
+            assert!(error.contains("50..=5000"), "{error}");
+        }
     }
 
     #[test]
@@ -277,6 +349,9 @@ mod tests {
             allowed_hosts: vec![],
             timeout_seconds: 30,
             max_response_bytes: 1024,
+            tools_list_page_limit: default_tools_list_page_limit(),
+            oauth_state_ttl_seconds: default_oauth_state_ttl_seconds(),
+            task_poll_interval_ms: default_task_poll_interval_ms(),
         }
     }
 }

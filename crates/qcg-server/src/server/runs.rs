@@ -1,20 +1,21 @@
 use anyhow::Result;
 use axum::Json;
-use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::Response;
 use qcg_api::{ForkRun, RunListQuery, RunListResponse, RunSnapshot, StartRun};
 use std::sync::Arc;
 
 use super::config::AppState;
 use super::error::ApiHttpError;
 use super::idempotency::{IdempotentCall, with_idempotency};
+use super::run_detail::{conditional_response, json_response_with_etag};
 
 pub(crate) async fn list_runs(
     State(state): State<Arc<AppState>>,
     Query(query): Query<RunListQuery>,
-) -> Result<Json<RunListResponse>, ApiHttpError> {
+    headers: HeaderMap,
+) -> Result<Response, ApiHttpError> {
     let limit = query.limit.unwrap_or(qcg_api::RUN_LIST_LIMIT_DEFAULT);
     if !(qcg_api::RUN_LIST_LIMIT_MIN..=qcg_api::RUN_LIST_LIMIT_MAX).contains(&limit) {
         return Err(ApiHttpError::bad_request_field(
@@ -102,7 +103,13 @@ pub(crate) async fn list_runs(
         format!("{}|{}", last.started_at, last.run_id)
     });
     items.truncate(limit);
-    Ok(Json(RunListResponse { items, next_cursor }))
+    // Weak ETag over the exact list body (E16): any item move changes the
+    // validator, and `If-None-Match` (including `*` and weak comparison)
+    // yields 304 via the single conditional entry point. Syntactically
+    // invalid validators fail closed with 400 (E16).
+    let body = serde_json::to_vec(&RunListResponse { items, next_cursor })
+        .map_err(ApiHttpError::internal)?;
+    conditional_response(&headers, body, "application/json")
 }
 
 pub(crate) async fn start_run(
@@ -126,7 +133,17 @@ pub(crate) async fn start_run(
         body: &body,
         created: true,
         reserved_run_id: Some(reserved),
-        execute: |reserved| async move { service.start_run_with_id(req, reserved).await },
+        // The reservation rides in the pending claim and the commit proves
+        // `request run_id == reserved run_id` (E02). A missing reservation
+        // fails closed instead of minting an unclaimed run.
+        execute: |reserved| async move {
+            let Some(reserved) = reserved else {
+                return Err(qcg_api::ApiError::Internal {
+                    detail: "idempotency reservation is missing; commit refused".into(),
+                });
+            };
+            service.start_run_with_id(req, Some(reserved)).await
+        },
     })
     .await
 }
@@ -138,9 +155,11 @@ pub(crate) fn respond_with_snapshot(
     if created {
         return created_run_response(snapshot);
     }
-    serde_json::to_value(&snapshot)
-        .map(|value| Json(value).into_response())
-        .map_err(ApiHttpError::internal)
+    // Mutation replays carry the same exact-body validator as the
+    // conditional GET so a client can condition its next read on the
+    // returned ETag instead of re-fetching blindly (E16).
+    let body = serde_json::to_vec(&snapshot).map_err(ApiHttpError::internal)?;
+    json_response_with_etag(StatusCode::OK, body, None)
 }
 pub(crate) async fn fork_run(
     State(state): State<Arc<AppState>>,
@@ -164,9 +183,16 @@ pub(crate) async fn fork_run(
         body: &body,
         created: true,
         reserved_run_id: Some(reserved),
+        // Reservation check mirrors `start_run` (E02): a missing
+        // reservation fails closed instead of forking unclaimed.
         execute: |reserved| async move {
+            let Some(reserved) = reserved else {
+                return Err(qcg_api::ApiError::Internal {
+                    detail: "idempotency reservation is missing; commit refused".into(),
+                });
+            };
             service
-                .fork_run_with_id(&source_id_query, request, reserved)
+                .fork_run_with_id(&source_id_query, request, Some(reserved))
                 .await
         },
     })
@@ -175,12 +201,6 @@ pub(crate) async fn fork_run(
 
 pub(crate) fn created_run_response(snapshot: RunSnapshot) -> Result<Response, ApiHttpError> {
     let location = format!("/api/runs/{}", snapshot.run_id);
-    Response::builder()
-        .status(StatusCode::CREATED)
-        .header(header::LOCATION, location)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&snapshot).map_err(ApiHttpError::internal)?,
-        ))
-        .map_err(ApiHttpError::internal)
+    let body = serde_json::to_vec(&snapshot).map_err(ApiHttpError::internal)?;
+    json_response_with_etag(StatusCode::CREATED, body, Some(location))
 }

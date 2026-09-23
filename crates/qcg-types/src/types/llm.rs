@@ -73,6 +73,21 @@ impl ReasoningEffort {
             Self::Max => "max",
         }
     }
+
+    /// Parses the provider-neutral name. Returns `None` for unknown values so
+    /// callers can distinguish a typo from an unsupported dynamic value.
+    pub fn from_snake_case(value: &str) -> Option<Self> {
+        Some(match value {
+            "none" => Self::None,
+            "minimal" => Self::Minimal,
+            "low" => Self::Low,
+            "medium" => Self::Medium,
+            "high" => Self::High,
+            "xhigh" => Self::Xhigh,
+            "max" => Self::Max,
+            _ => return None,
+        })
+    }
 }
 
 impl fmt::Display for ReasoningEffort {

@@ -36,10 +36,13 @@ pub(crate) fn parse_unix_mode(
         8,
     )
     .map_err(|_| StepError::failed(&node.id, "unix_mode is not valid octal"))?;
-    if !(0o600..=0o777).contains(&mode) || mode & !0o777 != 0 {
+    // World-writable modes are refused at validation: workspace writes must
+    // never become world-writable (E15). 0600..=0755 without `o+w` covers
+    // the legitimate range; 0777-style modes are rejected, not masked.
+    if !(0o600..=0o777).contains(&mode) || mode & !0o777 != 0 || mode & 0o002 != 0 {
         return Err(StepError::failed(
             &node.id,
-            "unix_mode must be between 0600 and 0777 without special bits",
+            "unix_mode must be between 0600 and 0777 without world-writable bit and without special bits",
         ));
     }
     if !cfg!(unix) {
@@ -51,20 +54,30 @@ pub(crate) fn parse_unix_mode(
     Ok(Some(mode))
 }
 
-pub(crate) fn apply_unix_mode(path: &camino::Utf8Path, mode: Option<u32>) -> Result<(), String> {
-    let Some(mode) = mode else {
-        return Ok(());
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-            .map_err(|error| error.to_string())?;
-        Ok(())
+#[cfg(test)]
+mod tests {
+    use super::parse_unix_mode;
+    use qcg_contract::NodeDef;
+    fn node() -> NodeDef {
+        serde_json::from_value(serde_json::json!({"id": "n", "type": "write"})).expect("node")
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, mode);
-        Err("unix_mode is unsupported on non-Unix platforms".into())
+    #[test]
+    fn world_writable_modes_are_refused() {
+        // E15: 0777-style modes never stage world-writable.
+        let node = node();
+        assert!(parse_unix_mode(&node, Some("0777")).is_err());
+        assert!(parse_unix_mode(&node, Some("0666")).is_err());
+        #[cfg(unix)]
+        {
+            assert!(parse_unix_mode(&node, Some("0755")).is_ok());
+            assert!(parse_unix_mode(&node, Some("0644")).is_ok());
+        }
+        #[cfg(not(unix))]
+        {
+            // POSIX bits cannot be honored here: every explicit mode
+            // fails closed instead of staging with a guessed mode.
+            assert!(parse_unix_mode(&node, Some("0755")).is_err());
+            assert!(parse_unix_mode(&node, Some("0644")).is_err());
+        }
     }
 }

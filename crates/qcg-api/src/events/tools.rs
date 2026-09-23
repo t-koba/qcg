@@ -59,6 +59,12 @@ pub enum ToolCallErrorCode {
     Cancelled,
     BudgetExceeded,
     ToolReportedError,
+    /// A per-attempt node timeout fired (E11). Distinct from
+    /// `ExecutionFailed` so timeouts are observable and retryable.
+    TimedOut,
+    /// The run-wide elapsed budget stopped this call (E11). Distinct from
+    /// node timeout and cancellation.
+    ElapsedExceeded,
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize, JsonSchema)]

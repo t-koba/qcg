@@ -1,6 +1,7 @@
 use camino::Utf8PathBuf;
 use qcg_api::RunEvent;
 use qcg_contract::RuntimeLimits;
+use qcg_policy::{AuditLimits, AuditPolicy};
 use serde::Serialize;
 use serde_json::Value;
 use std::fs::File;
@@ -13,6 +14,8 @@ pub struct JournalLimits {
     pub max_total_bytes: Option<usize>,
     pub max_event_count: Option<usize>,
     pub max_state_bytes: Option<usize>,
+    /// In-memory tail/repair scan window; `None` uses the default.
+    pub scan_window_bytes: Option<usize>,
 }
 
 impl From<&RuntimeLimits> for JournalLimits {
@@ -22,6 +25,7 @@ impl From<&RuntimeLimits> for JournalLimits {
             max_total_bytes: runtime.journal_total_limit_bytes,
             max_event_count: runtime.journal_event_count_limit,
             max_state_bytes: runtime.state_limit_bytes,
+            scan_window_bytes: runtime.journal_scan_window_bytes,
         }
     }
 }
@@ -85,6 +89,18 @@ pub struct JournalWriter {
     /// repaired file is shorter: durable history shrank outside the
     /// journal lock (B09).
     pub(crate) floor_len: Arc<Mutex<Option<u64>>>,
+    /// Sibling observation stream (`audit.jsonl`). Opened lazily on the
+    /// first persisted observation record so a policy that persists none
+    /// never creates the file.
+    pub(crate) audit_path: Utf8PathBuf,
+    pub(crate) audit_file: Arc<Mutex<Option<File>>>,
+    pub(crate) audit_policy: AuditPolicy,
+    pub(crate) audit_limits: AuditLimits,
+    pub(crate) audit_stats: Arc<Mutex<Option<JournalStats>>>,
+    /// Set once audit persistence degrades (limit breach or write failure)
+    /// so the durable `audit_degraded` record is emitted exactly once and
+    /// later observation records skip persistence instead of failing runs.
+    pub(crate) audit_degraded: Arc<Mutex<bool>>,
 }
 
 #[derive(Debug, Default, Clone, Serialize)]

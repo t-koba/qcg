@@ -73,6 +73,10 @@ Fields:
 - `max_tokens`: required positive output limit. For reasoning models this
   includes both hidden reasoning tokens and visible output tokens; qcg maps it
   to the field required by the selected API.
+- `journal_scan_window_bytes`: in-memory tail/repair scan window for the
+  run journal, between 4096 and 67108864 bytes. Omitted uses 1 MiB. The
+  window bounds repair memory; the total journal size stays governed by the
+  `journal_*` limits.
 - `max_context_bytes`
 - `max_context_tokens`
 - `max_media_bytes`: required aggregate byte limit when an LLM node declares
@@ -80,6 +84,11 @@ Fields:
   the run workspace and are encoded only after this bound is checked. Video
   inputs require a `video/` MIME type, request the `file_input` capability,
   and travel as file parts.
+- `cache`: prompt-cache policy. Unset and `off` send no cache instructions;
+  `auto` attaches the selected provider's declared cache mechanism
+  (`prompt_cache_field`). A provider that does not advertise
+  `capabilities.prompt_cache` refuses an `auto` request explicitly instead of
+  dropping the policy. Cache reads are reported as `cached_input` tokens.
 - `context_overflow`: `error` by default, or explicitly `truncate_head` /
   `truncate_tail`. Truncation is UTF-8 safe, visibly marked, deterministic,
   and recorded as `context_compacted`; no silent compaction occurs.
@@ -93,7 +102,13 @@ Fields:
 - `reasoning_effort`: optional `none`, `minimal`, `low`, `medium`, `high`,
   `xhigh`, or `max`. Supported values are model-specific and must also appear
   in the selected registry row. Omission means that qcg sends no effort value;
-  it is distinct from the explicit value `none`.
+  it is distinct from the explicit value `none`. Node-level and generator-wide
+  values may be minijinja templates resolved from durable run variables
+  immediately before each request; the resolved value is validated against the
+  selected model's advertised list and follows the same incompatibility rules.
+  A template that renders empty (for example when an optional `ask_user`
+  effort selection was skipped) leaves that layer unset instead of sending an
+  invalid value.
 - `structured_output`: `auto` by default. `auto` uses strict native JSON Schema
   only when the Schema is compatible, otherwise uses the provider's compatible
   native mode, and falls back to prompt transport when the provider has no
@@ -184,7 +199,7 @@ evaluates true.
 
 Fields:
 
-- `type`: `file`, `dir`, `url`, `skill`, `openapi`, or `exec`
+- `type`: `file`, `dir`, `url`, `skill`, `skill_library`, `openapi`, or `exec`
 - `path`: local package-relative path
 - `url`: remote URL, fetched through the network allowlist
 - `trust`: `trusted` or `untrusted`
@@ -193,11 +208,28 @@ Fields:
 - `cache_ttl_seconds`: optional remote snapshot TTL
 - `params`: optional explicit bounds for the selected built-in resource type.
   `file`, `url`, and `openapi` resources accept a positive
-  `max_bytes` limit; built-in `dir` and `skill` resources
+  `max_bytes` limit; built-in `dir`, `skill`, and `skill_library` resources
   accept positive `max_files`, `max_bytes`, `max_depth`, `max_entries`, and
   `max_selected_bytes`. Unset means no mechanistic limit. Reads stop
   at an explicit bound; limit violations and directory walk failures are
   explicit errors.
+
+A `skill` resource is an Agent Skills directory containing `SKILL.md`. The
+frontmatter follows the agentskills.io specification: required `name` and
+`description`, optional `license`, `compatibility`, `metadata` (a string map),
+and `allowed-tools`. `allowed-tools` is informational and never grants
+permissions. Conformant YAML is parsed for plain, quoted, folded (`>`), and
+literal (`|`) scalars; missing `name` or `description`, unparseable
+frontmatter, and a missing `SKILL.md` fail explicitly. Soft violations such as
+a name that differs from the directory name are recorded as diagnostics in the
+resource snapshot and logged instead of failing the run.
+
+A `skill_library` resource scans its `path` for direct subdirectories
+containing `SKILL.md` and exposes each one as a skill. It is the opt-in way to
+vendor a skill collection into a package: the declaration names the library
+root, and the skills inside are discovered automatically. Non-directory
+entries, `.git`, `node_modules`, and directories without `SKILL.md` are
+ignored.
 
 An `exec` resource is the stock declarative extension boundary for an external
 data source. It forbids `path` and `url`, requires
@@ -218,7 +250,17 @@ LLM context selectors:
 - `resources.openapi#operations(tag=tag-name)`
 - `resources.skill#meta`
 - `resources.skill#instructions`
-- `resources.skill#files/path`
+- `resources.skill#tree` / `resources.skill#files`: sorted file
+  metadata and content hashes for the skill directory.
+- `resources.skill#files/path`: one UTF-8 file from a `skill` resource,
+  for example `references/guide.md`.
+- `resources.library#catalog`: the `{name, description}` catalog for a
+  `skill_library`.
+- `resources.library#meta/skill` / `#instructions/skill` / `#tree/skill`:
+  per-skill metadata, instructions, and file listing. Structured references
+  use `{ resource = "library", select = "instructions", path = "skill" }`.
+- `resources.library#files/skill/references/path`: one UTF-8 file from a
+  library skill.
 - `resources.directory#tree` / `resources.directory#files`: sorted file
   metadata and content hashes for a `dir` resource.
 - `resources.directory#files/path`: one UTF-8 file from a `dir` resource.
@@ -239,23 +281,72 @@ effects are denied unless explicitly declared.
   explicitly grants execution under the qcg OS identity and cannot name an
   image.
 - `containers`: `{ enabled, runtime, images, on_missing }`. Enabled containers
-  must select `docker`, `podman`, `docker_runsc`, `incus`, `lxd`, or `lxc`;
+  must select `docker`, `podman`, `docker_runsc`, `incus`, or `lxd`;
   runtime auto-detection is deliberately forbidden. Image pin forms follow
   the runtime: `docker`, `podman`, and `docker_runsc` require
   `name@sha256:<hex>`; `incus` and `lxd` require
   `<remote>:<path>@sha256:<fingerprint>` and launch by fingerprint so
   exactly the pinned bits run (pre-pull the fingerprint with
-  `image copy`); `lxc` requires `<dist>:<release>` (for example
-  `alpine:3.20`) verified through the signed download index.
+  `image copy`).
 - `side_effects`: `none`, `confirm`, `dry_run_first`, or `allowed`.
+- `side_effects_scope`: `invocation` (default) or `content`. The default
+  applies at manifest-parse time only (`SideEffectScope::Invocation` when
+  the key is omitted); every minted `ConfirmSpec` still carries an explicit
+  `scope`, and a confirmation without one is corrupt (never silently
+  invocation-scoped). `invocation`
+  requires a fresh approval for every call; `content` reuses one approval for
+  identical content until the run ends. Identical content means the same
+  target plus the same canonical operation details: for HTTP, the method plus
+  the full-URL digest (canonical URL with sorted query pairs, so undeclared
+  query values also bind), the header digest, body digest, and
+  `sensitive_query` digest
+  (`http_operation_details` in
+  `crates/qcg-engine/src/engine/run_context.rs`); for commands, the argv plus
+  the stdin digest; secret values bind the digest but never enter the journal
+  (see `docs/security.md` contract sandbox). URL query VALUES are redacted by
+  default in journals (keys stay visible); `sensitive_query = ["name", ...]`
+  additionally removes those values from the journaled target and step
+  output, digests them into the approval, and passes them to the gateway so
+  canary redaction covers the request and its final URL. The scope is
+  recorded on the confirmation (`ConfirmSpec.scope`, required) so UI clients
+  can show how far an approval reaches, and the digest is recorded on
+  `ConfirmSpec.operation_digest` (required): a confirmation without either is
+  corrupt and fails closed, never an invocation-scoped default. Approvals
+  never cross runs: the operation id binds the run id, so an identical call
+  in another run always re-confirms. MCP approvals live in two namespaces
+  that never mix: single-shot `mcp.call` steps bind the node execution
+  (`execution:<node>:<count>` invocation id), while agent `mcp` tool calls
+  bind the model call id plus canonical redacted args (continuation key
+  `<node>:agentmcp:<alias>:<invocation_hash>#__mcp_pending` in
+  `crates/qcg-llm-steps/src/tool_events.rs`; the suffix marks stored
+  continuations), so one can never authorize the
+  other.
+
+  Confirmation id forms (never the 2-element `<node>:<kind>` form):
+
+  | scope | confirmation id form | authorizes |
+  |---|---|---|
+  | `content` | `<node>:<kind>:<operation_digest>` (3 parts) | identical content until the run ends |
+  | `invocation` (default) | `<node>:<kind>:<operation_digest>:<invocation_hash>` (4 parts) | one call only |
+
+  `operation_digest` is hex SHA-256 over `target + 0x00 + canonical details
+  JSON`. `invocation_hash` is hex SHA-256 over the invocation id:
+  `execution:<node>:<count>` for single-shot steps (finished-execution count;
+  retries and crash resumes keep the current identity, while a repair or
+  regenerate is a new invocation that re-confirms), or the stable model call
+  id for agent tool calls. The operation id (`run:node:sha256(invocation)` in
+  `crates/qcg-engine/src/state.rs`) is the remote idempotency key, never a
+  confirmation id. Predict confirmation ids from a prior `confirm_request`
+  event or run snapshot `confirm.id` (both carry the full id including scope and invocation hash); `side_effect` events carry only the content digest and never predict invocation-scoped ids alone; a second
+  approval for different content and native convergence across resends are
+  covered by tests in `run_context.rs`.
 
 Container commands run without a shell with no network and only the run
 workspace mounted at `/work`. Docker-compatible runtimes add a read-only
 root, all capabilities dropped, no-new-privileges, a PID limit, and a
 bounded `/tmp`. Incus-like runtimes (`incus`, `lxd`) launch by image
 fingerprint with no NIC, a workspace-only disk device, and unprivileged
-confinement. Legacy `lxc` runtimes use a generated config with no network,
-workspace-only bind mounts, dropped capabilities, and no-new-privileges.
+confinement.
 The declared runtime is recorded in the command plan, and every backend
 family guarantees cleanup on cancel and timeout, including when the
 awaiting future is dropped. Trusted-host commands run without a shell with
@@ -380,8 +471,26 @@ retry = { max_attempts = 3, backoff_ms = 1000, timeout_secs = 60 }
 Only execution failures are retried. Contract, budget, and cancellation
 errors fail fast, and cancellation during backoff aborts the wait. Each
 failed attempt emits a `step_retry` journal event with `attempt`,
-`max_attempts`, and `error`. `retry` applies to scheduler-dispatched nodes;
-`foreach` iterations and repair/regenerate cycles keep their own semantics.
+`max_attempts`, and `error`. Unified budget rule: every charged attempt
+consumes the run-wide step budget, including ordinary retries; no path
+gets a free retry while another pays. Repair/regenerate per-attempt
+consumes follow the same rule through the shared retry wrapper
+(`execute_node_with_retry`), including the private
+`execute_node_after_budget` entry which is reachable only through that
+wrapper so retry, timeout, and elapsed policies cannot be bypassed.
+`retry` applies to scheduler-dispatched nodes
+and to `foreach` children: every child runs through the same retry wrapper
+with its own `max_attempts`, per-attempt `timeout_secs`, and the run-wide
+elapsed deadline, for `parallel=1`, parallel, and nested iterations alike
+(E10). Foreach budget follows the single-charge rule: the outer foreach
+node is charged once total and children share that budget without
+per-child consume. A fired node timeout or elapsed deadline cancels the node scope and
+allows a 5 s cooperative grace: a parent cancel during the grace keeps the
+cancel classification, a cooperative cancel normalizes to the fired deadline
+(`TimedOut` retryable, `ElapsedExceeded` never retried), and any other
+settlement inside the grace is adopted for node timeout but never for the
+hard elapsed deadline, which always reports `ElapsedExceeded` once fired
+(E11). Repair/regenerate cycles keep their own admission semantics.
 
 Step-specific fields such as `prompt`, `output_file`, `command`, or `expect`
 must appear under `[flow.params]`. Unknown fields and invalid types are rejected
@@ -440,6 +549,26 @@ are explicit errors.
   values. Static and dynamic fields use the input-field localization members
   described above.
 
+  A scalar `options_from` or a field-level `options_from` names a dotted run
+  variable path (`inputs.*`, `steps.<id>.output.*`, or `item.*`) whose value
+  supplies the options at run time. Entries are strings or
+  `{ value, label?, label_i18n? }` objects; `label_i18n` is keyed by language
+  then value. `options_from` is mutually exclusive with static `options`, never
+  valid on pre-run `[inputs]` fields, and an empty result fails the step
+  explicitly instead of becoming an unconstrained text field. When combined
+  with the `llm.catalog` step this exposes the live provider/model/effort
+  catalog as form choices without any catalog logic in the form engine.
+
+`llm.catalog`
+: Read the selectable provider/model/effort catalog as a step output. `select`
+  is `providers`, `models`, or `efforts`; `models` requires `provider`,
+  `efforts` requires `provider` and `model` (both may be templates).
+  `enabled_only` (default `true`) hides disabled entries, and `require` filters
+  models by capability. The output contains `options` (values only), `entries`
+  (value, label, metadata), `count`, and a `catalog` slice. Use
+  `options_from = "steps.<id>.output.options"` or `.entries` to bind it to an
+  `ask_user` form. The step never calls an LLM and never grants permission.
+
 `check.schema`
 : Validate a workspace JSON file against a package JSON schema.
 
@@ -495,7 +624,12 @@ are explicit errors.
 `foreach`
 : Iterate over an array or object at `items` and execute the named `subflow`
   block. Array entries are `item`; object entries expose `item.key` and
-  `item.value`. Requires `max_iterations`.
+  `item.value`. Requires `max_iterations`. Parallel iterations share the
+  workspace, the journal, and the run-wide budget atomics
+  (shared-budget/shared-journal): there is no per-iteration isolation for
+  side effects, only for the variable scope cloned per iteration. Budget
+  follows the single-charge rule (outer charged once, children share
+  without per-child consume).
 
 ## Generated Step Parameter Schemas
 
@@ -544,6 +678,9 @@ metadata. Update it with `qcg docs step-schemas`.
         "type": "string"
       },
       "type": "array"
+    },
+    "options_from": {
+      "type": "string"
     }
   },
   "required": [
@@ -808,11 +945,12 @@ metadata. Update it with `qcg docs step-schemas`.
         "structured"
       ],
       "type": "string"
+    },
+    "tool": {
+      "type": "string"
     }
   },
-  "required": [
-    "command"
-  ],
+  "required": [],
   "type": "object"
 }
 ```
@@ -931,6 +1069,12 @@ metadata. Update it with `qcg docs step-schemas`.
     },
     "output_file": {
       "type": "string"
+    },
+    "sensitive_query": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
     },
     "url": {
       "type": "string"
@@ -1846,6 +1990,42 @@ metadata. Update it with `qcg docs step-schemas`.
 }
 ```
 
+### `llm.catalog`
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "enabled_only": {
+      "type": "boolean"
+    },
+    "model": {
+      "type": "string"
+    },
+    "provider": {
+      "type": "string"
+    },
+    "require": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "select": {
+      "enum": [
+        "providers",
+        "models",
+        "efforts"
+      ]
+    }
+  },
+  "required": [
+    "select"
+  ],
+  "type": "object"
+}
+```
+
 ### `llm.choose`
 
 ```json
@@ -2173,6 +2353,225 @@ metadata. Update it with `qcg docs step-schemas`.
     "options",
     "max_iterations",
     "max_tokens_total"
+  ],
+  "type": "object"
+}
+```
+
+### `llm.decide`
+
+```json
+{
+  "$defs": {
+    "content": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/literal"
+        }
+      ],
+      "type": [
+        "string",
+        "object",
+        "array"
+      ]
+    },
+    "literal": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/text"
+        },
+        {
+          "type": [
+            "null",
+            "boolean",
+            "number"
+          ]
+        },
+        {
+          "items": {
+            "$ref": "#/$defs/literal"
+          },
+          "type": "array"
+        },
+        {
+          "additionalProperties": {
+            "$ref": "#/$defs/literal"
+          },
+          "propertyNames": {
+            "$ref": "#/$defs/text"
+          },
+          "type": "object"
+        }
+      ]
+    },
+    "text": {
+      "not": {
+        "pattern": "\\{\\{|\\{%|\\{#"
+      },
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "oneOf": [
+    {
+      "required": [
+        "state"
+      ]
+    },
+    {
+      "required": [
+        "state_from"
+      ]
+    }
+  ],
+  "properties": {
+    "max_tokens": {
+      "description": "Local total input plus output usage ceiling, not sent upstream. Independent of [llm].max_tokens, which limits chat output. No [llm] chat controls are inherited; run-wide budgets remain enforced.",
+      "maximum": 4294967295,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "model": {
+      "additionalProperties": false,
+      "properties": {
+        "input_cost_per_million_usd": {
+          "minimum": 0,
+          "type": "number"
+        },
+        "model": {
+          "$ref": "#/$defs/text",
+          "pattern": "\\S"
+        },
+        "output_cost_per_million_usd": {
+          "minimum": 0,
+          "type": "number"
+        },
+        "provider": {
+          "$ref": "#/$defs/text",
+          "pattern": "\\S"
+        }
+      },
+      "required": [
+        "provider",
+        "model"
+      ],
+      "type": "object"
+    },
+    "questions": {
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "criteria": {
+                "additionalProperties": false,
+                "properties": {
+                  "false": {
+                    "$ref": "#/$defs/text"
+                  },
+                  "true": {
+                    "$ref": "#/$defs/text"
+                  }
+                },
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "instructions": {
+                "$ref": "#/$defs/content"
+              },
+              "type": {
+                "const": "noul"
+              }
+            },
+            "required": [
+              "type",
+              "instructions"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "criteria": {
+                "additionalProperties": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/text"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "maxProperties": 255,
+                "minProperties": 2,
+                "propertyNames": {
+                  "$ref": "#/$defs/text"
+                },
+                "type": "object"
+              },
+              "instructions": {
+                "$ref": "#/$defs/content"
+              },
+              "type": {
+                "const": "choice"
+              }
+            },
+            "required": [
+              "type",
+              "instructions",
+              "criteria"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "criteria": {
+                "items": {
+                  "$ref": "#/$defs/text"
+                },
+                "maxItems": 255,
+                "minItems": 2,
+                "type": "array"
+              },
+              "instructions": {
+                "$ref": "#/$defs/content"
+              },
+              "type": {
+                "const": "score"
+              }
+            },
+            "required": [
+              "type",
+              "instructions",
+              "criteria"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "minProperties": 1,
+      "propertyNames": {
+        "$ref": "#/$defs/text"
+      },
+      "type": "object"
+    },
+    "state": {
+      "$ref": "#/$defs/content"
+    },
+    "state_from": {
+      "$ref": "#/$defs/text",
+      "description": "ValueBag path resolved at execution without template rendering.",
+      "pattern": "^(inputs\\.[^.\\s]+(\\.[^.\\s]+)*|steps\\.[^.\\s]+\\.(output|status)(\\.[^.\\s]+)*|item(\\.[^.\\s]+)*)$"
+    }
+  },
+  "required": [
+    "model",
+    "questions",
+    "max_tokens"
   ],
   "type": "object"
 }
@@ -3315,6 +3714,13 @@ Every declaration has a unique non-empty `name`, a `kind`, and an optional
   provider-native structured output when supported and is always validated
   locally. A normal result is returned to the parent as agent-as-tool data;
   `handoff = true` makes the specialist result the node's final output.
+- `skill`: activates declared `skill` or `skill_library` resources by name.
+  The tool description carries the `{name, description}` catalog, and the
+  model-visible input is `{skill, file?}` where `skill` is an enum of the
+  discovered names. Activation returns the skill instructions plus its
+  bundled resource listing (paths only); `file` reads one skill-relative
+  reference on demand. The tool is read-only, never grants permissions, and
+  `max_calls` defaults to `4`.
 
 `on_failure.default` and `on_failure.by_code` select `return_error` or `fail`.
 The default is `return_error`, so a recoverable specialist failure becomes a
@@ -3446,10 +3852,14 @@ defaults to `true`; set it to `false` only for a known read-only operation. A
 true value routes the call through the
 contract's `[permissions].side_effects` policy: `none` denies it, `confirm`
 and `dry_run_first` create the normal HITL boundary, and `allowed` permits it.
-Each confirmation id binds the exact operation digest (`node:kind:digest`),
-so approving target A never authorizes a regenerated target B. Node-wide
+Each confirmation id binds the exact operation digest plus scope:
+`content` scope uses `<node>:<kind>:<operation_digest>` (3 parts),
+`invocation` scope (default) uses
+`<node>:<kind>:<operation_digest>:<invocation_hash>` (4 parts, with
+`invocation_hash` = hex SHA-256 over the invocation id), so approving target
+A never authorizes a regenerated target B. Node-wide
 bulk approvals do not exist: every approval authorizes exactly one
-operation digest.
+operation digest (plus one invocation under `invocation` scope).
 
 For Streamable HTTP, every host in the profile's `allowed_hosts` must also be
 listed in `permissions.network`. For stdio, the complete profile `command`
@@ -3553,17 +3963,76 @@ fields are rejected when their structs define a closed schema.
 :: Run-wide limits that survive suspend/resume rounds: `max_steps`,
    `max_tokens`, `max_cost_usd`, and `max_elapsed_seconds`. A cost limit
    requires input/output pricing on the declared `[llm].model` entry.
+   Guarantee strengths differ: `max_elapsed_seconds` is a hard deadline
+   enforced monotonically (a running node is stopped and the finalization
+   re-checks it before settling success), while `max_tokens` and
+   `max_cost_usd` are enforced at attempt entry (`StepContext::step_checkpoint`)
+   plus per-tool-call checkpoints inside agent execution (never mid-token-stream,
+   but checked on every tool call boundary as well as every attempt start) (E11).
+   Plan estimates (`--plan --diff` forecast/`estimates` in `crates/qcg/src/cli/plan.rs`,
+   FOREIGN) report these declared budgets read-only and enforce nothing themselves:
+   they must be presented with the enforcement strengths above (elapsed is a hard
+   deadline, tokens/cost are checkpoint-only), never as bounds the plan itself
+   guarantees.
 
 `[failure]`
-:: Hierarchical policy with `default` plus `[failure.by_kind]` entries for
-   `schema`, `range`, `permission`, `out_of_contract`, and `execution`.
-   Supported actions are `reject`, `clarify`, `clamp`, and `fail`. A flow node
-   may declare its own `failure` table to override the generator policy.
-   `out_of_contract = true` LLM responses are journaled before the selected
-   policy is applied.
+:: Hierarchical policy with `default` plus `[failure.by_kind]` entries.
+   `out_of_contract` is the only defined kind; every other engine failure is
+   fatal by mechanism, so no policy entry exists for it. Supported actions are
+   `reject`, `clarify`, `clamp`, and `fail`. A flow node may declare its own
+   `failure` table to override the generator policy. `out_of_contract = true`
+   LLM responses are journaled before the selected policy is applied.
 
-`[journal].retain_days`
-:: Retention window used by `qcg runs gc` in addition to `--keep`.
+`[retention].days`
+:: Retention window in days used by `qcg runs gc` in addition to `--keep`.
+
+`[audit]`
+:: Observation-stream policy (ADR 0001). Durable records are never filtered;
+   this section only controls the observation records that live in
+   `audit.jsonl`. `level = "standard"` (default) persists every observation
+   record; `level = "minimal"` persists none unless a class override raises
+   it. `[audit.classes]` maps an observation kind to `full`, `digest`, or
+   `off`; `digest` replaces every string in the payload with its content
+   digest so the record parses while the content is not retained. Durable
+   kinds are rejected as class keys. `max_bytes` and `max_events` bound the
+   observation stream; a breach or write failure degrades audit persistence
+   for the run and records a durable `audit_degraded` event instead of
+   failing the run. A deployment audit floor can only raise the effective
+   policy.
+
+`[[hooks.run_started]]`, `[[hooks.run_succeeded]]`, `[[hooks.run_failed]]`, `[[hooks.step_failed]]`
+:: Contract-declared lifecycle nodes (ADR 0001). Each entry is an inline
+   step (`id`, `type`, optional `[hooks.<event>.retry]`, and the required
+   `on_error = "fail" | "warn"`) executed in declaration order through the
+   normal bounded step path: hooks charge the run budget, pass the same
+   permission gates, journal `step_started`/`step_finished`, and replay
+   exactly once across resumes. `run_started` hooks run after input
+   materialization and before the scheduler; `run_succeeded` hooks run after
+   the final checkpoint and before outputs are collected, so a hook may
+   write a declared artifact; `step_failed` hooks run once during failed
+   settlement before `run_failed` hooks, with the failure list published as
+   the reserved `hook_failures` step variable; `run_failed` hooks run after
+   them and their `fail` policy adds to the recorded failure list.
+   Hooks must not suspend: `ask_user`, `await`, and `foreach` are rejected at
+   contract load, and a runtime suspension is a hook failure under
+   `on_error`. A hook that cannot run because the run budget is exhausted is
+   recorded as a durable `hook_skipped` event with `reason = "budget"` and is
+   not a failure: a hook never fails a successful run for lack of budget. A failure records a durable `hook_failed` event; `warn`
+   continues the run, `fail` ends it with the hook error. Hook ids share the
+   flow-node id namespace and must be unique.
+
+`[resources.<name>]` type `run_ref`
+:: Immutable, hash-pinned snapshot of another run's declared artifact. The
+   selector is policy and must name exactly one strategy: `run_id`,
+   `latest_success = "<generator-id>"`, or `latest_terminal =
+   "<generator-id>"`. `artifact` is the declared output path in the source
+   run's output manifest, `max_bytes` is the required explicit byte bound,
+   and optional `require_sha256` pins the exact revision. Resolution happens
+   once before execution: the bytes are verified against the source
+   manifest, copied to the workspace at `run-refs/<name>/<file>`, and the
+   resolution is persisted under the run metadata, so resume and replay
+   never depend on the source run surviving retention. An unresolvable
+   selector or a revision mismatch fails the run explicitly.
 
 `[assets]`
 :: Optional client assets declared by safe relative package paths. `files`
@@ -3575,3 +4044,90 @@ fields are rejected when their structs define a closed schema.
    containment prevents symlink escapes. `meta` is a free-form JSON object
    forwarded to clients without backend interpretation. File extensions and
    UI entry-point conventions are client responsibilities.
+
+## Durability guarantees
+
+The durability model targets process termination (including SIGKILL) and
+restart. Host power loss and storage-media failure are outside the guaranteed
+boundary; those would require synchronizing every external side effect behind
+directory-entry durability.
+
+Directory-entry durability means both the file bytes and the directory entry
+that names them are durable: data reaches the disk and the parent directory
+is fsynced so a crash cannot lose the rename that installed the file. qcg
+applies this to run metadata (`state.json` atomic replace plus parent
+directory sync in `persist_serialized_atomic`), workspace atomic
+replacements and removals, idempotency records, fork journals and blobs, and
+large operation-result sidecars (file plus parent directory sync);
+journal line appends rely on terminal-only fsync plus repair (next table),
+not on a per-append directory fsync. Host power loss and storage-media
+failure stay outside the guaranteed boundary as stated above, so no test
+fault-injects them: the table below pins the process-crash contract that
+native tests do cover.
+
+Terminal-only fsync mapping (`crates/qcg-engine/src/journal/writer.rs`):
+
+| path | what is fsynced | when |
+|---|---|---|
+| `JournalWriter::event` fast path | `file.sync_data()` on the journal file plus parent directory sync | only `operation_started` / `operation_finished` and terminal kinds (operation-driven `needs_sync`) |
+| `append_events_if` batch path | `file.sync_data()` on the journal file plus parent directory sync | only when the batch contains a terminal or operation event (`needs_sync`) |
+| torn-tail repair | `sync_data()` after truncate or newline commit | every repair |
+| `state.json` persist | atomic write + replace plus parent directory sync | every append |
+| `.clean_shutdown` marker | plain write / remove, no fsync | best-effort only, failures propagate (a failed terminal marker fails the operation) |
+
+Non-terminal appends are not individually fsynced; they rely on the next
+terminal sync or clean shutdown. A crash-truncated tail without a trailing
+newline is repaired on the next open under the journal lock. Repair marker
+semantics (tamper vs crash): a terminal event writes `.clean_shutdown` next
+to the journal; any later non-terminal append clears it. A truncated tail
+WITH the marker refuses repair as possible tampering; WITHOUT the marker it
+repairs as crash residue. See `docs/operations.md` for operator guidance.
+
+Admission records vs `.admission-*.lock`: admission records are persistent
+(idempotency mappings under `<runs-dir>/idempotency/` with 24-hour TTL plus
+the durable `run_queued` journal event), while `.admission-*.lock` files are
+stateless coordination only — small fixed-size files that are never unlinked
+and hold no run state. Large operation results spill to a sidecar blob under
+the run meta dir past 64 KiB (`OPERATION_RESULT_MAX_BYTES`); the journal
+carries `result_ref` and the guard reloads the blob on resend. One shared
+per-run journal poller serves all SSE subscribers (`journal_pollers`); live
+snapshot `duration_ms` is quantized to whole seconds so exact-digest ETags
+stay stable for conditional requests.
+
+## Shutdown and restart semantics
+
+Mirrors `docs/operations.md` shutdown section (normative operator text
+lives there). On `SIGINT`/`SIGTERM` the server stops accepting new mutating
+requests (they receive `503`); read requests (snapshots, events, artifacts)
+stay admissible but their streams close as the drain proceeds, so only
+mutating work is ever refused. SSE shutdown closes with an explicit
+`shutdown` marker event so clients distinguish shutdown from truncation.
+Startup order is resolve deployment policy once, build the service, build
+the router, then start recovery before resident tasks; shutdown order is
+signal, stop accepting mutating work, HTTP drain bounded by 30 s
+(`DRAIN_TIMEOUT`), mark the service shutting down, then resident-task
+shutdown and active-run settlement concurrently under a 150 second outer
+deadline (`SHUTDOWN_DEADLINE` in `crates/qcg-server/src/server/serve.rs`,
+returned as `Err` to the embedding host by `serve_with_listener_and_deadline`;
+see `docs/operations.md` for the normative shutdown contract). In shared mode,
+stopping one peer settles that peer's tracked runs only; other peers keep
+their own runs. The outer deadline starts
+after the HTTP drain completes: in-flight requests that drain promptly do not
+consume the settlement budget, while a wedged drain connection is cut after
+30 s so shutdown proceeds (the drain timeout is warned, never silent).
+
+Shutdown settles a cancel race as `Interrupted` when shutdown is already in
+effect, else `Canceled` (checked at settle time in `lifecycle.rs` and
+`runs_api.rs`); settled runs journal `run_interrupted` and are terminal and
+not auto-resumed by the next startup. Resume only applies to work that was
+waiting on human input, was explicitly requeued, or was never tracked by the
+stopping peer (a pre-existing adopted orphan with a durable `Queued` journal
+admitted nowhere keeps its queue and resumes on the next boot). This tracked
+vs durable-queue resume exception is stated normatively in
+`docs/operations.md`; this mirror must match it. Explicitly-requeued work
+(answered HITL suspensions re-entering the durable queue) is distinct from
+preemption (a higher-priority arrival returning the lowest-priority running
+run to `Queued` keeping its journal; equal priorities never preempt; already
+finished steps replay on resume). Host error reporting: deadline overruns
+and resident-task failures are returned to the embedding host instead of
+being logged and ignored.

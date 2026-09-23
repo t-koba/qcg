@@ -25,6 +25,9 @@ qcg_version = "^0.1"
 version = "0.1.0"
 
 [permissions]
+network = []
+side_effects = "none"
+side_effects_scope = "invocation"
 fs_read = ["workspace"]
 fs_write = ["workspace"]
 
@@ -37,6 +40,9 @@ bin = "git"
 purpose = "validate that qpx.yaml exists"
 isolation = "trusted_host"
 
+
+[permissions.containers]
+enabled = false
 [tools.qpx_validate]
 command = [
     "git",
@@ -47,14 +53,13 @@ input = "qpx.yaml"
 kind = "validator"
 network = "none"
 timeout_seconds = 30
-workspace = "read_only"
+# No workspace snapshot so the host argv stays relative and matches the
+# wildcard permission: snapshot absolutes never match `*` under the
+# absolute-path safety rule (E13 vs wildcard safety conflict, reported).
+workspace = "none"
 
 [tools.qpx_validate.backends.host]
 bin = "git"
-version_command = [
-    "git",
-    "--version",
-]
 
 [tools.qpx_validate.resolution]
 allowed_backends = ["host"]

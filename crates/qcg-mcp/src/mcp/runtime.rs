@@ -29,14 +29,14 @@ use super::profile::{
 use super::profile::{CredentialGuard, McpProfile};
 use super::session::{McpSession, mcp_http_client};
 use super::spec::McpServerSpec;
-use super::transport::{McpAuth, McpLifecycle, McpTransport, OAuthCredentialStore};
+use super::transport::{
+    McpAuth, McpLifecycle, McpTransport, OAuthCredentialStore, default_oauth_state_ttl_seconds,
+    default_task_poll_interval_ms, default_tools_list_page_limit,
+};
 #[cfg(feature = "mcp-oauth")]
 use super::validate::{auth_error, is_secure_remote_url, validate_redirect_uri};
 use super::validate::{required_env, validate_remote_url};
 use qcg_policy::{DEFAULT_MCP_MAX_RESPONSE_BYTES, DEFAULT_MCP_TIMEOUT_SECONDS};
-
-#[cfg(feature = "mcp-oauth")]
-const AUTHORIZATION_TTL: Duration = Duration::from_secs(10 * 60);
 
 pub(crate) struct QcgMcpClient;
 
@@ -351,7 +351,8 @@ impl McpRuntime {
             PendingAuthorization {
                 server_id: server_id.to_string(),
                 state,
-                expires_at: Instant::now() + AUTHORIZATION_TTL,
+                expires_at: Instant::now()
+                    + Duration::from_secs(profile.spec.oauth_state_ttl_seconds),
             },
         );
         Ok(authorization_url)
@@ -874,12 +875,6 @@ impl McpRuntime {
                                     &workload,
                                 )
                             }
-                            qcg_container::Backend::Lxc => qcg_container::lxc_server_argv(
-                                &name,
-                                qcg_container::LXC_MINIMAL_PATH,
-                                &server_env,
-                                &workload,
-                            ),
                             qcg_container::Backend::Docker { .. } => {
                                 return Err(McpError::Configuration(
                                     "docker backends take the one-shot path".into(),
@@ -975,6 +970,9 @@ fn public_default_specs() -> Vec<McpServerSpec> {
         allowed_hosts: vec![host.to_string()],
         timeout_seconds: DEFAULT_MCP_TIMEOUT_SECONDS,
         max_response_bytes: DEFAULT_MCP_MAX_RESPONSE_BYTES,
+        tools_list_page_limit: default_tools_list_page_limit(),
+        oauth_state_ttl_seconds: default_oauth_state_ttl_seconds(),
+        task_poll_interval_ms: default_task_poll_interval_ms(),
     })
     .collect()
 }

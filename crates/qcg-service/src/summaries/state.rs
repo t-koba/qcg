@@ -14,7 +14,6 @@ use super::reads::{
     read_journal_events, read_persisted_hitl_from_values, read_queued_identity_from_values,
 };
 use super::summary::run_meta_dir;
-use qcg_policy::MAX_DIRECTORY_SCAN_ENTRIES;
 
 pub(crate) fn fold_run_state(run_dir: &Utf8Path) -> Result<RunState, ServiceError> {
     RunState::fold_journal(&run_meta_dir(run_dir).join("journal.jsonl"))
@@ -96,6 +95,7 @@ pub(crate) fn status_from_journal(status: &str) -> Result<RunStatus, ServiceErro
 pub(crate) fn rehydrate_runs(
     runs_dir: &Utf8Path,
     max_tracked_runs: usize,
+    max_scan_entries: usize,
 ) -> Result<BTreeMap<String, RunRecord>, ServiceError> {
     let mut records = BTreeMap::new();
     if !runs_dir.exists() {
@@ -104,9 +104,9 @@ pub(crate) fn rehydrate_runs(
     let mut scanned = 0_usize;
     for entry in std::fs::read_dir(runs_dir)? {
         scanned = scanned.saturating_add(1);
-        if scanned > MAX_DIRECTORY_SCAN_ENTRIES {
+        if scanned > max_scan_entries {
             return Err(ServiceError::Invalid(format!(
-                "run store contains more than {MAX_DIRECTORY_SCAN_ENTRIES} entries"
+                "run store contains more than {max_scan_entries} entries"
             )));
         }
         let entry = entry?;
@@ -172,7 +172,7 @@ pub(crate) fn rehydrate_runs(
         // a restart preserves cross-generator submission order instead of
         // falling back to run_id string order.
         let queued_at = read_last_queued_at_from_values(&journal_values);
-        let (events, _) = broadcast::channel(512);
+        let (events, _) = broadcast::channel(qcg_policy::LIVE_EVENT_CHANNEL_CAPACITY);
         records.insert(
             run_id,
             RunRecord {

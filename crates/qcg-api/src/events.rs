@@ -107,6 +107,33 @@ mod tests {
     }
 
     #[test]
+    fn resource_events_decode_skill_diagnostics() {
+        let value = json!({
+            "t": "resource",
+            "seq": 3,
+            "ts": "2026-09-01T00:00:00Z",
+            "run_id": "run-1",
+            "trace_id": "trace-1",
+            "span_id": "span-3",
+            "name": "skills",
+            "type": "skill",
+            "source": { "kind": "path", "path": "resources/skills/demo" },
+            "sha256": "00",
+            "bytes": 12,
+            "cache": "not_applicable",
+            "trust": "trusted",
+            "llm_visible": true,
+            "diagnostics": ["skill name `Demo` does not match its directory `demo`"]
+        });
+        let event = RunEvent::from_flat(&value).expect("resource diagnostics should decode");
+        let RunEventData::Resource(resource) = event.data else {
+            panic!("resource event data should decode as a resource");
+        };
+        assert_eq!(resource.diagnostics.len(), 1);
+        assert!(resource.diagnostics[0].contains("does not match"));
+    }
+
+    #[test]
     fn specialist_events_use_the_node_envelope_and_closed_typed_data() {
         let delegated = json!({
             "t": "agent_delegated",

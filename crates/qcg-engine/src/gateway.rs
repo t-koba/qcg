@@ -1,8 +1,11 @@
 mod command;
 mod error;
 mod fs;
+#[cfg(unix)]
+mod handle;
 mod http;
 mod process;
+mod staging;
 
 pub use command::*;
 pub use error::*;
@@ -72,7 +75,10 @@ mod tests {
             .join("qcg-gateway-outside.txt");
         std::fs::write(&outside, "outside").expect("outside file should be written");
         let link = workspace.join("outside-link");
-        let _ = std::fs::remove_file(&link);
+        // Best-effort pre-clean documented here: a leftover link from a prior run is removed when present (E13).
+        if std::fs::remove_file(&link).is_err() && link.exists() {
+            panic!("stale test symlink should be removable");
+        }
         std::os::unix::fs::symlink(&outside, &link).expect("symlink should be created");
         let mut permissions = Permissions::default();
         permissions.fs_read.push("workspace".into());
@@ -175,6 +181,58 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&outside).expect("outside file should be readable"),
             "outside"
+        );
+        std::fs::remove_dir_all(base).expect("test workspace should be removed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_streaming_write_reclaims_staging_and_keeps_target() {
+        // E13: a producer failure must remove the staged file, keep the
+        // committed target, and leave no `.qcg-part-*` artifact behind.
+        let base = Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
+            "qcg-gateway-stream-{}",
+            uuid::Uuid::now_v7().as_simple()
+        )))
+        .expect("temporary directory path must be utf-8");
+        let workspace = base.join("workspace");
+        std::fs::create_dir_all(workspace.join("out")).expect("test workspace should be created");
+        let mut permissions = Permissions::default();
+        permissions.fs_write.push("workspace".into());
+        let gateway = FsGateway::new(workspace.clone(), &permissions);
+        let target = gateway
+            .resolve_write("out/data.txt")
+            .expect("target should resolve");
+        gateway
+            .write_file_atomic(&target, b"original")
+            .await
+            .expect("first write should succeed");
+        let error = gateway
+            .write_file_atomic_stream(&target, None, |file| -> std::io::Result<()> {
+                use std::io::Write as _;
+                file.write_all(b"partial")?;
+                Err(std::io::Error::other("producer failed"))
+            })
+            .await
+            .expect_err("a producer error must fail the write");
+        assert!(
+            error.to_string().contains("producer failed"),
+            "the producer error must surface: {error}"
+        );
+        assert_eq!(
+            std::fs::read(workspace.join("out/data.txt")).expect("target readable"),
+            b"original",
+            "a failed streaming write must not replace the target"
+        );
+        let leaked: Vec<String> = std::fs::read_dir(workspace.join("out"))
+            .expect("out dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("qcg-part"))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "a failed streaming write must not leak staging files: {leaked:?}"
         );
         std::fs::remove_dir_all(base).expect("test workspace should be removed");
     }
@@ -581,6 +639,31 @@ mod tests {
         let mut permissions = Permissions::default();
         permissions.network.push("example.com".into());
         assert!(ensure_url_allowed(&permissions, "https://example.com/path").is_ok());
+    }
+
+    #[test]
+    fn sensitive_query_values_refuse_typos_and_bad_urls() {
+        // E09: a mistyped name or unparseable URL fails closed so the value
+        // cannot slip into the journal in the clear.
+        use super::http::sensitive_query_values;
+        let values = sensitive_query_values(
+            "https://example.com/search?engine=google&api_key=secret-value",
+            &["api_key".to_string()],
+        )
+        .expect("declared values should extract");
+        assert_eq!(
+            values.get("api_key").map(String::as_str),
+            Some("secret-value")
+        );
+        assert!(
+            sensitive_query_values(
+                "https://example.com/search?engine=google",
+                &["api_key".to_string()]
+            )
+            .is_err()
+        );
+        assert!(sensitive_query_values(":::/not a url", &["api_key".to_string()]).is_err());
+        assert!(sensitive_query_values("https://example.com/plain", &[]).is_ok());
     }
 
     #[test]
@@ -1135,5 +1218,216 @@ mod tests {
             gateway.command_plan(&["cc".into(), "main.c".into(), "extra.c".into()]),
             Err(GatewayError::CommandArgsDenied { .. })
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn parent_swap_after_resolution_cannot_escape_the_workspace() {
+        // E13a: validate first, then replace the parent with a symlink to
+        // an outside directory. Both write and read must fail instead of
+        // reaching the outside target.
+        let root = Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("qcg-gateway-swap-{}", uuid::Uuid::now_v7())),
+        )
+        .expect("temporary path must be UTF-8");
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(workspace.join("sub")).expect("workspace sub");
+        std::fs::create_dir_all(outside.as_std_path()).expect("outside dir");
+        std::fs::write(workspace.join("sub/secret.txt"), b"inside").expect("secret");
+        std::fs::write(workspace.join("sub/removable.txt"), b"remove").expect("removable");
+        let mut permissions = Permissions::default();
+        permissions.fs_read.push("workspace".into());
+        permissions.fs_write.push("workspace".into());
+        let gateway = FsGateway::new(workspace.clone(), &permissions);
+        let write_target = gateway
+            .resolve_write("sub/file.txt")
+            .expect("write should resolve before the swap");
+        let read_target = gateway
+            .resolve_read("sub/secret.txt")
+            .expect("read should resolve before the swap");
+        let remove_target = gateway
+            .resolve_read("sub/removable.txt")
+            .expect("remove should resolve before the swap");
+        std::fs::rename(workspace.join("sub"), workspace.join("sub-real")).expect("rename");
+        std::os::unix::fs::symlink(&outside, workspace.join("sub")).expect("symlink");
+        let write_error = gateway
+            .write_file_atomic(&write_target, b"escape")
+            .await
+            .expect_err("write through a swapped parent must fail");
+        assert!(
+            !outside.join("file.txt").exists(),
+            "write must not escape the workspace: {write_error}"
+        );
+        gateway
+            .open_read_resolved(&read_target)
+            .expect_err("read through a swapped parent must fail");
+        assert!(
+            !outside.join("secret.txt").exists(),
+            "read must not escape the workspace"
+        );
+        gateway
+            .remove_file_resolved(&remove_target)
+            .await
+            .expect_err("remove through a swapped parent must fail");
+        assert!(
+            workspace.join("sub-real/removable.txt").exists(),
+            "remove must not touch the real target"
+        );
+        assert!(
+            !outside.join("removable.txt").exists(),
+            "remove must not follow the swapped parent"
+        );
+        // Best-effort test cleanup documented here: temp removal cannot propagate from test tails (E13).
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_tree_copies_handle_relative_and_rejects_symlinks() {
+        // E13: consumers that must parse a tree by path read a private
+        // handle-relative snapshot, which never follows symlinks.
+        let root = Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("qcg-tree-snapshot-{}", uuid::Uuid::now_v7())),
+        )
+        .expect("temporary path must be UTF-8");
+        let workspace = root.join("workspace");
+        let dest = root.join("snapshot");
+        std::fs::create_dir_all(workspace.join("out/sub")).expect("workspace tree");
+        std::fs::write(workspace.join("out/a.txt"), b"alpha").expect("file a");
+        std::fs::write(workspace.join("out/sub/b.txt"), b"beta").expect("file b");
+        let mut permissions = Permissions::default();
+        permissions.fs_read.push("workspace".into());
+        permissions.fs_write.push("workspace".into());
+        let gateway = FsGateway::new(workspace.clone(), &permissions);
+        let tree = gateway.resolve_read("out").expect("tree should resolve");
+        gateway
+            .snapshot_tree_to(&tree, &dest, Some(100), Some(10))
+            .expect("snapshot should copy");
+        assert_eq!(
+            std::fs::read(dest.join("a.txt")).expect("copied a"),
+            b"alpha"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("sub/b.txt")).expect("copied b"),
+            b"beta"
+        );
+        gateway
+            .snapshot_tree_to(&tree, &root.join("over-limit"), Some(2), Some(10))
+            .expect_err("byte limit must fail");
+        std::os::unix::fs::symlink(workspace.join("out/a.txt"), workspace.join("out/link"))
+            .expect("symlink");
+        gateway
+            .snapshot_tree_to(&tree, &root.join("with-link"), Some(100), Some(10))
+            .expect_err("symlinked entry must fail");
+        // Best-effort test cleanup documented here: temp removal cannot propagate from test tails (E13).
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_tree_stats_rejects_symlinks_limits_and_swapped_parents() {
+        // E13: the workspace tree check walks handle-relative and never
+        // follows symlinks, so it cannot be redirected after resolution.
+        let root = Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("qcg-tree-stats-{}", uuid::Uuid::now_v7())),
+        )
+        .expect("temporary path must be UTF-8");
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(workspace.join("out/sub")).expect("workspace tree");
+        std::fs::create_dir_all(outside.as_std_path()).expect("outside dir");
+        std::fs::write(workspace.join("out/a.txt"), b"0123456789").expect("file a");
+        std::fs::write(workspace.join("out/sub/b.txt"), b"01234").expect("file b");
+        let mut permissions = Permissions::default();
+        permissions.fs_read.push("workspace".into());
+        permissions.fs_write.push("workspace".into());
+        let gateway = FsGateway::new(workspace.clone(), &permissions);
+        let tree = gateway.resolve_read("out").expect("tree should resolve");
+        gateway
+            .bounded_tree_stats(&tree, Some(100), Some(10))
+            .expect("tree within limits");
+        gateway
+            .bounded_tree_stats(&tree, Some(5), Some(10))
+            .expect_err("oversize tree must fail");
+        gateway
+            .bounded_tree_stats(&tree, Some(100), Some(1))
+            .expect_err("entry limit must fail");
+        std::os::unix::fs::symlink(workspace.join("out/a.txt"), workspace.join("out/link"))
+            .expect("symlink");
+        gateway
+            .bounded_tree_stats(&tree, Some(100), Some(10))
+            .expect_err("symlinked entry must fail");
+        std::fs::remove_file(workspace.join("out/link")).expect("remove symlink");
+        std::fs::rename(workspace.join("out"), workspace.join("out-real")).expect("rename");
+        std::os::unix::fs::symlink(&outside, workspace.join("out")).expect("swap symlink");
+        gateway
+            .bounded_tree_stats(&tree, Some(100), Some(10))
+            .expect_err("a swapped parent must not be followed");
+        // Best-effort test cleanup documented here: temp removal cannot propagate from test tails (E13).
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_tree_rejects_symlinked_destination_parents() {
+        // E13: a planted symlink in the snapshot destination tree would
+        // divert the copy outside the run meta dir, so symlinked
+        // destination parents are refused before anything is created.
+        let root = Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("qcg-tree-dest-link-{}", uuid::Uuid::now_v7())),
+        )
+        .expect("temporary path must be UTF-8");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(workspace.join("out")).expect("workspace tree");
+        std::fs::write(workspace.join("out/a.txt"), b"alpha").expect("file a");
+        let mut permissions = Permissions::default();
+        permissions.fs_read.push("workspace".into());
+        permissions.fs_write.push("workspace".into());
+        let gateway = FsGateway::new(workspace.clone(), &permissions);
+        let tree = gateway.resolve_read("out").expect("tree should resolve");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        let linked_parent = root.join("linked");
+        std::os::unix::fs::symlink(&outside, &linked_parent).expect("symlinked parent");
+        gateway
+            .snapshot_tree_to(&tree, &linked_parent.join("snap"), Some(100), Some(10))
+            .expect_err("a symlinked destination parent must fail");
+        assert!(
+            !outside.join("snap").exists(),
+            "refusing the symlinked destination must divert nothing outside"
+        );
+        // Best-effort test cleanup documented here: temp removal cannot propagate from test tails (E13).
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_tree_copies_with_explicit_modes() {
+        // E15: snapshot copies set explicit modes instead of inheriting the
+        // process umask.
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("qcg-tree-modes-{}", uuid::Uuid::now_v7())),
+        )
+        .expect("temporary path must be UTF-8");
+        let workspace = root.join("workspace");
+        let dest = root.join("snapshot");
+        std::fs::create_dir_all(workspace.join("out")).expect("workspace tree");
+        std::fs::write(workspace.join("out/a.txt"), b"alpha").expect("file a");
+        let mut permissions = Permissions::default();
+        permissions.fs_read.push("workspace".into());
+        permissions.fs_write.push("workspace".into());
+        let gateway = FsGateway::new(workspace.clone(), &permissions);
+        let tree = gateway.resolve_read("out").expect("tree should resolve");
+        gateway
+            .snapshot_tree_to(&tree, &dest, Some(100), Some(10))
+            .expect("snapshot should copy");
+        assert_eq!(
+            std::fs::metadata(dest.join("a.txt"))
+                .expect("copied file should stat")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "snapshot copies must carry the explicit owner-only mode"
+        );
+        // Best-effort test cleanup documented here: temp removal cannot propagate from test tails (E13).
     }
 }

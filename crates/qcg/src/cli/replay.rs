@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use qcg_engine::read_output_manifest;
 use qcg_service::{
-    DirectRun, LocalQcgService, read_run_events, read_run_generator_path, read_run_inputs,
-    resolve_run_dir, run_meta_dir,
+    DirectRun, read_run_events, read_run_generator_path, read_run_inputs, resolve_run_dir,
+    run_meta_dir,
 };
 use qcg_types::OutputManifest;
 use serde_json::{Value, json};
@@ -55,7 +55,8 @@ pub(crate) async fn replay_run(request: ReplayRequest) -> Result<()> {
             runs_dir.join(format!("{id}-replay-{timestamp}"))
         }
     };
-    let service = LocalQcgService::new(Utf8PathBuf::new(), runs_dir.to_path_buf(), providers_path)?;
+    let service =
+        crate::local_cli_service(Utf8PathBuf::new(), runs_dir.to_path_buf(), providers_path)?;
     let replay_manifest = service
         .run_generator_path(DirectRun {
             generator_path: generator_path.clone(),
@@ -122,18 +123,20 @@ pub(crate) async fn export_run_trace(
 ) -> Result<()> {
     let run_dir = resolve_run_dir(runs_dir, id)?;
     let events = read_run_events(&run_dir)?;
-    if events.is_empty() {
+    // Bind first/last once: later indexing must never assume non-emptiness
+    // separately from this check.
+    let (Some(first), Some(last)) = (events.first(), events.last()) else {
         anyhow::bail!("run `{id}` has no trace events");
-    }
+    };
     if events
         .iter()
-        .any(|event| event.run_id != id || event.trace_id != events[0].trace_id)
+        .any(|event| event.run_id != id || event.trace_id != first.trace_id)
     {
         anyhow::bail!("run `{id}` contains inconsistent trace identity");
     }
-    let trace_id = events[0].trace_id.clone();
-    let start = event_time_unix_nano(&events[0])?;
-    let end = event_time_unix_nano(events.last().expect("events is non-empty"))?.max(start + 1);
+    let trace_id = first.trace_id.clone();
+    let start = event_time_unix_nano(first)?;
+    let end = event_time_unix_nano(last)?.max(start + 1);
     let run_span_id = qcg_api::span_id_for_scope(id, "run");
     let mut spans = vec![json!({
         "traceId": trace_id,
@@ -228,7 +231,13 @@ pub(crate) async fn export_run_trace(
             .with_context(|| format!("trace exporter `{endpoint}` rejected the payload"))?;
     }
     if output.is_none() && endpoint.is_none() {
-        println!("{}", String::from_utf8(encoded).expect("JSON is UTF-8"));
+        // serde_json emits valid UTF-8 by construction; a failure here is
+        // corrupt serializer output and fails closed instead of panicking.
+        println!(
+            "{}",
+            String::from_utf8(encoded)
+                .map_err(|error| anyhow::anyhow!("trace payload is not valid UTF-8: {error}"))?
+        );
     } else {
         if let Some(path) = output {
             println!("wrote OTLP trace `{path}`");

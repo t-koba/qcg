@@ -47,7 +47,9 @@ pub(crate) fn enforce_out_of_contract_policy(
         )),
         FailureAction::Clarify => Ok(OutOfContractDecision::NeedsUser {
             question: FormSpec {
-                id: node.id.clone(),
+                // Namespaced question id: a bare node id would alias
+                // AskUser answers across tools (E08).
+                id: format!("{}:out_of_contract", node.id),
                 title: "Clarify out-of-contract LLM response".into(),
                 title_i18n: Default::default(),
                 fields: vec![InputField {
@@ -67,6 +69,7 @@ pub(crate) fn enforce_out_of_contract_policy(
                     min_items: None,
                     item_type: None,
                     schema: None,
+                    options_from: None,
                     ui: Default::default(),
                 }],
             },

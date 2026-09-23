@@ -21,13 +21,49 @@ pub(crate) fn package_file(
             format!("{role} package path `{relative}` is invalid: {error}"),
         )
     })?;
-    if !path.is_file() {
+    // Containment is enforced by `resolve_package_path`; the `is_file`
+    // pathname check below is only a fast path. The authoritative file
+    // check happens on the opened handle in `open_package_read`
+    // (O_NOFOLLOW + handle `is_file`), so a symlink swap between this
+    // probe and the open cannot redirect the read (E13).
+    let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+        StepError::failed(
+            &node.id,
+            format!("{role} package path `{relative}` is not readable: {error}"),
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(StepError::failed(
+            &node.id,
+            format!("{role} package path `{relative}` must not be a symlink"),
+        ));
+    }
+    if !metadata.is_file() {
         return Err(StepError::failed(
             &node.id,
             format!("{role} package path `{relative}` must be a file"),
         ));
     }
     Ok(path)
+}
+
+/// Opens a package file through the same O_NOFOLLOW + handle boundary as
+/// snapshot reads (E13). The leaf is opened without following a terminal
+/// symlink via the shared `qcg_fs` helper (Unix O_NOFOLLOW authoritative,
+/// non-Unix symlink pre-check plus handle verification); the returned
+/// handle is verified to be a file, so a pathname `is_file` probe alone
+/// never authorizes the read.
+pub(crate) fn open_package_read(
+    node: &NodeDef,
+    path: &camino::Utf8Path,
+    role: &str,
+) -> Result<std::fs::File, StepError> {
+    qcg_fs::open_read_nofollow(path).map_err(|error| {
+        StepError::failed(
+            &node.id,
+            format!("{role} package path is not readable: {error}"),
+        )
+    })
 }
 
 pub(crate) fn render_command(
@@ -49,13 +85,12 @@ pub(crate) fn render_command(
         total = total
             .checked_add(arg.len().saturating_add(1))
             .ok_or_else(|| StepError::failed(&node.id, "rendered command size overflowed"))?;
-        if limit.is_some_and(|limit| total > limit) {
+        if let Some(limit) = limit
+            && total > limit
+        {
             return Err(StepError::failed(
                 &node.id,
-                format!(
-                    "rendered command arguments exceed {} bytes",
-                    limit.unwrap_or(usize::MAX)
-                ),
+                format!("rendered command arguments exceed {limit} bytes"),
             ));
         }
         rendered.push(arg);

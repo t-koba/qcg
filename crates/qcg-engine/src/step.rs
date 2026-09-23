@@ -39,6 +39,11 @@ pub enum StepError {
     /// timeout apart from a proven-clean error (B08/B11).
     #[error("step `{node}` timed out after {timeout_secs}s")]
     TimedOut { node: String, timeout_secs: u64 },
+    /// The run-wide elapsed budget stopped this node. Distinct from a node
+    /// timeout and from cancellation so hosts can report the actual cause
+    /// (E11).
+    #[error("step `{node}` exceeded the run elapsed limit of {limit_secs}s")]
+    ElapsedExceeded { node: String, limit_secs: u64 },
 }
 
 impl StepError {
@@ -53,6 +58,12 @@ impl StepError {
         if matches!(error, crate::GatewayError::Canceled) {
             Self::Cancelled
         } else {
+            // Gateway-internal bounds (including `CommandTimedOut`) surface
+            // as retryable Failed: the run-cancel / node-timeout / elapsed
+            // distinction of E11 applies to engine enforcement (node
+            // `timeout_secs`, run `max_elapsed_seconds`, cancellation), not
+            // to transport-internal limits, which carry no node budget to
+            // report against.
             Self::failed(node, error.to_string())
         }
     }
@@ -79,17 +90,19 @@ where
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum StepOutcome {
+    // No `#[serde(default)]` shims (E07): `output` and `files` are required
+    // on read so partial records fail closed instead of silently degrading
+    // to empty outputs. `output` uses presence-required deserialization
+    // because serde implicitly defaults missing `Option` fields to `None`.
     Success {
-        #[serde(default)]
+        #[serde(deserialize_with = "crate::required_presence")]
         output: Option<Value>,
-        #[serde(default)]
         files: Vec<Utf8PathBuf>,
     },
     CheckFailed {
         findings: Vec<Finding>,
-        #[serde(default)]
+        #[serde(deserialize_with = "crate::required_presence")]
         output: Option<Value>,
-        #[serde(default)]
         files: Vec<Utf8PathBuf>,
     },
     NeedsUser {
@@ -220,6 +233,21 @@ impl StepRegistry {
                 StepError::failed(&node.id, contract.line_hint(&error.to_string()))
             })?;
         }
+        // Lifecycle hooks execute through the same registry, so a hook with
+        // an unregistered or invalid step type fails at contract load
+        // instead of at run start.
+        for (event, hook) in contract.manifest.hooks.entries() {
+            let node = hook.to_node(event);
+            let Some(executor) = self.get(&node.kind) else {
+                return Err(StepError::failed(
+                    &node.id,
+                    contract.line_hint(&format!("step type `{}` is not registered", node.kind)),
+                ));
+            };
+            executor.validate(&node, contract).map_err(|error| {
+                StepError::failed(&node.id, contract.line_hint(&error.to_string()))
+            })?;
+        }
         Ok(())
     }
 }
@@ -232,11 +260,24 @@ pub struct StepContext<'a> {
 }
 
 impl StepContext<'_> {
-    pub async fn checkpoint(&self) -> Result<(), StepError> {
+    /// Node-scoped checkpoint: same shared `checkpoint_scope` as
+    /// `RunContext::run_checkpoint`, with the node id as scope (loop scopes
+    /// use the `"runtime"` sentinel there). The two methods differ only in
+    /// scope naming and error mapping, never in enforcement. Named
+    /// `step_checkpoint` (vs `run_checkpoint`) so the two scopes never share
+    /// one ambiguous `checkpoint` name (E11).
+    pub async fn step_checkpoint(&self, node: &NodeDef) -> Result<(), StepError> {
         tokio::task::yield_now().await;
-        if self.run.cancellation.is_cancelled() {
-            return Err(StepError::Cancelled);
-        }
+        // Shared scope check (E11): the monotonic `elapsed_deadline` is
+        // authoritative and stops in-flight work; cancellation maps to the
+        // step Cancelled variant on this path.
+        crate::engine::checkpoint_scope(
+            &self.run.cancellation,
+            self.run
+                .elapsed_deadline
+                .zip(self.run.contract.manifest.budget.max_elapsed_seconds),
+            &node.id,
+        )?;
         let budget = &self.run.contract.manifest.budget;
         let state = self.journal.state();
         let tokens = state
@@ -262,23 +303,12 @@ impl StepContext<'_> {
                 });
             }
         }
-        if let (Some(limit_seconds), Some(started_at)) =
-            (budget.max_elapsed_seconds, state.budget.started_at)
-        {
-            let started_at = chrono::DateTime::parse_from_rfc3339(&started_at)
-                .map_err(|error| StepError::failed("runtime", error.to_string()))?;
-            let elapsed = chrono::Utc::now()
-                .signed_duration_since(started_at)
-                .num_seconds()
-                .max(0) as u64;
-            if elapsed > limit_seconds {
-                return Err(StepError::BudgetExceeded {
-                    resource: "elapsed_seconds",
-                    used: elapsed,
-                    limit: limit_seconds,
-                });
-            }
-        }
+        // Enforcement uses the monotonic `elapsed_deadline` checked above
+        // only. The durable wall-clock record (`budget.started_at`) is
+        // diagnostic and never enforces: enforcing both clocks would drift
+        // up to 1 s on truncation and split NTP behavior (E11). Resume
+        // reconstructs the same monotonic deadline from the durable
+        // elapsed, so the basis never changes across restarts (E11).
         Ok(())
     }
 
@@ -327,16 +357,12 @@ impl TemplateService {
         limits: &RuntimeLimits,
     ) -> Result<String, minijinja::Error> {
         validate_template_limits(limits)?;
-        if limits
-            .template_source_limit_bytes
-            .is_some_and(|limit| source.len() > limit)
+        if let Some(limit) = limits.template_source_limit_bytes
+            && source.len() > limit
         {
             return Err(minijinja::Error::new(
                 ErrorKind::InvalidOperation,
-                format!(
-                    "template source exceeds {} bytes",
-                    limits.template_source_limit_bytes.unwrap_or(usize::MAX)
-                ),
+                format!("template source exceeds {limit} bytes"),
             ));
         }
         validate_template_context(&context, limits.template_context_limit_bytes)?;
@@ -487,10 +513,11 @@ impl io::Write for BoundedTemplateWriter {
             .len()
             .checked_add(bytes.len())
             .ok_or_else(|| io::Error::other("template output size overflowed"))?;
-        if self.limit.is_some_and(|limit| next > limit) {
+        if let Some(limit) = self.limit
+            && next > limit
+        {
             return Err(io::Error::other(format!(
-                "template output exceeds {} bytes",
-                self.limit.unwrap_or(usize::MAX)
+                "template output exceeds {limit} bytes"
             )));
         }
         self.bytes.extend_from_slice(bytes);

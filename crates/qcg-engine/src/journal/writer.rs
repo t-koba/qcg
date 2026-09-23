@@ -1,6 +1,5 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use chrono::Utc;
-use fs2::FileExt as _;
 use qcg_api::RunEvent;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -12,12 +11,100 @@ use super::read::{journal_metrics, read_journal_values};
 use super::serialize::{append_serialized_json_line, serialize_bounded};
 use super::types::{JournalError, JournalLimits, JournalWriter};
 
+/// Terminal journal events use the single canonical
+/// `qcg_api::is_terminal_event_kind` predicate shared with the service live
+/// tail, SSE wrapper, and shared poller, so sync, metrics, shutdown markers,
+/// and streams can never disagree about what "finished" means (Q2/E12).
+/// There is no local duplicate predicate: every call below invokes the
+/// canonical one directly.
+/// Resynchronizes memory state from durable truth in a single pass: when
+/// the persisted state.json already agrees with the durable tail seq it is
+/// adopted with one small read (every append persists it atomically after
+/// writing, so agreement means it reflects exactly the journal prefix
+/// through that seq); otherwise the journal is folded once. Failures fail
+/// closed instead of guessing seq values.
+fn resync_durable_state(
+    journal_path: &Utf8Path,
+    state_path: &Utf8Path,
+    limits: JournalLimits,
+    durable_seq: u64,
+) -> Result<crate::RunState, JournalError> {
+    if let Ok(bytes) = std::fs::read(state_path)
+        && let Ok(persisted) = serde_json::from_slice::<crate::RunState>(&bytes)
+        && persisted.last_seq == durable_seq
+    {
+        if persisted.schema_version != crate::RUN_STATE_SCHEMA_VERSION {
+            return Err(JournalError::InvalidEvent(format!(
+                "unsupported state schema_version {}; this qcg implements {}",
+                persisted.schema_version,
+                crate::RUN_STATE_SCHEMA_VERSION
+            )));
+        }
+        return Ok(persisted);
+    }
+    crate::RunState::fold_journal_with_limits(journal_path, limits)
+}
+
 /// Sibling lock file serializing all journal writers for one run across
 /// processes and threads. Every journal append holds this lock from the
 /// latest-state read through seq assignment, file append, and state.json
 /// update so concurrent writers cannot assign duplicate seq values.
 pub fn journal_lock_path(journal_path: &Utf8Path) -> Utf8PathBuf {
     journal_path.with_file_name(".journal.lock")
+}
+
+/// Marker written when a run reaches a terminal event through a graceful
+/// writer path. A truncated tail found WITH this marker present means
+/// durable history was damaged after a clean shutdown (tamper) and refuses
+/// repair; WITHOUT the marker the truncation is a crash remnant and
+/// repairs as before (Sensitive-8). The marker is removed on the next
+/// successful non-terminal append, so a continued run never carries a stale
+/// shutdown claim.
+pub fn clean_shutdown_marker_path(journal_path: &Utf8Path) -> Utf8PathBuf {
+    journal_path.with_file_name(".clean_shutdown")
+}
+
+/// Magic marker content: any regular file is not enough, since an
+/// attacker (or stray tool) with directory write access could plant one.
+/// Content is checked on read; absence still reads as no marker (Q2).
+const CLEAN_SHUTDOWN_MAGIC: &[u8] = b"qcg-clean-shutdown-v1\n";
+
+fn write_clean_shutdown_marker(journal_path: &Utf8Path) -> Result<(), JournalError> {
+    std::fs::write(
+        clean_shutdown_marker_path(journal_path),
+        CLEAN_SHUTDOWN_MAGIC,
+    )?;
+    Ok(())
+}
+
+fn clear_clean_shutdown_marker(journal_path: &Utf8Path) -> Result<(), JournalError> {
+    match std::fs::remove_file(clean_shutdown_marker_path(journal_path)) {
+        Ok(()) => Ok(()),
+        // Absence is the common case (runs that never terminated cleanly);
+        // any other removal failure propagates so a stale marker can never
+        // silently survive into a continued run.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(JournalError::Io(error)),
+    }
+}
+
+/// Syncs the journal parent directory so the directory entry is durable
+/// alongside the file bytes (Q2): same bar as `state.json` mapping persist
+/// (file plus parent directory sync). Unix opens the directory and syncs;
+/// non-Unix has no directory handle and relies on the file sync (best
+/// effort, documented).
+fn sync_parent_dir(journal_path: &Utf8Path) -> Result<(), JournalError> {
+    // The path feeds only the Unix directory sync below.
+    #[cfg(not(unix))]
+    let _ = journal_path;
+    #[cfg(unix)]
+    {
+        let Some(parent) = journal_path.parent() else {
+            return Ok(());
+        };
+        std::fs::File::open(parent).and_then(|dir| dir.sync_all())?;
+    }
+    Ok(())
 }
 
 fn acquire_journal_lock(journal_path: &Utf8Path) -> Result<File, JournalError> {
@@ -31,7 +118,7 @@ fn acquire_journal_lock(journal_path: &Utf8Path) -> Result<File, JournalError> {
         .read(true)
         .write(true)
         .open(&lock_path)?;
-    file.lock_exclusive()?;
+    file.lock()?;
     Ok(file)
 }
 
@@ -45,6 +132,18 @@ pub fn read_last_seq_from_tail(
     journal_path: &Utf8Path,
     limits: JournalLimits,
 ) -> Result<u64, JournalError> {
+    Ok(
+        read_last_seq_from_file_tail(journal_path, limits)?
+            .max(state_json_seq_floor(journal_path)?),
+    )
+}
+
+/// Tail seq of one JSONL file without the state.json floor. Used for the
+/// audit stream, whose seq space is independent of `state.last_seq`.
+pub fn read_last_seq_from_file_tail(
+    journal_path: &Utf8Path,
+    limits: JournalLimits,
+) -> Result<u64, JournalError> {
     if !journal_path.exists() {
         return Ok(0);
     }
@@ -53,9 +152,13 @@ pub fn read_last_seq_from_tail(
     if len == 0 {
         return Ok(0);
     }
-    const TAIL_WINDOW: u64 = 64 * 1024;
+    let tail_window = limits
+        .scan_window_bytes
+        .map(|value| value as u64)
+        .unwrap_or(64 * 1024)
+        .max(4 * 1024);
     const MAX_LINE: u64 = 1024 * 1024;
-    let window = len.min(TAIL_WINDOW + MAX_LINE);
+    let window = len.min(tail_window + MAX_LINE);
     let start = len.saturating_sub(window);
     let mut file = File::open(journal_path)?;
     use std::io::{Read as _, Seek as _};
@@ -89,24 +192,45 @@ pub fn read_last_seq_from_tail(
         // alone exceeds the window (B09) or the tail is corrupt. A stale
         // state.json must not stand in here: the persisted state may lag
         // a crashed peer's append, so resolve the final line with a
-        // bounded backward scan, falling back to a full scan bounded by
-        // the caller's limits. Limit violations propagate: guessing a seq
-        // here would risk duplicates, so resync fails closed instead.
+        // bounded backward scan, then with a full scan bounded by the
+        // caller's limits when the bounded scan cannot resolve it. Limit
+        // violations propagate: guessing a seq here would risk duplicates,
+        // so resync fails closed instead.
         // Seq values grow with file order, so any complete line the
         // window scan above found would already be the global max; only
         // the found-nothing case needs this resolution.
         let huge = match read_huge_tail_seq(journal_path, len, limits) {
             Ok(seq) => seq,
-            Err(_) => read_journal_values(journal_path, limits)?
-                .events
-                .iter()
-                .filter_map(|event| event.get("seq").and_then(Value::as_u64))
-                .max()
-                .unwrap_or(0),
+            Err(first) => {
+                let scan = read_journal_values(journal_path, limits).map_err(|second| {
+                    // Both resolution paths failed: report both so the
+                    // bounded-scan detail is not lost behind the full-scan
+                    // failure.
+                    JournalError::InvalidEvent(format!(
+                        "journal tail seq resolution failed (bounded scan: {first}; full scan: {second})"
+                    ))
+                })?;
+                // Explicit, not defaulted (Q2): an empty journal resolves to
+                // 0, but a non-empty journal with no seq is corruption and
+                // fails closed instead of silently restarting at 0.
+                if scan.events.is_empty() {
+                    0
+                } else {
+                    scan.events
+                        .iter()
+                        .filter_map(|event| event.get("seq").and_then(Value::as_u64))
+                        .max()
+                        .ok_or_else(|| {
+                            JournalError::InvalidEvent(
+                                "journal tail holds events without seq; refusing to guess".into(),
+                            )
+                        })?
+                }
+            }
         };
         last_seq = huge;
     }
-    Ok(last_seq.max(state_json_seq_floor(journal_path)))
+    Ok(last_seq)
 }
 
 /// Seq of a final line larger than the tail window, found by scanning
@@ -123,10 +247,9 @@ fn read_huge_tail_seq(
 ) -> Result<u64, JournalError> {
     use std::io::{Read as _, Seek as _};
     const CHUNK: u64 = 64 * 1024;
-    let cap = limits
-        .max_event_bytes
-        .map(|cap| cap as u64)
-        .unwrap_or(u64::MAX);
+    // No configured bound means the whole tail scans: the cap stays
+    // `None` instead of a fake numeric ceiling.
+    let cap = limits.max_event_bytes.map(|cap| cap as u64);
     let mut file = File::open(journal_path)?;
     // Locate the start of the last complete line by walking backwards;
     // then read that one line forward in a single bounded read.
@@ -164,9 +287,12 @@ fn read_huge_tail_seq(
         }
         // No newline in this chunk: the line extends further back.
         // Fail as soon as the line provably exceeds the cap instead of
-        // reading it to the file start.
-        scanned = scanned.saturating_add(take);
-        if scanned > cap {
+        // reading it to the file start. Counter overflow fails closed
+        // instead of saturating past the cap check (E13).
+        scanned = scanned.checked_add(take).ok_or_else(|| {
+            JournalError::InvalidEvent("journal tail scan offset overflowed".into())
+        })?;
+        if cap.is_some_and(|cap| scanned > cap) {
             return Err(JournalError::InvalidEvent(
                 "journal final line exceeds the event size limit".into(),
             ));
@@ -181,16 +307,21 @@ fn read_single_line_seq(
     file: &mut File,
     start: u64,
     end: u64,
-    cap: u64,
+    cap: Option<u64>,
 ) -> Result<u64, JournalError> {
     use std::io::{Read as _, Seek as _};
-    let line_len = end.saturating_sub(start);
+    // `end` always bounds `start` at every call site (file length or a
+    // located line end); a violation fails closed instead of clamping to an
+    // empty line (E13).
+    let line_len = end.checked_sub(start).ok_or_else(|| {
+        JournalError::InvalidEvent("journal tail offsets are inconsistent".into())
+    })?;
     if line_len == 0 {
         return Err(JournalError::InvalidEvent(
             "journal tail holds no complete line".into(),
         ));
     }
-    if line_len > cap {
+    if cap.is_some_and(|cap| line_len > cap) {
         return Err(JournalError::InvalidEvent(
             "journal final line exceeds the event size limit".into(),
         ));
@@ -209,35 +340,29 @@ fn read_single_line_seq(
 /// state.json as a seq lower bound only, combined with the window scan
 /// via max. The persisted state is written after its journal append, so it
 /// is never newer than the journal: staleness only lowers it, which max
-/// absorbs. An unreadable state file is logged, never silently equated
-/// with a zero bound.
-fn state_json_seq_floor(journal_path: &Utf8Path) -> u64 {
+/// absorbs. Conversion failures propagate (Q2): an unreadable or corrupt
+/// state file fails closed instead of silently equating with a zero bound.
+/// Absence (no state file yet) is the only case that resolves to 0.
+fn state_json_seq_floor(journal_path: &Utf8Path) -> Result<u64, JournalError> {
     let state_path = journal_path.with_file_name("state.json");
     match std::fs::read(&state_path) {
         Ok(bytes) => {
-            match serde_json::from_slice::<Value>(&bytes)
-                .ok()
-                .and_then(|state| state.get("last_seq").and_then(Value::as_u64))
-            {
-                Some(seq) => seq,
-                None => {
-                    tracing::warn!(
-                        state_path = %state_path,
-                        "state.json has no usable last_seq; seq floor comes from the journal window only"
-                    );
-                    0
-                }
-            }
+            let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+                JournalError::InvalidEvent(format!(
+                    "state.json is corrupt and cannot bound the journal tail: {error}"
+                ))
+            })?;
+            value
+                .get("last_seq")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    JournalError::InvalidEvent(
+                        "state.json has no usable last_seq; refusing to guess the tail seq".into(),
+                    )
+                })
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(error) => {
-            tracing::warn!(
-                state_path = %state_path,
-                %error,
-                "state.json unreadable; seq floor comes from the journal window only"
-            );
-            0
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(JournalError::Io(error)),
     }
 }
 
@@ -264,7 +389,33 @@ impl JournalWriter {
         event_sender: Option<broadcast::Sender<RunEvent>>,
         limits: JournalLimits,
     ) -> Result<Self, JournalError> {
+        Self::create_with_policies(
+            path,
+            run_id,
+            mirror_stdout,
+            event_sender,
+            limits,
+            qcg_policy::AuditPolicy::default(),
+            qcg_policy::AuditLimits::default(),
+        )
+    }
+
+    /// Opens the durable journal plus the sibling observation stream under
+    /// one lock. The durable fold never reads the observation stream, so an
+    /// audit policy can never change resume/replay semantics.
+    pub fn create_with_policies(
+        path: &Utf8Path,
+        run_id: impl Into<String>,
+        mirror_stdout: bool,
+        event_sender: Option<broadcast::Sender<RunEvent>>,
+        limits: JournalLimits,
+        audit_policy: qcg_policy::AuditPolicy,
+        audit_limits: qcg_policy::AuditLimits,
+    ) -> Result<Self, JournalError> {
         validate_limits(limits)?;
+        if let Err(resource) = audit_limits.validate() {
+            return Err(JournalError::InvalidLimit { resource });
+        }
         let run_id = run_id.into();
         if run_id.trim().is_empty() {
             return Err(JournalError::InvalidEvent(
@@ -274,10 +425,12 @@ impl JournalWriter {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let audit_path = audit_path_for(path);
         // Repair and initial fold hold the cross-process journal lock so a
         // live writer can never race with torn-tail truncation.
         let _journal_guard = acquire_journal_lock(path)?;
-        repair_truncated_tail_locked(path)?;
+        repair_truncated_tail_locked(path, limits)?;
+        repair_truncated_tail_locked(&audit_path, limits)?;
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         let state_path = path.with_file_name("state.json");
         // Single scan feeds both stats and the fold; a second full read
@@ -290,6 +443,13 @@ impl JournalWriter {
             })?;
             state.apply(event)?;
         }
+        if state.schema_version != crate::RUN_STATE_SCHEMA_VERSION {
+            return Err(JournalError::InvalidEvent(format!(
+                "unsupported state schema_version {}; this qcg implements {}",
+                state.schema_version,
+                crate::RUN_STATE_SCHEMA_VERSION
+            )));
+        }
         if let Some(existing) = state.run_id.as_deref()
             && existing != run_id
         {
@@ -299,8 +459,31 @@ impl JournalWriter {
         }
         // Seed identity at creation: budget reservations and other
         // run-keyed maps must never observe an ownerless state, even before
-        // the first event folds.
+        // the first event folds. The audit seq is recovered from the
+        // observation stream alone: durable and audit seqs share one space,
+        // but only audit records advance `audit_seq`.
         state.run_id = Some(run_id.clone());
+        let mut audit_seed_failed = false;
+        let audit_stats = match read_journal_values(&audit_path, audit_read_limits(audit_limits)) {
+            Ok(scan) => Some(scan.stats),
+            // A stream that already breaches the configured audit bounds
+            // degrades instead of failing the run: observation records are
+            // policy data. The durable `audit_degraded` record is emitted by
+            // the first observation append (or never, when none is written).
+            Err(_) => {
+                audit_seed_failed = true;
+                None
+            }
+        };
+        let audit_tail =
+            match read_last_seq_from_file_tail(&audit_path, audit_read_limits(audit_limits)) {
+                Ok(tail) => tail,
+                Err(_) => {
+                    audit_seed_failed = true;
+                    0
+                }
+            };
+        state.audit_seq = audit_tail;
         state.persist_atomic_with_limits(&state_path, limits.max_state_bytes)?;
         Ok(Self {
             run_id,
@@ -315,10 +498,169 @@ impl JournalWriter {
             // Unset until the first successful append: creation itself
             // repairs, so a create-time length is not a valid floor yet.
             floor_len: Arc::new(Mutex::new(None)),
+            audit_path,
+            audit_file: Arc::new(Mutex::new(None)),
+            audit_policy,
+            audit_limits,
+            audit_stats: Arc::new(Mutex::new(audit_stats)),
+            audit_degraded: Arc::new(Mutex::new(audit_seed_failed)),
         })
     }
 
+    /// Appends one record. Durable kinds take the durability path; observation
+    /// kinds are classified by [`qcg_policy::event_class`] and persisted
+    /// according to the resolved audit policy.
     pub fn event(&self, kind: &str, payload: impl Serialize) -> Result<(), JournalError> {
+        if qcg_policy::event_class(kind) == qcg_policy::EventClass::Observation {
+            return self.observation_event(kind, payload);
+        }
+        self.durable_event(kind, payload)
+    }
+
+    /// Persists one observation record, or skips it per policy. Never fails
+    /// the run: a write failure or limit breach degrades audit persistence
+    /// and records one durable `audit_degraded` marker.
+    fn observation_event(&self, kind: &str, payload: impl Serialize) -> Result<(), JournalError> {
+        match self.audit_policy.mode_for(kind) {
+            qcg_policy::AuditMode::Off => return Ok(()),
+            qcg_policy::AuditMode::Full | qcg_policy::AuditMode::Digest => {}
+        }
+        if *self
+            .audit_degraded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            return Ok(());
+        }
+        let payload = serialize_bounded(&payload, self.limits.max_event_bytes, "event")?;
+        let mut value = serde_json::from_slice::<Value>(&payload)?;
+        if !value.is_object() {
+            value = json!({ "value": value });
+        }
+        if self.audit_policy.mode_for(kind) == qcg_policy::AuditMode::Digest {
+            value = audit_digest(&value)?;
+        }
+        let journal_guard = acquire_journal_lock(&self.journal_path)?;
+        repair_truncated_tail_locked(&self.audit_path, self.limits)?;
+        let mut outcome = Ok(());
+        let event = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let seq = state
+                .last_seq
+                .max(state.audit_seq)
+                .checked_add(1)
+                .ok_or_else(|| JournalError::InvalidEvent("journal seq overflowed".into()))?;
+            let event_run_id = self.run_id.clone();
+            {
+                let object = value.as_object_mut().ok_or(JournalError::InvalidPayload)?;
+                object.insert("t".into(), Value::String(kind.into()));
+                object.insert("ts".into(), Value::String(Utc::now().to_rfc3339()));
+                object.insert("seq".into(), Value::Number(seq.into()));
+                object.insert("run_id".into(), Value::String(event_run_id.clone()));
+                object.insert(
+                    "trace_id".into(),
+                    Value::String(qcg_api::trace_id_for_run(&event_run_id)),
+                );
+                object.insert(
+                    "span_id".into(),
+                    Value::String(qcg_api::span_id_for_seq(seq)),
+                );
+                let parent_scope = object
+                    .get("node")
+                    .and_then(Value::as_str)
+                    .map(|node| format!("step:{node}"))
+                    .unwrap_or_else(|| "run".to_string());
+                object.insert(
+                    "parent_span_id".into(),
+                    Value::String(qcg_api::span_id_for_scope(&event_run_id, &parent_scope)),
+                );
+            }
+            let event = RunEvent::from_flat(&value).map_err(JournalError::InvalidEvent)?;
+            let bytes =
+                serialize_bounded(&value, self.audit_limits.max_event_bytes, "audit event")?;
+            let mut audit_file = self
+                .audit_file
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let open_error = match audit_file.as_mut() {
+                Some(_) => None,
+                None => match OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.audit_path)
+                {
+                    Ok(file) => {
+                        *audit_file = Some(file);
+                        None
+                    }
+                    Err(error) => Some(error),
+                },
+            };
+            if let Some(error) = open_error {
+                outcome = Err(JournalError::Io(error));
+            } else {
+                let mut audit_stats = self
+                    .audit_stats
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let mut stats = audit_stats.take().unwrap_or_default();
+                let limits = audit_append_limits(self.audit_limits);
+                let file = audit_file.as_mut().ok_or(JournalError::InvalidPayload)?;
+                match append_serialized_json_line(file, bytes, &mut stats, limits) {
+                    Ok(()) => {
+                        state.audit_seq = seq;
+                        *audit_stats = Some(stats);
+                    }
+                    Err(error) => outcome = Err(error),
+                }
+            }
+            event
+        };
+        // Release the journal lock before any degradation record: the
+        // durable path takes it again, and a lock held on one descriptor
+        // blocks a second acquisition even in the same thread.
+        drop(journal_guard);
+        if outcome.is_ok() {
+            // No state.json persist per observation record: the audit seq is
+            // recoverable from the observation tail at writer open, so
+            // persisting here would add an atomic write to every delta
+            // without adding a durability guarantee. The next durable record
+            // persists the counter along with the folded state.
+        } else {
+            // Degrade once, explicitly: record the reason durably and stop
+            // persisting observation records. The run itself proceeds.
+            let first = {
+                let mut degraded = self
+                    .audit_degraded
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let first = !*degraded;
+                *degraded = true;
+                first
+            };
+            if first {
+                let reason = match &outcome {
+                    Err(JournalError::LimitExceeded { .. })
+                    | Err(JournalError::EventCountExceeded { .. }) => "limit",
+                    _ => "write_failure",
+                };
+                self.durable_event(
+                    "audit_degraded",
+                    json!({ "reason": reason, "record": kind }),
+                )?;
+            }
+        }
+        if self.mirror_stdout {
+            let line = serde_json::to_string(&event)?;
+            tracing::info!("{line}");
+        }
+        if let Some(sender) = &self.event_sender {
+            let _ = sender.send(event);
+        }
+        Ok(())
+    }
+
+    fn durable_event(&self, kind: &str, payload: impl Serialize) -> Result<(), JournalError> {
         let payload = serialize_bounded(&payload, self.limits.max_event_bytes, "event")?;
         let mut value = serde_json::from_slice::<Value>(&payload)?;
         if !value.is_object() {
@@ -328,10 +670,7 @@ impl JournalWriter {
         // Every terminal event carries the accumulated cost metrics so wasted
         // spend on failed or canceled runs stays queryable afterwards.
         // Metrics must never break the event write itself.
-        if matches!(
-            kind,
-            "run_finished" | "run_error" | "run_canceled" | "run_interrupted"
-        ) {
+        if qcg_api::is_terminal_event_kind(kind) {
             match journal_metrics(
                 &self
                     .state
@@ -354,7 +693,7 @@ impl JournalWriter {
         // crash fragment can never fuse with the next append into an
         // InvalidLine. The file handle uses O_APPEND, so truncation remains
         // correct for subsequent writes.
-        repair_truncated_tail_locked(&self.journal_path)?;
+        repair_truncated_tail_locked(&self.journal_path, self.limits)?;
         let (line, event) = {
             let mut file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -387,19 +726,53 @@ impl JournalWriter {
             // duplicates and last-writer-wins state.
             let durable_seq = read_last_seq_from_tail(&self.journal_path, self.limits)?;
             if durable_seq > state.last_seq {
-                *state =
-                    crate::RunState::fold_journal_with_limits(&self.journal_path, self.limits)?;
+                *state = resync_durable_state(
+                    &self.journal_path,
+                    &self.state_path,
+                    self.limits,
+                    durable_seq,
+                )?;
                 // Rebuild stats from durable truth: limits below must
                 // enforce against what is on disk, not what this writer
                 // last wrote itself. Otherwise a peer's appends let this
                 // writer exceed configured event/byte caps (B09).
-                stats.bytes = std::fs::metadata(&self.journal_path)
+                // Unrepresentable counters fail closed instead of
+                // saturating to a wrong bound (E13).
+                let bytes = std::fs::metadata(&self.journal_path)
                     .map(|metadata| metadata.len())
-                    .map(|len| usize::try_from(len).unwrap_or(usize::MAX))
                     .map_err(JournalError::Io)?;
-                stats.events = usize::try_from(state.last_seq).unwrap_or(usize::MAX);
+                stats.bytes = usize::try_from(bytes).map_err(|_| {
+                    JournalError::InvalidEvent("journal byte count is not representable".into())
+                })?;
+                stats.events = usize::try_from(state.last_seq).map_err(|_| {
+                    JournalError::InvalidEvent("journal event count is not representable".into())
+                })?;
             }
-            let seq = state.last_seq.max(durable_seq).saturating_add(1);
+            // Durable and observation records share one seq space. After a
+            // resync (or refold) the in-memory audit counter may lag the
+            // observation stream; recover it from disk so a later audit
+            // append cannot reuse a seq. A stream that cannot be resolved
+            // degrades audit persistence instead of failing the run.
+            match read_last_seq_from_file_tail(
+                &self.audit_path,
+                audit_read_limits(self.audit_limits),
+            ) {
+                Ok(audit_tail) => state.audit_seq = state.audit_seq.max(audit_tail),
+                Err(_) => {
+                    *self
+                        .audit_degraded
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner) = true;
+                }
+            }
+            // Seq overflow fails closed: wrapping would duplicate seq values
+            // and fork journal state (E13).
+            let seq = state
+                .last_seq
+                .max(state.audit_seq)
+                .max(durable_seq)
+                .checked_add(1)
+                .ok_or_else(|| JournalError::InvalidEvent("journal seq overflowed".into()))?;
             if let Some(payload_run_id) = object.get("run_id").and_then(Value::as_str)
                 && payload_run_id != self.run_id
             {
@@ -441,26 +814,63 @@ impl JournalWriter {
                 JournalError::InvalidEvent(format!("journal event is not UTF-8: {error}"))
             })?;
             append_serialized_json_line(&mut *file, bytes, &mut stats, self.limits)?;
-            if matches!(kind, "run_finished" | "run_error" | "run_canceled") {
+            // Durability ordering (Q2): terminal events seal the run and
+            // operation mappings (`operation_started`/`operation_finished`)
+            // precede any external send, so both fsync the journal file
+            // before the atomic state persist below. The state persist
+            // (file plus parent directory sync) follows, so the mapping is
+            // durable in both the journal and state.json before the guard
+            // returns and any gateway is touched. The journal parent
+            // directory is also synced after the file sync (Q2): same
+            // durability bar as mapping persist, so the directory entry is
+            // durable alongside the bytes.
+            if qcg_api::is_terminal_event_kind(kind)
+                || matches!(kind, "operation_started" | "operation_finished")
+            {
                 file.sync_data()?;
+                sync_parent_dir(&self.journal_path)?;
             }
             *state = next_state;
             crate::RunState::persist_serialized_atomic(&self.state_path, &state_bytes)?;
             // Advance the truncation checkpoint only after the append and
             // its state persist both succeeded: this length is the new
-            // floor every future resync must meet or exceed. When the
-            // length cannot be observed, the previous floor stands: both
-            // are valid lower bounds, and inventing a length here could
-            // only mask a future truncation.
-            if let Ok(len) = std::fs::metadata(&self.journal_path).map(|metadata| metadata.len()) {
-                *floor = Some(len);
+            // floor every future resync must meet or exceed. The length is
+            // read once and reused here: a second metadata call could
+            // observe a peer's concurrent append and record a floor this
+            // writer never verified (single I/O pass). When the length
+            // cannot be observed, the previous floor stands: both are valid
+            // lower bounds, and inventing a length here could only mask a
+            // future truncation.
+            let appended_len = std::fs::metadata(&self.journal_path)
+                .map(|metadata| metadata.len())
+                .map_err(JournalError::Io)?;
+            *floor = Some(appended_len);
+            // Clean-shutdown marker (Sensitive-8): a terminal event seals
+            // the journal, so the marker is written; any other event means
+            // the run continues, so a stale marker is cleared before the
+            // call reports success. A failed terminal marker is a durability
+            // hole and fails the operation (Q2): warn-only would leave a
+            // sealed run without its shutdown claim, so both write and
+            // clear failures propagate.
+            if qcg_api::is_terminal_event_kind(kind) {
+                write_clean_shutdown_marker(&self.journal_path)?;
+            } else {
+                clear_clean_shutdown_marker(&self.journal_path)?;
             }
             (line, event)
         };
         if self.mirror_stdout {
-            println!("{line}");
+            // The mirrored line is the already-redacted journal line
+            // (secret values are digests or placeholders by construction),
+            // shown on the operator's own terminal for direct runs only.
+            // Library output routes through tracing, never stdout directly
+            // (Q2): the CLI subscriber renders it to the terminal.
+            tracing::info!("{line}");
         }
         if let Some(sender) = &self.event_sender {
+            // A send failure only means no receiver is listening; the event
+            // is already durable above, so it is intentionally ignored here
+            // and documented as best-effort broadcast (E13).
             let _ = sender.send(event);
         }
         Ok(())
@@ -543,7 +953,7 @@ impl JournalWriter {
             std::fs::create_dir_all(parent)?;
         }
         let _journal_guard = acquire_journal_lock(journal_path)?;
-        repair_truncated_tail_locked(journal_path)?;
+        repair_truncated_tail_locked(journal_path, limits)?;
         // Normalize every payload before folding so validation failures
         // reject the whole batch before anything appends.
         let mut normalized = Vec::with_capacity(events.len());
@@ -571,14 +981,42 @@ impl JournalWriter {
                 "journal run_id mismatch: expected `{run_id}`, found `{existing}`"
             )));
         }
+        // Control mutations persist state.json; preserve the observation
+        // seq recovered from the sibling stream so a later audit append
+        // cannot reuse a seq. A stream that cannot be resolved keeps the
+        // folded value: audit persistence degrades on its own path.
+        if let Ok(audit_tail) = read_last_seq_from_file_tail(
+            &audit_path_for(journal_path),
+            JournalLimits {
+                max_event_bytes: limits.max_event_bytes,
+                ..JournalLimits::default()
+            },
+        ) {
+            state.audit_seq = state.audit_seq.max(audit_tail);
+        }
         check(&state)?;
+        // The batch continues the run unless it seals it: clear a stale
+        // clean-shutdown marker before appending so a continued run never
+        // carries a shutdown claim into a later torn tail (Sensitive-8).
+        // Clearing before the first append keeps marker failures from
+        // masking append outcomes.
+        let batch_seals_run = normalized
+            .iter()
+            .any(|(kind, _)| qcg_api::is_terminal_event_kind(kind));
+        if !batch_seals_run {
+            clear_clean_shutdown_marker(journal_path)?;
+        }
         // Stats without a second full scan: strict seq monotonicity plus
         // refold-on-truncate keeps event count exactly at last_seq, and the
         // file length is the byte total.
         let file_len = std::fs::metadata(journal_path)?.len();
         let mut stats = super::types::JournalStats {
-            bytes: usize::try_from(file_len).unwrap_or(usize::MAX),
-            events: usize::try_from(state.last_seq).unwrap_or(usize::MAX),
+            bytes: usize::try_from(file_len).map_err(|_| {
+                JournalError::InvalidEvent("journal byte count is not representable".into())
+            })?,
+            events: usize::try_from(state.last_seq).map_err(|_| {
+                JournalError::InvalidEvent("journal event count is not representable".into())
+            })?,
         };
         let mut file = OpenOptions::new()
             .create(true)
@@ -589,8 +1027,15 @@ impl JournalWriter {
         let mut needs_sync = false;
         for (kind, mut value) in normalized {
             // Reject duplicate or out-of-order service writes instead of
-            // silently keeping last-writer-wins state.
-            let seq = state.last_seq.saturating_add(1);
+            // silently keeping last-writer-wins state. The observation
+            // stream shares this seq space, so the next seq clears both
+            // counters. Seq overflow fails closed instead of wrapping into
+            // duplicates (E13).
+            let seq = state
+                .last_seq
+                .max(state.audit_seq)
+                .checked_add(1)
+                .ok_or_else(|| JournalError::InvalidEvent("journal seq overflowed".into()))?;
             {
                 let object = value.as_object_mut().ok_or(JournalError::InvalidPayload)?;
                 object.insert("t".into(), Value::String(kind.into()));
@@ -610,22 +1055,32 @@ impl JournalWriter {
             state.apply(&value)?;
             let bytes = serialize_bounded(&value, limits.max_event_bytes, "event")?;
             append_serialized_json_line(&mut file, bytes, &mut stats, limits)?;
-            if matches!(
-                kind,
-                "run_finished" | "run_error" | "run_canceled" | "run_interrupted"
-            ) {
+            if qcg_api::is_terminal_event_kind(kind)
+                || matches!(kind, "operation_started" | "operation_finished")
+            {
                 needs_sync = true;
             }
             appended.push(event);
         }
         if needs_sync {
             file.sync_data()?;
+            sync_parent_dir(journal_path)?;
         }
         let state_bytes = serialize_bounded(&state, limits.max_state_bytes, "state")?;
         let state_path = journal_path.with_file_name("state.json");
         crate::RunState::persist_serialized_atomic(&state_path, &state_bytes)?;
+        // A sealing batch writes the clean-shutdown marker after the state
+        // persist (Sensitive-8). A marker failure is a durability hole and
+        // fails the batch (Q2): warn-only would leave a sealed run without
+        // its shutdown claim.
+        if batch_seals_run {
+            write_clean_shutdown_marker(journal_path)?;
+        }
         if let Some(sender) = &event_sender {
             for event in &appended {
+                // Broadcast only: the batch is durable, so a missing
+                // receiver is intentionally ignored here and documented as
+                // best-effort (E13).
                 let _ = sender.send(event.clone());
             }
         }
@@ -644,6 +1099,12 @@ impl JournalWriter {
             limits: self.limits,
             stats: Arc::clone(&self.stats),
             floor_len: Arc::clone(&self.floor_len),
+            audit_path: self.audit_path.clone(),
+            audit_file: Arc::clone(&self.audit_file),
+            audit_policy: self.audit_policy.clone(),
+            audit_limits: self.audit_limits,
+            audit_stats: Arc::clone(&self.audit_stats),
+            audit_degraded: Arc::clone(&self.audit_degraded),
         })
     }
 
@@ -655,12 +1116,64 @@ impl JournalWriter {
     }
 }
 
+/// Observation stream path for one run: a sibling of the durable journal.
+pub fn audit_path_for(journal_path: &Utf8Path) -> Utf8PathBuf {
+    journal_path.with_file_name("audit.jsonl")
+}
+
+/// Digest projection for `AuditMode::Digest`: every string in the
+/// observation payload is replaced by its content digest. Types and schema
+/// shape are preserved, so the record still parses as its typed event while
+/// the content itself is not retained.
+fn audit_digest(value: &Value) -> Result<Value, JournalError> {
+    use sha2::Digest as _;
+    fn digest_strings(value: &mut Value) {
+        match value {
+            Value::String(text) => {
+                let digest = hex::encode(sha2::Sha256::digest(text.as_bytes()));
+                *text = format!("sha256:{digest}");
+            }
+            Value::Array(items) => {
+                for item in items {
+                    digest_strings(item);
+                }
+            }
+            Value::Object(map) => {
+                for item in map.values_mut() {
+                    digest_strings(item);
+                }
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        }
+    }
+    let mut digested = value.clone();
+    digest_strings(&mut digested);
+    Ok(digested)
+}
+
+/// Limits used when scanning the observation stream (seed, resync, merge).
+pub(crate) fn audit_read_limits(limits: qcg_policy::AuditLimits) -> JournalLimits {
+    JournalLimits {
+        max_event_bytes: limits.max_event_bytes,
+        max_total_bytes: limits.max_total_bytes,
+        max_event_count: limits.max_event_count,
+        max_state_bytes: None,
+        scan_window_bytes: None,
+    }
+}
+
+/// Limits enforced while appending observation records.
+pub(crate) fn audit_append_limits(limits: qcg_policy::AuditLimits) -> JournalLimits {
+    audit_read_limits(limits)
+}
+
 pub(crate) fn validate_limits(limits: JournalLimits) -> Result<(), JournalError> {
     for (resource, value) in [
         ("max_event_bytes", limits.max_event_bytes),
         ("max_total_bytes", limits.max_total_bytes),
         ("max_event_count", limits.max_event_count),
         ("max_state_bytes", limits.max_state_bytes),
+        ("scan_window_bytes", limits.scan_window_bytes),
     ] {
         if value == Some(0) {
             return Err(JournalError::InvalidLimit { resource });
@@ -681,32 +1194,39 @@ pub(crate) fn validate_limits(limits: JournalLimits) -> Result<(), JournalError>
 /// never silently dropped and still surfaces as `InvalidLine` on read.
 /// Bounded torn-tail repair for maintenance paths that already hold the
 /// journal lock and the run execution lease with no live writer.
-pub fn repair_truncated_tail_locked(path: &Utf8Path) -> Result<(), JournalError> {
+pub fn repair_truncated_tail_locked(
+    path: &Utf8Path,
+    limits: JournalLimits,
+) -> Result<(), JournalError> {
     if !path.exists() {
         return Ok(());
     }
-    // Bounded tail inspection: only the final 1 MiB plus one line is read
-    // before the configured limits are enforced, so a huge journal never
-    // forces a full read here (C05).
-    const SCAN_WINDOW: u64 = 1024 * 1024;
+    // Bounded tail inspection: only the configured scan window plus one
+    // line is read before the configured limits are enforced, so a huge
+    // journal never forces a full read here (C05).
+    let scan_window = limits
+        .scan_window_bytes
+        .map(|value| value as u64)
+        .unwrap_or(1024 * 1024)
+        .max(4 * 1024);
     let metadata = std::fs::metadata(path)?;
     let len = metadata.len();
     if len == 0 {
         return Ok(());
     }
-    if len <= SCAN_WINDOW {
+    if len <= scan_window {
         let bytes = std::fs::read(path)?;
         if bytes.is_empty() || bytes.last() == Some(&b'\n') {
             return Ok(());
         }
         return repair_tail_bytes(path, &bytes, 0);
     }
-    let start = len.saturating_sub(SCAN_WINDOW);
+    let start = len.saturating_sub(scan_window);
     let mut file = File::open(path)?;
     use std::io::{Read as _, Seek as _};
     file.seek(std::io::SeekFrom::Start(start))?;
-    let mut bytes = Vec::with_capacity(SCAN_WINDOW as usize);
-    file.take(SCAN_WINDOW).read_to_end(&mut bytes)?;
+    let mut bytes = Vec::with_capacity(scan_window as usize);
+    file.take(scan_window).read_to_end(&mut bytes)?;
     if bytes.last() == Some(&b'\n') {
         return Ok(());
     }
@@ -719,7 +1239,7 @@ pub fn repair_truncated_tail_locked(path: &Utf8Path) -> Result<(), JournalError>
             let tail_start = start + pos as u64 + 1;
             repair_tail_at(path, &tail, tail_start)
         }
-        None => repair_tail_backscan(path, start, bytes),
+        None => repair_tail_backscan(path, start, bytes, scan_window),
     }
 }
 
@@ -731,15 +1251,14 @@ fn repair_tail_backscan(
     path: &Utf8Path,
     mut scan_end: u64,
     mut tail: Vec<u8>,
+    scan_window: u64,
 ) -> Result<(), JournalError> {
-    // Bounded tail inspection: only the final 1 MiB plus one line is read
-    // before the configured limits are enforced, so a huge journal never
-    // forces a full read here (C05).
-    const SCAN_WINDOW: u64 = 1024 * 1024;
-    const MAX_BACKSCAN: u64 = 16 * 1024 * 1024;
+    // The backscan bound scales with the configured window so repair memory
+    // stays flat and proportional to one explicit contract bound.
+    let max_backscan = scan_window.saturating_mul(16);
     use std::io::{Read as _, Seek as _};
     loop {
-        let scan_start = scan_end.saturating_sub(SCAN_WINDOW);
+        let scan_start = scan_end.saturating_sub(scan_window);
         let mut file = File::open(path)?;
         file.seek(std::io::SeekFrom::Start(scan_start))?;
         let mut chunk = vec![0u8; (scan_end - scan_start) as usize];
@@ -750,9 +1269,9 @@ fn repair_tail_backscan(
             let tail_start = scan_start + pos as u64 + 1;
             return repair_tail_at(path, &full_tail, tail_start);
         }
-        if tail.len() + chunk.len() > MAX_BACKSCAN as usize {
+        if tail.len() + chunk.len() > max_backscan as usize {
             return Err(JournalError::InvalidEvent(format!(
-                "journal tail exceeds {MAX_BACKSCAN} bytes without a line boundary; refusing unbounded repair"
+                "journal tail exceeds {max_backscan} bytes without a line boundary; refusing unbounded repair"
             )));
         }
         chunk.extend_from_slice(&tail);
@@ -771,6 +1290,39 @@ fn repair_tail_bytes(path: &Utf8Path, bytes: &[u8], base: u64) -> Result<(), Jou
 }
 
 fn repair_tail_at(path: &Utf8Path, tail: &[u8], tail_start: u64) -> Result<(), JournalError> {
+    // Tamper gate (Sensitive-8): a torn tail on a journal that shut down
+    // cleanly is damage to durable history, not a crash remnant. The marker
+    // must read as a non-symlink regular file with the exact magic content
+    // below; absence reads as no marker, while any other inspection failure
+    // propagates so a possibly tampered journal never repairs on an
+    // unreadable marker (fail closed). Coupling note (Q2): the marker
+    // write itself fails the operation on failure (see `JournalWriter::event`
+    // and `append_events_if`), so a missing marker at repair time means the
+    // terminal event never reported success — either no terminal event ran
+    // or its failure already surfaced. The truncated tail still repairs
+    // conservatively (prior events survive, the fragment is dropped), never
+    // by inventing events.
+    let clean_shutdown = match std::fs::read(clean_shutdown_marker_path(path)) {
+        Ok(bytes) => bytes == CLEAN_SHUTDOWN_MAGIC,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(JournalError::Io(error)),
+    };
+    // A non-symlink check stays: a link at the marker path is damage, never
+    // a shutdown claim, even with magic content.
+    if clean_shutdown
+        && std::fs::symlink_metadata(clean_shutdown_marker_path(path))
+            .is_ok_and(|meta| meta.file_type().is_symlink())
+    {
+        return Err(JournalError::InvalidEvent(
+            "clean-shutdown marker is a symbolic link; refusing repair as possible tampering"
+                .into(),
+        ));
+    }
+    if clean_shutdown {
+        return Err(JournalError::InvalidEvent(
+            "journal tail is truncated but a clean-shutdown marker is present; refusing repair as possible tampering".into(),
+        ));
+    }
     if tail.iter().all(u8::is_ascii_whitespace) {
         // Trailing whitespace without a newline carries no event; truncate
         // it so the next append starts on a clean line.
@@ -803,4 +1355,233 @@ fn truncate_to(path: &Utf8Path, len: u64) -> Result<(), JournalError> {
     file.set_len(len)?;
     file.sync_data()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{JournalWriter, clean_shutdown_marker_path};
+    use crate::JournalLimits;
+    use serde_json::json;
+
+    fn marker_fail_dir(case: &str) -> (std::path::PathBuf, camino::Utf8PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "qcg-journal-marker-fail-{case}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&dir).expect("test dir should be created");
+        let path = camino::Utf8PathBuf::from_path_buf(dir.join("journal.jsonl"))
+            .expect("temporary path must be UTF-8");
+        (dir, path)
+    }
+
+    #[test]
+    fn failed_terminal_marker_fails_the_event_operation() {
+        // Q2: a failed terminal marker is a durability hole, so the event
+        // operation fails instead of warn-only. A directory planted at the
+        // marker path makes the marker write fail on any platform with real
+        // filesystem semantics (no mocks).
+        let (dir, path) = marker_fail_dir("event");
+        let journal = JournalWriter::create(&path, "marker-fail-run", false, None)
+            .expect("journal should open");
+        journal
+            .event(
+                "run_started",
+                json!({
+                    "generator": "marker-fail@1.0.0",
+                    "generator_path": "marker-fail",
+                    "contract_sha256": "abc",
+                    "inputs": {},
+                    "resource_hashes": [],
+                    "qcg": "0.1.0",
+                    "schema_version": qcg_api::JOURNAL_SCHEMA_VERSION,
+                }),
+            )
+            .expect("run_started should append");
+        std::fs::create_dir(clean_shutdown_marker_path(&path))
+            .expect("marker-path directory should be created");
+        let error = journal
+            .event("run_finished", json!({ "status": "success" }))
+            .expect_err("a failed terminal marker must fail the operation");
+        assert!(
+            matches!(error, crate::JournalError::Io(_)),
+            "the marker write failure must propagate as an error: {error}"
+        );
+        std::fs::remove_dir(clean_shutdown_marker_path(&path))
+            .expect("marker-path directory should be removable");
+        std::fs::remove_dir_all(&dir).expect("test dir should be removed");
+    }
+
+    fn audit_test_journal(
+        case: &str,
+        policy: qcg_policy::AuditPolicy,
+        limits: qcg_policy::AuditLimits,
+    ) -> (std::path::PathBuf, camino::Utf8PathBuf, JournalWriter) {
+        let (dir, path) = marker_fail_dir(case);
+        let journal = JournalWriter::create_with_policies(
+            &path,
+            format!("audit-{case}"),
+            false,
+            None,
+            JournalLimits::default(),
+            policy,
+            limits,
+        )
+        .expect("journal should open");
+        (dir, path, journal)
+    }
+
+    #[test]
+    fn audit_policy_off_keeps_observation_records_out_of_both_streams() {
+        let (dir, path, journal) = audit_test_journal(
+            "off",
+            qcg_policy::AuditPolicy {
+                default_mode: qcg_policy::AuditMode::Off,
+                classes: std::collections::BTreeMap::new(),
+            },
+            qcg_policy::AuditLimits::default(),
+        );
+        journal
+            .event(
+                "llm_delta",
+                json!({ "provider": "p", "model": "m", "index": 0, "text": "observation" }),
+            )
+            .expect("filtered observation record must not fail the run");
+        journal
+            .event(
+                "run_finished",
+                json!({ "status": "success", "metrics": {} }),
+            )
+            .expect("durable record must append");
+        let durable = std::fs::read_to_string(&path).expect("journal should read");
+        assert!(!durable.contains("llm_delta"));
+        assert!(durable.contains("run_finished"));
+        assert!(
+            !super::audit_path_for(&path).exists(),
+            "a policy that persists no observation record must not create the stream"
+        );
+        std::fs::remove_dir_all(&dir).expect("test dir should be removed");
+    }
+
+    #[test]
+    fn audit_digest_replaces_the_payload_with_its_digest() {
+        let (dir, path, journal) = audit_test_journal(
+            "digest",
+            qcg_policy::AuditPolicy {
+                default_mode: qcg_policy::AuditMode::Digest,
+                classes: std::collections::BTreeMap::new(),
+            },
+            qcg_policy::AuditLimits::default(),
+        );
+        journal
+            .event(
+                "llm_delta",
+                json!({ "provider": "p", "model": "m", "index": 0, "text": "super-secret" }),
+            )
+            .expect("digest record should append");
+        journal
+            .event(
+                "run_finished",
+                json!({ "status": "success", "metrics": {} }),
+            )
+            .expect("durable record must append");
+        let audit = std::fs::read_to_string(super::audit_path_for(&path))
+            .expect("audit stream should exist");
+        assert!(audit.contains("llm_delta"));
+        assert!(
+            !audit.contains("super-secret"),
+            "digest must not retain content"
+        );
+        assert!(audit.contains("sha256"));
+        let durable = std::fs::read_to_string(&path).expect("journal should read");
+        assert!(!durable.contains("llm_delta"));
+        std::fs::remove_dir_all(&dir).expect("test dir should be removed");
+    }
+
+    #[test]
+    fn audit_limit_breach_degrades_without_failing_the_run() {
+        let (dir, path, journal) = audit_test_journal(
+            "degrade",
+            qcg_policy::AuditPolicy::default(),
+            qcg_policy::AuditLimits {
+                max_event_bytes: None,
+                max_total_bytes: None,
+                max_event_count: Some(1),
+            },
+        );
+        journal
+            .event(
+                "llm_delta",
+                json!({ "provider": "p", "model": "m", "index": 0, "text": "first" }),
+            )
+            .expect("first observation record should append");
+        journal
+            .event(
+                "llm_delta",
+                json!({ "provider": "p", "model": "m", "index": 0, "text": "second" }),
+            )
+            .expect("a breach must degrade, never fail");
+        journal
+            .event(
+                "run_finished",
+                json!({ "status": "success", "metrics": {} }),
+            )
+            .expect("the run must still settle");
+        let durable = std::fs::read_to_string(&path).expect("journal should read");
+        assert!(durable.contains("audit_degraded"));
+        assert!(!durable.contains("second"));
+        let audit = std::fs::read_to_string(super::audit_path_for(&path))
+            .expect("audit stream should exist");
+        assert!(audit.contains("first"));
+        assert!(!audit.contains("second"));
+        std::fs::remove_dir_all(&dir).expect("test dir should be removed");
+    }
+
+    #[test]
+    fn failed_terminal_marker_fails_the_batch_operation() {
+        // Q2: the batch append path carries the same bar: a sealing batch
+        // whose marker write fails reports the failure instead of sealing
+        // silently without its shutdown claim.
+        let (dir, path) = marker_fail_dir("batch");
+        JournalWriter::create(&path, "marker-fail-batch", false, None)
+            .expect("journal should open");
+        JournalWriter::append_single_event(
+            &path,
+            "marker-fail-batch",
+            "run_started",
+            json!({
+                "generator": "marker-fail@1.0.0",
+                "generator_path": "marker-fail",
+                "contract_sha256": "abc",
+                "inputs": {},
+                "resource_hashes": [],
+                "qcg": "0.1.0",
+                "schema_version": qcg_api::JOURNAL_SCHEMA_VERSION,
+            }),
+            JournalLimits::default(),
+            None,
+        )
+        .expect("run_started should append");
+        std::fs::create_dir(clean_shutdown_marker_path(&path))
+            .expect("marker-path directory should be created");
+        let error = JournalWriter::append_single_event(
+            &path,
+            "marker-fail-batch",
+            "run_finished",
+            // The batch path attaches no automatic metrics: the payload
+            // carries the (all-default) metrics object explicitly so the
+            // failure below proves the marker hole, not a shape error.
+            json!({ "status": "success", "metrics": {} }),
+            JournalLimits::default(),
+            None,
+        )
+        .expect_err("a failed batch terminal marker must fail the operation");
+        assert!(
+            matches!(error, crate::JournalError::Io(_)),
+            "the batch marker write failure must propagate as an error: {error}"
+        );
+        std::fs::remove_dir(clean_shutdown_marker_path(&path))
+            .expect("marker-path directory should be removable");
+        std::fs::remove_dir_all(&dir).expect("test dir should be removed");
+    }
 }

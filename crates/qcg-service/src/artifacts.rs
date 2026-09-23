@@ -127,10 +127,11 @@ fn write_artifacts_zip_stream_bounded<W: Write>(
         .iter()
         .try_fold(0_u64, |total, artifact| total.checked_add(artifact.bytes))
         .ok_or_else(|| ServiceError::Invalid("artifact zip size overflowed".into()))?;
-    if limits.max_bytes.is_some_and(|limit| total_bytes > limit) {
+    if let Some(limit) = limits.max_bytes
+        && total_bytes > limit
+    {
         return Err(ServiceError::Invalid(format!(
-            "artifact zip source bytes exceed limit: {total_bytes} > {}",
-            limits.max_bytes.unwrap_or(u64::MAX)
+            "artifact zip source bytes exceed limit: {total_bytes} > {limit}"
         )));
     }
     check_verified_artifact_hashes(&verified)?;
@@ -147,10 +148,11 @@ fn write_artifacts_zip_stream_bounded<W: Write>(
         .len()
         .checked_add(verified.len())
         .ok_or_else(|| ServiceError::Invalid("artifact zip entry count overflowed".into()))?;
-    if limits.max_entries.is_some_and(|limit| entry_count > limit) {
+    if let Some(limit) = limits.max_entries
+        && entry_count > limit
+    {
         return Err(ServiceError::Invalid(format!(
-            "artifact zip entries exceed limit: {entry_count} > {}",
-            limits.max_entries.unwrap_or(usize::MAX)
+            "artifact zip entries exceed limit: {entry_count} > {limit}"
         )));
     }
     let mut zip = zip::ZipWriter::new_stream(writer);
@@ -171,10 +173,11 @@ fn write_artifacts_zip_stream_bounded<W: Write>(
     }
     let writer = zip.finish().map_err(artifact_zip_error)?.into_inner();
     if writer.exceeded {
-        return Err(ServiceError::Invalid(format!(
-            "artifact zip output exceeds {} bytes",
-            writer.limit.unwrap_or(u64::MAX)
-        )));
+        let detail = match writer.limit {
+            Some(limit) => format!("artifact zip output exceeds {limit} bytes"),
+            None => "artifact zip output exceeded its bound".to_string(),
+        };
+        return Err(ServiceError::Invalid(detail));
     }
     Ok(())
 }
@@ -222,16 +225,20 @@ pub fn write_run_bundle_stream_with_limits<W: Write>(
             parent = directory.parent();
         }
     }
+    let audit_path = journal.with_file_name("audit.jsonl");
+    let audit_present = audit_path.exists();
     let entry_count = meta
         .len()
         .checked_add(1)
+        .and_then(|count| count.checked_add(usize::from(audit_present)))
         .and_then(|count| count.checked_add(directories.len()))
         .and_then(|count| count.checked_add(verified.len()))
         .ok_or_else(|| ServiceError::Invalid("run bundle entry count overflowed".into()))?;
-    if limits.max_entries.is_some_and(|limit| entry_count > limit) {
+    if let Some(limit) = limits.max_entries
+        && entry_count > limit
+    {
         return Err(ServiceError::Invalid(format!(
-            "run bundle entries exceed limit: {entry_count} > {}",
-            limits.max_entries.unwrap_or(usize::MAX)
+            "run bundle entries exceed limit: {entry_count} > {limit}"
         )));
     }
     let mut zip = zip::ZipWriter::new_stream(CountingWriter::new(writer, limits.max_bytes));
@@ -245,6 +252,12 @@ pub fn write_run_bundle_stream_with_limits<W: Write>(
         zip.start_file("journal.jsonl", bundle_entry_options(false))
             .map_err(artifact_zip_error)?;
         std::io::copy(&mut journal_file, &mut zip)?;
+    }
+    if audit_present {
+        let mut audit_file = File::open(&audit_path)?;
+        zip.start_file("audit.jsonl", bundle_entry_options(false))
+            .map_err(artifact_zip_error)?;
+        std::io::copy(&mut audit_file, &mut zip)?;
     }
     for directory in directories {
         zip.add_directory(format!("{directory}/"), bundle_entry_options(true))
@@ -261,10 +274,11 @@ pub fn write_run_bundle_stream_with_limits<W: Write>(
     }
     let writer = zip.finish().map_err(artifact_zip_error)?.into_inner();
     if writer.exceeded {
-        return Err(ServiceError::Invalid(format!(
-            "run bundle output exceeds {} bytes",
-            writer.limit.unwrap_or(u64::MAX)
-        )));
+        let detail = match writer.limit {
+            Some(limit) => format!("run bundle output exceeds {limit} bytes"),
+            None => "run bundle output exceeded its bound".to_string(),
+        };
+        return Err(ServiceError::Invalid(detail));
     }
     Ok(())
 }
@@ -300,7 +314,7 @@ impl<W: Write> Write for CountingWriter<W> {
             return Ok(bytes.len());
         };
         let remaining = usize::try_from(limit.saturating_sub(self.written))
-            .unwrap_or(usize::MAX)
+            .map_err(|_| std::io::Error::other("artifact zip output size overflowed"))?
             .min(bytes.len());
         if remaining > 0 {
             self.inner.write_all(&bytes[..remaining])?;
@@ -322,6 +336,10 @@ impl<W: Write> Write for CountingWriter<W> {
     }
 }
 
+/// Explicit zip modes for artifact entries. Unix file modes come from the
+/// source file itself; synthesized bundle entries carry fixed modes. No
+/// path relies on the zip default and no platform synthesizes a different
+/// readonly fallback: every entry declares its mode explicitly (E15).
 fn artifact_zip_options(
     metadata: &std::fs::Metadata,
     directory: bool,
@@ -343,27 +361,44 @@ fn artifact_zip_options(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        options = options.unix_permissions(metadata.permissions().mode());
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode == 0 {
+            return Err(ServiceError::Invalid(
+                "artifact file mode is zero; refusing to archive a modeless entry".into(),
+            ));
+        }
+        options = options.unix_permissions(mode);
+    }
+    #[cfg(not(unix))]
+    {
+        // No silent default: non-Unix metadata carries no Unix mode, so
+        // declare the entry mode from the file type and readonly bit
+        // instead of letting the zip writer synthesize one (E15).
+        let mode = if directory {
+            0o755
+        } else if metadata.permissions().readonly() {
+            0o444
+        } else {
+            0o644
+        };
+        options = options.unix_permissions(mode);
     }
     Ok(options)
 }
 
 /// Fixed zip options for synthesized bundle entries (no source file metadata).
+/// The mode is always explicit (0o755 for directories, 0o644 for files) on
+/// every platform: callers must not rely on zip defaults or platform
+/// readonly synthesis (E15).
 fn bundle_entry_options(directory: bool) -> SimpleFileOptions {
     let compression = if directory {
         zip::CompressionMethod::Stored
     } else {
         zip::CompressionMethod::Deflated
     };
-    let options = SimpleFileOptions::default().compression_method(compression);
-    #[cfg(unix)]
-    {
-        options.unix_permissions(if directory { 0o755 } else { 0o644 })
-    }
-    #[cfg(not(unix))]
-    {
-        options
-    }
+    SimpleFileOptions::default()
+        .compression_method(compression)
+        .unix_permissions(if directory { 0o755 } else { 0o644 })
 }
 
 pub(crate) fn api_bad_request(message: impl Into<String>) -> ApiError {

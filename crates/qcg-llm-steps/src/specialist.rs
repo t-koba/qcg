@@ -3,7 +3,7 @@ use qcg_contract::{LlmRequestPolicy, NodeDef, ToolDecl};
 use qcg_engine::{ResultExt, StepContext, StepError};
 use qcg_llm::{ChatContent, ChatMessage, ChatToolCall};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 use crate::agent::{agent_tool_requires_serial_execution, charge_agent_tool_call};
@@ -93,7 +93,7 @@ pub(crate) async fn execute_specialist_agent(
         .transpose()?;
     let tool_specs = delegated_tools
         .iter()
-        .map(|tool| tool_spec(tool, mcp))
+        .map(|tool| tool_spec(ctx, tool, mcp))
         .collect::<Result<Vec<_>, _>>()?;
     let task = serde_json::to_string(args)?;
     let mut messages = vec![ChatMessage::text(
@@ -105,6 +105,13 @@ pub(crate) async fn execute_specialist_agent(
     let mut tokens_total = 0_u64;
     let mut tool_calls_total = 0_usize;
     let mut tool_call_counts = BTreeMap::<String, usize>::new();
+    let mut activated_skills = BTreeSet::new();
+    // E07a/E08-1: used-call registry for the specialist path, mirroring the
+    // outer agent loop (`agent.rs`). The same delegated call id with the
+    // same canonical (redacted, salted) hash resumes idempotently, while
+    // the same id with different args fails closed so a specialist replay
+    // cannot complete a new question with an old answer.
+    let mut used_calls = BTreeMap::<String, String>::new();
     let mut last_validation_error = None;
     ctx.journal
         .event(
@@ -388,6 +395,34 @@ pub(crate) async fn execute_specialist_agent(
                 )?;
                 return Err(error);
             }
+            // E07a/E08-1 (same registry pre-check as the outer agent loop):
+            // every specialist call registers its salted canonical identity
+            // hash (run-id salt). Same id + same hash resumes idempotently;
+            // same id + different hash fails closed.
+            if let Err(error) = crate::agent_runtime::agent_call_identity_hash_for_tool(
+                &node.id,
+                &ctx.run.run_id,
+                all_tools,
+                &call.name,
+                &call.args,
+            )
+            .and_then(|hash| {
+                crate::agent_runtime::check_used_call_id(&node.id, &mut used_calls, &call.id, &hash)
+            }) {
+                record_tool_call_failure(
+                    ctx,
+                    node,
+                    &call,
+                    &error,
+                    tool_call_failure(
+                        Some(agent_name),
+                        ToolCallPhase::InputValidation,
+                        ToolCallErrorCode::InvalidArguments,
+                        tool_started,
+                    ),
+                )?;
+                return Err(error);
+            }
             let outcome = match Box::pin(execute_agent_tool(
                 ctx,
                 node,
@@ -399,6 +434,7 @@ pub(crate) async fn execute_specialist_agent(
                     call_id: &call.id,
                     call_number: tool_call_counts[&call.name],
                     args: &call.args,
+                    activated_skills: &mut activated_skills,
                 },
             ))
             .await

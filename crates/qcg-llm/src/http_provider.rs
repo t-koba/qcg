@@ -21,10 +21,14 @@ use crate::parse::{
     parse_responses_response,
 };
 use crate::payload::{anthropic_payload, chat_completions_payload, responses_payload};
-use crate::provider::{ApiFlavor, ChatTokenLimitField, LlmProvider, ProviderSpec};
+use crate::provider::{
+    ApiFlavor, ChatTokenLimitField, DEFAULT_RETRY_BACKOFF_EXPONENT_CAP,
+    DEFAULT_RETRY_RATE_LIMIT_FLOOR_MS, LlmProvider, ModelPricing, ModelSpec, PromptCacheField,
+    ProviderSpec,
+};
 use crate::stream::{HttpStreamAccumulator, json_contains_string_fragment};
 use crate::types::{
-    Capabilities, ChatRequest, ChatResponse, ChatStreamEvent, LlmError, LlmErrorKind,
+    Capabilities, ChatRequest, ChatResponse, ChatStreamEvent, LlmError, LlmErrorKind, PromptCache,
 };
 use crate::validate::{
     validate_chat_request, validate_multimodal_capabilities,
@@ -41,12 +45,17 @@ pub struct HttpProvider {
     credential_env: Option<String>,
     credential_file_env: Option<String>,
     capabilities: Capabilities,
+    models: BTreeMap<String, ModelSpec>,
     path_template: Option<String>,
     query: BTreeMap<String, String>,
     timeout_seconds: u64,
     retry_attempts: usize,
     retry_base_backoff_ms: u64,
+    stream_retry_attempts: usize,
+    retry_rate_limit_floor_ms: u64,
+    retry_backoff_exponent_cap: u32,
     chat_token_limit_field: ChatTokenLimitField,
+    prompt_cache_field: Option<PromptCacheField>,
     response_body_limit_bytes: usize,
     config_errors: Vec<String>,
     client: Option<Client>,
@@ -161,14 +170,27 @@ impl HttpProvider {
             credential_env: spec.api_key_env,
             credential_file_env: spec.api_key_file_env,
             capabilities: spec.capabilities,
+            models: spec
+                .models
+                .into_iter()
+                .map(|model| (model.id.clone(), model))
+                .collect(),
             path_template: spec.path_template,
             query,
             timeout_seconds: spec.timeout_seconds.unwrap_or(120),
             retry_attempts: spec.retry_attempts.unwrap_or(3),
             retry_base_backoff_ms: spec.retry_base_backoff_ms.unwrap_or(200),
+            stream_retry_attempts: spec.stream_retry_attempts.unwrap_or(0) as usize,
+            retry_rate_limit_floor_ms: spec
+                .retry_rate_limit_floor_ms
+                .unwrap_or(DEFAULT_RETRY_RATE_LIMIT_FLOOR_MS),
+            retry_backoff_exponent_cap: spec
+                .retry_backoff_exponent_cap
+                .unwrap_or(DEFAULT_RETRY_BACKOFF_EXPONENT_CAP),
             chat_token_limit_field: spec
                 .chat_token_limit_field
                 .unwrap_or(ChatTokenLimitField::MaxTokens),
+            prompt_cache_field: spec.prompt_cache_field,
             response_body_limit_bytes: spec
                 .response_body_limit_bytes
                 .unwrap_or(DEFAULT_RESPONSE_BODY_LIMIT_BYTES),
@@ -187,11 +209,48 @@ impl HttpProvider {
         }
     }
 
+    pub fn capabilities_for_model(&self, model: &str) -> Capabilities {
+        match self.models.get(model) {
+            Some(spec) => spec.effective_capabilities(&self.capabilities),
+            None => self.capabilities.clone(),
+        }
+    }
+
+    pub fn pricing_for_model(&self, model: &str) -> Option<ModelPricing> {
+        self.models.get(model).and_then(ModelSpec::pricing)
+    }
+
+    /// Resolves the cache mechanism for one request. An `auto` request against
+    /// a provider that does not advertise support fails explicitly instead of
+    /// silently dropping the declared policy.
+    fn prompt_cache_field_for(
+        &self,
+        req: &ChatRequest,
+        capabilities: &Capabilities,
+    ) -> Result<Option<PromptCacheField>, LlmError> {
+        if req.prompt_cache != PromptCache::Auto {
+            return Ok(None);
+        }
+        if !capabilities.prompt_cache {
+            return Err(LlmError::new(format!(
+                "{} provider does not support prompt caching",
+                self.id
+            )));
+        }
+        self.prompt_cache_field.map(Some).ok_or_else(|| {
+            LlmError::new(format!(
+                "{} provider enables prompt caching without a `prompt_cache_field`",
+                self.id
+            ))
+        })
+    }
+
     fn default_path(api: ApiFlavor) -> &'static str {
         match api {
             ApiFlavor::ChatCompletions => "chat/completions",
             ApiFlavor::Responses => "responses",
             ApiFlavor::AnthropicMessages => "messages",
+            ApiFlavor::SystemOne => "systemone",
         }
     }
 
@@ -333,6 +392,16 @@ impl HttpProvider {
     }
 
     async fn send(&self, payload: Value, model: &str) -> Result<ChatResponse, LlmError> {
+        let value = self.send_json(payload, model).await?;
+        match self.api {
+            ApiFlavor::ChatCompletions => parse_chat_completions_response(value),
+            ApiFlavor::Responses => parse_responses_response(value),
+            ApiFlavor::AnthropicMessages => parse_anthropic_response(value),
+            ApiFlavor::SystemOne => Err(LlmError::new("system_one requires typed decisions")),
+        }
+    }
+
+    async fn send_json(&self, payload: Value, model: &str) -> Result<Value, LlmError> {
         if let Some(error) = self.configuration_error_for(&self.id) {
             return Err(LlmError::new(error));
         }
@@ -416,11 +485,7 @@ impl HttpProvider {
                 self.id
             )));
         }
-        match self.api {
-            ApiFlavor::ChatCompletions => parse_chat_completions_response(value),
-            ApiFlavor::Responses => parse_responses_response(value),
-            ApiFlavor::AnthropicMessages => parse_anthropic_response(value),
-        }
+        Ok(value)
     }
 
     async fn send_stream(
@@ -462,7 +527,7 @@ impl HttpProvider {
         }
         let mut stream = SseStream::from_bytes_stream(response.bytes_stream());
         let mut total_bytes = 0_usize;
-        let mut accumulator = HttpStreamAccumulator::new(self.api);
+        let mut accumulator = HttpStreamAccumulator::new(self.api)?;
         // Pre-publication gate for the provider credential (B04): text
         // deltas pass through it, and only prefixes proven free of the
         // credential are released downstream. A metadata-mixed window can
@@ -660,8 +725,30 @@ impl LlmProvider for HttpProvider {
         Duration::from_millis(self.retry_base_backoff_ms)
     }
 
+    fn stream_retry_attempts(&self) -> usize {
+        self.stream_retry_attempts
+    }
+
+    fn retry_rate_limit_floor(&self) -> Duration {
+        Duration::from_millis(self.retry_rate_limit_floor_ms)
+    }
+
+    fn retry_backoff_exponent_cap(&self) -> u32 {
+        self.retry_backoff_exponent_cap
+    }
+
     fn capabilities(&self) -> Capabilities {
         self.capabilities.clone()
+    }
+
+    fn model_capabilities_for(&self, provider: &str, model: &str) -> Option<Capabilities> {
+        (provider == self.id).then(|| self.capabilities_for_model(model))
+    }
+
+    fn model_pricing_for(&self, provider: &str, model: &str) -> Option<ModelPricing> {
+        (provider == self.id)
+            .then(|| self.pricing_for_model(model))
+            .flatten()
     }
 
     fn configuration_error_for(&self, provider: &str) -> Option<String> {
@@ -683,11 +770,37 @@ impl LlmProvider for HttpProvider {
             .collect()
     }
 
+    fn supports_decisions_for(&self, provider: &str) -> bool {
+        provider == self.id && self.api == ApiFlavor::SystemOne
+    }
+
+    async fn decide(
+        &self,
+        req: crate::DecisionRequest,
+    ) -> Result<crate::DecisionResponse, LlmError> {
+        if !self.supports_decisions_for(&req.provider) {
+            return Err(LlmError::new("provider does not support typed decisions"));
+        }
+        req.validate()?;
+        let _slot = self.acquire_request_slot().await?;
+        let result = async {
+            let value = self.send_json(req.payload(), &req.model).await?;
+            let response: crate::DecisionResponse = serde_json::from_value(value)
+                .map_err(|_| LlmError::invalid_response("invalid System One response shape"))?;
+            response.validate(&req)?;
+            Ok(response)
+        }
+        .await;
+        self.record_request_result(&result);
+        result
+    }
+
     async fn complete(&self, req: ChatRequest) -> Result<ChatResponse, LlmError> {
         validate_chat_request(&req, self.api)?;
-        validate_multimodal_capabilities(&req, &self.capabilities)?;
-        validate_structured_output_capabilities(&req, self.api, &self.capabilities)?;
-        if req.seed.is_some() && !self.capabilities.seed {
+        let capabilities = self.capabilities_for_model(&req.model);
+        validate_multimodal_capabilities(&req, &capabilities)?;
+        validate_structured_output_capabilities(&req, self.api, &capabilities)?;
+        if req.seed.is_some() && !capabilities.seed {
             return Err(LlmError::new(format!(
                 "{} provider does not support seed",
                 self.id
@@ -695,41 +808,41 @@ impl LlmProvider for HttpProvider {
         }
         if req
             .reasoning_effort
-            .is_some_and(|effort| !self.capabilities.reasoning_effort.contains(&effort))
+            .is_some_and(|effort| !capabilities.reasoning_effort.contains(&effort))
         {
-            return Err(LlmError::new(format!(
-                "{} provider does not support reasoning_effort `{}`",
-                self.id,
-                req.reasoning_effort.expect("checked reasoning_effort")
-            )));
+            return Err(LlmError::new(match req.reasoning_effort {
+                Some(effort) => format!(
+                    "{} provider does not support reasoning_effort `{effort}`",
+                    self.id,
+                ),
+                // Unreachable: the enclosing `is_some_and` already proved
+                // presence. Fail closed instead of panicking.
+                None => format!("{} provider does not support reasoning_effort", self.id),
+            }));
         }
         for (configured, supported, name) in [
             (
                 req.temperature.is_some(),
-                self.capabilities.temperature,
+                capabilities.temperature,
                 "temperature",
             ),
-            (req.top_p.is_some(), self.capabilities.top_p, "top_p"),
+            (req.top_p.is_some(), capabilities.top_p, "top_p"),
             (
                 !req.stop_sequences.is_empty(),
-                self.capabilities.stop_sequences,
+                capabilities.stop_sequences,
                 "stop_sequences",
             ),
             (
                 req.tool_choice.is_some(),
-                self.capabilities.tool_choice,
+                capabilities.tool_choice,
                 "tool_choice",
             ),
             (
                 req.parallel_tool_calls.is_some(),
-                self.capabilities.parallel_tool_calls,
+                capabilities.parallel_tool_calls,
                 "parallel_tool_calls",
             ),
-            (
-                req.verbosity.is_some(),
-                self.capabilities.verbosity,
-                "verbosity",
-            ),
+            (req.verbosity.is_some(), capabilities.verbosity, "verbosity"),
         ] {
             if configured && !supported {
                 return Err(LlmError::new(format!(
@@ -738,14 +851,19 @@ impl LlmProvider for HttpProvider {
                 )));
             }
         }
+        let prompt_cache = self.prompt_cache_field_for(&req, &capabilities)?;
         let payload = match self.api {
             ApiFlavor::ChatCompletions => chat_completions_payload(
                 &req,
-                req.seed.is_some() && self.capabilities.seed,
+                req.seed.is_some() && capabilities.seed,
                 self.chat_token_limit_field,
+                prompt_cache,
             ),
-            ApiFlavor::Responses => responses_payload(&req),
-            ApiFlavor::AnthropicMessages => anthropic_payload(&req),
+            ApiFlavor::Responses => responses_payload(&req, prompt_cache),
+            ApiFlavor::AnthropicMessages => anthropic_payload(&req, prompt_cache),
+            ApiFlavor::SystemOne => {
+                return Err(LlmError::new("system_one requires typed decisions"));
+            }
         };
         let _slot = self.acquire_request_slot().await?;
         let result = self.send(payload, &req.model).await;
@@ -759,22 +877,28 @@ impl LlmProvider for HttpProvider {
         events: mpsc::Sender<ChatStreamEvent>,
     ) -> Result<(), LlmError> {
         validate_chat_request(&req, self.api)?;
-        validate_multimodal_capabilities(&req, &self.capabilities)?;
-        validate_structured_output_capabilities(&req, self.api, &self.capabilities)?;
-        if !self.capabilities.streaming {
+        let capabilities = self.capabilities_for_model(&req.model);
+        validate_multimodal_capabilities(&req, &capabilities)?;
+        validate_structured_output_capabilities(&req, self.api, &capabilities)?;
+        if !capabilities.streaming {
             return Err(LlmError::new(format!(
                 "{} provider does not support streaming",
                 self.id
             )));
         }
+        let prompt_cache = self.prompt_cache_field_for(&req, &capabilities)?;
         let mut payload = match self.api {
             ApiFlavor::ChatCompletions => chat_completions_payload(
                 &req,
-                req.seed.is_some() && self.capabilities.seed,
+                req.seed.is_some() && capabilities.seed,
                 self.chat_token_limit_field,
+                prompt_cache,
             ),
-            ApiFlavor::Responses => responses_payload(&req),
-            ApiFlavor::AnthropicMessages => anthropic_payload(&req),
+            ApiFlavor::Responses => responses_payload(&req, prompt_cache),
+            ApiFlavor::AnthropicMessages => anthropic_payload(&req, prompt_cache),
+            ApiFlavor::SystemOne => {
+                return Err(LlmError::new("system_one requires typed decisions"));
+            }
         };
         payload["stream"] = Value::Bool(true);
         if self.api == ApiFlavor::ChatCompletions {
@@ -871,6 +995,7 @@ mod loopback_stream_tests {
             parallel_tool_calls: None,
             verbosity: None,
             stream: true,
+            prompt_cache: PromptCache::Off,
         }
     }
 
@@ -925,6 +1050,32 @@ mod loopback_stream_tests {
             "published prefixes must never complete the credential, got: {published}"
         );
         assert!(!completed, "a refused stream must not report completion");
+    }
+
+    #[tokio::test]
+    async fn auto_prompt_cache_without_provider_support_is_explicit_error() {
+        // The registry row does not advertise prompt caching, so the
+        // declared `auto` policy must fail instead of being dropped.
+        let spec: ProviderSpec = serde_json::from_value(json!({
+            "id": "no-cache",
+            "api": "chat_completions",
+            "base_url": "http://127.0.0.1:9",
+        }))
+        .expect("test provider spec should parse");
+        let provider = HttpProvider::from_spec(spec);
+        let mut request = sample_stream_request();
+        request.stream = false;
+        request.prompt_cache = PromptCache::Auto;
+        let error = provider
+            .complete(request)
+            .await
+            .expect_err("unsupported prompt_cache must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("does not support prompt caching"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

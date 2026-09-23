@@ -15,12 +15,9 @@ struct ForeachParams {
     items: String,
     subflow: String,
     max_iterations: usize,
-    #[serde(default = "default_foreach_parallelism")]
+    // No wire-compat default (Q1): `parallel` is required like the engine
+    // params; omission fails closed.
     parallel: usize,
-}
-
-fn default_foreach_parallelism() -> usize {
-    1
 }
 
 #[async_trait]
@@ -103,7 +100,7 @@ mod tests {
             "foreach-iterations",
             "foreach",
             &format!(
-                "items = \"inputs.items\"\nsubflow = \"item\"\nmax_iterations = {}",
+                "items = \"inputs.items\"\nsubflow = \"item\"\nmax_iterations = {}\nparallel = 1",
                 MAX_FOREACH_ITERATIONS + 1
             ),
         );

@@ -227,28 +227,35 @@ pub(crate) fn validate_input_sizes<'a>(
 ) -> Result<(), ContractError> {
     let mut total = 0_usize;
     for (field, value) in values {
-        let bytes = serialized_value_size_optional(value, runtime.file_input_limit_bytes).map_err(
-            |error| ContractError::PayloadTooLarge {
-                field: field.clone(),
-                actual_bytes: error,
-                limit_bytes: runtime.file_input_limit_bytes.unwrap_or(usize::MAX),
-            },
-        )?;
+        let bytes = match (
+            serialized_value_size_optional(value, runtime.file_input_limit_bytes),
+            runtime.file_input_limit_bytes,
+        ) {
+            (Ok(bytes), _) => bytes,
+            (Err(actual_bytes), Some(limit_bytes)) => {
+                return Err(ContractError::PayloadTooLarge {
+                    field: field.clone(),
+                    actual_bytes,
+                    limit_bytes,
+                });
+            }
+            (Err(_), None) => {
+                return Err(ContractError::Invalid(format!(
+                    "input `{}` size overflowed the field limit",
+                    field
+                )));
+            }
+        };
         total = total
             .checked_add(bytes)
-            .ok_or_else(|| ContractError::PayloadTooLarge {
-                field: "inputs".into(),
-                actual_bytes: usize::MAX,
-                limit_bytes: runtime.input_total_limit_bytes.unwrap_or(usize::MAX),
-            })?;
-        if runtime
-            .input_total_limit_bytes
-            .is_some_and(|limit| total > limit)
+            .ok_or_else(|| ContractError::Invalid("inputs size overflowed usize".into()))?;
+        if let Some(limit_bytes) = runtime.input_total_limit_bytes
+            && total > limit_bytes
         {
             return Err(ContractError::PayloadTooLarge {
                 field: "inputs".into(),
                 actual_bytes: total,
-                limit_bytes: runtime.input_total_limit_bytes.unwrap_or(usize::MAX),
+                limit_bytes,
             });
         }
     }

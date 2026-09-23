@@ -1,6 +1,6 @@
 <script lang="ts">
   import { untrack } from "svelte";
-  import { errorMessage, type OutputArtifact } from "../api/client";
+  import { authHeaders, errorMessage, type OutputArtifact } from "../api/client";
   import { MAX_PREVIEW_BYTES, normalizeMime, normalizePreviewMode, previewMatchesMime, PreviewTooLargeError, readBoundedBlob, resolvePreviewKind, type PreviewKind } from "../preview";
   import type { Messages } from "../messages";
   import type { RunStore } from "../run-store.svelte";
@@ -53,7 +53,7 @@
       const requested = normalizePreviewMode(selected.preview);
       if (requested === "invalid") throw new Error(messages.previewInvalidMetadata);
       if (selected.bytes > maxPreviewBytes) throw new Error(messages.previewTooLarge);
-      const response = await fetch(artifactUrl, { signal: requestController.signal });
+      const response = await fetch(artifactUrl, { headers: authHeaders(), signal: requestController.signal });
       if (!response.ok) throw new Error(await errorMessage(response));
       const responseContentType = normalizeMime(response.headers.get("content-type"));
       const declaredLength = Number(response.headers.get("content-length"));

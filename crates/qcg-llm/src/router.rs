@@ -5,11 +5,15 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep, timeout};
 
+use crate::catalog::CatalogService;
 use crate::http_provider::HttpProvider;
-use crate::provider::{FakeLlmProvider, LlmProvider, LlmRuntime, ModelSelection, ProvidersFile};
+use crate::provider::{
+    FakeLlmProvider, LlmProvider, LlmRuntime, ModelPricing, ModelSelection, ProvidersFile,
+};
 use crate::search::SearchRuntime;
 use crate::types::{
     Capabilities, ChatRequest, ChatResponse, ChatStreamEvent, LlmError, LlmErrorKind,
@@ -42,6 +46,7 @@ pub struct LlmRouter {
     pub(crate) default_model: Option<ModelSelection>,
     pub(crate) search: SearchRuntime,
     pub(crate) mcp: qcg_mcp::McpRuntime,
+    pub(crate) catalog: Arc<CatalogService>,
 }
 
 impl std::fmt::Debug for LlmRouter {
@@ -51,6 +56,7 @@ impl std::fmt::Debug for LlmRouter {
             .field("default_model", &self.default_model)
             .field("search", &self.search)
             .field("mcp", &self.mcp)
+            .field("catalog", &self.catalog)
             .finish()
     }
 }
@@ -158,11 +164,19 @@ impl LlmRouter {
                 message,
             },
         )?;
+        let catalog =
+            CatalogService::new(file.provider.clone(), file.catalog).map_err(|message| {
+                RegistryError::Parse {
+                    path: path.to_path_buf(),
+                    message,
+                }
+            })?;
         let mut router = Self {
             providers: BTreeMap::new(),
             default_model,
             search: SearchRuntime::from_specs(default_search, file.search_provider),
             mcp,
+            catalog: Arc::new(catalog),
         };
         router.register(Arc::new(FakeLlmProvider));
         for spec in file.provider {
@@ -191,11 +205,16 @@ impl LlmRouter {
         &self.mcp
     }
 
+    pub fn catalog(&self) -> &Arc<CatalogService> {
+        &self.catalog
+    }
+
     pub fn into_runtime(self) -> LlmRuntime {
         LlmRuntime {
             default_model: self.default_model.clone(),
             search: self.search.clone(),
             mcp: self.mcp.clone(),
+            catalog: Arc::clone(&self.catalog),
             provider: Arc::new(self),
             registry_present: true,
         }
@@ -224,6 +243,7 @@ impl LlmProvider for LlmRouter {
             tool_choice: true,
             parallel_tool_calls: true,
             verbosity: true,
+            prompt_cache: false,
             reasoning_effort: vec![
                 ReasoningEffort::None,
                 ReasoningEffort::Minimal,
@@ -242,6 +262,19 @@ impl LlmProvider for LlmRouter {
             .map(|provider| provider.capabilities())
     }
 
+    fn model_capabilities_for(&self, provider: &str, model: &str) -> Option<Capabilities> {
+        if !self.providers.contains_key(provider) {
+            return None;
+        }
+        self.catalog
+            .model_capabilities(provider, model)
+            .or_else(|| self.capabilities_for(provider))
+    }
+
+    fn model_pricing_for(&self, provider: &str, model: &str) -> Option<ModelPricing> {
+        self.catalog.model_pricing(provider, model)
+    }
+
     fn configuration_error_for(&self, provider: &str) -> Option<String> {
         self.providers
             .get(provider)
@@ -255,6 +288,51 @@ impl LlmProvider for LlmRouter {
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect()
+    }
+
+    fn supports_decisions_for(&self, provider: &str) -> bool {
+        self.providers
+            .get(provider)
+            .is_some_and(|entry| entry.supports_decisions_for(provider))
+    }
+
+    async fn decide(
+        &self,
+        req: crate::DecisionRequest,
+    ) -> Result<crate::DecisionResponse, LlmError> {
+        req.validate()?;
+        let provider = self
+            .providers
+            .get(&req.provider)
+            .ok_or_else(|| LlmError::new("decision provider is not registered"))?;
+        for attempt in 1..=provider.retry_attempts().max(1) {
+            let result = timeout(
+                Duration::from_secs(provider.timeout_seconds()),
+                provider.decide(req.clone()),
+            )
+            .await
+            .map_err(|_| LlmError {
+                message: "decision request timed out".into(),
+                kind: LlmErrorKind::TimedOut,
+            })
+            .and_then(|result| result);
+            match result {
+                Err(error)
+                    if attempt < provider.retry_attempts()
+                        && error.is_retryable()
+                        && error.kind != LlmErrorKind::CircuitOpen =>
+                {
+                    sleep(retry_backoff(
+                        attempt,
+                        provider.retry_base_backoff(),
+                        provider.retry_backoff_exponent_cap(),
+                    ))
+                    .await;
+                }
+                result => return result,
+            }
+        }
+        Err(LlmError::new("decision request exhausted its attempts"))
     }
 
     async fn complete(&self, req: ChatRequest) -> Result<ChatResponse, LlmError> {
@@ -272,21 +350,58 @@ impl LlmProvider for LlmRouter {
         let provider = self.providers.get(&req.provider).ok_or_else(|| {
             LlmError::new(format!("LLM provider `{}` is not registered", req.provider))
         })?;
-        timeout(
-            Duration::from_secs(provider.timeout_seconds()),
-            provider.stream(req, events),
-        )
-        .await
-        .map_err(|_| LlmError {
-            message: format!(
-                "LLM provider `{}` stream timed out after {} seconds",
-                provider.id(),
-                provider.timeout_seconds()
-            ),
-            kind: LlmErrorKind::TimedOut,
-        })?
+        let attempts = provider.stream_retry_attempts();
+        let mut attempt = 0_usize;
+        loop {
+            // Proxy the provider's events so a failure BEFORE the first
+            // forwarded event can be retried without the consumer observing
+            // anything. Once an event is forwarded a retry is refused: two
+            // model responses interleaved would corrupt the output.
+            let delivered = Arc::new(AtomicBool::new(false));
+            let (proxy_tx, mut proxy_rx) = mpsc::channel(STREAM_PROXY_CAPACITY);
+            let forward_events = events.clone();
+            let forward_delivered = Arc::clone(&delivered);
+            let forwarder = tokio::spawn(async move {
+                while let Some(event) = proxy_rx.recv().await {
+                    forward_delivered.store(true, Ordering::SeqCst);
+                    if forward_events.send(event).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            let result = timeout(
+                Duration::from_secs(provider.timeout_seconds()),
+                provider.stream(req.clone(), proxy_tx),
+            )
+            .await
+            .map_err(|_| LlmError {
+                message: format!(
+                    "LLM provider `{}` stream timed out after {} seconds",
+                    provider.id(),
+                    provider.timeout_seconds()
+                ),
+                kind: LlmErrorKind::TimedOut,
+            });
+            // The provider dropped its sender when it returned, so the
+            // forwarder drains and exits; join before any retry so events
+            // from a superseded attempt can never interleave.
+            let _ = forwarder.await;
+            let error = match result {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(error)) => error,
+                Err(error) => error,
+            };
+            if attempt >= attempts || delivered.load(Ordering::SeqCst) {
+                return Err(error);
+            }
+            attempt += 1;
+        }
     }
 }
+
+/// Buffer between the provider's stream and the consumer while a
+/// pre-first-delta retry is still possible.
+const STREAM_PROXY_CAPACITY: usize = 64;
 
 fn candidate_paths(include_env: bool) -> Vec<Utf8PathBuf> {
     let mut candidates = Vec::new();
@@ -340,14 +455,14 @@ async fn complete_with_retry(
                     LlmErrorKind::HttpStatus(429) | LlmErrorKind::EmptyResponse
                 );
                 last_error = Some(error);
-                let mut delay = retry_backoff(attempt, provider.retry_base_backoff());
-                // Shared upstream pools publish "retry shortly" limits that a
-                // sub-second exponential cannot clear; give rate-limited and
-                // empty-body responses at least a few seconds per attempt.
-                if slow_down {
-                    delay = delay.max(Duration::from_secs(5 * attempt as u64));
-                }
-                sleep(delay).await;
+                sleep(retry_delay(
+                    attempt,
+                    provider.retry_base_backoff(),
+                    provider.retry_rate_limit_floor(),
+                    provider.retry_backoff_exponent_cap(),
+                    slow_down,
+                ))
+                .await;
             }
             Err(error) => return Err(error),
         }
@@ -360,8 +475,26 @@ async fn complete_with_retry(
     }))
 }
 
-pub(crate) fn retry_backoff(attempt: usize, base: Duration) -> Duration {
-    let exponent = attempt.saturating_sub(1).min(8) as u32;
-    base.checked_mul(2_u32.pow(exponent))
-        .unwrap_or(Duration::from_millis(51_200))
+pub(crate) fn retry_backoff(attempt: usize, base: Duration, exponent_cap: u32) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(exponent_cap as usize) as u32;
+    base.saturating_mul(2_u32.pow(exponent))
+}
+
+/// Exponential backoff for one retry attempt. Rate-limited and empty-body
+/// responses additionally honor the provider's configured floor, raised by the
+/// attempt number: shared upstream pools publish "retry shortly" limits that a
+/// sub-second exponential cannot clear.
+pub(crate) fn retry_delay(
+    attempt: usize,
+    base: Duration,
+    rate_limit_floor: Duration,
+    exponent_cap: u32,
+    slow_down: bool,
+) -> Duration {
+    let delay = retry_backoff(attempt, base, exponent_cap);
+    if slow_down {
+        delay.max(rate_limit_floor.saturating_mul(attempt as u32))
+    } else {
+        delay
+    }
 }

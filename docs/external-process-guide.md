@@ -45,6 +45,42 @@ unreadable or non-regular files, nonzero exits, and limit violations.
 Use the default `result = "process"` only when stdout and stderr are ordinary
 process output rather than the structured protocol.
 
+### Generator-packaged tools
+
+A command step may run a tool that ships inside the generator package by
+naming it instead of an argv:
+
+```toml
+[[flow]]
+id = "generate"
+type = "command"
+
+[flow.params]
+tool = "echoer"
+input = { request = "{{ inputs.request }}" }
+result = "structured"
+output_schema = { type = "object", required = ["summary"] }
+
+[tools.echoer]
+kind = "command"
+command = ["gen.sh"]
+workspace = "none"
+
+[tools.echoer.backends.bundled]
+bin = "resources/bin/{{ os }}/{{ arch }}/gen.sh"
+sha256 = "<sha256 of the packaged binary>"
+```
+
+The tool must declare `kind = "command"`, a bundled backend, `workspace =
+"none"`, `network = "none"`, and `result = "structured"`. qcg expands
+`{os}`/`{arch}`, verifies the packaged bytes against the declared sha256
+before spawn, journals `tool_backend_resolved`, and then applies the same
+structured stdin/stdout protocol and schema validation as an argv command.
+Because the bytes are package-verified, no `permissions.commands` entry is
+needed — an install-time absolute path could never be declared there. Host
+and container tool backends stay reserved for `check.tool`'s validator
+resolution.
+
 ## External resources
 
 Use an `exec` resource when external data or generated context must be captured

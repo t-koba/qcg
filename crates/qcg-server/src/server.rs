@@ -4,6 +4,8 @@ mod generators;
 mod idempotency;
 mod mcp;
 mod middleware;
+mod otlp;
+mod rate_limit;
 mod run_detail;
 mod runs;
 mod serve;
@@ -12,6 +14,8 @@ pub use config::*;
 pub(crate) use idempotency::*;
 #[cfg(test)]
 pub(crate) use middleware::*;
+pub use otlp::OtlpConfig;
+pub use rate_limit::RateLimitPolicy;
 #[cfg(test)]
 pub(crate) use run_detail::*;
 #[cfg(test)]

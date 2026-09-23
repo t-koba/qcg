@@ -10,5 +10,7 @@ publish.workspace = true
 
 [dependencies]
 camino.workspace = true
+libc.workspace = true
 hex.workspace = true
 sha2.workspace = true
+uuid.workspace = true

@@ -87,6 +87,7 @@ impl ResourceLoader for ExecResourceLoader {
             pin_sha256: resource.pin_sha256.clone(),
             trust: resource_trust_label(&resource.trust).into(),
             llm_visible: resource.llm_visible,
+            diagnostics: Vec::new(),
         })
     }
 

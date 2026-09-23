@@ -1,5 +1,5 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use qcg_contract::{LlmRequestPolicy, NodeDef, ToolDecl};
+use qcg_contract::{LlmRequestPolicy, NodeDef, PromptCachePolicy, ToolDecl};
 use qcg_engine::{StepContext, StepError};
 use qcg_llm::{ChatContentPart, ChatMessage, ChatRequest, LlmRuntime, ToolSpec};
 use qcg_types::StructuredOutputMode;
@@ -9,10 +9,11 @@ use super::{AGENT_SYSTEM_GUARDRAIL, FILL_SYSTEM_GUARDRAIL};
 use crate::agent_tools::agent_tool_schema;
 use crate::mcp_tools::McpAgentTools;
 use crate::policy::{
-    EffectiveRequestPolicy, MediaInput, MediaInputKind, effective_request_policy, llm_params,
+    EffectiveRequestPolicy, MediaInput, MediaInputKind, effective_request_policy,
+    effective_request_policy_with_request, llm_params, resolve_llm_efforts,
 };
 use crate::prompting::{read_bytes_bounded, resolve_workspace_read};
-use crate::validation::{resolve_model, validate_resolved_model};
+use crate::validation::{capabilities_for, resolve_model, validate_resolved_model};
 
 pub(crate) fn build_request(
     ctx: &StepContext<'_>,
@@ -27,14 +28,18 @@ pub(crate) fn build_request(
         .manifest
         .llm
         .as_ref()
-        .ok_or_else(|| StepError::failed(&node.id, "[llm] is required"))?;
-    let policy = effective_request_policy(node, llm, None)?;
-    let (provider, model) = resolve_model(ctx, llm, runtime, node)?;
+        .ok_or_else(|| StepError::failed(&node.id, "[llm] is required"))?
+        .clone();
+    let params = llm_params(node)?;
+    let (llm, request, _) = resolve_llm_efforts(ctx, node, &llm, &params.request, None)?;
+    let policy = effective_request_policy_with_request(node, &llm, &request, None)?;
+    let (provider, model) = resolve_model(ctx, &llm, runtime, node)?;
     validate_resolved_model(
         runtime,
         node,
         &policy,
         &provider,
+        &model,
         response_schema.is_some(),
         false,
     )?;
@@ -42,6 +47,7 @@ pub(crate) fn build_request(
         runtime,
         node,
         &provider,
+        &model,
         policy.structured_output,
         response_schema.as_ref(),
         false,
@@ -67,6 +73,10 @@ pub(crate) fn build_request(
         parallel_tool_calls: policy.parallel_tool_calls,
         verbosity: policy.verbosity,
         stream: policy.stream,
+        prompt_cache: match llm.cache {
+            PromptCachePolicy::Auto => qcg_llm::PromptCache::Auto,
+            PromptCachePolicy::Off => qcg_llm::PromptCache::Off,
+        },
     })
 }
 
@@ -99,8 +109,14 @@ pub(crate) fn build_user_message(
     for media in params.media {
         validate_media_input(node, &media)?;
         let path = resolve_workspace_read(ctx, node, &media.path)?;
+        let file = ctx.run.fs.open_read_resolved(&path).map_err(|error| {
+            StepError::failed(
+                &node.id,
+                format!("media input `{}` could not be opened: {error}", media.path),
+            )
+        })?;
         let remaining = limit.saturating_sub(total);
-        let bytes = read_bytes_bounded(&path, remaining).map_err(|error| {
+        let bytes = read_bytes_bounded(file, remaining).map_err(|error| {
             StepError::failed(
                 &node.id,
                 format!(
@@ -197,17 +213,23 @@ pub(crate) fn build_request_with_messages(
         .manifest
         .llm
         .as_ref()
-        .ok_or_else(|| StepError::failed(&node.id, "[llm] is required"))?;
-    let policy = effective_request_policy(node, llm, specialist_request)?;
+        .ok_or_else(|| StepError::failed(&node.id, "[llm] is required"))?
+        .clone();
+    let params = llm_params(node)?;
+    let (llm, request, specialist_request) =
+        resolve_llm_efforts(ctx, node, &llm, &params.request, specialist_request)?;
+    let policy =
+        effective_request_policy_with_request(node, &llm, &request, specialist_request.as_ref())?;
     let (provider, model) = model_override
         .map(|model| (model.provider.clone(), model.model.clone()))
         .map(Ok)
-        .unwrap_or_else(|| resolve_model(ctx, llm, runtime, node))?;
+        .unwrap_or_else(|| resolve_model(ctx, &llm, runtime, node))?;
     validate_resolved_model(
         runtime,
         node,
         &policy,
         &provider,
+        &model,
         response_schema.is_some(),
         !tools.is_empty(),
     )?;
@@ -215,6 +237,7 @@ pub(crate) fn build_request_with_messages(
         runtime,
         node,
         &provider,
+        &model,
         policy.structured_output,
         response_schema.as_ref(),
         !tools.is_empty(),
@@ -240,6 +263,10 @@ pub(crate) fn build_request_with_messages(
         parallel_tool_calls: policy.parallel_tool_calls,
         verbosity: policy.verbosity,
         stream: policy.stream,
+        prompt_cache: match llm.cache {
+            PromptCachePolicy::Auto => qcg_llm::PromptCache::Auto,
+            PromptCachePolicy::Off => qcg_llm::PromptCache::Off,
+        },
     })
 }
 
@@ -261,6 +288,7 @@ pub(crate) fn resolve_structured_output_mode(
     runtime: &LlmRuntime,
     node: &NodeDef,
     provider: &str,
+    model: &str,
     configured: StructuredOutputMode,
     schema: Option<&Value>,
     has_tools: bool,
@@ -268,15 +296,15 @@ pub(crate) fn resolve_structured_output_mode(
     if schema.is_none() {
         return Ok(configured);
     }
+    let capabilities = capabilities_for(runtime, provider, Some(model));
     if configured != StructuredOutputMode::Auto {
         if has_tools
             && matches!(
                 configured,
                 StructuredOutputMode::NativeStrict | StructuredOutputMode::NativeCompatible
             )
-            && !runtime
-                .provider
-                .capabilities_for(provider)
+            && !capabilities
+                .as_ref()
                 .is_some_and(|capabilities| capabilities.structured_output_with_tools)
         {
             return Err(StepError::failed(
@@ -302,13 +330,11 @@ pub(crate) fn resolve_structured_output_mode(
         }
         return Ok(configured);
     }
-    let supports_schema = runtime
-        .provider
-        .capabilities_for(provider)
+    let supports_schema = capabilities
+        .as_ref()
         .is_some_and(|capabilities| capabilities.json_schema);
-    let supports_schema_with_tools = runtime
-        .provider
-        .capabilities_for(provider)
+    let supports_schema_with_tools = capabilities
+        .as_ref()
         .is_some_and(|capabilities| capabilities.structured_output_with_tools);
     if !supports_schema
         || (has_tools && !supports_schema_with_tools)
@@ -361,9 +387,16 @@ pub(crate) fn scan_llm_text(
     gateway.scan_text(node, text)
 }
 
-pub(crate) fn tool_spec(tool: &ToolDecl, mcp: &McpAgentTools) -> Result<ToolSpec, StepError> {
+pub(crate) fn tool_spec(
+    ctx: &StepContext<'_>,
+    tool: &ToolDecl,
+    mcp: &McpAgentTools,
+) -> Result<ToolSpec, StepError> {
     if matches!(tool, ToolDecl::Mcp { .. }) {
         return mcp.tool_spec(tool.name());
+    }
+    if matches!(tool, ToolDecl::Skill { .. }) {
+        return crate::skill_tool::skill_tool_spec(ctx, tool);
     }
     Ok(ToolSpec {
         name: tool.name().to_string(),
@@ -371,6 +404,6 @@ pub(crate) fn tool_spec(tool: &ToolDecl, mcp: &McpAgentTools) -> Result<ToolSpec
             .description()
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| format!("qcg agent tool kind={}", tool.kind())),
-        input_schema: agent_tool_schema(tool),
+        input_schema: agent_tool_schema(tool)?,
     })
 }

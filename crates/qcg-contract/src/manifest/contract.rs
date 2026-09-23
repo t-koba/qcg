@@ -43,6 +43,14 @@ impl Contract {
         Self::load_with_limit(root, None)
     }
 
+    /// Raises the contract audit policy to a deployment floor. Deployment
+    /// policy may only tighten: durable records are never filtered, and a
+    /// `standard` floor restores full observation persistence regardless of
+    /// what the generator declared.
+    pub fn apply_audit_floor(&mut self, floor: qcg_policy::AuditFloor) {
+        self.manifest.audit.apply_floor(floor);
+    }
+
     /// Load a contract, enforcing an explicit manifest size limit only when set.
     /// `None` means no mechanistic limit; the caller sets a max only when desired.
     pub fn load_with_limit(

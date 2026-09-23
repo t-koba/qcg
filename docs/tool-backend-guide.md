@@ -28,7 +28,6 @@ mount = "/work"
 
 [tools.qpx_validate.backends.host]
 bin = "qpxd"
-version_command = ["qpxd", "--version"]
 ```
 
 `fallback = "explicit"` means qcg must not silently switch from a safer

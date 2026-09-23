@@ -40,6 +40,11 @@ JSON event output go to stdout.
   file-plus-command expansion pattern.
 - `qcg list [--generators-dir dir]` lists available packages from the installed
   directory and the bundled generator directory. Installed IDs take precedence.
+- `qcg models [--json] [--refresh]` lists the selectable LLM providers, models,
+  reasoning efforts, prices, and limits derived from `providers.toml`, the
+  optional external catalog, and per-provider discovery. `--refresh` re-fetches
+  external catalog sources first; stale or failed sources are reported on
+  stderr. Credentials are never printed.
 - `qcg eval <generator> --suite suite.json [--output .qcg/evals]
   [--runs-dir .qcg/runs] [--baseline REPORT_JSON] [--json]` executes isolated
   cases and optional repeated seed variations. Assertions cover artifacts,
@@ -79,6 +84,10 @@ JSON event output go to stdout.
   index transport plus the entry `sha256` checked at install.
 - `qcg uninstall <id> [--generators-dir dir] [--yes]` removes one installed
   generator ID after checking that the ID is a safe relative path.
+- `qcg skill validate <path> [--library] [--json]` validates an Agent Skills
+  directory (agentskills.io `SKILL.md` frontmatter) or, with `--library`, a
+  directory of `<name>/SKILL.md` skills. Hard errors exit non-zero; soft
+  violations are printed as warnings and included in `--json` output.
 
 ## Run commands
 
@@ -127,9 +136,18 @@ Failed runs get an additional `--keep-failed` retention budget for post-mortems.
   [--cors-origin origin]... [--api-token token]
   [--max-request-bytes N] [--max-artifact-bytes N]
   [--max-artifact-entries N] [--max-asset-bytes N]`
+- `qcg dev [--bind 127.0.0.1] [--port 0] [--generators-dir dir]
+  [--runs-dir dir] [--max-active-runs 8] [--providers PATH]
+  [--watch-interval-ms 500] [--eval generator-id]`
 - `qcg docs step-schemas`
 - `qcg docs run-events`
 - `qcg docs openapi`
+
+`qcg dev` runs the same server as `qcg serve` plus a polling watcher over
+`--generators-dir`: it prints one line per changed path and, with `--eval`,
+re-runs the generator's `suite.json` eval after each change. Eval failures are
+reported but never stop the dev loop, and `--watch-interval-ms 0` is refused.
+Contracts are re-read per request, so no restart is needed.
 
 Port `0` selects an available port. `qcg serve` exposes REST, SSE, and assets
 declared by generator contracts; it does not open a browser. The selected bind
@@ -179,8 +197,39 @@ use of the same output directory.
   declared `mcp` tool selects an explicit `[[mcp_server]]` row. The selected
   hosts or exact stdio command must still be listed in the contract's
   permissions; there is no implicit fallback.
+- `QCG_RATE_LIMIT_RPS` and `QCG_RATE_LIMIT_BURST`: optional per-credential
+  token bucket for the HTTP server. Unset `QCG_RATE_LIMIT_RPS` disables rate
+  limiting; `QCG_RATE_LIMIT_BURST` defaults to the rps value. Buckets are keyed
+  by the presented bearer credential (one anonymous bucket otherwise), so
+  credentials never share a budget. Requests over the limit receive `429` with
+  `Retry-After`; `GET /healthz` is exempt. Invalid values, zero, or a burst
+  without an rps refuse boot.
+- `QCG_LIVE_EVENT_CHANNEL_CAPACITY` (default `512`, range `16..=65536`),
+  `QCG_JOURNAL_POLL_INTERVAL_MS` (default `250`, range `50..=5000`),
+  `QCG_MAX_DIRECTORY_SCAN_ENTRIES` (default `100000`, range `1000..=10000000`),
+  `QCG_SHARED_RESCAN_SECS` and `QCG_QUEUED_RESUMER_SECS` (default `5`, range
+  `1..=3600`), `QCG_SHUTDOWN_DRAIN_SECS` (default `30`) and
+  `QCG_SHUTDOWN_SETTLE_SECS` (default `150`, range `1..=3600`): deployment
+  tuning for the live stream, shared-store cadence, directory scans, and the
+  graceful shutdown phases. Out-of-range values and a settle deadline below
+  the drain refuse boot.
+- `QCG_MAX_PARALLEL_STEPS`: deployment cap on parallel wave scheduling.
+  Unset uses the CPU count; `0` and invalid values refuse boot.
+- `QCG_API_TOKEN_FILE`: path to a file containing the instance bearer token.
+  `--api-token` / `QCG_API_TOKEN` wins when set; an unreadable or empty file
+  refuses boot instead of starting unauthenticated.
+- `QCG_GC_KEEP` (default `50`), `QCG_GC_KEEP_FAILED` (default `10`), and
+  `QCG_GC_INTERVAL_SECS` (default `86400`, minimum `60`): automatic retention
+  sweep counts and cadence for `qcg serve`. Failed runs get the additional
+  post-mortem budget; a run past its contract retention window is always
+  deleted. Invalid or zero values refuse boot.
+- `QCG_AUDIT_FLOOR=minimal|standard`: deployment audit floor. `standard`
+  restores full observation-record persistence for every run regardless of the
+  contract's `[audit]` policy; a floor can only raise persistence.
 - `QCG_CORS_ORIGIN`: comma-separated exact origins allowed for cross-origin
-  API requests. CORS is disabled when it is unset.
+  API requests. CORS is disabled when it is unset. Allowed request headers are
+  `authorization`, `content-type`, and `idempotency-key`; builds without the
+  `server-cors` cargo feature refuse configured origins with an explicit error.
 - `QCG_PACKAGE_MAX_ENTRIES`, `QCG_PACKAGE_MAX_BYTES`,
   `QCG_PACKAGE_MAX_ARCHIVE_BYTES`, `QCG_PACKAGE_MAX_METADATA_BYTES`: explicit
   max for `qcg package` and `qcg install`. Unset means no mechanistic limit.

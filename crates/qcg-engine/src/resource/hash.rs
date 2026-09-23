@@ -9,7 +9,27 @@ pub(crate) fn hash_resource_file(
     path: &camino::Utf8Path,
     max_bytes: Option<u64>,
 ) -> Result<(String, usize), std::io::Error> {
-    let mut file = std::fs::File::open(path)?;
+    // Refuse terminal symlinks like the directory walk below: a single
+    // file and a directory must share one policy, never diverge (E06).
+    // Non-Unix falls back to a pre-open probe.
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let mut file = {
+        if crate::engine::is_symlink_no_follow(path)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("resource file `{path}` is a symbolic link"),
+            ));
+        }
+        std::fs::File::open(path)?
+    };
     let mut digest = Sha256::new();
     let bytes = match max_bytes {
         Some(limit) => {
@@ -40,19 +60,21 @@ pub(crate) fn hash_resource_dir(
     let mut entries = 0_usize;
     for entry in qcg_fs::WalkDir::new(path).min_depth(1) {
         let entry = entry.map_err(std::io::Error::other)?;
-        if limits.max_depth.is_some_and(|limit| entry.depth() > limit) {
+        if let Some(limit) = limits.max_depth
+            && entry.depth() > limit
+        {
             return Err(std::io::Error::other(format!(
-                "resource directory `{path}` exceeds max_depth ({})",
-                limits.max_depth.unwrap_or(usize::MAX)
+                "resource directory `{path}` exceeds max_depth ({limit})"
             )));
         }
         entries = entries
             .checked_add(1)
             .ok_or_else(|| std::io::Error::other("resource directory entry count overflowed"))?;
-        if limits.max_entries.is_some_and(|limit| entries > limit) {
+        if let Some(limit) = limits.max_entries
+            && entries > limit
+        {
             return Err(std::io::Error::other(format!(
-                "resource directory `{path}` exceeds max_entries ({})",
-                limits.max_entries.unwrap_or(usize::MAX)
+                "resource directory `{path}` exceeds max_entries ({limit})"
             )));
         }
         if entry.file_type().is_symlink() {
@@ -68,10 +90,11 @@ pub(crate) fn hash_resource_dir(
         if !entry.file_type().is_file() {
             continue;
         }
-        if limits.max_files.is_some_and(|limit| files.len() >= limit) {
+        if let Some(limit) = limits.max_files
+            && files.len() >= limit
+        {
             return Err(std::io::Error::other(format!(
-                "resource directory `{path}` exceeds max_files ({})",
-                limits.max_files.unwrap_or(usize::MAX)
+                "resource directory `{path}` exceeds max_files ({limit})"
             )));
         }
         let file_path = entry.path().to_path_buf();

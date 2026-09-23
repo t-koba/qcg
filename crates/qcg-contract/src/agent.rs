@@ -18,11 +18,21 @@ pub enum AgentFailureCode {
     ValidationFailed,
     ProviderFailed,
     Cancelled,
+    /// A per-attempt node timeout fired. Distinct from ordinary tool failure
+    /// so retry policy and observability can tell an unknown-outcome timeout
+    /// apart from a proven-clean error (E11).
+    TimedOut,
+    /// The run-wide elapsed budget stopped this call. Distinct from node
+    /// timeout and cancellation so hosts report the actual cause (E11).
+    ElapsedExceeded,
 }
 
 impl AgentFailureCode {
     pub fn is_recoverable(self) -> bool {
-        !matches!(self, Self::RunBudgetExceeded | Self::Cancelled)
+        !matches!(
+            self,
+            Self::RunBudgetExceeded | Self::ElapsedExceeded | Self::Cancelled
+        )
     }
 
     pub fn policy_code(self) -> Option<RecoverableAgentFailureCode> {
@@ -38,7 +48,8 @@ impl AgentFailureCode {
             }
             Self::ValidationFailed => Some(RecoverableAgentFailureCode::ValidationFailed),
             Self::ProviderFailed => Some(RecoverableAgentFailureCode::ProviderFailed),
-            Self::RunBudgetExceeded | Self::Cancelled => None,
+            Self::TimedOut => Some(RecoverableAgentFailureCode::TimedOut),
+            Self::RunBudgetExceeded | Self::ElapsedExceeded | Self::Cancelled => None,
         }
     }
 }
@@ -55,6 +66,7 @@ pub enum RecoverableAgentFailureCode {
     IterationBudgetExceeded,
     ValidationFailed,
     ProviderFailed,
+    TimedOut,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, serde::Deserialize, JsonSchema, PartialEq, Eq)]

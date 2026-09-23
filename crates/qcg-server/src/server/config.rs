@@ -1,6 +1,7 @@
 use camino::Utf8PathBuf;
 use qcg_service::{LocalQcgService, RunStoreMode};
 use std::collections::{BTreeMap, BTreeSet};
+use tokio_util::sync::CancellationToken;
 
 use super::idempotency::IdempotencyEntry;
 
@@ -67,10 +68,19 @@ pub(crate) struct AppState {
     pub(crate) oauth_allowed_origins: BTreeSet<String>,
     pub(crate) oauth_callback_url: Option<String>,
     pub(crate) idempotency: tokio::sync::Mutex<BTreeMap<String, IdempotencyEntry>>,
+    /// Frozen idempotency policy resolved once at boot. Every request and
+    /// prune path uses these values, never re-reads the environment, so a
+    /// concurrent environment change cannot make one request judge records
+    /// by two standards and boot drift is impossible (E04).
+    pub(crate) idempotency_ttl: std::time::Duration,
+    pub(crate) idempotency_max_entries: usize,
     pub(crate) api_token_digest: Option<[u8; 32]>,
     pub(crate) artifact_limits: qcg_service::ArtifactZipLimits,
     pub(crate) asset_limit: Option<usize>,
     /// Effective request body limit surfaced by /healthz. None means no
     /// mechanistic limit.
     pub(crate) max_request_bytes: Option<usize>,
+    /// Set when graceful shutdown starts: new mutating requests are
+    /// rejected, resident tasks stop, and SSE streams close (E05).
+    pub(crate) shutdown: CancellationToken,
 }

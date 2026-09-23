@@ -1,4 +1,7 @@
-use crate::{AssetSpec, FieldType, GeneratorMeta, InputField, InputSpec};
+use crate::{
+    AssetSpec, FieldType, GeneratorMeta, InputField, InputSpec, is_skill_library_entry,
+    parse_skill_doc, validate_skill_doc,
+};
 use camino::Utf8Path;
 use qcg_policy::validate_bounded_json_schema;
 use schemars::JsonSchema;
@@ -9,10 +12,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::assets::{AssetRule, validate_field_value, validate_input_sizes};
 use super::contract::{ContractError, stripped_error_message};
 use super::flow::{CommandPermissionRule, FlowNodeRule, OutputArtifactRule, ToolRule};
+use super::hooks::{HooksConfig, HooksRule};
 use super::llm::{LlmConfig, RunBudget, RuntimeLimits};
 use super::metadata::GeneratorMetadataRule;
 use super::nodes::{ExhaustedAction, NodeDef, OnFail};
-use super::outputs::{FailurePolicy, JournalPolicy, OutputSpec};
+use super::outputs::{FailurePolicy, OutputSpec, RetentionPolicy};
 use super::resources::{Permissions, ResourceDef, ResourceKind, SecretRef, ToolDef};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -46,7 +50,14 @@ pub struct Manifest {
     #[serde(default)]
     pub failure: FailurePolicy,
     #[serde(default)]
-    pub journal: JournalPolicy,
+    pub hooks: HooksConfig,
+    #[serde(default)]
+    pub retention: RetentionPolicy,
+    /// Observation-stream policy (mechanism/policy separation, ADR 0001).
+    /// Durable records are never filtered by this section; class keys that
+    /// name a durable record are rejected at contract validation.
+    #[serde(default)]
+    pub audit: qcg_policy::AuditConfig,
     #[serde(default)]
     pub assets: AssetSpec,
     /// Generator dependencies: id to semver requirement, resolved at
@@ -62,6 +73,10 @@ impl Manifest {
         mut values: BTreeMap<String, Value>,
     ) -> Result<BTreeMap<String, Value>, ContractError> {
         validate_input_sizes(&values, &self.runtime)?;
+        // File inputs count toward `runtime.file_count_limit` exactly like
+        // collected artifacts and tool files do; only files in active
+        // stages count, because inactive stages never materialize.
+        let mut file_inputs = 0_usize;
         for stage in &self.inputs.stages {
             let bag = crate::ValueBag::with_inputs(values.clone());
             if !bag.eval_bool(stage.when.as_ref()).map_err(|error| {
@@ -88,6 +103,18 @@ impl Manifest {
                     continue;
                 };
                 validate_field_value(field, value, &self.runtime)?;
+                if field.kind == FieldType::File {
+                    file_inputs = file_inputs.checked_add(1).ok_or_else(|| {
+                        ContractError::Invalid("input file count overflowed usize".into())
+                    })?;
+                    if let Some(limit) = self.runtime.file_count_limit
+                        && file_inputs > limit
+                    {
+                        return Err(ContractError::Invalid(format!(
+                            "input file count {file_inputs} exceeds runtime.file_count_limit {limit}"
+                        )));
+                    }
+                }
             }
         }
         for id in values.keys() {
@@ -116,10 +143,21 @@ impl Manifest {
         check(InputRule.validate(self));
         check(ResourceRule.validate(self));
         check(FlowNodeRule.validate(self));
+        check(HooksRule::validate(self));
         check(CommandPermissionRule.validate(self));
         check(ToolRule.validate(self));
         check(OutputArtifactRule.validate(self));
         check(AssetRule.validate(self));
+        // Colon ambiguity backstop (Q1): `parallel` entries name flow nodes,
+        // so they share the node-id `:` ban. Flow and block ids are checked
+        // in `FlowNodeRule`; this covers the parallel list itself.
+        for entry in &self.parallel {
+            if entry.contains(':') {
+                errors.push(format!(
+                    "parallel entry `{entry}` must not contain `:`; confirmation ids use `:` as a separator"
+                ));
+            }
+        }
         match errors.len() {
             0 => Ok(()),
             1 => Err(ContractError::Invalid(errors.pop().unwrap_or_default())),
@@ -168,14 +206,13 @@ pub(crate) fn validate_resource_files(
         })?;
         let valid = match resource.kind.as_str() {
             "file" | "openapi" => resolved.is_file(),
-            "dir" => resolved.is_dir(),
-            "skill" => resolved.is_file() || resolved.is_dir(),
+            "dir" | "skill" | "skill_library" => resolved.is_dir(),
             _ => true,
         };
         if !valid {
             let expected = match resource.kind.as_str() {
-                "dir" => "a directory",
-                "skill" => "a file or directory",
+                "dir" | "skill_library" => "a directory",
+                "skill" => "a directory containing SKILL.md",
                 "file" | "openapi" => "a file",
                 _ => "a valid package path",
             };
@@ -184,7 +221,98 @@ pub(crate) fn validate_resource_files(
                 resource.kind
             )));
         }
+        match resource.kind.as_str() {
+            "skill" => validate_skill_resource(name, &resolved)?,
+            "skill_library" => validate_skill_library(name, &resolved)?,
+            _ => {}
+        }
     }
+    Ok(())
+}
+
+const MAX_SKILL_LIBRARY_ENTRIES: usize = 4096;
+
+fn validate_skill_resource(name: &str, root: &Utf8Path) -> Result<(), ContractError> {
+    let skill_path = root.join("SKILL.md");
+    if !skill_path.is_file() {
+        return Err(ContractError::Invalid(format!(
+            "skill resource `{name}` must contain SKILL.md at `{skill_path}`"
+        )));
+    }
+    read_and_validate_skill(name, &skill_path, root.file_name())
+}
+
+fn validate_skill_library(name: &str, root: &Utf8Path) -> Result<(), ContractError> {
+    let entries = std::fs::read_dir(root).map_err(|error| {
+        ContractError::Invalid(format!(
+            "skill_library resource `{name}` cannot read `{root}`: {error}"
+        ))
+    })?;
+    let mut inspected = 0_usize;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            ContractError::Invalid(format!(
+                "skill_library resource `{name}` cannot read an entry: {error}"
+            ))
+        })?;
+        inspected += 1;
+        if inspected > MAX_SKILL_LIBRARY_ENTRIES {
+            return Err(ContractError::Invalid(format!(
+                "skill_library resource `{name}` exceeds {MAX_SKILL_LIBRARY_ENTRIES} entries"
+            )));
+        }
+        let file_type = entry.file_type().map_err(|error| {
+            ContractError::Invalid(format!(
+                "skill_library resource `{name}` cannot inspect an entry: {error}"
+            ))
+        })?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Some(entry_name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !is_skill_library_entry(&entry_name) {
+            continue;
+        }
+        let child = camino::Utf8PathBuf::from_path_buf(entry.path()).map_err(|path| {
+            ContractError::Invalid(format!(
+                "skill_library resource `{name}` entry is not valid UTF-8: {}",
+                path.display()
+            ))
+        })?;
+        let skill_path = child.join("SKILL.md");
+        if !skill_path.is_file() {
+            continue;
+        }
+        let Some(dir_name) = child.file_name() else {
+            continue;
+        };
+        read_and_validate_skill(name, &skill_path, Some(dir_name))?;
+    }
+    Ok(())
+}
+
+fn read_and_validate_skill(
+    resource: &str,
+    skill_path: &Utf8Path,
+    expected_name: Option<&str>,
+) -> Result<(), ContractError> {
+    let source = std::fs::read_to_string(skill_path).map_err(|error| {
+        ContractError::Invalid(format!(
+            "skill resource `{resource}` cannot read `{skill_path}`: {error}"
+        ))
+    })?;
+    let doc = parse_skill_doc(&source).map_err(|error| {
+        ContractError::Invalid(format!(
+            "skill resource `{resource}` has invalid frontmatter in `{skill_path}`: {error}"
+        ))
+    })?;
+    validate_skill_doc(&doc, expected_name).map_err(|error| {
+        ContractError::Invalid(format!(
+            "skill resource `{resource}` is invalid in `{skill_path}`: {error}"
+        ))
+    })?;
     Ok(())
 }
 
@@ -225,7 +353,10 @@ impl ResourceRule {
     pub(crate) fn validate(&self, manifest: &Manifest) -> Result<(), ContractError> {
         for (name, resource) in &manifest.resources {
             match resource.kind {
-                ResourceKind::File | ResourceKind::Dir | ResourceKind::Skill => {
+                ResourceKind::File
+                | ResourceKind::Dir
+                | ResourceKind::Skill
+                | ResourceKind::SkillLibrary => {
                     if resource.path.is_none() || resource.url.is_some() {
                         return Err(ContractError::Invalid(format!(
                             "resource `{name}` type `{}` requires path and forbids url",
@@ -253,6 +384,14 @@ impl ResourceRule {
                     &manifest.permissions,
                     &manifest.runtime,
                 )?,
+                ResourceKind::RunRef => {
+                    if resource.path.is_some() || resource.url.is_some() {
+                        return Err(ContractError::Invalid(format!(
+                            "resource `{name}` type `run_ref` forbids path and url"
+                        )));
+                    }
+                    resource.run_ref_params(name)?;
+                }
             }
         }
         Ok(())
@@ -399,6 +538,12 @@ fn validate_input_field_contract(
     field: &InputField,
     runtime: &RuntimeLimits,
 ) -> Result<(), ContractError> {
+    if field.options_from.is_some() {
+        return Err(ContractError::Invalid(format!(
+            "{scope} `{}` cannot use options_from; dynamic options are only valid for ask_user form fields",
+            field.id
+        )));
+    }
     if let FieldType::Custom(kind) = &field.kind {
         validate_namespaced_id(kind).map_err(|error| {
             ContractError::Invalid(format!(
@@ -439,5 +584,23 @@ fn validate_namespaced_id(value: &str) -> Result<(), String> {
         Err(format!(
             "identifier `{value}` must use only lowercase ASCII letters, digits, `_`, and `.`"
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inputs_reject_dynamic_options() {
+        let field: InputField = serde_json::from_value(serde_json::json!({
+            "id": "model",
+            "type": "string",
+            "options_from": "steps.list.output.options"
+        }))
+        .expect("field must deserialize");
+        let error = validate_input_field_contract("input", &field, &RuntimeLimits::default())
+            .expect_err("options_from must be rejected for [inputs]");
+        assert!(error.to_string().contains("ask_user"), "{error}");
     }
 }

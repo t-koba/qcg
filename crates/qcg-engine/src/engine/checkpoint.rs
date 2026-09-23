@@ -59,10 +59,11 @@ impl CheckpointAccounting {
                 "runtime output limits must be greater than zero".into(),
             ));
         }
-        if file_limit.is_some_and(|limit| bytes > limit) {
+        if let Some(limit) = file_limit
+            && bytes > limit
+        {
             return Err(EngineError::Failed(format!(
-                "output file `{path}` exceeds {} bytes",
-                file_limit.unwrap_or(u64::MAX)
+                "output file `{path}` exceeds {limit} bytes"
             )));
         }
         let key = path.as_str().to_owned();
@@ -72,13 +73,11 @@ impl CheckpointAccounting {
             .len()
             .checked_add(if previous.is_some() { 0 } else { 1 })
             .ok_or_else(|| EngineError::Failed("output artifact count overflowed".into()))?;
-        if limits
-            .output_artifact_limit
-            .is_some_and(|limit| next_count > limit)
+        if let Some(limit) = limits.output_artifact_limit
+            && next_count > limit
         {
             return Err(EngineError::Failed(format!(
-                "output artifact count exceeds {}",
-                limits.output_artifact_limit.unwrap_or(usize::MAX)
+                "output artifact count exceeds {limit}"
             )));
         }
         let total_without_previous = self
@@ -88,11 +87,10 @@ impl CheckpointAccounting {
         let next_total = total_without_previous
             .checked_add(bytes)
             .ok_or_else(|| EngineError::Failed("output byte accounting overflowed".into()))?;
-        if total_limit.is_some_and(|limit| next_total > limit) {
-            return Err(EngineError::Failed(format!(
-                "output bytes exceed {}",
-                total_limit.unwrap_or(u64::MAX)
-            )));
+        if let Some(limit) = total_limit
+            && next_total > limit
+        {
+            return Err(EngineError::Failed(format!("output bytes exceed {limit}")));
         }
         self.total_bytes = next_total;
         self.bytes_by_path.insert(key, bytes);
@@ -133,6 +131,14 @@ pub(crate) fn pin_files(
     files
         .iter()
         .map(|path| {
+            // Refuse symlink outputs at pin time, symmetric with resume
+            // verification: pinning through a link while resume refuses it
+            // would create pins that can never resume (E06).
+            if is_symlink_no_follow(path)? {
+                return Err(EngineError::Failed(format!(
+                    "step output `{path}` is a symbolic link"
+                )));
+            }
             let canonical_path = dunce::canonicalize(path)?;
             let canonical_path = Utf8PathBuf::from_path_buf(canonical_path).map_err(|path| {
                 EngineError::Failed(format!(
@@ -159,13 +165,20 @@ pub(crate) fn pin_files(
                     "step output `{relative}` escapes the workspace"
                 )));
             }
-            let source = workspace.join(relative);
+            // Journaled pins must use portable separators on every
+            // platform: resume validation only accepts slash-separated
+            // paths, so a natively-separated pin could never resume (E06).
+            let relative =
+                camino::Utf8PathBuf::from(qcg_policy::portable_relative_path(relative));
+            let source = workspace.join(&relative);
             let digest = hash_file(&source, limits.output_file_limit_bytes)?;
             let previous = {
-                let mut accounting = accounting.lock().map_err(|_| {
-                    EngineError::Failed("checkpoint accounting mutex was poisoned".into())
+                let mut accounting = accounting.lock().map_err(|error| {
+                    EngineError::Failed(format!(
+                        "checkpoint accounting mutex was poisoned: {error}"
+                    ))
                 })?;
-                accounting.record(relative, digest.bytes, limits)?
+                accounting.record(&relative, digest.bytes, limits)?
             };
             if let Err(error) = persist_checkpoint_blob(
                 metadata,
@@ -173,10 +186,13 @@ pub(crate) fn pin_files(
                 &source,
                 limits.output_file_limit_bytes,
             ) {
-                let mut accounting = accounting.lock().map_err(|_| {
-                    EngineError::Failed("checkpoint accounting mutex was poisoned".into())
+                let mut accounting = accounting.lock().map_err(|poison| {
+                    EngineError::Failed(format!(
+                        "checkpoint accounting mutex was poisoned while rolling back `{relative}`: {poison}; \
+                         original persist error: {error}"
+                    ))
                 })?;
-                accounting.rollback(relative, digest.bytes, previous);
+                accounting.rollback(&relative, digest.bytes, previous);
                 return Err(error);
             }
             Ok(FilePin {
@@ -215,17 +231,58 @@ fn persist_checkpoint_blob(
     let blobs = metadata.join("checkpoint-blobs");
     std::fs::create_dir_all(&blobs)?;
     let destination = blobs.join(sha256);
-    if destination.exists() {
-        if hash_file(&destination, file_limit)?.sha256 != sha256 {
+    // Never follow a pre-planted symlink: a symlink at the blob path
+    // pointing at matching content would pass an existence check. A symlink
+    // here is always planted damage, never a valid blob (E06). Inspection
+    // failures propagate instead of reading as absent (E06).
+    if is_symlink_no_follow(&destination).map_err(EngineError::Io)? {
+        return Err(EngineError::Failed(format!(
+            "checkpoint blob `{sha256}` collides with a symbolic link"
+        )));
+    }
+    // Never use `exists()` here: it follows a symlink planted between the
+    // probe above and this check. `symlink_metadata` observes the leaf
+    // itself (E06).
+    match std::fs::symlink_metadata(&destination) {
+        Ok(meta) if meta.file_type().is_symlink() => {
             return Err(EngineError::Failed(format!(
-                "checkpoint blob `{sha256}` does not match its content digest"
+                "checkpoint blob `{sha256}` collides with a symbolic link"
             )));
         }
-        return Ok(());
+        Ok(_) => {
+            if hash_file(&destination, file_limit)?.sha256 != sha256 {
+                return Err(EngineError::Failed(format!(
+                    "checkpoint blob `{sha256}` does not match its content digest"
+                )));
+            }
+            return Ok(());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(EngineError::Io(error)),
     }
     let temporary = blobs.join(format!(".{sha256}.tmp-{}", Uuid::now_v7()));
     let copy_result = (|| -> Result<(), std::io::Error> {
-        let mut input = std::fs::File::open(source)?;
+        // Open without following a terminal symlink, matching the hash
+        // above: a link swapped in after verification is refused instead
+        // of copied (E06). Non-Unix falls back to a pre-open probe.
+        #[cfg(unix)]
+        let mut input = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(source)?
+        };
+        #[cfg(not(unix))]
+        let mut input = {
+            if is_symlink_no_follow(source)? {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("checkpoint source `{source}` is a symbolic link"),
+                ));
+            }
+            std::fs::File::open(source)?
+        };
         let mut file = std::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -248,12 +305,22 @@ fn persist_checkpoint_blob(
         Ok(())
     })();
     if let Err(error) = copy_result {
+        // Best-effort reclaim documented here: the copy error below stays
+        // authoritative, and the startup sweep reaps anything left behind.
         let _ = std::fs::remove_file(&temporary);
         return Err(error.into());
     }
     match std::fs::rename(&temporary, &destination) {
         Ok(()) => Ok(()),
-        Err(_error) if destination.exists() => {
+        Err(_rename_error)
+            if matches!(
+                std::fs::symlink_metadata(&destination).map(|m| m.file_type().is_symlink()),
+                Ok(false)
+            ) =>
+        {
+            // Best-effort reclaim documented here: the digest check below
+            // decides the outcome. A symlink at the destination is never
+            // treated as a competing writer (E06).
             let _ = std::fs::remove_file(&temporary);
             if hash_file(&destination, file_limit)?.sha256 == sha256 {
                 Ok(())
@@ -275,11 +342,64 @@ pub(crate) struct FileDigest {
     pub(crate) bytes: u64,
 }
 
+/// Reports whether `path` is a symlink without following it. A missing path
+/// is not a symlink; any other inspection failure propagates so callers fail
+/// closed instead of treating an unreadable path as safe (E06).
+pub(crate) fn is_symlink_no_follow(path: &camino::Utf8Path) -> Result<bool, std::io::Error> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_symlink()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) fn hash_file(
     path: &camino::Utf8Path,
     file_limit: Option<usize>,
 ) -> Result<FileDigest, std::io::Error> {
-    let mut file = std::fs::File::open(path)?;
+    // Open with O_NOFOLLOW on Unix so a terminal symlink is refused instead
+    // of followed: verification must hash the pinned file itself, never a
+    // link target planted after the pin (E06). The opened handle is then
+    // validated as a regular file via fstat, closing the swap window between
+    // a pathname check and the open.
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        let file_type = file.metadata()?.file_type();
+        if !file_type.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("`{path}` is not a regular file"),
+            ));
+        }
+        file
+    };
+    // No handle exists that can express O_NOFOLLOW on this platform; the
+    // pathname check below is the only available validation and is
+    // documented as best-effort here (E13). Non-Unix resume verification
+    // additionally refuses symlinked parents at the call site.
+    #[cfg(not(unix))]
+    let file = {
+        if is_symlink_no_follow(path)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("`{path}` is a symbolic link"),
+            ));
+        }
+        let file = std::fs::File::open(path)?;
+        if !file.metadata()?.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("`{path}` is not a regular file"),
+            ));
+        }
+        file
+    };
+    let mut file = file;
     let mut digest = Sha256::new();
     let bytes = {
         let mut writer = Sha256Writer {
@@ -316,8 +436,9 @@ impl std::io::Write for Sha256Writer<'_> {
                     .map_err(|_| std::io::Error::other("output byte count does not fit in u64"))?,
             )
             .ok_or_else(|| std::io::Error::other("output byte count overflowed"))?;
-        if self.limit.is_some_and(|limit| next > limit) {
-            let limit = self.limit.unwrap_or(u64::MAX);
+        if let Some(limit) = self.limit
+            && next > limit
+        {
             return Err(std::io::Error::other(format!(
                 "output file exceeds {limit} bytes"
             )));
@@ -347,10 +468,11 @@ impl std::io::Write for LimitedFileWriter<'_> {
                     .map_err(|_| std::io::Error::other("output byte count does not fit in u64"))?,
             )
             .ok_or_else(|| std::io::Error::other("output byte count overflowed"))?;
-        if self.limit.is_some_and(|limit| next > limit) {
+        if let Some(limit) = self.limit
+            && next > limit
+        {
             return Err(std::io::Error::other(format!(
-                "output file exceeds {} bytes",
-                self.limit.unwrap_or(u64::MAX)
+                "output file exceeds {limit} bytes"
             )));
         }
         self.file.write_all(bytes)?;

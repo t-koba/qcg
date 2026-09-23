@@ -132,18 +132,32 @@
         "type": "string"
       },
       "AgentFailureCode": {
-        "enum": [
-          "tool_failed",
-          "guardrail_rejected",
-          "token_budget_exceeded",
-          "tool_call_budget_exceeded",
-          "iteration_budget_exceeded",
-          "run_budget_exceeded",
-          "validation_failed",
-          "provider_failed",
-          "cancelled"
-        ],
-        "type": "string"
+        "oneOf": [
+          {
+            "enum": [
+              "tool_failed",
+              "guardrail_rejected",
+              "token_budget_exceeded",
+              "tool_call_budget_exceeded",
+              "iteration_budget_exceeded",
+              "run_budget_exceeded",
+              "validation_failed",
+              "provider_failed",
+              "cancelled"
+            ],
+            "type": "string"
+          },
+          {
+            "const": "timed_out",
+            "description": "A per-attempt node timeout fired. Distinct from ordinary tool failure\nso retry policy and observability can tell an unknown-outcome timeout\napart from a proven-clean error (E11).",
+            "type": "string"
+          },
+          {
+            "const": "elapsed_exceeded",
+            "description": "The run-wide elapsed budget stopped this call. Distinct from node\ntimeout and cancellation so hosts report the actual cause (E11).",
+            "type": "string"
+          }
+        ]
       },
       "AgentHandoffEventData": {
         "additionalProperties": false,
@@ -286,6 +300,21 @@
         ],
         "type": "string"
       },
+      "AuditLevel": {
+        "description": "Audit preset declared by the contract designer.",
+        "oneOf": [
+          {
+            "const": "standard",
+            "description": "Persist every observation record (default).",
+            "type": "string"
+          },
+          {
+            "const": "minimal",
+            "description": "Persist no observation record unless a class override raises it.",
+            "type": "string"
+          }
+        ]
+      },
       "CommandIsolation": {
         "enum": [
           "container",
@@ -378,9 +407,12 @@
             "type": "string"
           },
           "operation_digest": {
-            "default": "",
-            "description": "Canonical digest of target + details binding this approval to the\nexact operation content (A06). Approvals never transfer across\ndifferent digests even for the same node and kind.",
+            "description": "Canonical digest of target + details binding this approval to the\nexact operation content (A06). Approvals never transfer across\ndifferent digests even for the same node and kind. Required:\na confirmation without a digest is corrupt, never an\ninvocation-scoped default (Q1-5 fail-closed).",
             "type": "string"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/SideEffectScope",
+            "description": "How far this approval reaches, recorded from the manifest\npermission: `invocation` approves one call, `content` reuses the\napproval for identical content until the run ends (Q1). Required:\nthe scope must be stated explicitly, never defaulted silently.\nWire form: `invocation` confirmations carry 4-part ids\n(`node:kind:digest:invocation-hash`), `content` ones 3-part ids\n(`node:kind:digest`)."
           },
           "target": {
             "type": "string"
@@ -394,7 +426,9 @@
           "title",
           "kind",
           "target",
-          "dry_run"
+          "dry_run",
+          "operation_digest",
+          "scope"
         ],
         "type": "object"
       },
@@ -446,8 +480,7 @@
           "podman",
           "docker_runsc",
           "incus",
-          "lxd",
-          "lxc"
+          "lxd"
         ],
         "type": "string"
       },
@@ -612,18 +645,34 @@
         "type": "object"
       },
       "FailureCode": {
-        "enum": [
-          "when_false",
-          "dependency_unsatisfied",
-          "no_dependency_succeeded",
-          "check_failed",
-          "execution_failed",
-          "repair_exhausted",
-          "scheduler_failed",
-          "canceled",
-          "budget_exceeded"
-        ],
-        "type": "string"
+        "oneOf": [
+          {
+            "enum": [
+              "when_false",
+              "dependency_unsatisfied",
+              "no_dependency_succeeded",
+              "check_failed",
+              "execution_failed",
+              "elapsed_exceeded",
+              "repair_exhausted",
+              "scheduler_failed",
+              "canceled",
+              "interrupted",
+              "budget_exceeded"
+            ],
+            "type": "string"
+          },
+          {
+            "const": "timed_out",
+            "description": "A per-attempt node timeout fired. Distinct from execution failure\nand elapsed exceedance so run cancel, node timeout, and elapsed\nlimit stay distinguishable (E11).",
+            "type": "string"
+          },
+          {
+            "const": "refused",
+            "description": "A guard or admission refused the attempt. Distinct from execution\nfailure so a refusal never reads as a failed execution (E11).",
+            "type": "string"
+          }
+        ]
       },
       "FailureDetail": {
         "additionalProperties": false,
@@ -1158,6 +1207,13 @@
             },
             "type": "array"
           },
+          "options_from": {
+            "description": "Run-variable path supplying this field's options at run time, using\nthe same dotted paths as `ask_user.fields_from`. The value is an array\nof strings or of `{ value, label?, label_i18n? }` objects. Mutually\nexclusive with static `options` and valid only for runtime forms\n(`ask_user`), never for pre-run `[inputs]` fields.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "pattern": {
             "default": null,
             "type": [
@@ -1415,6 +1471,257 @@
         ],
         "type": "object"
       },
+      "LlmCatalogCapabilities": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "audio_input": {
+            "type": "boolean"
+          },
+          "file_input": {
+            "type": "boolean"
+          },
+          "image_input": {
+            "type": "boolean"
+          },
+          "json_schema": {
+            "type": "boolean"
+          },
+          "parallel_tool_calls": {
+            "type": "boolean"
+          },
+          "seed": {
+            "type": "boolean"
+          },
+          "stop_sequences": {
+            "type": "boolean"
+          },
+          "streaming": {
+            "type": "boolean"
+          },
+          "structured_output_with_tools": {
+            "type": "boolean"
+          },
+          "temperature": {
+            "type": "boolean"
+          },
+          "tool_choice": {
+            "type": "boolean"
+          },
+          "tool_use": {
+            "type": "boolean"
+          },
+          "top_p": {
+            "type": "boolean"
+          },
+          "verbosity": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "tool_use",
+          "json_schema",
+          "structured_output_with_tools",
+          "seed",
+          "image_input",
+          "audio_input",
+          "file_input",
+          "streaming",
+          "temperature",
+          "top_p",
+          "stop_sequences",
+          "tool_choice",
+          "parallel_tool_calls",
+          "verbosity"
+        ],
+        "title": "LlmCatalogCapabilities",
+        "type": "object"
+      },
+      "LlmCatalogModel": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "capabilities": {
+            "$ref": "#/components/schemas/LlmCatalogCapabilities"
+          },
+          "context_tokens": {
+            "default": null,
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "input_cost_per_million_usd": {
+            "default": null,
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "label": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_output_tokens": {
+            "default": null,
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "output_cost_per_million_usd": {
+            "default": null,
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "reasoning_effort": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "source": {
+            "description": "`built-in`, `explicit`, `external`, or `discovery` (combined sources\nare joined with ` + `).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "enabled",
+          "source",
+          "capabilities"
+        ],
+        "title": "LlmCatalogModel",
+        "type": "object"
+      },
+      "LlmCatalogProvider": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "available": {
+            "description": "False when the provider needs a credential that is not configured.",
+            "type": "boolean"
+          },
+          "discovery": {
+            "description": "Whether live `/v1/models` discovery is enabled for this provider.",
+            "type": "boolean"
+          },
+          "error": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "models": {
+            "items": {
+              "$ref": "#/components/schemas/LlmCatalogModel"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "available",
+          "discovery",
+          "models"
+        ],
+        "title": "LlmCatalogProvider",
+        "type": "object"
+      },
+      "LlmCatalogResponse": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Selectable LLM provider/model catalog. Metadata only: the catalog never\ncarries credentials and never grants run permissions.",
+        "properties": {
+          "fetched_at": {
+            "default": null,
+            "description": "RFC 3339 timestamp of the last successful external catalog fetch.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "providers": {
+            "items": {
+              "$ref": "#/components/schemas/LlmCatalogProvider"
+            },
+            "type": "array"
+          },
+          "sources": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/LlmCatalogSource"
+            },
+            "type": "array"
+          },
+          "stale": {
+            "default": false,
+            "description": "True while external metadata is missing or stale.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "providers"
+        ],
+        "title": "LlmCatalogResponse",
+        "type": "object"
+      },
+      "LlmCatalogSource": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "error": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fetched_at": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "location": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "location"
+        ],
+        "title": "LlmCatalogSource",
+        "type": "object"
+      },
       "LlmDeltaEventData": {
         "additionalProperties": false,
         "properties": {
@@ -1665,47 +1972,49 @@
         "additionalProperties": false,
         "properties": {
           "commands": {
-            "default": [],
             "items": {
               "$ref": "#/components/schemas/CommandPermission"
             },
             "type": "array"
           },
           "containers": {
-            "$ref": "#/components/schemas/ContainerPermission",
-            "default": {
-              "enabled": false,
-              "images": [],
-              "on_missing": null,
-              "runtime": null
-            }
+            "$ref": "#/components/schemas/ContainerPermission"
           },
           "fs_read": {
-            "default": [],
             "items": {
               "type": "string"
             },
             "type": "array"
           },
           "fs_write": {
-            "default": [],
             "items": {
               "type": "string"
             },
             "type": "array"
           },
           "network": {
-            "default": [],
             "items": {
               "type": "string"
             },
             "type": "array"
           },
           "side_effects": {
-            "$ref": "#/components/schemas/SideEffects",
-            "default": "none"
+            "$ref": "#/components/schemas/SideEffects"
+          },
+          "side_effects_scope": {
+            "$ref": "#/components/schemas/SideEffectScope",
+            "default": "invocation",
+            "description": "How far one approval reaches. `invocation` (default) authorizes a\nsingle call; `content` reuses the approval for identical content in\nlater calls (Q1). The serde default keeps the documented\nmanifest-parse-time default: an explicit `[permissions]` block may\nomit the key and still resolve to `invocation`."
           }
         },
+        "required": [
+          "fs_read",
+          "fs_write",
+          "network",
+          "commands",
+          "containers",
+          "side_effects"
+        ],
         "type": "object"
       },
       "ProblemDetails": {
@@ -1879,6 +2188,13 @@
           "cache": {
             "$ref": "#/components/schemas/ResourceEventCacheStatus"
           },
+          "diagnostics": {
+            "description": "Lenient specification violations recorded while inspecting the\nresource (for example a skill name that differs from its directory).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "files": {
             "default": [],
             "items": {
@@ -2012,6 +2328,28 @@
               "command"
             ],
             "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Snapshot copied from another run's declared artifact.",
+            "properties": {
+              "artifact": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "run_ref",
+                "type": "string"
+              },
+              "run_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "run_id",
+              "artifact"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -2089,6 +2427,18 @@
               "tokens_total": 0
             },
             "description": "Accumulated cost metrics, present when the writer attached them."
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FailureDetail"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Structured failure detail carrying the dedicated code (for example\nan elapsed-deadline stop), when the writer attached one."
           }
         },
         "required": [
@@ -2348,6 +2698,16 @@
         "title": "RunListItem",
         "type": "object"
       },
+      "RunListOrder": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Run history sort order. Ascending is the default and preserves the\nexisting cursor contract; descending serves newest-first views so\nrecent runs never fall out of a capped fetch window (B12).",
+        "enum": [
+          "asc",
+          "desc"
+        ],
+        "title": "RunListOrder",
+        "type": "string"
+      },
       "RunListResponse": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
@@ -2511,6 +2871,14 @@
             "description": "Owning generator id so clients never parse it from run_id (C03).\nRequired: a snapshot without an owner is corrupt, never something\nto guess from the run id.",
             "type": "string"
           },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "description": "Run metadata admitted with the run; never authorization.",
+            "type": "object"
+          },
           "metrics": {
             "anyOf": [
               {
@@ -2594,6 +2962,18 @@
             "default": {},
             "type": "object"
           },
+          "audit_raise": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AuditLevel"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Per-run audit level raise recorded at admission; it can only raise\nobservation persistence."
+          },
           "confirmations": {
             "additionalProperties": {
               "type": "boolean"
@@ -2632,6 +3012,14 @@
             "additionalProperties": true,
             "type": "object"
           },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "description": "Free-form run metadata admitted with the run. Metadata only: qcg\nnever reads identity or enforces authorization from labels.",
+            "type": "object"
+          },
           "parent_run_id": {
             "default": null,
             "description": "Parent run id for runs created by fork.",
@@ -2649,6 +3037,14 @@
           "qcg": {
             "type": "string"
           },
+          "queued_at": {
+            "default": null,
+            "description": "Durable admission instant for queue ordering. Written by fork\nadmissions and requeues; absent entries fall back to the event\ntimestamp (C04). Required to be explicit when present, never\ndefaulted silently on write.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "resource_hashes": {
             "default": [],
             "items": {
@@ -2656,7 +3052,7 @@
             },
             "type": "array"
           },
-          "retain_days": {
+          "retention_days": {
             "default": null,
             "format": "uint64",
             "minimum": 0,
@@ -2771,6 +3167,20 @@
         ],
         "type": "object"
       },
+      "SideEffectScope": {
+        "oneOf": [
+          {
+            "const": "invocation",
+            "description": "Approval binds one invocation: a later call re-confirms even for\nidentical content.",
+            "type": "string"
+          },
+          {
+            "const": "content",
+            "description": "Approval binds the exact operation content; the same content in a\nlater invocation reuses it.",
+            "type": "string"
+          }
+        ]
+      },
       "SideEffects": {
         "enum": [
           "none",
@@ -2789,6 +3199,18 @@
             "description": "Pre-provisioned answers keyed by question id, consumed without interaction.\nSame semantics as eval suite answers.",
             "type": "object"
           },
+          "audit_level": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AuditLevel"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Requests a higher observation-audit level for this run. The\ndeployment floor and the generator policy can only be raised."
+          },
           "confirmations": {
             "additionalProperties": {
               "type": "boolean"
@@ -2802,6 +3224,14 @@
           },
           "inputs": {
             "additionalProperties": true,
+            "type": "object"
+          },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "description": "Free-form run metadata (for example `owner`). Metadata only: it is\nstored and returned with the run, and never confers authorization.",
             "type": "object"
           },
           "priority": {
@@ -3054,16 +3484,30 @@
         "type": "object"
       },
       "ToolCallErrorCode": {
-        "enum": [
-          "invalid_arguments",
-          "guardrail_rejected",
-          "execution_failed",
-          "output_rejected",
-          "cancelled",
-          "budget_exceeded",
-          "tool_reported_error"
-        ],
-        "type": "string"
+        "oneOf": [
+          {
+            "enum": [
+              "invalid_arguments",
+              "guardrail_rejected",
+              "execution_failed",
+              "output_rejected",
+              "cancelled",
+              "budget_exceeded",
+              "tool_reported_error"
+            ],
+            "type": "string"
+          },
+          {
+            "const": "timed_out",
+            "description": "A per-attempt node timeout fired (E11). Distinct from\n`ExecutionFailed` so timeouts are observable and retryable.",
+            "type": "string"
+          },
+          {
+            "const": "elapsed_exceeded",
+            "description": "The run-wide elapsed budget stopped this call (E11). Distinct from\nnode timeout and cancellation.",
+            "type": "string"
+          }
+        ]
       },
       "ToolCallEventData": {
         "additionalProperties": false,
@@ -3409,6 +3853,43 @@
         "summary": "Read a declared generator asset"
       }
     },
+    "/api/llm/catalog": {
+      "get": {
+        "parameters": [
+          {
+            "in": "query",
+            "name": "refresh",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LlmCatalogResponse"
+                }
+              }
+            },
+            "description": "Selectable provider, model, and reasoning effort metadata"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "List selectable LLM providers and models"
+      }
+    },
     "/api/mcp/oauth/callback": {
       "get": {
         "parameters": [
@@ -3711,6 +4192,14 @@
               "format": "date-time",
               "type": "string"
             }
+          },
+          {
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/RunListOrder"
+            }
           }
         ],
         "responses": {
@@ -3983,6 +4472,70 @@
           }
         },
         "summary": "Run snapshot"
+      },
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Retries with the same key and request body return the original run.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunSnapshot"
+                }
+              }
+            },
+            "description": "Cancellation accepted"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Resource not found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Resource conflict"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Cancel a run (alias of /api/runs/{id}:cancel)"
       }
     },
     "/api/runs/{id}/artifacts": {

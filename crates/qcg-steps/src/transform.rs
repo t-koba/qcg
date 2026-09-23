@@ -142,7 +142,7 @@ impl StepExecutor for TransformStep {
         let mut value_output = None;
         match transform {
             "inject_secrets" => {
-                let text = bounded_transform_text(&source_path, transform_limit)
+                let text = bounded_transform_text(&ctx.run.fs, &source_path, transform_limit)
                     .await
                     .map_err(|error| StepError::failed(&node.id, error))?;
                 let injected = ctx
@@ -150,31 +150,49 @@ impl StepExecutor for TransformStep {
                     .secrets
                     .inject_declared_placeholders(&text, &params.secrets)
                     .map_err(|error| StepError::failed(&node.id, error))?;
-                write_transform_output(&node.id, &target_path, injected.as_bytes(), output_limit)
-                    .await?;
+                write_transform_output(
+                    &ctx.run.fs,
+                    &node.id,
+                    &target_path,
+                    injected.as_bytes(),
+                    output_limit,
+                )
+                .await?;
             }
             "json_pretty" => {
-                let text = bounded_transform_text(&source_path, transform_limit)
+                let text = bounded_transform_text(&ctx.run.fs, &source_path, transform_limit)
                     .await
                     .map_err(|error| StepError::failed(&node.id, error))?;
                 let value: Value = serde_json::from_str(&text)?;
                 let rendered = serde_json::to_string_pretty(&value)? + "\n";
-                write_transform_output(&node.id, &target_path, rendered.as_bytes(), output_limit)
-                    .await?;
+                write_transform_output(
+                    &ctx.run.fs,
+                    &node.id,
+                    &target_path,
+                    rendered.as_bytes(),
+                    output_limit,
+                )
+                .await?;
                 value_output = Some(value);
             }
             "json_compact" => {
-                let text = bounded_transform_text(&source_path, transform_limit)
+                let text = bounded_transform_text(&ctx.run.fs, &source_path, transform_limit)
                     .await
                     .map_err(|error| StepError::failed(&node.id, error))?;
                 let value: Value = serde_json::from_str(&text)?;
                 let rendered = serde_json::to_string(&value)? + "\n";
-                write_transform_output(&node.id, &target_path, rendered.as_bytes(), output_limit)
-                    .await?;
+                write_transform_output(
+                    &ctx.run.fs,
+                    &node.id,
+                    &target_path,
+                    rendered.as_bytes(),
+                    output_limit,
+                )
+                .await?;
                 value_output = Some(value);
             }
             "toml_to_json" => {
-                let text = bounded_transform_text(&source_path, transform_limit)
+                let text = bounded_transform_text(&ctx.run.fs, &source_path, transform_limit)
                     .await
                     .map_err(|error| StepError::failed(&node.id, error))?;
                 let value: toml::Value = toml::from_str(&text).map_err(|error| {
@@ -182,8 +200,14 @@ impl StepExecutor for TransformStep {
                 })?;
                 let value = serde_json::to_value(value)?;
                 let rendered = serde_json::to_string_pretty(&value)? + "\n";
-                write_transform_output(&node.id, &target_path, rendered.as_bytes(), output_limit)
-                    .await?;
+                write_transform_output(
+                    &ctx.run.fs,
+                    &node.id,
+                    &target_path,
+                    rendered.as_bytes(),
+                    output_limit,
+                )
+                .await?;
                 value_output = Some(value);
             }
             "json_merge" => {
@@ -200,23 +224,30 @@ impl StepExecutor for TransformStep {
                             format!("merge base is not in workspace: {error}"),
                         )
                     })?;
-                let base_text = bounded_transform_text(&with_path, transform_limit)
+                let base_text = bounded_transform_text(&ctx.run.fs, &with_path, transform_limit)
                     .await
                     .map_err(|error| StepError::failed(&node.id, error))?;
-                let overlay_text = bounded_transform_text(&source_path, transform_limit)
-                    .await
-                    .map_err(|error| StepError::failed(&node.id, error))?;
+                let overlay_text =
+                    bounded_transform_text(&ctx.run.fs, &source_path, transform_limit)
+                        .await
+                        .map_err(|error| StepError::failed(&node.id, error))?;
                 let overlay: Value = serde_json::from_str(&overlay_text)?;
                 let mut base: Value = serde_json::from_str(&base_text)?;
                 merge_json_objects(&mut base, &overlay);
                 let rendered = serde_json::to_string_pretty(&base)?;
                 let rendered = rendered + "\n";
-                write_transform_output(&node.id, &target_path, rendered.as_bytes(), output_limit)
-                    .await?;
+                write_transform_output(
+                    &ctx.run.fs,
+                    &node.id,
+                    &target_path,
+                    rendered.as_bytes(),
+                    output_limit,
+                )
+                .await?;
                 value_output = Some(base);
             }
             "json_to_toml" => {
-                let text = bounded_transform_text(&source_path, transform_limit)
+                let text = bounded_transform_text(&ctx.run.fs, &source_path, transform_limit)
                     .await
                     .map_err(|error| StepError::failed(&node.id, error))?;
                 let mut value: Value = serde_json::from_str(&text)?;
@@ -227,8 +258,14 @@ impl StepExecutor for TransformStep {
                 let text = toml::to_string_pretty(&value).map_err(|error| {
                     StepError::failed(&node.id, format!("failed to encode TOML: {error}"))
                 })?;
-                write_transform_output(&node.id, &target_path, text.as_bytes(), output_limit)
-                    .await?;
+                write_transform_output(
+                    &ctx.run.fs,
+                    &node.id,
+                    &target_path,
+                    text.as_bytes(),
+                    output_limit,
+                )
+                .await?;
             }
             "base64_decode" => {
                 let unix_mode = parse_unix_mode(node, rendered_unix_mode.as_deref())?;
@@ -239,6 +276,7 @@ impl StepExecutor for TransformStep {
                     ));
                 }
                 let decoded_bytes = decode_base64_file_atomic(
+                    &ctx.run.fs,
                     &source_path,
                     &target_path,
                     transform_limit,
@@ -247,19 +285,29 @@ impl StepExecutor for TransformStep {
                 .await
                 .map_err(|error| StepError::failed(&node.id, error))?;
                 if params.remove_source {
-                    tokio::fs::remove_file(&source_path).await?;
+                    ctx.run
+                        .fs
+                        .remove_file_resolved(&source_path)
+                        .await
+                        .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
                 }
                 value_output = Some(json!({ "bytes": decoded_bytes, "encoding": "binary" }));
             }
             "base64_encode" => {
-                let source_bytes =
-                    encode_base64_file_atomic(&source_path, &target_path, transform_limit)
-                        .await
-                        .map_err(|error| StepError::failed(&node.id, error))?;
+                let source_bytes = encode_base64_file_atomic(
+                    &ctx.run.fs,
+                    &source_path,
+                    &target_path,
+                    transform_limit,
+                )
+                .await
+                .map_err(|error| StepError::failed(&node.id, error))?;
                 value_output = Some(json!({ "bytes": source_bytes, "encoding": "base64" }));
             }
             "zip" => {
                 write_zip_atomic(
+                    &ctx.run.fs,
+                    &ctx.run.metadata,
                     &node.id,
                     &source_path,
                     &target_path,
@@ -311,7 +359,7 @@ fn transform_params(node: &NodeDef) -> Result<TransformParams, StepError> {
 
 #[cfg(test)]
 mod tests {
-    use crate::common::write_zip;
+    use crate::common::build_zip;
     use camino::Utf8PathBuf;
 
     #[test]
@@ -334,8 +382,17 @@ mod tests {
             .expect("source modification time should be set");
         let target = root.join("result.zip");
 
-        write_zip("archive", &source, &target, Some(1024 * 1024), Some(100))
-            .expect("zip should be written");
+        let mut buffer = std::io::Cursor::new(Vec::new());
+        build_zip(
+            "archive",
+            &source,
+            &target,
+            Some(1024 * 1024),
+            Some(100),
+            &mut buffer,
+        )
+        .expect("zip should build");
+        std::fs::write(&target, buffer.into_inner()).expect("zip should be written");
         let file = std::fs::File::open(&target).expect("zip should open");
         let mut archive = zip::ZipArchive::new(file).expect("zip should parse");
         assert!(

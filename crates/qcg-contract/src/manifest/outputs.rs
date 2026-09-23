@@ -58,16 +58,15 @@ pub enum FailureAction {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum FailureKind {
-    Schema,
-    Range,
-    Permission,
+    /// LLM output that violates the declared schema, budget, or contract
+    /// constraints. This is the only failure kind with a defined policy
+    /// point today; every other engine failure is fatal by mechanism.
     OutOfContract,
-    Execution,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct JournalPolicy {
+pub struct RetentionPolicy {
     #[serde(default)]
-    pub retain_days: Option<u32>,
+    pub days: Option<u32>,
 }

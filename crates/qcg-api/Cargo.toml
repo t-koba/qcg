@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 chrono.workspace = true
 qcg-contract = { path = "../qcg-contract" }
+qcg-policy = { path = "../qcg-policy" }
 qcg-types = { path = "../qcg-types" }
 schemars.workspace = true
 serde.workspace = true

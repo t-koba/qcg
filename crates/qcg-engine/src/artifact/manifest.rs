@@ -77,13 +77,11 @@ fn validate_output_manifest(
     manifest: &OutputManifest,
     limits: OutputLimits,
 ) -> Result<(), std::io::Error> {
-    if limits
-        .artifact_count
-        .is_some_and(|limit| manifest.artifacts.len() > limit)
+    if let Some(limit) = limits.artifact_count
+        && manifest.artifacts.len() > limit
     {
         return Err(io::Error::other(format!(
-            "output artifact count exceeds {}",
-            limits.artifact_count.unwrap_or(usize::MAX)
+            "output artifact count exceeds {limit}"
         )));
     }
     let mut paths = BTreeSet::new();
@@ -95,24 +93,21 @@ fn validate_output_manifest(
                 artifact.path
             )));
         }
-        if limits
-            .file_bytes
-            .is_some_and(|limit| artifact.bytes > limit)
+        if let Some(limit) = limits.file_bytes
+            && artifact.bytes > limit
         {
             return Err(io::Error::other(format!(
-                "output artifact `{}` exceeds {} bytes",
-                artifact.path,
-                limits.file_bytes.unwrap_or(u64::MAX)
+                "output artifact `{}` exceeds {limit} bytes",
+                artifact.path
             )));
         }
         total = total
             .checked_add(artifact.bytes)
             .ok_or_else(|| io::Error::other("output byte accounting overflowed"))?;
-        if limits.total_bytes.is_some_and(|limit| total > limit) {
-            return Err(io::Error::other(format!(
-                "output bytes exceed {}",
-                limits.total_bytes.unwrap_or(u64::MAX)
-            )));
+        if let Some(limit) = limits.total_bytes
+            && total > limit
+        {
+            return Err(io::Error::other(format!("output bytes exceed {limit}")));
         }
     }
     Ok(())

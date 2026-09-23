@@ -6,6 +6,21 @@
   import ArtifactPreview from "./ArtifactPreview.svelte";
   let { store, messages }: { store: RunStore; messages: Messages } = $props();
   let selected = $state<OutputArtifact | null>(null);
+
+  /** Opens an artifact through an authenticated blob URL: a plain anchor
+   * cannot attach the Authorization header an authenticated instance
+   * requires, and the token must never travel in a query string. */
+  async function openArtifact(artifact: OutputArtifact): Promise<void> {
+    if (!store.currentRun) return;
+    try {
+      const blob = await store.api.artifactBlob(store.currentRun, artifact.path);
+      const url = URL.createObjectURL(blob);
+      window.open(url, "_blank", "noopener");
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } catch (error) {
+      store.errorText = error instanceof Error ? error.message : String(error);
+    }
+  }
 </script>
 
 <div id="artifact-list" class="artifact-list">
@@ -21,11 +36,7 @@
       </div>
       <div class="artifact-actions">
         {#if artifact.preview !== "none"}<button type="button" onclick={() => selected = artifact}>{messages.preview}</button>{/if}
-        <a
-          href={store.currentRun ? store.api.artifactUrl(store.currentRun, artifact.path) : "#"}
-          target="_blank"
-          rel="noopener"
-        >{messages.open}</a>
+        <button type="button" onclick={() => void openArtifact(artifact)}>{messages.open}</button>
       </div>
     </article>
   {/each}
@@ -108,8 +119,7 @@
     gap: var(--space-xs);
   }
 
-  .artifact-actions button,
-  .artifact-actions a {
+  .artifact-actions button {
     align-items: center;
     background: transparent;
     border: 0;
@@ -125,8 +135,7 @@
     text-decoration: none;
   }
 
-  .artifact-actions button:hover,
-  .artifact-actions a:hover {
+  .artifact-actions button:hover {
     background: var(--accent-soft);
   }
 

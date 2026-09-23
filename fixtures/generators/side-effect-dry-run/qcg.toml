@@ -37,6 +37,9 @@ qcg_version = "^0.1"
 version = "0.1.0"
 
 [permissions]
+fs_read = []
+network = []
+side_effects_scope = "invocation"
 fs_write = ["workspace"]
 side_effects = "dry_run_first"
 
@@ -45,3 +48,6 @@ args = ["dry-run"]
 bin = "echo"
 purpose = "demonstrate dry-run side effect confirmation"
 isolation = "trusted_host"
+
+[permissions.containers]
+enabled = false

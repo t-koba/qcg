@@ -44,6 +44,12 @@ jobs:
       - name: Check generated documentation
         run: bash scripts/check-generated-docs.sh
 
+      - name: Check capability matrix
+        run: bash scripts/check-capability-matrix.sh
+
+      - name: Check SDKs
+        run: bash scripts/check-sdk.sh
+
       - name: Check third-party notices
         run: bash scripts/check-third-party-notices.sh
 

@@ -58,12 +58,21 @@ workflow:
 The built-in flow vocabulary is `write`, `render`, `copy`, `http`, `command`,
 `transform`, `ask_user`, `check.schema`, `check.format`, `check.command`,
 `check.tool`, `check.container`, `check.contract`, `fail`, `foreach`,
-`llm.generate`, `llm.fill`, `llm.choose`, `llm.repair`, `llm.agent`, and the
-direct `mcp.call` step. Their parameter schemas are the runtime contract:
+`llm.generate`, `llm.fill`, `llm.choose`, `llm.repair`, `llm.agent`,
+`llm.catalog`, and the direct `mcp.call` step. Their parameter schemas are the
+runtime contract:
 unknown parameters must be rejected, and all paths, models, providers,
 commands, MCP servers/tools, and resource kinds must be declared explicitly.
-Resource kinds are closed to `file`, `dir`, `skill`, `url`, `openapi`, and
-`exec`; use `exec` for an external process-backed resource.
+Resource kinds are closed to `file`, `dir`, `skill`, `skill_library`, `url`,
+`openapi`, and `exec`; use `exec` for an external process-backed resource.
+A `skill` resource is an Agent Skills directory containing a `SKILL.md` with
+`name` and `description` frontmatter; `skill_library` scans `<name>/SKILL.md`
+directories below its `path`. When a generated generator needs specialized
+procedural knowledge, add `resources/skills/<name>/SKILL.md` sources, declare
+the skill resource, and load it from an LLM node `context` with
+`select = "instructions"` (or `meta`, `tree`, `files`). Skills are data:
+`allowed-tools` never grants permissions, and every command, host, or write
+still requires an explicit manifest declaration.
 Use `[llm]` only for generator-wide defaults and ceilings. Every LLM flow node
 may declare a typed `request` object, and every agent-as-tool may refine it with
 its own `model`, `fallback_models`, and `request`. The layer order is `[llm]`,

@@ -24,21 +24,24 @@ describe("decodeView", () => {
     expect(decodeView(encodeView(view))).toEqual(view);
   });
 
-  it("ignores legacy answer and form maps", () => {
-    const decoded = decodeView(JSON.stringify({
+  it("resets to defaults on unknown persisted fields (fail-closed, no compat)", () => {
+    // Unknown or removed fields reset the whole view loudly: there is no
+    // partial rehydration. The legacy `answersByRun` shape (which could carry
+    // secrets) and any future field must not silently rehydrate.
+    expect(decodeView(JSON.stringify({
       version: 1,
       selected: "generator",
       tabOrder: ["run-a"],
       currentRun: "run-a",
       answersByRun: { "run-a": { "question:name": "secret" } },
-      formValuesByGenerator: { generator: { password: "secret" } },
-    }));
-    expect(decoded).toEqual({
+    }))).toBeNull();
+    expect(decodeView(JSON.stringify({
       version: 1,
       selected: "generator",
       tabOrder: ["run-a"],
       currentRun: "run-a",
-    });
+      futureField: "ignored",
+    }))).toBeNull();
   });
 
   it("drops placeholder tabs and caps the tab order", () => {

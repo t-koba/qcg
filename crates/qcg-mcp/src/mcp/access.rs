@@ -32,7 +32,6 @@ pub enum McpContainerRuntime {
     DockerRunsc,
     Incus,
     Lxd,
-    Lxc,
 }
 
 impl McpContainerRuntime {
@@ -59,7 +58,6 @@ impl McpContainerRuntime {
             Self::Lxd => Backend::Incus {
                 binary: "lxc".into(),
             },
-            Self::Lxc => Backend::Lxc,
         }
     }
 }
@@ -115,7 +113,6 @@ pub(crate) fn mcp_container_backend(
     let binaries = match &backend {
         qcg_container::Backend::Docker { binary, .. } => vec![binary.as_str()],
         qcg_container::Backend::Incus { binary } => vec![binary.as_str()],
-        qcg_container::Backend::Lxc => vec!["lxc-create"],
     };
     binaries
         .iter()

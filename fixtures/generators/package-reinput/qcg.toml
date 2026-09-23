@@ -40,6 +40,8 @@ output_file = "reinput-summary.md"
 template = "templates/summary.md.j2"
 
 [permissions]
+network = []
+side_effects_scope = "invocation"
 fs_read = ["workspace"]
 fs_write = ["workspace"]
 side_effects = "allowed"
@@ -50,5 +52,8 @@ args = ["-c", "*"]
 purpose = "expand a prior package file input for re-editing"
 isolation = "trusted_host"
 
+
+[permissions.containers]
+enabled = false
 [runtime]
 # No mechanistic limits by default. Set explicit max only when desired.

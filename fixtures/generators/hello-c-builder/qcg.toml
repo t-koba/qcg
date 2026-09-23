@@ -50,6 +50,9 @@ glob = "hello.exe"
 required = true
 
 [permissions]
+fs_read = []
+network = []
+side_effects_scope = "invocation"
 fs_write = ["workspace"]
 side_effects = "allowed"
 
@@ -68,3 +71,6 @@ args = []
 bin = "./hello.exe"
 purpose = "run generated executable for validation"
 isolation = "trusted_host"
+
+[permissions.containers]
+enabled = false

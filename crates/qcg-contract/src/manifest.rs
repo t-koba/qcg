@@ -1,6 +1,7 @@
 pub mod assets;
 pub mod contract;
 pub mod flow;
+pub mod hooks;
 pub mod llm;
 pub mod metadata;
 pub mod nodes;
@@ -11,6 +12,7 @@ pub mod validate;
 pub use contract::*;
 #[cfg(test)]
 pub(crate) use flow::*;
+pub use hooks::*;
 pub use llm::*;
 pub use nodes::*;
 pub use outputs::*;
@@ -85,7 +87,9 @@ qcg_version = "^0.1"
             blocks: BTreeMap::new(),
             outputs: OutputSpec::default(),
             failure: FailurePolicy::default(),
-            journal: JournalPolicy::default(),
+            retention: RetentionPolicy::default(),
+            audit: qcg_policy::AuditConfig::default(),
+            hooks: Default::default(),
             assets: AssetSpec::default(),
             dependencies: BTreeMap::new(),
         }
@@ -108,6 +112,7 @@ qcg_version = "^0.1"
             min_items: None,
             item_type: None,
             schema: None,
+            options_from: None,
             ui: Default::default(),
         }
     }
@@ -150,11 +155,37 @@ qcg_version = "^0.1"
             blocks: BTreeMap::new(),
             outputs: OutputSpec::default(),
             failure: FailurePolicy::default(),
-            journal: JournalPolicy::default(),
+            retention: RetentionPolicy::default(),
+            audit: qcg_policy::AuditConfig::default(),
+            hooks: Default::default(),
             assets: AssetSpec::default(),
             dependencies: BTreeMap::new(),
         }
     }
+    #[test]
+    fn decision_nodes_do_not_remove_chat_configuration_requirements() {
+        let mut decision = retry_node("decision", None);
+        decision.kind = StepType::from("llm.decide");
+        FlowNodeRule
+            .validate(&flow_manifest(vec![decision.clone()]))
+            .expect("decision nodes must not require chat configuration");
+        for kind in [
+            "llm.generate",
+            "llm.fill",
+            "llm.choose",
+            "llm.agent",
+            "llm.repair",
+            "llm.decide_extra",
+        ] {
+            let mut chat = retry_node("chat", None);
+            chat.kind = StepType::from(kind);
+            let error = FlowNodeRule
+                .validate(&flow_manifest(vec![decision.clone(), chat]))
+                .expect_err("chat nodes must still require chat configuration");
+            assert!(error.to_string().contains("[llm] is not declared"));
+        }
+    }
+
     #[test]
     fn retry_policy_bounds_are_enforced() {
         let valid = flow_manifest(vec![retry_node(
@@ -361,6 +392,7 @@ qcg_version = "^0.1"
             min_items: None,
             item_type: None,
             schema: None,
+            options_from: None,
             ui: Default::default(),
         });
         let resolved = manifest.resolve_inputs(BTreeMap::new()).unwrap();
@@ -372,6 +404,7 @@ qcg_version = "^0.1"
             id: "count".into(),
             kind: FieldType::Number,
             required: true,
+            options_from: None,
             schema: Some(serde_json::json!({
                 "type": "number",
                 "minimum": 2,
@@ -390,6 +423,7 @@ qcg_version = "^0.1"
             id: "count".into(),
             kind: FieldType::Number,
             default: Some(serde_json::json!(5)),
+            options_from: None,
             schema: Some(serde_json::json!({ "type": "number", "maximum": 4 })),
             ..input_field_defaults()
         });
@@ -400,6 +434,7 @@ qcg_version = "^0.1"
             id: "coordinates".into(),
             kind: FieldType::Custom("geo.point".into()),
             required: true,
+            options_from: None,
             schema: Some(serde_json::json!({
                 "type": "object",
                 "required": ["lat", "lon"],
@@ -421,6 +456,7 @@ qcg_version = "^0.1"
                 id: "coordinates".into(),
                 kind: FieldType::Custom(kind.into()),
                 required: true,
+                options_from: None,
                 schema: None,
                 ..input_field_defaults()
             });
@@ -548,6 +584,129 @@ qcg_version = "^0.1"
             assert!(error.to_string().contains("must not be empty"));
         }
     }
+    #[test]
+    fn journal_scan_window_obeys_its_mechanism_bounds() {
+        let mut manifest = manifest_with_field(InputField {
+            id: "name".into(),
+            ..input_field_defaults()
+        });
+        manifest.runtime.journal_scan_window_bytes =
+            Some(qcg_policy::MIN_JOURNAL_SCAN_WINDOW_BYTES);
+        manifest
+            .validate()
+            .expect("the minimum scan window should validate");
+        manifest.runtime.journal_scan_window_bytes =
+            Some(qcg_policy::MAX_JOURNAL_SCAN_WINDOW_BYTES);
+        manifest
+            .validate()
+            .expect("the maximum scan window should validate");
+        manifest.runtime.journal_scan_window_bytes =
+            Some(qcg_policy::MIN_JOURNAL_SCAN_WINDOW_BYTES - 1);
+        let error = manifest
+            .validate()
+            .expect_err("an undersized scan window must be rejected");
+        assert!(
+            error.to_string().contains("journal_scan_window_bytes"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn run_ref_resource_requires_one_selector_and_bounded_params() {
+        let manifest = |params: &str| -> Manifest {
+            toml::from_str(&format!(
+                r#"
+[generator]
+id = "run-ref"
+name = "Run Ref"
+version = "0.1.0"
+qcg_version = "^0.1"
+
+[resources.prev]
+type = "run_ref"
+{params}
+"#
+            ))
+            .expect("manifest should parse")
+        };
+        manifest(
+            r#"
+[resources.prev.params]
+selector = { latest_success = "producer" }
+artifact = "report.txt"
+max_bytes = 1024
+"#,
+        )
+        .validate()
+        .expect("a complete run_ref should validate");
+
+        let error = manifest(
+            r#"
+[resources.prev.params]
+selector = { run_id = "run-1", latest_success = "producer" }
+artifact = "report.txt"
+max_bytes = 1024
+"#,
+        )
+        .validate()
+        .expect_err("two selectors must be rejected");
+        assert!(
+            error.to_string().contains("exactly one selector"),
+            "{error}"
+        );
+
+        let error = manifest(
+            r#"
+[resources.prev.params]
+selector = { run_id = "run-1" }
+artifact = "../escape.txt"
+max_bytes = 1024
+"#,
+        )
+        .validate()
+        .expect_err("an escaping artifact must be rejected");
+        assert!(error.to_string().contains("safe relative path"), "{error}");
+
+        let error = manifest(
+            r#"
+[resources.prev.params]
+selector = { run_id = "run-1" }
+artifact = "report.txt"
+max_bytes = 0
+"#,
+        )
+        .validate()
+        .expect_err("a zero bound must be rejected");
+        assert!(error.to_string().contains("max_bytes"), "{error}");
+    }
+
+    #[test]
+    fn file_inputs_obey_the_runtime_file_count_limit() {
+        let file_field = |id: &str| InputField {
+            id: id.into(),
+            kind: FieldType::File,
+            required: true,
+            ..input_field_defaults()
+        };
+        let mut manifest = manifest_with_field(file_field("first"));
+        manifest.inputs.stages[0].fields.push(file_field("second"));
+        manifest.runtime.file_count_limit = Some(1);
+        let value = serde_json::to_value(
+            FileValue::from_text("note.txt", "hello").expect("file should be valid"),
+        )
+        .expect("file should encode");
+        let error = manifest
+            .resolve_inputs(BTreeMap::from([
+                ("first".into(), value.clone()),
+                ("second".into(), value),
+            ]))
+            .expect_err("the file count limit must apply to file inputs");
+        assert!(
+            error.to_string().contains("file_count_limit"),
+            "the error names the limit: {error}"
+        );
+    }
+
     #[test]
     fn resolve_inputs_validates_file_values_as_canonical_objects() {
         let manifest = manifest_with_field(InputField {
@@ -859,6 +1018,14 @@ llm_visible = true
 [resources.generated.params]
 command = ["printf", "hello"]
 max_bytes = 1024
+[permissions]
+fs_read = []
+fs_write = []
+network = []
+side_effects = "none"
+side_effects_scope = "invocation"
+[permissions.containers]
+enabled = false
 [[permissions.commands]]
 bin = "printf"
 args = ["hello"]
@@ -1064,17 +1231,14 @@ destination = "result.txt"
             r#"
 default = "fail"
 [by_kind]
-permission = "reject"
-range = "clamp"
+out_of_contract = "reject"
 "#,
         )
         .expect("global failure policy should parse");
         assert_eq!(
-            global.action(FailureKind::Permission),
+            global.action(FailureKind::OutOfContract),
             FailureAction::Reject
         );
-        assert_eq!(global.action(FailureKind::Range), FailureAction::Clamp);
-        assert_eq!(global.action(FailureKind::Schema), FailureAction::Fail);
         let node: NodeDef = toml::from_str(
             r#"
 id = "generate"
@@ -1087,10 +1251,6 @@ failure = { default = "clarify", by_kind = { out_of_contract = "reject" } }
         assert_eq!(
             override_policy.action(FailureKind::OutOfContract),
             FailureAction::Reject
-        );
-        assert_eq!(
-            override_policy.action(FailureKind::Schema),
-            FailureAction::Clarify
         );
     }
     #[test]

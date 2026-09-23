@@ -44,7 +44,8 @@
   </div>
   <div class="status-copy">
     <h2>{statusMessage}</h2>
-    {#if currentNode}<p>{humanizeIdentifier(currentNode.id)}</p>
+    {#if store.runState === "interrupted"}<p>{messages.statusInterruptedNote}</p>
+    {:else if currentNode}<p>{humanizeIdentifier(currentNode.id)}</p>
     {:else if total > 0}<p>{progressLabel}</p>{/if}
   </div>
   {#if active && store.currentRun}

@@ -288,8 +288,7 @@ mod tests {
             response.content.first(),
             Some(ChatContent::Text(text)) if text == "fallback response"
         ));
-        let journal_text =
-            std::fs::read_to_string(dir.join("journal.jsonl")).expect("journal should be readable");
+        let journal_text = persisted_text(&dir);
         assert!(journal_text.contains("llm_route_failed"));
     }
 
@@ -439,9 +438,20 @@ mod tests {
         .expect("temporary path must be UTF-8")
     }
 
+    /// Merged public record view: observation records live in the sibling
+    /// `audit.jsonl` (ADR 0001), so assertions read both streams.
+    fn persisted_text(dir: &Utf8PathBuf) -> String {
+        let mut text =
+            std::fs::read_to_string(dir.join("journal.jsonl")).expect("journal should be readable");
+        let audit = dir.join("audit.jsonl");
+        if let Ok(extra) = std::fs::read_to_string(&audit) {
+            text.push_str(&extra);
+        }
+        text
+    }
+
     fn route_failure_events(dir: &Utf8PathBuf) -> Vec<serde_json::Value> {
-        std::fs::read_to_string(dir.join("journal.jsonl"))
-            .expect("journal should be readable")
+        persisted_text(dir)
             .lines()
             .map(|line| serde_json::from_str(line).expect("journal line should be valid JSON"))
             .filter(|event: &serde_json::Value| event["t"] == "llm_route_failed")
@@ -523,8 +533,7 @@ mod tests {
             .await
             .expect_err("split secret must be rejected on completion");
         assert!(error.to_string().contains("secret `token`"));
-        let journal_text =
-            std::fs::read_to_string(dir.join("journal.jsonl")).expect("journal should be readable");
+        let journal_text = persisted_text(&dir);
         assert!(
             !journal_text.contains("secret-value"),
             "split deltas must not persist recoverable secrets"
@@ -586,8 +595,7 @@ mod tests {
             response.content.first(),
             Some(qcg_llm::ChatContent::Text(text)) if text == "hello world"
         ));
-        let journal_text =
-            std::fs::read_to_string(dir.join("journal.jsonl")).expect("journal should be readable");
+        let journal_text = persisted_text(&dir);
         let deltas: String = journal_text
             .lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
@@ -707,6 +715,7 @@ mod tests {
             parallel_tool_calls: None,
             verbosity: None,
             stream: false,
+            prompt_cache: qcg_llm::PromptCache::Off,
         }
     }
 

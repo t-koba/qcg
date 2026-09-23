@@ -1,4 +1,4 @@
-use qcg_contract::{Contract, LlmConfig, NodeDef, ToolDecl};
+use qcg_contract::{Contract, LlmConfig, LlmRequestPolicy, NodeDef, ToolDecl};
 use qcg_engine::{StepContext, StepError};
 use qcg_llm::LlmRuntime;
 use qcg_types::{StructuredOutputMode, ToolChoice};
@@ -56,14 +56,16 @@ pub(crate) fn validate_llm_node(
             .template_from_str(&model.model)
             .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
     }
+    validate_effort_templates(node, llm, &params.request, None)?;
     let required = required_capabilities(node, &policy, &params, has_response_schema, has_tools)?;
     if !dynamic_model {
-        let (provider_id, _) = resolve_model_static(llm, runtime, node)?;
+        let (provider_id, model) = resolve_model_static(llm, runtime, node)?;
         validate_provider_requirements(
             runtime,
             node,
             &policy,
             &provider_id,
+            Some(&model),
             "LLM provider",
             &required,
         )?;
@@ -74,11 +76,63 @@ pub(crate) fn validate_llm_node(
             node,
             &policy,
             &fallback.provider,
+            Some(&fallback.model),
             "fallback LLM provider",
             &required,
         )?;
     }
     Ok(())
+}
+
+/// Rejects malformed effort templates at contract validation. Rendering and
+/// model support are checked immediately before each request, where the
+/// resolved model is known.
+pub(crate) fn validate_effort_templates(
+    node: &NodeDef,
+    llm: &LlmConfig,
+    request: &LlmRequestPolicy,
+    specialist: Option<&LlmRequestPolicy>,
+) -> Result<(), StepError> {
+    let environment = minijinja::Environment::new();
+    for (field, spec) in [
+        ("[llm].reasoning_effort", llm.reasoning_effort.as_ref()),
+        (
+            "request.reasoning_effort",
+            request.reasoning_effort.as_ref(),
+        ),
+    ]
+    .into_iter()
+    .chain(specialist.into_iter().flat_map(|specialist| {
+        [(
+            "specialist request.reasoning_effort",
+            specialist.reasoning_effort.as_ref(),
+        )]
+    })) {
+        let Some(template) = spec.and_then(qcg_contract::ReasoningEffortSpec::template) else {
+            continue;
+        };
+        if !template.contains("{{") {
+            return Err(StepError::failed(
+                &node.id,
+                format!("{field} `{template}` is neither a known effort nor a template"),
+            ));
+        }
+        environment
+            .template_from_str(template)
+            .map_err(|error| StepError::failed(&node.id, format!("{field}: {error}")))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn capabilities_for(
+    runtime: &LlmRuntime,
+    provider_id: &str,
+    model: Option<&str>,
+) -> Option<qcg_llm::Capabilities> {
+    match model {
+        Some(model) => runtime.provider.model_capabilities_for(provider_id, model),
+        None => runtime.provider.capabilities_for(provider_id),
+    }
 }
 
 pub(crate) fn validate_effective_tool_policy(
@@ -192,13 +246,11 @@ pub(crate) fn validate_provider_requirements(
     node: &NodeDef,
     policy: &EffectiveRequestPolicy,
     provider_id: &str,
+    model: Option<&str>,
     provider_role: &str,
     required: &[String],
 ) -> Result<(), StepError> {
-    let capabilities = runtime
-        .provider
-        .capabilities_for(provider_id)
-        .ok_or_else(|| {
+    let capabilities = capabilities_for(runtime, provider_id, model).ok_or_else(|| {
             let hint = if provider_role == "LLM provider" && runtime.registry_present {
                 "enable its row in your providers.toml registry".to_string()
             } else if provider_role == "LLM provider" {
@@ -281,6 +333,7 @@ pub(crate) fn validate_resolved_model(
     node: &NodeDef,
     policy: &EffectiveRequestPolicy,
     provider: &str,
+    model: &str,
     has_response_schema: bool,
     has_tools: bool,
 ) -> Result<(), StepError> {
@@ -291,6 +344,7 @@ pub(crate) fn validate_resolved_model(
         node,
         policy,
         provider,
+        Some(model),
         "resolved LLM provider",
         &required,
     )

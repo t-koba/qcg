@@ -19,6 +19,25 @@ mod tests {
     use qcg_policy::MAX_JSON_SCHEMA_BYTES;
     use serde_json::json;
 
+    fn workspace_fs(root: &camino::Utf8Path) -> qcg_engine::FsGateway {
+        qcg_engine::FsGateway::new(
+            root.to_owned(),
+            &qcg_contract::Permissions {
+                fs_read: vec!["workspace".into()],
+                fs_write: vec!["workspace".into()],
+                ..Default::default()
+            },
+        )
+    }
+
+    /// The gateway compares canonical workspace prefixes, so tests that
+    /// build paths from `temp_dir()` must canonicalize first on platforms
+    /// where the temp root is a symlink.
+    fn canonical_root(path: &camino::Utf8Path) -> Utf8PathBuf {
+        Utf8PathBuf::from_path_buf(std::fs::canonicalize(path).expect("root should canonicalize"))
+            .expect("root must be UTF-8")
+    }
+
     #[test]
     fn package_backed_steps_validate_package_paths_before_execution() {
         let (contract, root) = test_contract("path");
@@ -206,16 +225,18 @@ output_file = "out.txt"
             .join(format!("qcg-base64-file-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("temporary directory should be created");
+        let root = canonical_root(&root);
+        let fs = workspace_fs(&root);
         let source = root.join("source.bin");
         let encoded = root.join("encoded.txt");
         let decoded = root.join("decoded.bin");
         let original = b"binary\0payload\xff";
         std::fs::write(&source, original).expect("source should be written");
-        let source_bytes = encode_base64_file_atomic(&source, &encoded, Some(1024))
+        let source_bytes = encode_base64_file_atomic(&fs, &source, &encoded, Some(1024))
             .await
             .expect("base64 encoding should succeed");
         assert_eq!(source_bytes, original.len());
-        let decoded_bytes = decode_base64_file_atomic(&encoded, &decoded, Some(1024), None)
+        let decoded_bytes = decode_base64_file_atomic(&fs, &encoded, &decoded, Some(1024), None)
             .await
             .expect("base64 decoding should succeed");
         assert_eq!(decoded_bytes, original.len());
@@ -226,7 +247,7 @@ output_file = "out.txt"
 
         std::fs::write(&encoded, "not canonical*").expect("invalid source should be written");
         std::fs::write(&decoded, b"previous output").expect("existing target should be written");
-        let error = decode_base64_file_atomic(&encoded, &decoded, Some(1024), None)
+        let error = decode_base64_file_atomic(&fs, &encoded, &decoded, Some(1024), None)
             .await
             .expect_err("invalid base64 must fail");
         assert!(error.contains("base64"));
@@ -245,14 +266,14 @@ output_file = "out.txt"
         let inplace = root.join("inplace");
         std::fs::write(&inplace, BASE64.encode(original))
             .expect("in-place source should be written");
-        decode_base64_file_atomic(&inplace, &inplace, Some(1024), None)
+        decode_base64_file_atomic(&fs, &inplace, &inplace, Some(1024), None)
             .await
             .expect("in-place base64 decode should succeed");
         assert_eq!(
             std::fs::read(&inplace).expect("in-place output should be readable"),
             original
         );
-        encode_base64_file_atomic(&inplace, &inplace, Some(1024))
+        encode_base64_file_atomic(&fs, &inplace, &inplace, Some(1024))
             .await
             .expect("in-place base64 encode should succeed");
         assert_eq!(
@@ -272,10 +293,12 @@ output_file = "out.txt"
             .join(format!("qcg-base64-mode-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("temporary directory should be created");
+        let root = canonical_root(&root);
+        let fs = workspace_fs(&root);
         let source = root.join("source.txt");
         let target = root.join("script");
         std::fs::write(&source, "c2V0IC1l").expect("source should be written");
-        decode_base64_file_atomic(&source, &target, Some(1024), Some(0o750))
+        decode_base64_file_atomic(&fs, &source, &target, Some(1024), Some(0o750))
             .await
             .expect("base64 decoding should succeed");
         assert_eq!(

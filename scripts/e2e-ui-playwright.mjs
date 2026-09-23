@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from "node:child_process";
-import { mkdtemp, mkdir, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { chromium } from "playwright";
@@ -132,35 +132,26 @@ async function assertSuccessfulRun(page) {
   await selectGenerator(page, /Hello Template/);
   await page.getByRole("button", { name: /^Start generation$/ }).click();
   await page.locator("#run-state.succeeded").waitFor({ timeout: 15000 });
-  await page.locator("#artifact-list .artifact").filter({ hasText: "README.md" }).waitFor({ timeout: 5000 });
-  const zipLink = page.locator("#zip-link:not(.hidden)");
-  await zipLink.waitFor({ timeout: 5000 });
-
-  const artifactHref = await page.locator("#artifact-list a").first().getAttribute("href");
-  if (!artifactHref) {
-    throw new Error("artifact link was not rendered");
-  }
-  const artifact = await page.evaluate(async (href) => {
-    const response = await fetch(href);
-    if (!response.ok) {
-      throw new Error(`artifact fetch failed: ${response.status}`);
-    }
-    return response.text();
-  }, artifactHref);
+  const row = page.locator("#artifact-list .artifact").filter({ hasText: "README.md" });
+  await row.waitFor({ timeout: 5000 });
+  await row.getByRole("button", { name: /^Preview$/ }).click();
+  const preview = page.locator("#artifact-preview pre");
+  await preview.waitFor({ timeout: 5000 });
+  const artifact = await preview.innerText();
   if (!artifact.includes("Hello from qcg")) {
     throw new Error(`artifact content was unexpected: ${artifact}`);
   }
-  const zipHref = await zipLink.getAttribute("href");
-  if (!zipHref) {
-    throw new Error("zip link was not rendered");
+  const zipButton = page.locator("#zip-link");
+  await zipButton.waitFor({ timeout: 5000 });
+  const [download] = await Promise.all([
+    page.waitForEvent("download", { timeout: 10000 }),
+    zipButton.click(),
+  ]);
+  const zipPath = await download.path();
+  if (!zipPath) {
+    throw new Error("zip download was not captured");
   }
-  const zipBytes = await page.evaluate(async (href) => {
-    const response = await fetch(href);
-    if (!response.ok) {
-      throw new Error(`zip fetch failed: ${response.status}`);
-    }
-    return (await response.arrayBuffer()).byteLength;
-  }, zipHref);
+  const zipBytes = (await stat(zipPath)).size;
   if (zipBytes <= 0) {
     throw new Error("zip response was empty");
   }
@@ -410,8 +401,13 @@ qcg_version = "^0.1"
 
 [permissions]
 side_effects = "allowed"
+fs_read = []
 fs_write = ["workspace"]
+network = []
 commands = [{ bin = "sh", args = ["-c", "sleep 30"], purpose = "UI cancellation test", isolation = "trusted_host" }]
+
+[permissions.containers]
+enabled = false
 
 [[flow]]
 id = "wait"

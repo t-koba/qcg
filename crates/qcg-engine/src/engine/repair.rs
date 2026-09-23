@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use super::checkpoint::pin_files;
 use super::repair_support::{RepairCycleOutcome, exhausted_question, failure_from_findings};
 use super::replay::{BudgetTracker, ExecutionEnv};
-use super::types::{Engine, EngineError, NamedNodeTarget};
+use super::types::{Engine, EngineError, NamedNodeTarget, with_failed_evidence};
 
 impl Engine {
     pub(crate) async fn execute_repair_cycle(
@@ -48,7 +48,7 @@ impl Engine {
         );
         let mut last_reason = failure_from_findings(&initial_findings, FailureCode::CheckFailed);
         for attempt in 1..=*max_attempts {
-            env.context.checkpoint()?;
+            env.context.run_checkpoint()?;
             env.journal.event(
                 "repair_attempt_started",
                 json!({
@@ -73,10 +73,39 @@ impl Engine {
                 )
                 .await?;
             if !matches!(repair_output, StepOutcome::Success { .. }) {
-                last_reason = FailureDetail::new(
-                    FailureCode::RepairExhausted,
-                    format!("repair node `{repair}` did not succeed"),
-                );
+                // An interaction requested by the repair node suspends the
+                // cycle exactly like a top-level node: the user's answer
+                // must not be swallowed by the next repair attempt (E10).
+                match repair_output {
+                    StepOutcome::NeedsUser { question } => {
+                        env.journal.event(
+                            "repair_attempt_finished",
+                            json!({ "node": failed_node.id, "attempt": attempt, "status": "needs_user", "question": question }),
+                        )?;
+                        return Err(EngineError::NeedsUser {
+                            question_id: question.id.clone(),
+                            question: Box::new(question),
+                        });
+                    }
+                    StepOutcome::NeedsConfirm { confirm } => {
+                        env.journal.event(
+                            "repair_attempt_finished",
+                            json!({ "node": failed_node.id, "attempt": attempt, "status": "needs_confirm", "confirm": confirm }),
+                        )?;
+                        return Err(EngineError::NeedsConfirm {
+                            confirm_id: confirm.id.clone(),
+                            confirm: Box::new(confirm),
+                        });
+                    }
+                    StepOutcome::CheckFailed { findings, .. } => {
+                        last_reason = failure_from_findings(&findings, FailureCode::CheckFailed);
+                    }
+                    StepOutcome::Success { .. } => {
+                        return Err(EngineError::Failed(
+                            "repair recheck unexpectedly succeeded".into(),
+                        ));
+                    }
+                }
                 env.journal.event(
                     "repair_attempt_finished",
                     json!({ "node": failed_node.id, "attempt": attempt, "status": "repair_failed", "reason": last_reason }),
@@ -227,6 +256,8 @@ impl Engine {
             });
         }
         let mut last_findings = initial_findings;
+        let mut last_output: Option<serde_json::Value> = None;
+        let mut last_files: Vec<camino::Utf8PathBuf> = Vec::new();
         vars.set_step_output(
             node.id.as_str(),
             json!({ "status": "check_failed", "findings": last_findings }),
@@ -236,11 +267,19 @@ impl Engine {
                 "regenerate_attempt_started",
                 json!({ "node": node.id, "attempt": attempt, "max_attempts": max_attempts }),
             )?;
+            // Check cancellation and the run-wide deadline before the
+            // attempt; budget is charged once per attempt inside the retry
+            // wrapper (unified rule, E10), not here.
+            env.context.run_checkpoint()?;
             match self
-                .execute_node(env.context, env.journal, vars, budget, node)
+                .execute_node_with_retry(env.context, env.journal, vars, budget, node)
                 .await?
             {
-                StepOutcome::CheckFailed { findings, .. } => {
+                StepOutcome::CheckFailed {
+                    findings,
+                    output,
+                    files,
+                } => {
                     vars.set_step_output(
                         node.id.as_str(),
                         json!({ "status": "check_failed", "findings": findings }),
@@ -250,6 +289,8 @@ impl Engine {
                         json!({ "node": node.id, "attempt": attempt, "status": "check_failed", "findings": findings }),
                     )?;
                     last_findings = findings;
+                    last_output = output;
+                    last_files = files;
                 }
                 outcome @ StepOutcome::Success { .. } => {
                     env.journal.event(
@@ -264,8 +305,8 @@ impl Engine {
         }
         Ok(StepOutcome::CheckFailed {
             findings: last_findings,
-            output: None,
-            files: vec![],
+            output: last_output,
+            files: last_files,
         })
     }
 
@@ -308,14 +349,19 @@ impl Engine {
                     .collect(),
             });
         }
-        budget.consume(&node.id)?;
+        // Budget is charged once per attempt inside the retry wrapper
+        // (unified rule, E10), not here, so repair attempts pay exactly like
+        // top-level attempts.
         states.insert(graph_node_id.clone(), NodeState::Running);
         env.journal.event(
             "step_started",
             json!({ "node": node.id, "type": node.kind.to_string(), "attempt": target.attempt }),
         )?;
+        // The named repair node honors its own retry policy, per-attempt
+        // timeout, and the run-wide elapsed deadline through the same
+        // wrapper as top-level nodes (E10).
         let outcome = self
-            .execute_node_after_budget(env.context, env.journal, vars, budget, &node)
+            .execute_node_with_retry(env.context, env.journal, vars, budget, &node)
             .await?;
         match &outcome {
             StepOutcome::Success { output, files } => {
@@ -326,16 +372,13 @@ impl Engine {
                     &env.context.contract.manifest.runtime,
                     &env.context.checkpoint_accounting,
                 )?;
-                let output_name = node.output.as_deref().unwrap_or(&node.id);
-                if let Some(output_name) = &node.output {
-                    if let Some(value) = output.clone() {
-                        vars.set_step_output(output_name, value.clone());
-                        vars.set_step_output(&graph_node_id, value);
-                    }
-                } else if let Some(value) = output.clone() {
-                    vars.set_step_output(&node.id, value.clone());
-                    vars.set_step_output(&graph_node_id, value);
-                }
+                let output_name = super::types::output_name_for(&node);
+                vars.publish_step_output(
+                    &node.id,
+                    node.output.as_deref(),
+                    output,
+                    Some(&graph_node_id),
+                );
                 states.insert(graph_node_id.clone(), NodeState::Success);
                 env.journal.event(
                     "step_finished",
@@ -356,15 +399,28 @@ impl Engine {
                     &env.context.checkpoint_accounting,
                 )?;
                 states.insert(graph_node_id.clone(), NodeState::Failed(reason.clone()));
+                // Unified failed-evidence notation (E06): every
+                // `step_finished` failure carries `failed_output` /
+                // `failed_files`, never `output` / `files` for failed
+                // revisions. Routed through the shared helper.
                 env.journal.event(
                     "step_finished",
-                    json!({ "node": node.id, "status": "check_failed", "findings": findings, "reason": reason, "output": output, "files": file_pins }),
+                    with_failed_evidence(json!({ "node": node.id, "status": "check_failed", "findings": findings, "reason": reason }), output, &file_pins)?,
                 )?;
             }
             StepOutcome::NeedsUser { question } => {
+                // Unified notation for suspensions without a failed attempt:
+                // null plus an empty list via the shared helper (E06).
+                // `confirm_request` stays exempt (FOREIGN schema allows only
+                // `confirm`).
+                const NO_OUTPUT: Option<serde_json::Value> = None;
                 env.journal.event(
                     "step_finished",
-                    json!({ "node": node.id, "status": "needs_user", "question": question }),
+                    with_failed_evidence(
+                        json!({ "node": node.id, "status": "needs_user", "question": question }),
+                        &NO_OUTPUT,
+                        &[],
+                    )?,
                 )?;
             }
             StepOutcome::NeedsConfirm { confirm } => {

@@ -88,6 +88,14 @@ pub(crate) enum Command {
         )]
         generators_dir: Utf8PathBuf,
     },
+    /// List selectable LLM providers, models, and reasoning efforts.
+    Models {
+        /// Refresh external catalog sources before listing.
+        #[arg(long)]
+        refresh: bool,
+        #[arg(long)]
+        json: bool,
+    },
     Runs {
         #[command(subcommand)]
         command: RunsCommand,
@@ -158,6 +166,10 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: RegistryCommand,
     },
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
     Search {
         query: String,
     },
@@ -214,6 +226,48 @@ pub(crate) enum Command {
         #[arg(long = "max-asset-bytes", env = "QCG_MAX_ASSET_BYTES")]
         max_asset_bytes: Option<usize>,
     },
+    /// Run a loopback server while polling the generators directory for
+    /// changes; each change is reported on stderr.
+    Dev {
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        #[arg(
+            long = "generators-dir",
+            env = "QCG_GENERATORS_DIR",
+            default_value = "generators"
+        )]
+        generators_dir: Utf8PathBuf,
+        #[arg(long = "runs-dir", default_value = ".qcg/runs")]
+        runs_dir: Utf8PathBuf,
+        #[arg(
+            long,
+            env = "QCG_MAX_ACTIVE_RUNS",
+            default_value_t = qcg_policy::DEFAULT_MAX_ACTIVE_RUNS
+        )]
+        max_active_runs: usize,
+        /// Generator tree poll interval in milliseconds; must be greater
+        /// than zero.
+        #[arg(long = "watch-interval-ms", default_value_t = 500, value_parser = parse_watch_interval_ms)]
+        watch_interval_ms: u64,
+        /// After each change, run `qcg eval` for this generator id; the
+        /// suite is `<generators-dir>/<generator-id>/suite.json`.
+        #[arg(long, value_name = "GENERATOR_ID")]
+        eval: Option<String>,
+    },
+}
+
+/// Reject a zero poll interval: a zero interval would spin the watch loop
+/// without ever yielding, so it fails before any server work starts.
+fn parse_watch_interval_ms(value: &str) -> Result<u64, String> {
+    let millis = value.parse::<u64>().map_err(|error| {
+        format!("watch interval must be a whole number of milliseconds: {error}")
+    })?;
+    if millis == 0 {
+        return Err("watch interval must be greater than zero".to_string());
+    }
+    Ok(millis)
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -237,6 +291,19 @@ pub(crate) enum RegistryCommand {
     Add { name: String, url: String },
     Remove { name: String },
     List,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum SkillCommand {
+    /// Validate an Agent Skills directory (or a library of skills).
+    Validate {
+        path: Utf8PathBuf,
+        /// Treat `path` as a directory of `<name>/SKILL.md` skills.
+        #[arg(long)]
+        library: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

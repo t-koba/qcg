@@ -55,6 +55,7 @@ impl StepExecutor for CheckFormatStep {
             )
         })?;
         let text = bounded_transform_text(
+            &ctx.run.fs,
             &source_path,
             ctx.run.contract.manifest.runtime.file_input_limit_bytes,
         )
@@ -68,7 +69,14 @@ impl StepExecutor for CheckFormatStep {
             "toml" => toml::from_str::<toml::Value>(&text)
                 .map(|_| ())
                 .map_err(|error| error.to_string()),
-            _ => unreachable!("validated format"),
+            _ => {
+                // Guarded by `check_format_params` above; a future caller
+                // bypassing validation must fail the step, never panic.
+                return Err(StepError::failed(
+                    &node.id,
+                    format!("unsupported check.format content `{format}`"),
+                ));
+            }
         };
         match result {
             Ok(()) => Ok(StepOutcome::Success {

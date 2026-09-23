@@ -11,7 +11,7 @@ mod registry;
 
 mod cli;
 
-use cli::args::{Cli, Command, DocsCommand, RegistryCommand, RunsCommand};
+use cli::args::{Cli, Command, DocsCommand, RegistryCommand, RunsCommand, SkillCommand};
 use cli::eval::run_eval;
 use cli::gc::{auto_gc_runs, gc_runs};
 use cli::inputs::{load_answers, load_confirmations, load_inputs};
@@ -29,7 +29,44 @@ use qcg_service::app_registry_with_providers as app_registry;
 // 8 MiB stack so behaviour is identical on every platform.
 const MAIN_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
 
-fn main() -> Result<()> {
+/// CLI-owned service construction (E04): every CLI command builds the
+/// service through the policy constructor with explicit CLI defaults.
+/// No production path may use the test-only `LocalQcgService::new`.
+pub(crate) fn local_cli_service(
+    generators_dir: Utf8PathBuf,
+    runs_dir: Utf8PathBuf,
+    providers_path: Option<Utf8PathBuf>,
+) -> Result<LocalQcgService> {
+    Ok(LocalQcgService::with_generator_roots_policy_and_store_mode(
+        vec![generators_dir],
+        runs_dir,
+        providers_path,
+        qcg_policy::DEFAULT_MAX_ACTIVE_RUNS,
+        qcg_policy::DEFAULT_MAX_TRACKED_RUNS,
+        qcg_service::RunStoreMode::Exclusive,
+        qcg_service::ServiceDeploymentPolicy::default(),
+    )?)
+}
+
+/// Shared serve boot for `qcg serve` and `qcg dev`. Resolve once before
+/// binding (E04 single freeze): validation and serving observe identical
+/// values; a refused boot never occupies the port.
+pub(crate) async fn serve_with_config(
+    config: qcg_server::ServerConfig,
+    bind: &str,
+    port: u16,
+) -> Result<()> {
+    let policy = qcg_server::resolve_server_policy(&config)
+        .map_err(|detail| anyhow::anyhow!("invalid server configuration: {detail}"))?;
+    let addr: std::net::SocketAddr = format!("{bind}:{port}").parse()?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let actual_addr = listener.local_addr()?;
+    println!("qcg server listening on http://{actual_addr}");
+    qcg_server::serve_with_resolved_policy(policy, config, listener).await?;
+    Ok(())
+}
+
+fn main() -> Result<std::process::ExitCode> {
     std::thread::Builder::new()
         .name("qcg-main".to_owned())
         .stack_size(MAIN_THREAD_STACK_BYTES)
@@ -39,7 +76,7 @@ fn main() -> Result<()> {
         .expect("main thread panicked")
 }
 
-fn run() -> Result<()> {
+fn run() -> Result<std::process::ExitCode> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -47,7 +84,7 @@ fn run() -> Result<()> {
         .block_on(run_async())
 }
 
-async fn run_async() -> Result<()> {
+async fn run_async() -> Result<std::process::ExitCode> {
     let cli = Cli::parse();
     init_tracing(cli.verbose, cli.log_format);
     let providers_path = cli.providers.clone();
@@ -62,7 +99,7 @@ async fn run_async() -> Result<()> {
                     contract.manifest.generator.version,
                     contract.sha256
                 );
-                return Ok(());
+                return Ok(std::process::ExitCode::SUCCESS);
             }
             let result = (|| {
                 let contract = Contract::load(&path)?;
@@ -90,7 +127,10 @@ async fn run_async() -> Result<()> {
                             "error": format!("{error:#}"),
                         }))?
                     );
-                    std::process::exit(1);
+                    // Report through the return code, never
+                    // process::exit: the machine-readable verdict above
+                    // is the report, and the exit status carries failure.
+                    return Ok(std::process::ExitCode::FAILURE);
                 }
             }
         }
@@ -125,11 +165,10 @@ async fn run_async() -> Result<()> {
             let confirmations = load_confirmations(confirms, confirmations_file)?;
             if plan {
                 print_run_plan(&contract, &inputs, &answers, &confirmations, json, diff)?;
-                return Ok(());
+                return Ok(std::process::ExitCode::SUCCESS);
             }
             let runs_dir = Utf8PathBuf::from(".qcg/runs");
-            let service =
-                LocalQcgService::new(Utf8PathBuf::new(), runs_dir.clone(), providers_path)?;
+            let service = local_cli_service(Utf8PathBuf::new(), runs_dir.clone(), providers_path)?;
             auto_gc_runs(&runs_dir)?;
             let run = DirectRun {
                 generator_path: generator,
@@ -211,6 +250,19 @@ async fn run_async() -> Result<()> {
                 }
             }
         }
+        Command::Models { refresh, json } => {
+            let service = local_cli_service(
+                Utf8PathBuf::new(),
+                Utf8PathBuf::from(".qcg/runs"),
+                providers_path.clone(),
+            )?;
+            let catalog = service.llm_catalog(refresh).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&catalog)?);
+            } else {
+                print_llm_catalog(&catalog);
+            }
+        }
         Command::Docs { command } => match command {
             DocsCommand::StepSchemas => {
                 print!("{}", step_param_schemas_markdown()?);
@@ -287,7 +339,7 @@ async fn run_async() -> Result<()> {
                     .with_context(|| format!("failed to parse state patch `{path}`"))?,
                     None => ForkStatePatch::default(),
                 };
-                let service = LocalQcgService::new(Utf8PathBuf::new(), runs_dir, providers_path)?;
+                let service = local_cli_service(Utf8PathBuf::new(), runs_dir, providers_path)?;
                 let fork_id = service
                     .fork_run(
                         &id,
@@ -329,7 +381,7 @@ async fn run_async() -> Result<()> {
                 delete,
             } => gc_runs(&runs_dir, keep, keep_failed, delete)?,
             RunsCommand::Delete { id, runs_dir, json } => {
-                let service = LocalQcgService::new(Utf8PathBuf::new(), runs_dir, providers_path)?;
+                let service = local_cli_service(Utf8PathBuf::new(), runs_dir, providers_path)?;
                 service.delete_run(&id).await?;
                 if json {
                     println!(
@@ -347,7 +399,7 @@ async fn run_async() -> Result<()> {
                 runs_dir,
                 output,
             } => {
-                let service = LocalQcgService::new(Utf8PathBuf::new(), runs_dir, providers_path)?;
+                let service = local_cli_service(Utf8PathBuf::new(), runs_dir, providers_path)?;
                 let parts = service.run_bundle_parts(&id).await?;
                 let output =
                     output.unwrap_or_else(|| Utf8PathBuf::from(format!("{id}-bundle.zip")));
@@ -383,13 +435,20 @@ async fn run_async() -> Result<()> {
                 max_archive_bytes: None,
             };
             package(&dir, &output, &limits)?;
-            println!("sha256 {}", sha256_file(&output)?);
+            println!("sha256 {}", sha256_file(&output, limits.max_archive_bytes)?);
             if let Some(signing_key) = signing_key {
                 let bytes = qcg_fs::read_bounded(
                     &output,
                     limits
                         .max_archive_bytes
-                        .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX)),
+                        .map(|limit| {
+                            usize::try_from(limit).map_err(|error| {
+                                anyhow::anyhow!(
+                                    "package archive limit is not representable: {error}"
+                                )
+                            })
+                        })
+                        .transpose()?,
                 )?;
                 sign_package(&output, &bytes, &signing_key)?;
             }
@@ -473,6 +532,13 @@ async fn run_async() -> Result<()> {
                 }
             }
         },
+        Command::Skill { command } => match command {
+            SkillCommand::Validate {
+                path,
+                library,
+                json,
+            } => return cli::skill::validate_skill(&path, library, json),
+        },
         Command::Search { query } => {
             let home = registry::home_dir()?;
             let config = registry::load_registries(&home)?;
@@ -512,36 +578,132 @@ async fn run_async() -> Result<()> {
             max_artifact_entries,
             max_asset_bytes,
         } => {
-            let addr: std::net::SocketAddr = format!("{bind}:{port}").parse()?;
-            let listener = tokio::net::TcpListener::bind(addr).await?;
-            let actual_addr = listener.local_addr()?;
-            println!("qcg server listening on http://{actual_addr}");
-            qcg_server::serve_with_listener(
-                qcg_server::ServerConfig {
-                    providers_path,
-                    extra_generators_dirs: bundled_generators_root()
-                        .filter(|bundled| bundled != &generators_dir)
-                        .into_iter()
-                        .collect(),
-                    generators_dir,
-                    runs_dir,
-                    max_active_runs,
-                    max_tracked_runs,
-                    max_total_steps,
-                    run_store_mode: run_store.into(),
-                    cors_origins,
-                    api_token,
-                    max_request_bytes,
-                    max_artifact_bytes,
-                    max_artifact_entries,
-                    max_asset_bytes,
-                },
-                listener,
-            )
-            .await?;
+            let api_token = resolve_api_token(api_token)?;
+            let config = qcg_server::ServerConfig {
+                providers_path,
+                extra_generators_dirs: bundled_generators_root()
+                    .filter(|bundled| bundled != &generators_dir)
+                    .into_iter()
+                    .collect(),
+                generators_dir,
+                runs_dir,
+                max_active_runs,
+                max_tracked_runs,
+                max_total_steps,
+                run_store_mode: run_store.into(),
+                cors_origins,
+                api_token,
+                max_request_bytes,
+                max_artifact_bytes,
+                max_artifact_entries,
+                max_asset_bytes,
+            };
+            serve_with_config(config, &bind, port).await?;
+        }
+        Command::Dev {
+            bind,
+            port,
+            generators_dir,
+            runs_dir,
+            max_active_runs,
+            watch_interval_ms,
+            eval,
+        } => {
+            let config = qcg_server::ServerConfig {
+                providers_path,
+                extra_generators_dirs: bundled_generators_root()
+                    .filter(|bundled| bundled != &generators_dir)
+                    .into_iter()
+                    .collect(),
+                generators_dir,
+                runs_dir,
+                max_active_runs,
+                max_tracked_runs: qcg_policy::DEFAULT_MAX_TRACKED_RUNS,
+                max_total_steps: None,
+                run_store_mode: qcg_service::RunStoreMode::Exclusive,
+                cors_origins: Vec::new(),
+                api_token: None,
+                max_request_bytes: None,
+                max_artifact_bytes: None,
+                max_artifact_entries: None,
+                max_asset_bytes: None,
+            };
+            cli::dev::run_dev(config, bind, port, watch_interval_ms, eval).await?;
         }
     }
-    Ok(())
+    Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// Resolves the instance bearer token: an explicit flag or `QCG_API_TOKEN`
+/// wins, then `QCG_API_TOKEN_FILE` (the only documented file source). An
+/// unreadable or empty file fails closed instead of booting unauthenticated.
+fn resolve_api_token(explicit: Option<String>) -> anyhow::Result<Option<String>> {
+    if explicit.is_some() {
+        return Ok(explicit);
+    }
+    let Some(path) = std::env::var_os("QCG_API_TOKEN_FILE") else {
+        return Ok(None);
+    };
+    let path =
+        camino::Utf8PathBuf::from_path_buf(std::path::PathBuf::from(path)).map_err(|path| {
+            anyhow::anyhow!("QCG_API_TOKEN_FILE is not valid UTF-8: {}", path.display())
+        })?;
+    let bytes = qcg_fs::read_bounded(&path, Some(qcg_policy::MAX_CREDENTIAL_FILE_BYTES as usize))
+        .map_err(|error| {
+        anyhow::anyhow!("failed to read QCG_API_TOKEN_FILE `{path}`: {error}")
+    })?;
+    let token = String::from_utf8(bytes)
+        .map_err(|error| anyhow::anyhow!("QCG_API_TOKEN_FILE `{path}` is not UTF-8: {error}"))?;
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        anyhow::bail!("QCG_API_TOKEN_FILE `{path}` is empty");
+    }
+    Ok(Some(token))
+}
+
+fn print_llm_catalog(catalog: &qcg_api::LlmCatalogResponse) {
+    println!("provider\tmodel\tenabled\tavailable\tefforts\tinput\toutput\tcontext\tsource");
+    let price = |value: Option<f64>| {
+        value
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    };
+    for provider in &catalog.providers {
+        for model in &provider.models {
+            let efforts = if model.reasoning_effort.is_empty() {
+                "-".to_string()
+            } else {
+                model.reasoning_effort.join(",")
+            };
+            let context = model
+                .context_tokens
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                provider.id,
+                model.id,
+                model.enabled,
+                provider.available,
+                efforts,
+                price(model.input_cost_per_million_usd),
+                price(model.output_cost_per_million_usd),
+                context,
+                model.source
+            );
+        }
+        if let Some(error) = &provider.error {
+            eprintln!("provider {}: {error}", provider.id);
+        }
+    }
+    if catalog.stale {
+        eprintln!("catalog metadata is stale; run `qcg models --refresh`");
+    }
+    for source in &catalog.sources {
+        if let Some(error) = &source.error {
+            eprintln!("catalog source {}: {error}", source.location);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -551,7 +713,7 @@ mod tests {
         EvalCase, EvalCaseReport, EvalSuite, percentile_u64, summarize_eval_cases,
     };
     use crate::cli::gc::gc_runs_impl;
-    use crate::cli::install::{CleanupPath, commit_install, verify_package_bytes};
+    use crate::cli::install::{CleanupPaths, commit_install, verify_package_bytes};
     use crate::cli::plan::{plan_command_allowed, read_bounded_confirmation};
     use crate::cli::replay::replay_seed_from_journal;
     use crate::cli::runs_cli::{find_pricing, format_usd};
@@ -614,18 +776,25 @@ params = { content = "x", output_file = "x.txt" }
 
     #[test]
     fn load_confirmations_parses_decisions() {
+        // Q1: confirmation ids are 3-part content or 4-part invocation
+        // scope; legacy 2-part ids fail closed.
+        let digest = "a".repeat(64);
+        let other_digest = "b".repeat(64);
         let parsed = load_confirmations(
             vec![
-                "effect:command=approve".to_string(),
-                "other:command=deny".to_string(),
+                format!("effect:command:{digest}=approve"),
+                format!("other:command:{other_digest}=deny"),
             ],
             None,
         )
         .expect("valid decisions should parse");
-        assert_eq!(parsed.get("effect:command"), Some(&true));
-        assert_eq!(parsed.get("other:command"), Some(&false));
+        assert_eq!(parsed.get(&format!("effect:command:{digest}")), Some(&true));
+        assert_eq!(
+            parsed.get(&format!("other:command:{other_digest}")),
+            Some(&false)
+        );
         assert!(
-            load_confirmations(vec!["effect:command=maybe".to_string()], None)
+            load_confirmations(vec![format!("effect:command:{digest}=maybe")], None)
                 .expect_err("unknown decision must fail")
                 .to_string()
                 .contains("approve|deny")
@@ -635,6 +804,12 @@ params = { content = "x", output_file = "x.txt" }
                 .expect_err("missing separator must fail")
                 .to_string()
                 .contains("ID=approve|deny")
+        );
+        assert!(
+            load_confirmations(vec!["effect:command=approve".to_string()], None)
+                .expect_err("legacy two-part id must fail")
+                .to_string()
+                .contains("invalid confirmation id")
         );
     }
 
@@ -659,7 +834,7 @@ params = { content = "x", output_file = "x.txt" }
     }
 
     #[test]
-    fn silent_gc_honors_retain_days_without_reporting() {
+    fn silent_gc_honors_retention_days_without_reporting() {
         let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
             .expect("temporary directory should be UTF-8")
             .join(format!("qcg-cli-gc-test-{}", std::process::id()));
@@ -687,8 +862,8 @@ type = "write"
 output_file = "noop.txt"
 content = "noop"
 
-[journal]
-retain_days = 0
+[retention]
+days = 0
 
 [outputs]
 extras = []
@@ -713,7 +888,7 @@ extras = []
                     "resource_hashes": [],
                     "qcg": env!("CARGO_PKG_VERSION"),
                     "schema_version": 1,
-                    "retain_days": 0,
+                    "retention_days": 0,
                 }),
             )
             .expect("run should start");
@@ -803,12 +978,16 @@ extras = []
             .join(format!("qcg-cli-commit-failure-test-{}", Uuid::now_v7()));
         let source = root.join("source");
         let temporary = root.join("temporary");
-        let target = root.join("missing-parent").join("generator");
+        // Block parent creation with a regular file: `create_dir_all`
+        // fails, so the commit fails while user sources must survive.
+        let blocker = root.join("missing-parent");
+        let target = blocker.join("generator");
         std::fs::create_dir_all(&source).expect("source directory should be created");
         std::fs::create_dir_all(&temporary).expect("temporary directory should be created");
         std::fs::write(source.join("source.txt"), "keep").expect("source file should be written");
         std::fs::write(temporary.join("new.txt"), "new").expect("new file should be written");
-        let temporary_guard = CleanupPath::new(temporary.clone());
+        std::fs::write(&blocker, "block").expect("parent blocker should be written");
+        let temporary_guard = CleanupPaths::new(temporary.clone());
 
         assert!(commit_install(&temporary, &target, false).is_err());
         drop(temporary_guard);
@@ -924,7 +1103,7 @@ content = "result"
                     "model": "fake",
                     "seed": 12345_u64,
                     "max_tokens": 128,
-                    "tokens": { "input": 0, "output": 0 },
+                    "tokens": { "input": 0, "output": 0, "cached_input": 0 },
                     "cost_microusd": 0,
                 }),
             )
@@ -1022,12 +1201,21 @@ name = "Plan Fixture"
 version = "0.1.0"
 qcg_version = "^0.1"
 
+[permissions]
+fs_read = []
+fs_write = []
+network = []
+side_effects = "none"
+side_effects_scope = "invocation"
+
+[permissions.containers]
+enabled = false
+
 [[permissions.commands]]
 bin = "cc"
 args = ["-o", "*"]
 purpose = "compile"
-isolation = "trusted_host"
-"#,
+isolation = "trusted_host""#,
         )
         .expect("fixture manifest should parse");
         assert!(plan_command_allowed(

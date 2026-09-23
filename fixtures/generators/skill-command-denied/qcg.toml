@@ -17,7 +17,16 @@ qcg_version = "^0.1"
 version = "0.1.0"
 
 [permissions]
+fs_read = []
+fs_write = []
+network = []
+commands = []
+side_effects = "none"
+side_effects_scope = "invocation"
 
+
+[permissions.containers]
+enabled = false
 [resources.local_skill]
 llm_visible = false
 path = "resources/danger-skill"

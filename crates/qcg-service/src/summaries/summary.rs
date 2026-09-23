@@ -14,7 +14,7 @@ pub struct RunSummary {
     pub started_at: String,
     pub finished_at: Option<String>,
     pub artifacts: Vec<OutputArtifact>,
-    pub retain_days: Option<u32>,
+    pub retention_days: Option<u32>,
 }
 
 impl RunSummary {
@@ -29,7 +29,7 @@ impl RunSummary {
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "artifacts": self.artifacts,
-            "retain_days": self.retain_days,
+            "retention_days": self.retention_days,
         })
     }
 }

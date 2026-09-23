@@ -48,6 +48,11 @@ const RUN_LIST_QUERY_PARAMETERS: &[ApiParameter] = &[
         required: false,
         schema: ParameterSchema::DateTime,
     },
+    ApiParameter {
+        name: "order",
+        required: false,
+        schema: ParameterSchema::Ref("RunListOrder"),
+    },
 ];
 const OAUTH_CALLBACK_QUERY_PARAMETERS: &[ApiParameter] = &[
     ApiParameter {
@@ -151,6 +156,26 @@ pub const API_ROUTES: &[ApiRoute] = &[
         request_schema: None,
         request_headers: NO_HEADERS,
         query_parameters: NO_QUERY_PARAMETERS,
+        errors: ERR_INTERNAL,
+    },
+    ApiRoute {
+        method: "get",
+        path: "/api/llm/catalog",
+        summary: "List selectable LLM providers and models",
+        response: ApiResponse {
+            status: 200,
+            description: "Selectable provider, model, and reasoning effort metadata",
+            body: ResponseBody::Json(Some(ResponseSchema::Ref("LlmCatalogResponse"))),
+            headers: NO_HEADERS,
+        },
+        additional_responses: NO_ADDITIONAL_RESPONSES,
+        request_schema: None,
+        request_headers: NO_HEADERS,
+        query_parameters: &[ApiParameter {
+            name: "refresh",
+            required: false,
+            schema: ParameterSchema::Boolean,
+        }],
         errors: ERR_INTERNAL,
     },
     ApiRoute {
@@ -384,6 +409,22 @@ pub const API_ROUTES: &[ApiRoute] = &[
         response: ApiResponse {
             status: 200,
             description: "Settled run snapshot",
+            body: ResponseBody::Json(Some(ResponseSchema::Ref("RunSnapshot"))),
+            headers: NO_HEADERS,
+        },
+        additional_responses: NO_ADDITIONAL_RESPONSES,
+        request_schema: None,
+        request_headers: IDEMPOTENCY_HEADERS,
+        query_parameters: NO_QUERY_PARAMETERS,
+        errors: ERR_MUTATION,
+    },
+    ApiRoute {
+        method: "post",
+        path: "/api/runs/{id}",
+        summary: "Cancel a run (alias of /api/runs/{id}:cancel)",
+        response: ApiResponse {
+            status: 200,
+            description: "Cancellation accepted",
             body: ResponseBody::Json(Some(ResponseSchema::Ref("RunSnapshot"))),
             headers: NO_HEADERS,
         },

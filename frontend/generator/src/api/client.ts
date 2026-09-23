@@ -19,16 +19,48 @@ export type McpServerSummary = components["schemas"]["McpServerSummary"];
 export type McpServersResponse = components["schemas"]["McpServerList"];
 export type McpAuthorizationResponse = components["schemas"]["McpAuthorizationStart"];
 
+const TOKEN_STORAGE_KEY = "qcg.api-token";
+
+/**
+ * Bearer token for authenticated instances, held in sessionStorage only.
+ * The token never enters a URL, a cookie, or localStorage, and the bundled
+ * UI always sends it as an `Authorization` header.
+ */
+export function storedApiToken(): string {
+  if (typeof sessionStorage === "undefined") return "";
+  try {
+    return sessionStorage.getItem(TOKEN_STORAGE_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+export function setStoredApiToken(token: string): void {
+  if (typeof sessionStorage === "undefined") return;
+  try {
+    const trimmed = token.trim();
+    if (trimmed) sessionStorage.setItem(TOKEN_STORAGE_KEY, trimmed);
+    else sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+  } catch {
+    // Storage may be unavailable; the request simply stays unauthenticated.
+  }
+}
+
+export function authHeaders(): Record<string, string> {
+  const token = storedApiToken();
+  return token ? { authorization: `Bearer ${token}` } : {};
+}
+
 export class ApiClient {
   readonly base = "";
 
   async get<T>(path: string, signal?: AbortSignal): Promise<T> {
-    const response = await fetch(`${this.base}${path}`, { signal });
+    const response = await fetch(`${this.base}${path}`, { headers: authHeaders(), signal });
     return parseResponse<T>(response);
   }
 
   async post<T>(path: string, body: unknown, idempotencyKey?: string, signal?: AbortSignal): Promise<T> {
-    const headers: Record<string, string> = { "content-type": "application/json" };
+    const headers: Record<string, string> = { ...authHeaders(), "content-type": "application/json" };
     if (idempotencyKey) headers["idempotency-key"] = idempotencyKey;
     const response = await fetch(`${this.base}${path}`, {
       method: "POST",
@@ -40,7 +72,7 @@ export class ApiClient {
   }
 
   async put<T>(path: string, body: unknown, idempotencyKey?: string, signal?: AbortSignal): Promise<T> {
-    const headers: Record<string, string> = { "content-type": "application/json" };
+    const headers: Record<string, string> = { ...authHeaders(), "content-type": "application/json" };
     if (idempotencyKey) headers["idempotency-key"] = idempotencyKey;
     const response = await fetch(`${this.base}${path}`, {
       method: "PUT",
@@ -52,8 +84,40 @@ export class ApiClient {
   }
 
   async delete<T = undefined>(path: string, signal?: AbortSignal): Promise<T> {
-    const response = await fetch(`${this.base}${path}`, { method: "DELETE", signal });
+    const response = await fetch(`${this.base}${path}`, { method: "DELETE", headers: authHeaders(), signal });
     return parseResponse<T>(response);
+  }
+
+  /** Artifact bytes fetched with credentials; callers build a blob URL. */
+  async artifactBlob(runId: string, path: string, signal?: AbortSignal): Promise<Blob> {
+    const response = await fetch(this.artifactUrl(runId, path), { headers: authHeaders(), signal });
+    if (!response.ok) {
+      throw new ApiProblemError(await readProblem(response), response.status, response.statusText);
+    }
+    return response.blob();
+  }
+
+  /** Bundle ZIP fetched with credentials. */
+  async zipBlob(runId: string, signal?: AbortSignal): Promise<Blob> {
+    const response = await fetch(this.zipUrl(runId), { headers: authHeaders(), signal });
+    if (!response.ok) {
+      throw new ApiProblemError(await readProblem(response), response.status, response.statusText);
+    }
+    return response.blob();
+  }
+
+  /**
+   * Opens the run event stream with credentials. EventSource cannot set an
+   * Authorization header, so the SPA reads SSE frames from a fetch body.
+   */
+  async events(runId: string, lastEventId?: number, signal?: AbortSignal): Promise<Response> {
+    const headers: Record<string, string> = { ...authHeaders() };
+    if (lastEventId !== undefined) headers["last-event-id"] = String(lastEventId);
+    const response = await fetch(`/api/runs/${encodeURIComponent(runId)}/events`, { headers, signal });
+    if (!response.ok) {
+      throw new ApiProblemError(await readProblem(response), response.status, response.statusText);
+    }
+    return response;
   }
 
   listMcpServers(signal?: AbortSignal): Promise<McpServersResponse> {

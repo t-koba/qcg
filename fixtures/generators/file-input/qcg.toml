@@ -31,5 +31,12 @@ required = true
 type = "file"
 
 [permissions]
+network = []
+commands = []
+side_effects = "none"
+side_effects_scope = "invocation"
 fs_read = ["workspace"]
 fs_write = ["workspace"]
+
+[permissions.containers]
+enabled = false

@@ -65,13 +65,12 @@ pub(crate) fn render_json_templates_inner(
             *rendered_bytes = rendered_bytes.checked_add(rendered.len()).ok_or_else(|| {
                 StepError::failed(&node.id, "rendered JSON input size overflowed")
             })?;
-            if limit.is_some_and(|limit| *rendered_bytes > limit) {
+            if let Some(limit) = limit
+                && *rendered_bytes > limit
+            {
                 return Err(StepError::failed(
                     &node.id,
-                    format!(
-                        "rendered JSON input exceeds {} bytes",
-                        limit.unwrap_or(usize::MAX)
-                    ),
+                    format!("rendered JSON input exceeds {limit} bytes"),
                 ));
             }
             Ok(Value::String(rendered))

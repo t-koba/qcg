@@ -135,6 +135,55 @@
   color: #fff;
 }
 
+/* API token entry for authenticated instances; the token is kept in
+   sessionStorage and sent as an Authorization header. */
+.token-switch {
+  border-top: 1px solid rgba(152, 162, 179, .2);
+  display: grid;
+  gap: 6px;
+  margin-top: 16px;
+  padding: 16px 8px 0;
+}
+
+.token-switch label {
+  color: var(--sidebar-faint);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.token-switch input {
+  background: rgba(255, 255, 255, .06);
+  border: 1px solid rgba(152, 162, 179, .35);
+  border-radius: var(--radius-sm);
+  color: var(--sidebar-fg);
+  font: inherit;
+  font-size: 12px;
+  padding: 6px 8px;
+}
+
+.token-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.token-actions button {
+  background: transparent;
+  border: 1px solid rgba(152, 162, 179, .35);
+  border-radius: var(--radius-sm);
+  color: var(--sidebar-fg);
+  cursor: pointer;
+  flex: 1;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 5px 8px;
+}
+
+.token-actions button:hover {
+  background: rgba(255, 255, 255, .08);
+  border-color: var(--sidebar-faint);
+  color: #fff;
+}
+
 /* MCP connection styles live in McpConnections.svelte. */
 .theme-switch + .mcp-connections {
   border-top: 0;

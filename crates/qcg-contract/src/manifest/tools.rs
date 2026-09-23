@@ -100,6 +100,21 @@ pub enum ToolDecl {
         #[serde(default)]
         handoff: bool,
     },
+    /// Activates Agent Skills resources declared in this contract. The tool
+    /// exposes the catalog (name and description) and returns the selected
+    /// skill's instructions plus its bundled resource listing. It never
+    /// grants permissions: skill content is data, and any command or network
+    /// use still requires an explicit declaration.
+    #[serde(rename = "skill")]
+    Skill {
+        name: String,
+        #[serde(default)]
+        description: Option<String>,
+        /// Resource names of `skill` or `skill_library` type.
+        resources: Vec<String>,
+        #[serde(default = "default_skill_tool_max_calls")]
+        max_calls: usize,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -143,7 +158,8 @@ impl ToolDecl {
             | Self::AskUser { name, .. }
             | Self::WebSearch { name, .. }
             | Self::Mcp { name, .. }
-            | Self::Agent { name, .. } => name,
+            | Self::Agent { name, .. }
+            | Self::Skill { name, .. } => name,
         }
     }
 
@@ -155,7 +171,8 @@ impl ToolDecl {
             | Self::AskUser { description, .. }
             | Self::WebSearch { description, .. }
             | Self::Mcp { description, .. }
-            | Self::Agent { description, .. } => description.as_deref(),
+            | Self::Agent { description, .. }
+            | Self::Skill { description, .. } => description.as_deref(),
         }
     }
 
@@ -166,7 +183,7 @@ impl ToolDecl {
             | Self::Http { input_schema, .. }
             | Self::AskUser { input_schema, .. }
             | Self::Agent { input_schema, .. } => input_schema.as_ref(),
-            Self::WebSearch { .. } | Self::Mcp { .. } => None,
+            Self::WebSearch { .. } | Self::Mcp { .. } | Self::Skill { .. } => None,
         }
     }
 
@@ -179,6 +196,7 @@ impl ToolDecl {
             Self::WebSearch { .. } => "web.search",
             Self::Mcp { .. } => "mcp",
             Self::Agent { .. } => "agent",
+            Self::Skill { .. } => "skill",
         }
     }
 }
@@ -193,6 +211,10 @@ fn default_search_max_calls() -> usize {
 
 fn default_mcp_max_calls() -> usize {
     3
+}
+
+fn default_skill_tool_max_calls() -> usize {
+    4
 }
 
 fn default_agent_tool_max_iterations() -> usize {

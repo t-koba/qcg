@@ -1,4 +1,4 @@
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use qcg_contract::CommandPermission;
 use qcg_policy::is_safe_relative_path;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -135,6 +135,9 @@ impl ProcessTreeGuard {
         }
         #[cfg(not(windows))]
         {
+            // OS pids always fit i32 (pid_max is far below 2^31); a
+            // conversion failure only skips the group kill while the owned
+            // child handle still terminates the child itself.
             let pgid = child.id().and_then(|pid| i32::try_from(pid).ok());
             Ok(Self {
                 pgid,
@@ -224,7 +227,26 @@ pub(crate) fn command_permission_summary(
     }
 }
 
+/// Static wildcard check without run roots (fail-closed for absolutes).
+/// Test-only helper preserving the original contract: bare absolute paths
+/// never match `*`. Production gateway code uses [`args_allowed_in`] with
+/// the run workspace/snapshot roots.
+#[cfg(test)]
 pub(crate) fn args_allowed(permission: &CommandPermission, args: &[String]) -> bool {
+    args_allowed_in(permission, args, &[])
+}
+
+/// Wildcard check with run-private absolute roots (E13). A static `*`
+/// declaration keeps rejecting bare absolutes (fail-closed); when the
+/// caller supplies the run workspace/snapshot roots, an absolute path
+/// rooted in those directories is accepted like its workspace-relative
+/// form. Anything outside the roots, or with `..`, NUL, or backslashes,
+/// is still rejected, so `/etc/passwd` can never match `*`.
+pub(crate) fn args_allowed_in(
+    permission: &CommandPermission,
+    args: &[String],
+    allowed_absolute_roots: &[Utf8PathBuf],
+) -> bool {
     if permission.args.is_empty() {
         return args.is_empty();
     }
@@ -235,7 +257,8 @@ pub(crate) fn args_allowed(permission: &CommandPermission, args: &[String]) -> b
         if pattern == actual {
             return true;
         }
-        if pattern.contains('*') && !is_safe_wildcard_command_arg(actual) {
+        if pattern.contains('*') && !is_safe_wildcard_command_arg_in(actual, allowed_absolute_roots)
+        {
             return false;
         }
         pattern == "*" || globish(pattern, actual)
@@ -253,21 +276,51 @@ fn globish(pattern: &str, actual: &str) -> bool {
     }
 }
 
-fn is_safe_wildcard_command_arg(actual: &str) -> bool {
-    if actual.is_empty()
-        || actual.contains('\0')
-        || actual.contains('\\')
-        || actual.starts_with('/')
-    {
+/// Rooted safety check shared by the static validator and the run-private
+/// gateway check. Relative paths follow the existing rules; absolute paths
+/// are accepted only when lexically rooted in one of the supplied
+/// run-private directories (workspace or snapshot/metadata) and otherwise
+/// safe. Lexical prefixing is sufficient here: `..` components are rejected
+/// outright, so `/root/../escape` can never pass, and the roots themselves
+/// are per-run directories the validator already trusts for relative `*`.
+fn is_safe_wildcard_command_arg_in(actual: &str, allowed_absolute_roots: &[Utf8PathBuf]) -> bool {
+    if actual.is_empty() || actual.contains('\0') || actual.contains('\\') {
         return false;
+    }
+    if let Some((_, value)) = actual.split_once('=') {
+        if value.is_empty() {
+            return false;
+        }
+        // An `=` value may itself be an absolute run-private path (for
+        // example `--input=/run/meta/snapshot/file`); otherwise it follows
+        // the same relative rules as the whole arg.
+        if value.starts_with('/') {
+            return is_absolute_under_roots(value, allowed_absolute_roots)
+                && !value.split('/').any(|part| part == "..");
+        }
+        if value.split('/').any(|part| part == "..") {
+            return false;
+        }
+    }
+    if actual.starts_with('/') {
+        return is_absolute_under_roots(actual, allowed_absolute_roots)
+            && !actual.split('/').any(|part| part == "..");
     }
     if actual.split('/').any(|part| part == "..") {
         return false;
     }
-    if let Some((_, value)) = actual.split_once('=')
-        && (value.is_empty() || value.starts_with('/') || value.split('/').any(|part| part == ".."))
-    {
-        return false;
-    }
     true
+}
+
+/// Lexical root check: the absolute path must equal a root or start with
+/// `root/`. No I/O is performed (the validator is pure); `..` is rejected
+/// by the caller, so prefix matching cannot be escaped lexically.
+fn is_absolute_under_roots(actual: &str, allowed_absolute_roots: &[Utf8PathBuf]) -> bool {
+    allowed_absolute_roots.iter().any(|root| {
+        let root = root.as_str().trim_end_matches('/');
+        if root.is_empty() {
+            return false;
+        }
+        actual == root || actual.starts_with(&format!("{root}/"))
+    })
 }

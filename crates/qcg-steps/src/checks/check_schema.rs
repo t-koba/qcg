@@ -60,6 +60,7 @@ impl StepExecutor for CheckSchemaStep {
             )
         })?;
         let value_source = bounded_transform_text(
+            &ctx.run.fs,
             &source_path,
             ctx.run.contract.manifest.runtime.file_input_limit_bytes,
         )

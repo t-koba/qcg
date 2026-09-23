@@ -1,9 +1,10 @@
 use crate::RunContext;
 use camino::Utf8PathBuf;
-use qcg_contract::{ResourceDef, parse_skill_doc};
+use qcg_contract::{ResourceDef, parse_skill_doc, skill_metadata_value, validate_skill_doc};
 use serde_json::{Value, json};
 
-use super::hash::resolve_resource_path;
+use super::hash::{hash_resource_dir, resolve_resource_path};
+use super::snapshot::DirectoryLimits;
 use super::types::{ResourceError, ResourceSelector};
 
 pub(crate) fn render_skill_resource(
@@ -11,41 +12,71 @@ pub(crate) fn render_skill_resource(
     resource_name: &str,
     resource: &ResourceDef,
     selector: Option<&ResourceSelector>,
-    max_selected_bytes: Option<usize>,
+    limits: DirectoryLimits,
 ) -> Result<String, ResourceError> {
     let path = resource
         .path
         .as_deref()
         .ok_or_else(|| ResourceError::MissingField {
             resource: resource_name.to_string(),
-            field: "path or library ref",
+            field: "path",
         })?;
     let skill_root = resolve_resource_path(context, resource_name, path)?;
-    let skill_path = if skill_root.is_dir() {
-        resolve_resource_file(resource_name, &skill_root, "SKILL.md")?
-    } else {
-        skill_root.clone()
-    };
-    let source = read_to_string_bounded(&skill_path, max_selected_bytes)?;
-    let skill = parse_skill_doc(&source);
+    if !skill_root.is_dir() {
+        return Err(ResourceError::InvalidSkill {
+            resource: resource_name.to_string(),
+            message: "a skill resource must be a directory containing SKILL.md".into(),
+        });
+    }
+    let skill = read_skill_doc(resource_name, &skill_root, limits.max_selected_bytes)?;
     match selector {
         None => Ok(skill.instructions),
         Some(ResourceSelector::Named(name)) if name == "instructions" => Ok(skill.instructions),
         Some(ResourceSelector::Named(name)) if name == "meta" => {
+            Ok(serde_json::to_string_pretty(&skill_metadata_value(&skill))?)
+        }
+        Some(ResourceSelector::Named(name)) if name == "tree" || name == "files" => {
+            let (sha256, files) =
+                hash_resource_dir(&skill_root, limits).map_err(|source| ResourceError::Read {
+                    path: skill_root.clone(),
+                    source,
+                })?;
             Ok(serde_json::to_string_pretty(&json!({
-                "name": skill.name,
-                "description": skill.description,
+                "sha256": sha256,
+                "files": files,
             }))?)
         }
         Some(ResourceSelector::File { path: rel }) => {
             let file_path = resolve_resource_file(resource_name, &skill_root, rel)?;
-            read_to_string_bounded(&file_path, max_selected_bytes)
+            read_to_string_bounded(&file_path, limits.max_selected_bytes)
         }
         Some(other) => Err(ResourceError::UnsupportedNamedSelector {
             resource: resource_name.to_string(),
             selector: format!("{other:?}"),
         }),
     }
+}
+
+pub(crate) fn read_skill_doc(
+    resource_name: &str,
+    skill_root: &camino::Utf8Path,
+    max_selected_bytes: Option<usize>,
+) -> Result<qcg_contract::SkillDoc, ResourceError> {
+    let skill_path = resolve_resource_file(resource_name, skill_root, "SKILL.md")?;
+    let source = read_to_string_bounded(&skill_path, max_selected_bytes)?;
+    let mut skill = parse_skill_doc(&source).map_err(|error| ResourceError::InvalidSkill {
+        resource: resource_name.to_string(),
+        message: error.to_string(),
+    })?;
+    let expected_name = skill_root.file_name().map(str::to_string);
+    let diagnostics = validate_skill_doc(&skill, expected_name.as_deref()).map_err(|error| {
+        ResourceError::InvalidSkill {
+            resource: resource_name.to_string(),
+            message: error.to_string(),
+        }
+    })?;
+    skill.diagnostics = diagnostics;
+    Ok(skill)
 }
 
 pub(crate) fn resolve_resource_file(
@@ -64,6 +95,25 @@ pub(crate) fn resolve_resource_file(
         });
     }
     let file = root.join(relative);
+    // Reject symlinks at every component without following them: a
+    // canonicalize-then-read sequence alone leaves a swap window where a
+    // planted symlink redirects the later read outside the root (E13).
+    {
+        let mut current = root.to_path_buf();
+        for part in relative.split('/') {
+            current = current.join(part);
+            let metadata =
+                std::fs::symlink_metadata(&current).map_err(|source| ResourceError::Read {
+                    path: current.clone(),
+                    source,
+                })?;
+            if metadata.file_type().is_symlink() {
+                return Err(ResourceError::FileEscapesRoot {
+                    resource: resource.to_string(),
+                });
+            }
+        }
+    }
     let canonical_root = std::fs::canonicalize(root).map_err(|source| ResourceError::Read {
         path: root.to_path_buf(),
         source,
@@ -212,7 +262,12 @@ pub(crate) fn read_bytes_bounded(
     let limit = u64::try_from(max_bytes)
         .map_err(|_| std::io::Error::other("resource byte limit does not fit u64"))?;
     let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
-    let mut limited = std::io::Read::take(file, limit.saturating_add(1));
+    // The one-byte over-read detects an over-limit file; limit overflow
+    // fails closed instead of clamping the detection window (E13).
+    let over_read = limit
+        .checked_add(1)
+        .ok_or_else(|| std::io::Error::other("resource byte limit overflowed"))?;
+    let mut limited = std::io::Read::take(file, over_read);
     std::io::Read::read_to_end(&mut limited, &mut bytes)?;
     if bytes.len() > max_bytes {
         return Err(std::io::Error::other(format!(

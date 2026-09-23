@@ -1,6 +1,6 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use qcg_contract::Contract;
-use qcg_service::{DirectRun, LocalQcgService};
+use qcg_service::DirectRun;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
@@ -37,28 +37,73 @@ async fn run_generator(
     values: BTreeMap<String, Value>,
     reply: BTreeMap<String, Value>,
 ) -> Result<Utf8PathBuf, String> {
-    let runs = run_dir(label).join("runs");
-    let service = LocalQcgService::new(
+    // E08f: `ask_user` question ids bind the resolved question content, so
+    // provisioned answers keyed by node id are re-keyed to the ids the run
+    // reports, resuming the suspended run until every question is answered.
+    // Direct-run metadata lives outside the output directory, so a replay
+    // resumes in place and the workspace must survive between attempts.
+    // One service owns the runs directory for the whole discovery loop.
+    let service = crate::test_service(
         workspace_root().join("fixtures/generators"),
-        runs,
+        run_dir(label).join("runs"),
         Some(workspace_root().join("providers.toml")),
     )
     .map_err(|error| error.to_string())?;
-    let manifest = service
-        .run_generator_path(DirectRun {
-            generator_path: generator,
-            inputs: values,
-            output_dir: run_dir(label),
-            json_events: false,
-            interactive: false,
-            answers: reply,
-            confirmations: BTreeMap::new(),
-            llm_seed_override: None,
-        })
-        .await
-        .map_err(|error| error.to_string())?;
-    let _ = manifest;
-    Ok(run_dir(label))
+    let mut provisioned: BTreeMap<String, Value> = BTreeMap::new();
+    for _ in 0..crate::MAX_QUESTION_DISCOVERY_ATTEMPTS {
+        // See `examples.rs`: a resume attempt can momentarily overlap the
+        // previous attempt's cleanup under load; retry only that condition.
+        let mut response = None;
+        for _ in 0..50 {
+            match service
+                .run_generator_path(DirectRun {
+                    generator_path: generator.clone(),
+                    inputs: values.clone(),
+                    output_dir: run_dir(label),
+                    json_events: false,
+                    interactive: false,
+                    answers: provisioned.clone(),
+                    confirmations: BTreeMap::new(),
+                    llm_seed_override: None,
+                })
+                .await
+            {
+                Err(error)
+                    if error
+                        .to_string()
+                        .contains("is already active in another qcg run") =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    continue;
+                }
+                other => {
+                    response = Some(other);
+                    break;
+                }
+            }
+        }
+        match response.expect("lock retry loop should produce a result") {
+            Ok(_) => return Ok(run_dir(label)),
+            Err(error) => {
+                let message = error.to_string();
+                let Some(question_id) = message.strip_prefix("run is waiting for user input: ")
+                else {
+                    return Err(message);
+                };
+                let Some(answer) = crate::answer_for_question(&reply, question_id) else {
+                    return Err(message);
+                };
+                if provisioned.contains_key(question_id) {
+                    return Err(message);
+                }
+                provisioned.insert(question_id.to_string(), answer.clone());
+            }
+        }
+    }
+    Err(format!(
+        "self-hosting run `{label}` did not settle within {} question-discovery replays",
+        crate::MAX_QUESTION_DISCOVERY_ATTEMPTS
+    ))
 }
 
 /// The blueprint is deliberate test input, not a production package-discovery
@@ -122,6 +167,7 @@ fn builder_answers() -> BTreeMap<String, Value> {
             "ask_llm_model",
             json!({"provider": "fake", "model": "fake"}),
         ),
+        ("ask_llm_effort", json!("high")),
         ("ask_research", json!("none")),
         (
             "ask_authority",
@@ -132,7 +178,8 @@ fn builder_answers() -> BTreeMap<String, Value> {
                     "network": ["mcp.exa.ai", "search.parallel.ai"],
                     "commands": [],
                     "containers": {"enabled": false, "images": [], "on_missing": "error"},
-                    "side_effects": "none"
+                    "side_effects": "none",
+                    "side_effects_scope": "invocation"
                 },
                 "secrets": {}
             }),

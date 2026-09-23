@@ -15,10 +15,9 @@ use tokio_util::sync::CancellationToken;
 use super::error::{McpCallOutcome, McpError, McpInputRequired};
 use super::profile::{CredentialGuard, McpProfile};
 use super::runtime::QcgMcpClient;
+use super::spec::{TASK_POLL_INTERVAL_MS_MAX, TASK_POLL_INTERVAL_MS_MIN};
 use super::transport::McpLifecycle;
 use super::validate::{guarded_transport_error, reject_credential_reflection};
-
-const MAX_TOOL_LIST_PAGES: usize = 100;
 
 pub struct McpSession {
     pub(crate) profile: McpProfile,
@@ -101,10 +100,11 @@ impl McpSession {
         let seconds = self.profile.spec.timeout_seconds;
         let mut sensitive_values = self.sensitive_values().await?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
+        let page_limit = self.profile.spec.tools_list_page_limit;
         let mut cursor = None;
         let mut seen_cursors = BTreeSet::new();
         let mut tools = Vec::new();
-        for _ in 0..MAX_TOOL_LIST_PAGES {
+        for _ in 0..page_limit {
             let result = tokio::select! {
                 _ = self.cancellation.cancelled() => {
                     self.cancel_transport();
@@ -151,7 +151,7 @@ impl McpSession {
             cursor = Some(next);
         }
         Err(McpError::Transport(format!(
-            "MCP server `{}` tools/list exceeded {MAX_TOOL_LIST_PAGES} pages",
+            "MCP server `{}` tools/list exceeded {page_limit} pages",
             self.profile.id()
         )))
     }
@@ -287,7 +287,10 @@ impl McpSession {
             }
         };
         let task_id = task.task_id;
-        let mut poll_interval = task.poll_interval_ms.unwrap_or(250).clamp(50, 5_000);
+        let mut poll_interval = task
+            .poll_interval_ms
+            .unwrap_or(self.profile.spec.task_poll_interval_ms)
+            .clamp(TASK_POLL_INTERVAL_MS_MIN, TASK_POLL_INTERVAL_MS_MAX);
         loop {
             tokio::select! {
                 _ = self.cancellation.cancelled() => {
@@ -309,7 +312,7 @@ impl McpSession {
                 .task
                 .poll_interval_ms
                 .unwrap_or(poll_interval)
-                .clamp(50, 5_000);
+                .clamp(TASK_POLL_INTERVAL_MS_MIN, TASK_POLL_INTERVAL_MS_MAX);
             match detailed.payload {
                 TaskPayload::Working => {}
                 TaskPayload::Completed { result } => {

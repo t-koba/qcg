@@ -40,6 +40,9 @@ model = "fake"
 provider = "fake"
 
 [permissions]
+fs_read = []
+network = []
+side_effects_scope = "invocation"
 fs_write = ["workspace"]
 side_effects = "allowed"
 
@@ -48,3 +51,6 @@ args = ["-c", "echo review-required; echo ran >> ran.txt"]
 bin = "sh"
 purpose = "produce a guardrail-rejected marker"
 isolation = "trusted_host"
+
+[permissions.containers]
+enabled = false

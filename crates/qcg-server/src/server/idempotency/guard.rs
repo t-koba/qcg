@@ -1,6 +1,9 @@
 //! Owner cleanup guard: an owner that fails or is dropped without
 //! disarming reverts its in-memory pending entry and wakes its waiters, so
-//! a dead owner never wedges retries on its key.
+//! a dead owner never wedges retries on its key. Only the memory entry is
+//! reverted here: the durable claim is released explicitly on error paths
+//! and otherwise expires via TTL adoption, so a guard drop never deletes a
+//! successor's claim file (E02).
 
 use std::sync::Arc;
 

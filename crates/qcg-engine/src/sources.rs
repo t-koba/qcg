@@ -7,11 +7,10 @@ pub const TOOL_EVENT_SOURCE_SCAN_BYTES: usize = 256 * 1024;
 pub const TOOL_EVENT_SOURCE_SCAN_NODES: usize = 8_192;
 pub const TOOL_EVENT_SOURCE_SCAN_DEPTH: usize = 64;
 
-fn tool_source_url_regex() -> &'static regex::Regex {
-    static URLS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    URLS.get_or_init(|| {
-        regex::Regex::new(r#"https?://[^\s<>\"']+"#).expect("tool source URL regex must compile")
-    })
+fn tool_source_url_regex() -> Option<&'static regex::Regex> {
+    static URLS: std::sync::OnceLock<Option<regex::Regex>> = std::sync::OnceLock::new();
+    URLS.get_or_init(|| regex::Regex::new(r#"https?://[^\s<>\"']+"#).ok())
+        .as_ref()
 }
 
 /// Extracts bounded, public source references from a structured tool result.
@@ -70,10 +69,12 @@ pub fn tool_call_sources(value: &Value) -> Vec<Value> {
                 }
                 let scanned = utf8_head(text, remaining);
                 string_bytes = string_bytes.saturating_add(scanned.len());
-                for candidate in tool_source_url_regex()
-                    .find_iter(scanned)
-                    .map(|matched| matched.as_str())
-                {
+                // Production regex compilation failure fails closed with no
+                // text sources (explicit error path, never expect/panic).
+                let Some(regex) = tool_source_url_regex() else {
+                    continue;
+                };
+                for candidate in regex.find_iter(scanned).map(|matched| matched.as_str()) {
                     if let Some(url) = public_source_url(candidate)
                         && text_sources.len() < TOOL_EVENT_SOURCE_LIMIT
                     {

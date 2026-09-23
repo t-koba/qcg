@@ -1,4 +1,4 @@
-use crate::common::{ensure_bounded_file_tree, require};
+use crate::common::require;
 use async_trait::async_trait;
 use qcg_contract::{Contract, NodeDef};
 use qcg_engine::{StepContext, StepError, StepExecutor, StepOutcome, StepTraits};
@@ -50,14 +50,34 @@ impl StepExecutor for CheckContractStep {
                 format!("source path is not in workspace: {error}"),
             )
         })?;
-        ensure_bounded_file_tree(
-            &generator_dir,
-            ctx.run.contract.manifest.runtime.file_input_limit_bytes,
-            ctx.run.contract.manifest.runtime.file_count_limit,
-        )
-        .await
-        .map_err(|error| StepError::failed(&node.id, error))?;
-        match Contract::load(&generator_dir) {
+        // Load from a private handle-relative snapshot instead of the live
+        // workspace tree: a parent swapped after resolution cannot redirect
+        // the parse, and the snapshot enforces the input limits itself (E13).
+        // The `.qcg-part-` prefix is the single unified temp prefix swept
+        // at startup.
+        let snapshot = ctx
+            .run
+            .metadata
+            .join(format!(".qcg-part-{}", uuid::Uuid::now_v7()));
+        let loaded = ctx
+            .run
+            .fs
+            .snapshot_tree_to(
+                &generator_dir,
+                &snapshot,
+                ctx.run.contract.manifest.runtime.file_input_limit_bytes,
+                ctx.run.contract.manifest.runtime.file_count_limit,
+            )
+            .map_err(|error| StepError::failed(&node.id, error.to_string()))
+            .and_then(|()| {
+                Contract::load(&snapshot)
+                    .map_err(|error| StepError::failed(&node.id, error.to_string()))
+            });
+        // Temp cleanup failures propagate fail-closed (E13-9): a leftover
+        // snapshot must surface instead of silently accumulating.
+        std::fs::remove_dir_all(&snapshot)
+            .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
+        match loaded {
             Ok(contract) => Ok(StepOutcome::Success {
                 output: Some(json!({
                     "status": "pass",

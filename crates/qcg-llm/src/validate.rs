@@ -9,6 +9,11 @@ use crate::types::{Capabilities, ChatContentPart, ChatRequest, LlmError};
 use qcg_policy::{MAX_JSON_SCHEMA_BYTES, MAX_JSON_SCHEMA_DEPTH, MAX_JSON_SCHEMA_NODES};
 
 pub(crate) fn validate_chat_request(req: &ChatRequest, api: ApiFlavor) -> Result<(), LlmError> {
+    if api == ApiFlavor::SystemOne {
+        return Err(LlmError::new(
+            "system_one requires llm.decide, not a chat request",
+        ));
+    }
     if req.max_tokens == 0 {
         return Err(LlmError::new("max_tokens must be greater than zero"));
     }

@@ -162,6 +162,10 @@ impl GeneratorMetadataRule {
                 manifest.runtime.journal_event_limit_bytes,
             ),
             (
+                "runtime.journal_scan_window_bytes",
+                manifest.runtime.journal_scan_window_bytes,
+            ),
+            (
                 "runtime.journal_total_limit_bytes",
                 manifest.runtime.journal_total_limit_bytes,
             ),
@@ -248,6 +252,16 @@ impl GeneratorMetadataRule {
                     "[llm].seed must be omitted when reasoning_effort is set".into(),
                 ));
             }
+            if let Some(template) = llm
+                .reasoning_effort
+                .as_ref()
+                .and_then(|spec| spec.template())
+                && !template.contains("{{")
+            {
+                return Err(ContractError::Invalid(format!(
+                    "[llm].reasoning_effort `{template}` is neither a known effort nor a template"
+                )));
+            }
             if llm.stop_sequences.len() > 8
                 || llm
                     .stop_sequences
@@ -289,20 +303,10 @@ impl GeneratorMetadataRule {
                         )));
                     }
                 }
-                if manifest.budget.max_cost_usd.is_some()
-                    && (model.input_cost_per_million_usd.is_none()
-                        || model.output_cost_per_million_usd.is_none())
-                {
-                    return Err(ContractError::Invalid(format!(
-                        "model `{}/{}` must declare input and output pricing when budget.max_cost_usd is set",
-                        model.provider, model.model
-                    )));
-                }
-            } else if manifest.budget.max_cost_usd.is_some() {
-                return Err(ContractError::Invalid(
-                    "[llm].model must be declared when budget.max_cost_usd is set because the provider default does not carry pricing"
-                        .into(),
-                ));
+                // Pricing may also come from the model catalog at request
+                // time, so the manifest only rejects impossible values here.
+                // `invocation_routes` fails closed when a cost budget is set
+                // and no contract or catalog price exists for a route.
             }
             let mut model_ids = BTreeSet::new();
             for model in &llm.models {
@@ -365,6 +369,18 @@ impl GeneratorMetadataRule {
                     )));
                 }
             }
+        }
+
+        if let Some(window) = manifest.runtime.journal_scan_window_bytes
+            && !(qcg_policy::MIN_JOURNAL_SCAN_WINDOW_BYTES
+                ..=qcg_policy::MAX_JOURNAL_SCAN_WINDOW_BYTES)
+                .contains(&window)
+        {
+            return Err(ContractError::Invalid(format!(
+                "runtime.journal_scan_window_bytes must be between {} and {}",
+                qcg_policy::MIN_JOURNAL_SCAN_WINDOW_BYTES,
+                qcg_policy::MAX_JOURNAL_SCAN_WINDOW_BYTES
+            )));
         }
         Ok(())
     }

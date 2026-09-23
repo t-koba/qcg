@@ -12,12 +12,19 @@ qcg listens on the selected address without forcing authentication. When
 `--api-token` or `QCG_API_TOKEN` is set, clients send `Authorization: Bearer
 <token>`. This authenticates an instance boundary, not individual run ownership.
 
-The bundled generator UI has no bearer token input and sends no
-`Authorization` header (including `EventSource` streams and artifact
-downloads). Combining the UI directly with the embedded bearer token is
-therefore unsupported. When browser access must be authenticated, place the
-UI and API behind qpx and let qpx inject the `Authorization` header after
-validating the caller. Never put tokens in URL query strings.
+The bundled generator UI supports the embedded bearer token: enter it in the
+sidebar token field, where it is kept in `sessionStorage` for the tab and sent
+as an `Authorization` header on every request, event stream, and artifact
+download. EventSource cannot set headers, so the UI reads SSE frames from a
+fetch body and resumes with `Last-Event-ID`; artifact and ZIP downloads use
+authenticated fetches and blob URLs. The token never appears in a URL query
+string, a cookie, or `localStorage`. Static generator assets
+(`GET /api/generators/{id}/assets/{path}`) stay readable without a token so
+the UI shell can load before the token is entered; declared assets are not
+secrets. Every JSON API route, including runs, journals, and artifacts,
+requires the credential when one is configured. When browser access must be
+authenticated at a different boundary, place the UI and API behind qpx and
+let qpx inject the `Authorization` header after validating the caller.
 
 ## Responsibilities
 
@@ -30,8 +37,12 @@ qpx validates it, and qpx forwards accepted HTTP traffic to qcg on
 `127.0.0.1`. Integration is only at the binary and HTTP boundary; qcg has no
 build-time or runtime dependency on either sister product.
 
-qcg does not read caller identity, attach an owner or tenant to a run, or
-filter run resources by user. Authentication at qpx therefore does not by
+Runs accept optional `labels` (bounded free-form metadata, for example
+`{"owner": "team-a"}`) and an optional `audit_level` raise on `POST
+/api/runs`; both are stored with the run and visible in snapshots. Labels
+are metadata only: qcg does not read caller identity, authenticate from
+them, or filter run resources by label. qcg does not attach an owner or
+tenant to a run or filter run resources by user. Authentication at qpx therefore does not by
 itself provide per-user isolation. Use qcg for trusted shared use, or enforce
 separation outside qcg with a separate service and runs directory per trust
 domain.
@@ -76,6 +87,7 @@ event, artifact, and journal routes. Principal paths include:
 - `GET /api/generators`
 - `GET /api/generators/{id}`
 - `GET /api/generators/{id}/assets/{path...}`
+- `GET /api/llm/catalog` (`?refresh=true` re-fetches external catalog sources)
 - `GET /api/mcp/servers`
 - `POST, DELETE /api/mcp/servers/{id}/authorization`
 - `DELETE /api/mcp/servers/{id}/authorization/pending`
@@ -198,5 +210,52 @@ keeps network delivery explicit and journaled.
 ## CORS and events
 
 CORS is disabled unless one or more exact `--cors-origin` values are supplied.
-Allowed request headers are `content-type` and `idempotency-key`; credentialed
-CORS is not enabled. Run events use SSE and support `Last-Event-ID` replay.
+Allowed request headers are `authorization`, `content-type`, and
+`idempotency-key`; credentialed CORS is not enabled. Builds without the
+`server-cors` cargo feature refuse configured origins with an explicit error
+instead of serving without CORS. Run events use SSE and support `Last-Event-ID` replay.
+
+## Shutdown behavior
+
+On `SIGINT`/`SIGTERM` the server stops accepting mutating requests with
+`503` (JSON problem shape), closes event streams with an explicit
+`shutdown` marker (distinguishing shutdown from truncation), stops resident
+tasks, and
+settles tracked runs as `Interrupted` under a 150 s outer deadline exceeded
+as an error to the host (total bound from signal to exit is 180 s: 30 s
+drain + 150 s outer; the outer starts after the drain, so a wedged drain
+delays settlement by design). Startup order is policy resolve, service build,
+router build, then recovery before resident tasks; shutdown order is signal,
+mutating-work gate, HTTP drain bounded by 30 s (`DRAIN_TIMEOUT`), then
+resident-task and active-run settlement concurrently under the outer
+deadline. Settled runs are terminal and cover every tracked
+non-terminal run including `Queued`; only work that was waiting on human
+input, explicitly requeued, or never tracked by the stopping peer resumes
+after a restart. Single-peer enforcement: the lease-holding peer settles
+its own runs; leaseless peers never touch others' runs. In shared mode stopping one peer settles only that peer's
+runs. A cancel racing the shutdown settles as `Interrupted` once shutdown
+started, else `Canceled`. The HTTP drain is bounded by 30 s: a wedged
+connection is cut so shutdown proceeds (warned, never silent). See `docs/operations.md` for the
+normative shutdown contract.
+
+## Conditional snapshots
+
+`GET /api/runs/{id}` (and the artifact inventory) return an exact-body
+`ETag`. Repeating the request with `If-None-Match` set to that value yields
+`304` while the body is unchanged; `If-None-Match: *` matches any existing
+snapshot, and comma-separated lists use weak comparison per RFC 7232.
+Malformed validators fail closed with `400`. Mutation responses (`POST`
+start/fork, idempotent replays) carry the same
+validator so the next read can condition on it, and replays return the
+identical validator. Queue movement, metrics,
+prompts, and approvals all change the body and therefore the validator.
+The run list, cost metrics, and single-artifact bodies carry validators
+(exact-body digest, or manifest sha256 for artifacts); the bounded journal
+snapshot carries an exact-body validator and the unbounded live tail carries
+a weak revision validator over (size + mtime), so both journal shapes are
+conditional. The generator catalog and streaming archives (artifact zip, run
+bundle) carry no validator and always return `200`: hashing the full archive
+upfront would defeat streaming. For streams the snapshot or
+artifact-list validator is the queue-revision alternative: conditional reads
+apply to snapshots, the run list, cost metrics, single artifacts, the
+artifact inventory, bounded and unbounded journal reads, and mutation responses.

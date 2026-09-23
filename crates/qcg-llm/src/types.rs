@@ -19,7 +19,19 @@ pub struct Capabilities {
     pub tool_choice: bool,
     pub parallel_tool_calls: bool,
     pub verbosity: bool,
+    pub prompt_cache: bool,
     pub reasoning_effort: Vec<ReasoningEffort>,
+}
+
+/// Per-request prompt-cache directive resolved from `[llm].cache`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCache {
+    /// Attach the provider's cache instructions for this request.
+    Auto,
+    /// Send no cache instructions.
+    #[default]
+    Off,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +55,8 @@ pub struct ChatRequest {
     pub verbosity: Option<ResponseVerbosity>,
     #[serde(default)]
     pub stream: bool,
+    #[serde(default)]
+    pub prompt_cache: PromptCache,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

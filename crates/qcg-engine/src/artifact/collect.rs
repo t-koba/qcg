@@ -155,14 +155,11 @@ fn insert_artifact(
         .len()
         .checked_add(if artifacts.contains_key(&path) { 0 } else { 1 })
         .ok_or_else(|| std::io::Error::other("output artifact count overflowed"))?;
-    if accounting
-        .limits
-        .artifact_count
-        .is_some_and(|limit| next_count > limit)
+    if let Some(limit) = accounting.limits.artifact_count
+        && next_count > limit
     {
         return Err(std::io::Error::other(format!(
-            "output artifact count exceeds {}",
-            accounting.limits.artifact_count.unwrap_or(usize::MAX)
+            "output artifact count exceeds {limit}"
         )));
     }
     let total_without_previous = accounting
@@ -172,14 +169,11 @@ fn insert_artifact(
     let next_total = total_without_previous
         .checked_add(artifact.bytes)
         .ok_or_else(|| std::io::Error::other("output byte accounting overflowed"))?;
-    if accounting
-        .limits
-        .total_bytes
-        .is_some_and(|limit| next_total > limit)
+    if let Some(limit) = accounting.limits.total_bytes
+        && next_total > limit
     {
         return Err(std::io::Error::other(format!(
-            "output bytes exceed {}",
-            accounting.limits.total_bytes.unwrap_or(u64::MAX)
+            "output bytes exceed {limit}"
         )));
     }
     accounting.total_bytes = next_total;
@@ -232,10 +226,11 @@ pub(crate) fn matching_files(
         entries = entries
             .checked_add(1)
             .ok_or_else(|| std::io::Error::other("artifact entry count overflowed"))?;
-        if count_limit.is_some_and(|limit| entries > limit) {
+        if let Some(limit) = count_limit
+            && entries > limit
+        {
             return Err(std::io::Error::other(format!(
-                "artifact scan contains more than {} entries",
-                count_limit.unwrap_or(usize::MAX)
+                "artifact scan contains more than {limit} entries"
             )));
         }
         if !entry.file_type().is_file() {
@@ -252,10 +247,11 @@ pub(crate) fn matching_files(
             )));
         }
         if glob_matches(pattern.as_bytes(), portable.as_bytes())? {
-            if artifact_limit.is_some_and(|limit| matches.len() >= limit) {
+            if let Some(limit) = artifact_limit
+                && matches.len() >= limit
+            {
                 return Err(std::io::Error::other(format!(
-                    "artifact glob matches more than {} files",
-                    artifact_limit.unwrap_or(usize::MAX)
+                    "artifact glob matches more than {limit} files"
                 )));
             }
             matches.push(path);

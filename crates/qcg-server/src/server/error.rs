@@ -67,6 +67,17 @@ impl ApiHttpError {
         )
     }
 
+    pub(crate) fn too_many_requests(detail: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many requests",
+            "rate_limited",
+            detail,
+            "",
+            Vec::new(),
+        )
+    }
+
     pub(crate) fn service_unavailable(detail: impl Into<String>) -> Self {
         Self::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -166,6 +177,12 @@ impl ApiHttpError {
                 errors,
             }),
         }
+    }
+}
+
+impl std::fmt::Display for ApiHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.problem.title, self.problem.detail)
     }
 }
 

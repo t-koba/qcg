@@ -80,9 +80,9 @@ pub fn docker_run_argv(spec: &DockerRunSpec<'_>) -> Vec<String> {
     argv
 }
 
-/// Unique instance name valid for Incus, LXD, and legacy LXC: lowercase
-/// `qcg` prefix plus the full 128-bit UUID as hex, no hyphen (LXC
-/// identifiers are alphanumeric). UUIDv7 encodes its entropy in the low
+/// Unique instance name valid for Incus and LXD: lowercase
+/// `qcg` prefix plus the full 128-bit UUID as hex, no hyphen.
+/// UUIDv7 encodes its entropy in the low
 /// bits while the high bits are timestamp and counter, so truncating the
 /// prefix makes names created in the same millisecond collide (D01).
 pub fn instance_name() -> String {
@@ -144,53 +144,6 @@ pub fn validate_image_for_backend(
                 ))
             }
         }
-        Backend::Lxc => {
-            if parse_lxc_image(image).is_some() {
-                Ok(())
-            } else {
-                Err(invalid_image(
-                    image,
-                    backend.display_name(),
-                    "image must have form `<dist>:<release>` (for example `alpine:3.20`)",
-                ))
-            }
-        }
-    }
-}
-
-/// Parses a legacy LXC download-template image reference `dist:release`.
-pub fn parse_lxc_image(image: &str) -> Option<(String, String)> {
-    if image.contains('@') || image.contains('/') || image.contains(char::is_whitespace) {
-        return None;
-    }
-    let (dist, release) = image.split_once(':')?;
-    if dist.is_empty()
-        || release.is_empty()
-        || !dist.bytes().all(|byte| {
-            byte.is_ascii_lowercase()
-                || byte.is_ascii_digit()
-                || byte == b'.'
-                || byte == b'-'
-                || byte == b'_'
-        })
-        || !release.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-' || byte == b'_'
-        })
-    {
-        return None;
-    }
-    Some((dist.to_string(), release.to_string()))
-}
-
-/// Maps host architecture names to LXC download-template arch names.
-pub fn map_lxc_arch(arch: &str) -> Option<&'static str> {
-    match arch {
-        "x86_64" => Some("amd64"),
-        "aarch64" => Some("arm64"),
-        "x86" => Some("i386"),
-        "arm" => Some("armhf"),
-        "riscv64" => Some("riscv64"),
-        _ => None,
     }
 }
 
@@ -205,150 +158,6 @@ pub fn validate_guest_path(guest: &str) -> Result<(), ContainerError> {
         });
     }
     Ok(())
-}
-
-/// Minimal PATH set explicitly inside legacy LXC workloads, which start
-/// with a cleared environment.
-pub const LXC_MINIMAL_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-
-/// Capabilities dropped from legacy LXC workloads. Every entry is a real
-/// Linux capability name; an unknown entry would fail container start
-/// closed instead of silently weakening isolation.
-pub const LXC_CAP_DROP: &str = "sys_module sys_rawio sys_boot sys_time audit_control audit_write mac_admin mac_override syslog wake_alarm";
-
-/// Generates a legacy LXC container configuration enforcing network
-/// isolation, workspace-only bind mounts, dropped capabilities, and
-/// no-new-privileges. Guests are written relative to the container rootfs.
-pub fn lxc_config_text(mounts: &[Mount<'_>]) -> Result<String, ContainerError> {
-    // `none` shares the HOST network namespace (it is not isolation);
-    // loopback-only isolation is `empty`. The bare `lxc.net =` first clears
-    // any inherited network stanza so a surrounding default cannot re-add
-    // interfaces behind the explicit setting (B03).
-    let mut text = String::from("lxc.net =\nlxc.net.0.type = empty\n");
-    for mount in mounts {
-        validate_guest_path(mount.guest)?;
-        let relative = mount.guest.trim_start_matches('/');
-        let options = if mount.readonly {
-            "bind,ro,create=dir"
-        } else {
-            "bind,create=dir"
-        };
-        text.push_str(&format!(
-            "lxc.mount.entry = {} {} none {} 0 0\n",
-            mount.host.to_string_lossy(),
-            relative,
-            options
-        ));
-    }
-    text.push_str(&format!("lxc.cap.drop = {LXC_CAP_DROP}\n"));
-    text.push_str("lxc.no_new_privs = 1\n");
-    Ok(text)
-}
-
-pub fn lxc_create_argv(
-    name: &str,
-    config_path: &Path,
-    dist: &str,
-    release: &str,
-    arch: &str,
-) -> Vec<String> {
-    vec![
-        "lxc-create".into(),
-        "-n".into(),
-        name.into(),
-        "-f".into(),
-        config_path.to_string_lossy().into_owned(),
-        "-t".into(),
-        "download".into(),
-        "--".into(),
-        "-d".into(),
-        dist.into(),
-        "-r".into(),
-        release.into(),
-        "-a".into(),
-        arch.into(),
-    ]
-}
-
-pub fn lxc_start_argv(name: &str) -> Vec<String> {
-    vec!["lxc-start".into(), "-n".into(), name.into(), "-d".into()]
-}
-
-pub fn lxc_probe_argv(name: &str) -> Vec<String> {
-    vec![
-        "lxc-attach".into(),
-        "-n".into(),
-        name.into(),
-        "--clear-env".into(),
-        "--".into(),
-        "/bin/true".into(),
-    ]
-}
-
-/// One-shot workload argv. `lxc-attach` has no `--cwd` flag, so the workload
-/// runs through `/bin/sh` which changes to the workdir and `exec`s the real
-/// command, preserving PID, stdio, signals, and exit status.
-pub fn lxc_exec_argv(
-    name: &str,
-    path_env: &str,
-    workdir: &str,
-    workload: &[String],
-) -> Vec<String> {
-    let mut argv = vec![
-        "lxc-attach".into(),
-        "-n".into(),
-        name.into(),
-        "--clear-env".into(),
-        "-v".into(),
-        format!("PATH={path_env}"),
-        "--".into(),
-        "/bin/sh".into(),
-        "-c".into(),
-        "cd \"$1\" && shift && exec \"$@\"".into(),
-        "qcg-sh".into(),
-        workdir.into(),
-    ];
-    argv.extend(workload.iter().cloned());
-    argv
-}
-
-/// Long-lived server spawn argv without the workdir wrapper: servers do not
-/// depend on a working directory, so the extra shell is omitted.
-pub fn lxc_server_argv(
-    name: &str,
-    path_env: &str,
-    env: &[(String, String)],
-    workload: &[String],
-) -> Vec<String> {
-    let mut argv = vec![
-        "lxc-attach".into(),
-        "-n".into(),
-        name.into(),
-        "--clear-env".into(),
-        "-v".into(),
-        format!("PATH={path_env}"),
-    ];
-    for (key, value) in env {
-        argv.push("-v".into());
-        argv.push(format!("{key}={value}"));
-    }
-    argv.push("--".into());
-    argv.extend(workload.iter().cloned());
-    argv
-}
-
-pub fn lxc_stop_argv(name: &str) -> Vec<String> {
-    vec![
-        "lxc-stop".into(),
-        "-n".into(),
-        name.into(),
-        "-k".into(),
-        "-W".into(),
-    ]
-}
-
-pub fn lxc_destroy_argv(name: &str) -> Vec<String> {
-    vec!["lxc-destroy".into(), "-n".into(), name.into(), "-f".into()]
 }
 
 /// Storage pool discovery following the daemon's own default profile.
@@ -483,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_instance_names_are_distinct_and_lxc_safe() {
+    fn generated_instance_names_are_distinct_and_safe() {
         let names: Vec<String> = (0..64).map(|_| instance_name()).collect();
         for name in &names {
             assert_eq!(name.len(), 35, "qcg plus a full UUID is 35 chars: {name}");
@@ -492,7 +301,7 @@ mod tests {
                     && name[3..]
                         .bytes()
                         .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
-                "{name} must stay alphanumeric lowercase for LXC"
+                "{name} must stay alphanumeric lowercase"
             );
         }
         let unique: std::collections::BTreeSet<&String> = names.iter().collect();

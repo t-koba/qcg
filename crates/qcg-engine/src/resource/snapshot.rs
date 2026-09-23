@@ -32,6 +32,9 @@ pub(crate) async fn snapshot_remote_or_local_resource(
             ResourceCacheStatus::Local,
         )
     } else if let Some(url) = &resource.url {
+        // No cache record means "not fresh": refetch instead of trusting an
+        // unchecked cache. IO errors propagate via `?` above; only absence
+        // reads as a miss (E13).
         let cache_is_fresh = resource
             .cache_ttl_seconds
             .map(|ttl| cached_snapshot_is_fresh(&snapshot_path, ttl))
@@ -60,13 +63,24 @@ pub(crate) async fn snapshot_remote_or_local_resource(
                 })
                 .await?;
             let bytes = response.body;
-            if limits.max_bytes.is_some_and(|limit| bytes.len() > limit) {
+            if let Some(limit) = limits.max_bytes
+                && bytes.len() > limit
+            {
                 return Err(EngineError::Failed(format!(
-                    "resource `{name}` exceeds max_bytes ({})",
-                    limits.max_bytes.unwrap_or(usize::MAX)
+                    "resource `{name}` exceeds max_bytes ({limit})"
                 )));
             }
             tokio::fs::write(&snapshot_path, &bytes).await?;
+            // Explicit owner-only mode after the write: snapshot bytes may
+            // carry sensitive data, and creation must not depend on the
+            // process umask (E15). Propagation failures fail the snapshot
+            // instead of leaving umask-dependent permissions behind.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                tokio::fs::set_permissions(&snapshot_path, std::fs::Permissions::from_mode(0o600))
+                    .await?;
+            }
             (
                 bytes,
                 ResourceSnapshotSource::Url {
@@ -83,6 +97,13 @@ pub(crate) async fn snapshot_remote_or_local_resource(
     };
     if !snapshot_path.exists() {
         tokio::fs::write(&snapshot_path, &bytes).await?;
+        // Explicit owner-only mode, same rationale as above (E15).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            tokio::fs::set_permissions(&snapshot_path, std::fs::Permissions::from_mode(0o600))
+                .await?;
+        }
     }
     let sha256 = hex::encode(Sha256::digest(&bytes));
     if let Some(pin_sha256) = &resource.pin_sha256
@@ -104,6 +125,7 @@ pub(crate) async fn snapshot_remote_or_local_resource(
         pin_sha256: resource.pin_sha256.clone(),
         trust: resource_trust_label(&resource.trust).into(),
         llm_visible: resource.llm_visible,
+        diagnostics: Vec::new(),
     })
 }
 

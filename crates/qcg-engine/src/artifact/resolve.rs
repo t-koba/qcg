@@ -106,10 +106,11 @@ impl std::io::Write for DigestWriter<'_> {
                     std::io::Error::other("artifact byte count does not fit in u64")
                 })?)
                 .ok_or_else(|| std::io::Error::other("artifact byte count overflowed"))?;
-        if self.limit.is_some_and(|limit| next > limit) {
+        if let Some(limit) = self.limit
+            && next > limit
+        {
             return Err(std::io::Error::other(format!(
-                "artifact file exceeds {} bytes",
-                self.limit.unwrap_or(u64::MAX)
+                "artifact file exceeds {limit} bytes"
             )));
         }
         self.digest.update(bytes);

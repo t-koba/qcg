@@ -30,11 +30,23 @@ impl Graph {
                 let subflow = node
                     .param_str("subflow")
                     .ok_or_else(|| format!("foreach node `{}` must declare subflow", node.id))?;
-                if !manifest.blocks.contains_key(subflow) {
+                let Some(block) = manifest.blocks.get(subflow) else {
                     return Err(format!(
                         "foreach node `{}` references unknown block `{subflow}`",
                         node.id
                     ));
+                };
+                // Block children run in declared order; dependency edges
+                // (`needs`) have no meaning inside a block and would be
+                // silently ignored, so refuse them fail-closed instead of
+                // running a different order than the manifest states.
+                for child in block {
+                    if !child.needs.is_empty() {
+                        return Err(format!(
+                            "foreach block `{subflow}` child `{}` must not declare `needs`; block children run in declared order",
+                            child.id
+                        ));
+                    }
                 }
             }
         }

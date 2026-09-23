@@ -260,7 +260,7 @@ impl FileValue {
         match (&self.text, &self.content_base64) {
             (Some(text), None) => Ok(text.as_bytes().to_vec()),
             (None, Some(content_base64)) => decode_base64(content_base64),
-            _ => unreachable!("FileValue::validate checked content exclusivity"),
+            _ => Err(FileValueError::MultipleContent),
         }
     }
 

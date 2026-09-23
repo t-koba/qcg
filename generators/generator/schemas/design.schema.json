@@ -38,7 +38,7 @@
             "blocks": { "type": "object" },
             "outputs": { "type": "object" },
             "failure": { "type": "object" },
-            "journal": { "type": "object" },
+            "retention": { "type": "object" },
             "assets": { "type": "object" }
           }
         },

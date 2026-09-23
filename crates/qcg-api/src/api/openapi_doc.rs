@@ -121,6 +121,7 @@ fn parameter_json_header(header: &ApiHeader) -> Value {
 fn parameter_schema(schema: ParameterSchema) -> Value {
     match schema {
         ParameterSchema::String => json!({ "type": "string" }),
+        ParameterSchema::Boolean => json!({ "type": "boolean" }),
         ParameterSchema::DateTime => json!({ "type": "string", "format": "date-time" }),
         ParameterSchema::Integer {
             minimum,

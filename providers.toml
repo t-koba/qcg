@@ -14,9 +14,9 @@
 # they stay unresolved. Azure OpenAI takes its full endpoint root (including
 # /openai/v1) from QCG_AZURE_OPENAI_BASE_URL instead.
 #
-# Local endpoints (ollama, lmstudio, openai_compat) are active by default and
+# Local endpoints (ollama, lmstudio, openai_client) are active by default and
 # only connect when a run reaches them. Ollama and LM Studio need no credential;
-# openai_compat reads the explicitly named credential variable below.
+# openai_client reads the explicitly named credential variable below.
 #
 # The `fake` provider is built into the qcg binary for deterministic tests. The
 # bundled authoring demo asks for a configured real model before LLM work.
@@ -205,6 +205,13 @@ api_key_env = "SERPAPI_API_KEY"
 auth_query_param = "api_key"
 
 [[provider]]
+id = "typesafe"
+api = "system_one"
+base_url = "https://api.typesafe.ai/v1"
+base_url_env = "QCG_TYPESAFE_BASE_URL"
+api_key_env = "TYPESAFE_API_KEY"
+
+[[provider]]
 id = "ollama"
 api = "chat_completions"
 base_url = "http://127.0.0.1:11434/v1"
@@ -219,11 +226,11 @@ base_url_env = "QCG_LMSTUDIO_BASE_URL"
 capabilities = { tool_use = true, json_schema = true, seed = false, temperature = true, top_p = true, stop_sequences = true, tool_choice = true, parallel_tool_calls = true }
 
 [[provider]]
-id = "openai_compat"
+id = "openai_client"
 api = "chat_completions"
 base_url = "http://127.0.0.1:8080/v1"
-base_url_env = "QCG_OPENAI_COMPAT_BASE_URL"
-api_key_env = "QCG_OPENAI_COMPAT_API_KEY"
+base_url_env = "QCG_OPENAI_CLIENT_BASE_URL"
+api_key_env = "QCG_OPENAI_CLIENT_API_KEY"
 capabilities = { tool_use = true, json_schema = true, seed = false, temperature = true, top_p = true, stop_sequences = true, tool_choice = true, parallel_tool_calls = true }
 
 # [[provider]]
@@ -373,3 +380,53 @@ capabilities = { tool_use = true, json_schema = true, seed = false, temperature 
 # api_key_env = "QCG_AZURE_OPENAI_API_KEY"
 # auth_header = "api-key"
 # capabilities = { tool_use = true, json_schema = true, seed = false, reasoning_effort = ["none", "minimal", "low", "medium", "high", "xhigh", "max"] }
+
+# Model catalog (optional).
+#
+# `models_discovery = "openai"` is an optional per-provider switch: when set,
+# `GET {base_url}/models` is queried with the provider's own credentials and
+# the returned ids appear in `qcg models` / `GET /api/llm/catalog` for
+# selection. Discovery is metadata only: it grants no permission and never
+# changes which hosts a contract may reach. It is not available for providers
+# that need it disabled, and run validation keeps using declared metadata.
+#
+# [[provider.models]] entries declare per-model metadata explicitly. A model
+# entry may override provider capabilities and the reasoning_effort list, and
+# may carry pricing so operator-selected models can be metered under
+# `budget.max_cost_usd`. `enabled = false` hides an entry from the catalog
+# while pinned contracts may still use it.
+#
+# [[provider]]
+# id = "example-openai"
+# api = "chat_completions"
+# base_url = "https://api.openai.com/v1"
+# api_key_env = "QCG_OPENAI_API_KEY"
+# chat_token_limit_field = "max_completion_tokens"
+# catalog_id = "openai"          # optional external-catalog provider key
+# capabilities = { tool_use = true, json_schema = true }
+#
+# [[provider.models]]
+# id = "gpt-5.2"
+# label = "GPT-5.2"
+# reasoning_effort = ["none", "low", "medium", "high", "xhigh"]
+# input_cost_per_million_usd = 1.75
+# output_cost_per_million_usd = 14.0
+# context_tokens = 400000
+# max_output_tokens = 128000
+
+# External catalog sources are optional and metadata-only. `models_dev`
+# accepts a models.dev api.json URL or a vendored file; entries fill in
+# pricing, context limits, capabilities, and reasoning_effort for models the
+# registry does not declare. Explicit [[provider.models]] entries win field by
+# field. Fetched data is cached under $QCG_HOME/cache/llm-catalog.json (or
+# `cache = "<path>"`) and refreshed by `qcg models --refresh` or
+# `GET /api/llm/catalog?refresh=true`.
+#
+# [catalog]
+# cache = "~/.qcg/cache/llm-catalog.json"
+# refresh_seconds = 86400
+#
+# [[catalog.source]]
+# kind = "models_dev"
+# url = "https://models.dev/api.json"
+# sha256 = "..."                 # optional pin of the fetched bytes

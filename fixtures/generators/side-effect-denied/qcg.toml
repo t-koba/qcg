@@ -16,6 +16,10 @@ qcg_version = "^0.1"
 version = "0.1.0"
 
 [permissions]
+fs_read = []
+fs_write = []
+network = []
+side_effects_scope = "invocation"
 side_effects = "none"
 
 [[permissions.commands]]
@@ -23,3 +27,6 @@ args = ["denied"]
 bin = "echo"
 purpose = "demonstrate side effect denial"
 isolation = "trusted_host"
+
+[permissions.containers]
+enabled = false

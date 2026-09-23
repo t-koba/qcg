@@ -60,8 +60,18 @@ impl StepExecutor for LlmChooseStep {
         base_prompt.push_str("\nQCG_OPTIONS: ");
         let params = llm_params(node)?;
         base_prompt.push_str(&serde_json::to_string(&params.options)?);
-        let max_attempts = params.max_iterations.expect("validated max_iterations");
-        let max_tokens_total = params.max_tokens_total.expect("validated max_tokens_total");
+        let Some(max_attempts) = params.max_iterations else {
+            return Err(StepError::failed(
+                &node.id,
+                "validated max_iterations is missing",
+            ));
+        };
+        let Some(max_tokens_total) = params.max_tokens_total else {
+            return Err(StepError::failed(
+                &node.id,
+                "validated max_tokens_total is missing",
+            ));
+        };
         let mut tokens_total = 0_u64;
         let mut last_error = None;
         for attempt in 0..max_attempts {

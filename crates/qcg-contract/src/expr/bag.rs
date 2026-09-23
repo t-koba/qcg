@@ -37,6 +37,27 @@ impl ValueBag {
         self.steps.insert(id.into(), value);
     }
 
+    /// Publishes a step output under the node's output alias (or the node
+    /// id when unset), optionally also under a second id for namespaced
+    /// replays. One shared rule for the sequential, wave, and repair
+    /// success paths so they cannot drift apart (E10).
+    pub fn publish_step_output(
+        &mut self,
+        node_id: &str,
+        output_alias: Option<&str>,
+        output: &Option<Value>,
+        extra_alias: Option<&str>,
+    ) {
+        let Some(value) = output.clone() else {
+            return;
+        };
+        let name = output_alias.unwrap_or(node_id);
+        self.set_step_output(name, value.clone());
+        if let Some(extra) = extra_alias {
+            self.set_step_output(extra, value);
+        }
+    }
+
     pub fn set_inputs(&mut self, inputs: BTreeMap<String, Value>) {
         self.inputs = inputs;
     }
@@ -64,6 +85,16 @@ impl ValueBag {
                 .into_iter()
                 .map(|(key, value)| (key, Value::String(value))),
         );
+    }
+
+    /// Merges step outputs and statuses produced by a parallel iteration.
+    /// Inputs and the loop item are per-iteration context and stay local;
+    /// children address their own node ids, so keys are disjoint.
+    pub fn absorb(&mut self, other: &ValueBag) {
+        self.steps
+            .extend(other.steps.iter().map(|(k, v)| (k.clone(), v.clone())));
+        self.statuses
+            .extend(other.statuses.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
 
     pub fn item(&self) -> Option<&Value> {

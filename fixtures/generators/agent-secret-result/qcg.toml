@@ -30,6 +30,9 @@ model = "fake"
 provider = "fake"
 
 [permissions]
+fs_read = []
+network = []
+side_effects_scope = "invocation"
 fs_write = ["workspace"]
 side_effects = "allowed"
 
@@ -39,5 +42,8 @@ bin = "sh"
 purpose = "produce a value for the secret scan"
 isolation = "trusted_host"
 
+
+[permissions.containers]
+enabled = false
 [secrets.api_token]
 env = "QCG_TEST_TOKEN"

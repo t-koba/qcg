@@ -30,9 +30,13 @@ pub(crate) fn read_declared_artifact(
         .output_file_limit_bytes
         .is_some_and(|limit| artifact.bytes > limit as u64)
     {
+        let Some(limit) = runtime.output_file_limit_bytes else {
+            return Err(format!(
+                "artifact `{path}` exceeds the configured output file limit"
+            ));
+        };
         return Err(format!(
-            "artifact `{path}` exceeds runtime.output_file_limit_bytes ({})",
-            runtime.output_file_limit_bytes.unwrap_or(usize::MAX)
+            "artifact `{path}` exceeds runtime.output_file_limit_bytes ({limit})"
         ));
     }
     let bytes = qcg_fs::read_bounded(&output_root.join(&artifact.path), Some(declared))

@@ -20,7 +20,9 @@ pub fn serialize_bounded<T: Serialize>(
         Ok(()) => Ok(writer.bytes),
         Err(_error) if writer.exceeded => Err(JournalError::LimitExceeded {
             resource,
-            actual: limit.saturating_add(1),
+            actual: limit.checked_add(1).ok_or(JournalError::InvalidEvent(
+                "event size limit overflowed".into(),
+            ))?,
             limit,
         }),
         Err(error) => Err(JournalError::Json(error)),
@@ -73,51 +75,61 @@ pub fn append_serialized_json_line<W: Write>(
     limits: JournalLimits,
 ) -> Result<(), JournalError> {
     validate_limits(limits)?;
-    if limits
-        .max_event_count
-        .is_some_and(|limit| stats.events >= limit)
+    if let Some(limit) = limits.max_event_count
+        && stats.events >= limit
     {
         return Err(JournalError::EventCountExceeded {
-            actual: stats.events.saturating_add(1),
-            limit: limits.max_event_count.unwrap_or(usize::MAX),
+            actual: stats
+                .events
+                .checked_add(1)
+                .ok_or(JournalError::InvalidEvent(
+                    "journal event count overflowed".into(),
+                ))?,
+            limit,
         });
     }
-    if limits
-        .max_event_bytes
-        .is_some_and(|limit| bytes.len() > limit)
+    if let Some(limit) = limits.max_event_bytes
+        && bytes.len() > limit
     {
         return Err(JournalError::LimitExceeded {
             resource: "event",
             actual: bytes.len(),
-            limit: limits.max_event_bytes.unwrap_or(usize::MAX),
+            limit,
         });
     }
-    let line_bytes = bytes
+    // A `usize` length overflow is a corrupt caller, not a limit
+    // question: report it without inventing a bound.
+    let line_len = bytes
         .len()
         .checked_add(1)
-        .ok_or(JournalError::LimitExceeded {
-            resource: "total journal",
-            actual: usize::MAX,
-            limit: limits.max_total_bytes.unwrap_or(usize::MAX),
-        })?;
+        .ok_or(JournalError::InvalidEvent(
+            "journal event length overflowed usize".into(),
+        ))?;
+    let line_bytes = line_len;
     let total = stats
         .bytes
         .checked_add(line_bytes)
-        .ok_or(JournalError::LimitExceeded {
-            resource: "total journal",
-            actual: usize::MAX,
-            limit: limits.max_total_bytes.unwrap_or(usize::MAX),
-        })?;
-    if limits.max_total_bytes.is_some_and(|limit| total > limit) {
+        .ok_or(JournalError::InvalidEvent(
+            "journal byte total overflowed usize".into(),
+        ))?;
+    if let Some(limit) = limits.max_total_bytes
+        && total > limit
+    {
         return Err(JournalError::LimitExceeded {
             resource: "total journal",
             actual: total,
-            limit: limits.max_total_bytes.unwrap_or(usize::MAX),
+            limit,
         });
     }
     bytes.push(b'\n');
     writer.write_all(&bytes)?;
     stats.bytes = total;
-    stats.events = stats.events.saturating_add(1);
+    // Counter overflow fails closed instead of wrapping the stats (E13).
+    stats.events = stats
+        .events
+        .checked_add(1)
+        .ok_or(JournalError::InvalidEvent(
+            "journal event count overflowed".into(),
+        ))?;
     Ok(())
 }

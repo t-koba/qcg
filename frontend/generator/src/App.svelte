@@ -9,6 +9,7 @@
   import RunHistory from "./components/RunHistory.svelte";
   import RunProgress from "./components/RunProgress.svelte";
   import RunTabs from "./components/RunTabs.svelte";
+  import { setStoredApiToken, storedApiToken } from "./api/client";
   import { currentMessages } from "./messages";
   import { RunStore } from "./run-store.svelte";
 
@@ -16,6 +17,36 @@
   const language = navigator.language.toLowerCase().startsWith("ja") ? "ja" : "en";
   const messages = currentMessages(language);
   let refreshTimer: ReturnType<typeof setInterval> | null = null;
+  let apiTokenInput = $state(storedApiToken());
+
+  function saveApiToken(): void {
+    setStoredApiToken(apiTokenInput);
+    // Reload so every fetch and stream picks up the credential; the view is
+    // restored from local storage by the store.
+    window.location.reload();
+  }
+
+  function clearApiToken(): void {
+    setStoredApiToken("");
+    apiTokenInput = "";
+    window.location.reload();
+  }
+
+  /** Downloads the bundle through an authenticated blob URL. */
+  async function downloadZip(): Promise<void> {
+    if (!store.currentRun) return;
+    try {
+      const blob = await store.api.zipBlob(store.currentRun);
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `${store.currentRun}.zip`;
+      anchor.click();
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } catch (error) {
+      store.errorText = error instanceof Error ? error.message : String(error);
+    }
+  }
 
   type ThemeChoice = "light" | "dark" | "system";
   const themeStorageKey = "qcg-theme";
@@ -109,6 +140,21 @@
         {messages.theme}: {themeLabel}
       </button>
     </div>
+    <div class="token-switch">
+      <label for="api-token">{messages.apiToken}</label>
+      <input
+        id="api-token"
+        type="password"
+        bind:value={apiTokenInput}
+        placeholder={messages.apiTokenPlaceholder}
+        title={messages.apiTokenHint}
+        autocomplete="off"
+      />
+      <div class="token-actions">
+        <button type="button" onclick={saveApiToken}>{messages.apiTokenSave}</button>
+        <button type="button" onclick={clearApiToken}>{messages.apiTokenClear}</button>
+      </div>
+    </div>
     <McpConnections {messages} />
   </aside>
 
@@ -166,7 +212,7 @@
         <section class="surface artifacts-surface">
           <div class="section-heading">
             <div><p class="eyebrow">{store.artifacts.length}</p><h2>{messages.artifacts}</h2></div>
-            {#if store.currentRun}<a id="zip-link" class="secondary-btn" href={store.api.zipUrl(store.currentRun)}>{messages.downloadZip}</a>{/if}
+            {#if store.currentRun}<button id="zip-link" class="secondary-btn" type="button" onclick={() => void downloadZip()}>{messages.downloadZip}</button>{/if}
           </div>
           <ArtifactList {store} {messages} />
         </section>

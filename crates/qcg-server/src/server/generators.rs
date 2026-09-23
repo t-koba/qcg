@@ -1,17 +1,22 @@
 use anyhow::Result;
 use axum::Json;
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
-use qcg_api::GeneratorSummary;
+use qcg_api::{GeneratorSummary, LlmCatalogResponse};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 use super::config::AppState;
 use super::error::ApiHttpError;
-use super::run_detail::{conditional_json, content_type_for_name, weak_etag};
+use super::run_detail::content_type_for_name;
+
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct CatalogQuery {
+    #[serde(default)]
+    refresh: bool,
+}
 
 pub(crate) async fn healthz(State(state): State<Arc<AppState>>) -> Json<Value> {
     // Effective request body limit: null means no mechanistic limit
@@ -37,6 +42,18 @@ pub(crate) async fn list_generators(
         .map_err(ApiHttpError::from_api)
 }
 
+pub(crate) async fn llm_catalog(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<CatalogQuery>,
+) -> Result<Json<LlmCatalogResponse>, ApiHttpError> {
+    state
+        .service
+        .llm_catalog(query.refresh)
+        .await
+        .map(Json)
+        .map_err(ApiHttpError::from_api)
+}
+
 pub(crate) async fn describe_generator(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -47,10 +64,10 @@ pub(crate) async fn describe_generator(
         .describe(&id)
         .await
         .map_err(ApiHttpError::from_api)?;
-    let digest = hex::encode(Sha256::digest(
-        serde_json::to_vec(&detail).map_err(ApiHttpError::internal)?,
-    ));
-    conditional_json(&headers, weak_etag(&format!("generator-{digest}")), &detail)
+    // Single conditional entry point (E16): serialize once and let the
+    // shared responder hash exactly once.
+    let body = serde_json::to_vec(&detail).map_err(ApiHttpError::internal)?;
+    super::run_detail::conditional_response(&headers, body, "application/json")
 }
 
 pub(crate) async fn read_generator_asset(

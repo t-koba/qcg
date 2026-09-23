@@ -1,0 +1,71 @@
+[[flow]]
+id = "list_providers"
+type = "llm.catalog"
+
+[flow.params]
+select = "providers"
+
+[[flow]]
+id = "ask_provider"
+type = "ask_user"
+needs = ["list_providers"]
+
+[flow.params]
+content = "Select a provider."
+options_from = "steps.list_providers.output.options"
+
+[[flow]]
+id = "list_models"
+type = "llm.catalog"
+needs = ["ask_provider"]
+
+[flow.params]
+select = "models"
+provider = "{{ steps.ask_provider.output }}"
+
+[[flow]]
+id = "ask_model"
+type = "ask_user"
+needs = ["list_models"]
+
+[flow.params]
+content = "Select a model."
+options_from = "steps.list_models.output.options"
+
+[[flow]]
+id = "list_efforts"
+type = "llm.catalog"
+needs = ["ask_model"]
+
+[flow.params]
+select = "efforts"
+provider = "{{ steps.ask_provider.output }}"
+model = "{{ steps.ask_model.output }}"
+
+[[flow]]
+id = "record"
+type = "write"
+needs = ["list_efforts"]
+artifact = { label = "Selection", required = true }
+
+[flow.params]
+content = "{{ steps.ask_provider.output }}|{{ steps.ask_model.output }}|{{ steps.list_efforts.output.count }}"
+output_file = "selection.txt"
+
+[generator]
+description = "Selects a provider, model, and effort from the live catalog."
+id = "catalog-selection"
+name = "Catalog Selection"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[permissions]
+network = []
+commands = []
+side_effects = "none"
+side_effects_scope = "invocation"
+fs_read = ["workspace"]
+fs_write = ["workspace"]
+
+[permissions.containers]
+enabled = false

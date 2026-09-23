@@ -49,5 +49,12 @@ model = "fake"
 provider = "fake"
 
 [permissions]
+fs_read = []
+commands = []
+side_effects = "none"
+side_effects_scope = "invocation"
 fs_write = ["workspace"]
 network = ["127.0.0.1"]
+
+[permissions.containers]
+enabled = false

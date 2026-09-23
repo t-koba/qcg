@@ -10,11 +10,11 @@ publish.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+libc.workspace = true
 camino.workspace = true
 chrono.workspace = true
 dunce.workspace = true
 futures-util.workspace = true
-fs2.workspace = true
 hex.workspace = true
 qcg-api = { path = "../qcg-api" }
 qcg-container = { path = "../qcg-container" }
@@ -26,6 +26,7 @@ qcg-llm-steps = { path = "../qcg-llm-steps" }
 qcg-policy = { path = "../qcg-policy" }
 qcg-steps = { path = "../qcg-steps" }
 qcg-types = { path = "../qcg-types" }
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true

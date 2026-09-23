@@ -1,0 +1,46 @@
+[[flow]]
+id = "agent"
+output = "agent_result"
+type = "llm.agent"
+
+[flow.params]
+max_iterations = 5
+max_tokens_total = 4096
+prompt = "prompts/agent.j2"
+
+[[flow.params.tools]]
+kind = "skill"
+name = "use_skill"
+resources = ["skills"]
+
+[generator]
+description = "Deterministic llm.agent example exercising skill activation and progressive disclosure."
+id = "agent-skill"
+name = "Agent Skill"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[llm]
+max_tokens = 256
+temperature = 0.0
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[permissions]
+fs_read = []
+fs_write = ["workspace"]
+network = []
+commands = []
+side_effects = "none"
+side_effects_scope = "invocation"
+
+[permissions.containers]
+enabled = false
+
+[resources.skills]
+llm_visible = true
+path = "resources/skills"
+trust = "trusted"
+type = "skill_library"

@@ -28,9 +28,17 @@ user tokens while qpx terminates TLS, enforces
 identity, and proxies accepted requests to the loopback qcg listener. The
 three products remain independently deployed binaries.
 
-qcg's bearer token authenticates the instance, not a user or run owner. Use it
-behind a trusted shared boundary, or deploy separate qcg instances and runs directories
-for trust domains that require isolation. The default `exclusive` run store
+qcg's bearer token authenticates the instance, not a user or run owner. One
+deployment configures a single token per instance (`--api-token` /
+`QCG_API_TOKEN`); there is no per-user or per-run token table inside qcg.
+Use it behind a trusted shared boundary, or deploy separate qcg instances and runs directories
+for trust domains that require isolation. See `docs/security.md` (trust
+boundary) and `docs/http-server-guide.md` (bearer + CORS) for the full
+boundary. Platform filesystem boundaries differ by OS: Unix uses
+handle-relative `O_NOFOLLOW` traversal with directory fsync, Windows uses
+canonicalize-based checks, and non-Unix targets map modes onto the read-only
+flag only — see `docs/security.md` "Platform guarantees" for the normative
+definition. The default `exclusive` run store
 takes one directory lock. `shared-filesystem` enables active-active services
 when the underlying storage provides reliable advisory locks: run-level leases
 prevent duplicate execution, abandoned work is rescanned every 5 seconds, and
@@ -105,8 +113,11 @@ call with its request state. Deprecated MCP sampling is not exposed.
 
 ## Run retention
 
-`qcg serve` periodically retains the newest 50 terminal run directories. Set
-`QCG_AUTO_GC=0` to disable automatic retention and use:
+`qcg serve` periodically retains the newest 50 terminal run directories plus
+10 additional failed runs and deletes any run past its contract retention
+window. `QCG_GC_KEEP`, `QCG_GC_KEEP_FAILED`, and `QCG_GC_INTERVAL_SECS`
+(default `86400`, minimum `60`) retune the sweep; invalid or zero values
+refuse boot. Set `QCG_AUTO_GC=0` to disable automatic retention and use:
 
 ```bash
 qcg runs gc --runs-dir /var/lib/qcg/runs --keep 50
@@ -140,7 +151,8 @@ memory or disk. Minimum set:
   `max_media_bytes` when `params.media` is declared.
 - Resources: explicit `params` bounds (`max_bytes` for `file`, `url`,
   `openapi`, and `exec`; `max_files`, `max_bytes`, `max_depth`,
-  `max_entries`, `max_selected_bytes` for `dir` and `skill`).
+  `max_entries`, `max_selected_bytes` for `dir`, `skill`, and
+  `skill_library`).
 - `qcg package`: `--max-entries`, `--max-bytes`, `--max-metadata-bytes`.
   Unbounded packaging trusts the source tree; never package untrusted trees
   without bounds.
@@ -148,6 +160,25 @@ memory or disk. Minimum set:
 `[budget]` (`max_steps`, `max_tokens`, `max_cost_usd`,
 `max_elapsed_seconds`) is the run-wide backstop and should always be set for
 server-hosted generators.
+
+## Skill resources and diagnostics
+
+`skill` and `skill_library` resources follow the agentskills.io format.
+Names, descriptions, and unparseable frontmatter are hard errors at contract
+load; soft violations (name length, character set, or a name that differs from
+the directory name) are recorded as diagnostics on the run's resource snapshot
+and logged with `tracing` instead of failing the run. Validate a skill or a
+library before packaging with:
+
+```bash
+qcg skill validate path/to/skill
+qcg skill validate --library path/to/skills
+qcg skill validate --json path/to/skill
+```
+
+The CLI exits non-zero on hard errors and prints soft diagnostics. Skills are
+always data: `allowed-tools` is informational, and loading a skill never grants
+command, network, or write permissions.
 
 ## Verification
 
@@ -189,25 +220,75 @@ Prerequisites for any unattended run:
 
 - The contract is reviewed. Pre-provisioning answers and approvals bypasses
   human review, so treat the provisioned values as part of the deployment.
-- Every `ask_user` question id and every confirmation id (`<node>:<kind>`
-  for side effects) is known in advance.
+- Every `ask_user` question id and every confirmation id is known in advance.
+  Confirmation ids are never the 2-element `<node>:<kind>` form (mirror of
+  the normative Q1 definition in `docs/contract-reference.md`). The exact
+  forms are:
+
+  | scope | confirmation id form | authorizes |
+  |---|---|---|
+  | `content` | `<node>:<kind>:<operation_digest>` (3 parts) | identical content until the run ends |
+  | `invocation` (default) | `<node>:<kind>:<operation_digest>:<invocation_hash>` (4 parts) | one call only |
+
+  `operation_digest` is hex SHA-256 over the target plus a `0` byte plus the
+  canonical details JSON (`operation_digest(target, details)` in
+  `crates/qcg-engine/src/engine/run_context.rs`). `invocation_hash` is hex
+  SHA-256 over the invocation id. Single-shot steps use
+  `execution:<node>:<count>` (finished-execution count, so a repair or
+  regenerate is a new invocation); agent tool calls use the stable model call
+  id. The operation id (`run:node:sha256(invocation)` in
+  `crates/qcg-engine/src/state.rs`) is a different value: it is the remote
+  idempotency key, never a confirmation id. The manifest
+  `permissions.side_effects_scope` defaults to `invocation` when omitted;
+  every minted `ConfirmSpec` carries an explicit `scope` and
+  `operation_digest`, and a confirmation without either is corrupt and fails
+  closed (never an invocation-scoped default).
 - `side_effects = "confirm"` steps are pre-approved per confirmation id, or
   the generator uses `side_effects = "allowed"` / `"none"`.
+
+Predict the id from a prior interactive run instead of guessing it: read the
+`confirm_request` event or the run snapshot `confirm.id` (both carry the
+full id including scope and invocation hash). The journal `side_effect` /
+`dry_run` events carry only the content `operation_digest`, which predicts
+3-part content-scope ids alone but never a 4-part invocation-scoped id. The
+`--confirm` value must be the full 3-part or 4-part id for the run's
+`permissions.side_effects_scope`, e.g. `publish:http:<64hex>` for content
+scope or `publish:http:<64hex>:<64hex>` for invocation scope (the default). MCP approvals live in two namespaces that
+never mix: single-shot `mcp.call` steps bind the node execution
+(`execution:<node>:<count>`), while agent `mcp` tool calls bind the model
+call id plus canonical redacted args
+(`<node>:agentmcp:<alias>:<invocation_hash>#__mcp_pending` continuation key in
+`crates/qcg-llm-steps/src/tool_events.rs` (the `#__mcp_pending` suffix marks stored continuations)), so one can never authorize the
+other. Doc-to-key conformance: the `<node>:agentmcp:<alias>:<64hex>#__mcp_pending`
+format is pinned by `frontend/generator/src/confirm-scope.test.ts` ("mcp
+continuation key format") against a captured real key shape, since the key
+constructor lives outside the docs scope.
 
 ### cron
 
 ```cron
 # Daily 02:30 unattended generation. --yes disables prompting; unanswered
 # questions and unapproved confirmations pause or fail the run instead.
+# The confirmation id is the full 3-part (content scope) or 4-part
+# (invocation scope) form, e.g. publish:http:<64hex> or
+# publish:http:<64hex>:<64hex>; copy it from a prior
+# confirm_request event, never the 2-element <node>:<kind> form.
+# The examples below assume side_effects_scope = "content" (3-part ids);
+# with the default invocation scope, use the 4-part id from the
+# confirm_request event instead.
 30 2 * * * /usr/local/bin/qcg run /srv/qcg/generators/report \
   --input date=$(date +\%F) \
   --answer scope=brief \
-  --confirm publish:http=true \
+  --confirm publish:http:<64hex>=true \
   --output /srv/qcg/out --yes >>/var/log/qcg/report.log 2>&1
 ```
 
 `--confirm` takes `ID=approve|deny` pairs; `--confirmations-file` accepts the
-same mapping as a JSON id-to-boolean object.
+same mapping as a JSON id-to-boolean object. `ID` is the full confirmation
+id from the table above. Decisions apply only to server-minted pending ids
+by exact match: an unknown id (including an unknown scope) matches nothing
+and is refused, so deny stays safe to offer unconditionally while approve
+is disabled for unknown scopes in the UI.
 
 ### systemd timer
 
@@ -224,7 +305,7 @@ Environment=QCG_API_TOKEN_FILE=/etc/qcg/api-token
 ExecStart=/usr/local/bin/qcg run /srv/qcg/generators/report \
   --input date=%Y-%m-%d \
   --answer scope=brief \
-  --confirm publish:http=true \
+  --confirm publish:http:<64hex>=true \
   --output /srv/qcg/out --yes
 ```
 
@@ -255,11 +336,115 @@ RUN=$(curl -fsS -X POST "$BASE/api/runs" \
   -H "Idempotency-Key: report-$(date +%F)" \
   -H "Content-Type: application/json" \
   -d '{"generator_id":"report","inputs":{"date":"2026-09-06"},
-       "answers":{"scope":"brief"},"confirmations":{"publish:http":true}}' \
+       "answers":{"scope":"brief"},"confirmations":{"publish:http:<64hex>":true}}' \
   | jq -r .run_id)
 curl -fsSN "$BASE/api/runs/$RUN/events" -H "Last-Event-ID: 0" \
   -H "Authorization: Bearer $QCG_API_TOKEN"
 ```
+
+Event-stream client contract: history replays first, then the live tail.
+If the client falls behind the live buffer it receives a `lagged` marker
+carrying the last actually-delivered sequence number — never a fabricated
+cursor — and the stream ends. The client must reconnect with that number
+as `Last-Event-ID`; the journal replay then yields the next real event,
+so ignoring the marker (instead of reconnecting) is the only way to lose
+events, and that is the client's responsibility. A stream for an
+already-settled run returns history and ends immediately.
+
+## Durability guarantees
+
+The durability model targets process termination (including SIGKILL) and
+restart. Host power loss and storage-media failure are outside the guaranteed
+boundary; those would require synchronizing every external side effect behind
+directory-entry durability (see below).
+
+Directory-entry durability means both the file bytes and the directory entry
+that names them are durable: the data reaches the disk and the parent
+directory is fsynced so a crash cannot lose the rename that installed the
+file. qcg applies this to run metadata (`state.json` atomic replace plus
+parent directory sync in `persist_serialized_atomic`), workspace atomic
+replacements and removals, idempotency records, fork journals and blobs, and
+large operation-result sidecars (file plus parent directory sync);
+journal line appends rely on terminal-only fsync plus repair (next table),
+not on a per-append directory fsync. Host power loss and storage-media
+failure stay outside the guaranteed boundary as stated above, so no test
+fault-injects them: the table below pins the process-crash contract that
+native tests do cover.
+
+Terminal-only fsync mapping (`crates/qcg-engine/src/journal/writer.rs`):
+
+| path | what is fsynced | when |
+|---|---|---|
+| `JournalWriter::event` fast path | `file.sync_data()` on the journal file plus parent directory sync | when the event is terminal or operation-driven (`operation_started` / `operation_finished` set `needs_sync`; see `JournalWriter::event` in `writer.rs`) |
+| `append_events_if` batch path | `file.sync_data()` on the journal file plus parent directory sync | when the batch contains a terminal or operation event (`needs_sync`) |
+| torn-tail repair `truncate_to` / newline commit | `sync_data()` after truncate or newline commit | every repair |
+| `state.json` persist | atomic write + replace via `persist_serialized_atomic` | every append (state always follows the journal) |
+| `.clean_shutdown` marker | plain `write` / `remove_file`, no fsync | best-effort I/O, failures propagate (a failed terminal marker fails the operation; see repair marker below) |
+
+Cancel mailbox (`request_remote_cancel` in `crates/qcg-service/src/run_dirs.rs`):
+post-publish directory-sync failure is warn-only by necessity — reporting an
+error would make the caller retry under a fresh operation id and journal a
+duplicate cancel for one published request. Power loss may drop the directory
+entry; the next boot observes the request as absent and a retry publishes
+under a fresh operation id, with deduplication by cancel-drain idempotence
+(E01). Idempotency Ready commit (`store_durable_ready` in
+`crates/qcg-server/src/server/idempotency/durable.rs`): directory-sync
+failure is likewise warn-only (the staged file is `sync_all` durable); a
+power-loss entry loss resurrects the key as unclaimed and a retry re-commits
+the same mapping instead of minting a duplicate. Duplicate execution under
+power loss is accepted there (E02/Q2).
+Non-terminal appends are not individually fsynced; they rely on the next
+terminal sync or clean shutdown for media durability. A crash-truncated tail
+without a trailing newline is repaired on the next open under the journal
+lock: complete JSON without its newline gains the newline; torn JSON or a
+partial fragment is truncated so prior newline-terminated events survive and
+the next append does not fuse lines.
+
+Repair marker (tamper vs crash): a terminal event writes the
+`.clean_shutdown` marker (exact magic content `qcg-clean-shutdown-v1`)
+next to the journal; any later non-terminal append
+clears it (`writer.rs`: `write_clean_shutdown_marker` /
+`clear_clean_shutdown_marker`). A truncated tail found WITH the magic
+marker present refuses repair as possible tampering (durable history was
+damaged after a clean shutdown); WITHOUT the marker the truncation is a
+crash remnant and repairs as above. The marker must read as a non-symlink
+regular file with the exact content; an unreadable marker fails closed and
+never repairs. A terminal marker write or clear failure fails the
+operation before success is reported (Q2): warn-only would leave a sealed
+run without its shutdown claim, so both propagate and a continued run never
+carries a stale shutdown claim. The `failed_terminal_marker_fails_the_event_operation`
+native test pins this fail-closed behavior.
+
+Admission records vs `.admission-*.lock`: they are different mechanisms.
+
+- Admission records are persistent: idempotency mappings under
+  `<runs-dir>/idempotency/` (24-hour TTL, survive restarts and shared-store
+  peers) plus the durable `run_queued` journal event. A reused
+  `Idempotency-Key` with identical content replays the original result; the
+  same key with different content is rejected with `409 Conflict`. The
+  pre-execution ownership recheck cannot fully close the window before
+  execution starts: a successor that acts in between may let the stale owner
+  briefly start its engine. Such surplus execution never commits and is
+  canceled by the orphan settlement at commit time, so every stale execution
+  converges or cancels and never leaks (E02).
+- Per-run admission locks are small, fixed-size files next to the run
+  directories (`.admission-*.lock`). They are intentionally never unlinked:
+  removing a locked file would let a later admission lock a fresh inode while
+  the current holder still owns the old one. They hold no run state, are
+  stateless coordination only, and can be ignored by operators.
+
+Large operation results spill to a sidecar blob under the run meta dir when
+they exceed 64 KiB (`OPERATION_RESULT_MAX_BYTES` in
+`crates/qcg-engine/src/state.rs`); the journal carries `result_ref` (the
+content-hash blob name) instead of the inline bytes, and the dir-backed guard
+reloads the blob on resend. Shared per-run journal pollers serve all SSE
+subscribers of one run from a single poll task
+(`journal_pollers` in `crates/qcg-service/src/types.rs`). Snapshot live
+`duration_ms` is quantized down to whole seconds so exact-digest ETags stay
+stable within a second and conditional requests can return 304; crossing a
+second boundary advances the body (and the validator) even when nothing
+else changed, so an unrelated `200` there is correct, not stale
+(`live_metrics` in `crates/qcg-service/src/summaries/metrics.rs`).
 
 A reused `Idempotency-Key` with identical content replays the original result
 instead of starting a duplicate run; the same key with different content is
@@ -270,14 +455,97 @@ rejected with `409 Conflict`. Records persist for 24 hours under
 `PUT /api/runs/{id}/confirmations/{cid}`. `GET /healthz` and `GET /metrics`
 cover liveness and Prometheus monitoring.
 
+### Installed package repair
+
+Installing an already-installed parent re-verifies its file inventory and
+re-walks its dependency closure instead of returning success on the parent
+alone, so an interrupted install is repaired by re-running the same command;
+there is no rollback of the already-committed parent. Dependencies that
+cannot be resolved or fetched fail the repair closed: a partial closure is
+never recorded as complete. Direct path installs (a local directory or file
+instead of a registry package) also walk the dependency closure against the
+configured registries after committing the parent; a missing set fails the
+install with the partial state and the repair (rerun the same command)
+instead of lingering silently. Crash recovery is not an automatic rollback:
+a commit interrupted after the backup rename leaves the target missing with
+a `.qcg-install-backup-*` sibling intact; rerun the install to converge (or
+manually rename the newest backup back to the target). Backups are retained
+on failure paths, never auto-deleted, and only reaped by the stale sweep
+after aging out.
+
+## Shutdown and restart semantics
+
+On `SIGINT`/`SIGTERM` the server stops accepting new mutating requests (they
+receive `503`); this covers start, fork, answer, confirm, and cancel alike,
+including idempotent replays that would otherwise report `Ok` without new
+work. Read requests (snapshots, events, artifacts) stay admissible but their
+streams close as the drain proceeds, so only mutating work is ever refused:
+a `GET` during drain is not rejected with `503`, but its long-lived body
+(SSE, journal stream, artifacts zip) ends at shutdown instead of holding the
+drain open, and the client reconnects from its last sequence number. SSE
+shutdown closes with an explicit `shutdown` marker event so clients
+distinguish shutdown from truncation (a terminal close carries its terminal
+event, a truncation carries neither). It
+closes SSE streams, stops maintenance tasks (shared-store refresh, queued
+resumer, retention GC), and then settles active runs under a 150 second
+outer deadline (`SHUTDOWN_DEADLINE` in
+`crates/qcg-server/src/server/serve.rs`, enforced by
+`serve_with_listener_and_deadline`); exceeding it is reported to the
+embedding host instead of
+being logged and ignored. Total bound from shutdown signal to process exit
+is 180 s (`TOTAL_SHUTDOWN_BOUND` = `DRAIN_TIMEOUT` 30 s + `SHUTDOWN_DEADLINE`
+150 s): the outer deadline starts after the HTTP drain completes, so a
+wedged drain delays settlement by design (cut after 30 s with a warning)
+and the total never exceeds 180 s. Startup order is resolve deployment policy once,
+build the service, build the router, then start recovery
+(`resume_recovered_runs`) before resident tasks; shutdown order is signal,
+stop accepting mutating work (shared token), HTTP drain bounded by 30 s
+(`DRAIN_TIMEOUT`), mark the service shutting down, then resident-task
+shutdown and active-run settlement concurrently under the 150 s outer
+deadline. Resident-join and run-convergence run concurrently by design
+(E05): serializing them would let one consume the other's settlement
+budget, so the outer deadline covers both together. Responsibility split
+(E05/Q3): the HTTP drain (30 s) ends accepting work, resident-task shutdown
+stops the execution sources (shared token, GC, resumer, shared-store
+refresh), active-run settlement converges the runs, and the resume exception
+(tracked runs terminate; only a durable `Queued` journal never tracked by the
+stopping peer resumes next boot) decides what restarts. Q3 owns the
+terminate-vs-resume policy; E05 owns the drain/join/settle mechanism. The outer deadline starts after the HTTP drain completes:
+in-flight requests that drain promptly do not consume the
+active-run settlement budget, while a wedged drain connection is cut after
+30 s so shutdown proceeds (the drain timeout is warned, never silent).
+
+Shutdown signal platform matrix: Unix waits for Ctrl-C or SIGTERM;
+Windows waits for Ctrl-C plus the console/service controls tokio exposes
+(`ctrl_close`, `ctrl_break`) as the SIGTERM equivalents; other targets wait
+for Ctrl-C only. A wait failure still proceeds to shutdown (fail-safe).
+Settled runs are terminal:
+all tracked non-terminal runs, including `Queued`, are journaled as
+`run_interrupted` and are not auto-resumed by the next startup. A durable
+`Queued` journal never tracked by the stopping peer (a pre-existing adopted
+orphan admitted nowhere) keeps its queue and resumes on the next boot. This
+tracked vs durable-queue resume exception is the single source of truth; the
+`contract-reference` mirror must match it. A restart
+therefore never conflates "server process restarted" with "resume every
+run"; resume only applies to work that was waiting on human input or was
+explicitly requeued before the shutdown began. A cancel racing the shutdown
+settles as `Interrupted` once shutdown started, else `Canceled`. Single-peer
+enforcement: the lease-holding peer settles its own runs; leaseless peers
+never touch others' runs. In shared mode, stopping one peer settles that
+peer's runs only (exactly the non-terminal runs in its own memory map);
+other peers keep their own runs, and an Exclusive owner cannot start while
+any shared peer holds the store (and vice versa). Fork follows the same shutdown gate as
+start: it is refused with `503` during drain, never half-copied.
+
 Unattended limits:
 
 - MCP OAuth authorization needs a browser on loopback and cannot run
   unattended.
 - A denied confirmation ends the run as `Failed`; retries, backoff, and
   notifications are the orchestrator's job, not qcg's.
-- `qcg serve` retains the newest 50 terminal run directories; size the
-  `runs-dir` volume and retention for the schedule above.
+- `qcg serve` retains the newest 50 terminal run directories plus 10 failed
+  runs and sweeps every 24 hours; size the `runs-dir` volume and retention
+  for the schedule above.
 
 ## Priority scheduling and preemption
 
@@ -299,3 +567,18 @@ snapshots and durable across restarts. A flow can join sibling runs with an
 id-to-state map once every listed run is terminal. Unknown runs and timeouts
 fail explicitly. Typical fan-out/fan-in: start or fork children, then await
 them from a collector run before proceeding.
+
+Queued snapshots carry RFC 3339 queued_at stamped once at admission and
+shared by journal and memory; queue_position follows priority then queued_at
+then id (E16). Memory state is only a fallback for journals written before
+the stamp existed; the journaled instant always wins, so every process
+observes identical FIFO order. Position merges live and on-disk queued runs
+under one FIFO; stores beyond 10,000 entries refuse the snapshot with an
+internal error instead of letting latency grow with run count. The on-disk
+half is served from a 1 s process-wide cache shared across subscribers (at
+most 128 runs-directory keys with whole-map clear on overflow): only
+disk-only peer runs can lag a queue move by at most the TTL, which delays
+position display without misordering execution (the scheduler never consults
+this cache). A lagging position still serves the exact-body validator for
+the lagging body, so the ETag stays exact for what is served — display
+staleness by design, never a mismatched validator (E12/E16).

@@ -69,7 +69,11 @@ impl<'a> LlmGateway<'a> {
         Ok(())
     }
 
-    fn assert_value_absent(&self, node: &NodeDef, value: &Value) -> Result<(), StepError> {
+    pub(crate) fn assert_value_absent(
+        &self,
+        node: &NodeDef,
+        value: &Value,
+    ) -> Result<(), StepError> {
         match value {
             Value::String(value) => self.assert_absent(node, value),
             Value::Array(values) => {

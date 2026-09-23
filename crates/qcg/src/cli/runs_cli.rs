@@ -13,7 +13,9 @@ pub(crate) fn list_runs(
     state: Option<&str>,
     generator: Option<&str>,
 ) -> Result<()> {
-    for (summary, _) in list_run_summaries(runs_dir)? {
+    for (summary, _) in
+        list_run_summaries(runs_dir, qcg_policy::DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES)?
+    {
         if let Some(want) = state
             && summary.status != want
         {

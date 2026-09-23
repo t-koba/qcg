@@ -2,6 +2,7 @@
   "/api/generators",
   "/api/generators/{id}",
   "/api/generators/{id}/assets/{path}",
+  "/api/llm/catalog",
   "/api/mcp/oauth/callback",
   "/api/mcp/servers",
   "/api/mcp/servers/{id}/authorization",

@@ -25,6 +25,7 @@ mod tests {
             max_total_bytes: Some(max_total_bytes),
             max_event_count: Some(max_event_count),
             max_state_bytes: Some(max_state_bytes),
+            scan_window_bytes: None,
         }
     }
 
@@ -501,7 +502,7 @@ mod tests {
                     "provider": "fake",
                     "model": "fake",
                     "max_tokens": 128,
-                    "tokens": { "input": 7, "output": 3 },
+                    "tokens": { "input": 7, "output": 3, "cached_input": 2 },
                     "cost_microusd": 25,
                 }),
             )
@@ -523,6 +524,7 @@ mod tests {
         assert_eq!(event["metrics"]["llm_calls"], 1);
         assert_eq!(event["metrics"]["tokens_input"], 7);
         assert_eq!(event["metrics"]["tokens_output"], 3);
+        assert_eq!(event["metrics"]["tokens_cached_input"], 2);
         assert_eq!(event["metrics"]["tokens_total"], 10);
         assert_eq!(event["metrics"]["cost_microusd"], 25);
         assert!(event["metrics"]["duration_ms"].as_u64().is_some());
@@ -660,7 +662,7 @@ mod tests {
                         "provider": "fake",
                         "model": "fake",
                         "max_tokens": 128,
-                        "tokens": { "input": 7, "output": 3 },
+                        "tokens": { "input": 7, "output": 3, "cached_input": 2 },
                         "cost_microusd": 25,
                     }),
                 )
@@ -692,7 +694,7 @@ mod tests {
                     "provider": "fake",
                     "model": "fake",
                     "max_tokens": 128,
-                    "tokens": { "input": 11, "output": 5 },
+                    "tokens": { "input": 11, "output": 5, "cached_input": 4 },
                     "cost_microusd": 75,
                 }),
             )
@@ -706,6 +708,7 @@ mod tests {
         assert_eq!(state.budget.llm_calls, 2);
         assert_eq!(state.budget.tokens_input, 18);
         assert_eq!(state.budget.tokens_output, 8);
+        assert_eq!(state.budget.tokens_cached_input, 6);
         assert_eq!(state.budget.cost_microusd, 100);
         let source = std::fs::read_to_string(&path).expect("journal should be readable");
         let finished: Value = serde_json::from_str(source.lines().last().expect("finished event"))
@@ -796,6 +799,156 @@ mod tests {
             .expect("fold after repair must succeed");
         assert!(scan.events.iter().any(|event| event["t"] == "run_started"));
         assert!(scan.events.iter().any(|event| event["t"] == "step_started"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn terminal_event_writes_marker_and_continuation_clears_it() {
+        // Sensitive-8: a graceful terminal event seals the journal with a
+        // `.clean_shutdown` marker; a later non-terminal append clears it
+        // so a continued run never carries a stale shutdown claim.
+        let dir = std::env::temp_dir().join(format!(
+            "qcg-journal-marker-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.join("journal.jsonl")).unwrap();
+        let marker = path.with_file_name(".clean_shutdown");
+        let journal = JournalWriter::create(&path, "marker-run", false, None).unwrap();
+        journal
+            .event(
+                "run_started",
+                json!({
+                    "generator": "marker@1.0.0",
+                    "generator_path": "marker",
+                    "contract_sha256": "abc",
+                    "inputs": {},
+                    "resource_hashes": [],
+                    "qcg": "0.1.0",
+                    "schema_version": 1,
+                }),
+            )
+            .unwrap();
+        assert!(
+            !marker.exists(),
+            "a non-terminal event must not leave a shutdown marker"
+        );
+        journal
+            .event("run_finished", json!({ "status": "success" }))
+            .unwrap();
+        assert!(
+            marker.exists(),
+            "a graceful terminal event must write the shutdown marker"
+        );
+        journal
+            .event(
+                "step_started",
+                json!({ "node": "after", "type": "test", "attempt": 1 }),
+            )
+            .unwrap();
+        assert!(
+            !marker.exists(),
+            "a continued run must clear the stale shutdown marker"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn truncated_tail_with_marker_refuses_repair_as_tampering() {
+        // Sensitive-8: a torn tail on a cleanly shut down journal is damage
+        // to durable history, not a crash remnant, and refuses repair.
+        let dir = std::env::temp_dir().join(format!(
+            "qcg-journal-tamper-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.join("journal.jsonl")).unwrap();
+        {
+            let journal = JournalWriter::create(&path, "tamper-run", false, None).unwrap();
+            journal
+                .event(
+                    "run_started",
+                    json!({
+                        "generator": "tamper@1.0.0",
+                        "generator_path": "tamper",
+                        "contract_sha256": "abc",
+                        "inputs": {},
+                        "resource_hashes": [],
+                        "qcg": "0.1.0",
+                        "schema_version": 1,
+                    }),
+                )
+                .unwrap();
+            journal
+                .event("run_finished", json!({ "status": "success" }))
+                .unwrap();
+        }
+        // Damage durable history after the clean shutdown.
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(b"{\"t\":\"step_started\",\"node\":")
+                .unwrap();
+        }
+        let error = match JournalWriter::create(&path, "tamper-run", false, None) {
+            Ok(_) => panic!("a torn tail with a shutdown marker must refuse repair"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("clean-shutdown marker"),
+            "the refusal must name the tamper gate: {error}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn truncated_tail_without_marker_repairs_as_a_crash() {
+        // Sensitive-8: without a shutdown marker the same torn tail is a
+        // crash remnant and repairs as before.
+        let dir = std::env::temp_dir().join(format!(
+            "qcg-journal-crash-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.join("journal.jsonl")).unwrap();
+        {
+            let journal = JournalWriter::create(&path, "crash-run", false, None).unwrap();
+            journal
+                .event(
+                    "run_started",
+                    json!({
+                        "generator": "crash@1.0.0",
+                        "generator_path": "crash",
+                        "contract_sha256": "abc",
+                        "inputs": {},
+                        "resource_hashes": [],
+                        "qcg": "0.1.0",
+                        "schema_version": 1,
+                    }),
+                )
+                .unwrap();
+        }
+        assert!(
+            !path.with_file_name(".clean_shutdown").exists(),
+            "a crashed run must carry no shutdown marker"
+        );
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(b"{\"t\":\"step_started\",\"node\":")
+                .unwrap();
+        }
+        JournalWriter::create(&path, "crash-run", false, None)
+            .expect("a torn tail without a marker must repair as a crash");
         let _ = std::fs::remove_dir_all(dir);
     }
 

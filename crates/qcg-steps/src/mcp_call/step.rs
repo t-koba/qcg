@@ -104,33 +104,32 @@ impl StepExecutor for McpCallStep {
         }
         validate_mcp_call_arguments(node, params.input_schema.as_ref(), &arguments)?;
         let access = mcp_access(ctx, profile.command());
+        let confirm_details = Some(json!({
+            "server": params.server,
+            "tool": params.tool,
+            "argument_names": arguments
+                .as_object()
+                .map(|object| {
+                    let mut names: Vec<String> = object.keys().cloned().collect();
+                    names.sort();
+                    names
+                })
+                .unwrap_or_default(),
+            // The approval binds the full argument value, not just
+            // names: approving one call must never authorize a
+            // regenerated different payload.
+            "arguments_sha256": hex::encode(sha2::Sha256::digest(&argument_bytes)),
+        }));
+        let confirm_target = format!("{}/{}", params.server, params.tool);
+        let confirm_invocation = qcg_engine::RunContext::execution_invocation(ctx.journal, node);
         if params.side_effects
             && let Some(confirm) = ctx.run.require_side_effect(
                 ctx.journal,
                 node,
                 "mcp.call",
-                &format!("{}/{}", params.server, params.tool),
-                Some(json!({
-                    "server": params.server,
-                    "tool": params.tool,
-                    "argument_names": arguments
-                        .as_object()
-                        .map(|object| {
-                            let mut names: Vec<String> =
-                                object.keys().cloned().collect();
-                            names.sort();
-                            names
-                        })
-                        .unwrap_or_default(),
-                    // The approval binds the full argument value, not just
-                    // names: approving one call must never authorize a
-                    // regenerated different payload.
-                    "arguments_sha256": hex::encode(
-                        sha2::Sha256::digest(
-                            serde_json::to_vec(&arguments).unwrap_or_default()
-                        )
-                    ),
-                })),
+                &confirm_target,
+                confirm_details,
+                &confirm_invocation,
             )?
         {
             return Ok(StepOutcome::NeedsConfirm { confirm });

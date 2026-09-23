@@ -1,11 +1,10 @@
 //! Managed-instance lifecycle shared by every caller: provision an
 //! isolated instance, enter it for one-shot or long-lived workloads, and
 //! always clean it up. Docker-compatible backends stay one-shot (`run`);
-//! Incus-like and legacy LXC backends follow init/configure/start/exec/
+//! Incus-like backends follow init/configure/start/exec/
 //! stop/delete with a guard that cleans up even when the awaiting future is
 //! dropped by an outer timeout or abort.
 
-use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -30,7 +29,7 @@ pub const PROBE_INTERVAL: Duration = Duration::from_millis(500);
 pub enum InstanceId {
     /// Docker-family tracking file holding the container id.
     CidFile(PathBuf),
-    /// Managed instance name (Incus-like, legacy LXC).
+    /// Managed instance name (Incus-like).
     Name(String),
 }
 
@@ -241,7 +240,6 @@ pub async fn provision(backend: &Backend, spec: &Provision<'_>) -> Result<Sessio
             })
         }
         Backend::Incus { binary } => provision_incus(binary, spec).await,
-        Backend::Lxc => provision_lxc(spec).await,
     }
 }
 
@@ -379,99 +377,6 @@ async fn provision_incus(binary: &str, spec: &Provision<'_>) -> Result<Session, 
     }
 }
 
-async fn provision_lxc(spec: &Provision<'_>) -> Result<Session, ContainerError> {
-    let name = plans::instance_name();
-    let (dist, release) =
-        plans::parse_lxc_image(spec.image).ok_or_else(|| ContainerError::InvalidImage {
-            image: spec.image.to_string(),
-            backend: "lxc".into(),
-            reason: "image must have form `<dist>:<release>` (for example `alpine:3.20`)".into(),
-        })?;
-    let arch = plans::map_lxc_arch(std::env::consts::ARCH).ok_or_else(|| {
-        ContainerError::InvalidImage {
-            image: spec.image.to_string(),
-            backend: "lxc".into(),
-            reason: format!(
-                "host architecture `{}` has no LXC download mapping",
-                std::env::consts::ARCH
-            ),
-        }
-    })?;
-    let config_path = std::env::temp_dir().join(format!("{name}.conf"));
-    // Own the instance (and its config file) before the first daemon side
-    // effect so an aborted or dropped provision still cleans up (B06).
-    let guard = ProvisionGuard::new(&Backend::Lxc, name.clone(), Some(config_path.clone()));
-    let config_text =
-        plans::lxc_config_text(spec.mounts).map_err(|error| ContainerError::StageFailed {
-            stage: "configure",
-            instance: name.clone(),
-            detail: error.to_string(),
-        })?;
-    // create_new refuses to overwrite an unrelated file at the temp path.
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&config_path)?
-        .write_all(config_text.as_bytes())?;
-    let session = Session {
-        backend: Backend::Lxc,
-        id: InstanceId::Name(name.clone()),
-    };
-    let result: Result<(), ContainerError> = async {
-        run_admin(
-            &plans::lxc_create_argv(&name, &config_path, &dist, &release, arch),
-            CREATE_TIMEOUT,
-            spec.cancel,
-            &name,
-            "create",
-        )
-        .await?;
-        run_admin(
-            &plans::lxc_start_argv(&name),
-            START_TIMEOUT,
-            spec.cancel,
-            &name,
-            "start",
-        )
-        .await?;
-        wait_ready(
-            &plans::lxc_probe_argv(&name),
-            START_TIMEOUT,
-            spec.cancel,
-            &name,
-        )
-        .await?;
-        Ok(())
-    }
-    .await;
-    let _ = std::fs::remove_file(&config_path);
-    match result {
-        Ok(()) => {
-            guard.commit();
-            Ok(session)
-        }
-        Err(error) => {
-            // A refused create with an existing-name report belongs to
-            // another owner and must not be torn down (D01).
-            if matches!(error, ContainerError::InstanceExists { .. }) {
-                guard.disarm();
-                return Err(error);
-            }
-            if let Err(cleanup_error) = teardown(&session).await {
-                record_cleanup_failure();
-                tracing::warn!(
-                    %cleanup_error,
-                    instance = name.as_str(),
-                    "provision cleanup failed; guard backstop remains armed"
-                );
-            } else {
-                guard.disarm();
-            }
-            Err(error)
-        }
-    }
-}
-
 /// Whether daemon stderr proves the instance itself already exists (D01).
 /// Requires the daemon's existing-name report for OUR instance: a generic
 /// "already exists" about a device, pool, or foreign name proves nothing.
@@ -561,27 +466,6 @@ pub async fn teardown(session: &Session) -> Result<(), ContainerError> {
                 Err(error) => Err(error),
             }
         }
-        Session {
-            backend: Backend::Lxc,
-            id: InstanceId::Name(name),
-        } => {
-            if let Err(error) =
-                run_admin_timed_vec(&plans::lxc_stop_argv(name), STOP_TIMEOUT, name, "stop").await
-            {
-                tracing::warn!(%error, instance = name.as_str(), "instance stop failed; continuing to destroy");
-            }
-            match run_admin_timed_vec(
-                &plans::lxc_destroy_argv(name),
-                STOP_TIMEOUT,
-                name,
-                "destroy",
-            )
-            .await
-            {
-                Ok(()) | Err(ContainerError::InstanceAbsent { .. }) => Ok(()),
-                Err(error) => Err(error),
-            }
-        }
         _ => Ok(()),
     }
 }
@@ -664,31 +548,6 @@ pub fn teardown_sync(session: &Session) -> Result<(), ContainerError> {
                     }
                     if stage == "stop" {
                         tracing::warn!(%error, instance = name.as_str(), "instance stop failed; continuing to delete");
-                        continue;
-                    }
-                    return Err(error);
-                }
-            }
-            Ok(())
-        }
-        Session {
-            backend: Backend::Lxc,
-            id: InstanceId::Name(name),
-        } => {
-            for (argv, stage) in [
-                (plans::lxc_stop_argv(name), "stop"),
-                (plans::lxc_destroy_argv(name), "destroy"),
-            ] {
-                let Some((bin, args)) = argv.split_first() else {
-                    continue;
-                };
-                let args: Vec<&str> = args.iter().map(String::as_str).collect();
-                if let Err(error) = run_sync_bounded(bin, &args, STOP_TIMEOUT, name, stage) {
-                    if matches!(error, ContainerError::InstanceAbsent { .. }) {
-                        continue;
-                    }
-                    if stage == "stop" {
-                        tracing::warn!(%error, instance = name.as_str(), "instance stop failed; continuing to destroy");
                         continue;
                     }
                     return Err(error);
@@ -1128,7 +987,6 @@ mod tests {
             "Error: Failed instance creation: The instance \"qcg-1\" already exists",
             "error: instance qcg-1 already exists",
             "container qcg-1 exists already",
-            "lxc-create: qcg-1: container already in use",
         ] {
             assert!(
                 is_instance_exists_report(report, "qcg-1"),
@@ -1211,7 +1069,6 @@ mod tests {
             "Error response from daemon: No such container: qcg-1",
             "Error: Instance \"qcg-1\" not found",
             "error: The instance qcg-1 does not exist",
-            "lxc-destroy: qcg-1: unknown instance",
             "could not find container qcg-1",
         ] {
             assert!(

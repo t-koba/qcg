@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::error::GatewayError;
 use super::process::{
-    ProcessTreeGuard, StreamReadError, args_allowed, command_permission_summaries,
+    ProcessTreeGuard, StreamReadError, args_allowed_in, command_permission_summaries,
     command_permission_summary, configure_process_group, read_stream_bounded,
     resolve_command_program,
 };
@@ -28,6 +28,11 @@ pub struct CmdGateway {
     permissions: Permissions,
     bounds: CommandBounds,
     workspace: Utf8PathBuf,
+    /// Additional run-private absolute roots (for example the run metadata
+    /// directory holding E13 snapshots) that a static `*` may match. The
+    /// workspace itself is always an allowed root; extras only widen to
+    /// other per-run directories, never to the host.
+    extra_allowed_roots: Vec<Utf8PathBuf>,
     cancellation: CancellationToken,
 }
 
@@ -52,12 +57,20 @@ impl CmdGateway {
                 output_limit_bytes: None,
             },
             workspace,
+            extra_allowed_roots: Vec::new(),
             cancellation: CancellationToken::new(),
         }
     }
 
     pub fn with_bounds(mut self, bounds: CommandBounds) -> Self {
         self.bounds = bounds;
+        self
+    }
+
+    /// Adds a run-private absolute root (E13 snapshot/metadata) that a
+    /// static wildcard may match. Only per-run directories belong here.
+    pub fn with_extra_allowed_root(mut self, root: Utf8PathBuf) -> Self {
+        self.extra_allowed_roots.push(root);
         self
     }
 
@@ -162,7 +175,7 @@ impl CmdGateway {
     }
 
     /// Runs one workload inside the declared container backend. Docker-family
-    /// backends execute one-shot `run`; Incus-like and legacy LXC backends
+    /// backends execute one-shot `run`; Incus-like backends
     /// provision a managed instance first. Every path owns a session guard,
     /// so cancel/timeout never orphans the daemon-side container.
     pub async fn run_container_workload(
@@ -287,18 +300,6 @@ impl CmdGateway {
                         &[],
                         spec.workload_argv,
                     ),
-                    Backend::Lxc => {
-                        // `lxc-attach` has no workdir flag; the wrapper below
-                        // preserves the workload PID, stdio, signals, and
-                        // exit status while entering the workdir.
-                        let guest = workdir.unwrap_or("/");
-                        qcg_container::lxc_exec_argv(
-                            &instance,
-                            qcg_container::LXC_MINIMAL_PATH,
-                            guest,
-                            spec.workload_argv,
-                        )
-                    }
                     Backend::Docker { .. } => {
                         return Err(GatewayError::Container(
                             qcg_container::ContainerError::StageFailed {
@@ -521,9 +522,15 @@ impl CmdGateway {
                 }
             }
         }
-        let status = child_status.expect("child status is collected before command completion");
+        let status = child_status.ok_or_else(|| {
+            GatewayError::Io(std::io::Error::other(
+                "command completion missing child status",
+            ))
+        })?;
         let stdout = stdout_result
-            .expect("stdout result is collected before command completion")
+            .ok_or_else(|| {
+                GatewayError::Io(std::io::Error::other("command completion missing stdout"))
+            })?
             .map_err(|error| match error {
                 StreamReadError::LimitExceeded => {
                     GatewayError::CommandOutputTooLarge { bin: bin.clone() }
@@ -531,7 +538,9 @@ impl CmdGateway {
                 StreamReadError::Io(error) => GatewayError::Io(error),
             })?;
         let stderr = stderr_result
-            .expect("stderr result is collected before command completion")
+            .ok_or_else(|| {
+                GatewayError::Io(std::io::Error::other("command completion missing stderr"))
+            })?
             .map_err(|error| match error {
                 StreamReadError::LimitExceeded => {
                     GatewayError::CommandOutputTooLarge { bin: bin.clone() }
@@ -563,7 +572,7 @@ pub struct ContainerWorkload<'a> {
     /// `(host path, guest destination, readonly)` bind mounts.
     pub mounts: &'a [(Utf8PathBuf, String, bool)],
     /// Guest working directory. Docker passes `--workdir`; Incus passes
-    /// `--cwd`; legacy LXC enters it through the shell wrapper.
+    /// `--cwd`.
     pub workdir: Option<&'a str>,
     pub workload_argv: &'a [String],
     pub stdin: Option<&'a [u8]>,
@@ -578,8 +587,24 @@ impl CmdGateway {
             .runtime
             .as_ref()
             .map(|runtime| runtime.display_name().to_string());
+        // E09c SENSITIVE: the planned/guarded/journaled view never carries
+        // plaintext secrets. Each argv element is redacted via the shared
+        // credential + URL helpers (keys stay visible, values become
+        // `[REDACTED]`), preserving array structure. Execution uses the raw
+        // `argv` separately; only this planned copy is redacted. The full
+        // plaintext argv stays bound through the salted `target_sha256` /
+        // `argv_sha256` digests the callers add (run-id salt), so distinct
+        // secrets never alias to one approval.
+        let redacted_argv: Vec<String> = argv
+            .iter()
+            .map(|element| {
+                qcg_policy::redact_credential_assignments_in_text(&qcg_policy::redact_urls_in_text(
+                    element,
+                ))
+            })
+            .collect();
         Ok(json!({
-            "argv": argv,
+            "argv": redacted_argv,
             "cwd": self.workspace.as_str(),
             "isolation": permission.isolation,
             "image": permission.image,
@@ -617,10 +642,16 @@ impl CmdGateway {
                 allowed: command_permission_summaries(&self.permissions.commands),
             });
         }
+        // The workspace is always a run-private allowed root; extras cover
+        // E13 snapshot/metadata directories supplied by the engine. Bare
+        // absolutes outside these roots still fail closed (E13).
+        let mut roots: Vec<Utf8PathBuf> = Vec::with_capacity(self.extra_allowed_roots.len() + 1);
+        roots.push(self.workspace.clone());
+        roots.extend(self.extra_allowed_roots.iter().cloned());
         permissions
             .iter()
             .copied()
-            .find(|permission| args_allowed(permission, args))
+            .find(|permission| args_allowed_in(permission, args, &roots))
             .ok_or_else(|| GatewayError::CommandArgsDenied {
                 bin: bin.clone(),
                 actual: args.to_vec(),
@@ -629,5 +660,109 @@ impl CmdGateway {
                     .map(|permission| command_permission_summary(permission))
                     .collect(),
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_gateway() -> CmdGateway {
+        use qcg_contract::{CommandPermission, Permissions};
+        let mut permissions = Permissions::default();
+        permissions.commands.push(CommandPermission {
+            bin: "deploy".into(),
+            args: vec!["*".into(), "*".into()],
+            purpose: "test".into(),
+            isolation: Some(qcg_contract::CommandIsolation::TrustedHost),
+            image: None,
+        });
+        permissions.commands.push(CommandPermission {
+            bin: "echo".into(),
+            args: vec!["*".into()],
+            purpose: "test".into(),
+            isolation: Some(qcg_contract::CommandIsolation::TrustedHost),
+            image: None,
+        });
+        CmdGateway::new(
+            permissions,
+            camino::Utf8PathBuf::from("/tmp/qcg-test-workspace"),
+        )
+    }
+
+    #[test]
+    fn command_plan_redacts_secrets_but_binds_full_argv() {
+        // E09c SENSITIVE: journaled/planned/guarded argv views never carry
+        // plaintext secrets; structure is preserved and the full argv stays
+        // bound via salted digests the callers add. Plain commands pass
+        // through unchanged so existing digests stay stable.
+        let plan = test_gateway()
+            .command_plan(&[
+                "deploy".to_string(),
+                "--api-key=SENTINEL_ARGV_SECRET".to_string(),
+                "https://example.test/?token=SENTINEL_URL_SECRET".to_string(),
+            ])
+            .expect("plan should build");
+        let plan_str = plan.to_string();
+        assert!(
+            !plan_str.contains("SENTINEL_ARGV_SECRET"),
+            "planned argv must not leak the secret: {plan_str}"
+        );
+        assert!(
+            !plan_str.contains("SENTINEL_URL_SECRET"),
+            "planned URL secret must not leak: {plan_str}"
+        );
+        let argv = plan["argv"].as_array().expect("argv should be an array");
+        assert_eq!(argv.len(), 3, "structure must be preserved: {plan_str}");
+        assert!(
+            plan_str.contains("api-key="),
+            "keys stay visible: {plan_str}"
+        );
+        // Plain commands pass through unchanged.
+        let plain = test_gateway()
+            .command_plan(&["echo".to_string(), "hi".to_string()])
+            .expect("plain plan should build");
+        assert_eq!(plain["argv"], serde_json::json!(["echo", "hi"]));
+        // Full argv binding distinguishes secrets even though displays alias:
+        // callers salt with the run id; identical redacted displays bind
+        // different digests.
+        let first = crate::salted_binding_digest(
+            "command-argv-v1",
+            "run-1",
+            &serde_json::to_vec(&vec!["deploy".to_string(), "--api-key=alpha".to_string()])
+                .expect("argv serializes"),
+        );
+        let second = crate::salted_binding_digest(
+            "command-argv-v1",
+            "run-1",
+            &serde_json::to_vec(&vec!["deploy".to_string(), "--api-key=beta".to_string()])
+                .expect("argv serializes"),
+        );
+        assert_ne!(first, second, "distinct secrets must bind distinctly");
+        let other_run = crate::salted_binding_digest(
+            "command-argv-v1",
+            "run-2",
+            &serde_json::to_vec(&vec!["deploy".to_string(), "--api-key=alpha".to_string()])
+                .expect("argv serializes"),
+        );
+        assert_ne!(first, other_run, "cross-run digests must diverge");
+    }
+
+    #[test]
+    fn command_plan_production_code_uses_no_debug_formatting() {
+        // E09h: the gateway command planning path must never Debug-format
+        // values in production code. Mirrors the llm-steps pin test.
+        let source = include_str!("command.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        for (index, line) in production.lines().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            assert!(
+                !line.contains(":?}"),
+                "gateway command production code must not Debug-format: {}: {line}",
+                index + 1,
+            );
+        }
     }
 }

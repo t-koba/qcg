@@ -22,6 +22,21 @@ pub struct RunEvent {
     pub data: RunEventData,
 }
 
+/// Terminal run-event kinds shared by the service live tail, the SSE
+/// wrapper, and the shared poller, so the three layers can never disagree
+/// on what ends a stream (E12).
+pub const TERMINAL_EVENT_KINDS: [&str; 4] = [
+    "run_finished",
+    "run_error",
+    "run_canceled",
+    "run_interrupted",
+];
+
+/// Reports whether a run-event kind ends its stream.
+pub fn is_terminal_event_kind(kind: &str) -> bool {
+    TERMINAL_EVENT_KINDS.contains(&kind)
+}
+
 impl<'de> Deserialize<'de> for RunEvent {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
