@@ -763,59 +763,7 @@ export interface paths {
             };
         };
         put?: never;
-        /** Cancel a run (alias of /api/runs/{id}:cancel) */
-        post: {
-            parameters: {
-                query?: never;
-                header?: {
-                    /** @description Retries with the same key and request body return the original run. */
-                    "Idempotency-Key"?: string;
-                };
-                path: {
-                    id: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description Cancellation accepted */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["RunSnapshot"];
-                    };
-                };
-                /** @description Resource not found */
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/problem+json": components["schemas"]["ProblemDetails"];
-                    };
-                };
-                /** @description Resource conflict */
-                409: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/problem+json": components["schemas"]["ProblemDetails"];
-                    };
-                };
-                /** @description Internal server error */
-                500: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/problem+json": components["schemas"]["ProblemDetails"];
-                    };
-                };
-            };
-        };
+        post?: never;
         /** Delete a terminal run */
         delete: {
             parameters: {
@@ -2490,6 +2438,7 @@ export interface components {
             /**
              * @description Accumulated cost metrics, present when the writer attached them.
              * @default {
+             *       "budget_charged": 0,
              *       "cost_microusd": 0,
              *       "duration_ms": 0,
              *       "llm_calls": 0,
@@ -2608,6 +2557,7 @@ export interface components {
             /**
              * @description Accumulated cost metrics, present when the writer attached them.
              * @default {
+             *       "budget_charged": 0,
              *       "cost_microusd": 0,
              *       "duration_ms": 0,
              *       "llm_calls": 0,
@@ -2683,6 +2633,15 @@ export interface components {
             next_cursor: string | null;
         };
         RunMetrics: {
+            /**
+             * Format: uint64
+             * @description Durable step-budget consumption (F13): sum of `budget_charged`
+             *     deltas. `steps_executed` counts `step_started` events (observational,
+             *     includes uncharged foreach children); this counter drives
+             *     `max_steps` enforcement and survives restarts identically.
+             * @default 0
+             */
+            budget_charged: number;
             /**
              * Format: uint64
              * @default 0

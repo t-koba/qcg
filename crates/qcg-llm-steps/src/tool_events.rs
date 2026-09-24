@@ -309,13 +309,7 @@ impl std::fmt::Debug for RedactedMessage<'_> {
         let redacted_content = qcg_policy::redact_credential_assignments_in_text(
             &qcg_policy::redact_urls_in_text(&self.0.content),
         );
-        let content = if redacted_content.len() <= 256 {
-            redacted_content
-        } else {
-            use sha2::Digest as _;
-            let digest = hex::encode(sha2::Sha256::digest(redacted_content.as_bytes()));
-            format!("{}...[sha256:{digest}]", &redacted_content[..256])
-        };
+        let content = crate::prompting::truncate_with_digest(&redacted_content, 256);
         let tool_calls: Vec<RedactedToolCall<'_>> =
             self.0.tool_calls.iter().map(RedactedToolCall).collect();
         formatter

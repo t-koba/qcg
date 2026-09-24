@@ -135,6 +135,11 @@ impl CatalogConfig {
 pub struct ExternalCatalog {
     #[serde(default)]
     fetched_at: Option<String>,
+    /// Fingerprint of the source configuration this data was fetched under
+    /// (F09-02). A cache entry from different sources is never treated as
+    /// verified data for the current pins.
+    #[serde(default)]
+    fingerprint: Option<String>,
     /// External provider key -> model id -> spec.
     #[serde(default)]
     providers: BTreeMap<String, BTreeMap<String, ModelSpec>>,
@@ -145,6 +150,8 @@ struct CachedCatalog {
     #[serde(default)]
     fetched_at: Option<String>,
     #[serde(default)]
+    fingerprint: Option<String>,
+    #[serde(default)]
     providers: BTreeMap<String, BTreeMap<String, ModelSpec>>,
 }
 
@@ -154,7 +161,6 @@ struct Snapshot {
     models: BTreeMap<String, Vec<ModelSpec>>,
     external: ExternalCatalog,
     sources: Vec<CatalogSourceStatus>,
-    stale: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -262,7 +268,6 @@ impl CatalogService {
             });
         }
         let snapshot = Snapshot {
-            stale: snapshot_stale(external.fetched_at.as_deref(), config.refresh_seconds),
             models: BTreeMap::new(),
             sources,
             external,
@@ -287,12 +292,18 @@ impl CatalogService {
     }
 
     /// Whether the loaded external metadata is missing or older than the
-    /// configured refresh interval.
+    /// configured refresh interval (F09-01). Computed from `fetched_at` and
+    /// the current time on every read so staleness re-arises after the TTL
+    /// even after a successful refresh; no stored bool can go stale.
     pub fn is_stale(&self) -> bool {
-        self.snapshot
+        let snapshot = self
+            .snapshot
             .read()
-            .unwrap_or_else(|error| error.into_inner())
-            .stale
+            .unwrap_or_else(|error| error.into_inner());
+        snapshot_stale(
+            snapshot.external.fetched_at.as_deref(),
+            self.config.refresh_seconds,
+        )
     }
 
     /// Interval between background staleness checks. Never below one minute
@@ -367,6 +378,8 @@ impl CatalogService {
 
     /// Refreshes every configured external source and persists the cache.
     /// Returned errors are also recorded per source in the catalog view.
+    /// Cache persistence failures are reported (F09-03), never silently
+    /// ignored.
     pub async fn refresh(&self) -> Result<(), String> {
         if self.config.source.is_empty() {
             return Ok(());
@@ -402,6 +415,27 @@ impl CatalogService {
             }
         }
         merged.fetched_at = Some(chrono::Utc::now().to_rfc3339());
+        merged.fingerprint = Some(config_fingerprint(&self.config));
+        let mut cache_error: Option<String> = None;
+        if first_error.is_none() {
+            // Persist before publishing so a crash cannot publish data the
+            // cache does not hold; a write failure is reported and keeps
+            // the previous snapshot instead of advertising fresh data.
+            match write_cache(&self.config, &merged) {
+                Ok(()) => {}
+                Err(error) => {
+                    cache_error = Some(error.clone());
+                    statuses.push(CatalogSourceStatus {
+                        kind: "cache".to_string(),
+                        location: cache_path(&self.config)
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        fetched_at: None,
+                        error: Some(error),
+                    });
+                }
+            }
+        }
         {
             let mut snapshot = self
                 .snapshot
@@ -409,17 +443,16 @@ impl CatalogService {
                 .unwrap_or_else(|error| error.into_inner());
             // A failed source keeps the previous external data instead of
             // silently dropping metadata; the error stays visible.
-            if first_error.is_none() {
+            // Staleness recomputes from fetched_at on read (F09-01).
+            if first_error.is_none() && cache_error.is_none() {
                 snapshot.external = merged.clone();
             }
             snapshot.sources = statuses;
-            snapshot.stale = first_error.is_some();
         }
-        if first_error.is_none() {
-            let _ = write_cache(&self.config, &merged);
+        if first_error.is_none() && cache_error.is_none() {
             self.rebuild_models();
         }
-        match first_error {
+        match first_error.or(cache_error) {
             Some(error) => Err(error),
             None => Ok(()),
         }
@@ -476,33 +509,54 @@ impl CatalogService {
 
     /// Builds the serializable catalog view. Discovery runs on demand and is
     /// merged over the explicit and cached metadata for selection only.
+    /// Display and runtime share the same field-level overlay (F09-04):
+    /// explicit declarations win per field, unspecified fields inherit the
+    /// external entry, so shown capabilities/pricing equal execution-time
+    /// resolution.
     pub async fn view(&self, refresh: bool) -> CatalogView {
         if refresh {
             let _ = self.refresh().await;
         }
-        let (stale, fetched_at, sources, external) = {
+        let (fetched_at, sources, external) = {
             let snapshot = self
                 .snapshot
                 .read()
                 .unwrap_or_else(|error| error.into_inner());
             (
-                snapshot.stale,
                 snapshot.external.fetched_at.clone(),
                 snapshot.sources.clone(),
                 snapshot.external.clone(),
             )
         };
+        let stale = snapshot_stale(fetched_at.as_deref(), self.config.refresh_seconds);
         let mut providers = vec![fake_provider_view()];
         for (provider_id, spec) in &self.specs {
             let catalog_id = spec.catalog_id.as_deref().unwrap_or(provider_id);
             let mut models: BTreeMap<String, CatalogModelView> = BTreeMap::new();
+            // Same overlay as rebuild_models (F09-04): explicit wins per
+            // field, external fills the gaps, so the view matches runtime.
+            let external_models = external.providers.get(catalog_id);
             for model in &spec.models {
+                let merged = match external_models.and_then(|models| models.get(&model.id)) {
+                    Some(external_model) => merge_model(external_model, model),
+                    None => model.clone(),
+                };
+                let has_external =
+                    external_models.is_some_and(|models| models.contains_key(&model.id));
                 models.insert(
                     model.id.clone(),
-                    model_view(model, "explicit", &spec.capabilities),
+                    model_view(
+                        &merged,
+                        if has_external {
+                            "explicit + external"
+                        } else {
+                            "explicit"
+                        },
+                        &spec.capabilities,
+                    ),
                 );
             }
-            if let Some(external_models) = external.providers.get(catalog_id) {
+            if let Some(external_models) = external_models {
                 for (model_id, model) in external_models {
                     models
                         .entry(model_id.clone())
@@ -611,6 +665,10 @@ impl CatalogService {
             .client
             .get(url)
             .timeout(Duration::from_secs(DEFAULT_CATALOG_FETCH_TIMEOUT_SECONDS));
+        // Active credentials for reflection screening (F03). Loaded here so
+        // rotation takes effect on the next call; never logged or returned
+        // in errors.
+        let mut active_credentials: Vec<String> = Vec::new();
         if let Some(name) = &spec.api_key_env {
             let value = std::env::var(name).map_err(|_| {
                 format!(
@@ -618,6 +676,7 @@ impl CatalogService {
                     spec.id
                 )
             })?;
+            active_credentials.push(value.clone());
             request = attach_credential(request, spec.auth_header.as_deref(), &value)?;
         } else if let Some(name) = &spec.api_key_file_env {
             let path = std::env::var(name).map_err(|_| {
@@ -627,6 +686,7 @@ impl CatalogService {
                 )
             })?;
             let value = read_credential_file(Path::new(&path))?;
+            active_credentials.push(value.clone());
             request = attach_credential(request, spec.auth_header.as_deref(), &value)?;
         }
         let response = request
@@ -649,6 +709,17 @@ impl CatalogService {
                 spec.id
             )
         })?;
+        // Credential reflection screening (F03): a malicious or confused
+        // provider must not be able to launder the request credential into
+        // the public catalog view as a model id. Check raw bytes and all
+        // decoded keys/values before anything reaches the view, records, or
+        // error text. The error never echoes the secret.
+        if let Some(reason) = credential_reflection(&bytes, &value, &active_credentials) {
+            return Err(format!(
+                "provider `{}` model discovery response failed credential screening: {reason}",
+                spec.id
+            ));
+        }
         let entries = value
             .get("data")
             .or_else(|| value.get("models"))
@@ -691,6 +762,55 @@ fn attach_credential(
             Ok(request.header(name, value))
         }
         None => Ok(request.bearer_auth(value)),
+    }
+}
+
+/// Screens a discovery response for credential reflection (F03). Checks the
+/// raw response bytes (covers JSON-escaped reflections) and every decoded
+/// key/value string before the ids reach the public view. Returns a generic
+/// reason without echoing the secret. Short credentials (< 8 chars) are
+/// still checked for exact id equality to avoid substring false positives
+/// on tiny values while catching direct echo.
+fn credential_reflection(
+    raw: &[u8],
+    decoded: &Value,
+    credentials: &[String],
+) -> Option<&'static str> {
+    for credential in credentials {
+        let credential = credential.trim();
+        if credential.is_empty() {
+            continue;
+        }
+        // Raw-byte check covers JSON-escaped reflections.
+        if let Ok(text) = std::str::from_utf8(raw)
+            && text.contains(credential)
+        {
+            return Some("response reflects the request credential");
+        }
+        if json_contains_credential(decoded, credential) {
+            return Some("response reflects the request credential");
+        }
+    }
+    None
+}
+
+fn json_contains_credential(value: &Value, credential: &str) -> bool {
+    match value {
+        Value::String(text) => {
+            if credential.len() < 8 {
+                text == credential
+            } else {
+                text.contains(credential)
+            }
+        }
+        Value::Array(items) => items
+            .iter()
+            .any(|item| json_contains_credential(item, credential)),
+        Value::Object(map) => map.iter().any(|(key, val)| {
+            (credential.len() >= 8 && key.contains(credential))
+                || json_contains_credential(val, credential)
+        }),
+        _ => false,
     }
 }
 
@@ -844,18 +964,47 @@ fn load_cached_external(config: &CatalogConfig) -> (ExternalCatalog, Option<Stri
         }
     };
     match serde_json::from_slice::<CachedCatalog>(&bytes) {
-        Ok(cached) => (
-            ExternalCatalog {
-                fetched_at: cached.fetched_at,
-                providers: cached.providers,
-            },
-            None,
-        ),
+        Ok(cached) => {
+            // Fingerprint gate (F09-02): a cache written under different
+            // sources is not verified data for the current pins.
+            let expected = config_fingerprint(config);
+            if cached.fingerprint.as_deref() != Some(expected.as_str()) {
+                return (
+                    ExternalCatalog::default(),
+                    Some("catalog cache is from different sources; ignoring".to_string()),
+                );
+            }
+            (
+                ExternalCatalog {
+                    fetched_at: cached.fetched_at,
+                    fingerprint: cached.fingerprint,
+                    providers: cached.providers,
+                },
+                None,
+            )
+        }
         Err(error) => (
             ExternalCatalog::default(),
             Some(format!("catalog cache is corrupt: {error}")),
         ),
     }
+}
+
+/// Fingerprint of the source configuration (F09-02): kind plus location
+/// plus pin, so a URL/file/hash change invalidates the old cache.
+fn config_fingerprint(config: &CatalogConfig) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update([config.source.len() as u8]);
+    for source in &config.source {
+        hasher.update(source.kind_name().as_bytes());
+        hasher.update([0]);
+        hasher.update(source.location().as_bytes());
+        hasher.update([0]);
+        hasher.update(source.sha256.as_deref().unwrap_or("").as_bytes());
+        hasher.update([0]);
+    }
+    hex::encode(hasher.finalize())
 }
 
 fn write_cache(config: &CatalogConfig, catalog: &ExternalCatalog) -> Result<(), String> {
@@ -869,15 +1018,40 @@ fn write_cache(config: &CatalogConfig, catalog: &ExternalCatalog) -> Result<(), 
         .map_err(|error| format!("catalog cache directory could not be created: {error}"))?;
     let cached = CachedCatalog {
         fetched_at: catalog.fetched_at.clone(),
+        fingerprint: catalog
+            .fingerprint
+            .clone()
+            .or_else(|| Some(config_fingerprint(config))),
         providers: catalog.providers.clone(),
     };
     let bytes = serde_json::to_vec_pretty(&cached)
         .map_err(|error| format!("catalog cache is not serializable: {error}"))?;
-    let tmp = path.with_extension("json.tmp");
+    // Unique temp name (F09-03): concurrent refreshes must not share one
+    // fixed `.tmp` path and clobber each other's publish.
+    let tmp = parent.join(format!(
+        ".llm-catalog-{}-{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    ));
     std::fs::write(&tmp, &bytes)
         .map_err(|error| format!("catalog cache could not be written: {error}"))?;
+    #[cfg(unix)]
+    {
+        if let Ok(file) = std::fs::File::open(&tmp) {
+            let _ = file.sync_all();
+        }
+    }
     std::fs::rename(&tmp, &path)
         .map_err(|error| format!("catalog cache could not be published: {error}"))?;
+    #[cfg(unix)]
+    {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(())
 }
 
@@ -1121,11 +1295,14 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("cache dir");
         let cache = dir.join("catalog.json");
+        // Fingerprint for a sourceless config (F09-02): sha256 of [0x00].
+        // The cache is only trusted when it names the current sources.
         std::fs::write(
             &cache,
             format!(
                 r#"{{
   "fetched_at": "{}",
+  "fingerprint": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
   "providers": {{
     "openai": {{
       "gpt-from-cache": {{
@@ -1207,5 +1384,367 @@ models_discovery = "openai"
         let models = service.discover(spec).await.expect("discovery");
         assert_eq!(models, vec!["alpha".to_string(), "beta".to_string()]);
         let _ = handle.join();
+    }
+
+    #[tokio::test]
+    async fn discovery_normal_rotation_and_limits_share_one_path() {
+        // F03-03: normal listings, credential rotation, and the body limit
+        // all flow through the same credentialed discovery path.
+        use std::io::{Read, Write};
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        let handle = std::thread::spawn(move || {
+            // Four requests: key-1 listing, rotated key-2 listing, an
+            // over-limit body, and a reflection attack with key-2.
+            let bodies = [
+                r#"{"data":[{"id":"alpha"}]}"#.to_string(),
+                r#"{"data":[{"id":"alpha"}]}"#.to_string(),
+                "x".repeat(2 * 1024 * 1024 + 1),
+                r#"{"data":[{"id":"QCG-E2E-ROTATED-KEY-2"}]}"#.to_string(),
+            ];
+            for body in bodies {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") && head.len() < 65536 {
+                    let mut byte = [0u8; 1];
+                    match stream.read(&mut byte) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => head.push(byte[0]),
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        let file = ProvidersFile::parse(&format!(
+            r#"
+[[provider]]
+id = "local"
+api = "chat_completions"
+base_url = "http://{address}/v1"
+api_key_env = "QCG_TEST_DISCOVER_E2E_KEY"
+models_discovery = "openai"
+"#
+        ))
+        .expect("registry must parse");
+        let service = CatalogService::new(file.provider, None).expect("catalog service");
+        let spec = service.provider("local").expect("provider");
+        // SAFETY: unique env name used only by this test.
+        unsafe {
+            std::env::set_var("QCG_TEST_DISCOVER_E2E_KEY", "QCG-E2E-KEY-1");
+        }
+        let models = service.discover(spec).await.expect("listing should pass");
+        assert_eq!(models, vec!["alpha".to_string()]);
+        // Rotation uses the same path with the new credential.
+        unsafe {
+            std::env::set_var("QCG_TEST_DISCOVER_E2E_KEY", "QCG-E2E-ROTATED-KEY-2");
+        }
+        let models = service.discover(spec).await.expect("rotated listing");
+        assert_eq!(models, vec!["alpha".to_string()]);
+        // Over-limit bodies fail closed on the same path.
+        let error = service
+            .discover(spec)
+            .await
+            .expect_err("over-limit body must fail");
+        assert!(error.contains("exceeded"), "{error}");
+        assert!(
+            !error.contains("QCG-E2E-ROTATED-KEY-2"),
+            "limits must not echo the credential: {error}"
+        );
+        // A reflection of the current credential is rejected (F03-01/02).
+        let error = service
+            .discover(spec)
+            .await
+            .expect_err("reflection must fail");
+        assert!(error.contains("credential screening"), "{error}");
+        assert!(
+            !error.contains("QCG-E2E-ROTATED-KEY-2"),
+            "rejections must not echo the credential: {error}"
+        );
+        unsafe {
+            std::env::remove_var("QCG_TEST_DISCOVER_E2E_KEY");
+        }
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn discovery_reflection_screening_rejects_credential_echo() {
+        // F03-01/F03-02: data id, models name, and JSON-escaped reflections
+        // are rejected before publication, without echoing the secret.
+        let secret = "QCG-TEST-SECRET-abc123xyz".to_string();
+        let raw = format!(r#"{{"data":[{{"id":"{secret}"}}]}}"#).into_bytes();
+        let decoded: Value = serde_json::from_slice(&raw).expect("fixture JSON");
+        let reason = credential_reflection(&raw, &decoded, std::slice::from_ref(&secret))
+            .expect("direct echo must be rejected");
+        assert!(reason.contains("credential"), "{reason}");
+
+        let raw_models =
+            format!(r#"{{"models":[{{"name":"prefix-{secret}-suffix"}}]}}"#).into_bytes();
+        let decoded_models: Value = serde_json::from_slice(&raw_models).expect("fixture JSON");
+        assert!(
+            credential_reflection(&raw_models, &decoded_models, std::slice::from_ref(&secret))
+                .is_some(),
+            "models[].name reflection must be rejected"
+        );
+
+        // Normal ids pass, and rotation (different credential) passes.
+        let benign = br#"{"data":[{"id":"gpt-5"},{"name":"o3"}]}"#;
+        let benign_decoded: Value = serde_json::from_slice(benign).expect("fixture JSON");
+        assert!(
+            credential_reflection(benign, &benign_decoded, &[secret]).is_none(),
+            "benign listing must pass"
+        );
+        assert!(
+            credential_reflection(benign, &benign_decoded, &["rotated-key-999".to_string()])
+                .is_none(),
+            "rotated credential must use the same path"
+        );
+    }
+
+    #[test]
+    fn staleness_recomputes_from_time_not_a_stored_flag() {
+        // F09-01: staleness derives from fetched_at + now on every read.
+        assert!(snapshot_stale(None, 3600), "missing fetch is stale");
+        let old = (chrono::Utc::now() - chrono::Duration::seconds(7200)).to_rfc3339();
+        assert!(
+            snapshot_stale(Some(old.as_str()), 3600),
+            "TTL-exceeded fetch is stale"
+        );
+        let fresh = chrono::Utc::now().to_rfc3339();
+        assert!(
+            !snapshot_stale(Some(fresh.as_str()), 3600),
+            "fresh fetch is not stale"
+        );
+        assert!(
+            snapshot_stale(Some("not-a-date"), 3600),
+            "unparseable is stale"
+        );
+    }
+
+    #[test]
+    fn cache_from_other_sources_is_ignored() {
+        // F09-02: a cache fingerprint from different sources is never
+        // trusted as verified data for the current pins.
+        let config = CatalogConfig {
+            cache: None,
+            refresh_seconds: 86_400,
+            source: vec![CatalogSourceSpec {
+                kind: CatalogSourceKind::ModelsDev,
+                url: Some("https://example.test/api.json".into()),
+                file: None,
+                sha256: None,
+            }],
+        };
+        let expected = config_fingerprint(&config);
+        let other = CatalogConfig::default();
+        assert_ne!(
+            config_fingerprint(&other),
+            expected,
+            "different sources must fingerprint differently"
+        );
+    }
+
+    #[tokio::test]
+    async fn view_matches_runtime_overlay_for_partial_explicit() {
+        // F09-04: a partially explicit model shows the same merged
+        // capabilities/pricing in the view as runtime resolution uses.
+        use crate::provider::ProvidersFile;
+        let file = ProvidersFile::parse(
+            r#"
+[[provider]]
+id = "openai"
+api = "chat_completions"
+base_url = "https://example.test/v1"
+chat_token_limit_field = "max_completion_tokens"
+capabilities = { tool_use = true }
+
+[[provider.models]]
+id = "gpt-5"
+label = "Explicit label"
+"#,
+        )
+        .expect("registry must parse");
+        let service = CatalogService::new(file.provider, None).expect("catalog service");
+        // Inject an external entry for the same model with pricing the
+        // explicit declaration leaves unset.
+        {
+            let mut snapshot = service
+                .snapshot
+                .write()
+                .unwrap_or_else(|error| error.into_inner());
+            let mut models = BTreeMap::new();
+            models.insert(
+                "gpt-5".to_string(),
+                crate::provider::ModelSpec {
+                    id: "gpt-5".into(),
+                    label: Some("External label".into()),
+                    capabilities: None,
+                    reasoning_effort: Some(vec![ReasoningEffort::Low]),
+                    input_cost_per_million_usd: Some(1.0),
+                    output_cost_per_million_usd: Some(2.0),
+                    context_tokens: Some(1000),
+                    max_output_tokens: Some(500),
+                    enabled: None,
+                },
+            );
+            let mut providers = BTreeMap::new();
+            providers.insert("openai".to_string(), models);
+            snapshot.external = ExternalCatalog {
+                fetched_at: Some(chrono::Utc::now().to_rfc3339()),
+                fingerprint: None,
+                providers,
+            };
+        }
+        service.rebuild_models();
+        let runtime_pricing = service
+            .model_pricing("openai", "gpt-5")
+            .expect("runtime pricing");
+        assert_eq!(runtime_pricing.input_cost_per_million_usd, Some(1.0));
+        let view = service.view(false).await;
+        let provider = view
+            .providers
+            .iter()
+            .find(|p| p.id == "openai")
+            .expect("provider view");
+        let model = provider
+            .models
+            .iter()
+            .find(|m| m.id == "gpt-5")
+            .expect("model view");
+        assert_eq!(
+            model.input_cost_per_million_usd, runtime_pricing.input_cost_per_million_usd,
+            "view pricing must equal runtime pricing"
+        );
+        assert_eq!(model.label.as_deref(), Some("Explicit label"));
+    }
+
+    fn file_source_config(cache: &std::path::Path, source: &std::path::Path) -> CatalogConfig {
+        CatalogConfig {
+            cache: Some(cache.to_string_lossy().into_owned()),
+            refresh_seconds: 1,
+            source: vec![CatalogSourceSpec {
+                kind: CatalogSourceKind::ModelsDev,
+                url: None,
+                file: Some(source.to_string_lossy().into_owned()),
+                sha256: None,
+            }],
+        }
+    }
+
+    fn write_models_dev(path: &std::path::Path, model: &str) {
+        std::fs::write(
+            path,
+            format!(r#"{{"openai": {{"models": {{"{model}": {{"tool_call": true}}}}}}}}"#),
+        )
+        .expect("fixture should write");
+    }
+
+    fn temp_catalog_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "qcg-catalog-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir should create");
+        dir
+    }
+
+    #[tokio::test]
+    async fn staleness_returns_after_ttl_and_view_agrees() {
+        // F09-01: a successful refresh clears staleness, the TTL expiry
+        // brings it back, and the view reports the same value so the
+        // resident loop refreshes again.
+        let dir = temp_catalog_dir("stale");
+        let source = dir.join("api.json");
+        write_models_dev(&source, "gpt-stale");
+        let config = file_source_config(&dir.join("cache.json"), &source);
+        let service = CatalogService::new(Vec::new(), Some(config)).expect("service should build");
+        assert!(service.is_stale(), "missing fetch starts stale");
+        service.refresh().await.expect("refresh should succeed");
+        assert!(!service.is_stale(), "fresh fetch is not stale");
+        let view = service.view(false).await;
+        assert!(!view.stale, "the view must agree while fresh");
+        // Whole-second TTL comparison needs a full two seconds past the
+        // one-second TTL.
+        std::thread::sleep(std::time::Duration::from_millis(2200));
+        assert!(service.is_stale(), "TTL expiry must restore staleness");
+        assert!(
+            service.view(false).await.stale,
+            "the view must agree once stale"
+        );
+        service.refresh().await.expect("re-refresh should succeed");
+        assert!(!service.is_stale(), "re-refresh clears staleness again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn concurrent_refreshes_converge_on_a_complete_snapshot() {
+        // F09-03: concurrent refreshes publish complete snapshots (no
+        // fixed-temp clobbering) and both report success.
+        let dir = temp_catalog_dir("concurrent");
+        let source = dir.join("api.json");
+        write_models_dev(&source, "gpt-race");
+        let config = file_source_config(&dir.join("cache.json"), &source);
+        let service = CatalogService::new(Vec::new(), Some(config)).expect("service should build");
+        let (first, second) = tokio::join!(service.refresh(), service.refresh());
+        first.expect("first refresh should succeed");
+        second.expect("concurrent refresh should succeed");
+        let snapshot = service
+            .snapshot
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(
+            snapshot
+                .external
+                .providers
+                .get("openai")
+                .is_some_and(|models| models.contains_key("gpt-race")),
+            "the snapshot must be complete after concurrent refresh"
+        );
+        assert!(snapshot.external.fetched_at.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cache_save_failures_are_reported_not_silent() {
+        // F09-03: when the cache cannot persist, refresh fails loudly,
+        // records the cache error, and keeps the previous snapshot instead
+        // of advertising fresh data it did not store.
+        let dir = temp_catalog_dir("save-fail");
+        let source = dir.join("api.json");
+        write_models_dev(&source, "gpt-lost");
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, b"not a directory").expect("blocker should write");
+        let config = file_source_config(&blocker.join("cache.json"), &source);
+        let service = CatalogService::new(Vec::new(), Some(config)).expect("service should build");
+        let error = service
+            .refresh()
+            .await
+            .expect_err("an unwritable cache must fail refresh");
+        assert!(error.contains("cache"), "{error}");
+        assert!(
+            service.is_stale(),
+            "the snapshot must stay stale when persistence failed"
+        );
+        assert!(
+            service
+                .snapshot
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .sources
+                .iter()
+                .any(|status| status.kind == "cache" && status.error.is_some()),
+            "the cache failure must stay visible per source"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

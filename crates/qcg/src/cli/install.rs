@@ -13,6 +13,7 @@ use std::collections::BTreeSet;
 
 use std::io::ErrorKind;
 
+use super::install_commit;
 use super::plan::ensure_safe_install_id;
 
 use qcg_policy::MAX_SIGNING_KEY_BYTES;
@@ -51,7 +52,6 @@ pub(crate) fn reap_install_tmps_before(
     parent: &Utf8Path,
     prefix: &str,
     cutoff: std::time::SystemTime,
-    own_pid: u32,
 ) -> Result<()> {
     let entries = match std::fs::read_dir(parent) {
         Ok(entries) => entries,
@@ -61,7 +61,6 @@ pub(crate) fn reap_install_tmps_before(
                 .with_context(|| format!("failed to scan `{parent}` for stale installs"));
         }
     };
-    let own_marker = format!("-{own_pid}-");
     let mut failures = Vec::new();
     for entry in entries {
         let entry = match entry {
@@ -95,23 +94,24 @@ pub(crate) fn reap_install_tmps_before(
         // For symlinks, use symlink_metadata (never follows) for the age
         // gate: `entry.metadata()` would follow the link and could inspect
         // outside the install tree. A symlink whose own metadata cannot be
-        // read fails closed (reaped only if own-pid, else gated).
+        // read fails closed (kept: unreadable age never proves staleness).
+        // The age gate applies to every entry including same-process ones:
+        // the pid only proves which process created an entry, never that it
+        // is dead, so a concurrent install in this process must not lose
+        // its live staging to a sibling's sweep.
         let is_symlink = kind.is_symlink();
-        let is_own = name.contains(&own_marker);
-        if !is_own {
-            // Never follow symlinks for the age gate: use the link's own
-            // metadata, not the target's.
-            let old_enough = (if is_symlink {
-                std::fs::symlink_metadata(entry.path())
-            } else {
-                entry.metadata()
-            })
-            .and_then(|metadata| metadata.modified())
-            .map(|mtime| mtime <= cutoff)
-            .unwrap_or(false);
-            if !old_enough {
-                continue;
-            }
+        // Never follow symlinks for the age gate: use the link's own
+        // metadata, not the target's.
+        let old_enough = (if is_symlink {
+            std::fs::symlink_metadata(entry.path())
+        } else {
+            entry.metadata()
+        })
+        .and_then(|metadata| metadata.modified())
+        .map(|mtime| mtime <= cutoff)
+        .unwrap_or(false);
+        if !old_enough {
+            continue;
         }
         let path = Utf8PathBuf::from_path_buf(entry.path()).map_err(|path| {
             anyhow::anyhow!("stale install path is not valid UTF-8: {}", path.display())
@@ -131,22 +131,155 @@ pub(crate) fn reap_install_tmps_before(
 }
 
 pub(crate) fn reap_stale_install_tmps(generators_dir: &Utf8Path) -> Result<()> {
+    // Recovery runs before any sweep (F14-02): a missing target with a
+    // backup sibling restores instead of being deleted as stale. The sweep
+    // below never deletes a backup whose target is missing.
+    recover_generators_backups(generators_dir);
     // A clock behind the directory mtimes would make everything look
-    // young; saturating to "now" fails the sweep closed (removes nothing
-    // but fresh foreign entries) instead of wiping live staging. Own-pid
-    // leftovers are reaped regardless of age.
+    // young; saturating to "now" fails the sweep closed (removes nothing)
+    // instead of wiping live staging. Fresh entries always survive,
+    // including same-process ones: only age proves staleness.
     let cutoff = std::time::SystemTime::now()
         .checked_sub(std::time::Duration::from_secs(3600))
         .unwrap_or(std::time::SystemTime::now());
-    let own_pid = std::process::id();
-    reap_install_tmps_before(generators_dir, ".qcg-install-temp-", cutoff, own_pid)?;
-    reap_install_tmps_before(generators_dir, ".qcg-install-backup-", cutoff, own_pid)?;
+    reap_install_tmps_before(generators_dir, ".qcg-install-temp-", cutoff)?;
+    reap_install_backup_siblings(generators_dir, cutoff)?;
     if let Ok(parent) = Utf8PathBuf::from_path_buf(std::env::temp_dir()) {
-        reap_install_tmps_before(&parent, ".qcg-install-stage-", cutoff, own_pid)?;
-        reap_install_tmps_before(&parent, ".qcg-install-archive-", cutoff, own_pid)?;
-        reap_install_tmps_before(&parent, ".qcg-install-private-", cutoff, own_pid)?;
+        reap_install_tmps_before(&parent, ".qcg-install-stage-", cutoff)?;
+        reap_install_tmps_before(&parent, ".qcg-install-archive-", cutoff)?;
+        reap_install_tmps_before(&parent, ".qcg-install-private-", cutoff)?;
     }
     Ok(())
+}
+
+/// Restores every interrupted backup under `generators_dir` (F14-02).
+/// Iterates child directories (candidate targets) and attempts recovery
+/// for missing ones. Best-effort: failures leave backups in place.
+fn recover_generators_backups(generators_dir: &Utf8Path) {
+    let Ok(entries) = std::fs::read_dir(generators_dir) else {
+        return;
+    };
+    // Recovery targets are unknown (target itself is missing), so scan
+    // backup markers to learn candidate ids instead of directory names.
+    let mut ids = std::collections::BTreeSet::new();
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !name.starts_with(".qcg-install-backup-") {
+            continue;
+        }
+        let Ok(backup) = Utf8PathBuf::from_path_buf(entry.path()) else {
+            continue;
+        };
+        let marker = backup.join(install_commit::BACKUP_MARKER_FILE);
+        if let Ok(bytes) = std::fs::read(&marker)
+            && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            && let Some(id) = value.get("id").and_then(|v| v.as_str())
+        {
+            ids.insert(id.to_string());
+        }
+    }
+    for id in ids {
+        let target = generators_dir.join(&id);
+        install_commit::recover_interrupted_backup(&target);
+    }
+}
+
+/// Reaps `.qcg-install-backup-*` siblings with recovery-aware guards
+/// (F14-01/F14-03/F14-04):
+/// - a backup whose target is missing is never deleted (recover first);
+/// - freshness uses the marker mtime, not the renamed directory mtime;
+/// - a contended per-id lock (concurrent commit) skips deletion;
+/// - unmarked directories fall back to the scratch age gate.
+///
+/// The freshness gate applies to every entry: the pid only proves which
+/// process created a backup, never that its commit finished, so a
+/// concurrent commit in this process must not lose its live backup.
+fn reap_install_backup_siblings(
+    generators_dir: &Utf8Path,
+    cutoff: std::time::SystemTime,
+) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir(generators_dir) else {
+        return Ok(());
+    };
+    let mut failures = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !name.starts_with(".qcg-install-backup-") {
+            continue;
+        }
+        let Ok(backup) = Utf8PathBuf::from_path_buf(entry.path()) else {
+            continue;
+        };
+        // Resolve the target id from the marker when present. A present
+        // but unreadable marker fails closed: the entry may be the sole
+        // surviving copy of an interrupted commit, so it is never swept
+        // as scratch (the recovery pass above already restored whatever
+        // it could parse; the rest stays for the operator).
+        let marker_path = backup.join(install_commit::BACKUP_MARKER_FILE);
+        let marker_present = std::fs::symlink_metadata(&marker_path).is_ok();
+        let target_id: Option<String> = std::fs::read(&marker_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|value| value.get("id").and_then(|v| v.as_str()).map(str::to_string));
+        if marker_present && target_id.is_none() {
+            continue;
+        }
+        if let Some(id) = &target_id {
+            let target = generators_dir.join(id);
+            // Sole remaining old version with a missing target: keep for
+            // recovery, never sweep (F14-02/F14-04).
+            if std::fs::symlink_metadata(&target).is_err() {
+                continue;
+            }
+            // Live commit guard (F14-03): a concurrent commit holds the
+            // per-id file lock. Try non-blocking; contention means live.
+            let lock_path = generators_dir.join(install_commit::per_id_lock_name(id));
+            if let Ok(lock_file) = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&lock_path)
+                && lock_file.try_lock().is_err()
+            {
+                continue;
+            }
+            // Freshness from the marker (F14-01): the renamed directory
+            // keeps its old mtime, so the directory mtime alone would mark
+            // a just-made backup as stale.
+            let fresh = install_commit::backup_freshness(&backup);
+            let old_enough = fresh.map(|mtime| mtime <= cutoff).unwrap_or(false);
+            if !old_enough {
+                continue;
+            }
+        } else {
+            // Unmarked: legacy scratch path with the age gate.
+            let old_enough = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .map(|mtime| mtime <= cutoff)
+                .unwrap_or(false);
+            if !old_enough {
+                continue;
+            }
+        }
+        if let Err(error) = install_commit::remove_owned_path(&backup) {
+            failures.push(format!(
+                "failed to remove stale install `{backup}`: {error}"
+            ));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "failed to reap stale installs in `{generators_dir}`: {}",
+            failures.join("; ")
+        ))
+    }
 }
 
 pub(crate) async fn install(
@@ -313,6 +446,7 @@ pub(crate) fn sign_package(output: &Utf8Path, bytes: &[u8], signing_key: &Utf8Pa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::install_commit;
 
     static ENV_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
@@ -629,10 +763,11 @@ qcg_version = "^0.1"
 
     #[test]
     fn stale_install_tmps_reap_by_cutoff_prefix_and_ownership() {
-        // E14-8: install staging, archive, and backup prefixes are reaped;
-        // own-pid leftovers go aggressively while foreign names keep the 1h
-        // gate. A cutoff of `UNIX_EPOCH` reaps nothing foreign, proving the
-        // age gate direction without touching mtimes.
+        // E14-8: install staging, archive, and backup prefixes are reaped
+        // purely by age. Fresh entries survive even with an own-pid name: a
+        // concurrent install in this process must not lose its live staging
+        // to a sibling's sweep. A cutoff of `UNIX_EPOCH` reaps nothing,
+        // proving the age gate direction without touching mtimes.
         use std::time::SystemTime;
         let root = Utf8PathBuf::from_path_buf(
             std::env::temp_dir().join(format!("qcg-install-reap-{}", uuid::Uuid::now_v7())),
@@ -642,10 +777,12 @@ qcg_version = "^0.1"
         std::fs::create_dir_all(&root).expect("root should be created");
         let own_pid = std::process::id();
         let foreign_pid = own_pid.wrapping_add(1);
-        // Own-pid staging dir is reaped even with a future cutoff (no age gate).
+        let hour_ago = SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(3600))
+            .expect("one hour ago must be representable");
+        // Just-created entries are fresh: an hour-old cutoff reaps nothing,
+        // regardless of pid ownership.
         let own_staging = root.join(format!(".qcg-install-temp-{own_pid}-old"));
-        // Foreign staging with an old mtime is reaped; the epoch cutoff
-        // proves the gate (nothing older than epoch, so nothing reaped).
         let foreign_staging = root.join(format!(".qcg-install-temp-{foreign_pid}-old"));
         let foreign_archive = root.join(format!(".qcg-install-archive-{foreign_pid}-old.qcg"));
         let foreign_backup = root.join(format!(".qcg-install-backup-{foreign_pid}-old"));
@@ -655,11 +792,23 @@ qcg_version = "^0.1"
         std::fs::write(&foreign_archive, b"x").expect("foreign archive should be created");
         std::fs::create_dir_all(&foreign_backup).expect("foreign backup should be created");
         std::fs::create_dir_all(&foreign_file).expect("foreign should be created");
-        reap_install_tmps_before(&root, ".qcg-install-temp-", SystemTime::now(), own_pid)
+        reap_install_tmps_before(&root, ".qcg-install-temp-", hour_ago)
+            .expect("reap should succeed");
+        assert!(
+            own_staging.exists(),
+            "fresh own-pid staging must survive a concurrent sweep"
+        );
+        assert!(
+            foreign_staging.exists(),
+            "fresh foreign staging must survive the age gate"
+        );
+        // A `now` cutoff treats just-created entries as stale: all prefixes
+        // are reaped.
+        reap_install_tmps_before(&root, ".qcg-install-temp-", SystemTime::now())
             .expect("reap should succeed");
         assert!(
             !own_staging.exists(),
-            "own-pid staging must be reaped aggressively"
+            "stale own-pid staging must be reaped"
         );
         assert!(
             !foreign_staging.exists(),
@@ -667,24 +816,170 @@ qcg_version = "^0.1"
         );
         assert!(foreign_file.exists(), "a foreign dir must survive");
         // Archive and backup prefixes are reaped too.
-        reap_install_tmps_before(&root, ".qcg-install-archive-", SystemTime::now(), own_pid)
+        reap_install_tmps_before(&root, ".qcg-install-archive-", SystemTime::now())
             .expect("archive reap should succeed");
         assert!(!foreign_archive.exists(), "an archive file must be reaped");
-        reap_install_tmps_before(&root, ".qcg-install-backup-", SystemTime::now(), own_pid)
+        reap_install_tmps_before(&root, ".qcg-install-backup-", SystemTime::now())
             .expect("backup reap should succeed");
         assert!(!foreign_backup.exists(), "a backup dir must be reaped");
         // Epoch cutoff reaps nothing foreign.
         std::fs::create_dir_all(&foreign_staging).expect("foreign staging should be recreated");
-        reap_install_tmps_before(
-            &root,
-            ".qcg-install-temp-",
-            SystemTime::UNIX_EPOCH,
-            foreign_pid.wrapping_add(1000),
-        )
-        .expect("reap should succeed");
+        reap_install_tmps_before(&root, ".qcg-install-temp-", SystemTime::UNIX_EPOCH)
+            .expect("reap should succeed");
         assert!(
             foreign_staging.exists(),
             "nothing is older than the epoch, so nothing must be reaped"
+        );
+    }
+
+    #[test]
+    fn backup_with_missing_target_recovers_before_sweep() {
+        // F14-02: a backup whose target is missing restores instead of
+        // being swept, even when the backup directory mtime looks old
+        // (rename preserves it).
+        let root = Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("qcg-install-recover-{}", uuid::Uuid::now_v7())),
+        )
+        .expect("temporary path must be UTF-8");
+        let _temp_guard = TempGuard(root.clone());
+        std::fs::create_dir_all(&root).expect("root should be created");
+        let backup = root.join(format!(
+            ".qcg-install-backup-{}-{}",
+            std::process::id().wrapping_add(777),
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(backup.join("content")).expect("backup content");
+        std::fs::write(
+            backup.join(install_commit::BACKUP_MARKER_FILE),
+            r#"{"id":"mygen","target":"mygen","phase":"backup-created","pid":1}"#,
+        )
+        .expect("marker");
+        // Target "mygen" is missing: recovery must restore it.
+        reap_stale_install_tmps(&root).expect("sweep should succeed");
+        assert!(
+            root.join("mygen").exists(),
+            "the missing target must be restored from backup"
+        );
+        assert!(
+            !backup.exists(),
+            "the restored backup must be consumed, not left behind"
+        );
+    }
+
+    #[test]
+    fn fresh_marked_backup_survives_foreign_sweep() {
+        // F14-01: a just-made backup keeps its old directory mtime after
+        // rename; the fresh marker mtime protects it from a concurrent
+        // foreign sweep while its target exists.
+        let root = Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("qcg-install-fresh-{}", uuid::Uuid::now_v7())),
+        )
+        .expect("temporary path must be UTF-8");
+        let _temp_guard = TempGuard(root.clone());
+        std::fs::create_dir_all(&root).expect("root should be created");
+        std::fs::create_dir_all(root.join("mygen")).expect("target exists");
+        let backup = root.join(format!(
+            ".qcg-install-backup-{}-{}",
+            std::process::id().wrapping_add(778),
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&backup).expect("backup dir");
+        std::fs::write(
+            backup.join(install_commit::BACKUP_MARKER_FILE),
+            r#"{"id":"mygen","target":"mygen","phase":"backup-created","pid":1}"#,
+        )
+        .expect("marker");
+        reap_stale_install_tmps(&root).expect("sweep should succeed");
+        assert!(
+            backup.exists(),
+            "a fresh marked backup must survive a foreign sweep"
+        );
+        assert!(root.join("mygen").exists(), "the target must remain");
+    }
+
+    #[test]
+    fn failed_commit_restores_old_version_and_converges_on_rerun() {
+        // F14-04 (commit-failure half): with an installed target, a commit
+        // whose staging vanished fails; the old version is rolled back
+        // intact, no orphan backup is left behind, and a rerun with fresh
+        // staging converges. The rollback-failure arm (retained backup +
+        // reported path) is structural: the sweep half is covered by
+        // backup_with_missing_target_recovers_before_sweep.
+        let root = Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("qcg-install-commitfail-{}", uuid::Uuid::now_v7())),
+        )
+        .expect("temporary path must be UTF-8");
+        let _temp_guard = TempGuard(root.clone());
+        let target = root.join("mygen");
+        std::fs::create_dir_all(&target).expect("target should be created");
+        std::fs::write(target.join("qcg.toml"), "old = true\n").expect("old manifest");
+        std::fs::write(target.join("data.txt"), "old-version-bytes").expect("old content");
+        // Staging that will never exist: the commit must fail.
+        let missing_staging = root.join("staging-vanished");
+        let error = install_commit::commit_install(&missing_staging, &target, true)
+            .expect_err("a commit without staging must fail");
+        assert!(
+            error.to_string().contains("failed to commit generator"),
+            "the failure must name the commit: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("data.txt")).expect("restored content"),
+            "old-version-bytes",
+            "rollback must restore the sole old version"
+        );
+        let orphans: Vec<_> = std::fs::read_dir(&root)
+            .expect("scan")
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(".qcg-install-backup-"))
+            })
+            .collect();
+        assert!(
+            orphans.is_empty(),
+            "a restored rollback must consume its backup"
+        );
+        // Rerun with real staging converges onto the restored old version.
+        let staging = root.join("staging-fresh");
+        std::fs::create_dir_all(&staging).expect("fresh staging");
+        std::fs::write(staging.join("qcg.toml"), "new = true\n").expect("new manifest");
+        install_commit::commit_install(&staging, &target, true).expect("rerun should converge");
+        assert_eq!(
+            std::fs::read_to_string(target.join("qcg.toml")).expect("new manifest"),
+            "new = true\n",
+            "the rerun must publish the new target"
+        );
+    }
+
+    #[test]
+    fn corrupt_marked_backup_is_never_swept() {
+        // A marker that cannot be parsed may still guard the sole copy of
+        // an interrupted commit: the sweep must keep it (fail closed)
+        // instead of treating it as age-gated scratch.
+        let root = Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("qcg-install-corrupt-{}", uuid::Uuid::now_v7())),
+        )
+        .expect("temporary path must be UTF-8");
+        let _temp_guard = TempGuard(root.clone());
+        std::fs::create_dir_all(&root).expect("root should be created");
+        let backup = root.join(format!(
+            ".qcg-install-backup-{}-{}",
+            std::process::id().wrapping_add(779),
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&backup).expect("backup dir");
+        std::fs::write(
+            backup.join(install_commit::BACKUP_MARKER_FILE),
+            b"\x00not-json",
+        )
+        .expect("corrupt marker");
+        // No target exists and no id parses: the sweep must still keep it.
+        reap_stale_install_tmps(&root).expect("sweep should succeed");
+        assert!(
+            backup.exists(),
+            "a corrupt-marked backup must survive the sweep"
         );
     }
 

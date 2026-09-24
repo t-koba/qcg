@@ -2081,6 +2081,7 @@
           "metrics": {
             "$ref": "#/components/schemas/RunMetrics",
             "default": {
+              "budget_charged": 0,
               "cost_microusd": 0,
               "duration_ms": 0,
               "llm_calls": 0,
@@ -2411,6 +2412,7 @@
           "metrics": {
             "$ref": "#/components/schemas/RunMetrics",
             "default": {
+              "budget_charged": 0,
               "cost_microusd": 0,
               "duration_ms": 0,
               "llm_calls": 0,
@@ -2733,6 +2735,13 @@
       },
       "RunMetrics": {
         "properties": {
+          "budget_charged": {
+            "default": 0,
+            "description": "Durable step-budget consumption (F13): sum of `budget_charged`\ndeltas. `steps_executed` counts `step_started` events (observational,\nincludes uncharged foreach children); this counter drives\n`max_steps` enforcement and survives restarts identically.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "cost_microusd": {
             "default": 0,
             "format": "uint64",
@@ -4472,70 +4481,6 @@
           }
         },
         "summary": "Run snapshot"
-      },
-      "post": {
-        "parameters": [
-          {
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Retries with the same key and request body return the original run.",
-            "in": "header",
-            "name": "Idempotency-Key",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RunSnapshot"
-                }
-              }
-            },
-            "description": "Cancellation accepted"
-          },
-          "404": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
-                }
-              }
-            },
-            "description": "Resource not found"
-          },
-          "409": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
-                }
-              }
-            },
-            "description": "Resource conflict"
-          },
-          "500": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
-                }
-              }
-            },
-            "description": "Internal server error"
-          }
-        },
-        "summary": "Cancel a run (alias of /api/runs/{id}:cancel)"
       }
     },
     "/api/runs/{id}/artifacts": {

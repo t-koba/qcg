@@ -384,6 +384,59 @@ pub(crate) fn checkpoint_scope(
 }
 
 impl RunContext {
+    /// Test-only context builder for downstream approval/resume tests
+    /// (F02). Mirrors production construction (same gateways, same secret
+    /// loading) with fresh cancellation and empty replay state. Only
+    /// available with the `test-support` feature, never in production
+    /// builds; downstream crates opt in through dev-dependencies.
+    #[cfg(feature = "test-support")]
+    pub fn for_tests(
+        run_id: String,
+        workspace: camino::Utf8PathBuf,
+        metadata: camino::Utf8PathBuf,
+        contract: qcg_contract::Contract,
+        confirmations: std::collections::BTreeMap<String, bool>,
+        answers: std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Result<Self, String> {
+        use std::sync::{Arc, Mutex};
+        let runtime = contract.manifest.runtime.clone();
+        let fs = crate::FsGateway::new(workspace.clone(), &contract.manifest.permissions);
+        let cmd = crate::CmdGateway::new(contract.manifest.permissions.clone(), workspace.clone());
+        let http = crate::HttpGateway::new(
+            contract.manifest.permissions.clone(),
+            std::time::Duration::from_secs(runtime.http_timeout_seconds),
+            runtime.http_body_limit_bytes,
+            runtime.http_redirect_limit,
+        )
+        .map_err(|error| error.to_string())?;
+        let secrets = crate::SecretStore::try_from_env(&contract.manifest.secrets)
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            run_id,
+            contract,
+            workspace: workspace.clone(),
+            metadata: metadata.clone(),
+            fs,
+            cmd,
+            http,
+            secrets,
+            interactive: false,
+            answers,
+            confirmations,
+            llm_provider: None,
+            llm_seed_override: None,
+            templates: crate::TemplateService,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            elapsed_deadline: None,
+            snapshot_source: None,
+            run_refs: Arc::new(std::collections::BTreeMap::new()),
+            replayed_steps: Arc::new(std::collections::BTreeMap::new()),
+            checkpoint_accounting: Arc::new(Mutex::new(
+                crate::engine::checkpoint::CheckpointAccounting::default(),
+            )),
+        })
+    }
+
     pub(crate) fn run_checkpoint(&self) -> Result<(), EngineError> {
         // Loop scope: no single node is responsible, so the single format
         // names it "runtime" (E11).
@@ -879,6 +932,125 @@ impl RunContext {
                 }))
             }
         }
+    }
+
+    /// Stores the exact pending tool payload in a run-private sidecar
+    /// (F02). The public journal keeps only the redacted copy; this file
+    /// holds the full bytes so an approved operation resumes with the
+    /// original content after a restart or in-process HITL. Owner-only
+    /// (0600), fsynced, never exposed via journal/SSE APIs.
+    pub fn store_pending_tool_payload(
+        &self,
+        node: &NodeDef,
+        operation_id: &str,
+        payload: &Value,
+    ) -> Result<(), StepError> {
+        let dir = self.metadata.join("pending-payloads");
+        std::fs::create_dir_all(dir.as_std_path()).map_err(|error| {
+            StepError::failed(
+                &node.id,
+                format!(
+                    "operation `{operation_id}` pending payload dir cannot be created: {error}"
+                ),
+            )
+        })?;
+        let name = Self::pending_payload_name(operation_id);
+        let path = dir.join(&name);
+        let bytes = serde_json::to_vec(payload).map_err(|error| {
+            StepError::failed(
+                &node.id,
+                format!("operation `{operation_id}` pending payload is not serializable: {error}"),
+            )
+        })?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        use std::io::Write as _;
+        let mut file = options.open(path.as_std_path()).map_err(|error| {
+            StepError::failed(
+                &node.id,
+                format!("operation `{operation_id}` pending payload cannot be opened: {error}"),
+            )
+        })?;
+        file.write_all(&bytes).map_err(|error| {
+            StepError::failed(
+                &node.id,
+                format!("operation `{operation_id}` pending payload cannot be written: {error}"),
+            )
+        })?;
+        file.sync_all().map_err(|error| {
+            StepError::failed(
+                &node.id,
+                format!("operation `{operation_id}` pending payload cannot be synced: {error}"),
+            )
+        })?;
+        drop(file);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(
+                path.as_std_path(),
+                std::fs::Permissions::from_mode(0o600),
+            );
+            if let Ok(dir_file) = std::fs::File::open(dir.as_std_path()) {
+                let _ = dir_file.sync_all();
+            }
+        }
+        Ok(())
+    }
+
+    /// Loads a stored pending payload. Returns `None` when absent (no
+    /// payload was stored); corrupt files fail closed as refusals so a
+    /// damaged continuation never executes unknown bytes.
+    pub fn load_pending_tool_payload(
+        &self,
+        node: &NodeDef,
+        operation_id: &str,
+    ) -> Result<Option<Value>, StepError> {
+        let path = self
+            .metadata
+            .join("pending-payloads")
+            .join(Self::pending_payload_name(operation_id));
+        match std::fs::read(path.as_std_path()) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|error| StepError::Refused {
+                    node: node.id.clone(),
+                    message: format!(
+                        "operation `{operation_id}` pending payload is corrupt: {error}; manual recovery required"
+                    ),
+                }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(StepError::Refused {
+                node: node.id.clone(),
+                message: format!(
+                    "operation `{operation_id}` pending payload is unreadable: {error}; manual recovery required"
+                ),
+            }),
+        }
+    }
+
+    /// Removes a pending payload after the operation settles (success,
+    /// clean error, or explicit refusal). Best-effort: failures are
+    /// ignored so settlement never fails on cleanup.
+    pub fn clear_pending_tool_payload(&self, operation_id: &str) {
+        let path = self
+            .metadata
+            .join("pending-payloads")
+            .join(Self::pending_payload_name(operation_id));
+        let _ = std::fs::remove_file(path.as_std_path());
+    }
+
+    fn pending_payload_name(operation_id: &str) -> String {
+        use sha2::{Digest, Sha256};
+        format!(
+            "{}.json",
+            hex::encode(Sha256::digest(operation_id.as_bytes()))
+        )
     }
 }
 

@@ -85,6 +85,7 @@ fn live_metrics(budget: &qcg_engine::BudgetState) -> RunMetrics {
         steps_failed: budget.steps_failed,
         steps_skipped: budget.steps_skipped,
         steps_executed: budget.steps_executed as u64,
+        budget_charged: budget.budget_charged as u64,
         repair_attempts: budget.repair_attempts,
         regenerate_attempts: budget.regenerate_attempts,
         llm_calls: budget.llm_calls,

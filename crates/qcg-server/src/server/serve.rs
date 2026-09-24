@@ -97,8 +97,9 @@ pub struct ResolvedServerPolicy {
     pub auto_gc: bool,
     pub preemption_enabled: bool,
     /// Deployment HTTP rate limit resolved at boot (E04 freeze). `None`
-    /// leaves the server unthrottled; `Some` installs one token bucket per
-    /// presented credential.
+    /// leaves the server unthrottled; `Some` installs one shared
+    /// anonymous/instance bucket plus one bucket for verified identity
+    /// (F10), never one bucket per unverified presented string.
     pub rate_limit: Option<RateLimitPolicy>,
     /// Deployment audit floor resolved at boot (E04 freeze).
     pub audit_floor: qcg_policy::AuditFloor,
@@ -421,8 +422,8 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
         max_total_steps = max_total_steps,
         auto_gc,
         preemption_enabled,
-        rate_limit_rps = rate_limit.map(|policy| policy.rps),
-        rate_limit_burst = rate_limit.map(|policy| policy.burst),
+        rate_limit_rps = rate_limit.as_ref().map(|policy| policy.rps),
+        rate_limit_burst = rate_limit.as_ref().map(|policy| policy.burst),
         validated_cors_origins = validated_cors.len(),
         otlp = otlp
             .as_ref()
@@ -509,11 +510,13 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
     // maintenance tasks start, so the first GC and resumer pass cannot
     // race the recovery admission (E04).
     service.resume_recovered_runs().await;
-    let tasks = ResidentTasks::start(&service, &shutdown, auto_gc);
+    let mut tasks = ResidentTasks::start(&service, &shutdown, auto_gc);
     // Resident OTLP export: best-effort delivery, cancelled by the shared
-    // shutdown token, never on the run execution path.
+    // shutdown token, never on the run execution path. Owned by
+    // ResidentTasks so an outer-deadline timeout aborts and joins it like
+    // every other resident (F01).
     if let Some(otlp) = otlp {
-        tokio::spawn(super::otlp::run_exporter(Arc::clone(&state), otlp));
+        tasks.spawn_otlp(super::otlp::run_exporter(Arc::clone(&state), otlp));
     }
     tracing::info!(%actual_addr, "qcg server listening");
     // Single shutdown initiation (E05): every path below converges on
@@ -526,33 +529,42 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
     // (E05). Cancelling the shared token is exactly what
     // `mark_shutting_down` does, without the ownership.
     let shutdown_at_signal = shutdown.clone();
-    // The HTTP drain itself is bounded by DRAIN_TIMEOUT: a wedged drain
-    // connection cannot delay shutdown settlement indefinitely (E05). On
-    // timeout the serve future is dropped (cutting the drain) and shutdown
-    // proceeds anyway; the timeout is warned, never silent.
-    let serve_result: std::io::Result<()> = match tokio::time::timeout(
-        shutdown_drain,
-        axum::serve(listener, app).with_graceful_shutdown(async move {
-            #[cfg(unix)]
-            shutdown_signal(terminate).await;
-            #[cfg(not(unix))]
-            shutdown_signal().await;
-            // Completing this future stops accepting new connections and
-            // starts the HTTP drain. Initiating shutdown here rejects new
-            // mutating requests, closes SSE streams, and makes the service
-            // refuse internal admissions from the same moment (E05).
-            initiate_shutdown(&shutdown_at_signal);
-        }),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => {
-            tracing::warn!(
-                drain_secs = shutdown_drain.as_secs(),
-                "HTTP drain exceeded its timeout; proceeding to shutdown"
-            );
-            Ok(())
+    // Normal operation is unbounded (F01): no timeout wraps the serve
+    // future itself. The drain timeout starts only after the shutdown
+    // signal fires. Before the signal the server runs indefinitely; after
+    // the signal in-flight connections have `shutdown_drain` to drain
+    // before shutdown proceeds anyway.
+    let serve_grand = axum::serve(listener, app).with_graceful_shutdown(async move {
+        #[cfg(unix)]
+        shutdown_signal(terminate).await;
+        #[cfg(not(unix))]
+        shutdown_signal().await;
+        // Completing this future stops accepting new connections and
+        // starts the HTTP drain. Initiating shutdown here rejects new
+        // mutating requests, closes SSE streams, and makes the service
+        // refuse internal admissions from the same moment (E05).
+        initiate_shutdown(&shutdown_at_signal);
+    });
+    // `WithGracefulShutdown` is `IntoFuture` but not `Future`: wrap it so
+    // `select!` and the drain-only `timeout` share one future object.
+    let mut serve_future = Box::pin(async move { serve_grand.await });
+    let serve_result: std::io::Result<()> = tokio::select! {
+        result = &mut serve_future => result,
+        _ = shutdown.cancelled() => {
+            // Shutdown was initiated externally (e.g. service-level
+            // cancellation) before the OS signal future completed.
+            // The graceful-shutdown future is now draining; bound only
+            // the drain phase from this point.
+            match tokio::time::timeout(shutdown_drain, serve_future).await {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!(
+                        drain_secs = shutdown_drain.as_secs(),
+                        "HTTP drain exceeded its timeout; proceeding to shutdown"
+                    );
+                    Ok(())
+                }
+            }
         }
     };
     // Serving returned, so the shutdown signal fired (or the listener
@@ -656,6 +668,13 @@ fn initiate_shutdown(shutdown: &CancellationToken) {
 /// resumers or runs that hold service clones and the run-store lock (E05).
 struct ResidentTasks {
     handles: Vec<tokio::task::JoinHandle<Result<(), qcg_service::ServiceError>>>,
+    /// Abort handles for every resident task, retained for the lifetime of
+    /// this struct (F01). Waiters move the original `JoinHandle` inside so
+    /// `handles` is drained during graceful shutdown; aborting only the
+    /// waiter would drop the inner handle (detach) without stopping the
+    /// original task. These abort handles let `Drop` stop the originals
+    /// even after the waiters were aborted by an outer-deadline timeout.
+    abort_handles: Vec<tokio::task::AbortHandle>,
     /// Grace waiters spawned by `shutdown`. Kept on the struct (not in a
     /// local) so `Drop` can abort them on the abort path: dropping a bare
     /// `JoinSet` would detach waiter tasks that own resident handles and
@@ -664,6 +683,10 @@ struct ResidentTasks {
     /// Service handle for abort-path engine cleanup. Unit tests that only
     /// exercise handle bookkeeping leave this empty (E05).
     service: Option<LocalQcgService>,
+    /// OTLP exporter handle owned like every other resident (F01). Kept
+    /// separate because its output type differs from the service tasks.
+    otlp_handle: Option<tokio::task::JoinHandle<()>>,
+    otlp_abort: Option<tokio::task::AbortHandle>,
 }
 
 impl ResidentTasks {
@@ -679,11 +702,23 @@ impl ResidentTasks {
         if auto_gc && let Some(handle) = service.start_retention_gc(shutdown.clone()) {
             handles.push(handle);
         }
+        let abort_handles = handles.iter().map(|h| h.abort_handle()).collect();
         Self {
             handles,
+            abort_handles,
             waiters: tokio::task::JoinSet::new(),
             service: Some(service.clone()),
+            otlp_handle: None,
+            otlp_abort: None,
         }
+    }
+
+    /// Takes ownership of the OTLP exporter task so shutdown and abort
+    /// paths join it like every other resident (F01).
+    fn spawn_otlp(&mut self, future: impl std::future::Future<Output = ()> + Send + 'static) {
+        let handle = tokio::spawn(future);
+        self.otlp_abort = Some(handle.abort_handle());
+        self.otlp_handle = Some(handle);
     }
 
     async fn shutdown(mut self) -> Result<()> {
@@ -706,6 +741,10 @@ impl ResidentTasks {
                 match tokio::time::timeout(std::time::Duration::from_secs(5), &mut handle).await {
                     Err(_) => {
                         handle.abort();
+                        // Confirm termination so no detached task keeps a
+                        // service clone (and the run-store lock) alive
+                        // after the grace period (F01).
+                        let _ = handle.await;
                         tracing::warn!("resident task exceeded the shutdown grace period; aborted");
                         Err("resident task exceeded the shutdown grace period".to_string())
                     }
@@ -720,6 +759,25 @@ impl ResidentTasks {
                         Err(format!("resident task ended with an error: {task_error}"))
                     }
                     Ok(Ok(Ok(()))) => Ok(()),
+                }
+            });
+        }
+        if let Some(mut otlp) = self.otlp_handle.take() {
+            self.waiters.spawn(async move {
+                match tokio::time::timeout(std::time::Duration::from_secs(5), &mut otlp).await {
+                    Err(_) => {
+                        otlp.abort();
+                        let _ = otlp.await;
+                        tracing::warn!("OTLP exporter exceeded the shutdown grace period; aborted");
+                        Err("OTLP exporter exceeded the shutdown grace period".to_string())
+                    }
+                    Ok(Err(join_error)) if !join_error.is_cancelled() => {
+                        tracing::warn!(%join_error, "OTLP exporter failed during shutdown");
+                        Err(format!(
+                            "OTLP exporter failed during shutdown: {join_error}"
+                        ))
+                    }
+                    _ => Ok(()),
                 }
             });
         }
@@ -766,7 +824,19 @@ impl Drop for ResidentTasks {
             service.abort_all_engine_tasks();
         }
         self.waiters.abort_all();
+        // Abort the original resident tasks via retained abort handles
+        // (F01): `handles` may already be drained into waiters, and
+        // aborting only the waiter would detach the original task.
+        for abort in &self.abort_handles {
+            abort.abort();
+        }
         for handle in &self.handles {
+            handle.abort();
+        }
+        if let Some(abort) = &self.otlp_abort {
+            abort.abort();
+        }
+        if let Some(handle) = &self.otlp_handle {
             handle.abort();
         }
     }
@@ -831,7 +901,8 @@ pub(crate) fn build_router(
         // (E05). The rate limit layer is layered after auth and immediately
         // inside the shutdown gate: draining still answers 503 before the
         // limiter can answer 429, while the limiter covers unauthenticated
-        // floods and keys one bucket per presented credential.
+        // floods with a shared anonymous bucket and splits only verified
+        // identity (F10).
         .layer(axum_middleware::from_fn(reject_unsafe_generator_asset_path))
         .layer(axum_middleware::from_fn(security_headers_middleware))
         .layer(axum_middleware::from_fn_with_state(
@@ -839,10 +910,13 @@ pub(crate) fn build_router(
             require_api_auth,
         ));
     let app = match rate_limit {
-        Some(policy) => app.layer(axum_middleware::from_fn_with_state(
-            Arc::new(RateLimiter::new(policy)),
-            enforce_rate_limit,
-        )),
+        Some(policy) => {
+            let limiter = RateLimiter::with_expected_digest(policy, state.api_token_digest);
+            app.layer(axum_middleware::from_fn_with_state(
+                Arc::new(limiter),
+                enforce_rate_limit,
+            ))
+        }
         None => app,
     };
     let mut app = app
@@ -1446,8 +1520,11 @@ mod tests {
         });
         let tasks = ResidentTasks {
             handles: vec![handle],
+            abort_handles: vec![],
             waiters: tokio::task::JoinSet::new(),
             service: None,
+            otlp_handle: None,
+            otlp_abort: None,
         };
         let error = tasks
             .shutdown()
@@ -1474,8 +1551,11 @@ mod tests {
         });
         let tasks = ResidentTasks {
             handles: vec![first, second],
+            abort_handles: vec![],
             waiters: tokio::task::JoinSet::new(),
             service: None,
+            otlp_handle: None,
+            otlp_abort: None,
         };
         let started = tokio::time::Instant::now();
         let error = tasks
@@ -1677,17 +1757,54 @@ command = ["sh", "-c", "sleep 30"]"#,
             let _ = done_tx.send(());
             Ok::<(), qcg_service::ServiceError>(())
         });
+        let abort = handle.abort_handle();
         {
             let _tasks = ResidentTasks {
                 handles: vec![handle],
+                abort_handles: vec![abort],
                 waiters: tokio::task::JoinSet::new(),
                 service: None,
+                otlp_handle: None,
+                otlp_abort: None,
             };
             // Drop aborts the wedged loop here.
         }
         assert!(
             done_rx.await.is_err(),
             "the wedged loop must be aborted on drop, not detached"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_handles_survive_graceful_drain() {
+        // F01: waiters move the original JoinHandles inside during graceful
+        // shutdown; the retained abort handles let Drop stop the originals
+        // even after an outer-deadline timeout aborts the waiters.
+        let handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok::<(), qcg_service::ServiceError>(())
+        });
+        let abort = handle.abort_handle();
+        let mut tasks = ResidentTasks {
+            handles: vec![handle],
+            abort_handles: vec![abort.clone()],
+            waiters: tokio::task::JoinSet::new(),
+            service: None,
+            otlp_handle: None,
+            otlp_abort: None,
+        };
+        // Simulate the graceful path draining `handles` into waiters, then
+        // an outer timeout dropping everything mid-wait.
+        let drained = std::mem::take(&mut tasks.handles);
+        assert_eq!(drained.len(), 1);
+        drop(tasks);
+        assert!(
+            abort.is_finished() || {
+                // Give the abort a moment to land; the task never exits alone.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                abort.is_finished()
+            },
+            "the original resident must stop via its retained abort handle"
         );
     }
 
@@ -1880,8 +1997,11 @@ command = ["sh", "-c", "sleep 30"]"#,
         });
         let tasks = ResidentTasks {
             handles: vec![wedged],
+            abort_handles: vec![],
             waiters: tokio::task::JoinSet::new(),
             service: Some(service.clone()),
+            otlp_handle: None,
+            otlp_abort: None,
         };
         service.mark_shutting_down();
         // The outer deadline from serve (short for the test) covers both
@@ -2026,7 +2146,11 @@ command = ["sh", "-c", "sleep 30"]"#,
             resolve_server_policy(&config)
                 .expect("a positive rps should resolve")
                 .rate_limit,
-            Some(RateLimitPolicy { rps: 10, burst: 10 }),
+            Some(RateLimitPolicy {
+                rps: 10,
+                burst: 10,
+                trusted_identity_header: None
+            }),
             "an unset burst must default to the rps value"
         );
         set("QCG_RATE_LIMIT_BURST", "25");
@@ -2034,7 +2158,11 @@ command = ["sh", "-c", "sleep 30"]"#,
             resolve_server_policy(&config)
                 .expect("a positive burst should resolve")
                 .rate_limit,
-            Some(RateLimitPolicy { rps: 10, burst: 25 })
+            Some(RateLimitPolicy {
+                rps: 10,
+                burst: 25,
+                trusted_identity_header: None
+            })
         );
         unset("QCG_RATE_LIMIT_RPS");
         unset("QCG_RATE_LIMIT_BURST");
@@ -2149,7 +2277,11 @@ command = ["sh", "-c", "sleep 30"]"#,
         let config = boot_config(&generators, &runs);
         let validated_cors =
             parse_cors_origins(&config.cors_origins).expect("test CORS should parse");
-        let policy = RateLimitPolicy { rps: 1, burst: 1 };
+        let policy = RateLimitPolicy {
+            rps: 1,
+            burst: 1,
+            trusted_identity_header: None,
+        };
         let app = build_router(&state, &config, &validated_cors, Some(policy))
             .expect("router should build");
         let read = || {

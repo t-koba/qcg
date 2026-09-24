@@ -39,6 +39,12 @@ pub struct RunMetrics {
     pub steps_skipped: u64,
     #[serde(default)]
     pub steps_executed: u64,
+    /// Durable step-budget consumption (F13): sum of `budget_charged`
+    /// deltas. `steps_executed` counts `step_started` events (observational,
+    /// includes uncharged foreach children); this counter drives
+    /// `max_steps` enforcement and survives restarts identically.
+    #[serde(default)]
+    pub budget_charged: u64,
     #[serde(default)]
     pub repair_attempts: u64,
     #[serde(default)]

@@ -564,12 +564,11 @@ pub(crate) fn redacted_ask_user_title(title: &str) -> String {
     }
     use sha2::Digest as _;
     let digest = hex::encode(sha2::Sha256::digest(redacted.as_bytes()));
-    let mut head = redacted[..LIMIT].to_string();
-    // Keep the truncation on a character boundary.
-    while !head.is_empty() && !redacted[..LIMIT].is_char_boundary(head.len()) {
-        head.pop();
+    let mut end = LIMIT.min(redacted.len());
+    while end > 0 && !redacted.is_char_boundary(end) {
+        end -= 1;
     }
-    format!("{head}...[sha256:{digest}]")
+    format!("{}...[sha256:{digest}]", &redacted[..end])
 }
 
 #[cfg(test)]

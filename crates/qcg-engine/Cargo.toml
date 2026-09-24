@@ -41,3 +41,9 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Secur
 
 [dev-dependencies]
 toml.workspace = true
+
+[features]
+# Test-only RunContext builder for downstream approval/resume tests (F02).
+# Never enabled in production builds; only downstream dev-dependencies opt
+# in so integration-style tests can drive real gateways without mocks.
+test-support = []

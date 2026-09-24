@@ -73,6 +73,17 @@ pub enum NodeOutcome {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BudgetState {
     pub steps_executed: usize,
+    /// Durable budget consumption (F13): sum of `budget_charged` deltas.
+    /// Live execution and journal recovery share this counter so retry and
+    /// foreach charge rules mean the same after a restart. `steps_executed`
+    /// stays as the observational event count (step_started events).
+    #[serde(default)]
+    pub budget_charged: usize,
+    /// Whether any `budget_charged` event folded (F13 migration): new
+    /// journals seed the live tracker from `budget_charged`; journals that
+    /// predate the event fall back to `steps_executed`.
+    #[serde(default)]
+    pub has_budget_charges: bool,
     pub steps_succeeded: u64,
     pub steps_failed: u64,
     pub steps_skipped: u64,
@@ -182,6 +193,12 @@ pub struct RunState {
     /// question proves a crash mid-remote-call with an indeterminate remote
     /// outcome, and must fail instead of blindly resuming.
     pub mcp_resumed: BTreeMap<String, String>,
+    /// Hooks settled with `on_error = warn` (F07-02): a Warn-ended hook is
+    /// processed, not pending. Resume skips it instead of re-executing so a
+    /// HITL resume after a warned `run_started` hook has no undeclared
+    /// duplicate execution. Successful hooks replay via node outcomes.
+    #[serde(default)]
+    pub hooks_settled: BTreeSet<String>,
 }
 
 impl Default for RunState {
@@ -215,6 +232,7 @@ impl Default for RunState {
             cancel_operations: BTreeSet::new(),
             mcp_pending: BTreeMap::new(),
             mcp_resumed: BTreeMap::new(),
+            hooks_settled: BTreeSet::new(),
         }
     }
 }
@@ -458,6 +476,31 @@ impl RunState {
                         crate::JournalError::InvalidEvent("executed step count overflowed".into())
                     })?;
             }
+            "budget_charged" => {
+                // Durable budget delta (F13): live and recovery share this
+                // counter. Observational `steps_executed` stays separate.
+                // A present-but-mistyped amount fails closed instead of
+                // silently charging a default: the journal is the budget.
+                let amount = match event.get("amount") {
+                    None => 1_usize,
+                    Some(value) => value
+                        .as_u64()
+                        .and_then(|n| usize::try_from(n).ok())
+                        .ok_or_else(|| {
+                            crate::JournalError::InvalidEvent(
+                                "budget_charged amount must be a non-negative integer".into(),
+                            )
+                        })?,
+                };
+                self.budget.budget_charged = self
+                    .budget
+                    .budget_charged
+                    .checked_add(amount)
+                    .ok_or_else(|| {
+                        crate::JournalError::InvalidEvent("budget charge count overflowed".into())
+                    })?;
+                self.budget.has_budget_charges = true;
+            }
             "llm_call" => {
                 self.budget.llm_calls = self.budget.llm_calls.checked_add(1).ok_or_else(|| {
                     crate::JournalError::InvalidEvent("LLM call count overflowed".into())
@@ -669,6 +712,24 @@ impl RunState {
                 // through cancel_requested instead.
                 if let Some(operation_id) = event.get("operation_id").and_then(Value::as_str) {
                     self.cancel_operations.insert(operation_id.to_string());
+                }
+            }
+            "hook_failed" => {
+                // Warn-policy hook settlement (F07-02): the hook ran and was
+                // accepted as a warning, so resume must not re-execute it.
+                // Fail-policy hooks return Err immediately and never settle.
+                if event.get("policy").and_then(Value::as_str) == Some("warn")
+                    && let Some(hook) = event.get("hook").and_then(Value::as_str)
+                {
+                    self.hooks_settled.insert(hook.to_string());
+                }
+            }
+            "hook_skipped" => {
+                // Budget-skipped hooks are settled too: the budget cannot
+                // grow on resume, so re-running would skip identically while
+                // risking an undeclared duplicate side effect.
+                if let Some(hook) = event.get("hook").and_then(Value::as_str) {
+                    self.hooks_settled.insert(hook.to_string());
                 }
             }
             "mcp_input_pending" => {
@@ -1306,5 +1367,35 @@ mod tests {
         assert!(matches!(record.status, OperationStatus::Succeeded));
         assert_eq!(record.result, None);
         assert_eq!(record.result_ref.as_deref(), Some("abc123.json"));
+    }
+
+    #[test]
+    fn budget_charged_amount_must_typecheck() {
+        // Explicit amounts fold; a present-but-mistyped amount fails the
+        // fold instead of silently charging a default: the journal is the
+        // budget.
+        let mut state = RunState::default();
+        state
+            .apply(&json!({"t": "budget_charged", "seq": 1, "node": "a", "amount": 2}))
+            .expect("explicit amount should fold");
+        state
+            .apply(&json!({"t": "budget_charged", "seq": 2, "node": "a"}))
+            .expect("absent amount defaults to one charge");
+        assert_eq!(state.budget.budget_charged, 3);
+        assert!(state.budget.has_budget_charges);
+        let error = state
+            .apply(&json!({"t": "budget_charged", "seq": 3, "node": "a", "amount": "many"}))
+            .expect_err("mistyped amount must fail closed");
+        assert!(
+            error.to_string().contains("non-negative integer"),
+            "{error}"
+        );
+        let error = state
+            .apply(&json!({"t": "budget_charged", "seq": 4, "node": "a", "amount": -1}))
+            .expect_err("negative amount must fail closed");
+        assert!(
+            error.to_string().contains("non-negative integer"),
+            "{error}"
+        );
     }
 }

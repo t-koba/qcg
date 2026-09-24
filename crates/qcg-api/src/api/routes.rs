@@ -419,22 +419,6 @@ pub const API_ROUTES: &[ApiRoute] = &[
         errors: ERR_MUTATION,
     },
     ApiRoute {
-        method: "post",
-        path: "/api/runs/{id}",
-        summary: "Cancel a run (alias of /api/runs/{id}:cancel)",
-        response: ApiResponse {
-            status: 200,
-            description: "Cancellation accepted",
-            body: ResponseBody::Json(Some(ResponseSchema::Ref("RunSnapshot"))),
-            headers: NO_HEADERS,
-        },
-        additional_responses: NO_ADDITIONAL_RESPONSES,
-        request_schema: None,
-        request_headers: IDEMPOTENCY_HEADERS,
-        query_parameters: NO_QUERY_PARAMETERS,
-        errors: ERR_MUTATION,
-    },
-    ApiRoute {
         method: "get",
         path: "/api/runs/{id}/events",
         summary: "Subscribe to run events",

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import codecs
+import contextlib
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Iterator
 from urllib.parse import quote, urlencode
@@ -18,11 +21,74 @@ class QcgError(Exception):
         self.problem = problem
 
 
+def _encode_segment(value: Any) -> str:
+    """Encodes one path segment (no slashes survive)."""
+    return quote(str(value), safe="")
+
+
+def _encode_path(value: Any) -> str:
+    """Encodes a multi-segment wildcard path, preserving slashes."""
+    return "/".join(quote(segment, safe="") for segment in str(value).split("/"))
+
+
+def _normalize_query(query: dict[str, Any] | None) -> dict[str, Any]:
+    cleaned: dict[str, Any] = {}
+    for key, value in (query or {}).items():
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            cleaned[key] = "true" if value else "false"
+        elif isinstance(value, (list, tuple)):
+            cleaned[key] = [
+                "true" if item is True else "false" if item is False else item
+                for item in value
+            ]
+        else:
+            cleaned[key] = value
+    return cleaned
+
+
+class _NoCrossOriginAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Strips Authorization on cross-origin redirects and downgrades (F04)."""
+
+    def _strip_if_needed(self, req: urllib.request.Request, location: str) -> None:
+        if req.get_header("Authorization") is None and req.get_header("authorization") is None:
+            return
+        try:
+            current = urllib.parse.urlsplit(req.full_url)
+            nxt = urllib.parse.urlsplit(urllib.parse.urljoin(req.full_url, location))
+        except ValueError:
+            req.remove_header("Authorization")
+            req.remove_header("authorization")
+            return
+        current_origin = (current.scheme.lower(), current.hostname, current.port)
+        next_origin = (nxt.scheme.lower(), nxt.hostname, nxt.port)
+        downgrade = current.scheme.lower() == "https" and nxt.scheme.lower() != "https"
+        if current_origin != next_origin or downgrade:
+            req.remove_header("Authorization")
+            req.remove_header("authorization")
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+        self._strip_if_needed(req, newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    def http_error_308(self, req, fp, code, msg, headers):  # type: ignore[override]
+        location = headers.get("Location") or headers.get("location")
+        if location is not None:
+            self._strip_if_needed(req, location)
+        return super().http_error_307(req, fp, code, msg, headers)
+
+
+def _opener() -> urllib.request.OpenerDirector:
+    return urllib.request.build_opener(_NoCrossOriginAuthRedirectHandler)
+
+
 class QcgClient:
     """Dependency-free client for the qcg HTTP API.
 
-    The bearer token is sent only as an Authorization header. Event streams
-    are read incrementally from the response body.
+    The bearer token is sent only as an Authorization header and is never
+    forwarded cross-origin or over a TLS downgrade. Event streams are read
+    incrementally from the response body.
     """
 
     def __init__(self, base_url: str = "", token: str | None = None) -> None:
@@ -38,20 +104,48 @@ class QcgClient:
             headers["authorization"] = f"Bearer {self.token}"
         return headers
 
-    def _url(self, path: str, query: dict[str, Any] | None = None) -> str:
-        if not query:
-            return f"{self.base_url}{path}"
-        cleaned = {key: value for key, value in query.items() if value is not None}
-        return f"{self.base_url}{path}?{urlencode(cleaned)}"
+    def _merge_headers(
+        self,
+        headers: dict[str, str] | None,
+        idempotency_key: str | None,
+    ) -> dict[str, str] | None:
+        if idempotency_key is None:
+            return headers
+        merged = dict(headers or {})
+        merged["idempotency-key"] = idempotency_key
+        return merged
 
-    def _request(
+    def _url(self, path: str, query: dict[str, Any] | None = None) -> str:
+        cleaned = _normalize_query(query)
+        if not cleaned:
+            return f"{self.base_url}{path}"
+        return f"{self.base_url}{path}?{urlencode(cleaned, doseq=True)}"
+
+    def _open(self, request: urllib.request.Request):
+        return _opener().open(request)
+
+    def _problem_from_error(self, error: urllib.error.HTTPError) -> tuple[Any, str]:
+        if error.code == 304:
+            return None, ""
+        try:
+            raw = error.read().decode("utf-8", errors="replace")
+        except Exception:
+            raw = ""
+        try:
+            problem = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            problem = {"detail": raw}
+        detail = problem.get("detail") if isinstance(problem, dict) else None
+        return problem, detail or error.reason or str(error.code)
+
+    def _request_bytes_raw(
         self,
         method: str,
         path: str,
         query: dict[str, Any] | None = None,
         body: Any = None,
         headers: dict[str, str] | None = None,
-    ) -> Any:
+    ) -> tuple[int, dict[str, str], bytes]:
         data = None if body is None else json.dumps(body).encode("utf-8")
         extra = dict(headers or {})
         if body is not None:
@@ -60,19 +154,95 @@ class QcgClient:
             self._url(path, query), data=data, method=method, headers=self._headers(extra)
         )
         try:
-            with urllib.request.urlopen(request) as response:
+            with self._open(request) as response:
                 payload = response.read()
-                if response.status == 204 or not payload:
-                    return None
-                return json.loads(payload.decode("utf-8"))
+                response_headers = {key.lower(): value for key, value in response.headers.items()}
+                return response.status, response_headers, payload
         except urllib.error.HTTPError as error:
-            raw = error.read().decode("utf-8", errors="replace")
-            try:
-                problem = json.loads(raw) if raw else {}
-            except json.JSONDecodeError:
-                problem = {"detail": raw}
-            detail = problem.get("detail") if isinstance(problem, dict) else None
-            raise QcgError(error.code, problem, detail or error.reason or str(error.code)) from error
+            if error.code == 304:
+                return 304, {}, b""
+            problem, detail = self._problem_from_error(error)
+            raise QcgError(error.code, problem, detail) from error
+
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        query: dict[str, Any] | None = None,
+        body: Any = None,
+        headers: dict[str, str] | None = None,
+        idempotency_key: str | None = None,
+    ) -> Any:
+        headers = self._merge_headers(headers, idempotency_key)
+        status, _, payload = self._request_bytes_raw(method, path, query, body, headers)
+        if status == 204 or status == 304 or not payload:
+            return None
+        return json.loads(payload.decode("utf-8"))
+
+    def _request_text(
+        self,
+        method: str,
+        path: str,
+        query: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> str | None:
+        status, _, payload = self._request_bytes_raw(method, path, query, None, headers)
+        if status == 304:
+            return None
+        return payload.decode("utf-8")
+
+    def _request_bytes(
+        self,
+        method: str,
+        path: str,
+        query: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> bytes | None:
+        status, _, payload = self._request_bytes_raw(method, path, query, None, headers)
+        if status == 304:
+            return None
+        return payload
+
+    def _request_ndjson(
+        self,
+        method: str,
+        path: str,
+        query: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> list[Any] | None:
+        text = self._request_text(method, path, query, headers)
+        if text is None:
+            return None
+        events: list[Any] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if line:
+                events.append(json.loads(line))
+        return events
+
+    def _request_empty(
+        self,
+        method: str,
+        path: str,
+        query: dict[str, Any] | None = None,
+        body: Any = None,
+        headers: dict[str, str] | None = None,
+        idempotency_key: str | None = None,
+    ) -> None:
+        headers = self._merge_headers(headers, idempotency_key)
+        self._request_bytes_raw(method, path, query, body, headers)
+        return None
+
+    # Back-compat JSON reader used by older call sites.
+    def _request(
+        self,
+        method: str,
+        path: str,
+        query: dict[str, Any] | None = None,
+        body: Any = None,
+        headers: dict[str, str] | None = None,
+    ) -> Any:
+        return self._request_json(method, path, query, body, headers)
 
     def stream_run_events(self, run_id: str, last_event_id: int | None = None) -> Iterator[Any]:
         """Yields parsed SSE event payloads until the stream ends."""
@@ -80,103 +250,130 @@ class QcgClient:
         if last_event_id is not None:
             headers["last-event-id"] = str(last_event_id)
         request = urllib.request.Request(
-            self._url(f"/api/runs/{quote(str(run_id), safe='')}/events"), headers=headers
+            self._url(f"/api/runs/{_encode_segment(run_id)}/events"), headers=headers
         )
-        with urllib.request.urlopen(request) as response:
-            buffer = ""
-            while True:
-                chunk = response.read(4096)
-                if not chunk:
-                    return
-                buffer += chunk.decode("utf-8", errors="replace")
-                while "\n\n" in buffer:
-                    frame, buffer = buffer.split("\n\n", 1)
-                    data = "".join(
-                        line[5:].lstrip() for line in frame.split("\n") if line.startswith("data:")
-                    )
-                    if data:
-                        yield json.loads(data)
+        try:
+            raw = self._open(request)
+        except urllib.error.HTTPError as error:
+            problem, detail = self._problem_from_error(error)
+            raise QcgError(error.code, problem, detail) from error
+        with contextlib.closing(raw):
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+            text_buffer = ""
+            byte_remainder = b""
+            try:
+                while True:
+                    chunk = raw.read(1)
+                    if not chunk:
+                        break
+                    byte_remainder += chunk
+                    try:
+                        text_buffer += decoder.decode(byte_remainder, final=False)
+                        byte_remainder = b""
+                    except UnicodeDecodeError:
+                        # Incomplete multi-byte sequence: read more bytes.
+                        if len(byte_remainder) > 4:
+                            text_buffer += decoder.decode(byte_remainder, final=True)
+                            byte_remainder = b""
+                        continue
+                    # Normalize CRLF/CR per the SSE spec before framing.
+                    text_buffer = text_buffer.replace("\r\n", "\n").replace("\r", "\n")
+                    while "\n\n" in text_buffer:
+                        frame, text_buffer = text_buffer.split("\n\n", 1)
+                        data_lines = [
+                            line[5:].lstrip() if line[5:6] == " " else line[5:]
+                            for line in frame.split("\n")
+                            if line.startswith("data:")
+                        ]
+                        # Comment-only (: ...) and empty frames yield nothing.
+                        if not data_lines:
+                            continue
+                        data = "\n".join(data_lines)
+                        if data:
+                            yield json.loads(data)
+            finally:
+                try:
+                    raw.close()
+                except Exception:
+                    pass
 
     def list_generators(self):
-        return self._request("GET", "/api/generators")
+        return self._request_json("GET", "/api/generators")
 
-    def get_generator(self, id):
-        return self._request("GET", f"/api/generators/{id}")
+    def get_generator(self, id, headers=None):
+        return self._request_json("GET", f"/api/generators/{_encode_segment(id)}", headers=headers)
 
     def read_generator_asset(self, id, path):
-        return self._request("GET", f"/api/generators/{id}/assets/{path}")
+        return self._request_bytes("GET", f"/api/generators/{_encode_segment(id)}/assets/{_encode_path(path)}")
 
     def llm_catalog(self, query=None):
-        return self._request("GET", "/api/llm/catalog", query=query)
+        return self._request_json("GET", "/api/llm/catalog", query=query)
 
     def complete_mcp_authorization(self, query=None):
-        return self._request("GET", "/api/mcp/oauth/callback", query=query)
+        return self._request_text("GET", "/api/mcp/oauth/callback", query=query)
 
     def list_mcp_servers(self):
-        return self._request("GET", "/api/mcp/servers")
+        return self._request_json("GET", "/api/mcp/servers")
 
     def start_mcp_authorization(self, id):
-        return self._request("POST", f"/api/mcp/servers/{id}/authorization")
+        return self._request_json("POST", f"/api/mcp/servers/{_encode_segment(id)}/authorization")
 
     def clear_mcp_authorization(self, id):
-        return self._request("DELETE", f"/api/mcp/servers/{id}/authorization")
+        return self._request_empty("DELETE", f"/api/mcp/servers/{_encode_segment(id)}/authorization")
 
     def cancel_pending_mcp_authorization(self, id):
-        return self._request("DELETE", f"/api/mcp/servers/{id}/authorization/pending")
+        return self._request_empty("DELETE", f"/api/mcp/servers/{_encode_segment(id)}/authorization/pending")
 
     def openapi(self):
-        return self._request("GET", "/api/openapi.json")
+        return self._request_json("GET", "/api/openapi.json")
 
     def list_runs(self, query=None):
-        return self._request("GET", "/api/runs", query=query)
+        return self._request_json("GET", "/api/runs", query=query)
 
-    def start_run(self, body=None):
-        return self._request("POST", "/api/runs", body=body)
+    def start_run(self, body=None, headers=None, idempotency_key=None):
+        return self._request_json("POST", "/api/runs", body=body, headers=headers, idempotency_key=idempotency_key)
 
-    def get_run(self, id):
-        return self._request("GET", f"/api/runs/{id}")
-
-    def cancel_run_alias(self, id):
-        return self._request("POST", f"/api/runs/{id}")
+    def get_run(self, id, headers=None):
+        return self._request_json("GET", f"/api/runs/{_encode_segment(id)}", headers=headers)
 
     def delete_run(self, id):
-        return self._request("DELETE", f"/api/runs/{id}")
+        return self._request_empty("DELETE", f"/api/runs/{_encode_segment(id)}")
 
-    def list_artifacts(self, id):
-        return self._request("GET", f"/api/runs/{id}/artifacts")
+    def list_artifacts(self, id, headers=None):
+        return self._request_json("GET", f"/api/runs/{_encode_segment(id)}/artifacts", headers=headers)
 
     def download_artifacts_zip(self, id):
-        return self._request("GET", f"/api/runs/{id}/artifacts.zip")
+        return self._request_bytes("GET", f"/api/runs/{_encode_segment(id)}/artifacts.zip")
 
     def read_artifact(self, id, path):
-        return self._request("GET", f"/api/runs/{id}/artifacts/{path}")
+        return self._request_bytes("GET", f"/api/runs/{_encode_segment(id)}/artifacts/{_encode_path(path)}")
 
     def download_run_bundle(self, id):
-        return self._request("GET", f"/api/runs/{id}/bundle")
+        return self._request_bytes("GET", f"/api/runs/{_encode_segment(id)}/bundle")
 
-    def confirm_run(self, id, cid, body=None):
-        return self._request("PUT", f"/api/runs/{id}/confirmations/{cid}", body=body)
+    def confirm_run(self, id, cid, body=None, headers=None, idempotency_key=None):
+        return self._request_json("PUT", f"/api/runs/{_encode_segment(id)}/confirmations/{_encode_segment(cid)}", body=body, headers=headers, idempotency_key=idempotency_key)
 
-    def run_events(self, id):
-        return self._request("GET", f"/api/runs/{id}/events")
+    def run_events(self, id, headers=None):
+        return self._request_text("GET", f"/api/runs/{_encode_segment(id)}/events", headers=headers)
 
-    def fork_run(self, id, body=None):
-        return self._request("POST", f"/api/runs/{id}/fork", body=body)
+    def fork_run(self, id, body=None, headers=None, idempotency_key=None):
+        return self._request_json("POST", f"/api/runs/{_encode_segment(id)}/fork", body=body, headers=headers, idempotency_key=idempotency_key)
 
     def read_run_journal(self, id):
-        return self._request("GET", f"/api/runs/{id}/journal")
+        return self._request_ndjson("GET", f"/api/runs/{_encode_segment(id)}/journal")
 
     def read_run_metrics(self, id):
-        return self._request("GET", f"/api/runs/{id}/metrics")
+        return self._request_json("GET", f"/api/runs/{_encode_segment(id)}/metrics")
 
-    def answer_question(self, id, qid, body=None):
-        return self._request("PUT", f"/api/runs/{id}/questions/{qid}", body=body)
+    def answer_question(self, id, qid, body=None, headers=None, idempotency_key=None):
+        return self._request_json("PUT", f"/api/runs/{_encode_segment(id)}/questions/{_encode_segment(qid)}", body=body, headers=headers, idempotency_key=idempotency_key)
 
-    def cancel_run(self, id):
-        return self._request("POST", f"/api/runs/{id}:cancel")
+    def cancel_run(self, id, headers=None, idempotency_key=None):
+        return self._request_json("POST", f"/api/runs/{_encode_segment(id)}:cancel", headers=headers, idempotency_key=idempotency_key)
 
     def health(self):
-        return self._request("GET", "/healthz")
+        return self._request_json("GET", "/healthz")
 
     def metrics(self):
-        return self._request("GET", "/metrics")
+        return self._request_text("GET", "/metrics")

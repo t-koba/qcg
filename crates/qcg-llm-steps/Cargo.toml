@@ -30,3 +30,7 @@ tokio = { workspace = true, features = ["fs", "macros", "rt", "time"] }
 thiserror.workspace = true
 tokio-util.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+# Enables qcg-engine's test-support builder for approval/resume e2e tests.
+qcg-engine = { path = "../qcg-engine", features = ["test-support"] }

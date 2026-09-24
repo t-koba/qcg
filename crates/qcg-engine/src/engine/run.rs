@@ -229,6 +229,13 @@ impl Engine {
                 )?;
                 continue;
             }
+            // Warn/skip-settled hooks from a previous execution (F07-02):
+            // resume must not re-execute them. Journal a replay marker so
+            // the skip stays observable instead of silent.
+            if journal.state().hooks_settled.contains(&node.id) {
+                journal.event("hook_replayed", json!({ "hook": node.id, "event": event }))?;
+                continue;
+            }
             journal.event(
                 "step_started",
                 json!({ "node": node.id, "type": node.kind.to_string(), "attempt": 1 }),
@@ -603,7 +610,15 @@ impl Engine {
             options
                 .max_total_steps
                 .min(context.contract.manifest.budget.max_steps),
-            replay.state.budget.steps_executed,
+            // Durable budget seed (F13): journals with `budget_charged`
+            // deltas resume from the same consumption live execution saw;
+            // older journals without the event keep the legacy
+            // `steps_executed` seed.
+            if replay.state.budget.has_budget_charges {
+                replay.state.budget.budget_charged
+            } else {
+                replay.state.budget.steps_executed
+            },
         );
         let max_parallel_steps = options.max_parallel_steps.max(1);
         let mut states: BTreeMap<String, NodeState> = context
@@ -627,6 +642,11 @@ impl Engine {
         self.run_hooks(&context, &journal, &mut vars, &mut budget, "run_started")
             .await?;
 
+        // First distinct execution error (timeout/elapsed/budget) stashed
+        // while failure settlement still runs hooks (F07-01 + E11): the
+        // journal and hooks observe the failure, but the caller keeps the
+        // distinct classification instead of a joined generic failure.
+        let mut first_distinct_error: Option<EngineError> = None;
         loop {
             if context.cancellation.is_cancelled() {
                 return Err(EngineError::Canceled);
@@ -693,15 +713,43 @@ impl Engine {
                 && ready.len() <= max_parallel_steps
                 && ready.iter().all(|node| self.is_parallel_safe_node(node))
             {
-                self.execute_parallel_wave(
-                    &context,
-                    &journal,
-                    &mut vars,
-                    &mut states,
-                    &mut budget,
-                    ready,
-                )
-                .await?;
+                // Like the sequential path (F07-01): ordinary wave errors
+                // are already journaled per node inside the wave, so the
+                // run continues to shared failure settlement for hooks.
+                // HITL suspensions and cancellations still propagate.
+                if let Err(error) = self
+                    .execute_parallel_wave(
+                        &context,
+                        &journal,
+                        &mut vars,
+                        &mut states,
+                        &mut budget,
+                        ready,
+                    )
+                    .await
+                {
+                    if error.is_canceled()
+                        || matches!(
+                            error,
+                            EngineError::NeedsUser { .. } | EngineError::NeedsConfirm { .. }
+                        )
+                    {
+                        return Err(error);
+                    }
+                    // Per-node failures are already in `states`/journal;
+                    // continue scheduling (dependents skip) toward
+                    // settlement instead of bypassing failure hooks.
+                    // Distinct classifications survive settlement (F07+E11).
+                    if is_budget_exhaustion(&error) {
+                        if first_distinct_error.is_none() {
+                            first_distinct_error = Some(error);
+                        }
+                        break;
+                    }
+                    if is_distinct_execution_error(&error) && first_distinct_error.is_none() {
+                        first_distinct_error = Some(error);
+                    }
+                }
                 progressed = true;
             } else if let Some(node) = ready.first() {
                 let id = node.id.clone();
@@ -721,9 +769,59 @@ impl Engine {
                     json!({ "node": id, "type": node.kind.to_string(), "attempt": 1 }),
                 )?;
                 tracing::debug!(run_id = %context.run_id, node = %id, "step started");
-                let outcome = self
+                // Ordinary execution errors (command/HTTP/LLM failures,
+                // timeouts) become node failures (F07-01) so the shared
+                // failure settlement runs step_failed/run_failed hooks.
+                // Cancellations and HITL suspensions still propagate.
+                // Agent failures propagate too: the agent owns durable
+                // continuations (checkpoints plus operation records) whose
+                // replay-safety verdict only its operation guard can make
+                // on re-entry. Settling one here as a terminal node failure
+                // would report the stale error on resume instead of
+                // re-entering the agent, stranding the continuation.
+                let outcome = match self
                     .execute_node_with_retry(&context, &journal, &mut vars, &mut budget, node)
-                    .await?;
+                    .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(error)
+                        if error.is_canceled()
+                            || matches!(
+                                error,
+                                EngineError::NeedsUser { .. } | EngineError::NeedsConfirm { .. }
+                            )
+                            || node.kind.as_str() == "llm.agent" =>
+                    {
+                        return Err(error);
+                    }
+                    Err(error) => {
+                        let reason =
+                            FailureDetail::new(failure_code_for_error(&error), error.to_string());
+                        states.insert(id.clone(), NodeState::Failed(reason.clone()));
+                        journal.event(
+                            "step_finished",
+                            json!({ "node": id, "status": "failed", "reason": reason }),
+                        )?;
+                        // Budget exhaustion cannot progress further: break
+                        // to settlement instead of failing every remaining
+                        // node identically.
+                        if is_budget_exhaustion(&error) {
+                            if first_distinct_error.is_none() {
+                                first_distinct_error = Some(error);
+                            }
+                            break;
+                        }
+                        if is_distinct_execution_error(&error) && first_distinct_error.is_none() {
+                            first_distinct_error = Some(error);
+                        }
+                        // Continue scheduling: the failure is recorded and
+                        // dependents skip on the next pass toward shared
+                        // settlement. No `progressed` flag is needed here:
+                        // `continue` restarts the loop (which recomputes
+                        // readiness) instead of falling to the stall check.
+                        continue;
+                    }
+                };
                 if matches!(&outcome, StepOutcome::NeedsConfirm { .. }) {
                     // Confirmation suspends before real work; the start
                     // above overstates slightly but keeps seq monotonic.
@@ -1200,6 +1298,13 @@ impl Engine {
                 "run_finished",
                 json!({ "status": "failed", "failures": failed }),
             )?;
+            // Distinct execution errors keep their classification (E11)
+            // after hooks observed the failure (F07-01): hooks ran, the
+            // journal shows the failure, but the caller still sees the
+            // timeout/elapsed/budget error, not a joined generic failure.
+            if let Some(error) = first_distinct_error {
+                return Err(error);
+            }
             return Err(EngineError::Failed(
                 failed
                     .iter()
@@ -1246,6 +1351,21 @@ fn is_budget_exhaustion(error: &EngineError) -> bool {
             message.contains("global step budget exceeded")
         }
         _ => false,
+    }
+}
+
+/// Execution errors with a distinct caller-visible classification (F07+E11):
+/// timeouts, elapsed overruns, and budget exhaustion settle through failure
+/// hooks like every other failure, but the caller keeps the original error
+/// instead of a joined generic failure.
+fn is_distinct_execution_error(error: &EngineError) -> bool {
+    match error {
+        EngineError::Step(
+            StepError::TimedOut { .. }
+            | StepError::ElapsedExceeded { .. }
+            | StepError::BudgetExceeded { .. },
+        ) => true,
+        _ => is_budget_exhaustion(error),
     }
 }
 

@@ -506,6 +506,127 @@ pub(crate) fn redact_messages_for_journal(
         .collect()
 }
 
+/// Restores a redacted pending call from its run-private sidecar (F02).
+/// Returns the full call when the sidecar payload verifies against the
+/// stored confirmation digest; otherwise returns the stored (redacted)
+/// call so the caller still fails closed. The public journal never gains
+/// the restored bytes: restoration is execution-only.
+pub(crate) fn restore_pending_call_from_sidecar(
+    tools: &[ToolDecl],
+    node: &NodeDef,
+    run_id: &str,
+    stored: &qcg_llm::ChatToolCall,
+    confirm: Option<&qcg_api::ConfirmSpec>,
+    sidecar: Option<&Value>,
+) -> qcg_llm::ChatToolCall {
+    let Some(sidecar) = sidecar else {
+        return stored.clone();
+    };
+    let restored = qcg_llm::ChatToolCall {
+        id: sidecar
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or(&stored.id)
+            .to_string(),
+        name: sidecar
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(&stored.name)
+            .to_string(),
+        args: sidecar.get("args").cloned().unwrap_or(Value::Null),
+    };
+    if restored.id != stored.id || restored.name != stored.name {
+        return stored.clone();
+    }
+    // The restored payload must redact to the journaled copy: otherwise
+    // the sidecar names a different operation than the journaled one.
+    let redacted_restored = redact_tool_call_for_journal(tools, &restored);
+    if redacted_restored.id != stored.id
+        || redacted_restored.name != stored.name
+        || redacted_restored.args != stored.args
+    {
+        return stored.clone();
+    }
+    // When a confirmation binds the original content digest, the restored
+    // payload must recompute to it; otherwise a swapped payload could ride
+    // the same approval.
+    if let Some(confirm) = confirm
+        && let Some(expected) = pending_call_digest(tools, node, run_id, &restored)
+        && expected != confirm.operation_digest
+    {
+        return stored.clone();
+    }
+    restored
+}
+
+/// Recomputes the approval digest for a pending call (F02). Returns `None`
+/// for tool kinds without a content-bound digest reconstructible here
+/// (command tools bind through gateway-built plans); those keep the
+/// redacted-equality check above, which still requires the private sidecar
+/// to match the journaled operation exactly.
+fn pending_call_digest(
+    tools: &[ToolDecl],
+    node: &NodeDef,
+    run_id: &str,
+    call: &qcg_llm::ChatToolCall,
+) -> Option<String> {
+    let tool = tools.iter().find(|tool| tool.name() == call.name)?;
+    match tool {
+        ToolDecl::FsWrite { path_prefix, .. } => {
+            let path = call.args.get("path")?.as_str()?;
+            let content = call.args.get("content")?.as_str()?;
+            let details = Some(json!({
+                "path_prefix": path_prefix,
+                "content_sha256": qcg_engine::salted_binding_digest(
+                    "fswrite-content-v1",
+                    run_id,
+                    content.as_bytes()
+                ),
+            }));
+            qcg_engine::RunContext::operation_digest(path, &details).ok()
+        }
+        ToolDecl::Http { .. } => {
+            let method = call
+                .args
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or("GET")
+                .to_ascii_uppercase();
+            let url = call.args.get("url")?.as_str()?;
+            let mut headers = BTreeMap::new();
+            if let Some(object) = call.args.get("headers").and_then(Value::as_object) {
+                for (key, value) in object {
+                    headers.insert(key.clone(), value.as_str()?.to_string());
+                }
+            }
+            let body = call.args.get("body").and_then(Value::as_str);
+            let sensitive =
+                agent_sensitive_query(&node.id, url, call.args.get("sensitive_query")).ok()?;
+            let journal_url = qcg_policy::redact_all_query_values(
+                &qcg_engine::redact_query_parameters(url, &sensitive).ok()?,
+            );
+            let details = http_details_with_url(
+                &method,
+                &headers,
+                body.map(str::as_bytes),
+                &sensitive,
+                run_id,
+                url,
+            );
+            qcg_engine::RunContext::operation_digest(&journal_url, &details).ok()
+        }
+        ToolDecl::Mcp { server, tool, .. } => {
+            // Same target/details shape as the MCP approval site, so a
+            // swapped payload recomputes a different digest and fails the
+            // confirm binding below instead of riding it.
+            let target = format!("{server}/{tool}");
+            let details = Some(crate::mcp_forms::mcp_argument_summary(&call.args));
+            qcg_engine::RunContext::operation_digest(&target, &details).ok()
+        }
+        _ => None,
+    }
+}
+
 pub(crate) async fn execute_agent_fs_write(
     ctx: &mut StepContext<'_>,
     node: &NodeDef,
@@ -528,6 +649,9 @@ pub(crate) async fn execute_agent_fs_write(
                 operation_id,
                 Some(value.clone()),
             )?;
+            // Settlement cleanup (F02): the pending payload is no longer
+            // needed once the operation finished.
+            ctx.run.clear_pending_tool_payload(operation_id);
             Ok(AgentToolOutcome::Result(value))
         }
         Err(error) => {
@@ -1184,13 +1308,7 @@ pub(crate) async fn execute_agent_tool(
                     &qcg_policy::redact_urls_in_text(raw_title),
                 );
                 const LIMIT: usize = 256;
-                if redacted.len() <= LIMIT {
-                    redacted
-                } else {
-                    use sha2::Digest as _;
-                    let digest = hex::encode(sha2::Sha256::digest(redacted.as_bytes()));
-                    format!("{}...[sha256:{digest}]", &redacted[..LIMIT])
-                }
+                crate::prompting::truncate_with_digest(&redacted, LIMIT)
             };
             let options = validated_options;
             // The default form (no declared fields) is still a validated
@@ -1370,6 +1488,8 @@ pub(crate) fn finish_rejected_external_operation(
         &operation_id,
         qcg_engine::OperationOutcome::Success { result: None },
     );
+    // Settlement cleanup (F02): the pending payload is no longer needed.
+    ctx.run.clear_pending_tool_payload(&operation_id);
 }
 
 pub(crate) fn validate_agent_tool_call_args(
@@ -2556,5 +2676,833 @@ mod tests {
             qcg_engine::RunContext::operation_digest("https://example.test", &Some(send))
                 .expect("digest should compute");
         assert_eq!(guard_digest, send_digest, "digests must match at send time");
+    }
+
+    #[test]
+    fn pending_sidecar_restores_nonsecret_payload_with_digest_binding() {
+        // F02-01/F02-02/F02-04: a redacted journal copy restores to the
+        // original bytes via the private sidecar when the digest matches;
+        // tampered payloads stay redacted and fail closed downstream.
+        use qcg_contract::NodeDef;
+        let node = NodeDef {
+            id: "agent".into(),
+            kind: qcg_contract::StepType::from("llm.agent"),
+            needs: vec![],
+            when: None,
+            on_deps: qcg_contract::OnDeps::AllSucceeded,
+            context: vec![],
+            output: None,
+            artifact: None,
+            on_fail: None,
+            failure: None,
+            retry: None,
+            params: Default::default(),
+        };
+        let tools = vec![ToolDecl::FsWrite {
+            name: "write".into(),
+            description: None,
+            input_schema: None,
+            path_prefix: "out/".into(),
+        }];
+        let original = qcg_llm::ChatToolCall {
+            id: "call-1".into(),
+            name: "write".into(),
+            args: json!({"path": "out/a.txt", "content": "hello non-secret"}),
+        };
+        let stored = redact_tool_call_for_journal(&tools, &original);
+        assert!(
+            args_contain_redaction_marker(&stored.args),
+            "journaled copy must be redacted"
+        );
+        let digest =
+            pending_call_digest(&tools, &node, "run-1", &original).expect("digest should compute");
+        let confirm = qcg_api::ConfirmSpec {
+            id: "agent:fs.write:abc".into(),
+            title: "confirm".into(),
+            kind: "fs.write".into(),
+            target: "out/a.txt".into(),
+            dry_run: false,
+            details: None,
+            operation_digest: digest,
+            scope: qcg_contract::SideEffectScope::Content,
+        };
+        let sidecar = json!({
+            "id": original.id,
+            "name": original.name,
+            "args": original.args,
+        });
+        let restored = restore_pending_call_from_sidecar(
+            &tools,
+            &node,
+            "run-1",
+            &stored,
+            Some(&confirm),
+            Some(&sidecar),
+        );
+        assert_eq!(
+            restored.args, original.args,
+            "verified payload must restore original bytes"
+        );
+        // Tampered sidecar with different content redacts differently and
+        // must not restore.
+        let tampered = json!({
+            "id": "call-1",
+            "name": "write",
+            "args": json!({"path": "out/a.txt", "content": "forged"}),
+        });
+        let kept = restore_pending_call_from_sidecar(
+            &tools,
+            &node,
+            "run-1",
+            &stored,
+            Some(&confirm),
+            Some(&tampered),
+        );
+        assert_eq!(
+            kept.args, stored.args,
+            "tampered payload must stay redacted"
+        );
+        // Journal redaction itself carries no plaintext secret.
+        assert!(
+            !stored.args.to_string().contains("hello non-secret"),
+            "journaled copy must not carry the original bytes"
+        );
+    }
+}
+
+/// Approval end-to-end through real contexts, journals, and gateways
+/// (F02-01..F02-04). No mocks: a real `RunContext` (real gateways, real
+/// metadata dir), a real `JournalWriter` file, and — for HTTP — a real
+/// loopback server. Phase 1 generates the call and checkpoints the
+/// redacted copy; phase 2 rebuilds every context from disk (a restart)
+/// and resumes from the private sidecar after approval.
+#[cfg(test)]
+mod approval_e2e {
+    use super::*;
+    use crate::agent::{AgentCheckpoint, record_agent_checkpoint};
+    use crate::mcp_tools::McpAgentTools;
+    use qcg_contract::{
+        AssetSpec, Contract, FailurePolicy, GeneratorMeta, Graph, InputSpec, Manifest, OnDeps,
+        OutputSpec, Permissions, RetentionPolicy, SideEffects, StepType,
+    };
+    use qcg_engine::{JournalWriter, RunContext, StepContext};
+    use qcg_types::NodePath;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct ApprovalHarness {
+        _root_guard: TempGuard,
+        root: camino::Utf8PathBuf,
+        run_id: String,
+    }
+
+    struct TempGuard(std::path::PathBuf);
+    impl Drop for TempGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl ApprovalHarness {
+        fn setup(name: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let root = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
+                "qcg-approval-{name}-{}-{nonce}",
+                std::process::id()
+            )))
+            .expect("temporary path must be UTF-8");
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("workspace")).expect("workspace should be creatable");
+            std::fs::create_dir_all(root.join("meta")).expect("meta should be creatable");
+            let run_id = format!("approval-{name}-{nonce}");
+            Self {
+                _root_guard: TempGuard(root.clone().into_std_path_buf()),
+                root,
+                run_id,
+            }
+        }
+
+        fn manifest(&self) -> Manifest {
+            Manifest {
+                generator: GeneratorMeta {
+                    id: "approval-test".into(),
+                    name: "Approval Test".into(),
+                    version: "0.1.0".into(),
+                    description: String::new(),
+                    authors: vec![],
+                    qcg_version: String::new(),
+                },
+                permissions: Permissions {
+                    fs_read: vec![],
+                    fs_write: vec!["workspace".into()],
+                    network: vec!["127.0.0.1".into()],
+                    commands: vec![],
+                    containers: Default::default(),
+                    side_effects: SideEffects::Confirm,
+                    side_effects_scope: Default::default(),
+                },
+                llm: None,
+                inputs: InputSpec::default(),
+                resources: BTreeMap::new(),
+                tools: BTreeMap::new(),
+                secrets: BTreeMap::new(),
+                runtime: Default::default(),
+                budget: Default::default(),
+                flow: vec![],
+                parallel: vec![],
+                blocks: BTreeMap::new(),
+                outputs: OutputSpec { extras: vec![] },
+                failure: FailurePolicy::default(),
+                retention: RetentionPolicy::default(),
+                audit: qcg_policy::AuditConfig::default(),
+                hooks: Default::default(),
+                assets: AssetSpec::default(),
+                dependencies: Default::default(),
+            }
+        }
+
+        fn contract(&self) -> Contract {
+            let manifest = self.manifest();
+            let graph = Graph::build(&manifest).expect("empty flow should build");
+            Contract {
+                root: self.root.clone(),
+                manifest,
+                graph,
+                sha256: "approval-e2e".into(),
+            }
+        }
+
+        fn node() -> NodeDef {
+            NodeDef {
+                id: "agent".into(),
+                kind: StepType::from("llm.agent"),
+                needs: vec![],
+                when: None,
+                on_deps: OnDeps::AllSucceeded,
+                context: vec![],
+                output: None,
+                artifact: None,
+                on_fail: None,
+                failure: None,
+                retry: None,
+                params: Default::default(),
+            }
+        }
+
+        fn journal_path(&self) -> camino::Utf8PathBuf {
+            self.root.join("meta/journal.jsonl")
+        }
+
+        fn journal_text(&self) -> String {
+            std::fs::read_to_string(self.journal_path()).unwrap_or_default()
+        }
+
+        fn operation_started_count(&self, operation_id: &str) -> usize {
+            self.journal_text()
+                .lines()
+                .filter(|line| {
+                    line.contains("\"t\":\"operation_started\"") && line.contains(operation_id)
+                })
+                .count()
+        }
+    }
+
+    fn test_runtime() -> qcg_llm::LlmRuntime {
+        qcg_llm::LlmRuntime::builtins()
+    }
+
+    /// One captured server hit: request line, authorization header, body.
+    type ServerHit = (String, String, Vec<u8>);
+
+    /// Drives one tool call to its approval request and checkpoints the
+    /// redacted copy plus the private sidecar, like the agent turn loop.
+    struct ApprovalCall<'a> {
+        run: &'a RunContext,
+        journal: &'a JournalWriter,
+        node: &'a NodeDef,
+        runtime: &'a qcg_llm::LlmRuntime,
+        tools: &'a [ToolDecl],
+        name: &'a str,
+        call_id: &'a str,
+        args: &'a Value,
+    }
+
+    async fn request_approval(call: ApprovalCall<'_>) -> qcg_api::ConfirmSpec {
+        let ApprovalCall {
+            run,
+            journal,
+            node,
+            runtime,
+            tools,
+            name,
+            call_id,
+            args,
+        } = call;
+        let mut vars = qcg_contract::ValueBag::with_inputs(BTreeMap::new());
+        let mut ctx = StepContext {
+            run,
+            journal,
+            vars: &mut vars,
+            llm: None,
+        };
+        let mcp = McpAgentTools::prepare(&ctx, node, runtime, tools)
+            .await
+            .expect("no MCP tools should prepare cleanly");
+        let mut activated = BTreeSet::new();
+        let outcome = execute_agent_tool(
+            &mut ctx,
+            node,
+            AgentToolServices {
+                runtime,
+                guardrails: &[],
+            },
+            AgentToolInvocation {
+                mcp: &mcp,
+                tools,
+                name,
+                call_id,
+                call_number: 0,
+                args,
+                activated_skills: &mut activated,
+            },
+        )
+        .await
+        .expect("approval request should not error");
+        let AgentToolOutcome::NeedsConfirm(confirm) = outcome else {
+            panic!("a confirming policy must request approval");
+        };
+        record_agent_checkpoint(
+            &ctx,
+            node,
+            0,
+            "before_side_effect",
+            &AgentCheckpoint {
+                messages: vec![],
+                next_turn: 0,
+                tokens_total: 0,
+                tool_calls_total: 0,
+                tool_call_counts: BTreeMap::new(),
+                pending_side_effect: Some(qcg_llm::ChatToolCall {
+                    id: call_id.to_string(),
+                    name: name.to_string(),
+                    args: args.clone(),
+                }),
+                pending_confirm: Some(confirm.clone()),
+                pending_mcp_call: None,
+                used_calls: BTreeMap::new(),
+            },
+            tools,
+        )
+        .expect("checkpoint should journal");
+        confirm
+    }
+
+    /// Reloads the journaled checkpoint after a restart and restores the
+    /// exact payload from the private sidecar.
+    fn restore_after_restart(
+        run: &RunContext,
+        journal: &JournalWriter,
+        node: &NodeDef,
+        run_id: &str,
+        tools: &[ToolDecl],
+        call_id: &str,
+    ) -> (qcg_llm::ChatToolCall, qcg_api::ConfirmSpec) {
+        let stored: AgentCheckpoint = serde_json::from_value(
+            journal
+                .state()
+                .checkpoints
+                .get(&NodePath::root(&node.id))
+                .expect("checkpoint should survive the restart")
+                .clone(),
+        )
+        .expect("checkpoint should deserialize");
+        let pending = stored
+            .pending_side_effect
+            .expect("pending call should be stored");
+        let confirm = stored.pending_confirm.expect("confirm should be stored");
+        let operation_id = qcg_engine::operation_id_for(run_id, &node.id, call_id);
+        let sidecar = run
+            .load_pending_tool_payload(node, &operation_id)
+            .expect("sidecar load should not corrupt")
+            .expect("sidecar should survive the restart");
+        let restored = restore_pending_call_from_sidecar(
+            tools,
+            node,
+            run_id,
+            &pending,
+            Some(&confirm),
+            Some(&sidecar),
+        );
+        assert!(
+            !args_contain_redaction_marker(&restored.args),
+            "the restored call must carry original bytes, not markers"
+        );
+        (restored, confirm)
+    }
+
+    #[tokio::test]
+    async fn approved_fs_write_executes_original_content_once() {
+        // F02-02 + F02-03 + F02-04: non-secret content approved after a
+        // restart executes exactly once; the public journal never carries
+        // the bytes; a duplicate resume resends instead of rewriting.
+        let harness = ApprovalHarness::setup("fs-write");
+        let node = ApprovalHarness::node();
+        let tools = vec![ToolDecl::FsWrite {
+            name: "write".into(),
+            description: None,
+            input_schema: None,
+            path_prefix: "drafts".into(),
+        }];
+        let content = "deploy notes with password=hunter2-marked-secret inside";
+        let args = json!({"path": "drafts/note.txt", "content": content});
+        let runtime = test_runtime();
+        let confirm = {
+            let run = RunContext::for_tests(
+                harness.run_id.clone(),
+                harness.root.join("workspace"),
+                harness.root.join("meta"),
+                harness.contract(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+            .expect("test context should build");
+            let journal =
+                JournalWriter::create(&harness.journal_path(), &harness.run_id, false, None)
+                    .expect("journal should open");
+            request_approval(ApprovalCall {
+                run: &run,
+                journal: &journal,
+                node: &node,
+                runtime: &runtime,
+                tools: &tools,
+                name: "write",
+                call_id: "call-1",
+                args: &args,
+            })
+            .await
+        };
+        let journal_text = harness.journal_text();
+        assert!(
+            !journal_text.contains("hunter2-marked-secret"),
+            "the public journal must not carry the content: {journal_text}"
+        );
+        // Restart: fresh contexts, approval recorded, journal + sidecar from disk.
+        let target_before = harness.root.join("workspace/drafts/note.txt");
+        assert!(!target_before.exists(), "nothing executes before approval");
+        {
+            let mut confirmations = BTreeMap::new();
+            confirmations.insert(confirm.id.clone(), true);
+            let run = RunContext::for_tests(
+                harness.run_id.clone(),
+                harness.root.join("workspace"),
+                harness.root.join("meta"),
+                harness.contract(),
+                confirmations,
+                BTreeMap::new(),
+            )
+            .expect("restart context should build");
+            let journal =
+                JournalWriter::create(&harness.journal_path(), &harness.run_id, false, None)
+                    .expect("journal should reopen");
+            let (restored, _) =
+                restore_after_restart(&run, &journal, &node, &harness.run_id, &tools, "call-1");
+            assert_eq!(restored.args, args, "the exact payload must come back");
+            let mut vars = qcg_contract::ValueBag::with_inputs(BTreeMap::new());
+            let mut ctx = StepContext {
+                run: &run,
+                journal: &journal,
+                vars: &mut vars,
+                llm: None,
+            };
+            let mcp = McpAgentTools::prepare(&ctx, &node, &runtime, &tools)
+                .await
+                .expect("prepare should succeed");
+            let mut activated = BTreeSet::new();
+            let outcome = execute_agent_tool(
+                &mut ctx,
+                &node,
+                AgentToolServices {
+                    runtime: &runtime,
+                    guardrails: &[],
+                },
+                AgentToolInvocation {
+                    mcp: &mcp,
+                    tools: &tools,
+                    name: "write",
+                    call_id: "call-1",
+                    call_number: 0,
+                    args: &restored.args,
+                    activated_skills: &mut activated,
+                },
+            )
+            .await
+            .expect("approved execution should succeed");
+            assert!(
+                matches!(outcome, AgentToolOutcome::Result(_)),
+                "fs.write finishes inline"
+            );
+            // Duplicate resume resends the cached result instead of
+            // executing a second time.
+            let again = execute_agent_tool(
+                &mut ctx,
+                &node,
+                AgentToolServices {
+                    runtime: &runtime,
+                    guardrails: &[],
+                },
+                AgentToolInvocation {
+                    mcp: &mcp,
+                    tools: &tools,
+                    name: "write",
+                    call_id: "call-1",
+                    call_number: 0,
+                    args: &restored.args,
+                    activated_skills: &mut activated,
+                },
+            )
+            .await
+            .expect("duplicate resume should resend");
+            assert!(
+                matches!(again, AgentToolOutcome::Result(_)),
+                "duplicate resume must resend"
+            );
+        }
+        let written = std::fs::read_to_string(harness.root.join("workspace/drafts/note.txt"))
+            .expect("file written");
+        assert_eq!(written, content, "the original content must land once");
+        let operation_id = qcg_engine::operation_id_for(&harness.run_id, "agent", "call-1");
+        assert_eq!(
+            harness.operation_started_count(&operation_id),
+            1,
+            "exactly one guarded execution: {}",
+            harness.journal_text()
+        );
+    }
+
+    #[tokio::test]
+    async fn approved_post_sends_original_body_once() {
+        // F02-01 + F02-03: a non-secret POST body approved after a restart
+        // is sent with the original method/headers/body exactly once; the
+        // public journal never carries the bytes.
+        use std::sync::{Arc, Mutex};
+        let hits: Arc<Mutex<Vec<ServerHit>>> = Arc::new(Mutex::new(Vec::new()));
+        let server_hits = Arc::clone(&hits);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback should bind");
+        let port = listener.local_addr().expect("address").port();
+        let server = std::thread::spawn(move || {
+            listener.set_nonblocking(true).expect("nonblocking mode");
+            let start = std::time::Instant::now();
+            let mut first_hit: Option<std::time::Instant> = None;
+            // Exactly one approved execution sends; resends never touch
+            // the wire. Linger briefly after the first hit so a duplicate
+            // send would be observed instead of refused.
+            loop {
+                let elapsed = start.elapsed();
+                if first_hit.is_some_and(|t| t.elapsed() > std::time::Duration::from_millis(1500))
+                    || elapsed > std::time::Duration::from_secs(10)
+                {
+                    break;
+                }
+                let Ok((stream, _)) = listener.accept() else {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    continue;
+                };
+                let mut stream = stream;
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+                let _ = stream.set_nonblocking(false);
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && head.len() < 65536 {
+                    match stream.read(&mut byte) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => head.push(byte[0]),
+                    }
+                }
+                let head_text = String::from_utf8_lossy(&head).into_owned();
+                let first_line = head_text.lines().next().unwrap_or_default().to_string();
+                let content_length = head_text
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("Content-Length:")
+                            .or_else(|| line.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0u8; content_length];
+                let _ = stream.read_exact(&mut body);
+                // Authorization header, if any, is captured from the head.
+                let auth = head_text
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("Authorization:")
+                            .or_else(|| line.strip_prefix("authorization:"))
+                            .map(|v| v.trim().to_string())
+                    })
+                    .unwrap_or_default();
+                server_hits
+                    .lock()
+                    .expect("hits lock")
+                    .push((first_line, auth, body));
+                if first_hit.is_none() {
+                    first_hit = Some(std::time::Instant::now());
+                }
+                let response = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 11\r\nconnection: close\r\n\r\n{\"ok\":true}";
+                let _ = stream.write_all(response);
+            }
+        });
+        let harness = ApprovalHarness::setup("http-post");
+        let node = ApprovalHarness::node();
+        let tools = vec![ToolDecl::Http {
+            name: "fetch".into(),
+            description: None,
+            input_schema: None,
+            methods: vec!["POST".into()],
+            hosts: vec!["127.0.0.1".into()],
+        }];
+        let body = "field=1&api_key=SECRET-XYZ-body-token";
+        let args = json!({
+            "method": "POST",
+            "url": format!("http://127.0.0.1:{port}/ingest"),
+            "headers": {"X-Tenant": "alpha"},
+            "body": body,
+        });
+        let runtime = test_runtime();
+        let confirm = {
+            let run = RunContext::for_tests(
+                harness.run_id.clone(),
+                harness.root.join("workspace"),
+                harness.root.join("meta"),
+                harness.contract(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+            .expect("test context should build");
+            let journal =
+                JournalWriter::create(&harness.journal_path(), &harness.run_id, false, None)
+                    .expect("journal should open");
+            request_approval(ApprovalCall {
+                run: &run,
+                journal: &journal,
+                node: &node,
+                runtime: &runtime,
+                tools: &tools,
+                name: "fetch",
+                call_id: "call-1",
+                args: &args,
+            })
+            .await
+        };
+        let journal_text = harness.journal_text();
+        assert!(
+            !journal_text.contains("SECRET-XYZ-body-token"),
+            "the public journal must not carry the body: {journal_text}"
+        );
+        {
+            let mut confirmations = BTreeMap::new();
+            confirmations.insert(confirm.id.clone(), true);
+            let run = RunContext::for_tests(
+                harness.run_id.clone(),
+                harness.root.join("workspace"),
+                harness.root.join("meta"),
+                harness.contract(),
+                confirmations,
+                BTreeMap::new(),
+            )
+            .expect("restart context should build");
+            let journal =
+                JournalWriter::create(&harness.journal_path(), &harness.run_id, false, None)
+                    .expect("journal should reopen");
+            let (restored, _) =
+                restore_after_restart(&run, &journal, &node, &harness.run_id, &tools, "call-1");
+            assert_eq!(restored.args, args, "the exact body must come back");
+            let mut vars = qcg_contract::ValueBag::with_inputs(BTreeMap::new());
+            let mut ctx = StepContext {
+                run: &run,
+                journal: &journal,
+                vars: &mut vars,
+                llm: None,
+            };
+            let mcp = McpAgentTools::prepare(&ctx, &node, &runtime, &tools)
+                .await
+                .expect("prepare should succeed");
+            let mut activated = BTreeSet::new();
+            // Finish the operation as the turn loop would after output
+            // checks, then prove a duplicate resume resends from the cache
+            // without touching the wire again.
+            let outcome = execute_agent_tool(
+                &mut ctx,
+                &node,
+                AgentToolServices {
+                    runtime: &runtime,
+                    guardrails: &[],
+                },
+                AgentToolInvocation {
+                    mcp: &mcp,
+                    tools: &tools,
+                    name: "fetch",
+                    call_id: "call-1",
+                    call_number: 0,
+                    args: &restored.args,
+                    activated_skills: &mut activated,
+                },
+            )
+            .await
+            .expect("approved execution should succeed");
+            assert!(
+                matches!(outcome, AgentToolOutcome::OperationResult { .. }),
+                "HTTP finishes as an operation result"
+            );
+            if let AgentToolOutcome::OperationResult {
+                value,
+                operation_id,
+            } = outcome
+            {
+                ctx.run
+                    .finish_external_operation(ctx.journal, &node, &operation_id, Some(value))
+                    .expect("finish should journal");
+                let again = execute_agent_tool(
+                    &mut ctx,
+                    &node,
+                    AgentToolServices {
+                        runtime: &runtime,
+                        guardrails: &[],
+                    },
+                    AgentToolInvocation {
+                        mcp: &mcp,
+                        tools: &tools,
+                        name: "fetch",
+                        call_id: "call-1",
+                        call_number: 0,
+                        args: &restored.args,
+                        activated_skills: &mut activated,
+                    },
+                )
+                .await
+                .expect("duplicate resume should resend");
+                assert!(
+                    matches!(again, AgentToolOutcome::Result(_)),
+                    "duplicate resume must resend, not re-send"
+                );
+            }
+        }
+        drop(harness);
+        server.join().expect("server thread should finish");
+        let hits = hits.lock().expect("hits lock");
+        assert_eq!(
+            hits.len(),
+            1,
+            "exactly one POST must reach the server: {hits:?}"
+        );
+        let (request_line, _auth, body_bytes) = &hits[0];
+        assert!(
+            request_line.starts_with("POST /ingest "),
+            "original method and path: {request_line}"
+        );
+        assert_eq!(
+            body_bytes,
+            &body.as_bytes().to_vec(),
+            "original body bytes must arrive intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn tampered_payload_after_approval_requests_fresh_confirmation() {
+        // F02-04: the same invocation with changed content does not ride
+        // the original approval; it requests a new confirmation instead of
+        // executing.
+        let harness = ApprovalHarness::setup("tamper");
+        let node = ApprovalHarness::node();
+        let tools = vec![ToolDecl::FsWrite {
+            name: "write".into(),
+            description: None,
+            input_schema: None,
+            path_prefix: "drafts".into(),
+        }];
+        let args = json!({"path": "drafts/note.txt", "content": "original"});
+        let runtime = test_runtime();
+        let confirm = {
+            let run = RunContext::for_tests(
+                harness.run_id.clone(),
+                harness.root.join("workspace"),
+                harness.root.join("meta"),
+                harness.contract(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+            .expect("test context should build");
+            let journal =
+                JournalWriter::create(&harness.journal_path(), &harness.run_id, false, None)
+                    .expect("journal should open");
+            request_approval(ApprovalCall {
+                run: &run,
+                journal: &journal,
+                node: &node,
+                runtime: &runtime,
+                tools: &tools,
+                name: "write",
+                call_id: "call-1",
+                args: &args,
+            })
+            .await
+        };
+        let mut confirmations = BTreeMap::new();
+        confirmations.insert(confirm.id.clone(), true);
+        let run = RunContext::for_tests(
+            harness.run_id.clone(),
+            harness.root.join("workspace"),
+            harness.root.join("meta"),
+            harness.contract(),
+            confirmations,
+            BTreeMap::new(),
+        )
+        .expect("restart context should build");
+        let journal = JournalWriter::create(&harness.journal_path(), &harness.run_id, false, None)
+            .expect("journal should reopen");
+        let mut vars = qcg_contract::ValueBag::with_inputs(BTreeMap::new());
+        let mut ctx = StepContext {
+            run: &run,
+            journal: &journal,
+            vars: &mut vars,
+            llm: None,
+        };
+        let mcp = McpAgentTools::prepare(&ctx, &node, &runtime, &tools)
+            .await
+            .expect("prepare should succeed");
+        let mut activated = BTreeSet::new();
+        let tampered = json!({"path": "drafts/note.txt", "content": "forged"});
+        let outcome = execute_agent_tool(
+            &mut ctx,
+            &node,
+            AgentToolServices {
+                runtime: &runtime,
+                guardrails: &[],
+            },
+            AgentToolInvocation {
+                mcp: &mcp,
+                tools: &tools,
+                name: "write",
+                call_id: "call-1",
+                call_number: 0,
+                args: &tampered,
+                activated_skills: &mut activated,
+            },
+        )
+        .await
+        .expect("tampered call should not error");
+        match outcome {
+            AgentToolOutcome::NeedsConfirm(fresh) => {
+                assert_ne!(
+                    fresh.id, confirm.id,
+                    "changed content must not reuse the original approval"
+                );
+            }
+            _ => panic!("changed content must re-confirm"),
+        }
+        assert!(
+            !harness.root.join("workspace/drafts/note.txt").exists(),
+            "nothing executes without its own approval"
+        );
     }
 }

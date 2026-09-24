@@ -233,9 +233,39 @@ impl Engine {
             }
         }
 
+        let had_join_errors = !join_errors.is_empty();
         let mut terminal_errors: Vec<EngineError> = join_errors;
+        // HITL-aware settlement (F12): when a sibling suspended for user
+        // input/confirmation, outcome-less siblings were aborted by the
+        // scheduler, not failed by their own logic. They journal a resumable
+        // `step_interrupted` marker (fold-ignored, node stays Pending) so
+        // the post-answer resume re-executes them under the same invocation
+        // instead of restoring a permanent failure. True panics (join
+        // errors present) stay fail-closed as scheduler failures so a real
+        // crash is never mistaken for a HITL interruption (F12-02).
+        // NOTE: HITL outcomes still sit in `outcomes` (not yet in
+        // `terminal_errors`), so scan both.
+        let hitl_pending = terminal_errors.iter().any(|error| {
+            matches!(
+                error,
+                EngineError::NeedsUser { .. } | EngineError::NeedsConfirm { .. }
+            )
+        }) || outcomes.values().any(|(_, outcome)| {
+            matches!(
+                outcome,
+                Ok(StepOutcome::NeedsUser { .. }) | Ok(StepOutcome::NeedsConfirm { .. })
+            )
+        });
         for node in nodes {
             let Some((node, outcome)) = outcomes.remove(&node.id) else {
+                if hitl_pending && !had_join_errors {
+                    states.insert(node.id.clone(), NodeState::Pending);
+                    journal.event(
+                        "step_interrupted",
+                        json!({ "node": node.id, "reason": "parallel sibling suspended for user input; will resume", "parallel": true }),
+                    )?;
+                    continue;
+                }
                 states.insert(
                     node.id.clone(),
                     NodeState::Failed(FailureDetail::new(
@@ -260,6 +290,33 @@ impl Engine {
             let outcome = match outcome {
                 Ok(outcome) => outcome,
                 Err(error) => {
+                    // A scheduler-aborted sibling that surfaces as Canceled
+                    // while HITL is pending is an interruption, not a
+                    // failure (F12): it resumes with the wave.
+                    if hitl_pending && error.is_canceled() {
+                        states.insert(node.id.clone(), NodeState::Pending);
+                        journal.event(
+                            "step_interrupted",
+                            json!({ "node": node.id, "reason": "parallel sibling canceled for user input; will resume", "parallel": true }),
+                        )?;
+                        continue;
+                    }
+                    // Agent errors defer to the sequential loop (same rule
+                    // as there): the agent owns durable continuations whose
+                    // replay-safety verdict only its operation guard can
+                    // make on re-entry. Settle as interrupted-pending so
+                    // the loop re-executes it sequentially instead of
+                    // stranding a terminal failure that resume would
+                    // report as a stale error.
+                    if node.kind.as_str() == "llm.agent" {
+                        states.insert(node.id.clone(), NodeState::Pending);
+                        journal.event(
+                            "step_interrupted",
+                            json!({ "node": node.id, "reason": "agent failure defers to sequential re-entry; will resume", "parallel": true }),
+                        )?;
+                        terminal_errors.push(error);
+                        continue;
+                    }
                     let reason =
                         FailureDetail::new(failure_code_for_error(&error), error.to_string());
                     states.insert(node.id.clone(), NodeState::Failed(reason.clone()));
@@ -404,8 +461,12 @@ impl Engine {
             // run-wide step budget, including ordinary retries. Foreach
             // children pass charge=false (single-charge outer only), all
             // other paths pass true so no path gets a free retry.
+            // Durable delta (F13): the consumption is journaled so live
+            // and recovery apply the same rule; observational step counts
+            // stay separate from the budget counter.
             if charge {
                 budget.consume(&node.id)?;
+                journal.event("budget_charged", json!({ "node": node.id, "amount": 1 }))?;
             }
             let result = self
                 .execute_attempt(context, journal, vars, budget, node, bounds)

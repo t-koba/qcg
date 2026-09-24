@@ -566,6 +566,11 @@ pub(crate) fn commit_install(
     target: &Utf8Path,
     replace_existing: bool,
 ) -> Result<()> {
+    // Recovery before locking (F14): if a previous commit died between
+    // target->backup and new-target publish, `target` is missing with a
+    // backup sibling intact. Restore the newest backup for this id before
+    // any sweep or commit can delete the sole old version.
+    recover_interrupted_backup(target);
     // Per-id serialization in-process plus per-id file lock across
     // processes, held for the whole backup+rename window. Fresh installs
     // race too (two NotFound observers both renaming): without the lock
@@ -607,6 +612,18 @@ pub(crate) fn commit_install(
                 }
             }
         };
+        // Backup ownership marker (F14): rename preserves the old
+        // directory mtime, so a fresh backup would otherwise look
+        // 1h-stale to a concurrent sweep. The sidecar carries the target
+        // id, commit phase, owner pid, and creation time; its own mtime
+        // is the freshness signal. Recovery runs before sweep, so a
+        // missing target with a backup sibling restores instead of
+        // deleting.
+        if let Err(error) = write_backup_marker(&backup, id, target) {
+            let _ = std::fs::rename(&backup, target);
+            return Err(error)
+                .with_context(|| format!("failed to mark install backup for `{target}`"));
+        }
         // Durability: fsync the parent after moving the existing target to
         // backup, before replacing (E14 backup→fsync→replace→fsync). A crash
         // between backup and replace leaves `target` missing with `backup`
@@ -839,4 +856,113 @@ pub(crate) fn unique_nonexistent_path(parent: &Utf8Path, prefix: &str) -> Result
             }
         }
     }
+}
+
+/// Sidecar marker that distinguishes a recovery backup from disposable
+/// scratch (F14). Written immediately after target->backup rename so the
+/// fresh backup has a fresh mtime even though the renamed directory keeps
+/// its old mtime.
+pub(crate) const BACKUP_MARKER_FILE: &str = ".qcg-backup.json";
+
+/// Best-effort recovery for a commit interrupted between target->backup
+/// and new-target publish (F14-02/F14-04). If `target` is missing but a
+/// backup sibling with a marker for this id exists, the newest backup is
+/// renamed back. Never deletes: on failure the backup and its location
+/// remain for manual recovery.
+pub(crate) fn recover_interrupted_backup(target: &Utf8Path) {
+    if std::fs::symlink_metadata(target).is_ok() {
+        return;
+    }
+    let Some(parent) = target.parent() else {
+        return;
+    };
+    let Some(id) = target.file_name() else {
+        return;
+    };
+    let candidates = backup_candidates_for(parent, id);
+    // Newest marker mtime first so the latest pre-commit state wins.
+    let mut newest: Option<(Utf8PathBuf, std::time::SystemTime)> = None;
+    for candidate in candidates {
+        let marker = candidate.join(BACKUP_MARKER_FILE);
+        let mtime = std::fs::symlink_metadata(&marker)
+            .and_then(|meta| meta.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let is_newer = newest.as_ref().is_none_or(|(_, t)| mtime > *t);
+        if is_newer {
+            newest = Some((candidate, mtime));
+        }
+    }
+    if let Some((backup, _)) = newest
+        && std::fs::rename(&backup, target).is_ok()
+    {
+        let _ = fsync_parent_dir(target);
+    }
+}
+
+/// Lists backup siblings whose marker names this target id (F14). Marker
+/// parsing is best-effort: unmarked directories are scratch, not recovery
+/// backups, and are left to the age-gated scratch path.
+pub(crate) fn backup_candidates_for(parent: &Utf8Path, id: &str) -> Vec<Utf8PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !name.starts_with(".qcg-install-backup-") {
+            continue;
+        }
+        let path = match Utf8PathBuf::from_path_buf(entry.path()) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        if backup_marker_id(&path).as_deref() == Some(id) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+fn backup_marker_id(backup: &Utf8Path) -> Option<String> {
+    let bytes = std::fs::read(backup.join(BACKUP_MARKER_FILE)).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+/// Freshness of a backup (F14-01): the max of the directory mtime and the
+/// marker mtime. Rename preserves the old directory mtime, so a just-made
+/// backup would otherwise look hours old.
+pub(crate) fn backup_freshness(backup: &Utf8Path) -> Option<std::time::SystemTime> {
+    let dir_mtime = std::fs::symlink_metadata(backup)
+        .and_then(|meta| meta.modified())
+        .ok();
+    let marker_mtime = std::fs::symlink_metadata(backup.join(BACKUP_MARKER_FILE))
+        .and_then(|meta| meta.modified())
+        .ok();
+    match (dir_mtime, marker_mtime) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn write_backup_marker(backup: &Utf8Path, id: &str, target: &Utf8Path) -> Result<()> {
+    let marker = serde_json::json!({
+        "id": id,
+        "target": target.as_str(),
+        "phase": "backup-created",
+        "pid": std::process::id(),
+        "created_at": chrono::Utc::now().to_rfc3339(),
+    });
+    let bytes = serde_json::to_vec_pretty(&marker).context("backup marker is not serializable")?;
+    std::fs::write(backup.join(BACKUP_MARKER_FILE), &bytes)
+        .with_context(|| format!("failed to write backup marker for `{target}`"))?;
+    let _ = fsync_parent_dir(target);
+    Ok(())
 }

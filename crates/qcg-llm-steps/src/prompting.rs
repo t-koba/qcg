@@ -118,6 +118,19 @@ pub(crate) fn utf8_tail(value: &str, max_bytes: usize) -> &str {
     &value[start..]
 }
 
+/// Shortens a journaled title to `limit` bytes plus a hash of the full
+/// text (F08). The cut always lands on a UTF-8 character boundary so
+/// multi-byte titles can never panic the task; short titles pass through
+/// unchanged.
+pub(crate) fn truncate_with_digest(value: &str, limit: usize) -> String {
+    if value.len() <= limit {
+        return value.to_string();
+    }
+    use sha2::Digest as _;
+    let digest = hex::encode(sha2::Sha256::digest(value.as_bytes()));
+    format!("{}...[sha256:{digest}]", utf8_head(value, limit))
+}
+
 pub(crate) fn estimate_context_tokens(text: &str) -> usize {
     text.chars().count().div_ceil(4).max(1)
 }
@@ -676,4 +689,68 @@ pub(crate) fn response_text(content: Vec<ChatContent>) -> Result<String, StepErr
             ChatContent::ToolCall { .. } => None,
         })
         .ok_or_else(|| StepError::failed("llm", "LLM response did not contain text"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::Digest as _;
+
+    #[test]
+    fn truncate_with_digest_never_panics_on_any_boundary() {
+        // F08-01: every byte length around and beyond the limit, across
+        // Japanese, emoji, and ASCII mixes, must shorten without panicking
+        // and stay valid UTF-8 within the byte budget.
+        const LIMIT: usize = 256;
+        let units = ["あ", "ア", "😀", "a", "é", "\u{2000B}"];
+        for unit in units {
+            for len in 0..=300 {
+                let text = unit.repeat(len);
+                let shortened = truncate_with_digest(&text, LIMIT);
+                // The digest suffix may make barely-over-limit titles
+                // longer in total; the budget applies to the head below.
+                if text.len() <= LIMIT {
+                    assert_eq!(shortened, text, "short titles stay identical");
+                } else {
+                    let head = shortened
+                        .strip_suffix(&format!(
+                            "...[sha256:{}]",
+                            hex::encode(sha2::Sha256::digest(text.as_bytes()))
+                        ))
+                        .expect("long titles carry shape plus hash");
+                    assert!(
+                        head.len() <= LIMIT,
+                        "unit {unit:?} x{len}: head exceeds the byte budget"
+                    );
+                    assert!(
+                        text.starts_with(head),
+                        "unit {unit:?} x{len}: head must be a prefix"
+                    );
+                }
+            }
+        }
+        // F08-02: the audit's case, 86 hiragana (258 bytes), plus a mixed
+        // title: stable across calls and bound to the full content.
+        let hiragana = "あ".repeat(86);
+        assert_eq!(hiragana.len(), 258);
+        let first = truncate_with_digest(&hiragana, LIMIT);
+        assert_eq!(first, truncate_with_digest(&hiragana, LIMIT));
+        assert!(
+            first.len() < hiragana.len() + 80,
+            "suffix overhead must stay bounded"
+        );
+        let mixed = format!(
+            "{}-{}-{}",
+            "あ".repeat(60),
+            "😀".repeat(20),
+            "x".repeat(100)
+        );
+        let shortened = truncate_with_digest(&mixed, LIMIT);
+        assert!(shortened.len() < mixed.len());
+        assert_ne!(
+            truncate_with_digest(&format!("{mixed}!"), LIMIT),
+            shortened,
+            "different content must hash differently"
+        );
+    }
 }

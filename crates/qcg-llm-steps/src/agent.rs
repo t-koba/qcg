@@ -607,17 +607,38 @@ impl StepExecutor for LlmAgentStep {
         // interrupted call is settled by its durable record (E07).
         // E07f: rejected stays rejected (no resume); undecided does not
         // resume here (the entry checkpoint above re-emits it).
+        // F02: the journaled pending call is redacted; the exact payload
+        // is restored from the run-private sidecar when it verifies
+        // against the stored confirmation digest. Unverifiable payloads
+        // stay redacted and fail closed downstream.
         let resumed_pending: Option<ChatToolCall> = checkpoint.as_ref().and_then(|stored| {
             let pending = stored.pending_side_effect.clone()?;
-            match stored.pending_confirm.as_ref() {
+            let approved = match stored.pending_confirm.as_ref() {
                 // Interrupted after execution started: the guard owns the
                 // decision, never the entry checkpoint.
-                None => Some(pending),
+                None => true,
                 // Only an explicit approval resumes.
                 Some(confirm) => {
-                    matches!(ctx.run.confirmations.get(&confirm.id), Some(true)).then_some(pending)
+                    matches!(ctx.run.confirmations.get(&confirm.id), Some(true))
                 }
+            };
+            if !approved {
+                return None;
             }
+            let operation_id = qcg_engine::operation_id_for(&ctx.run.run_id, &node.id, &pending.id);
+            let sidecar = ctx
+                .run
+                .load_pending_tool_payload(node, &operation_id)
+                .ok()
+                .flatten();
+            Some(crate::agent_runtime::restore_pending_call_from_sidecar(
+                &params.tools,
+                node,
+                &ctx.run.run_id,
+                &pending,
+                stored.pending_confirm.as_ref(),
+                sidecar.as_ref(),
+            ))
         });
         // E08d + E08 SENSITIVE two-field: the builtin suspension's question
         // binding is verified before choosing resend. The stored REDACTED
@@ -1582,6 +1603,9 @@ impl StepExecutor for LlmAgentStep {
                         &operation_id,
                         Some(result.clone()),
                     )?;
+                    // Settlement cleanup (F02): the pending payload sidecar
+                    // is no longer needed once the operation finished.
+                    ctx.run.clear_pending_tool_payload(&operation_id);
                 }
                 ctx.journal.event("tool_call", event).step_err(&node.id)?;
                 messages.push(ChatMessage::tool_result(call.id, encoded));
@@ -1653,12 +1677,30 @@ pub(crate) fn record_agent_checkpoint(
 ) -> Result<(), StepError> {
     // Journaled copies never carry plaintext secrets: pending calls and
     // transcript tool calls are redacted, while live execution keeps raw
-    // args in memory. A redacted resume returns cached success or fails
-    // closed instead of sending the placeholder (E09).
+    // args in memory. The exact execution payload rides in a run-private
+    // sidecar (F02) so an approved operation resumes with its original
+    // bytes; a redacted journal copy alone still fails closed.
     use crate::agent_runtime::{redact_messages_for_journal, redact_tool_call_for_journal};
     let mut journaled = checkpoint.clone();
     if let Some(call) = checkpoint.pending_side_effect.as_ref() {
         journaled.pending_side_effect = Some(redact_tool_call_for_journal(tools, call));
+        // Non-public continuation (F02): store the full call bound to this
+        // invocation. Failures to store fail the checkpoint so a redacted
+        // journal without a restorable payload is never written as if it
+        // were resumable.
+        let operation_id = qcg_engine::operation_id_for(&ctx.run.run_id, &node.id, &call.id);
+        let payload = serde_json::json!({
+            "id": call.id,
+            "name": call.name,
+            "args": call.args,
+        });
+        // The sidecar write is load-bearing, not best-effort: a journaled
+        // redacted checkpoint without its restorable payload would only
+        // fail later at resume time with a confusing refusal. Failing the
+        // checkpoint here keeps the cause (sync/permission) diagnosable
+        // and the run fail-closed at suspension instead (F02).
+        ctx.run
+            .store_pending_tool_payload(node, &operation_id, &payload)?;
     }
     if let Some(suspended) = checkpoint.pending_mcp_call.as_ref() {
         // E08-4 exact journaling rule. Builtin AskUser suspensions keep

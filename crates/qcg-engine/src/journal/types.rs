@@ -116,6 +116,7 @@ pub(crate) struct JournalMetrics {
     pub(crate) tokens_output: u64,
     pub(crate) tokens_cached_input: u64,
     pub(crate) steps_executed: u64,
+    pub(crate) budget_charged: u64,
     pub(crate) tokens_total: u64,
     pub(crate) cost_microusd: u64,
     pub(crate) duration_ms: u64,

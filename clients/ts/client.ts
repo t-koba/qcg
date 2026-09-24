@@ -8,6 +8,15 @@ export type QcgClientOptions = {
   token?: string;
   /** Fetch implementation override (tests, Node runtimes). */
   fetch?: typeof fetch;
+  /** Redirect policy for authenticated requests: same-origin only by default. */
+  redirect?: "same-origin" | "follow";
+};
+
+export type RequestOptions = {
+  query?: Record<string, unknown>;
+  body?: unknown;
+  headers?: Record<string, string>;
+  idempotencyKey?: string;
 };
 
 export class QcgError extends Error {
@@ -21,15 +30,30 @@ export class QcgError extends Error {
   }
 }
 
+/** Encodes one path segment (no slashes survive). */
+function encodeSegment(value: string): string {
+  return encodeURIComponent(value);
+}
+
+/** Encodes a multi-segment wildcard path, preserving slashes. */
+function encodePathParam(value: string): string {
+  return value
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+}
+
 export class QcgClient {
   private readonly baseUrl: string;
   private token?: string;
   private readonly fetchImpl: typeof fetch;
+  private readonly redirectPolicy: "same-origin" | "follow";
 
   constructor(options: QcgClientOptions = {}) {
     this.baseUrl = (options.baseUrl ?? "").replace(/\/$/, "");
     this.token = options.token;
     this.fetchImpl = options.fetch ?? globalThis.fetch;
+    this.redirectPolicy = options.redirect ?? "same-origin";
   }
 
   /** Replaces the bearer token for subsequent requests. */
@@ -40,7 +64,9 @@ export class QcgClient {
   private url(path: string, query?: Record<string, unknown>): string {
     const params = new URLSearchParams();
     for (const [key, value] of Object.entries(query ?? {})) {
-      if (value !== undefined && value !== null) params.set(key, String(value));
+      if (value === undefined || value === null) continue;
+      if (typeof value === "boolean") params.set(key, value ? "true" : "false");
+      else params.set(key, String(value));
     }
     const suffix = params.size > 0 ? `?${params.toString()}` : "";
     return `${this.baseUrl}${path}${suffix}`;
@@ -53,39 +79,172 @@ export class QcgClient {
     };
   }
 
+  private withIdempotency(
+    extra?: Record<string, string>,
+    idempotencyKey?: string,
+  ): Record<string, string> | undefined {
+    if (idempotencyKey === undefined) return extra;
+    return { ...extra, "idempotency-key": idempotencyKey };
+  }
+
+  private sameOrigin(url: string): boolean {
+    if (!this.baseUrl) return true;
+    try {
+      const base = new URL(this.baseUrl);
+      const target = new URL(url, this.baseUrl);
+      return base.origin === target.origin;
+    } catch {
+      return false;
+    }
+  }
+
+  private async checkedFetch(url: string, init: RequestInit): Promise<Response> {
+    // F04: never forward the bearer cross-origin or over a downgrade.
+    // The token lives only in memory; cross-origin redirects are followed
+    // without it (same-origin policy by default).
+    const response = await this.fetchImpl(url, { ...init, redirect: "manual" });
+    const location = response.headers.get("location");
+    if (
+      location !== null &&
+      [301, 302, 303, 307, 308].includes(response.status)
+    ) {
+      const next = new URL(location, url);
+      const current = new URL(url, this.baseUrl || undefined);
+      const crossOrigin = next.origin !== current.origin;
+      const downgrade = current.protocol === "https:" && next.protocol !== "https:";
+      const initHeaders = new Headers(init.headers);
+      if ((crossOrigin || downgrade) && initHeaders.has("authorization")) {
+        initHeaders.delete("authorization");
+      }
+      if (crossOrigin && this.redirectPolicy === "same-origin") {
+        // Follow same-origin redirects with the (possibly stripped)
+        // headers; cross-origin is followed once without credentials.
+        // Further hops re-enter this method via recursion below.
+      }
+      const nextInit: RequestInit = { ...init, headers: initHeaders };
+      // 303 always becomes GET (except HEAD); 301/302 POST becomes GET.
+      if (
+        response.status === 303 ||
+        ((response.status === 301 || response.status === 302) &&
+          (init.method ?? "GET") === "POST")
+      ) {
+        nextInit.method = "GET";
+        nextInit.body = undefined;
+        initHeaders.delete("content-type");
+        initHeaders.delete("content-length");
+      }
+      return this.checkedFetch(next.href, nextInit);
+    }
+    return response;
+  }
+
+  private async readProblem(response: Response): Promise<unknown> {
+    const text = await response.text();
+    if (!text) return {};
+    try {
+      return JSON.parse(text) as unknown;
+    } catch {
+      return { detail: text };
+    }
+  }
+
+  private async throwForStatus(response: Response): Promise<never> {
+    const problem = await this.readProblem(response);
+    throw new QcgError(response.status, problem, problemMessage(problem) || response.statusText);
+  }
+
   async request<T>(
     method: string,
     path: string,
     options: { query?: Record<string, unknown>; body?: unknown } = {},
   ): Promise<T> {
-    const headers: Record<string, string> = this.headers(
-      options.body === undefined ? undefined : { "content-type": "application/json" },
+    return this.requestJson(method, path, options);
+  }
+
+  private async requestJson<T>(
+    method: string,
+    path: string,
+    options: RequestOptions = {},
+  ): Promise<T> {
+    const headers = this.headers(
+      options.body === undefined ? options.headers : { "content-type": "application/json", ...options.headers },
     );
-    const response = await this.fetchImpl(this.url(path, options.query), {
+    const response = await this.checkedFetch(this.url(path, options.query), {
       method,
       headers,
       body: options.body === undefined ? undefined : JSON.stringify(options.body),
     });
-    if (!response.ok) {
-      const problem = await readProblem(response);
-      throw new QcgError(response.status, problem, problemMessage(problem) || response.statusText);
-    }
+    if (response.status === 304) return null as T;
+    if (!response.ok) await this.throwForStatus(response);
     if (response.status === 204) return undefined as T;
-    return (await response.json()) as T;
+    const text = await response.text();
+    if (!text) return undefined as T;
+    return JSON.parse(text) as T;
+  }
+
+  private async requestText(
+    method: string,
+    path: string,
+    options: RequestOptions = {},
+  ): Promise<string | null> {
+    const response = await this.checkedFetch(this.url(path, options.query), {
+      method,
+      headers: this.headers(options.headers),
+    });
+    if (response.status === 304) return null;
+    if (!response.ok) await this.throwForStatus(response);
+    return response.text();
+  }
+
+  private async requestBytes(
+    method: string,
+    path: string,
+    options: RequestOptions = {},
+  ): Promise<Uint8Array | null> {
+    const response = await this.checkedFetch(this.url(path, options.query), {
+      method,
+      headers: this.headers(options.headers),
+    });
+    if (response.status === 304) return null;
+    if (!response.ok) await this.throwForStatus(response);
+    return new Uint8Array(await response.arrayBuffer());
+  }
+
+  private async requestNdjson(
+    method: string,
+    path: string,
+    options: RequestOptions = {},
+  ): Promise<unknown[] | null> {
+    const text = await this.requestText(method, path, options);
+    if (text === null) return null;
+    return text
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+      .map((line) => JSON.parse(line) as unknown);
+  }
+
+  private async requestEmpty(method: string, path: string, options: RequestOptions = {}): Promise<void> {
+    const headers = this.headers(
+      options.body === undefined ? options.headers : { "content-type": "application/json", ...options.headers },
+    );
+    const response = await this.checkedFetch(this.url(path, options.query), {
+      method,
+      headers,
+      body: options.body === undefined ? undefined : JSON.stringify(options.body),
+    });
+    if (!response.ok) await this.throwForStatus(response);
   }
 
   private async text(path: string): Promise<string> {
-    const response = await this.fetchImpl(this.url(path), { headers: this.headers() });
-    if (!response.ok) {
-      const problem = await readProblem(response);
-      throw new QcgError(response.status, problem, problemMessage(problem) || response.statusText);
-    }
-    return response.text();
+    const result = await this.requestText("GET", path, {});
+    if (result === null) return "";
+    return result;
   }
 
   /** Reads run events as server-sent event JSON payloads, resuming from an id. */
   async *streamRunEvents(runId: string, lastEventId?: number): AsyncGenerator<unknown> {
-    const response = await this.fetchImpl(
+    const response = await this.checkedFetch(
       this.url(`/api/runs/${encodeURIComponent(runId)}/events`),
       {
         headers: this.headers(
@@ -94,152 +253,163 @@ export class QcgClient {
       },
     );
     if (!response.ok || !response.body) {
-      const problem = await readProblem(response);
-      throw new QcgError(response.status, problem, problemMessage(problem) || response.statusText);
+      await this.throwForStatus(response);
     }
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) return;
-      buffer += decoder.decode(value, { stream: true });
-      let boundary = buffer.indexOf("\n\n");
-      while (boundary >= 0) {
-        const frame = buffer.slice(0, boundary);
-        buffer = buffer.slice(boundary + 2);
-        const data = frame
-          .split("\n")
-          .filter((line) => line.startsWith("data:"))
-          .map((line) => line.slice(5).trimStart())
-          .join("");
-        if (data) yield JSON.parse(data) as unknown;
-        boundary = buffer.indexOf("\n\n");
+    const reader = response.body!.getReader();
+    try {
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          buffer += decoder.decode();
+          if (buffer.trim().length > 0) {
+            const payload = parseSseFrame(buffer);
+            if (payload !== undefined) yield payload;
+          }
+          return;
+        }
+        buffer += decoder.decode(value, { stream: true });
+        // Normalize CRLF/CR per the SSE spec before framing.
+        buffer = buffer.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+        let boundary = buffer.indexOf("\n\n");
+        while (boundary >= 0) {
+          const frame = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          const payload = parseSseFrame(frame);
+          if (payload !== undefined) yield payload;
+          boundary = buffer.indexOf("\n\n");
+        }
       }
+    } finally {
+      try {
+        await reader.cancel();
+      } catch {
+        // Cancel is best-effort: the connection may already be closed.
+      }
+      reader.releaseLock();
     }
   }
 
-  async listGenerators(): Promise<paths["/api/generators"]["get"]["responses"][200]["content"]["application/json"]> {
-    return this.request("GET", `/api/generators`);
+  async listGenerators(): Promise<paths["/api/generators"]["get"]["responses"][200]["content"]["application/json"] | null> {
+    return this.requestJson<paths["/api/generators"]["get"]["responses"][200]["content"]["application/json"] | null>("GET", `/api/generators`);
   }
 
-  async getGenerator(id: string): Promise<paths["/api/generators/{id}"]["get"]["responses"][200]["content"]["application/json"]> {
-    return this.request("GET", `/api/generators/${encodeURIComponent(id)}`);
+  async getGenerator(id: string, options?: { headers?: Record<string, string> }): Promise<paths["/api/generators/{id}"]["get"]["responses"][200]["content"]["application/json"] | null> {
+    return this.requestJson<paths["/api/generators/{id}"]["get"]["responses"][200]["content"]["application/json"] | null>("GET", `/api/generators/${encodeURIComponent(id)}`, { headers: options?.headers });
   }
 
-  async readGeneratorAsset(id: string, path: string): Promise<void> {
-    return this.request("GET", `/api/generators/${encodeURIComponent(id)}/assets/${encodeURIComponent(path)}`);
+  async readGeneratorAsset(id: string, path: string): Promise<Uint8Array | null> {
+    return this.requestBytes("GET", `/api/generators/${encodeURIComponent(id)}/assets/${encodePathParam(path)}`);
   }
 
-  async llmCatalog(query?: paths["/api/llm/catalog"]["get"]["parameters"]["query"]): Promise<paths["/api/llm/catalog"]["get"]["responses"][200]["content"]["application/json"]> {
-    return this.request("GET", `/api/llm/catalog`, { query });
+  async llmCatalog(query?: paths["/api/llm/catalog"]["get"]["parameters"]["query"], options?: { query?: Record<string, unknown>; headers?: Record<string, string> }): Promise<paths["/api/llm/catalog"]["get"]["responses"][200]["content"]["application/json"] | null> {
+    return this.requestJson<paths["/api/llm/catalog"]["get"]["responses"][200]["content"]["application/json"] | null>("GET", `/api/llm/catalog`, { query, headers: options?.headers });
   }
 
-  async completeMcpAuthorization(query?: paths["/api/mcp/oauth/callback"]["get"]["parameters"]["query"]): Promise<void> {
-    return this.request("GET", `/api/mcp/oauth/callback`, { query });
+  async completeMcpAuthorization(query?: paths["/api/mcp/oauth/callback"]["get"]["parameters"]["query"], options?: { query?: Record<string, unknown>; headers?: Record<string, string> }): Promise<string | null> {
+    return this.requestText("GET", `/api/mcp/oauth/callback`, { query, headers: options?.headers });
   }
 
-  async listMcpServers(): Promise<paths["/api/mcp/servers"]["get"]["responses"][200]["content"]["application/json"]> {
-    return this.request("GET", `/api/mcp/servers`);
+  async listMcpServers(): Promise<paths["/api/mcp/servers"]["get"]["responses"][200]["content"]["application/json"] | null> {
+    return this.requestJson<paths["/api/mcp/servers"]["get"]["responses"][200]["content"]["application/json"] | null>("GET", `/api/mcp/servers`);
   }
 
-  async startMcpAuthorization(id: string): Promise<paths["/api/mcp/servers/{id}/authorization"]["post"]["responses"][200]["content"]["application/json"]> {
-    return this.request("POST", `/api/mcp/servers/${encodeURIComponent(id)}/authorization`);
+  async startMcpAuthorization(id: string): Promise<paths["/api/mcp/servers/{id}/authorization"]["post"]["responses"][200]["content"]["application/json"] | null> {
+    return this.requestJson<paths["/api/mcp/servers/{id}/authorization"]["post"]["responses"][200]["content"]["application/json"] | null>("POST", `/api/mcp/servers/${encodeURIComponent(id)}/authorization`);
   }
 
   async clearMcpAuthorization(id: string): Promise<void> {
-    return this.request("DELETE", `/api/mcp/servers/${encodeURIComponent(id)}/authorization`);
+    return this.requestEmpty("DELETE", `/api/mcp/servers/${encodeURIComponent(id)}/authorization`);
   }
 
   async cancelPendingMcpAuthorization(id: string): Promise<void> {
-    return this.request("DELETE", `/api/mcp/servers/${encodeURIComponent(id)}/authorization/pending`);
+    return this.requestEmpty("DELETE", `/api/mcp/servers/${encodeURIComponent(id)}/authorization/pending`);
   }
 
-  async openapi(): Promise<paths["/api/openapi.json"]["get"]["responses"][200]["content"]["application/json"]> {
-    return this.request("GET", `/api/openapi.json`);
+  async openapi(): Promise<paths["/api/openapi.json"]["get"]["responses"][200]["content"]["application/json"] | null> {
+    return this.requestJson<paths["/api/openapi.json"]["get"]["responses"][200]["content"]["application/json"] | null>("GET", `/api/openapi.json`);
   }
 
-  async listRuns(query?: paths["/api/runs"]["get"]["parameters"]["query"]): Promise<paths["/api/runs"]["get"]["responses"][200]["content"]["application/json"]> {
-    return this.request("GET", `/api/runs`, { query });
+  async listRuns(query?: paths["/api/runs"]["get"]["parameters"]["query"], options?: { query?: Record<string, unknown>; headers?: Record<string, string> }): Promise<paths["/api/runs"]["get"]["responses"][200]["content"]["application/json"] | null> {
+    return this.requestJson<paths["/api/runs"]["get"]["responses"][200]["content"]["application/json"] | null>("GET", `/api/runs`, { query, headers: options?.headers });
   }
 
-  async startRun(body: paths["/api/runs"]["post"]["requestBody"]["content"]["application/json"]): Promise<paths["/api/runs"]["post"]["responses"][201]["content"]["application/json"]> {
-    return this.request("POST", `/api/runs`, { body });
+  async startRun(body: paths["/api/runs"]["post"]["requestBody"]["content"]["application/json"], options?: { body?: unknown; headers?: Record<string, string>; idempotencyKey?: string }): Promise<paths["/api/runs"]["post"]["responses"][201]["content"]["application/json"] | null> {
+    return this.requestJson<paths["/api/runs"]["post"]["responses"][201]["content"]["application/json"] | null>("POST", `/api/runs`, { body: body ?? options?.body, headers: this.withIdempotency(options?.headers, options?.idempotencyKey) });
   }
 
-  async getRun(id: string): Promise<paths["/api/runs/{id}"]["get"]["responses"][200]["content"]["application/json"]> {
-    return this.request("GET", `/api/runs/${encodeURIComponent(id)}`);
-  }
-
-  async cancelRunAlias(id: string): Promise<paths["/api/runs/{id}"]["post"]["responses"][200]["content"]["application/json"]> {
-    return this.request("POST", `/api/runs/${encodeURIComponent(id)}`);
+  async getRun(id: string, options?: { headers?: Record<string, string> }): Promise<paths["/api/runs/{id}"]["get"]["responses"][200]["content"]["application/json"] | null> {
+    return this.requestJson<paths["/api/runs/{id}"]["get"]["responses"][200]["content"]["application/json"] | null>("GET", `/api/runs/${encodeURIComponent(id)}`, { headers: options?.headers });
   }
 
   async deleteRun(id: string): Promise<void> {
-    return this.request("DELETE", `/api/runs/${encodeURIComponent(id)}`);
+    return this.requestEmpty("DELETE", `/api/runs/${encodeURIComponent(id)}`);
   }
 
-  async listArtifacts(id: string): Promise<paths["/api/runs/{id}/artifacts"]["get"]["responses"][200]["content"]["application/json"]> {
-    return this.request("GET", `/api/runs/${encodeURIComponent(id)}/artifacts`);
+  async listArtifacts(id: string, options?: { headers?: Record<string, string> }): Promise<paths["/api/runs/{id}/artifacts"]["get"]["responses"][200]["content"]["application/json"] | null> {
+    return this.requestJson<paths["/api/runs/{id}/artifacts"]["get"]["responses"][200]["content"]["application/json"] | null>("GET", `/api/runs/${encodeURIComponent(id)}/artifacts`, { headers: options?.headers });
   }
 
-  async downloadArtifactsZip(id: string): Promise<void> {
-    return this.request("GET", `/api/runs/${encodeURIComponent(id)}/artifacts.zip`);
+  async downloadArtifactsZip(id: string): Promise<Uint8Array | null> {
+    return this.requestBytes("GET", `/api/runs/${encodeURIComponent(id)}/artifacts.zip`);
   }
 
-  async readArtifact(id: string, path: string): Promise<void> {
-    return this.request("GET", `/api/runs/${encodeURIComponent(id)}/artifacts/${encodeURIComponent(path)}`);
+  async readArtifact(id: string, path: string): Promise<Uint8Array | null> {
+    return this.requestBytes("GET", `/api/runs/${encodeURIComponent(id)}/artifacts/${encodePathParam(path)}`);
   }
 
-  async downloadRunBundle(id: string): Promise<void> {
-    return this.request("GET", `/api/runs/${encodeURIComponent(id)}/bundle`);
+  async downloadRunBundle(id: string): Promise<Uint8Array | null> {
+    return this.requestBytes("GET", `/api/runs/${encodeURIComponent(id)}/bundle`);
   }
 
-  async confirmRun(id: string, cid: string, body: paths["/api/runs/{id}/confirmations/{cid}"]["put"]["requestBody"]["content"]["application/json"]): Promise<paths["/api/runs/{id}/confirmations/{cid}"]["put"]["responses"][200]["content"]["application/json"]> {
-    return this.request("PUT", `/api/runs/${encodeURIComponent(id)}/confirmations/${encodeURIComponent(cid)}`, { body });
+  async confirmRun(id: string, cid: string, body: paths["/api/runs/{id}/confirmations/{cid}"]["put"]["requestBody"]["content"]["application/json"], options?: { body?: unknown; headers?: Record<string, string>; idempotencyKey?: string }): Promise<paths["/api/runs/{id}/confirmations/{cid}"]["put"]["responses"][200]["content"]["application/json"] | null> {
+    return this.requestJson<paths["/api/runs/{id}/confirmations/{cid}"]["put"]["responses"][200]["content"]["application/json"] | null>("PUT", `/api/runs/${encodeURIComponent(id)}/confirmations/${encodeURIComponent(cid)}`, { body: body ?? options?.body, headers: this.withIdempotency(options?.headers, options?.idempotencyKey) });
   }
 
-  async runEvents(id: string): Promise<void> {
-    return this.request("GET", `/api/runs/${encodeURIComponent(id)}/events`);
+  async runEvents(id: string, options?: { headers?: Record<string, string> }): Promise<string | null> {
+    return this.requestText("GET", `/api/runs/${encodeURIComponent(id)}/events`, { headers: options?.headers });
   }
 
-  async forkRun(id: string, body: paths["/api/runs/{id}/fork"]["post"]["requestBody"]["content"]["application/json"]): Promise<paths["/api/runs/{id}/fork"]["post"]["responses"][201]["content"]["application/json"]> {
-    return this.request("POST", `/api/runs/${encodeURIComponent(id)}/fork`, { body });
+  async forkRun(id: string, body: paths["/api/runs/{id}/fork"]["post"]["requestBody"]["content"]["application/json"], options?: { body?: unknown; headers?: Record<string, string>; idempotencyKey?: string }): Promise<paths["/api/runs/{id}/fork"]["post"]["responses"][201]["content"]["application/json"] | null> {
+    return this.requestJson<paths["/api/runs/{id}/fork"]["post"]["responses"][201]["content"]["application/json"] | null>("POST", `/api/runs/${encodeURIComponent(id)}/fork`, { body: body ?? options?.body, headers: this.withIdempotency(options?.headers, options?.idempotencyKey) });
   }
 
-  async readRunJournal(id: string): Promise<void> {
-    return this.request("GET", `/api/runs/${encodeURIComponent(id)}/journal`);
+  async readRunJournal(id: string): Promise<unknown[] | null> {
+    return this.requestNdjson("GET", `/api/runs/${encodeURIComponent(id)}/journal`);
   }
 
-  async readRunMetrics(id: string): Promise<paths["/api/runs/{id}/metrics"]["get"]["responses"][200]["content"]["application/json"]> {
-    return this.request("GET", `/api/runs/${encodeURIComponent(id)}/metrics`);
+  async readRunMetrics(id: string): Promise<paths["/api/runs/{id}/metrics"]["get"]["responses"][200]["content"]["application/json"] | null> {
+    return this.requestJson<paths["/api/runs/{id}/metrics"]["get"]["responses"][200]["content"]["application/json"] | null>("GET", `/api/runs/${encodeURIComponent(id)}/metrics`);
   }
 
-  async answerQuestion(id: string, qid: string, body: paths["/api/runs/{id}/questions/{qid}"]["put"]["requestBody"]["content"]["application/json"]): Promise<paths["/api/runs/{id}/questions/{qid}"]["put"]["responses"][200]["content"]["application/json"]> {
-    return this.request("PUT", `/api/runs/${encodeURIComponent(id)}/questions/${encodeURIComponent(qid)}`, { body });
+  async answerQuestion(id: string, qid: string, body: paths["/api/runs/{id}/questions/{qid}"]["put"]["requestBody"]["content"]["application/json"], options?: { body?: unknown; headers?: Record<string, string>; idempotencyKey?: string }): Promise<paths["/api/runs/{id}/questions/{qid}"]["put"]["responses"][200]["content"]["application/json"] | null> {
+    return this.requestJson<paths["/api/runs/{id}/questions/{qid}"]["put"]["responses"][200]["content"]["application/json"] | null>("PUT", `/api/runs/${encodeURIComponent(id)}/questions/${encodeURIComponent(qid)}`, { body: body ?? options?.body, headers: this.withIdempotency(options?.headers, options?.idempotencyKey) });
   }
 
-  async cancelRun(id: string): Promise<paths["/api/runs/{id}:cancel"]["post"]["responses"][200]["content"]["application/json"]> {
-    return this.request("POST", `/api/runs/${encodeURIComponent(id)}:cancel`);
+  async cancelRun(id: string, options?: { headers?: Record<string, string>; idempotencyKey?: string }): Promise<paths["/api/runs/{id}:cancel"]["post"]["responses"][200]["content"]["application/json"] | null> {
+    return this.requestJson<paths["/api/runs/{id}:cancel"]["post"]["responses"][200]["content"]["application/json"] | null>("POST", `/api/runs/${encodeURIComponent(id)}:cancel`, { headers: this.withIdempotency(options?.headers, options?.idempotencyKey) });
   }
 
-  async health(): Promise<paths["/healthz"]["get"]["responses"][200]["content"]["application/json"]> {
-    return this.request("GET", `/healthz`);
+  async health(): Promise<paths["/healthz"]["get"]["responses"][200]["content"]["application/json"] | null> {
+    return this.requestJson<paths["/healthz"]["get"]["responses"][200]["content"]["application/json"] | null>("GET", `/healthz`);
   }
 
-  async metrics(): Promise<void> {
-    return this.request("GET", `/metrics`);
+  async metrics(): Promise<string | null> {
+    return this.requestText("GET", `/metrics`);
   }
 }
 
-async function readProblem(response: Response): Promise<unknown> {
-  const text = await response.text();
-  if (!text) return {};
-  try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    return { detail: text };
+function parseSseFrame(frame: string): unknown | undefined {
+  const data: string[] = [];
+  for (const line of frame.split("\n")) {
+    if (line.startsWith(":")) continue;
+    if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
   }
+  if (data.length === 0) return undefined;
+  const text = data.join("\n");
+  if (!text) return undefined;
+  return JSON.parse(text) as unknown;
 }
 
 function problemMessage(problem: unknown): string {

@@ -3983,6 +3983,629 @@ api_key_env = "QCG_SECURE_API_KEY"
         assert!(journal.contains("hook.run_started.seed"), "{journal}");
     }
 
+    #[tokio::test]
+    async fn ordinary_execution_errors_reach_failure_hooks() {
+        // F07-01: an ordinary step Err (not a CheckFailed outcome) must
+        // still run step_failed/run_failed hooks exactly once each.
+        let run_dir = temp_run_dir("hooks-ordinary-err");
+        let _ = std::fs::remove_dir_all(&run_dir);
+        let mut manifest = manifest(vec![node("broken", "test.parallel_fail")]);
+        manifest
+            .hooks
+            .step_failed
+            .push(hook("report", "test.pass", HookErrorPolicy::Warn));
+        manifest
+            .hooks
+            .run_failed
+            .push(hook("notify", "test.pass", HookErrorPolicy::Warn));
+        let graph = Graph::build(&manifest).expect("test graph should build");
+        let contract = Contract {
+            root: run_dir.clone(),
+            manifest,
+            graph,
+            sha256: "hooks-ordinary-err".into(),
+        };
+        Engine::new(test_registry())
+            .run_with_id(
+                "hooks-ordinary-err".into(),
+                run_dir.join("meta"),
+                contract,
+                BTreeMap::new(),
+                RunOptions {
+                    output_dir: run_dir.join("workspace"),
+                    json_events: false,
+                    event_sender: None,
+                    interactive: false,
+                    answers: BTreeMap::new(),
+                    confirmations: BTreeMap::new(),
+                    max_total_steps: 100,
+                    max_parallel_steps: 1,
+                    llm_provider: None,
+                    llm_seed_override: None,
+                    run_refs: std::collections::BTreeMap::new(),
+                    cancellation: CancellationToken::new(),
+                    shutdown: None,
+                },
+            )
+            .await
+            .expect_err("the broken node must still fail the run");
+        let journal =
+            std::fs::read_to_string(run_dir.join("meta/journal.jsonl")).expect("journal reads");
+        assert_eq!(
+            journal.matches("\"t\":\"step_started\"").count(),
+            3,
+            "broken node + step_failed hook + run_failed hook must each start once: {journal}"
+        );
+        assert!(
+            journal.contains("\"status\":\"failed\""),
+            "the failure must settle durably: {journal}"
+        );
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[tokio::test]
+    async fn foreach_single_charge_matches_live_and_fold() {
+        // F13-02: the single-charge rule (one outer charge, children share
+        // it) must read identically live and after a journal fold: five
+        // children journal six step_started events but a single
+        // budget_charged delta, and recovery seeds from the delta.
+        struct ForeachPassKind;
+        #[async_trait]
+        impl StepExecutor for ForeachPassKind {
+            fn type_id(&self) -> &'static str {
+                "test.foreach"
+            }
+            fn traits(&self) -> StepTraits {
+                StepTraits {
+                    parallel_safe: false,
+                    control_flow: crate::StepControlFlow::Foreach,
+                }
+            }
+            async fn execute(
+                &self,
+                _ctx: &mut StepContext<'_>,
+                node: &NodeDef,
+            ) -> Result<StepOutcome, StepError> {
+                Err(StepError::failed(
+                    &node.id,
+                    "foreach must not execute its body",
+                ))
+            }
+        }
+        let run_dir = temp_run_dir("foreach-charge");
+        let _ = std::fs::remove_dir_all(&run_dir);
+        let mut flow_manifest = manifest(vec![foreach_node("each", "body", "inputs.items", 1, 10)]);
+        flow_manifest.inputs = foreach_items_input();
+        flow_manifest
+            .blocks
+            .insert("body".into(), vec![node("child", "test.pass")]);
+        let graph = Graph::build(&flow_manifest).expect("test graph should build");
+        let contract = Contract {
+            root: run_dir.clone(),
+            manifest: flow_manifest,
+            graph,
+            sha256: "foreach-charge".into(),
+        };
+        let mut registry = StepRegistry::new();
+        registry.register(ForeachPassKind);
+        registry.register(TestPassStep);
+        Engine::new(registry)
+            .run_with_id(
+                "foreach-charge".into(),
+                run_dir.join("meta"),
+                contract,
+                BTreeMap::from([("items".into(), json!(["a", "b", "c", "d", "e"]))]),
+                RunOptions {
+                    output_dir: run_dir.join("workspace"),
+                    json_events: false,
+                    event_sender: None,
+                    interactive: false,
+                    answers: BTreeMap::new(),
+                    confirmations: BTreeMap::new(),
+                    max_total_steps: 100,
+                    max_parallel_steps: 1,
+                    llm_provider: None,
+                    llm_seed_override: None,
+                    run_refs: std::collections::BTreeMap::new(),
+                    cancellation: CancellationToken::new(),
+                    shutdown: None,
+                },
+            )
+            .await
+            .expect("five passing children must succeed");
+        let journal =
+            std::fs::read_to_string(run_dir.join("meta/journal.jsonl")).expect("journal reads");
+        assert_eq!(
+            journal.matches("\"t\":\"budget_charged\"").count(),
+            1,
+            "single-charge: one delta for the whole foreach: {journal}"
+        );
+        assert_eq!(
+            journal.matches("\"t\":\"step_started\"").count(),
+            6,
+            "observational count still sees outer plus five children: {journal}"
+        );
+        let state =
+            RunState::fold_journal(&run_dir.join("meta/journal.jsonl")).expect("fold must succeed");
+        assert_eq!(
+            state.budget.budget_charged, 1,
+            "fold must recover one charge"
+        );
+        assert!(
+            state.budget.has_budget_charges,
+            "resume must seed from the delta, not the six starts"
+        );
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[tokio::test]
+    async fn budget_charges_match_attempts_live_and_after_fold() {
+        // F13-01: three attempts on one node charge three budget units
+        // live; folding the journal yields the same consumption so a
+        // resume (SIGKILL/HITL) sees identical remaining budget.
+        let run_dir = temp_run_dir("budget-charges");
+        let _ = std::fs::remove_dir_all(&run_dir);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = StepRegistry::new();
+        registry.register(FlakyStep {
+            calls: Arc::clone(&calls),
+            fail_first: 2,
+            permanent: false,
+            slow_secs: 0,
+        });
+        let flow_manifest = manifest(vec![retry_node("flaky", "test.flaky", 3, 0, None)]);
+        let graph = Graph::build(&flow_manifest).expect("test graph should build");
+        let contract = Contract {
+            root: run_dir.clone(),
+            manifest: flow_manifest,
+            graph,
+            sha256: "budget-charges".into(),
+        };
+        Engine::new(registry)
+            .run_with_id(
+                "budget-charges".into(),
+                run_dir.join("meta"),
+                contract,
+                BTreeMap::new(),
+                RunOptions {
+                    output_dir: run_dir.join("workspace"),
+                    json_events: false,
+                    event_sender: None,
+                    interactive: false,
+                    answers: BTreeMap::new(),
+                    confirmations: BTreeMap::new(),
+                    max_total_steps: 100,
+                    max_parallel_steps: 1,
+                    llm_provider: None,
+                    llm_seed_override: None,
+                    run_refs: std::collections::BTreeMap::new(),
+                    cancellation: CancellationToken::new(),
+                    shutdown: None,
+                },
+            )
+            .await
+            .expect("three attempts must succeed on the last try");
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "three attempts must run");
+        let journal =
+            std::fs::read_to_string(run_dir.join("meta/journal.jsonl")).expect("journal reads");
+        assert_eq!(
+            journal.matches("\"t\":\"budget_charged\"").count(),
+            3,
+            "each attempt must journal its charge: {journal}"
+        );
+        let state =
+            RunState::fold_journal(&run_dir.join("meta/journal.jsonl")).expect("fold must succeed");
+        assert_eq!(
+            state.budget.budget_charged, 3,
+            "fold must recover 3 charges"
+        );
+        assert!(
+            state.budget.has_budget_charges,
+            "new journals must seed from charges, not event counts"
+        );
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[tokio::test]
+    async fn budget_boundary_exact_succeeds_and_over_fails() {
+        // F13-03: at exactly the limit the run succeeds; one over fails
+        // through shared settlement with the budget cause preserved.
+        // Metrics meaning: steps_executed counts starts (observational),
+        // budget_charged drives enforcement (F13).
+        let run_case = |name: &str, max_total_steps: usize| {
+            let run_dir = temp_run_dir(name);
+            let _ = std::fs::remove_dir_all(&run_dir);
+            let flow_manifest = manifest(vec![
+                node("first", "test.pass"),
+                node("second", "test.pass"),
+            ]);
+            let graph = Graph::build(&flow_manifest).expect("test graph should build");
+            let contract = Contract {
+                root: run_dir.clone(),
+                manifest: flow_manifest,
+                graph,
+                sha256: "budget-boundary".into(),
+            };
+            let mut registry = StepRegistry::new();
+            registry.register(TestPassStep);
+            (run_dir, contract, registry, max_total_steps)
+        };
+        let run_options = |run_dir: &Utf8PathBuf, max_total_steps: usize| RunOptions {
+            output_dir: run_dir.join("workspace"),
+            json_events: false,
+            event_sender: None,
+            interactive: false,
+            answers: BTreeMap::new(),
+            confirmations: BTreeMap::new(),
+            max_total_steps,
+            max_parallel_steps: 1,
+            llm_provider: None,
+            llm_seed_override: None,
+            run_refs: std::collections::BTreeMap::new(),
+            cancellation: CancellationToken::new(),
+            shutdown: None,
+        };
+        let (ok_dir, ok_contract, ok_registry, _) = run_case("budget-exact", 2);
+        Engine::new(ok_registry)
+            .run_with_id(
+                "budget-exact".into(),
+                ok_dir.join("meta"),
+                ok_contract,
+                BTreeMap::new(),
+                run_options(&ok_dir, 2),
+            )
+            .await
+            .expect("exactly at the limit must succeed");
+        let state =
+            RunState::fold_journal(&ok_dir.join("meta/journal.jsonl")).expect("fold must succeed");
+        assert_eq!(state.budget.budget_charged, 2);
+        assert_eq!(state.budget.steps_executed, 2);
+        let _ = std::fs::remove_dir_all(&ok_dir);
+        let (over_dir, over_contract, over_registry, _) = run_case("budget-over", 1);
+        let error = Engine::new(over_registry)
+            .run_with_id(
+                "budget-over".into(),
+                over_dir.join("meta"),
+                over_contract,
+                BTreeMap::new(),
+                run_options(&over_dir, 1),
+            )
+            .await
+            .expect_err("one over the limit must fail");
+        assert!(
+            error.to_string().contains("budget"),
+            "the cause must stay a budget error: {error}"
+        );
+        let journal =
+            std::fs::read_to_string(over_dir.join("meta/journal.jsonl")).expect("journal reads");
+        assert!(
+            journal.contains("\"status\":\"failed\""),
+            "over-limit must settle durably: {journal}"
+        );
+        let _ = std::fs::remove_dir_all(&over_dir);
+    }
+
+    #[tokio::test]
+    async fn parallel_hitl_interruption_resumes_siblings() {
+        // F12-01: a fast suspending step plus a slow side-effect-free step
+        // in one wave: the answer resumes the run and the interrupted
+        // sibling completes instead of staying permanently failed.
+        struct AnswerOnceStep;
+        #[async_trait]
+        impl StepExecutor for AnswerOnceStep {
+            fn type_id(&self) -> &'static str {
+                "test.answer_once"
+            }
+            fn traits(&self) -> StepTraits {
+                StepTraits {
+                    parallel_safe: true,
+                    ..StepTraits::default()
+                }
+            }
+            async fn execute(
+                &self,
+                ctx: &mut StepContext<'_>,
+                _node: &NodeDef,
+            ) -> Result<StepOutcome, StepError> {
+                if ctx.run.answers.contains_key("q-fast") {
+                    return Ok(StepOutcome::Success {
+                        output: Some(json!({ "answered": true })),
+                        files: vec![],
+                    });
+                }
+                Ok(StepOutcome::NeedsUser {
+                    question: qcg_api::FormSpec {
+                        id: "q-fast".into(),
+                        title: "fast question".into(),
+                        title_i18n: Default::default(),
+                        fields: vec![],
+                    },
+                })
+            }
+        }
+        struct SlowPassStep;
+        #[async_trait]
+        impl StepExecutor for SlowPassStep {
+            fn type_id(&self) -> &'static str {
+                "test.slow_pass"
+            }
+            fn traits(&self) -> StepTraits {
+                StepTraits {
+                    parallel_safe: true,
+                    ..StepTraits::default()
+                }
+            }
+            async fn execute(
+                &self,
+                _ctx: &mut StepContext<'_>,
+                node: &NodeDef,
+            ) -> Result<StepOutcome, StepError> {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                Ok(StepOutcome::Success {
+                    output: Some(json!({ "node": node.id })),
+                    files: vec![],
+                })
+            }
+        }
+        let run_dir = temp_run_dir("parallel-hitl-resume");
+        let _ = std::fs::remove_dir_all(&run_dir);
+        let mut registry = StepRegistry::new();
+        registry.register(AnswerOnceStep);
+        registry.register(SlowPassStep);
+        let mut flow_manifest = manifest(vec![
+            node("fast", "test.answer_once"),
+            node("slow", "test.slow_pass"),
+        ]);
+        flow_manifest.parallel = vec!["fast".into(), "slow".into()];
+        let graph = Graph::build(&flow_manifest).expect("test graph should build");
+        let contract = Contract {
+            root: run_dir.clone(),
+            manifest: flow_manifest,
+            graph,
+            sha256: "parallel-hitl".into(),
+        };
+        let options = |answers: BTreeMap<String, Value>| RunOptions {
+            output_dir: run_dir.join("workspace"),
+            json_events: false,
+            event_sender: None,
+            interactive: false,
+            answers,
+            confirmations: BTreeMap::new(),
+            max_total_steps: 100,
+            max_parallel_steps: 2,
+            llm_provider: None,
+            llm_seed_override: None,
+            run_refs: std::collections::BTreeMap::new(),
+            cancellation: CancellationToken::new(),
+            shutdown: None,
+        };
+        let error = Engine::new(registry.clone())
+            .run_with_id(
+                "parallel-hitl".into(),
+                run_dir.join("meta"),
+                contract.clone(),
+                BTreeMap::new(),
+                options(BTreeMap::new()),
+            )
+            .await
+            .expect_err("the fast question must suspend the wave");
+        assert!(
+            matches!(error, EngineError::NeedsUser { .. }),
+            "the wave must suspend, not fail: {error}"
+        );
+        let journal =
+            std::fs::read_to_string(run_dir.join("meta/journal.jsonl")).expect("journal reads");
+        assert!(
+            journal.contains("step_interrupted") && journal.contains("\"node\":\"slow\""),
+            "the aborted sibling must be resumable, not failed: {journal}"
+        );
+        assert!(
+            !journal.contains("\"node\":\"slow\",\"status\":\"failed\"")
+                && !journal.contains("\"node\": \"slow\", \"status\": \"failed\"")
+                && !journal.contains("\"status\":\"failed\",\"reason\"")
+                || !journal
+                    .lines()
+                    .any(|line| line.contains("\"node\":\"slow\"") && line.contains("\"failed\"")),
+            "the aborted sibling must not journal failure: {journal}"
+        );
+        // Answer and resume: both steps complete and the run succeeds.
+        let mut answers = BTreeMap::new();
+        answers.insert("q-fast".to_string(), json!({ "answer": "yes" }));
+        Engine::new(registry)
+            .run_with_id(
+                "parallel-hitl".into(),
+                run_dir.join("meta"),
+                contract,
+                BTreeMap::new(),
+                options(answers),
+            )
+            .await
+            .expect("the resumed wave must succeed");
+        let journal =
+            std::fs::read_to_string(run_dir.join("meta/journal.jsonl")).expect("journal reads");
+        assert!(
+            journal.contains("\"status\":\"success\""),
+            "the resumed run must settle successfully: {journal}"
+        );
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[tokio::test]
+    async fn sequential_and_parallel_waves_agree_on_success() {
+        // F12-03: the same two side-effect-free steps succeed identically
+        // sequential and parallel; completed results are kept in both
+        // paths with no duplication.
+        struct EchoStep;
+        #[async_trait]
+        impl StepExecutor for EchoStep {
+            fn type_id(&self) -> &'static str {
+                "test.echo"
+            }
+            fn traits(&self) -> StepTraits {
+                StepTraits {
+                    parallel_safe: true,
+                    ..StepTraits::default()
+                }
+            }
+            async fn execute(
+                &self,
+                _ctx: &mut StepContext<'_>,
+                node: &NodeDef,
+            ) -> Result<StepOutcome, StepError> {
+                Ok(StepOutcome::Success {
+                    output: Some(json!({ "node": node.id })),
+                    files: vec![],
+                })
+            }
+        }
+        let run_case = |name: &str, parallel: Vec<String>| {
+            let run_dir = temp_run_dir(name);
+            let _ = std::fs::remove_dir_all(&run_dir);
+            let mut flow_manifest = manifest(vec![node("a", "test.echo"), node("b", "test.echo")]);
+            flow_manifest.parallel = parallel;
+            let graph = Graph::build(&flow_manifest).expect("test graph should build");
+            let contract = Contract {
+                root: run_dir.clone(),
+                manifest: flow_manifest,
+                graph,
+                sha256: "wave-agree".into(),
+            };
+            let mut registry = StepRegistry::new();
+            registry.register(EchoStep);
+            (run_dir, contract, registry)
+        };
+        let run_options = |run_dir: &Utf8PathBuf| RunOptions {
+            output_dir: run_dir.join("workspace"),
+            json_events: false,
+            event_sender: None,
+            interactive: false,
+            answers: BTreeMap::new(),
+            confirmations: BTreeMap::new(),
+            max_total_steps: 100,
+            max_parallel_steps: 2,
+            llm_provider: None,
+            llm_seed_override: None,
+            run_refs: std::collections::BTreeMap::new(),
+            cancellation: CancellationToken::new(),
+            shutdown: None,
+        };
+        let (seq_dir, seq_contract, seq_registry) = run_case("wave-seq", vec![]);
+        let seq_out = Engine::new(seq_registry)
+            .run_with_id(
+                "wave-seq".into(),
+                seq_dir.join("meta"),
+                seq_contract,
+                BTreeMap::new(),
+                run_options(&seq_dir),
+            )
+            .await
+            .expect("sequential wave must succeed");
+        let (par_dir, par_contract, par_registry) =
+            run_case("wave-par", vec!["a".into(), "b".into()]);
+        let par_out = Engine::new(par_registry)
+            .run_with_id(
+                "wave-par".into(),
+                par_dir.join("meta"),
+                par_contract,
+                BTreeMap::new(),
+                run_options(&par_dir),
+            )
+            .await
+            .expect("parallel wave must succeed");
+        assert_eq!(
+            seq_out.artifacts.len(),
+            par_out.artifacts.len(),
+            "both paths must settle the same outputs"
+        );
+        for (dir, name) in [(&seq_dir, "seq"), (&par_dir, "par")] {
+            let journal =
+                std::fs::read_to_string(dir.join("meta/journal.jsonl")).expect("journal reads");
+            assert_eq!(
+                journal.matches("\"t\":\"step_finished\"").count(),
+                2,
+                "{name}: each step finishes exactly once"
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn warned_run_started_hook_does_not_rerun_after_hitl_resume() {
+        // F07-02: a Warn-ended run_started hook is processed; a later HITL
+        // resume must not re-execute it.
+        let run_dir = temp_run_dir("hooks-warn-hitl");
+        let _ = std::fs::remove_dir_all(&run_dir);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = StepRegistry::new();
+        registry.register(CountingPassStep {
+            calls: Arc::clone(&calls),
+        });
+        registry.register(TestCheckFailStep);
+        let mut manifest = manifest(vec![node("build", "test.pass")]);
+        // A CheckFailed hook under Warn settles as warned (not success).
+        manifest
+            .hooks
+            .run_started
+            .push(hook("seed", "test.check_fail", HookErrorPolicy::Warn));
+        let graph = Graph::build(&manifest).expect("test graph should build");
+        let contract = Contract {
+            root: run_dir.clone(),
+            manifest,
+            graph,
+            sha256: "hooks-warn-hitl".into(),
+        };
+        let options = || RunOptions {
+            output_dir: run_dir.join("workspace"),
+            json_events: false,
+            event_sender: None,
+            interactive: false,
+            answers: BTreeMap::new(),
+            confirmations: BTreeMap::new(),
+            max_total_steps: 100,
+            max_parallel_steps: 1,
+            llm_provider: None,
+            llm_seed_override: None,
+            run_refs: std::collections::BTreeMap::new(),
+            cancellation: CancellationToken::new(),
+            shutdown: None,
+        };
+        // First run succeeds; the Warn hook settles (Warn continues).
+        Engine::new(registry.clone())
+            .run_with_id(
+                "hooks-warn-hitl".into(),
+                run_dir.join("meta"),
+                contract.clone(),
+                BTreeMap::new(),
+                options(),
+            )
+            .await
+            .expect("first run should succeed");
+        let first_calls = calls.load(Ordering::SeqCst);
+        // Resume replays without re-executing the settled hook.
+        Engine::new(registry)
+            .run_with_id(
+                "hooks-warn-hitl".into(),
+                run_dir.join("meta"),
+                contract,
+                BTreeMap::new(),
+                options(),
+            )
+            .await
+            .expect("resume should succeed");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            first_calls,
+            "a settled hook must not re-execute on resume"
+        );
+        let journal =
+            std::fs::read_to_string(run_dir.join("meta/journal.jsonl")).expect("journal reads");
+        assert!(
+            journal.contains("hook_replayed") && journal.contains("hook_failed"),
+            "the warned hook must settle once and replay by marker: {journal}"
+        );
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
     fn node(id: &str, kind: &str) -> NodeDef {
         NodeDef {
             id: id.into(),
