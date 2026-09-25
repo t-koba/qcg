@@ -19,6 +19,24 @@ pub enum ToolDecl {
         input_schema: Option<Value>,
         path_prefix: String,
     },
+    #[serde(rename = "fs.read")]
+    FsRead {
+        name: String,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        input_schema: Option<Value>,
+        path_prefix: String,
+    },
+    #[serde(rename = "fs.patch")]
+    FsPatch {
+        name: String,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        input_schema: Option<Value>,
+        path_prefix: String,
+    },
     #[serde(rename = "command")]
     Command {
         name: String,
@@ -153,6 +171,8 @@ impl ToolDecl {
     pub fn name(&self) -> &str {
         match self {
             Self::FsWrite { name, .. }
+            | Self::FsRead { name, .. }
+            | Self::FsPatch { name, .. }
             | Self::Command { name, .. }
             | Self::Http { name, .. }
             | Self::AskUser { name, .. }
@@ -166,6 +186,8 @@ impl ToolDecl {
     pub fn description(&self) -> Option<&str> {
         match self {
             Self::FsWrite { description, .. }
+            | Self::FsRead { description, .. }
+            | Self::FsPatch { description, .. }
             | Self::Command { description, .. }
             | Self::Http { description, .. }
             | Self::AskUser { description, .. }
@@ -179,6 +201,8 @@ impl ToolDecl {
     pub fn input_schema(&self) -> Option<&Value> {
         match self {
             Self::FsWrite { input_schema, .. }
+            | Self::FsRead { input_schema, .. }
+            | Self::FsPatch { input_schema, .. }
             | Self::Command { input_schema, .. }
             | Self::Http { input_schema, .. }
             | Self::AskUser { input_schema, .. }
@@ -190,6 +214,8 @@ impl ToolDecl {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::FsWrite { .. } => "fs.write",
+            Self::FsRead { .. } => "fs.read",
+            Self::FsPatch { .. } => "fs.patch",
             Self::Command { .. } => "command",
             Self::Http { .. } => "http",
             Self::AskUser { .. } => "ask_user",

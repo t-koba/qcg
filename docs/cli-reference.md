@@ -14,6 +14,12 @@ JSON event output go to stdout.
 
 ## Generator commands
 
+- `qcg new <path> [--id ID] [--force]` creates a minimal generator skeleton.
+  Mechanism only: directory layout (`qcg.toml` plus empty `prompts/`,
+  `templates/`, `schemas/`) and immediate `validate`. Prompt text, schemas,
+  budgets, and permissions stay author policy as follow-up edits. Fails closed
+  when the target is non-empty without `--force` or when the skeleton does not
+  validate.
 - `qcg validate <path> [--json]` loads the contract, checks the graph, validates every
   registered step's closed `params`, and prints the contract digest.
   All rule violations are reported together instead of stopping at the first
@@ -27,12 +33,15 @@ JSON event output go to stdout.
   confirmations pause or fail the run instead of prompting, so pre-provision
   them with `--answer` and `--confirm` (or `--confirmations-file`, a JSON
   id-to-boolean map); use only for a reviewed contract.
-  `--plan` prints the execution plan (steps, permissions, declared outputs,
-  pre-provision coverage) without running; add `--json` for machine-readable
+  `--plan` prints the execution plan (steps with `needs`, `on_deps`, full `when`,
+  `output`, `parallel` membership, permissions, declared outputs,
+  pre-provision coverage, plus read-only `ids` with `questions` and
+  `confirmation_shapes`) without running; add `--json` for machine-readable
   output. `--plan --diff` additionally prints a read-only forecast per node
   (declared writes, command allowlist result, literal HTTP host check, side-effect
   flag) plus whole-plan budget estimates. No filesystem writes, processes, or
-  network requests are performed.
+  network requests are performed. Digests are runtime facts and are never
+  predicted by plan output.
   A previous package (`.qcg` ZIP, `blueprint-package.json`, or any file) is
   re-entered as an ordinary `type = "file"` input via
   `--input-file field=path`, optionally combined with extra `--input` values
@@ -53,7 +62,15 @@ JSON event output go to stdout.
   repetitions with flaky detection, per-case terminal metrics
   (`tokens_total`, `cost_microusd`, `duration_ms`, `llm_calls`), and baseline
   p50 cost/duration deltas. A baseline comparison fails on pass-rate or
-  case regressions.
+  case regressions. Suite schema: `{ name, min_pass_rate = 1.0,
+  repetitions = 1, cases: [{ name, inputs = {}, answers = {},
+  confirmations = {}, seed?, assertions: [...] }] }`. Assertion `type` values:
+  `artifact_exists`, `artifact_sha256`, `artifact_contains`,
+  `artifact_matches`, `artifact_json_schema`, `manifest_pointer`,
+  `event_count`, `event_sequence`, `metric_max`. See
+  `fixtures/generators/hello-template/suite.json` for a minimal example.
+  Semantic judges are out of mechanism: use an external `command` step or
+  guardrail when meaning must be judged, with explicit timeout and byte limits.
 - `qcg package <dir> [-o package.qcg] [--signing-key key.pk8]
   [--max-entries N] [--max-bytes N] [--max-metadata-bytes N]` creates a `.qcg`
   ZIP from a directory, prints its SHA-256, and optionally writes detached
@@ -97,8 +114,10 @@ JSON event output go to stdout.
   a USD estimate, duration). `--diagnose` bundles journal failure signals
   (`step_failed`, `step_skipped`, `tool_failed`, `llm_route_failed`,
   `llm_validation_failed`, `step_retry`, `context_compacted`, guardrail and
-  run errors) into one ordered screen; `--json --diagnose` returns
-  `{summary, diagnosis}`.
+  run errors) into one ordered screen plus read-only per-node LLM cost facts
+  (`node_costs` folded from `llm_call` events: calls, tokens, microUSD);
+  `--json --diagnose` returns
+  `{summary, diagnosis}` with no threshold judgement.
 - `qcg runs costs [--runs-dir dir] [--state <s>] [--generator <id>]
   [--by-model] [--json]` prints per-run cost totals plus a grand total.
   `--by-model` adds a provider/model breakdown with tokens, calls, contract

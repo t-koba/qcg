@@ -32,6 +32,16 @@ pub(crate) enum LogFormat {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Create a minimal generator skeleton. Mechanism only: empty
+    /// prompts/templates/schemas plus a valid qcg.toml. Policy content
+    /// (prompts, schemas, budgets) stays with the author.
+    New {
+        path: Utf8PathBuf,
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        force: bool,
+    },
     Validate {
         path: Utf8PathBuf,
         #[arg(long)]

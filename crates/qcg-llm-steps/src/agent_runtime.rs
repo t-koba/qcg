@@ -68,6 +68,8 @@ pub(crate) fn redact_agent_tool_args_for_journal(
         qcg_engine::redact_http_args_for_journal(args)
     } else if kind == Some("fs.write") {
         qcg_engine::redact_fs_write_args_for_journal(args)
+    } else if kind == Some("fs.patch") {
+        qcg_engine::redact_fs_patch_args_for_journal(args)
     } else {
         qcg_engine::redact_credential_values(args)
     };
@@ -285,7 +287,9 @@ pub(crate) fn canonical_agent_registry_args(tools: &[ToolDecl], name: &str, args
         // recomputes identically when content matches and refuses when
         // query/headers differ. Execution still uses raw args; only the
         // registry and journal use this form.
-        Some("http") | Some("fs.write") => redact_agent_tool_args_for_journal(tools, name, args),
+        Some("http") | Some("fs.write") | Some("fs.patch") => {
+            redact_agent_tool_args_for_journal(tools, name, args)
+        }
         _ => qcg_engine::redact_credential_values(args),
     }
 }
@@ -559,6 +563,109 @@ pub(crate) fn restore_pending_call_from_sidecar(
     restored
 }
 
+/// Canonical `edits` array for `fs.patch` approval binding.
+/// Sorts object keys by serializing through `serde_json::Value` (which uses
+/// `BTreeMap` ordering) so key order never forks the digest. Returns `None`
+/// when the shape is not a valid patch call.
+pub(crate) fn canonical_patch_edits(args: &Value) -> Option<Value> {
+    let edits = args.get("edits")?.as_array()?;
+    let mut canonical = Vec::with_capacity(edits.len());
+    for edit in edits {
+        let object = edit.as_object()?;
+        let op = object.get("op")?.as_str()?;
+        if !matches!(op, "replace" | "append" | "prepend") {
+            return None;
+        }
+        let anchor = object.get("anchor")?.as_str()?;
+        let lines = object.get("lines")?.as_array()?;
+        let mut text = Vec::with_capacity(lines.len());
+        for line in lines {
+            text.push(line.as_str()?.to_string());
+        }
+        canonical.push(json!({"anchor": anchor, "lines": text, "op": op}));
+    }
+    Some(Value::Array(canonical))
+}
+
+/// Resolves anchored patch limits from contract policy with defaults.
+/// Mechanism receives plain numbers; no `None` leaks past this function.
+pub(crate) fn resolve_patch_limits(
+    ctx: &StepContext<'_>,
+    node: &NodeDef,
+) -> Result<qcg_fs::PatchLimits, StepError> {
+    let runtime = &ctx.run.contract.manifest.runtime;
+    let max_edits = runtime
+        .patch_hunks_limit
+        .unwrap_or(qcg_policy::DEFAULT_PATCH_EDITS);
+    if !(qcg_policy::MIN_PATCH_EDITS..=qcg_policy::MAX_PATCH_EDITS).contains(&max_edits) {
+        return Err(StepError::failed(
+            &node.id,
+            format!("resolved patch_hunks_limit {max_edits} is outside mechanism bounds"),
+        ));
+    }
+    let max_patch_bytes = runtime
+        .patch_bytes_limit
+        .unwrap_or(qcg_policy::DEFAULT_PATCH_BYTES);
+    if !(qcg_policy::MIN_PATCH_BYTES..=qcg_policy::MAX_PATCH_BYTES).contains(&max_patch_bytes) {
+        return Err(StepError::failed(
+            &node.id,
+            format!("resolved patch_bytes_limit {max_patch_bytes} is outside mechanism bounds"),
+        ));
+    }
+    let max_result_bytes = runtime.output_file_limit_bytes.unwrap_or(
+        runtime
+            .output_total_limit_bytes
+            .unwrap_or(qcg_policy::DEFAULT_LLM_CONTEXT_LIMIT_BYTES),
+    );
+    Ok(qcg_fs::PatchLimits {
+        max_edits,
+        max_patch_bytes,
+        max_result_bytes,
+    })
+}
+
+/// Parses `fs.patch` string edits into mechanism edits.
+/// Fails closed on invalid op or anchor shapes.
+pub(crate) fn parse_patch_edits(
+    node: &NodeDef,
+    edits: &[Value],
+) -> Result<Vec<qcg_fs::PatchEdit>, StepError> {
+    let mut raw = Vec::with_capacity(edits.len());
+    for edit in edits {
+        let object = edit
+            .as_object()
+            .ok_or_else(|| StepError::failed(&node.id, "fs.patch edit must be an object"))?;
+        let op = object
+            .get("op")
+            .and_then(Value::as_str)
+            .ok_or_else(|| StepError::failed(&node.id, "fs.patch edit requires op"))?;
+        let anchor = object
+            .get("anchor")
+            .and_then(Value::as_str)
+            .ok_or_else(|| StepError::failed(&node.id, "fs.patch edit requires anchor"))?;
+        let lines = object
+            .get("lines")
+            .and_then(Value::as_array)
+            .ok_or_else(|| StepError::failed(&node.id, "fs.patch edit requires lines"))?;
+        let mut text = Vec::with_capacity(lines.len());
+        for line in lines {
+            text.push(
+                line.as_str()
+                    .ok_or_else(|| {
+                        StepError::failed(&node.id, "fs.patch edit lines must be strings")
+                    })?
+                    .to_string(),
+            );
+        }
+        raw.push(qcg_fs::RawPatchEdit {
+            op: op.to_string(),
+            anchor: anchor.to_string(),
+            lines: text,
+        });
+    }
+    qcg_fs::parse_edits(&raw).map_err(|error| StepError::failed(&node.id, error.to_string()))
+}
+
 /// Recomputes the approval digest for a pending call (F02). Returns `None`
 /// for tool kinds without a content-bound digest reconstructible here
 /// (command tools bind through gateway-built plans); those keep the
@@ -581,6 +688,22 @@ fn pending_call_digest(
                     "fswrite-content-v1",
                     run_id,
                     content.as_bytes()
+                ),
+            }));
+            qcg_engine::RunContext::operation_digest(path, &details).ok()
+        }
+        ToolDecl::FsPatch { path_prefix, .. } => {
+            let path = call.args.get("path")?.as_str()?;
+            let base = call.args.get("expected_base_sha256")?.as_str()?;
+            let canonical = canonical_patch_edits(&call.args)?;
+            let bytes = serde_json::to_vec(&canonical).ok()?;
+            let details = Some(json!({
+                "path_prefix": path_prefix,
+                "expected_base_sha256": base,
+                "edits_sha256": qcg_engine::salted_binding_digest(
+                    "fspatch-edits-v1",
+                    run_id,
+                    &bytes
                 ),
             }));
             qcg_engine::RunContext::operation_digest(path, &details).ok()
@@ -662,6 +785,92 @@ pub(crate) async fn execute_agent_fs_write(
                     operation_id,
                     qcg_engine::OperationOutcome::gateway_error(&error, false),
                 );
+            }
+            Err(StepError::from_gateway(&node.id, error))
+        }
+    }
+}
+
+/// Executes a verified `fs.patch` call. Policy (prefix, approval, guard,
+/// budgets) is already resolved; this function only drives the mechanism
+/// and settles the operation record. Stale anchors and base mismatches
+/// surface as typed tool errors with remaps so the model can self-correct.
+pub(crate) async fn execute_agent_fs_patch(
+    ctx: &mut StepContext<'_>,
+    node: &NodeDef,
+    path: &str,
+    expected_base: &str,
+    edits: Vec<qcg_fs::PatchEdit>,
+    limits: qcg_fs::PatchLimits,
+    operation_id: &str,
+) -> Result<AgentToolOutcome, StepError> {
+    let target = ctx.run.fs.resolve_write(path).step_err(&node.id)?;
+    match ctx
+        .run
+        .fs
+        .apply_anchored_patch(&target, Some(expected_base), edits, limits)
+        .await
+    {
+        Ok(outcome) => {
+            let value = json!({
+                "file": path,
+                "applied": outcome.applied,
+                "base_sha256": outcome.new_base_sha256,
+            });
+            ctx.run.finish_external_operation(
+                ctx.journal,
+                node,
+                operation_id,
+                Some(value.clone()),
+            )?;
+            ctx.run.clear_pending_tool_payload(operation_id);
+            Ok(AgentToolOutcome::Result(value))
+        }
+        Err(error) => {
+            if !matches!(error, qcg_engine::GatewayError::Canceled) {
+                ctx.run.finish_external_operation_with_warn(
+                    ctx.journal,
+                    node,
+                    operation_id,
+                    qcg_engine::OperationOutcome::gateway_error(&error, false),
+                );
+            }
+            // Mechanism errors stay typed through the gateway; translate the
+            // recoverable stale/base cases into model-readable tool errors
+            // with remaps instead of failing the node.
+            if let qcg_engine::GatewayError::AnchoredPatch(
+                qcg_fs::AnchoredPatchError::AnchorStale {
+                    anchor,
+                    remaps,
+                    current_base,
+                },
+            ) = &error
+            {
+                let value = json!({
+                    "file": path,
+                    "ok": false,
+                    "error": "anchor_stale",
+                    "stale_anchor": anchor,
+                    "current_base_sha256": current_base,
+                    "remaps": remaps.iter().map(|remap| json!({
+                        "stale_anchor": remap.stale_anchor,
+                        "current_anchor": remap.current_anchor,
+                    })).collect::<Vec<_>>(),
+                });
+                return Ok(AgentToolOutcome::Result(value));
+            }
+            if let qcg_engine::GatewayError::AnchoredPatch(
+                qcg_fs::AnchoredPatchError::BaseMismatch { expected, actual },
+            ) = &error
+            {
+                let value = json!({
+                    "file": path,
+                    "ok": false,
+                    "error": "base_mismatch",
+                    "expected_base_sha256": expected,
+                    "current_base_sha256": actual,
+                });
+                return Ok(AgentToolOutcome::Result(value));
             }
             Err(StepError::from_gateway(&node.id, error))
         }
@@ -933,6 +1142,190 @@ pub(crate) async fn execute_agent_tool(
                 ctx.run.fs.resolve_write(path).step_err(&node.id)?;
                 return execute_agent_fs_write(ctx, node, path, content, &operation_id).await;
             }
+        }
+        ToolDecl::FsRead { path_prefix, .. } => {
+            let path = args
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| StepError::failed(&node.id, "fs.read tool requires path"))?;
+            if !path_is_within_prefix(path, path_prefix) {
+                return Err(StepError::failed(
+                    &node.id,
+                    format!("tool `{name}` path `{path}` is outside prefix `{path_prefix}`"),
+                ));
+            }
+            let offset = args
+                .get("offset")
+                .and_then(Value::as_u64)
+                .unwrap_or(1)
+                .max(1) as usize;
+            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(200) as usize;
+            if limit == 0 || limit > qcg_policy::MAX_ANCHORED_READ_LINES {
+                return Err(StepError::failed(
+                    &node.id,
+                    format!(
+                        "fs.read limit must be from 1 through {}",
+                        qcg_policy::MAX_ANCHORED_READ_LINES
+                    ),
+                ));
+            }
+            let target = ctx.run.fs.resolve_read(path).step_err(&node.id)?;
+            let max_bytes = ctx.run.contract.manifest.runtime.file_input_limit_bytes;
+            let snapshot = ctx
+                .run
+                .fs
+                .read_anchored(&target, offset, limit, max_bytes)
+                .map_err(|error| StepError::from_gateway(&node.id, error))?;
+            let lines: Vec<Value> = snapshot
+                .lines
+                .iter()
+                .map(|line| {
+                    json!({
+                        "anchor": line.anchor(),
+                        "text": line.text,
+                    })
+                })
+                .collect();
+            Ok(AgentToolOutcome::Result(json!({
+                "file": path,
+                "base_sha256": snapshot.base_sha256,
+                "total_lines": snapshot.total_lines,
+                "lines": lines,
+            })))
+        }
+        ToolDecl::FsPatch { path_prefix, .. } => {
+            let path = args
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| StepError::failed(&node.id, "fs.patch tool requires path"))?;
+            let expected_base = args
+                .get("expected_base_sha256")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    StepError::failed(&node.id, "fs.patch tool requires expected_base_sha256")
+                })?;
+            let raw_edits = args
+                .get("edits")
+                .and_then(Value::as_array)
+                .ok_or_else(|| StepError::failed(&node.id, "fs.patch tool requires edits"))?;
+            if !path_is_within_prefix(path, path_prefix) {
+                return Err(StepError::failed(
+                    &node.id,
+                    format!("tool `{name}` path `{path}` is outside prefix `{path_prefix}`"),
+                ));
+            }
+            let salt = ctx.run.run_id.clone();
+            let canonical = canonical_patch_edits(args).ok_or_else(|| {
+                StepError::failed(&node.id, "fs.patch edits are not canonicalizable")
+            })?;
+            let canonical_bytes = serde_json::to_vec(&canonical).map_err(|error| {
+                StepError::failed(
+                    &node.id,
+                    format!("fs.patch edits are not serializable: {error}"),
+                )
+            })?;
+            let details = Some(json!({
+                "path_prefix": path_prefix,
+                "expected_base_sha256": expected_base,
+                "edits_sha256": qcg_engine::salted_binding_digest(
+                    "fspatch-edits-v1",
+                    &salt,
+                    &canonical_bytes
+                ),
+            }));
+            if args_contain_redaction_marker(args) {
+                let operation_id = qcg_engine::operation_id_for(&ctx.run.run_id, &node.id, call_id);
+                let state = ctx.journal.state();
+                let record = state.operation_records.get(&operation_id).cloned();
+                if let Some(result) = redacted_success_resend(record.as_ref()) {
+                    return Ok(AgentToolOutcome::Result(result));
+                }
+                let had_record = record.is_some();
+                match ctx.run.guard_external_operation(
+                    ctx.journal,
+                    node,
+                    "fs.patch",
+                    path,
+                    &details,
+                    call_id,
+                )? {
+                    qcg_engine::GuardDecision::Resend { result, .. } => {
+                        return Ok(AgentToolOutcome::Result(result));
+                    }
+                    qcg_engine::GuardDecision::Proceed { operation_id } => {
+                        if !had_record {
+                            ctx.run.finish_external_operation_with_warn(
+                                ctx.journal,
+                                node,
+                                &operation_id,
+                                qcg_engine::OperationOutcome::Indeterminate {
+                                    reason: format!(
+                                        "operation `{operation_id}` holds redacted patch content; refusing to re-execute without the original bytes"
+                                    ),
+                                },
+                            );
+                            return Err(StepError::Refused {
+                                node: node.id.clone(),
+                                message: format!(
+                                    "operation `{operation_id}` holds redacted patch content; refusing to re-execute without the original bytes"
+                                ),
+                            });
+                        }
+                    }
+                }
+                let operation_id = qcg_engine::operation_id_for(&ctx.run.run_id, &node.id, call_id);
+                ctx.run.finish_external_operation_with_warn(
+                    ctx.journal,
+                    node,
+                    &operation_id,
+                    qcg_engine::OperationOutcome::Indeterminate {
+                        reason: format!(
+                            "operation `{operation_id}` holds redacted patch content; refusing to re-execute without the original bytes"
+                        ),
+                    },
+                );
+                return Err(StepError::Refused {
+                    node: node.id.clone(),
+                    message: format!(
+                        "operation `{operation_id}` holds redacted patch content; refusing to re-execute without the original bytes"
+                    ),
+                });
+            }
+            if let Some(confirm) = ctx.run.require_side_effect(
+                ctx.journal,
+                node,
+                "fs.patch",
+                path,
+                details.clone(),
+                call_id,
+            )? {
+                return Ok(AgentToolOutcome::NeedsConfirm(confirm));
+            }
+            let operation_id = match ctx.run.guard_external_operation(
+                ctx.journal,
+                node,
+                "fs.patch",
+                path,
+                &details,
+                call_id,
+            )? {
+                qcg_engine::GuardDecision::Proceed { operation_id } => operation_id,
+                qcg_engine::GuardDecision::Resend { result, .. } => {
+                    return Ok(AgentToolOutcome::Result(result));
+                }
+            };
+            let edits = parse_patch_edits(node, raw_edits)?;
+            let limits = resolve_patch_limits(ctx, node)?;
+            return execute_agent_fs_patch(
+                ctx,
+                node,
+                path,
+                expected_base,
+                edits,
+                limits,
+                &operation_id,
+            )
+            .await;
         }
         ToolDecl::Command { command, .. } => {
             // Same side-effect gate as ordinary command steps (A05):
@@ -3503,6 +3896,63 @@ mod approval_e2e {
         assert!(
             !harness.root.join("workspace/drafts/note.txt").exists(),
             "nothing executes without its own approval"
+        );
+    }
+
+    #[test]
+    fn patch_edits_canonicalize_independently_of_key_order() {
+        let first = json!({
+            "path": "notes.txt",
+            "expected_base_sha256": "abc",
+            "edits": [{"op": "replace", "anchor": "2:015cadfe", "lines": ["BETA"]}],
+        });
+        let second = json!({
+            "edits": [{"lines": ["BETA"], "anchor": "2:015cadfe", "op": "replace"}],
+            "expected_base_sha256": "abc",
+            "path": "notes.txt",
+        });
+        assert_eq!(
+            canonical_patch_edits(&first),
+            canonical_patch_edits(&second),
+            "key order must not fork the approval digest"
+        );
+    }
+
+    #[test]
+    fn patch_edits_reject_unknown_ops() {
+        let args = json!({
+            "path": "notes.txt",
+            "expected_base_sha256": "abc",
+            "edits": [{"op": "swap", "anchor": "2:015cadfe", "lines": ["x"]}],
+        });
+        assert!(
+            canonical_patch_edits(&args).is_none(),
+            "unknown ops must not canonicalize"
+        );
+    }
+
+    #[test]
+    fn patch_journal_redaction_hides_lines_but_keeps_anchors() {
+        let tools = vec![ToolDecl::FsPatch {
+            name: "patch".into(),
+            description: None,
+            input_schema: None,
+            path_prefix: "notes.txt".into(),
+        }];
+        let args = json!({
+            "path": "notes.txt",
+            "expected_base_sha256": "abc",
+            "edits": [{"op": "replace", "anchor": "2:015cadfe", "lines": ["s3cret-line"]}],
+        });
+        let redacted = redact_agent_tool_args_for_journal(&tools, "patch", &args);
+        let redacted_str = redacted.to_string();
+        assert!(
+            !redacted_str.contains("s3cret-line"),
+            "journaled patch must not contain plaintext lines: {redacted_str}"
+        );
+        assert!(
+            redacted_str.contains("2:015cadfe"),
+            "journaled patch must keep anchors for review: {redacted_str}"
         );
     }
 }

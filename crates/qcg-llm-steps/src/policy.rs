@@ -29,6 +29,11 @@ pub(crate) struct LlmParams {
     pub(crate) source: Option<String>,
     #[serde(default)]
     pub(crate) target: Option<String>,
+    /// `llm.repair` output contract: `text` (default, full rewrite) or
+    /// `patch` (anchored edits JSON). Policy-selected; each mode has its
+    /// own fixed mechanism below.
+    #[serde(default)]
+    pub(crate) mode: Option<String>,
     #[serde(default)]
     pub(crate) max_iterations: Option<usize>,
     #[serde(default)]

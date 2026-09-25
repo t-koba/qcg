@@ -3985,7 +3985,9 @@ qcg_version = "^0.1"
 id = "agent"
 output = "agent_result"
 type = "llm.agent"
-retry = {{ max_attempts = 2, backoff_ms = 0, timeout_secs = 1, on_indeterminate = "{on_indeterminate}" }}
+# 5s lets a slow shell land `touch ran` before the kill; the 30s sleep
+# still guarantees the interrupt, so attempt 2 always observes `ran`.
+retry = {{ max_attempts = 2, backoff_ms = 0, timeout_secs = 5, on_indeterminate = "{on_indeterminate}" }}
 
 [flow.params]
 max_iterations = 4
@@ -5676,7 +5678,9 @@ content = "{{ inputs.marker }}""#,
     }
 
     async fn wait_for_terminal_snapshot(service: &LocalQcgService, id: &str) -> RunSnapshot {
-        for _ in 0..200 {
+        // 20s polling budget: long-timeout interrupt tests (5s attempt
+        // timeout plus retry) must fit inside the wait.
+        for _ in 0..2000 {
             let snapshot = service
                 .snapshot(id.to_string())
                 .await

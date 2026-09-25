@@ -13,4 +13,5 @@ camino.workspace = true
 libc.workspace = true
 hex.workspace = true
 sha2.workspace = true
+thiserror.workspace = true
 uuid.workspace = true

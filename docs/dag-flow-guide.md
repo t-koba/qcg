@@ -73,6 +73,8 @@ them in parallel if every node in that wave is deterministic and has no
 - `render`
 - `write`
 - `copy`
+- `read_anchored`
+- `patch`
 - `transform`
 - `check.schema`
 - `check.format`
@@ -80,7 +82,10 @@ them in parallel if every node in that wave is deterministic and has no
 
 Each parallel task receives the same immutable `ValueBag` snapshot. Outputs are
 merged back into the main run state in graph order after the wave completes, so
-downstream nodes see deterministic `steps.*` values. Side-effecting, LLM,
+downstream nodes see deterministic `steps.*` values. Parallel `patch` nodes
+must target disjoint files: overlapping patches stay caller-exclusive and the
+second writer fails with a base or anchor mismatch instead of overwriting
+silently. Side-effecting, LLM,
 interactive, container, command, HTTP, and `foreach` nodes stay on the
 single-node path.
 

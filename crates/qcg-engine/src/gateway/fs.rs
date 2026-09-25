@@ -48,6 +48,16 @@ pub struct CommandPermissionSummary {
     pub image: Option<String>,
 }
 
+/// Hash-anchored read snapshot returned by the mechanism layer.
+/// Policy layers decide windowing budgets and approval; this struct
+/// carries only the verified snapshot.
+#[derive(Debug, Clone)]
+pub struct AnchoredRead {
+    pub base_sha256: String,
+    pub lines: Vec<qcg_fs::AnchoredLine>,
+    pub total_lines: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct FsGateway {
     workspace: Utf8PathBuf,
@@ -1140,6 +1150,86 @@ impl FsGateway {
         }
     }
 
+    /// Hash-anchored read over an already-resolved path.
+    ///
+    /// Mechanism only: containment and handle-relative open are enforced,
+    /// but permission checks happened at `resolve_read` time. Returns the
+    /// file base hash plus the requested window of anchored lines.
+    pub fn read_anchored(
+        &self,
+        target: &Utf8Path,
+        offset: usize,
+        limit: usize,
+        max_bytes: Option<usize>,
+    ) -> Result<AnchoredRead, GatewayError> {
+        use std::io::Read as _;
+        let file = self.open_read_resolved(target)?;
+        let cap = max_bytes.map_or(u64::MAX, |value| value.saturating_add(1) as u64);
+        let mut bytes = Vec::new();
+        file.take(cap).read_to_end(&mut bytes)?;
+        if let Some(value) = max_bytes
+            && bytes.len() > value
+        {
+            return Err(GatewayError::Io(std::io::Error::other(format!(
+                "file `{target}` exceeds {value} bytes"
+            ))));
+        }
+        let text = String::from_utf8(bytes).map_err(|_| GatewayError::PatchNotUtf8 {
+            path: target.to_string(),
+        })?;
+        let total_lines = qcg_fs::split_lines(&text).len();
+        let (base_sha256, window) = qcg_fs::read_window(&text, offset, limit);
+        Ok(AnchoredRead {
+            base_sha256,
+            lines: window,
+            total_lines,
+        })
+    }
+
+    /// Hash-anchored modify over an already-resolved path.
+    ///
+    /// Mechanism only: reads the current snapshot through the
+    /// handle-relative open, verifies `expected_base` and every anchor,
+    /// then commits atomically. Policy (permissions, approval, budgets,
+    /// retry) is resolved by the caller before invoking this method.
+    /// The read-verify-write sequence holds the process-wide per-file
+    /// exclusion, so a concurrent in-process writer either lands fully
+    /// before the read (then the base check sees it) or waits until after
+    /// the commit (then its own base check sees this write): overlap can
+    /// only surface as an explicit base mismatch, never a silent merge.
+    /// Cross-process writers are outside this boundary and still rely on
+    /// base mismatch to fail closed.
+    pub async fn apply_anchored_patch(
+        &self,
+        target: &Utf8Path,
+        expected_base: Option<&str>,
+        edits: Vec<qcg_fs::PatchEdit>,
+        limits: qcg_fs::PatchLimits,
+    ) -> Result<qcg_fs::PatchOutcome, GatewayError> {
+        use std::io::Read as _;
+        let _guard = super::lock_patch_paths(&[target]).await;
+        let current = {
+            let file = self.open_read_resolved(target)?;
+            let cap = limits.max_result_bytes.saturating_add(1) as u64;
+            let mut bytes = Vec::new();
+            file.take(cap).read_to_end(&mut bytes)?;
+            if bytes.len() > limits.max_result_bytes {
+                return Err(qcg_fs::AnchoredPatchError::ResultTooLarge {
+                    bytes: bytes.len(),
+                    limit: limits.max_result_bytes,
+                }
+                .into());
+            }
+            String::from_utf8(bytes).map_err(|_| GatewayError::PatchNotUtf8 {
+                path: target.to_string(),
+            })?
+        };
+        let outcome = qcg_fs::apply_anchored_patch(&current, expected_base, &edits, limits)?;
+        self.write_file_atomic(target, outcome.new_text.as_bytes())
+            .await?;
+        Ok(outcome)
+    }
+
     /// Validates workspace containment and the terminal non-symlink
     /// invariant shared by every atomic replace. On Unix missing parents
     /// are allowed: they are created handle-relative inside the write, so
@@ -1713,6 +1803,96 @@ mod unix_staging_tests {
             "parallel writes must not leak staging files: {leaked:?}"
         );
     }
+
+    #[tokio::test]
+    async fn concurrent_same_file_patches_fail_closed_on_base_drift() {
+        // Two base-pinned patches race on one file: the process-wide
+        // per-file exclusion serializes the read-verify-write sequences,
+        // so the loser deterministically observes the winner's commit as
+        // an explicit base mismatch instead of merging silently.
+        let base = Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
+            "qcg-gateway-patch-race-{}",
+            uuid::Uuid::now_v7().as_simple()
+        )))
+        .expect("temporary directory path must be utf-8");
+        let _temp_guard = TempGuard(base.clone());
+        let workspace = base.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("test workspace should be created");
+        let mut permissions = Permissions::default();
+        permissions.fs_write.push("workspace".into());
+        permissions.fs_read.push("workspace".into());
+        let gateway = FsGateway::new(workspace.clone(), &permissions);
+        let seed = "alpha\nbeta\n";
+        std::fs::write(workspace.join("notes.txt"), seed).expect("seed should be written");
+        let target = gateway
+            .resolve_write("notes.txt")
+            .expect("target should resolve");
+        let base_hash = qcg_fs::base_sha256(seed);
+        let annotated = qcg_fs::annotate(seed);
+        let limits = qcg_fs::PatchLimits {
+            max_edits: 8,
+            max_patch_bytes: 4096,
+            max_result_bytes: 65536,
+        };
+        let edit_for = |line: &str| {
+            vec![qcg_fs::PatchEdit {
+                op: qcg_fs::PatchOp::Replace,
+                anchor_line: annotated[0].line_no,
+                anchor_hash: annotated[0].hash.clone(),
+                lines: vec![line.to_string()],
+            }]
+        };
+        let edits_a = edit_for("winner-a");
+        let edits_b = edit_for("winner-b");
+        let first = {
+            let gateway = gateway.clone();
+            let target = target.clone();
+            let base_hash = base_hash.clone();
+            tokio::spawn(async move {
+                gateway
+                    .apply_anchored_patch(&target, Some(&base_hash), edits_a, limits)
+                    .await
+            })
+        };
+        let second = {
+            let gateway = gateway.clone();
+            let target = target.clone();
+            tokio::spawn(async move {
+                gateway
+                    .apply_anchored_patch(&target, Some(&base_hash), edits_b, limits)
+                    .await
+            })
+        };
+        let (first, second) = tokio::join!(first, second);
+        let first = first.expect("first patch task should not panic");
+        let second = second.expect("second patch task should not panic");
+        let succeeded = [&first, &second]
+            .iter()
+            .filter(|outcome| outcome.is_ok())
+            .count();
+        assert_eq!(
+            succeeded, 1,
+            "exactly one racy patch must win: {first:?} / {second:?}"
+        );
+        for outcome in [&first, &second] {
+            if let Err(error) = outcome {
+                assert!(
+                    matches!(
+                        error,
+                        GatewayError::AnchoredPatch(
+                            qcg_fs::AnchoredPatchError::BaseMismatch { .. }
+                        )
+                    ),
+                    "the loser must fail on base drift, got: {error:?}"
+                );
+            }
+        }
+        let final_text = std::fs::read_to_string(&target).expect("patched file should be readable");
+        assert!(
+            final_text == "winner-a\nbeta\n" || final_text == "winner-b\nbeta\n",
+            "the file must hold exactly one complete winner: {final_text:?}"
+        );
+    }
 }
 
 #[cfg(all(test, not(unix)))]
@@ -1768,5 +1948,116 @@ mod staged_mode_tests {
         assert_eq!(FsGateway::staged_mode(Some(0o777)), 0o775);
         assert_eq!(FsGateway::staged_mode(Some(0o666)), 0o664);
         assert_eq!(FsGateway::staged_mode(None), 0o600);
+    }
+}
+
+#[cfg(test)]
+mod anchored_patch_tests {
+    use super::*;
+    use qcg_contract::Permissions;
+
+    fn isolated_gateway() -> (Utf8PathBuf, FsGateway) {
+        let base = Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("qcg-anchored-{}", uuid::Uuid::now_v7())),
+        )
+        .expect("temporary path must be UTF-8");
+        let workspace = base.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("test workspace should be created");
+        let mut permissions = Permissions::default();
+        permissions.fs_read.push("workspace".into());
+        permissions.fs_write.push("workspace".into());
+        let gateway = FsGateway::new(workspace.clone(), &permissions);
+        (base, gateway)
+    }
+
+    #[tokio::test]
+    async fn anchored_read_and_patch_round_trip() {
+        let (base, gateway) = isolated_gateway();
+        let target = gateway
+            .resolve_write("notes.txt")
+            .expect("write should resolve");
+        gateway
+            .write_file_atomic(&target, b"alpha\nbeta\ngamma")
+            .await
+            .expect("seed write should succeed");
+        let snapshot = gateway
+            .read_anchored(&target, 1, 10, Some(1024))
+            .expect("anchored read should succeed");
+        assert_eq!(snapshot.total_lines, 3);
+        assert_eq!(snapshot.lines.len(), 3);
+        assert_eq!(
+            snapshot.base_sha256,
+            "f3220283d05d1ff2ae350cfe9e0e367cb5aef46e10efb203c8a53c678e2218c8"
+        );
+        let edits = vec![qcg_fs::PatchEdit {
+            op: qcg_fs::PatchOp::Replace,
+            anchor_line: 2,
+            anchor_hash: qcg_fs::line_hash(2, "beta"),
+            lines: vec!["BETA".into()],
+        }];
+        let outcome = gateway
+            .apply_anchored_patch(
+                &target,
+                Some(&snapshot.base_sha256),
+                edits,
+                qcg_fs::PatchLimits {
+                    max_edits: 8,
+                    max_patch_bytes: 1024,
+                    max_result_bytes: 1024,
+                },
+            )
+            .await
+            .expect("anchored patch should apply");
+        assert_eq!(outcome.applied, 1);
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("patched file should be readable"),
+            "alpha\nBETA\ngamma"
+        );
+        std::fs::remove_dir_all(&base).expect("test workspace should be removed");
+    }
+
+    #[tokio::test]
+    async fn stale_anchor_rejects_without_modification() {
+        let (base, gateway) = isolated_gateway();
+        let target = gateway
+            .resolve_write("notes.txt")
+            .expect("write should resolve");
+        gateway
+            .write_file_atomic(&target, b"alpha\nBETA\ngamma")
+            .await
+            .expect("seed write should succeed");
+        let stale = qcg_fs::PatchEdit {
+            op: qcg_fs::PatchOp::Replace,
+            anchor_line: 2,
+            anchor_hash: qcg_fs::line_hash(2, "beta"),
+            lines: vec!["beta".into()],
+        };
+        let error = gateway
+            .apply_anchored_patch(
+                &target,
+                None,
+                vec![stale],
+                qcg_fs::PatchLimits {
+                    max_edits: 8,
+                    max_patch_bytes: 1024,
+                    max_result_bytes: 1024,
+                },
+            )
+            .await
+            .expect_err("stale anchor must fail");
+        match error {
+            GatewayError::AnchoredPatch(qcg_fs::AnchoredPatchError::AnchorStale {
+                remaps, ..
+            }) => {
+                assert_eq!(remaps.len(), 1);
+                assert_eq!(remaps[0].current_anchor, qcg_fs::anchor_for(2, "BETA"));
+            }
+            other => panic!("unexpected gateway error: {other}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("failed patch must not modify"),
+            "alpha\nBETA\ngamma"
+        );
+        std::fs::remove_dir_all(&base).expect("test workspace should be removed");
     }
 }

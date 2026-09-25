@@ -1,0 +1,19 @@
+{
+  "name": "hello-template-smoke",
+  "min_pass_rate": 1.0,
+  "repetitions": 1,
+  "cases": [
+    {
+      "name": "readme-emitted",
+      "inputs": {},
+      "answers": {},
+      "confirmations": {},
+      "assertions": [
+        { "type": "artifact_exists", "path": "README.md" },
+        { "type": "artifact_contains", "path": "README.md", "text": "Hello" },
+        { "type": "event_count", "kind": "step_finished", "min": 1 },
+        { "type": "metric_max", "metric": "tokens_total", "max": 0 }
+      ]
+    }
+  ]
+}

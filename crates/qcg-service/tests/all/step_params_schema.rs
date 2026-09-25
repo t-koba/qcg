@@ -25,6 +25,8 @@ fn built_in_registry_exposes_parameter_schemas_for_all_steps() {
         "llm.generate",
         "llm.repair",
         "mcp.call",
+        "patch",
+        "read_anchored",
         "render",
         "transform",
         "write",

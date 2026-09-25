@@ -1,0 +1,3 @@
+Return anchored patch edits for the file. Return only the JSON object.
+
+FAKE_JSON: {"edits": [{"op": "replace", "anchor": "2:015cadfe", "lines": ["BETA"]}]}

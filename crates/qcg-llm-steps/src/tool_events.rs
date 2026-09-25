@@ -44,15 +44,18 @@ pub(crate) fn tool_call_event(
 ) -> Result<Value, serde_json::Error> {
     let sources = tool_call_sources(result);
     // Journaled arguments never carry plaintext secrets: HTTP query,
-    // credential headers, and bodies plus `fs.write` contents are redacted
-    // via the shared gateway helpers, and any other credential-like keys
-    // are redacted generically (E09). Every remaining URL query VALUE is
+    // credential headers, and bodies plus `fs.write` contents and
+    // `fs.patch` replacement lines are redacted via the shared gateway
+    // helpers, and any other credential-like keys are redacted generically
+    // (E09). Every remaining URL query VALUE is
     // additionally redacted by default (keys stay visible) so an
     // undeclared secret never reaches the journal (E09-1). Execution
     // always uses the raw call; only this journaled copy is redacted.
     let mut redacted_args =
-        qcg_engine::redact_credential_values(&qcg_engine::redact_fs_write_args_for_journal(
-            &qcg_engine::redact_http_args_for_journal(&call.args),
+        qcg_engine::redact_credential_values(&qcg_engine::redact_fs_patch_args_for_journal(
+            &qcg_engine::redact_fs_write_args_for_journal(
+                &qcg_engine::redact_http_args_for_journal(&call.args),
+            ),
         ));
     if let Some(url) = redacted_args
         .get("url")
@@ -254,14 +257,17 @@ pub(crate) fn bounded_event_value(value: &Value) -> Result<(Value, bool), serde_
 
 /// Redacted args for Debug display (E09h). Mirrors the journal redaction
 /// in [`tool_call_event`]: HTTP query values, credential headers, bodies,
-/// and generic credential-like keys are redacted, so a Debug dump never
+/// `fs.write` contents, `fs.patch` replacement lines, and generic
+/// credential-like keys are redacted, so a Debug dump never
 /// carries plaintext secrets. Execution always uses the raw args; only
 /// this Debug copy is redacted.
 #[allow(dead_code)]
 pub(crate) fn redacted_tool_call_args_for_debug(call: &ChatToolCall) -> Value {
     let mut redacted =
-        qcg_engine::redact_credential_values(&qcg_engine::redact_fs_write_args_for_journal(
-            &qcg_engine::redact_http_args_for_journal(&call.args),
+        qcg_engine::redact_credential_values(&qcg_engine::redact_fs_patch_args_for_journal(
+            &qcg_engine::redact_fs_write_args_for_journal(
+                &qcg_engine::redact_http_args_for_journal(&call.args),
+            ),
         ));
     if let Some(url) = redacted
         .get("url")
@@ -279,9 +285,12 @@ pub(crate) fn redacted_tool_call_args_for_debug(call: &ChatToolCall) -> Value {
 
 /// Redacting Debug wrapper for [`ChatToolCall`] (E09h). The orphan rule
 /// forbids implementing `Debug` for the foreign `qcg_llm` type itself, so
-/// all log sites must format through this wrapper (or the field-by-field
-/// redaction above): URL, header, body, and args values never reach logs
-/// in plaintext. Direct `{:?}` on `ChatToolCall` must never be logged.
+/// any future log site must format through this wrapper (or the
+/// field-by-field redaction above): URL, header, body, and args values
+/// never reach logs in plaintext. Direct `{:?}` on `ChatToolCall` must
+/// never be logged. No production site formats these types today, so the
+/// wrappers are scaffolding pinned by tests: the safe path exists before
+/// the first log site needs it, not after a leak.
 #[allow(dead_code)]
 pub(crate) struct RedactedToolCall<'a>(pub &'a ChatToolCall);
 
@@ -300,7 +309,8 @@ impl std::fmt::Debug for RedactedToolCall<'_> {
 /// credential/URL-redacted and length-bounded (shape plus hash beyond 256
 /// chars); tool calls delegate to the redacted form above; provider state
 /// shows shape only (count), never values. Direct `{:?}` on `ChatMessage`
-/// must never be logged.
+/// must never be logged. Like [`RedactedToolCall`], this is scaffolding
+/// with no production call site yet: pinned by tests, ready before use.
 #[allow(dead_code)]
 pub(crate) struct RedactedMessage<'a>(pub &'a ChatMessage);
 
@@ -1211,6 +1221,40 @@ mod tests {
             !event_str.contains("q=x"),
             "undeclared query values must be redacted by default: {event_str}"
         );
+        // fs.patch replacement lines are file content: they must reach the
+        // journal as a hash placeholder while path and anchors stay visible.
+        let patch_call = ChatToolCall {
+            id: "call-2".into(),
+            name: "apply_patch".into(),
+            args: json!({
+                "path": "notes.txt",
+                "expected_base_sha256": "abc123",
+                "edits": [{"op": "replace", "anchor": "2:015cadfe", "lines": ["S3CRET_PATCH_LINE"]}],
+            }),
+        };
+        let patch_event = tool_call_event(
+            "node",
+            None,
+            None,
+            &patch_call,
+            &json!({"ok": true}),
+            tool_call_outcome(
+                qcg_api::ToolCallStatus::Succeeded,
+                qcg_api::ToolCallPhase::Completed,
+                None,
+                Instant::now(),
+            ),
+        )
+        .expect("patch event should build");
+        let patch_str = patch_event.to_string();
+        assert!(
+            !patch_str.contains("S3CRET_PATCH_LINE"),
+            "journaled fs.patch lines must not leak plaintext: {patch_str}"
+        );
+        assert!(
+            patch_str.contains("2:015cadfe"),
+            "patch anchors stay visible for review: {patch_str}"
+        );
     }
 
     #[test]
@@ -1264,7 +1308,8 @@ mod tests {
         // The orphan rule forbids a direct `Debug` impl on the foreign
         // `qcg_llm` types, so this pins the redacting wrappers that all log
         // sites must use. Sentinel secrets cover URL query values, credential
-        // headers, bodies, and generic credential-like args.
+        // headers, bodies, fs.write contents, fs.patch lines, and generic
+        // credential-like args.
         use qcg_llm::{ChatMessage, ChatToolCall};
         let call = ChatToolCall {
             id: "call-sentinel".into(),
@@ -1277,6 +1322,8 @@ mod tests {
                 },
                 "body": "token=SENTINEL_BODY_SECRET",
                 "api_key": "SENTINEL_ARGS_SECRET",
+                "content": "SENTINEL_WRITE_SECRET",
+                "edits": [{"op": "replace", "anchor": "2:015cadfe", "lines": ["SENTINEL_PATCH_SECRET"]}],
             }),
         };
         let debug = format!("{:?}", super::RedactedToolCall(&call));
@@ -1286,6 +1333,8 @@ mod tests {
             "SENTINEL_HEADER_SECRET",
             "SENTINEL_BODY_SECRET",
             "SENTINEL_ARGS_SECRET",
+            "SENTINEL_WRITE_SECRET",
+            "SENTINEL_PATCH_SECRET",
         ] {
             assert!(
                 !debug.contains(sentinel),

@@ -1095,6 +1095,20 @@ impl LocalQcgService {
         Ok(items)
     }
 
+    /// In-flight preemption fact for observability only: counts in-memory
+    /// runs currently marked preempted. No threshold or alert lives here;
+    /// policy decisions stay outside. Async so the read takes the lock
+    /// instead of reporting 0 under contention.
+    pub async fn preempted_inflight(&self) -> usize {
+        self.inner
+            .runs
+            .read()
+            .await
+            .values()
+            .filter(|record| record.preempted)
+            .count()
+    }
+
     pub(crate) fn load_generator(&self, id: &str) -> Result<Contract, ApiError> {
         if !is_safe_id(id) {
             return Err(api_bad_request(format!(

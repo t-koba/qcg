@@ -135,48 +135,103 @@ pub(crate) fn estimate_context_tokens(text: &str) -> usize {
     text.chars().count().div_ceil(4).max(1)
 }
 
-pub(crate) fn render_repair_prompt(
+/// Builds the repair prompt around an already-read source snapshot.
+/// `execute` paths that also bind the write-back pass the same snapshot
+/// so the shown text and the bound base come from one read.
+pub(crate) fn render_repair_prompt_with(
     ctx: &StepContext<'_>,
     node: &NodeDef,
+    snapshot: Option<&RepairSourceSnapshot>,
 ) -> Result<String, StepError> {
     let mut prompt = render_prompt(ctx, node)?;
-    let params = llm_params(node)?;
-    if let Some(source) = &params.source {
-        let source = ctx.render_inline(node, source)?;
-        let source_path = resolve_workspace_read(ctx, node, &source)?;
-        let source_file = ctx
-            .run
-            .fs
-            .open_read_resolved(&source_path)
-            .map_err(|error| {
-                StepError::failed(
-                    &node.id,
-                    format!("repair source `{source}` could not be opened: {error}"),
-                )
-            })?;
-        let source_limit = prompt_source_byte_limit(&ctx.run.contract);
-        let source_bytes = read_bytes_bounded(source_file, source_limit).map_err(|error| {
-            StepError::failed(
-                &node.id,
-                format!(
-                    "repair source `{source}` could not be read within its byte limit: {error}"
-                ),
-            )
-        })?;
-        let source_text = String::from_utf8(source_bytes).map_err(|error| {
-            StepError::failed(
-                &node.id,
-                format!("repair source `{source}` is not valid UTF-8: {error}"),
-            )
-        })?;
+    if let Some(snapshot) = snapshot {
         prompt.push_str("\n\n<QCG_REPAIR_SOURCE path=\"");
-        prompt.push_str(&source);
+        prompt.push_str(&snapshot.path);
         prompt.push_str("\">\n");
-        prompt.push_str(&source_text);
+        prompt.push_str(&snapshot.text);
         prompt.push_str("\n</QCG_REPAIR_SOURCE>\n");
         manage_context_limits(ctx, node, &mut prompt)?;
     }
     Ok(prompt)
+}
+
+/// Builds the `patch`-mode repair prompt around an already-read source
+/// snapshot. Anchors and the output contract are mechanism-fixed: the
+/// model must return a single `{"edits": [...]}` JSON object and nothing
+/// else, so contract authors cannot weaken the shape.
+pub(crate) fn render_repair_patch_prompt(
+    ctx: &StepContext<'_>,
+    node: &NodeDef,
+    snapshot: &RepairSourceSnapshot,
+) -> Result<String, StepError> {
+    let mut prompt = render_prompt(ctx, node)?;
+    prompt.push_str("\n\n<QCG_REPAIR_ANCHORED_SOURCE path=\"");
+    prompt.push_str(&snapshot.path);
+    prompt.push_str("\" base_sha256=\"");
+    prompt.push_str(&snapshot.base_sha256);
+    prompt.push_str("\">\n");
+    for line in qcg_fs::annotate(&snapshot.text) {
+        prompt.push_str(&line.anchor());
+        prompt.push(':');
+        prompt.push_str(&line.text);
+        prompt.push('\n');
+    }
+    prompt.push_str("</QCG_REPAIR_ANCHORED_SOURCE>\n");
+    prompt.push_str(
+        "Respond with a single JSON object {\"edits\": [{\"op\": \"replace\"|\"append\"|\"prepend\", \"anchor\": \"LINE:HASH\", \"lines\": [\"...\"]}]} and nothing else.\n",
+    );
+    manage_context_limits(ctx, node, &mut prompt)?;
+    Ok(prompt)
+}
+
+/// Workspace source snapshot shown to the repair model.
+/// The text feeds the prompt and the base binds the self-repair
+/// write-back; both must come from this single read.
+pub(crate) struct RepairSourceSnapshot {
+    pub(crate) path: String,
+    pub(crate) text: String,
+    pub(crate) base_sha256: String,
+}
+
+pub(crate) fn read_repair_source(
+    ctx: &StepContext<'_>,
+    node: &NodeDef,
+) -> Result<Option<RepairSourceSnapshot>, StepError> {
+    let params = llm_params(node)?;
+    let Some(source) = &params.source else {
+        return Ok(None);
+    };
+    let source = ctx.render_inline(node, source)?;
+    let source_path = resolve_workspace_read(ctx, node, &source)?;
+    let source_file = ctx
+        .run
+        .fs
+        .open_read_resolved(&source_path)
+        .map_err(|error| {
+            StepError::failed(
+                &node.id,
+                format!("repair source `{source}` could not be opened: {error}"),
+            )
+        })?;
+    let source_limit = prompt_source_byte_limit(&ctx.run.contract);
+    let source_bytes = read_bytes_bounded(source_file, source_limit).map_err(|error| {
+        StepError::failed(
+            &node.id,
+            format!("repair source `{source}` could not be read within its byte limit: {error}"),
+        )
+    })?;
+    let source_text = String::from_utf8(source_bytes).map_err(|error| {
+        StepError::failed(
+            &node.id,
+            format!("repair source `{source}` is not valid UTF-8: {error}"),
+        )
+    })?;
+    let base_sha256 = qcg_fs::base_sha256(&source_text);
+    Ok(Some(RepairSourceSnapshot {
+        path: source,
+        text: source_text,
+        base_sha256,
+    }))
 }
 
 pub(crate) fn read_bytes_bounded(

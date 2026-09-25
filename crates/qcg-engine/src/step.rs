@@ -204,16 +204,14 @@ impl StepRegistry {
     }
 
     pub fn validate_contract(&self, contract: &Contract) -> Result<(), StepError> {
+        let mut errors: Vec<String> = Vec::new();
         for (secret_name, secret) in &contract.manifest.secrets {
             let Some(source) = secret.source_env_name() else {
                 continue;
             };
             if self.reserved_secret_env_names.contains(source) {
-                return Err(StepError::failed(
-                    "contract",
-                    format!(
-                        "generator secret `{secret_name}` targets reserved provider credential environment variable `{source}`"
-                    ),
+                errors.push(format!(
+                    "generator secret `{secret_name}` targets reserved provider credential environment variable `{source}`"
                 ));
             }
         }
@@ -224,14 +222,20 @@ impl StepRegistry {
             .chain(contract.manifest.blocks.values().flatten())
         {
             let Some(executor) = self.get(&node.kind) else {
-                return Err(StepError::failed(
-                    &node.id,
-                    contract.line_hint(&format!("step type `{}` is not registered", node.kind)),
+                errors.push(format!(
+                    "node `{}`: {}",
+                    node.id,
+                    contract.line_hint(&format!("step type `{}` is not registered", node.kind))
                 ));
+                continue;
             };
-            executor.validate(node, contract).map_err(|error| {
-                StepError::failed(&node.id, contract.line_hint(&error.to_string()))
-            })?;
+            if let Err(error) = executor.validate(node, contract) {
+                errors.push(format!(
+                    "node `{}`: {}",
+                    node.id,
+                    contract.line_hint(&error.to_string())
+                ));
+            }
         }
         // Lifecycle hooks execute through the same registry, so a hook with
         // an unregistered or invalid step type fails at contract load
@@ -239,16 +243,41 @@ impl StepRegistry {
         for (event, hook) in contract.manifest.hooks.entries() {
             let node = hook.to_node(event);
             let Some(executor) = self.get(&node.kind) else {
-                return Err(StepError::failed(
-                    &node.id,
-                    contract.line_hint(&format!("step type `{}` is not registered", node.kind)),
+                errors.push(format!(
+                    "hook `{event}`: {}",
+                    contract.line_hint(&format!("step type `{}` is not registered", node.kind))
                 ));
+                continue;
             };
-            executor.validate(&node, contract).map_err(|error| {
-                StepError::failed(&node.id, contract.line_hint(&error.to_string()))
-            })?;
+            if let Err(error) = executor.validate(&node, contract) {
+                errors.push(format!(
+                    "hook `{event}`: {}",
+                    contract.line_hint(&error.to_string())
+                ));
+            }
         }
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else if errors.len() == 1 {
+            Err(StepError::failed(
+                "contract",
+                errors.pop().unwrap_or_default(),
+            ))
+        } else {
+            Err(StepError::failed(
+                "contract",
+                format!(
+                    "invalid contract ({} problems):\n{}",
+                    errors.len(),
+                    errors
+                        .iter()
+                        .enumerate()
+                        .map(|(index, error)| format!("{}. {error}", index + 1))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ),
+            ))
+        }
     }
 }
 

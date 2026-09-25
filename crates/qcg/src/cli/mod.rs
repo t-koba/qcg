@@ -7,6 +7,7 @@ pub(crate) mod inputs;
 pub(crate) mod install;
 pub(crate) mod install_commit;
 pub(crate) mod install_stage;
+pub(crate) mod new;
 pub(crate) mod package_cmd;
 pub(crate) mod plan;
 pub(crate) mod replay;

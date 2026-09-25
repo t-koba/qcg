@@ -1,0 +1,46 @@
+[[flow]]
+id = "seed"
+type = "write"
+
+[flow.params]
+content = """alpha
+beta
+gamma"""
+output_file = "notes.txt"
+
+[[flow]]
+id = "repair"
+type = "llm.repair"
+needs = ["seed"]
+artifact = { label = "Notes", required = true, mime = "text/plain" }
+
+[flow.params]
+prompt = "prompts/repair.txt"
+source = "notes.txt"
+target = "notes.txt"
+mode = "patch"
+
+[generator]
+description = "Repairs a file with hash-anchored patch edits from the fake LLM provider"
+id = "repair-patch-fake"
+name = "Repair Patch Fake"
+qcg_version = "^0.1"
+version = "0.1.0"
+
+[llm]
+max_tokens = 512
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[permissions]
+fs_read = ["workspace"]
+network = []
+commands = []
+side_effects = "none"
+side_effects_scope = "invocation"
+fs_write = ["workspace"]
+
+[permissions.containers]
+enabled = false

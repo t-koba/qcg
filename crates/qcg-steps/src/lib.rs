@@ -12,6 +12,7 @@ mod files;
 mod foreach;
 mod http;
 mod mcp_call;
+mod patch;
 mod transform;
 
 use ask_user::AskUserStep;
@@ -26,6 +27,7 @@ use files::{CopyStep, RenderStep, WriteStep};
 use foreach::ForeachStep;
 use http::HttpStep;
 use mcp_call::McpCallStep;
+use patch::{PatchStep, ReadAnchoredStep};
 use qcg_engine::StepRegistry;
 use qcg_mcp::McpRuntime;
 use std::sync::Arc;
@@ -40,6 +42,8 @@ pub fn deterministic_registry_with_mcp(mcp: Arc<McpRuntime>) -> StepRegistry {
     registry.register(RenderStep);
     registry.register(WriteStep);
     registry.register(CopyStep);
+    registry.register(ReadAnchoredStep);
+    registry.register(PatchStep);
     registry.register(TransformStep);
     registry.register(CommandStep);
     registry.register(HttpStep);

@@ -64,6 +64,68 @@ pub(crate) fn validate_agent_tool(
                 ));
             }
         }
+        ToolDecl::FsRead {
+            name, path_prefix, ..
+        } => {
+            if path_prefix.is_empty() {
+                return Err(StepError::failed(
+                    &node.id,
+                    format!("tool `{name}` requires path_prefix"),
+                ));
+            }
+            if normalize_path_prefix(path_prefix).is_none() {
+                return Err(StepError::failed(
+                    &node.id,
+                    format!("tool `{name}` path_prefix must be a safe relative path"),
+                ));
+            }
+            if !contract
+                .manifest
+                .permissions
+                .fs_read
+                .iter()
+                .any(|scope| scope == "workspace")
+            {
+                return Err(StepError::failed(
+                    &node.id,
+                    format!(
+                        "tool `{}` requires permissions.fs_read to include workspace",
+                        name
+                    ),
+                ));
+            }
+        }
+        ToolDecl::FsPatch {
+            name, path_prefix, ..
+        } => {
+            if path_prefix.is_empty() {
+                return Err(StepError::failed(
+                    &node.id,
+                    format!("tool `{name}` requires path_prefix"),
+                ));
+            }
+            if normalize_path_prefix(path_prefix).is_none() {
+                return Err(StepError::failed(
+                    &node.id,
+                    format!("tool `{name}` path_prefix must be a safe relative path"),
+                ));
+            }
+            if !contract
+                .manifest
+                .permissions
+                .fs_write
+                .iter()
+                .any(|scope| scope == "workspace")
+            {
+                return Err(StepError::failed(
+                    &node.id,
+                    format!(
+                        "tool `{}` requires permissions.fs_write to include workspace",
+                        name
+                    ),
+                ));
+            }
+        }
         ToolDecl::Command { name, command, .. } => {
             if command.is_empty() {
                 return Err(StepError::failed(
@@ -524,6 +586,40 @@ pub(crate) fn agent_tool_schema(tool: &ToolDecl) -> Result<Value, StepError> {
             "properties": {
                 "path": { "type": "string" },
                 "content": { "type": "string" }
+            }
+        }),
+        ToolDecl::FsRead { .. } => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path"],
+            "properties": {
+                "path": { "type": "string" },
+                "offset": { "type": "integer", "minimum": 1 },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 2000 }
+            }
+        }),
+        ToolDecl::FsPatch { .. } => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "expected_base_sha256", "edits"],
+            "properties": {
+                "path": { "type": "string" },
+                "expected_base_sha256": { "type": "string" },
+                "edits": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 128,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["op", "anchor", "lines"],
+                        "properties": {
+                            "op": { "type": "string", "enum": ["replace", "append", "prepend"] },
+                            "anchor": { "type": "string" },
+                            "lines": { "type": "array", "items": { "type": "string" } }
+                        }
+                    }
+                }
             }
         }),
         ToolDecl::Command { .. } => json!({

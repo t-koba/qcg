@@ -2,6 +2,14 @@
 //! explicit optional cap. `None` means no mechanistic limit; the caller sets
 //! a max only when wanted.
 
+pub mod anchored;
+
+pub use anchored::{
+    ANCHOR_HASH_LEN, AnchorRemap, AnchoredLine, AnchoredPatchError, PatchEdit, PatchLimits,
+    PatchOp, PatchOutcome, RawPatchEdit, anchor_for, annotate, apply_anchored_patch, base_sha256,
+    line_hash, parse_anchor, parse_edits, read_window, split_lines,
+};
+
 use camino::{Utf8Path, Utf8PathBuf};
 use sha2::{Digest, Sha256};
 use std::fs::File;

@@ -1647,9 +1647,15 @@ pub(crate) fn agent_tool_has_side_effects(tools: &[ToolDecl], name: &str) -> boo
         .iter()
         .find(|tool| tool.name() == name)
         .is_some_and(|tool| match tool {
-            ToolDecl::FsWrite { .. } | ToolDecl::Command { .. } | ToolDecl::Http { .. } => true,
+            ToolDecl::FsWrite { .. }
+            | ToolDecl::FsPatch { .. }
+            | ToolDecl::Command { .. }
+            | ToolDecl::Http { .. } => true,
             ToolDecl::Mcp { side_effects, .. } => *side_effects,
-            ToolDecl::AskUser { .. } | ToolDecl::WebSearch { .. } | ToolDecl::Skill { .. } => false,
+            ToolDecl::FsRead { .. }
+            | ToolDecl::AskUser { .. }
+            | ToolDecl::WebSearch { .. }
+            | ToolDecl::Skill { .. } => false,
             ToolDecl::Agent {
                 tools: delegated, ..
             } => delegated

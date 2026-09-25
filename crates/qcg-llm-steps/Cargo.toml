@@ -18,6 +18,7 @@ qcg-api = { path = "../qcg-api" }
 qcg-policy = { path = "../qcg-policy" }
 qcg-contract = { path = "../qcg-contract" }
 qcg-engine = { path = "../qcg-engine" }
+qcg-fs = { path = "../qcg-fs" }
 qcg-llm = { path = "../qcg-llm" }
 qcg-mcp = { path = "../qcg-mcp" }
 qcg-types = { path = "../qcg-types" }

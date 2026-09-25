@@ -177,6 +177,14 @@ impl GeneratorMetadataRule {
                 "runtime.state_limit_bytes",
                 manifest.runtime.state_limit_bytes,
             ),
+            (
+                "runtime.patch_hunks_limit",
+                manifest.runtime.patch_hunks_limit,
+            ),
+            (
+                "runtime.patch_bytes_limit",
+                manifest.runtime.patch_bytes_limit,
+            ),
         ] {
             if value == Some(0) {
                 return Err(ContractError::Invalid(format!(
@@ -380,6 +388,24 @@ impl GeneratorMetadataRule {
                 "runtime.journal_scan_window_bytes must be between {} and {}",
                 qcg_policy::MIN_JOURNAL_SCAN_WINDOW_BYTES,
                 qcg_policy::MAX_JOURNAL_SCAN_WINDOW_BYTES
+            )));
+        }
+        if let Some(limit) = manifest.runtime.patch_hunks_limit
+            && !(qcg_policy::MIN_PATCH_EDITS..=qcg_policy::MAX_PATCH_EDITS).contains(&limit)
+        {
+            return Err(ContractError::Invalid(format!(
+                "runtime.patch_hunks_limit must be between {} and {}",
+                qcg_policy::MIN_PATCH_EDITS,
+                qcg_policy::MAX_PATCH_EDITS
+            )));
+        }
+        if let Some(limit) = manifest.runtime.patch_bytes_limit
+            && !(qcg_policy::MIN_PATCH_BYTES..=qcg_policy::MAX_PATCH_BYTES).contains(&limit)
+        {
+            return Err(ContractError::Invalid(format!(
+                "runtime.patch_bytes_limit must be between {} and {}",
+                qcg_policy::MIN_PATCH_BYTES,
+                qcg_policy::MAX_PATCH_BYTES
             )));
         }
         Ok(())

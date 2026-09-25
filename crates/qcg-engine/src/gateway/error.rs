@@ -65,4 +65,10 @@ pub enum GatewayError {
     Io(#[from] std::io::Error),
     #[error("execution was canceled")]
     Canceled,
+    /// Hash-anchored patch mechanism failure. Policy layers match on the
+    /// inner variant instead of parsing message strings.
+    #[error(transparent)]
+    AnchoredPatch(#[from] qcg_fs::AnchoredPatchError),
+    #[error("file `{path}` is not valid UTF-8 for anchored patch")]
+    PatchNotUtf8 { path: String },
 }

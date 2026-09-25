@@ -117,6 +117,14 @@ pub(crate) async fn metrics(State(state): State<Arc<AppState>>) -> Result<Respon
     body.push_str("# HELP qcg_runs_confirming Number of runs waiting for confirmation.\n");
     body.push_str("# TYPE qcg_runs_confirming gauge\n");
     body.push_str(&format!("qcg_runs_confirming {confirming}\n"));
+    // Mechanism fact only: in-flight preempted runs held in memory.
+    // No threshold or alert lives here; policy stays outside.
+    let preempted = state.service.preempted_inflight().await;
+    body.push_str(
+        "# HELP qcg_runs_preempted Number of in-memory runs currently marked preempted.\n",
+    );
+    body.push_str("# TYPE qcg_runs_preempted gauge\n");
+    body.push_str(&format!("qcg_runs_preempted {preempted}\n"));
     body.push_str(
         "# HELP qcg_generators Number of distinct generators represented in the run inventory.\n",
     );

@@ -103,11 +103,23 @@ pub(crate) fn show_run(
     Ok(())
 }
 
-/// Bundle journal failure signals into one ordered diagnosis object.
+/// Bundle journal failure signals into one ordered diagnosis object,
+/// plus read-only per-node LLM cost facts folded from `llm_call` events.
+/// No threshold or judgement lives here; policy stays outside.
 fn diagnose_run(run_dir: &Utf8Path) -> Result<Value> {
     use qcg_service::read_run_events;
+    use std::collections::BTreeMap;
     let events = read_run_events(run_dir)?;
     let mut causes: Vec<Value> = Vec::new();
+    #[derive(Default)]
+    struct NodeCost {
+        calls: u64,
+        tokens_input: u64,
+        tokens_output: u64,
+        tokens_cached_input: u64,
+        cost_microusd: u64,
+    }
+    let mut node_costs: BTreeMap<String, NodeCost> = BTreeMap::new();
     for event in &events {
         let node = event
             .path
@@ -172,10 +184,51 @@ fn diagnose_run(run_dir: &Utf8Path) -> Result<Value> {
         if let Some(cause) = cause {
             causes.push(cause);
         }
+        if event.kind.as_str() == "llm_call" {
+            let entry = node_costs.entry(node.clone()).or_default();
+            entry.calls = entry.calls.saturating_add(1);
+            entry.tokens_input = entry.tokens_input.saturating_add(
+                data.get("tokens")
+                    .and_then(|tokens| tokens.get("input"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            );
+            entry.tokens_output = entry.tokens_output.saturating_add(
+                data.get("tokens")
+                    .and_then(|tokens| tokens.get("output"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            );
+            entry.tokens_cached_input = entry.tokens_cached_input.saturating_add(
+                data.get("tokens")
+                    .and_then(|tokens| tokens.get("cached_input"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            );
+            entry.cost_microusd = entry.cost_microusd.saturating_add(
+                data.get("cost_microusd")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            );
+        }
     }
+    let node_costs = node_costs
+        .into_iter()
+        .map(|(node, cost)| {
+            json!({
+                "node": node,
+                "llm_calls": cost.calls,
+                "tokens_input": cost.tokens_input,
+                "tokens_output": cost.tokens_output,
+                "tokens_cached_input": cost.tokens_cached_input,
+                "cost_microusd": cost.cost_microusd,
+            })
+        })
+        .collect::<Vec<_>>();
     Ok(json!({
         "causes": causes,
         "cause_count": causes.len(),
+        "node_costs": node_costs,
     }))
 }
 
@@ -187,23 +240,59 @@ fn print_diagnosis(diagnosis: &Value) {
         .unwrap_or_default();
     if causes.is_empty() {
         println!("diagnosis: no failure signals in journal");
-        return;
+    } else {
+        println!("diagnosis ({} signals):", causes.len());
+        for cause in causes {
+            println!(
+                "  #{} {} node={} {}",
+                cause.get("seq").and_then(Value::as_u64).unwrap_or(0),
+                cause
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+                cause.get("node").and_then(Value::as_str).unwrap_or("-"),
+                cause
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map_or_else(String::new, |message| message.chars().take(160).collect()),
+            );
+        }
     }
-    println!("diagnosis ({} signals):", causes.len());
-    for cause in causes {
-        println!(
-            "  #{} {} node={} {}",
-            cause.get("seq").and_then(Value::as_u64).unwrap_or(0),
-            cause
-                .get("kind")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown"),
-            cause.get("node").and_then(Value::as_str).unwrap_or("-"),
-            cause
-                .get("message")
-                .and_then(Value::as_str)
-                .map_or_else(String::new, |message| message.chars().take(160).collect()),
-        );
+    // Node costs are journal facts, not failure signals: they print even
+    // when no failure fired, matching the `--json` output which always
+    // carries `node_costs`.
+    let node_costs = diagnosis
+        .get("node_costs")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !node_costs.is_empty() {
+        println!("node costs:");
+        for entry in node_costs {
+            println!(
+                "  {} calls={} in={} out={} cached={} cost={}",
+                entry.get("node").and_then(Value::as_str).unwrap_or("-"),
+                entry.get("llm_calls").and_then(Value::as_u64).unwrap_or(0),
+                entry
+                    .get("tokens_input")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                entry
+                    .get("tokens_output")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                entry
+                    .get("tokens_cached_input")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                format_usd(
+                    entry
+                        .get("cost_microusd")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                ),
+            );
+        }
     }
 }
 

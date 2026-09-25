@@ -5,6 +5,15 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::{BufRead as _, Read as _, Write};
 
+/// Wire-form `on_deps` shared by machine-readable and text output alike
+/// (`all_succeeded`, never the Rust `AllSucceeded` debug name).
+fn on_deps_wire(node: &qcg_contract::NodeDef) -> String {
+    serde_json::to_value(&node.on_deps)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{:?}", node.on_deps))
+}
+
 pub(crate) fn print_run_plan(
     contract: &Contract,
     inputs: &BTreeMap<String, Value>,
@@ -16,6 +25,8 @@ pub(crate) fn print_run_plan(
     let manifest = &contract.manifest;
     let mut missing_answers = Vec::new();
     let mut steps = Vec::new();
+    let parallel_set: std::collections::BTreeSet<&str> =
+        manifest.parallel.iter().map(String::as_str).collect();
     for node in &manifest.flow {
         let kind = node.kind.as_str();
         if kind == "ask_user" && !answers.contains_key(&node.id) {
@@ -25,8 +36,11 @@ pub(crate) fn print_run_plan(
             "id": node.id,
             "type": kind,
             "needs": node.needs,
+            "on_deps": on_deps_wire(node),
             "when": node.when.as_ref().map(|when| when.0.clone()),
+            "output": node.output,
             "artifact": node.artifact.as_ref().map(|artifact| artifact.label.clone()),
+            "in_parallel_wave": parallel_set.contains(node.id.as_str()),
             "pre_provisioned_answer": answers.contains_key(&node.id),
             "retry": node.retry.as_ref().map(|retry| json!({
                 "max_attempts": retry.max_attempts,
@@ -39,6 +53,58 @@ pub(crate) fn print_run_plan(
         }
         steps.push(entry);
     }
+    // Read-only id enumeration (mechanism facts only, no digest prediction).
+    // Question ids are node ids for ask_user steps. Confirmation id shapes
+    // depend on the manifest scope; digests are runtime facts and are never
+    // predicted here. The wire form (`invocation`, never the Rust `Invocation`
+    // debug name) is produced through serialization like every other
+    // machine-readable field.
+    let scope = serde_json::to_value(manifest.permissions.side_effects_scope)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "invocation".to_string());
+    let question_ids: Vec<Value> = manifest
+        .flow
+        .iter()
+        .filter(|node| node.kind.as_str() == "ask_user")
+        .map(|node| {
+            json!({
+                "node": node.id,
+                "question_id": node.id,
+                "provided": answers.contains_key(&node.id),
+            })
+        })
+        .collect();
+    let confirmation_shapes: Vec<Value> = manifest
+        .flow
+        .iter()
+        .filter(|node| {
+            matches!(node.kind.as_str(), "http" | "command" | "mcp.call")
+                || node
+                    .params_json()
+                    .get("side_effects")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+        })
+        .map(|node| {
+            let form = if scope == "content" {
+                format!("{}:{}:<operation_digest>", node.id, node.kind.as_str())
+            } else {
+                format!(
+                    "{}:{}:<operation_digest>:<invocation_hash>",
+                    node.id,
+                    node.kind.as_str()
+                )
+            };
+            json!({
+                "node": node.id,
+                "type": node.kind.as_str(),
+                "scope": scope,
+                "id_form": form,
+                "pre_provisioned": confirmations.keys().any(|key| key.starts_with(&format!("{}:", node.id))),
+            })
+        })
+        .collect();
     let mut plan = json!({
         "generator": format!("{}@{}", manifest.generator.id, manifest.generator.version),
         "contract_sha256": contract.sha256,
@@ -65,7 +131,12 @@ pub(crate) fn print_run_plan(
         "pre_provisioned": {
             "answers": answers.keys().collect::<Vec<_>>(),
             "confirmations": confirmations.keys().collect::<Vec<_>>(),
-            "missing_answers": missing_answers,
+            "missing_answers": missing_answers.clone(),
+        },
+        "ids": {
+            "questions": question_ids,
+            "confirmation_shapes": confirmation_shapes,
+            "note": "Digests are runtime facts and are never predicted by plan output",
         },
     });
     if show_diff && let Value::Object(map) = &mut plan {
@@ -86,11 +157,26 @@ pub(crate) fn print_run_plan(
         if !node.needs.is_empty() {
             markers.push(format!("needs={}", node.needs.join(",")));
         }
-        if node.when.is_some() {
-            markers.push("when=...".to_string());
+        markers.push(format!("on_deps={}", on_deps_wire(node)));
+        if let Some(when) = node.when.as_ref() {
+            // Char-boundary truncation: byte slicing panics on multi-byte
+            // `when` expressions longer than the display budget.
+            let shown: String = when.0.chars().take(120).collect();
+            let shown = if when.0.chars().count() > 120 {
+                format!("{shown}...")
+            } else {
+                shown
+            };
+            markers.push(format!("when={shown}"));
+        }
+        if let Some(output) = node.output.as_deref() {
+            markers.push(format!("output={output}"));
         }
         if node.artifact.is_some() {
             markers.push("artifact".to_string());
+        }
+        if parallel_set.contains(node.id.as_str()) {
+            markers.push("parallel_wave".to_string());
         }
         if kind == "ask_user" {
             markers.push(if answers.contains_key(&node.id) {

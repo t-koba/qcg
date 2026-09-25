@@ -248,6 +248,14 @@ pub struct RuntimeLimits {
     /// Explicit max only. `None` means no mechanistic limit.
     #[serde(default)]
     pub template_output_limit_bytes: Option<usize>,
+    /// Explicit max only for hash-anchored patch edits per call.
+    /// `None` falls back to the policy default.
+    #[serde(default)]
+    pub patch_hunks_limit: Option<usize>,
+    /// Explicit max only for hash-anchored patch payload bytes.
+    /// `None` falls back to the policy default.
+    #[serde(default)]
+    pub patch_bytes_limit: Option<usize>,
     #[serde(default = "default_template_fuel")]
     pub template_fuel: u64,
 }
@@ -275,6 +283,8 @@ impl Default for RuntimeLimits {
             journal_event_count_limit: None,
             state_limit_bytes: None,
             template_output_limit_bytes: None,
+            patch_hunks_limit: None,
+            patch_bytes_limit: None,
             template_fuel: default_template_fuel(),
         }
     }

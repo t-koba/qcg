@@ -2034,6 +2034,7 @@ dependencies = [
  "hex",
  "libc",
  "sha2 0.11.0",
+ "thiserror 2.0.20",
  "uuid",
 ]
 
@@ -2094,6 +2095,7 @@ dependencies = [
  "qcg-api",
  "qcg-contract",
  "qcg-engine",
+ "qcg-fs",
  "qcg-llm",
  "qcg-mcp",
  "qcg-policy",

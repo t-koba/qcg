@@ -120,6 +120,27 @@ pub const MAX_INTERACTIVE_INPUT_BYTES: usize = 64 * 1024;
 /// Maximum result files collected from a single command execution.
 pub const MAX_COMMAND_RESULT_FILES: usize = 1024;
 
+/// Inclusive mechanism bounds for hash-anchored patch edits per call.
+/// The policy layer resolves a contract value within these bounds and
+/// passes a plain number to the mechanism.
+pub const MIN_PATCH_EDITS: usize = 1;
+pub const MAX_PATCH_EDITS: usize = 128;
+
+/// Inclusive mechanism bounds for hash-anchored patch payload bytes
+/// (sum of replacement line bytes, excluding file content).
+pub const MIN_PATCH_BYTES: usize = 1;
+pub const MAX_PATCH_BYTES: usize = 256 * 1024;
+
+/// Inclusive mechanism bound for anchored read windows.
+/// The lower bound is structural (line numbers start at 1) and enforced at
+/// each call site, so only the upper bound lives here as policy.
+pub const MAX_ANCHORED_READ_LINES: usize = 2_000;
+
+/// Default anchored patch budgets applied when the contract leaves
+/// the corresponding runtime limit unset.
+pub const DEFAULT_PATCH_EDITS: usize = 32;
+pub const DEFAULT_PATCH_BYTES: usize = 64 * 1024;
+
 /// Default timeout, in seconds, for MCP server operations.
 pub const DEFAULT_MCP_TIMEOUT_SECONDS: u64 = 120;
 

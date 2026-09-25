@@ -509,6 +509,39 @@ pub fn redact_fs_write_args_for_journal(args: &serde_json::Value) -> serde_json:
     redacted
 }
 
+/// Redacts an `fs.patch` tool `args` object for journaling: every
+/// replacement line becomes a hash placeholder while `path`, `op`
+/// ordering, and anchors stay visible for review. Execution uses the
+/// raw lines; a redacted resume returns cached success or fails closed.
+pub fn redact_fs_patch_args_for_journal(args: &serde_json::Value) -> serde_json::Value {
+    use sha2::{Digest as _, Sha256};
+    let mut redacted = args.clone();
+    let Some(object) = redacted.as_object_mut() else {
+        return redacted;
+    };
+    let Some(edits) = object
+        .get_mut("edits")
+        .and_then(|value| value.as_array_mut())
+    else {
+        return redacted;
+    };
+    for edit in edits.iter_mut() {
+        let Some(item) = edit.as_object_mut() else {
+            continue;
+        };
+        let Some(lines) = item.get("lines").and_then(|value| value.as_array()) else {
+            continue;
+        };
+        let canonical = serde_json::to_vec(lines).unwrap_or_default();
+        let digest = hex::encode(Sha256::digest(&canonical));
+        item.insert(
+            "lines".into(),
+            serde_json::Value::String(redacted_hash_placeholder(&digest)),
+        );
+    }
+    redacted
+}
+
 /// Redacts sensitive query values but keeps their names with a placeholder
 /// so journaled copies never carry plaintext yet remain detectable (E09).
 fn redact_url_preserving_keys(

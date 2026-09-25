@@ -16,6 +16,7 @@ use cli::eval::run_eval;
 use cli::gc::{auto_gc_runs, gc_runs};
 use cli::inputs::{load_answers, load_confirmations, load_inputs};
 use cli::install::{InstallVerification, install, sign_package, uninstall};
+use cli::new::new_generator;
 use cli::package_cmd::{package, sha256_file};
 use cli::plan::print_run_plan;
 use cli::replay::{ReplayRequest, export_run_trace, replay_run};
@@ -89,6 +90,9 @@ async fn run_async() -> Result<std::process::ExitCode> {
     init_tracing(cli.verbose, cli.log_format);
     let providers_path = cli.providers.clone();
     match cli.command {
+        Command::New { path, id, force } => {
+            new_generator(&path, id.as_deref(), force)?;
+        }
         Command::Validate { path, json } => {
             if !json {
                 let contract = Contract::load(&path)?;

@@ -459,6 +459,28 @@ native schema mode only if the provider advertises both `json_schema` and
 same mandatory local validation and bounded correction loop. Selecting an
 explicit native mode for an unsupported combination fails before transport.
 
+### Budget and fallback policy guidance
+
+Mechanism enforces, policy chooses. qcg enforces run-wide `[budget]`
+(`max_steps`, `max_tokens`, `max_cost_usd`, `max_elapsed_seconds`), static
+ordered `fallback_models` (at most 8, retryable route failures only), and the
+streaming rule that route fallback is refused once the first delta is emitted
+(partial billing is then unavoidable). Unpriced routes account as zero and are
+flagged, since totals may understate spend.
+
+Policy guidance for authors:
+
+- Set `[budget]` on every server-hosted generator; treat provisioned answers
+  and approvals as deployment policy, not code defaults.
+- Keep `max_tokens` as the output ceiling (hidden reasoning tokens included);
+  there is no separate reasoning budget. Tighten per node via
+  `params.request.max_tokens` (tighten-only, never raise).
+- Order `fallback_models` by cost and capability explicitly; an empty list
+  disables fallback instead of inheriting. `llm.decide` and `llm.catalog`
+  never fall back.
+- Prefer small `max_iterations` and `max_tool_calls_total` on specialists;
+  parent and specialist budgets are independent and additive.
+
 ### Reasoning models
 
 Declare reasoning explicitly when the selected model supports it:

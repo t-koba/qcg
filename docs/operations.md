@@ -128,6 +128,15 @@ GC never removes a non-terminal run. The first command is a dry run.
 Failed runs keep an additional `--keep-failed` budget (default 10) for
 post-mortems even when they fall outside `--keep`.
 
+Retention is count-based only; there is no byte or disk-usage ceiling in
+mechanism. Size the `runs-dir` volume externally and export a run bundle
+(`qcg runs export`) before GC when audit evidence must survive deletion:
+deletion removes journals, FileValue content, and artifacts together.
+Queue depth beyond 10,000 entries refuses snapshots instead of degrading
+silently; treat sustained growth as capacity policy owned by the orchestrator.
+No aging, quota, or starvation avoidance exists: low-priority runs wait in
+priority order with FIFO ties by design.
+
 Journals include inline FileValue content and should be protected as sensitive
 run data. `qcg runs show` summarizes file values by name, decoded bytes, and
 SHA-256 instead of printing base64.
@@ -540,12 +549,33 @@ start: it is refused with `503` during drain, never half-copied.
 Unattended limits:
 
 - MCP OAuth authorization needs a browser on loopback and cannot run
-  unattended.
+  unattended. Authorize once from the loopback Connections panel, then persist
+  the OS keyring entry per deployment policy (backup and rotation are operator
+  policy; qcg never exports tokens). Headless or container renewal without a
+  prior authorized keyring fails closed.
 - A denied confirmation ends the run as `Failed`; retries, backoff, and
   notifications are the orchestrator's job, not qcg's.
 - `qcg serve` retains the newest 50 terminal run directories plus 10 failed
   runs and sweeps every 24 hours; size the `runs-dir` volume and retention
   for the schedule above.
+- `Waiting` and `Confirming` runs release their execution slot but have no
+  TTL in mechanism; an unanswered run stays paused until answered, confirmed,
+  or canceled. Expire it from the orchestrator with `cancel` when policy
+  requires. Note `budget.max_elapsed_seconds` covers queue plus HITL dwell.
+
+## Observability
+
+- `GET /healthz` is liveness only (`ok` plus `max_request_bytes`); readiness,
+  queue depth, lease, and GC state are not reported there.
+- `GET /metrics` exposes gauges only: durable runs by state, active, queued,
+  waiting, confirming, in-flight preempted (`qcg_runs_preempted`), distinct
+  generators, and per-generator top-20 counts.
+  Latency histograms, error rates, queue dwell, preemption totals, and GC
+  deletion or failure counts are not exported; alert thresholds live outside.
+- OTLP export exists in implementation (`QCG_OTLP_ENDPOINT`,
+  `QCG_OTLP_INTERVAL_MS`, best-effort) and `qcg runs trace` builds
+  hierarchical spans, but no SLO is defined here. Treat traces as mechanism
+  facts for external analysis.
 
 ## Priority scheduling and preemption
 

@@ -224,6 +224,13 @@ frontmatter, and a missing `SKILL.md` fail explicitly. Soft violations such as
 a name that differs from the directory name are recorded as diagnostics in the
 resource snapshot and logged instead of failing the run.
 
+Skill reuse recipe (policy): a skill never carries permissions. Copy the
+skill's required `permissions` (`commands`, `network`, `containers`), the
+`resources.skill` or `resources.skill_library` declaration, and the agent
+`skill` tool entry into each consuming generator, then review them as
+deployment policy. `qcg skill validate` checks the `SKILL.md` shape only;
+permission wiring stays explicit in `qcg.toml`.
+
 A `skill_library` resource scans its `path` for direct subdirectories
 containing `SKILL.md` and exposes each one as a skill. It is the opt-in way to
 vendor a skill collection into a package: the declaration names the library
@@ -355,8 +362,15 @@ limits. Stdio MCP processes use the same declared isolation mode.
 
 ## `[tools.<name>]`
 
-Logical tools describe what a flow needs without forcing the flow to know how
-the runtime will execute it. `check.tool` currently supports validator tools.
+Logical validator tools describe what a `check.tool` flow node needs without
+forcing the flow to know how the runtime will execute it. This section is
+mechanism for validator backends only and is distinct from `llm.agent` inline
+`tools` (policy): agent tools (`fs.write`, `command`, `http`, `ask_user`,
+`web.search`, `mcp`, `agent`, `skill`) are declared inline under
+`[flow.params]` per node with their own budgets and side-effect flags, while
+`[tools.*]` entries are referenced by name from `check.tool` nodes only.
+Conflating the two is rejected: a validator entry never grants agent
+capabilities and an agent tool never selects a validator backend.
 
 Common fields:
 
@@ -527,6 +541,30 @@ are explicit errors.
 `copy`
 : Copy workspace/package content from `source` to `target`.
 
+`read_anchored`
+: Read a workspace file window with hash-anchored lines. Params are `path`
+  plus optional `offset` (1-indexed, default `1`) and `limit` (default `200`,
+  at most `2000`). The output carries `file`, `base_sha256`, `total_lines`,
+  and `lines` (`{anchor, text}` with `LINE:HASH` anchors). Use the returned
+  `base_sha256` and anchors as the inputs of a later `patch` step.
+
+`patch`
+: Apply hash-anchored edits to an existing workspace file. Params are
+  `target`, required `expected_base_sha256`, and `edits` (`{op, anchor,
+  lines}` with `op` in `replace`, `append`, `prepend`). Every anchor is
+  validated against one snapshot before anything is written; one stale
+  anchor rejects the whole batch atomically and reports remaps. The base
+  pin is the compare-and-swap: omitting it would let a racing patch lose
+  updates on untouched lines, so it fails closed instead. Concurrent
+  patches to one file serialize on that pin: the loser fails with a base
+  mismatch instead of merging, so fan-out writes to one file must sequence
+  or target disjoint files. A `base`
+  mismatch also fails without modification. Uniform CRLF snapshots rejoin
+  with CRLF so untouched endings survive; LF and mixed snapshots join
+  with LF. Creation stays on
+  `write`/`render`/`fs.write`; modification of existing files belongs on
+  `patch`/`fs.patch`.
+
 `transform`
 : Requires `transform`, `source`, and `target`. Supported transforms are
   `inject_secrets`, `json_pretty`, `json_compact`, `toml_to_json`,
@@ -615,7 +653,18 @@ are explicit errors.
   `max_iterations` attempts.
 
 `llm.repair`
-: Ask the LLM to rewrite `source` into `target`.
+: Ask the LLM to rewrite `source` into `target` in one shot. `mode`
+  selects the output contract: `text` (default) rewrites the whole file,
+  best for small files; `patch` requires the model to return
+  `{"edits": [...]}` anchored edits, best for large files where unrelated
+  churn must not spread. `patch` mode requires `source` plus `target` or
+  `output_file`, and malformed output fails the node with no silent
+  fallback to full rewrite. The `source` snapshot shown to the model binds
+  a self-repair write-back (`source == target`, compared insensitive to
+  leading `./` spelling): a file changed since that
+  snapshot fails the write explicitly instead of overwriting silently.
+  Cross-file repair keeps the declared overwrite semantic. Iterative edits
+  to large files belong on `llm.agent` with `fs.read`/`fs.patch`.
 
 `llm.agent`
 : Run a bounded tool loop. Requires `max_iterations`,
@@ -3336,6 +3385,13 @@ metadata. Update it with `qcg docs step-schemas`.
       "maxItems": 16,
       "type": "array"
     },
+    "mode": {
+      "enum": [
+        "text",
+        "patch"
+      ],
+      "type": "string"
+    },
     "model": {
       "additionalProperties": false,
       "properties": {
@@ -3574,6 +3630,86 @@ metadata. Update it with `qcg docs step-schemas`.
 }
 ```
 
+### `patch`
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "edits": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "anchor": {
+            "type": "string"
+          },
+          "lines": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "op": {
+            "enum": [
+              "replace",
+              "append",
+              "prepend"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "op",
+          "anchor"
+        ],
+        "type": "object"
+      },
+      "maxItems": 128,
+      "minItems": 1,
+      "type": "array"
+    },
+    "expected_base_sha256": {
+      "type": "string"
+    },
+    "target": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "target",
+    "expected_base_sha256",
+    "edits"
+  ],
+  "type": "object"
+}
+```
+
+### `read_anchored`
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "limit": {
+      "maximum": 2000,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "offset": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "path": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "path"
+  ],
+  "type": "object"
+}
+```
+
 ### `render`
 
 ```json
@@ -3697,7 +3833,16 @@ text field. Answers are durable and resume through the normal run boundary.
 Every declaration has a unique non-empty `name`, a `kind`, and an optional
 `description`. `llm.agent` accepts these closed tool variants:
 
-- `fs.write`: `path_prefix`, plus an optional `input_schema`.
+- `fs.write`: `path_prefix`, plus an optional `input_schema`. Creates or
+  replaces whole files; prefer `fs.patch` for edits to existing files.
+- `fs.read`: `path_prefix`, plus an optional `input_schema`. Model-visible
+  input is `{path, offset?, limit?}` and the result carries hash-anchored
+  lines plus `base_sha256` for a later `fs.patch` call.
+- `fs.patch`: `path_prefix`, plus an optional `input_schema`. Model-visible
+  input is `{path, expected_base_sha256, edits}` with `edits` as
+  `{op, anchor, lines}` items. Approval binds `path`, the expected base,
+  and the canonical edits (`fspatch-v1`); stale anchors return remaps as
+  tool results instead of failing the node.
 - `command`: a fixed `command`, plus an optional `input_schema`.
 - `http`: fixed `methods` and `hosts`, plus an optional `input_schema`.
 - `ask_user`: an optional `input_schema` for a runtime-generated form.
@@ -3941,7 +4086,8 @@ fields are rejected when their structs define a closed schema.
    `http_body_limit_bytes`, `http_redirect_limit`, `file_input_limit_bytes`,
    `file_count_limit`, `input_total_limit_bytes`, `output_file_limit_bytes`,
    `output_total_limit_bytes`,
-   `output_artifact_limit`, `template_source_limit_bytes`,
+   `output_artifact_limit`, `patch_hunks_limit`, `patch_bytes_limit`,
+   `template_source_limit_bytes`,
    `template_context_limit_bytes`, `journal_event_limit_bytes`,
    `journal_total_limit_bytes`, `journal_event_count_limit`,
    `state_limit_bytes`, `template_output_limit_bytes`, and `template_fuel`.

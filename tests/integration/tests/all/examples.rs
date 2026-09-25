@@ -81,6 +81,24 @@ async fn file_input_is_journaled_and_materialized_in_the_workspace() {
 }
 
 #[tokio::test]
+async fn anchored_patch_applies_hash_bound_edits() {
+    let run = run_fixture("anchored-patch", inputs([]), answers([]))
+        .await
+        .expect("anchored-patch should run");
+    assert_file_eq(&run, "notes.txt", "alpha\nBETA\ngamma");
+    assert_required_artifact(&run, "notes.txt");
+}
+
+#[tokio::test]
+async fn repair_patch_mode_applies_model_edits_through_anchors() {
+    let run = run_fixture("repair-patch-fake", inputs([]), answers([]))
+        .await
+        .expect("repair-patch-fake should run");
+    assert_file_eq(&run, "notes.txt", "alpha\nBETA\ngamma");
+    assert_required_artifact(&run, "notes.txt");
+}
+
+#[tokio::test]
 async fn transform_formats_roundtrips_structured_files() {
     let run = run_fixture("transform-formats", inputs([]), answers([]))
         .await
