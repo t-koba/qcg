@@ -169,7 +169,13 @@ pub(crate) fn lock_runs_directory_shared(runs_dir: &Utf8Path) -> Result<File, Se
 /// The lock lives next to the run directory, never inside it: admission may
 /// wipe the run directory, and unlinking a locked file would let a later
 /// admission lock a fresh inode while this one still holds the old (E03).
-/// The name is a digest because run ids may contain separators.
+/// G03: coordination uses a fixed set of sharded lock files shared by many
+/// run ids (one file per shard, not per run), so lifetime admissions never
+/// accumulate entries in the runs directory. Same-run admissions map to the
+/// same shard and still exclude each other; distinct ids sharing a shard
+/// only wait briefly. Legacy per-run `.admission-<digest>.lock` files from
+/// earlier releases are never created here and are ignored by every store
+/// scan (see [`is_store_coordination_name`]).
 pub(crate) struct RunAdmissionLock(File);
 
 impl Drop for RunAdmissionLock {
@@ -178,28 +184,58 @@ impl Drop for RunAdmissionLock {
     }
 }
 
+/// Number of admission-lock shards (G03). Power of two so the index is a
+/// bitmask; the file count in the store stays constant regardless of
+/// lifetime admissions.
+pub(crate) const ADMISSION_SHARD_COUNT: usize = 64;
+
+/// Maps a run id to its admission shard (FNV-1a, 64-bit, same family as the
+/// workspace patch shards). Distinct spellings of one id share one shard
+/// because the id itself (the directory name) is hashed, never a path.
+fn admission_shard_index(run_id: &str) -> usize {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in run_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    (hash as usize) & (ADMISSION_SHARD_COUNT - 1)
+}
+
+/// Whether a runs-directory entry is store coordination/metadata rather
+/// than a run directory (G03): hidden entries (`.service.lock`,
+/// `.maintenance.lock`, legacy `.admission-*.lock`, `.admission-shards/`)
+/// and the `idempotency` bookkeeping directory. Scans skip these WITHOUT
+/// counting them toward `max_scan_entries`, so lifetime admissions can
+/// never exhaust the recovery budget. Mirrors the shutdown orphan pass,
+/// which already skips `idempotency` and dotfiles.
+pub(crate) fn is_store_coordination_name(name: &str) -> bool {
+    name.starts_with('.') || name == "idempotency"
+}
+
 pub(crate) fn try_lock_run_admission(
     run_dir: &Utf8Path,
 ) -> Result<Option<RunAdmissionLock>, ServiceError> {
     // Lock files are intentionally never unlinked: removing a locked file
     // would let a later admission lock a fresh inode while the holder still
-    // owns the old one. Growth is bounded: one small file per distinct run
-    // id, and run directories (with their lock files) are bounded by
-    // max_tracked_runs plus GC retention (E03).
+    // owns the old one. Growth is bounded by the fixed shard count: every
+    // run id hashes to one of ADMISSION_SHARD_COUNT files under
+    // `.admission-shards/`, so the store holds O(1) coordination files no
+    // matter how many runs are admitted over its lifetime (G03).
     let runs_dir = run_dir
         .parent()
         .ok_or_else(|| ServiceError::Invalid(format!("run directory `{run_dir}` has no parent")))?;
-    std::fs::create_dir_all(runs_dir)?;
+    let shards_dir = runs_dir.join(".admission-shards");
+    std::fs::create_dir_all(&shards_dir)?;
     let run_id = run_dir
         .file_name()
         .ok_or_else(|| ServiceError::Invalid(format!("run directory `{run_dir}` has no name")))?;
-    let digest = hex::encode(Sha256::digest(run_id.as_bytes()));
+    let shard = admission_shard_index(run_id);
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(runs_dir.join(format!(".admission-{digest}.lock")))?;
+        .open(shards_dir.join(format!("shard-{shard:02x}.lock")))?;
     match file.try_lock() {
         Ok(()) => Ok(Some(RunAdmissionLock(file))),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),

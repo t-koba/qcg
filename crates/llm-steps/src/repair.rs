@@ -157,9 +157,13 @@ impl LlmRepairStep {
             {
                 verify_repair_base(ctx, node, &target, snapshot)?;
             }
+            // G02: the guard above already holds the per-file exclusion, so
+            // the write-back must not re-lock (self-deadlock). G06: a
+            // content repair preserves the target's existing mode instead
+            // of resetting executability to owner-only.
             ctx.run
                 .fs
-                .write_file_atomic(&target, text.as_bytes())
+                .write_file_atomic_preserving_mode_under_guard(&target, text.as_bytes(), &_guard)
                 .await
                 .map_err(|error| StepError::from_gateway(&node.id, error))?;
             files.push(target);
@@ -241,9 +245,15 @@ impl LlmRepairStep {
             .require_unchanged_since(&target, target_before.as_deref())
             .await
             .map_err(|error| StepError::from_gateway(&node.id, error))?;
+        // G02/G06: guarded commit without re-locking, preserving the
+        // target's existing mode (see the text-mode site above).
         ctx.run
             .fs
-            .write_file_atomic(&target, outcome.new_text.as_bytes())
+            .write_file_atomic_preserving_mode_under_guard(
+                &target,
+                outcome.new_text.as_bytes(),
+                &_guard,
+            )
             .await
             .map_err(|error| StepError::from_gateway(&node.id, error))?;
         Ok(StepOutcome::Success {

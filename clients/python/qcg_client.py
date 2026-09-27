@@ -260,14 +260,41 @@ class QcgClient:
         with contextlib.closing(raw):
             decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
             text_buffer = ""
+            pending_cr = False
             try:
                 while True:
-                    chunk = raw.read(1 << 16)
+                    # G04: read1 returns available bytes without waiting for
+                    # a full 64 KiB, so a flushed tens-of-bytes question
+                    # event reaches the consumer while the connection stays
+                    # open. Plain read(64 KiB) would stall until the buffer
+                    # fills or EOF.
+                    read1 = getattr(raw, "read1", None)
+                    if read1 is not None:
+                        chunk = read1(1 << 16)
+                    else:
+                        chunk = raw.read(1 << 16)
                     if not chunk:
                         break
-                    text_buffer += decoder.decode(chunk, final=False)
-                    # Normalize CRLF/CR per the SSE spec before framing.
-                    text_buffer = text_buffer.replace("\r\n", "\n").replace("\r", "\n")
+                    piece = decoder.decode(chunk, final=False)
+                    # G04: a CRLF split across chunks must frame as one line
+                    # break, never two. A trailing CR is held back until the
+                    # next chunk proves whether it pairs with LF: a following
+                    # LF completes one break (consumed here); anything else
+                    # means the held CR was already a full break and the new
+                    # piece is left intact for normal normalization.
+                    if pending_cr:
+                        if piece.startswith("\n"):
+                            text_buffer += "\n"
+                            piece = piece[1:]
+                        else:
+                            text_buffer += "\n"
+                        pending_cr = False
+                    if piece.endswith("\r"):
+                        piece = piece[:-1]
+                        pending_cr = True
+                    if piece:
+                        piece = piece.replace("\r\n", "\n").replace("\r", "\n")
+                        text_buffer += piece
                     while "\n\n" in text_buffer:
                         frame, text_buffer = text_buffer.split("\n\n", 1)
                         data_lines = [
@@ -281,6 +308,33 @@ class QcgClient:
                         data = "\n".join(data_lines)
                         if data:
                             yield json.loads(data)
+                # G04: EOF resolves a dangling CR into its line break, then
+                # dispatches frames already terminated by a blank line and
+                # discards only the truly unterminated tail (SSE spec: an
+                # unterminated tail never becomes an event). Flush the UTF-8
+                # decoder so a split multibyte tail cannot poison the next
+                # stream on a reused connection.
+                try:
+                    tail = decoder.decode(b"", final=True)
+                except Exception:
+                    tail = ""
+                if tail:
+                    text_buffer += tail.replace("\r\n", "\n").replace("\r", "\n")
+                if pending_cr:
+                    text_buffer += "\n"
+                    pending_cr = False
+                while "\n\n" in text_buffer:
+                    frame, text_buffer = text_buffer.split("\n\n", 1)
+                    data_lines = [
+                        line[5:].lstrip() if line[5:6] == " " else line[5:]
+                        for line in frame.split("\n")
+                        if line.startswith("data:")
+                    ]
+                    if not data_lines:
+                        continue
+                    data = "\n".join(data_lines)
+                    if data:
+                        yield json.loads(data)
             finally:
                 try:
                     raw.close()

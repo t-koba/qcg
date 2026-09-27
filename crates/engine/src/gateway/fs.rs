@@ -713,7 +713,24 @@ impl FsGateway {
     /// Unix removes handle-relative from the workspace root with
     /// `O_NOFOLLOW` at every component, so a parent swap cannot redirect
     /// the unlink outside the workspace (E13).
+    ///
+    /// G02/G02-03: deletions hold the same per-file exclusion as writes
+    /// and patches, so a patch that observed "present" (or "absent") keeps
+    /// that expectation through commit instead of racing a concurrent
+    /// delete/recreate silently.
     pub async fn remove_file_resolved(&self, target: &Utf8Path) -> Result<(), GatewayError> {
+        let _guard = super::lock_patch_paths(&[target]).await;
+        self.remove_file_resolved_under_guard(target, &_guard).await
+    }
+
+    /// [`Self::remove_file_resolved`] with the per-file exclusion already
+    /// held (G02-04): proof-of-ownership variant for callers that own the
+    /// guard across a read-delete or delete-create sequence.
+    pub async fn remove_file_resolved_under_guard(
+        &self,
+        target: &Utf8Path,
+        _guard: &super::PatchPathsGuard,
+    ) -> Result<(), GatewayError> {
         let workspace = dunce::canonicalize(&self.workspace)?;
         let workspace =
             Utf8PathBuf::from_path_buf(workspace).map_err(|_| GatewayError::PathDenied {
@@ -946,11 +963,35 @@ impl FsGateway {
     /// [`Self::write_file_atomic`] with an explicit owner permission mode
     /// applied to the staged file before the replace (E13). Callers pass an
     /// already-masked mode.
+    ///
+    /// G02: every unconditional writer holds the process-wide per-file
+    /// exclusion for its target, so a concurrent conditional patch either
+    /// lands fully before this write (then the patch base check sees it)
+    /// or waits until after (then this write lands first and the patch
+    /// re-check sees it). Overlap can only serialize, never silently lose
+    /// an intervening update.
     pub async fn write_file_atomic_with_mode(
         &self,
         target: &Utf8Path,
         bytes: &[u8],
         mode: Option<u32>,
+    ) -> Result<(), GatewayError> {
+        let _guard = super::lock_patch_paths(&[target]).await;
+        self.write_file_atomic_with_mode_under_guard(target, bytes, mode, &_guard)
+            .await
+    }
+
+    /// [`Self::write_file_atomic_with_mode`] with the per-file exclusion
+    /// already held (G02): patch and repair bodies that own the guard call
+    /// this instead of re-locking, because `tokio::sync::Mutex` is not
+    /// reentrant and re-acquiring our own shard would self-deadlock
+    /// (G02-04). The `_guard` parameter is proof of ownership only.
+    pub async fn write_file_atomic_with_mode_under_guard(
+        &self,
+        target: &Utf8Path,
+        bytes: &[u8],
+        mode: Option<u32>,
+        _guard: &super::PatchPathsGuard,
     ) -> Result<(), GatewayError> {
         let (workspace, resolved) = self.resolve_atomic_target(target)?;
         // `workspace` travels only into the Unix handle path below; keep
@@ -1073,11 +1114,33 @@ impl FsGateway {
     /// against the staged handle, so large generated content never has to be
     /// buffered in memory and a failed producer leaves the target untouched
     /// (E13 cleanup).
+    ///
+    /// G02: holds the same per-file exclusion as the byte-slice write, so
+    /// streaming writers serialize against conditional patches too.
     pub async fn write_file_atomic_stream<T, F>(
         &self,
         target: &Utf8Path,
         mode: Option<u32>,
         write: F,
+    ) -> Result<T, GatewayError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut std::fs::File) -> std::io::Result<T> + Send + 'static,
+    {
+        let _guard = super::lock_patch_paths(&[target]).await;
+        self.write_file_atomic_stream_under_guard(target, mode, write, &_guard)
+            .await
+    }
+
+    /// [`Self::write_file_atomic_stream`] with the per-file exclusion
+    /// already held (G02/G02-04): proof-of-ownership variant, see
+    /// [`Self::write_file_atomic_with_mode_under_guard`].
+    pub async fn write_file_atomic_stream_under_guard<T, F>(
+        &self,
+        target: &Utf8Path,
+        mode: Option<u32>,
+        write: F,
+        _guard: &super::PatchPathsGuard,
     ) -> Result<T, GatewayError>
     where
         T: Send + 'static,
@@ -1202,6 +1265,10 @@ impl FsGateway {
     /// only surface as an explicit base mismatch, never a silent merge.
     /// Cross-process writers are outside this boundary and still rely on
     /// base mismatch to fail closed.
+    ///
+    /// G06: a content edit preserves the target's existing sanitized mode
+    /// (executability survives a one-line patch); brand-new files keep the
+    /// owner-only default. Setuid/setgid/sticky bits are never preserved.
     pub async fn apply_anchored_patch(
         &self,
         target: &Utf8Path,
@@ -1227,6 +1294,10 @@ impl FsGateway {
                 path: target.to_string(),
             })?
         };
+        // G06: capture the pre-edit mode while holding the exclusion, so a
+        // concurrent chmod racing the commit cannot divert the inherited
+        // mode silently; the commit-time re-check below still gates content.
+        let preserved_mode = Self::existing_sanitized_mode(target);
         let outcome = files::apply_anchored_patch(&current, expected_base, &edits, limits)?;
         // Commit-time re-check. The lock above only excludes writers inside
         // this process, so a second qcg process or a direct workspace edit can
@@ -1237,9 +1308,57 @@ impl FsGateway {
         // re-checks after a failure.
         self.require_unchanged_since(target, Some(&files::base_sha256(&current)))
             .await?;
-        self.write_file_atomic(target, outcome.new_text.as_bytes())
-            .await?;
+        self.write_file_atomic_with_mode_under_guard(
+            target,
+            outcome.new_text.as_bytes(),
+            preserved_mode,
+            &_guard,
+        )
+        .await?;
         Ok(outcome)
+    }
+
+    /// Sanitized mode of the existing target, if it is a regular file
+    /// (G06): content edits inherit executability (0755 stays executable)
+    /// while setuid/setgid/sticky/world-writable bits are stripped by
+    /// [`files::sanitize_mode_bits`]. Returns `None` for absent targets
+    /// (callers fall back to the owner-only default) and for non-Unix
+    /// platforms (no POSIX bits to inherit). Symlinks are never followed:
+    /// a symlinked leaf is refused elsewhere, and here it reads as "no
+    /// inheritable mode" instead of the link target's mode.
+    fn existing_sanitized_mode(target: &Utf8Path) -> Option<u32> {
+        #[cfg(unix)]
+        {
+            match std::fs::symlink_metadata(target.as_std_path()) {
+                Ok(meta) if meta.file_type().is_file() => {
+                    Some(files::sanitized_metadata_mode(&meta))
+                }
+                _ => None,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = target;
+            None
+        }
+    }
+
+    /// Content-edit write with the per-file exclusion already held that
+    /// preserves the target's existing sanitized mode (G06). Repair and
+    /// other edit-not-replace paths call this instead of the unconditional
+    /// `write_file_atomic_*`: a 0755 script stays executable after its
+    /// content is repaired, while brand-new files keep the owner-only
+    /// default. Refused edits never reach this call, so content and mode
+    /// stay jointly untouched on rejection (G06-03).
+    pub async fn write_file_atomic_preserving_mode_under_guard(
+        &self,
+        target: &Utf8Path,
+        bytes: &[u8],
+        _guard: &super::PatchPathsGuard,
+    ) -> Result<(), GatewayError> {
+        let preserved = Self::existing_sanitized_mode(target);
+        self.write_file_atomic_with_mode_under_guard(target, bytes, preserved, _guard)
+            .await
     }
 
     /// Current content digest of a patch target, or `None` when it does not
@@ -2028,5 +2147,618 @@ mod unix_staging_tests {
             .require_unchanged_since(&target, None)
             .await
             .expect("an absent target observed as absent must pass");
+    }
+
+    #[tokio::test]
+    async fn g02_repair_style_verify_then_preserving_write_serializes() {
+        // G02-02: the llm.repair commit shape (verify the shown base under
+        // the guard, then a mode-preserving write through `_under_guard`)
+        // races an ordinary writer on the same target: the repair either
+        // serializes first (write lands after) or observes the write and
+        // refuses explicitly. Both sides never report success while losing
+        // the intervening update.
+        use super::*;
+        use contract::Permissions;
+        for _ in 0..20 {
+            let base = Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
+                "gateway-g02-repair-{}",
+                uuid::Uuid::now_v7().as_simple()
+            )))
+            .expect("temporary directory path must be utf-8");
+            let _temp_guard = TempGuard(base.clone());
+            let workspace = base.join("workspace");
+            std::fs::create_dir_all(&workspace).expect("workspace should be created");
+            let mut permissions = Permissions::default();
+            permissions.fs_write.push("workspace".into());
+            permissions.fs_read.push("workspace".into());
+            let gateway = FsGateway::new(workspace.clone(), &permissions);
+            std::fs::write(workspace.join("notes.txt"), "shown\n").expect("seed");
+            let target = gateway.resolve_write("notes.txt").expect("target");
+            let shown_base = files::base_sha256("shown\n");
+            let gateway_repair = gateway.clone();
+            let target_repair = target.clone();
+            let repair_task = tokio::spawn(async move {
+                // Repair shape: lock, re-read, verify shown base, commit
+                // preserving the mode without re-locking.
+                let guard = super::super::lock_patch_paths(&[target_repair.as_path()]).await;
+                let current = {
+                    use std::io::Read as _;
+                    let file = gateway_repair.open_read_resolved(&target_repair)?;
+                    let mut bytes = Vec::new();
+                    file.take(65536).read_to_end(&mut bytes)?;
+                    String::from_utf8(bytes).map_err(|_| GatewayError::PatchNotUtf8 {
+                        path: target_repair.to_string(),
+                    })?
+                };
+                if files::base_sha256(&current) != shown_base {
+                    return Err(GatewayError::AnchoredPatch(
+                        files::AnchoredPatchError::BaseMismatch {
+                            expected: shown_base,
+                            actual: files::base_sha256(&current),
+                        },
+                    ));
+                }
+                gateway_repair
+                    .write_file_atomic_preserving_mode_under_guard(
+                        &target_repair,
+                        b"repaired\n",
+                        &guard,
+                    )
+                    .await
+            });
+            let gateway_write = gateway.clone();
+            let target_write = target.clone();
+            let write_task = tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                gateway_write
+                    .write_file_atomic(&target_write, b"ordinary\n")
+                    .await
+            });
+            let (repair_outcome, write_outcome) = tokio::join!(repair_task, write_task);
+            let repair_outcome = repair_outcome.expect("repair task should not panic");
+            write_outcome
+                .expect("write task should not panic")
+                .expect("the ordinary write must succeed");
+            let final_text = std::fs::read_to_string(&target).expect("file should be readable");
+            match repair_outcome {
+                Ok(()) => {
+                    // Repair serialized first; the ordinary write landed after.
+                    assert_eq!(final_text, "ordinary\n", "serialized write must win last");
+                }
+                Err(error) => {
+                    assert!(
+                        matches!(
+                            error,
+                            GatewayError::AnchoredPatch(
+                                files::AnchoredPatchError::BaseMismatch { .. }
+                            )
+                        ),
+                        "a repair racing a committed write must refuse, got: {error:?}"
+                    );
+                    assert_eq!(final_text, "ordinary\n", "the committed write must survive");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn g02_patch_vs_ordinary_write_serializes_without_loss() {
+        // G02-01: the ordinary writer now holds the same per-file exclusion
+        // as the patch, so a write racing a patch serializes instead of
+        // being silently lost with both sides reporting success. Twenty
+        // iterations race a pinned patch against an unconditional write on
+        // one file: every round ends with exactly one complete winner and
+        // the loser (when it is the patch) reports an explicit base
+        // mismatch.
+        use super::*;
+        use contract::Permissions;
+        for _ in 0..20 {
+            let base = Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
+                "gateway-g02-race-{}",
+                uuid::Uuid::now_v7().as_simple()
+            )))
+            .expect("temporary directory path must be utf-8");
+            let _temp_guard = TempGuard(base.clone());
+            let workspace = base.join("workspace");
+            std::fs::create_dir_all(&workspace).expect("workspace should be created");
+            let mut permissions = Permissions::default();
+            permissions.fs_write.push("workspace".into());
+            permissions.fs_read.push("workspace".into());
+            let gateway = FsGateway::new(workspace.clone(), &permissions);
+            std::fs::write(workspace.join("notes.txt"), "alpha\nbeta\n")
+                .expect("seed should be written");
+            let target = gateway
+                .resolve_write("notes.txt")
+                .expect("target should resolve");
+            let base_hash = files::base_sha256("alpha\nbeta\n");
+            let annotated = files::annotate("alpha\nbeta\n");
+            let limits = files::PatchLimits {
+                max_edits: 8,
+                max_patch_bytes: 4096,
+                max_result_bytes: 65536,
+            };
+            let patch_edits = vec![files::PatchEdit {
+                op: files::PatchOp::Replace,
+                anchor_line: annotated[0].line_no,
+                anchor_hash: annotated[0].hash.clone(),
+                lines: vec!["patched".to_string()],
+            }];
+            let gateway_patch = gateway.clone();
+            let target_patch = target.clone();
+            let base_hash_patch = base_hash.clone();
+            let patch_task = tokio::spawn(async move {
+                gateway_patch
+                    .apply_anchored_patch(
+                        &target_patch,
+                        Some(&base_hash_patch),
+                        patch_edits,
+                        limits,
+                    )
+                    .await
+            });
+            let gateway_write = gateway.clone();
+            let target_write = target.clone();
+            let write_task = tokio::spawn(async move {
+                // Small yield so the patch usually wins the read first and
+                // the write lands inside its read-verify-commit window: the
+                // exclusion must serialize it after the commit.
+                tokio::task::yield_now().await;
+                gateway_write
+                    .write_file_atomic(&target_write, b"ordinary-winner\nbeta\n")
+                    .await
+            });
+            let (patch_outcome, write_outcome) = tokio::join!(patch_task, write_task);
+            let patch_outcome = patch_outcome.expect("patch task should not panic");
+            write_outcome
+                .expect("write task should not panic")
+                .expect("the ordinary write must succeed");
+            let final_text =
+                std::fs::read_to_string(&target).expect("patched file should be readable");
+            match patch_outcome {
+                Ok(_) => {
+                    // Patch won or serialized after the write with a fresh
+                    // base? No: the patch pinned the stale base, so if the
+                    // write committed inside its window the patch must have
+                    // failed. A patch success means it serialized first and
+                    // the write landed after: the file holds the write.
+                    assert_eq!(
+                        final_text, "ordinary-winner\nbeta\n",
+                        "when the patch commits first the serialized write must win last"
+                    );
+                }
+                Err(error) => {
+                    assert!(
+                        matches!(
+                            error,
+                            GatewayError::AnchoredPatch(
+                                files::AnchoredPatchError::BaseMismatch { .. }
+                            )
+                        ),
+                        "a patch racing a committed write must fail on base drift, got: {error:?}"
+                    );
+                    assert_eq!(
+                        final_text, "ordinary-winner\nbeta\n",
+                        "the committed write must survive when the patch loses"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn g02_guarded_writer_does_not_self_deadlock_and_keeps_parallelism() {
+        // G02-04: a holder of the per-file guard commits through the
+        // `_under_guard` variant without re-locking (tokio Mutex is not
+        // reentrant), while unrelated targets still proceed in parallel.
+        use super::*;
+        use contract::Permissions;
+        let base = Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
+            "gateway-g02-guard-{}",
+            uuid::Uuid::now_v7().as_simple()
+        )))
+        .expect("temporary directory path must be utf-8");
+        let _temp_guard = TempGuard(base.clone());
+        let workspace = base.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace should be created");
+        let mut permissions = Permissions::default();
+        permissions.fs_write.push("workspace".into());
+        permissions.fs_read.push("workspace".into());
+        let gateway = FsGateway::new(workspace.clone(), &permissions);
+        std::fs::write(workspace.join("a.txt"), "a\n").expect("seed a");
+        std::fs::write(workspace.join("b.txt"), "b\n").expect("seed b");
+        let target_a = gateway.resolve_write("a.txt").expect("target a");
+        let target_b = gateway.resolve_write("b.txt").expect("target b");
+        // Guarded commit on the same target must not self-deadlock.
+        let guard = super::super::lock_patch_paths(&[target_a.as_path()]).await;
+        gateway
+            .write_file_atomic_with_mode_under_guard(&target_a, b"guarded\n", None, &guard)
+            .await
+            .expect("guarded write must not deadlock");
+        drop(guard);
+        assert_eq!(
+            std::fs::read_to_string(&target_a).expect("a should read"),
+            "guarded\n"
+        );
+        // Distinct targets proceed concurrently through the public locked
+        // path: 8 parallel writes to 8 files all land exactly.
+        let mut handles = Vec::new();
+        for index in 0..8 {
+            let gateway = gateway.clone();
+            let target = gateway
+                .resolve_write(&format!("p-{index}.txt"))
+                .expect("parallel target should resolve");
+            handles.push(tokio::spawn(async move {
+                gateway
+                    .write_file_atomic(&target, format!("payload-{index}\n").as_bytes())
+                    .await
+                    .expect("parallel write should succeed");
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("parallel writer should not panic");
+        }
+        // Existing patch-vs-patch serialization still holds (regression).
+        let target = gateway.resolve_write("b.txt").expect("target b");
+        let _ = target_b;
+        let base_hash = files::base_sha256("b\n");
+        let annotated = files::annotate("b\n");
+        let limits = files::PatchLimits {
+            max_edits: 8,
+            max_patch_bytes: 4096,
+            max_result_bytes: 65536,
+        };
+        let edit_for = |line: &str| {
+            vec![files::PatchEdit {
+                op: files::PatchOp::Replace,
+                anchor_line: annotated[0].line_no,
+                anchor_hash: annotated[0].hash.clone(),
+                lines: vec![line.to_string()],
+            }]
+        };
+        let (first, second) = tokio::join!(
+            gateway.apply_anchored_patch(&target, Some(&base_hash), edit_for("w1"), limits),
+            gateway.apply_anchored_patch(&target, Some(&base_hash), edit_for("w2"), limits),
+        );
+        assert!(
+            first.is_ok() ^ second.is_ok(),
+            "exactly one racy patch must win: {first:?} / {second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn g02_delete_recreate_keeps_presence_expectation() {
+        // G02-03: deletions participate in the same exclusion, so a patch
+        // that observed "present" cannot silently commit over a concurrent
+        // delete (it fails on the absent re-check), and a patch that
+        // observed "absent" still matches after the window.
+        use super::*;
+        use contract::Permissions;
+        let base = Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
+            "gateway-g02-delete-{}",
+            uuid::Uuid::now_v7().as_simple()
+        )))
+        .expect("temporary directory path must be utf-8");
+        let _temp_guard = TempGuard(base.clone());
+        let workspace = base.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace should be created");
+        let mut permissions = Permissions::default();
+        permissions.fs_write.push("workspace".into());
+        permissions.fs_read.push("workspace".into());
+        let gateway = FsGateway::new(workspace.clone(), &permissions);
+        std::fs::write(workspace.join("notes.txt"), "alpha\n").expect("seed");
+        let target = gateway.resolve_write("notes.txt").expect("target");
+        // Observe present, delete underneath, then require-present must fail.
+        let observed = gateway
+            .observe_patch_state(&target)
+            .await
+            .expect("observe should succeed");
+        assert!(observed.is_some());
+        gateway
+            .remove_file_resolved(&target)
+            .await
+            .expect("delete should succeed");
+        let error = gateway
+            .require_unchanged_since(&target, observed.as_deref())
+            .await
+            .expect_err("a deleted target must fail the present re-check");
+        assert!(
+            matches!(
+                error,
+                GatewayError::AnchoredPatch(files::AnchoredPatchError::BaseMismatch { .. })
+            ),
+            "delete must surface as base drift, got: {error:?}"
+        );
+        // Absent-observed still matches absent.
+        gateway
+            .require_unchanged_since(&target, None)
+            .await
+            .expect("absent observed as absent must pass");
+        // Absent-observed plus a concurrent create must fail: the file the
+        // patch assumed missing is now present.
+        gateway
+            .write_file_atomic(&target, b"created\n")
+            .await
+            .expect("concurrent create should succeed");
+        let error = gateway
+            .require_unchanged_since(&target, None)
+            .await
+            .expect_err("a created target must fail the absent re-check");
+        assert!(
+            matches!(
+                error,
+                GatewayError::AnchoredPatch(files::AnchoredPatchError::BaseMismatch { .. })
+            ),
+            "create must surface as base drift, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn g06_patch_preserves_executable_bit_and_runs() {
+        // G06-01: a one-line patch of a 0755 script keeps executability and
+        // the repaired script still executes directly.
+        use super::*;
+        use contract::Permissions;
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
+            "gateway-g06-exec-{}",
+            uuid::Uuid::now_v7().as_simple()
+        )))
+        .expect("temporary directory path must be utf-8");
+        let _temp_guard = TempGuard(base.clone());
+        let workspace = base.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace should be created");
+        let mut permissions = Permissions::default();
+        permissions.fs_write.push("workspace".into());
+        permissions.fs_read.push("workspace".into());
+        let gateway = FsGateway::new(workspace.clone(), &permissions);
+        let script = "#!/bin/sh\necho before\n";
+        std::fs::write(workspace.join("run.sh"), script).expect("script should be written");
+        std::fs::set_permissions(
+            workspace.join("run.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("script should be executable");
+        let target = gateway.resolve_write("run.sh").expect("target");
+        let annotated = files::annotate(script);
+        let base_hash = files::base_sha256(script);
+        let limits = files::PatchLimits {
+            max_edits: 8,
+            max_patch_bytes: 4096,
+            max_result_bytes: 65536,
+        };
+        gateway
+            .apply_anchored_patch(
+                &target,
+                Some(&base_hash),
+                vec![files::PatchEdit {
+                    op: files::PatchOp::Replace,
+                    anchor_line: annotated[1].line_no,
+                    anchor_hash: annotated[1].hash.clone(),
+                    lines: vec!["echo after".to_string()],
+                }],
+                limits,
+            )
+            .await
+            .expect("patch should succeed");
+        let mode = std::fs::metadata(&target)
+            .expect("script should stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755, "a patch must preserve 0755, got {mode:o}");
+        let output = std::process::Command::new(&target)
+            .output()
+            .expect("patched script should execute directly");
+        assert!(
+            output.status.success(),
+            "patched script must run: {output:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("after"),
+            "patched content must run: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        // Guarded preserving write (the repair commit shape) also keeps it.
+        let guard = super::super::lock_patch_paths(&[target.as_path()]).await;
+        gateway
+            .write_file_atomic_preserving_mode_under_guard(&target, b"#!/bin/sh\necho v2\n", &guard)
+            .await
+            .expect("preserving write should succeed");
+        drop(guard);
+        let mode = std::fs::metadata(&target)
+            .expect("script should stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o755,
+            "a repair-style write must preserve 0755, got {mode:o}"
+        );
+    }
+
+    #[tokio::test]
+    async fn g06_data_mode_and_special_bits_are_sanitized() {
+        // G06-02: ordinary 0644 data keeps its mode; setuid/setgid/sticky
+        // bits from a pre-existing file are never inherited; new files
+        // stay owner-only.
+        use super::*;
+        use contract::Permissions;
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
+            "gateway-g06-mode-{}",
+            uuid::Uuid::now_v7().as_simple()
+        )))
+        .expect("temporary directory path must be utf-8");
+        let _temp_guard = TempGuard(base.clone());
+        let workspace = base.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace should be created");
+        let mut permissions = Permissions::default();
+        permissions.fs_write.push("workspace".into());
+        permissions.fs_read.push("workspace".into());
+        let gateway = FsGateway::new(workspace.clone(), &permissions);
+        std::fs::write(workspace.join("data.txt"), "a\n").expect("data seed");
+        std::fs::set_permissions(
+            workspace.join("data.txt"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .expect("data mode should set");
+        let target = gateway.resolve_write("data.txt").expect("target");
+        let base_hash = files::base_sha256("a\n");
+        let annotated = files::annotate("a\n");
+        gateway
+            .apply_anchored_patch(
+                &target,
+                Some(&base_hash),
+                vec![files::PatchEdit {
+                    op: files::PatchOp::Replace,
+                    anchor_line: annotated[0].line_no,
+                    anchor_hash: annotated[0].hash.clone(),
+                    lines: vec!["b".to_string()],
+                }],
+                files::PatchLimits {
+                    max_edits: 8,
+                    max_patch_bytes: 4096,
+                    max_result_bytes: 65536,
+                },
+            )
+            .await
+            .expect("data patch should succeed");
+        let mode = std::fs::metadata(&target)
+            .expect("data should stat")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            mode & 0o777,
+            0o644,
+            "0644 data must keep its mode, got {mode:o}"
+        );
+        // Special bits are stripped on inherit, never preserved.
+        std::fs::write(workspace.join("suid.sh"), "#!/bin/sh\necho x\n").expect("suid seed");
+        std::fs::set_permissions(
+            workspace.join("suid.sh"),
+            std::fs::Permissions::from_mode(0o4755),
+        )
+        .expect("setuid mode should set");
+        let suid = gateway.resolve_write("suid.sh").expect("suid target");
+        let text = std::fs::read_to_string(&suid).expect("suid should read");
+        let annotated = files::annotate(&text);
+        let base_hash = files::base_sha256(&text);
+        gateway
+            .apply_anchored_patch(
+                &suid,
+                Some(&base_hash),
+                vec![files::PatchEdit {
+                    op: files::PatchOp::Replace,
+                    anchor_line: annotated[1].line_no,
+                    anchor_hash: annotated[1].hash.clone(),
+                    lines: vec!["echo y".to_string()],
+                }],
+                files::PatchLimits {
+                    max_edits: 8,
+                    max_patch_bytes: 4096,
+                    max_result_bytes: 65536,
+                },
+            )
+            .await
+            .expect("suid patch should succeed");
+        let mode = std::fs::metadata(&suid)
+            .expect("suid should stat")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            mode & 0o7000,
+            0,
+            "special bits must never survive, got {mode:o}"
+        );
+        assert_eq!(
+            mode & 0o777,
+            0o755,
+            "permission bits inherit sanitized, got {mode:o}"
+        );
+        // Brand-new files stay owner-only.
+        let fresh = gateway.resolve_write("fresh.txt").expect("fresh target");
+        gateway
+            .write_file_atomic(&fresh, b"new\n")
+            .await
+            .expect("fresh write should succeed");
+        let mode = std::fs::metadata(&fresh)
+            .expect("fresh should stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "new files must stay owner-only, got {mode:o}");
+    }
+
+    #[tokio::test]
+    async fn g06_rejected_patch_leaves_content_and_mode_untouched() {
+        // G06-03: a base-mismatched or anchor-rejected patch changes
+        // neither bytes nor mode.
+        use super::*;
+        use contract::Permissions;
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
+            "gateway-g06-reject-{}",
+            uuid::Uuid::now_v7().as_simple()
+        )))
+        .expect("temporary directory path must be utf-8");
+        let _temp_guard = TempGuard(base.clone());
+        let workspace = base.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace should be created");
+        let mut permissions = Permissions::default();
+        permissions.fs_write.push("workspace".into());
+        permissions.fs_read.push("workspace".into());
+        let gateway = FsGateway::new(workspace.clone(), &permissions);
+        std::fs::write(workspace.join("run.sh"), "#!/bin/sh\necho a\n").expect("seed");
+        std::fs::set_permissions(
+            workspace.join("run.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("mode should set");
+        let target = gateway.resolve_write("run.sh").expect("target");
+        let before_bytes = std::fs::read(&target).expect("bytes should read");
+        let before_mode = std::fs::metadata(&target)
+            .expect("stat should succeed")
+            .permissions()
+            .mode()
+            & 0o7777;
+        // Wrong base: refused before any write.
+        let annotated = files::annotate("#!/bin/sh\necho a\n");
+        let error = gateway
+            .apply_anchored_patch(
+                &target,
+                Some(&files::base_sha256("stale\n")),
+                vec![files::PatchEdit {
+                    op: files::PatchOp::Replace,
+                    anchor_line: annotated[0].line_no,
+                    anchor_hash: annotated[0].hash.clone(),
+                    lines: vec!["x".to_string()],
+                }],
+                files::PatchLimits {
+                    max_edits: 8,
+                    max_patch_bytes: 4096,
+                    max_result_bytes: 65536,
+                },
+            )
+            .await
+            .expect_err("a stale base must be refused");
+        assert!(
+            matches!(
+                error,
+                GatewayError::AnchoredPatch(files::AnchoredPatchError::BaseMismatch { .. })
+            ),
+            "must report base drift, got: {error:?}"
+        );
+        assert_eq!(std::fs::read(&target).expect("bytes"), before_bytes);
+        assert_eq!(
+            std::fs::metadata(&target)
+                .expect("stat")
+                .permissions()
+                .mode()
+                & 0o7777,
+            before_mode,
+            "a refused patch must not touch the mode"
+        );
     }
 }

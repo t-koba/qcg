@@ -1327,3 +1327,147 @@ async fn adopt_then_cancel_reaches_the_run_and_sse_continues_to_terminal() {
         RunStatus::Canceled
     );
 }
+
+#[tokio::test]
+async fn g01_forced_cancel_settles_without_self_conflict() {
+    // G01-01: a mock executor that ignores cancellation is force-aborted
+    // after the deadline; with no peer owner the cancel must settle
+    // `run_canceled` exactly once instead of misreporting our own held
+    // execution lease as a peer conflict (409). Before the fix the abort
+    // path re-acquired the lease through a second open, and `flock`
+    // reported our own first fd as `WouldBlock`.
+    let root = temp_run_dir("g01-forced-cancel");
+    let _guard = TempGuard(root.clone());
+    let generators =
+        Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+    let runs = root.join("runs");
+    let service = test_service(vec![generators], runs.clone());
+    let contract = service
+        .load_generator("ask-user")
+        .expect("fixture generator should load");
+    let run_id = "g01-stuck-run";
+    let run_dir = runs.join(run_id);
+    prepare_api_run_directory(&run_dir).expect("run directory should prepare");
+    let (events, _) = broadcast::channel(512);
+    // An executor that never observes cancellation (wedged loop).
+    let stuck = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    });
+    let record = RunRecord {
+        contract: contract.clone(),
+        contract_sha256: contract.sha256.clone(),
+        inputs: BTreeMap::new(),
+        answers: BTreeMap::new(),
+        confirmations: BTreeMap::new(),
+        priority: 0,
+        parent_run_id: None,
+        preempted: false,
+        state: RunStatus::Running,
+        run_dir: run_dir.clone(),
+        artifacts: None,
+        question: None,
+        confirm: None,
+        events,
+        cancellation: CancellationToken::new(),
+        task: Arc::new(Mutex::new(Some(stuck))),
+        queued_at: None,
+        owner_id: String::new(),
+        ephemeral: false,
+    };
+    write_run_event(
+        &record,
+        "run_queued",
+        json!({
+            "run_id": run_id,
+            "generator": "ask-user@0.1.0",
+            "generator_path": contract.root,
+            "contract_sha256": contract.sha256,
+            "inputs": {},
+            "schema_version": api::JOURNAL_SCHEMA_VERSION,
+        }),
+    )
+    .expect("queued event should append");
+    service
+        .inner
+        .runs
+        .write()
+        .await
+        .insert(run_id.to_string(), record);
+    // The stuck task forces the 5 s abort path; the fix settles under the
+    // already-held lease instead of conflicting with itself.
+    service
+        .cancel(run_id.to_string())
+        .await
+        .expect("forced cancel with no peer must settle, not conflict");
+    let journal = read_journal_string(&service, run_id.to_string()).await;
+    assert_eq!(
+        journal.matches("\"t\":\"run_canceled\"").count(),
+        1,
+        "forced cancel must journal exactly one run_canceled: {journal}"
+    );
+    assert_eq!(
+        service
+            .snapshot(run_id.to_string())
+            .await
+            .expect("snapshot should exist")
+            .state,
+        RunStatus::Canceled,
+        "forced cancel must settle as Canceled"
+    );
+}
+
+#[tokio::test]
+async fn g01_peer_execution_lease_blocks_false_settlement() {
+    // G01-02: when a real peer holds the execution lease, a task-less
+    // cancel must report the peer conflict (cancel signaled, settlement
+    // elsewhere) instead of faking a local stop. The durable mailbox
+    // already carries the request to the owner.
+    let root = temp_run_dir("g01-peer-lease");
+    let _guard = TempGuard(root.clone());
+    let generators =
+        Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+    let runs = root.join("runs");
+    let service = test_service(vec![generators.clone()], runs.clone());
+    let id = service
+        .start_run(StartRun {
+            generator_id: "ask-user".into(),
+            inputs: BTreeMap::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("run should start");
+    wait_for_snapshot(&service, &id, RunStatus::Waiting).await;
+    // Simulate a restart: the rebooted service tracks the run with no live
+    // task, while a peer process holds execution.
+    drop(service);
+    wait_for_runs_store_release(&runs).await;
+    let peer = test_service(vec![generators], runs.clone());
+    // No resume: the rehydrated record carries no live task, and no engine
+    // holds the lease yet, so the externally held peer lease below is the
+    // sole owner. (Resuming would spawn an engine that takes the lease
+    // itself and the test could no longer stage a foreign owner.)
+    let run_dir = peer.run_dir_for(&id).await.expect("run dir should exist");
+    let _peer_lease = crate::run_dirs::try_lock_run_execution(&run_dir)
+        .expect("peer lease should lock")
+        .expect("peer must own execution for this test");
+    let error = peer
+        .cancel(id.clone())
+        .await
+        .expect_err("a peer-owned execution must not settle locally");
+    assert!(
+        matches!(error, ApiError::Conflict { .. }),
+        "peer ownership must surface as Conflict, got: {error}"
+    );
+    assert!(
+        error.to_string().contains("executing elsewhere"),
+        "the conflict must name the peer owner: {error}"
+    );
+    // No terminal outcome was faked locally: the journal holds no
+    // run_canceled/run_interrupted from this caller.
+    let journal = read_journal_string(&peer, id).await;
+    assert!(
+        !journal.contains("\"t\":\"run_canceled\"")
+            && !journal.contains("\"t\":\"run_interrupted\""),
+        "a peer-owned cancel must not journal a local terminal: {journal}"
+    );
+}

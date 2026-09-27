@@ -1,13 +1,21 @@
-//! Process-wide exclusion for read-modify-write file patch paths.
+//! Process-wide exclusion for every workspace file mutation (G02).
 //!
 //! Parallel `foreach` iterations, parallel-wave siblings, and concurrent
-//! runs in this process serialize on the same file, so a base check and
-//! its write stay atomic with respect to each other: the loser observes a
-//! changed base and fails explicitly instead of silently overwriting.
+//! runs in this process serialize on the same file, so a patch base check
+//! and its commit stay atomic with respect to each other AND with respect
+//! to unconditional writers: the loser observes a changed base and fails
+//! explicitly instead of silently overwriting.
 //! Sharded static mutexes keep the table bounded (no per-path growth in a
 //! long-lived server); unrelated files may share a shard and wait briefly.
 //! Cross-process writers are outside this boundary: concurrent processes
 //! still rely on base mismatch to fail closed.
+//!
+//! Every mutating gateway path participates: `apply_anchored_patch`,
+//! `write_file_atomic_with_mode` (+ stream), and `remove_file_resolved`
+//! all hold this lock for their target. Patch bodies that already hold the
+//! guard must use the `_under_guard` write variants, which skip
+//! re-acquisition: `tokio::sync::Mutex` is not reentrant, so re-locking
+//! the same shard from the holder would self-deadlock (G02-04).
 
 use std::collections::BTreeSet;
 use std::sync::LazyLock;

@@ -47,8 +47,14 @@ jobs:
       - name: Check capability matrix
         run: bash scripts/check-capability-matrix.sh
 
+      - name: Check capability gate self-test
+        run: bash scripts/test-capability-matrix-gate.sh
+
       - name: Check SDKs
         run: bash scripts/check-sdk.sh
+
+      - name: Check SDK behavior (SSE/redirect over live servers and mocks)
+        run: bash scripts/check-sdk-behavior.sh
 
       - name: Check third-party notices
         run: bash scripts/check-third-party-notices.sh

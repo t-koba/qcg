@@ -83,17 +83,53 @@ export class QcgClient {
     return { ...extra, "idempotency-key": idempotencyKey };
   }
 
-  private async checkedFetch(url: string, init: RequestInit): Promise<Response> {
-    // F04: never forward the bearer cross-origin or over a downgrade.
-    // The token lives only in memory; redirects are followed without it.
+  private static readonly MAX_REDIRECTS = 5;
+
+  private async checkedFetch(
+    url: string,
+    init: RequestInit,
+    hops = 0,
+    visited: string[] = [],
+  ): Promise<Response> {
+    // G05: manual redirects are followed finitely (max 5 hops) with cycle
+    // detection and a clear error. Unbounded recursion previously followed
+    // self-loops forever; the hop count and the visited list bound it.
+    // The bearer token lives only in memory and is stripped cross-origin
+    // or over a TLS downgrade (F04, preserved).
     const response = await this.fetchImpl(url, { ...init, redirect: "manual" });
     const location = response.headers.get("location");
     if (
       location !== null &&
       [301, 302, 303, 307, 308].includes(response.status)
     ) {
-      const next = new URL(location, url);
-      const current = new URL(url, this.baseUrl || undefined);
+      // The request URL may be relative (default same-origin "/api/..."),
+      // which URL() cannot parse as a base: resolve it first so relative
+      // Locations and origin comparisons work in every runtime (G05-02).
+      let current: URL;
+      let next: URL;
+      try {
+        current = new URL(url, this.absoluteBaseFor(url));
+        next = new URL(location, current);
+      } catch {
+        await this.discardBody(response);
+        throw new QcgError(
+          response.status,
+          {},
+          "redirect location is not a valid URL: " + location,
+        );
+      }
+      if (hops >= QcgClient.MAX_REDIRECTS) {
+        await this.discardBody(response);
+        throw new QcgError(
+          response.status,
+          {},
+          "redirect limit exceeded after " + QcgClient.MAX_REDIRECTS + " hops",
+        );
+      }
+      if (visited.includes(next.href)) {
+        await this.discardBody(response);
+        throw new QcgError(response.status, {}, "redirect cycle detected: " + next.href);
+      }
       const crossOrigin = next.origin !== current.origin;
       const downgrade = current.protocol === "https:" && next.protocol !== "https:";
       const initHeaders = new Headers(init.headers);
@@ -112,9 +148,49 @@ export class QcgClient {
         initHeaders.delete("content-type");
         initHeaders.delete("content-length");
       }
-      return this.checkedFetch(next.href, nextInit);
+      // G05-04: release the intermediate response before following, so an
+      // abandoned redirect chain cannot accumulate unread connections.
+      await this.discardBody(response);
+      return this.checkedFetch(next.href, nextInit, hops + 1, [...visited, current.href]);
     }
     return response;
+  }
+
+  private absoluteBaseFor(url: string): string | undefined {
+    // Absolute request URLs need no base. Otherwise prefer the configured
+    // baseUrl when it is absolute; in browsers fall back to the document
+    // base so same-origin "/api/..." resolves; in Node without a base,
+    // use a dummy origin purely for resolution (the fetch itself already
+    // received the original url).
+    try {
+      new URL(url);
+      return undefined;
+    } catch {
+      // Relative: fall through to the base candidates below.
+    }
+    if (this.baseUrl) {
+      try {
+        new URL(this.baseUrl);
+        return this.baseUrl;
+      } catch {
+        // Non-absolute baseUrl: try the runtime location next.
+      }
+    }
+    try {
+      const href = (globalThis as { location?: { href?: unknown } }).location?.href;
+      if (typeof href === "string" && href) return href;
+    } catch {
+      // No location: use the dummy origin below.
+    }
+    return "http://localhost";
+  }
+
+  private async discardBody(response: Response): Promise<void> {
+    try {
+      if (response.body) await response.body.cancel();
+    } catch {
+      // Best-effort: the connection may already be closed.
+    }
   }
 
   private async readProblem(response: Response): Promise<unknown> {
@@ -238,19 +314,54 @@ export class QcgClient {
     try {
       const decoder = new TextDecoder();
       let buffer = "";
+      let pendingCr = false;
       while (true) {
         const { done, value } = await reader.read();
         if (done) {
-          buffer += decoder.decode();
-          if (buffer.trim().length > 0) {
-            const payload = parseSseFrame(buffer);
+          // G04: EOF resolves a dangling CR, then dispatches frames already
+          // terminated by a blank line and discards only the truly
+          // unterminated tail (SSE spec). The decoder flush only completes
+          // a split multibyte character, which can never create the ASCII
+          // blank line that frames an event.
+          try {
+            decoder.decode();
+          } catch {
+            // Best-effort flush: a malformed tail is still discarded.
+          }
+          if (pendingCr) {
+            buffer += "\n";
+            pendingCr = false;
+          }
+          let tail = buffer.indexOf("\n\n");
+          while (tail >= 0) {
+            const frame = buffer.slice(0, tail);
+            buffer = buffer.slice(tail + 2);
+            const payload = parseSseFrame(frame);
             if (payload !== undefined) yield payload;
+            tail = buffer.indexOf("\n\n");
           }
           return;
         }
-        buffer += decoder.decode(value, { stream: true });
-        // Normalize CRLF/CR per the SSE spec before framing.
-        buffer = buffer.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+        let piece = decoder.decode(value, { stream: true });
+        // G04: a CRLF split across chunks frames as one break, never two.
+        // A trailing CR is held until the next chunk proves LF pairing.
+        if (pendingCr) {
+          if (piece.startsWith("\n")) {
+            buffer += "\n";
+            piece = piece.slice(1);
+          } else {
+            buffer += "\n";
+          }
+          pendingCr = false;
+        }
+        if (piece.endsWith("\r")) {
+          piece = piece.slice(0, -1);
+          pendingCr = true;
+        }
+        if (piece) {
+          piece = piece.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+          buffer += piece;
+        }
         let boundary = buffer.indexOf("\n\n");
         while (boundary >= 0) {
           const frame = buffer.slice(0, boundary);

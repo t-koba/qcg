@@ -1161,3 +1161,285 @@ enabled = false"#,
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[tokio::test]
+async fn g03_gc_then_restart_recovers_under_small_budget() {
+    // G03-01 (faithful): real admissions through the service, real GC of
+    // the completed runs, then a real reboot under an injected tiny scan
+    // budget with pre-fix legacy lock accumulation on disk. Recovery must
+    // succeed with only the surviving run tracked.
+    let root = temp_run_dir("g03-gc-restart");
+    let _guard = TempGuard(root.clone());
+    let generators =
+        Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+    let runs = root.join("runs");
+    let policy = ServiceDeploymentPolicy {
+        max_directory_scan_entries: 8,
+        ..ServiceDeploymentPolicy::default()
+    };
+    let service = LocalService::with_generator_roots_policy_and_store_mode(
+        vec![generators.clone()],
+        runs.clone(),
+        None,
+        policy::DEFAULT_MAX_ACTIVE_RUNS,
+        DEFAULT_MAX_TRACKED_RUNS,
+        RunStoreMode::Exclusive,
+        policy,
+    )
+    .expect("service should initialize");
+    for _ in 0..2 {
+        let id = service
+            .start_run(StartRun {
+                generator_id: "hello-template".into(),
+                inputs: BTreeMap::new(),
+                ..Default::default()
+            })
+            .await
+            .expect("quick run should start");
+        wait_for_terminal_snapshot(&service, &id).await;
+    }
+    let waiting = service
+        .start_run(StartRun {
+            generator_id: "ask-user".into(),
+            inputs: BTreeMap::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("waiting run should start");
+    wait_for_snapshot(&service, &waiting, RunStatus::Waiting).await;
+    // Pre-fix accumulation: legacy per-run locks from before the shard fix.
+    for index in 0..9 {
+        std::fs::write(
+            runs.join(format!(".admission-legacy{index:02}.lock")),
+            b"lock",
+        )
+        .expect("legacy lock should be written");
+    }
+    let deleted = crate::summaries::gc_run_directories(&runs, 0, 0, true, 8)
+        .expect("gc must succeed despite the lock pile");
+    assert!(
+        deleted.len() >= 2,
+        "both completed runs must be collected: {deleted:?}"
+    );
+    drop(service);
+    wait_for_runs_store_release(&runs).await;
+    let rebooted = LocalService::with_generator_roots_policy_and_store_mode(
+        vec![generators],
+        runs,
+        None,
+        policy::DEFAULT_MAX_ACTIVE_RUNS,
+        DEFAULT_MAX_TRACKED_RUNS,
+        RunStoreMode::Exclusive,
+        policy,
+    )
+    .expect("reboot must succeed despite legacy locks and shard files");
+    let snapshot = rebooted
+        .snapshot(waiting.clone())
+        .await
+        .expect("surviving run should be tracked after reboot");
+    assert!(
+        !snapshot.state.is_terminal(),
+        "the surviving waiting run must still be live: {:?}",
+        snapshot.state
+    );
+}
+
+#[tokio::test]
+async fn g03_shared_refresh_recovers_despite_legacy_locks() {
+    // G03-02: two SharedFilesystem peers share one store carrying pre-fix
+    // legacy lock accumulation. The second peer initializes and runs its
+    // periodic recovery (`refresh_shared_runs`) under the same tiny scan
+    // budget without losing the healthy run.
+    let root = temp_run_dir("g03-shared-refresh");
+    let _guard = TempGuard(root.clone());
+    let generators =
+        Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+    let runs = root.join("runs");
+    let policy = ServiceDeploymentPolicy {
+        max_directory_scan_entries: 8,
+        ..ServiceDeploymentPolicy::default()
+    };
+    let owner = LocalService::with_generator_roots_policy_and_store_mode(
+        vec![generators.clone()],
+        runs.clone(),
+        None,
+        policy::DEFAULT_MAX_ACTIVE_RUNS,
+        DEFAULT_MAX_TRACKED_RUNS,
+        RunStoreMode::SharedFilesystem,
+        policy,
+    )
+    .expect("shared owner should initialize");
+    let id = owner
+        .start_run(StartRun {
+            generator_id: "ask-user".into(),
+            inputs: BTreeMap::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("run should start");
+    wait_for_snapshot(&owner, &id, RunStatus::Waiting).await;
+    for index in 0..9 {
+        std::fs::write(
+            runs.join(format!(".admission-legacy{index:02}.lock")),
+            b"lock",
+        )
+        .expect("legacy lock should be written");
+    }
+    let peer = LocalService::with_generator_roots_policy_and_store_mode(
+        vec![generators],
+        runs.clone(),
+        None,
+        policy::DEFAULT_MAX_ACTIVE_RUNS,
+        DEFAULT_MAX_TRACKED_RUNS,
+        RunStoreMode::SharedFilesystem,
+        policy,
+    )
+    .expect("shared peer must initialize despite legacy locks");
+    peer.refresh_shared_runs()
+        .await
+        .expect("periodic shared recovery must not stall on admission metadata");
+    let snapshot = peer
+        .snapshot(id.clone())
+        .await
+        .expect("healthy run must stay observable after shared recovery");
+    assert!(
+        matches!(
+            snapshot.state,
+            RunStatus::Waiting | RunStatus::CancelRequested | RunStatus::Queued
+        ),
+        "healthy run must remain tracked, got {:?}",
+        snapshot.state
+    );
+}
+
+#[test]
+fn g03_accumulated_admissions_do_not_exhaust_scan_budget() {
+    // G03-01: lifetime admissions plus GC must not break recovery. Legacy
+    // per-run `.admission-<digest>.lock` files accumulate without bound in
+    // old stores; the scan skips coordination entries without consuming
+    // `max_scan_entries`, so a handful of live runs still rehydrate under
+    // a tiny injected budget. New admissions use fixed shards (no growth).
+    let root = temp_run_dir("g03-scan-budget");
+    let _guard = TempGuard(root.clone());
+    let runs = root.join("runs");
+    std::fs::create_dir_all(&runs).expect("runs dir should be created");
+    // Simulate an old store: 9 legacy admission locks, no live run dirs.
+    for index in 0..9 {
+        std::fs::write(
+            runs.join(format!(".admission-legacy{index:02}.lock")),
+            b"lock",
+        )
+        .expect("legacy lock should be written");
+    }
+    std::fs::write(runs.join(".service.lock"), b"lock").expect("service lock");
+    std::fs::write(runs.join(".maintenance.lock"), b"lock").expect("maintenance lock");
+    // Zero live runs must rehydrate under a budget smaller than the
+    // coordination count (8 would fail if locks were counted).
+    let recovered = crate::summaries::rehydrate_runs(&runs, 16, 8)
+        .expect("coordination-only store must rehydrate");
+    assert!(
+        recovered.is_empty(),
+        "no live runs should be tracked, got: {}",
+        recovered.len()
+    );
+    // One live run plus the same coordination pile still fits the budget.
+    // The live run is built through the real admission writer so its
+    // journal carries a loadable generator path.
+    let live_id = "live-run-1";
+    let live_record = synthetic_hitl_record(&root, live_id);
+    drop(live_record);
+    let recovered = crate::summaries::rehydrate_runs(&runs, 16, 8)
+        .expect("one live run plus coordination must rehydrate");
+    assert_eq!(
+        recovered.len(),
+        1,
+        "the live run must be found: {recovered:?}"
+    );
+    assert!(recovered.contains_key(live_id));
+}
+
+#[test]
+fn g03_store_scans_skip_coordination_in_lists_and_gc() {
+    // G03-02: the SharedFilesystem periodic recovery paths (`list` and
+    // `gc`) share the same coordination skip, so past admission metadata
+    // never stops observation or collection of healthy runs.
+    let root = temp_run_dir("g03-lists-gc");
+    let _guard = TempGuard(root.clone());
+    let runs = root.join("runs");
+    std::fs::create_dir_all(&runs).expect("runs dir should be created");
+    for index in 0..9 {
+        std::fs::write(
+            runs.join(format!(".admission-legacy{index:02}.lock")),
+            b"lock",
+        )
+        .expect("legacy lock should be written");
+    }
+    let summaries = crate::summaries::list_run_summaries(&runs, 8)
+        .expect("coordination-only listing must succeed");
+    assert!(summaries.is_empty());
+    let deleted =
+        crate::summaries::gc_run_directories(&runs, 1, 1, false, 8).expect("gc must succeed");
+    assert!(deleted.is_empty());
+}
+
+#[tokio::test]
+async fn g03_concurrent_same_run_admission_stays_exclusive() {
+    // G03-03: two peers admitting the same run id concurrently must not
+    // split the inode or admit twice. Sharded locks map the same id to
+    // the same shard file, so exactly one holder wins; the loser sees
+    // contention (None) instead of a second inode. Lock files are never
+    // unlinked, so no removal races the holder.
+    let root = temp_run_dir("g03-admission-race");
+    let _guard = TempGuard(root.clone());
+    let runs = root.join("runs");
+    std::fs::create_dir_all(&runs).expect("runs dir should be created");
+    let run_dir = runs.join("race-run");
+    let first = crate::run_dirs::try_lock_run_admission(&run_dir)
+        .expect("first admission lock should not error");
+    assert!(first.is_some(), "the first admission must own the shard");
+    let second = crate::run_dirs::try_lock_run_admission(&run_dir)
+        .expect("second admission lock should not error");
+    assert!(
+        second.is_none(),
+        "a concurrent admission of the same run must observe contention"
+    );
+    drop(first);
+    let third = crate::run_dirs::try_lock_run_admission(&run_dir)
+        .expect("re-admission after release should not error");
+    assert!(
+        third.is_some(),
+        "the shard must be re-acquirable after release"
+    );
+    drop(third);
+    // Fixed shard layout: no per-run files are created regardless of how
+    // many distinct ids are admitted (each lock is released before the
+    // next, so shard sharing never blocks sequential admissions).
+    for index in 0..16 {
+        let dir = runs.join(format!("distinct-run-{index}"));
+        let _held = crate::run_dirs::try_lock_run_admission(&dir)
+            .expect("distinct admission should not error")
+            .expect("distinct admission must lock its shard");
+    }
+    let mut per_run_locks = 0;
+    for entry in std::fs::read_dir(&runs).expect("runs should read") {
+        let entry = entry.expect("entry should read");
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(".admission-") && name.ends_with(".lock") && !entry.path().is_dir() {
+            per_run_locks += 1;
+        }
+    }
+    assert_eq!(
+        per_run_locks, 0,
+        "sharded admissions must create no per-run lock files"
+    );
+    let shards = runs.join(".admission-shards");
+    assert!(shards.is_dir(), "the fixed shard directory must exist");
+    let shard_files = std::fs::read_dir(&shards)
+        .expect("shards should read")
+        .count();
+    assert!(
+        shard_files <= crate::run_dirs::ADMISSION_SHARD_COUNT,
+        "shard files must stay bounded at {}: {shard_files}",
+        crate::run_dirs::ADMISSION_SHARD_COUNT
+    );
+}

@@ -3070,13 +3070,13 @@ impl LocalService {
                     // resume a canceled run. Lease-gated; a peer owner
                     // settles instead when it holds execution.
                     let run_dir = self.run_dir_for(&id).await?;
-                    let _lease = crate::run_dirs::try_lock_run_execution(&run_dir)
+                    let lease = crate::run_dirs::try_lock_run_execution(&run_dir)
                         .map_err(api_internal)?;
-                    if _lease.is_none() {
+                    let Some(lease) = lease else {
                         return Err(ApiError::Conflict {
                             detail: format!("run `{id}` is executing elsewhere; cancel was signaled"),
                         });
-                    }
+                    };
                     let settled_now = {
                         let runs = self.inner.runs.read().await;
                         runs.get(&id).cloned().ok_or_else(|| {
@@ -3086,7 +3086,14 @@ impl LocalService {
                     // The aborted task may have settled through the queued
                     // finalizer first: reuse the terminal-checked settlement
                     // instead of journaling a second terminal outcome.
-                    if !self.settle_canceled_here(&id, &settled_now).await? {
+                    // G01: the lease above is held across settlement, so
+                    // settle under it instead of re-acquiring through a
+                    // second open (which `flock` reports as a peer
+                    // conflict against our own first fd).
+                    if !self
+                        .settle_canceled_under_lease(&id, &settled_now, &run_dir, &lease)
+                        .await?
+                    {
                         return Err(ApiError::Conflict {
                             detail: format!("run `{id}` is executing elsewhere; cancel was signaled"),
                         });
@@ -3106,20 +3113,39 @@ impl LocalService {
     /// Returns Ok(true) once this process owns settlement.
     async fn settle_canceled_here(&self, id: &str, fallback: &RunRecord) -> Result<bool, ApiError> {
         let run_dir = self.run_dir_for(id).await?;
-        let _lease = crate::run_dirs::try_lock_run_execution(&run_dir).map_err(api_internal)?;
-        if _lease.is_none() {
+        let lease = crate::run_dirs::try_lock_run_execution(&run_dir).map_err(api_internal)?;
+        let Some(lease) = lease else {
             return Ok(false);
-        }
+        };
+        self.settle_canceled_under_lease(id, fallback, &run_dir, &lease)
+            .await
+    }
+
+    /// Settlement body with the execution lease already held (G01): the
+    /// forced-cancel abort path owns the lease across the abort and must
+    /// not re-acquire it through a second open (same-process `flock` on a
+    /// fresh fd reports `WouldBlock` against our own first fd and would
+    /// misreport self-contention as a peer conflict). Callers that do not
+    /// hold the lease use [`Self::settle_canceled_here`], which acquires
+    /// it and delegates here so the drain-plus-journal sequence lives in
+    /// exactly one place.
+    async fn settle_canceled_under_lease(
+        &self,
+        id: &str,
+        fallback: &RunRecord,
+        run_dir: &camino::Utf8PathBuf,
+        _lease: &std::fs::File,
+    ) -> Result<bool, ApiError> {
         // No live engine writer, so settling here is safe. Drain the
         // mailbox to a single journal event first, then record cancel.
         // A failed drain aborts settlement instead of dropping the
         // cancel request.
-        self.drain_cancel_controls(id, &run_dir)
+        self.drain_cancel_controls(id, run_dir)
             .await
             .map_err(api_internal)?;
         // A terminal event may already exist (a writer settled between our
         // check and the lease): never journal a second terminal outcome.
-        let terminal = fold_run_state(&run_dir)
+        let terminal = fold_run_state(run_dir)
             .map(|state| state.terminal)
             .map_err(api_internal)?;
         // Shutdown-aware settlement at settle time (E05): a cancel racing

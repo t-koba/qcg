@@ -102,13 +102,25 @@ pub(crate) fn rehydrate_runs(
     }
     let mut scanned = 0_usize;
     for entry in std::fs::read_dir(runs_dir)? {
+        let entry = entry?;
+        // G03: coordination/metadata entries (dotfiles, legacy per-run
+        // admission locks, the sharded admission directory, idempotency
+        // bookkeeping) are skipped WITHOUT consuming the scan budget, so
+        // lifetime admissions can never exhaust recovery. The name probe
+        // uses the directory entry name only, never following links.
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(crate::run_dirs::is_store_coordination_name)
+        {
+            continue;
+        }
         scanned = scanned.saturating_add(1);
         if scanned > max_scan_entries {
             return Err(ServiceError::Invalid(format!(
                 "run store contains more than {max_scan_entries} entries"
             )));
         }
-        let entry = entry?;
         let run_dir = Utf8PathBuf::from_path_buf(entry.path()).map_err(|path| {
             ServiceError::Invalid(format!("run path is not valid UTF-8: {}", path.display()))
         })?;

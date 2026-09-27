@@ -36,13 +36,22 @@ pub fn gc_run_directories(
     let mut candidates = Vec::new();
     let mut scanned = 0_usize;
     for entry in std::fs::read_dir(runs_dir)? {
+        let entry = entry?;
+        // G03: coordination entries never consume the scan budget (see
+        // rehydrate_runs for the rationale).
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(crate::run_dirs::is_store_coordination_name)
+        {
+            continue;
+        }
         scanned = scanned.saturating_add(1);
         if scanned > max_scan_entries {
             return Err(ServiceError::Invalid(format!(
                 "runs directory contains more than {max_scan_entries} entries"
             )));
         }
-        let entry = entry?;
         let path = Utf8PathBuf::from_path_buf(entry.path()).map_err(|path| {
             ServiceError::Invalid(format!("run path is not valid UTF-8: {}", path.display()))
         })?;

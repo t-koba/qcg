@@ -355,17 +355,53 @@ export class QcgClient {
     return { ...extra, "idempotency-key": idempotencyKey };
   }
 
-  private async checkedFetch(url: string, init: RequestInit): Promise<Response> {
-    // F04: never forward the bearer cross-origin or over a downgrade.
-    // The token lives only in memory; redirects are followed without it.
+  private static readonly MAX_REDIRECTS = 5;
+
+  private async checkedFetch(
+    url: string,
+    init: RequestInit,
+    hops = 0,
+    visited: string[] = [],
+  ): Promise<Response> {
+    // G05: manual redirects are followed finitely (max 5 hops) with cycle
+    // detection and a clear error. Unbounded recursion previously followed
+    // self-loops forever; the hop count and the visited list bound it.
+    // The bearer token lives only in memory and is stripped cross-origin
+    // or over a TLS downgrade (F04, preserved).
     const response = await this.fetchImpl(url, { ...init, redirect: "manual" });
     const location = response.headers.get("location");
     if (
       location !== null &&
       [301, 302, 303, 307, 308].includes(response.status)
     ) {
-      const next = new URL(location, url);
-      const current = new URL(url, this.baseUrl || undefined);
+      // The request URL may be relative (default same-origin "/api/..."),
+      // which URL() cannot parse as a base: resolve it first so relative
+      // Locations and origin comparisons work in every runtime (G05-02).
+      let current: URL;
+      let next: URL;
+      try {
+        current = new URL(url, this.absoluteBaseFor(url));
+        next = new URL(location, current);
+      } catch {
+        await this.discardBody(response);
+        throw new QcgError(
+          response.status,
+          {},
+          "redirect location is not a valid URL: " + location,
+        );
+      }
+      if (hops >= QcgClient.MAX_REDIRECTS) {
+        await this.discardBody(response);
+        throw new QcgError(
+          response.status,
+          {},
+          "redirect limit exceeded after " + QcgClient.MAX_REDIRECTS + " hops",
+        );
+      }
+      if (visited.includes(next.href)) {
+        await this.discardBody(response);
+        throw new QcgError(response.status, {}, "redirect cycle detected: " + next.href);
+      }
       const crossOrigin = next.origin !== current.origin;
       const downgrade = current.protocol === "https:" && next.protocol !== "https:";
       const initHeaders = new Headers(init.headers);
@@ -384,9 +420,49 @@ export class QcgClient {
         initHeaders.delete("content-type");
         initHeaders.delete("content-length");
       }
-      return this.checkedFetch(next.href, nextInit);
+      // G05-04: release the intermediate response before following, so an
+      // abandoned redirect chain cannot accumulate unread connections.
+      await this.discardBody(response);
+      return this.checkedFetch(next.href, nextInit, hops + 1, [...visited, current.href]);
     }
     return response;
+  }
+
+  private absoluteBaseFor(url: string): string | undefined {
+    // Absolute request URLs need no base. Otherwise prefer the configured
+    // baseUrl when it is absolute; in browsers fall back to the document
+    // base so same-origin "/api/..." resolves; in Node without a base,
+    // use a dummy origin purely for resolution (the fetch itself already
+    // received the original url).
+    try {
+      new URL(url);
+      return undefined;
+    } catch {
+      // Relative: fall through to the base candidates below.
+    }
+    if (this.baseUrl) {
+      try {
+        new URL(this.baseUrl);
+        return this.baseUrl;
+      } catch {
+        // Non-absolute baseUrl: try the runtime location next.
+      }
+    }
+    try {
+      const href = (globalThis as { location?: { href?: unknown } }).location?.href;
+      if (typeof href === "string" && href) return href;
+    } catch {
+      // No location: use the dummy origin below.
+    }
+    return "http://localhost";
+  }
+
+  private async discardBody(response: Response): Promise<void> {
+    try {
+      if (response.body) await response.body.cancel();
+    } catch {
+      // Best-effort: the connection may already be closed.
+    }
   }
 
   private async readProblem(response: Response): Promise<unknown> {
@@ -510,19 +586,54 @@ export class QcgClient {
     try {
       const decoder = new TextDecoder();
       let buffer = "";
+      let pendingCr = false;
       while (true) {
         const { done, value } = await reader.read();
         if (done) {
-          buffer += decoder.decode();
-          if (buffer.trim().length > 0) {
-            const payload = parseSseFrame(buffer);
+          // G04: EOF resolves a dangling CR, then dispatches frames already
+          // terminated by a blank line and discards only the truly
+          // unterminated tail (SSE spec). The decoder flush only completes
+          // a split multibyte character, which can never create the ASCII
+          // blank line that frames an event.
+          try {
+            decoder.decode();
+          } catch {
+            // Best-effort flush: a malformed tail is still discarded.
+          }
+          if (pendingCr) {
+            buffer += "\\n";
+            pendingCr = false;
+          }
+          let tail = buffer.indexOf("\\n\\n");
+          while (tail >= 0) {
+            const frame = buffer.slice(0, tail);
+            buffer = buffer.slice(tail + 2);
+            const payload = parseSseFrame(frame);
             if (payload !== undefined) yield payload;
+            tail = buffer.indexOf("\\n\\n");
           }
           return;
         }
-        buffer += decoder.decode(value, { stream: true });
-        // Normalize CRLF/CR per the SSE spec before framing.
-        buffer = buffer.replace(/\\r\\n/g, "\\n").replace(/\\r/g, "\\n");
+        let piece = decoder.decode(value, { stream: true });
+        // G04: a CRLF split across chunks frames as one break, never two.
+        // A trailing CR is held until the next chunk proves LF pairing.
+        if (pendingCr) {
+          if (piece.startsWith("\\n")) {
+            buffer += "\\n";
+            piece = piece.slice(1);
+          } else {
+            buffer += "\\n";
+          }
+          pendingCr = false;
+        }
+        if (piece.endsWith("\\r")) {
+          piece = piece.slice(0, -1);
+          pendingCr = true;
+        }
+        if (piece) {
+          piece = piece.replace(/\\r\\n/g, "\\n").replace(/\\r/g, "\\n");
+          buffer += piece;
+        }
         let boundary = buffer.indexOf("\\n\\n");
         while (boundary >= 0) {
           const frame = buffer.slice(0, boundary);
@@ -828,14 +939,41 @@ class QcgClient:
         with contextlib.closing(raw):
             decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
             text_buffer = ""
+            pending_cr = False
             try:
                 while True:
-                    chunk = raw.read(1 << 16)
+                    # G04: read1 returns available bytes without waiting for
+                    # a full 64 KiB, so a flushed tens-of-bytes question
+                    # event reaches the consumer while the connection stays
+                    # open. Plain read(64 KiB) would stall until the buffer
+                    # fills or EOF.
+                    read1 = getattr(raw, "read1", None)
+                    if read1 is not None:
+                        chunk = read1(1 << 16)
+                    else:
+                        chunk = raw.read(1 << 16)
                     if not chunk:
                         break
-                    text_buffer += decoder.decode(chunk, final=False)
-                    # Normalize CRLF/CR per the SSE spec before framing.
-                    text_buffer = text_buffer.replace("\\r\\n", "\\n").replace("\\r", "\\n")
+                    piece = decoder.decode(chunk, final=False)
+                    # G04: a CRLF split across chunks must frame as one line
+                    # break, never two. A trailing CR is held back until the
+                    # next chunk proves whether it pairs with LF: a following
+                    # LF completes one break (consumed here); anything else
+                    # means the held CR was already a full break and the new
+                    # piece is left intact for normal normalization.
+                    if pending_cr:
+                        if piece.startswith("\\n"):
+                            text_buffer += "\\n"
+                            piece = piece[1:]
+                        else:
+                            text_buffer += "\\n"
+                        pending_cr = False
+                    if piece.endswith("\\r"):
+                        piece = piece[:-1]
+                        pending_cr = True
+                    if piece:
+                        piece = piece.replace("\\r\\n", "\\n").replace("\\r", "\\n")
+                        text_buffer += piece
                     while "\\n\\n" in text_buffer:
                         frame, text_buffer = text_buffer.split("\\n\\n", 1)
                         data_lines = [
@@ -849,6 +987,33 @@ class QcgClient:
                         data = "\\n".join(data_lines)
                         if data:
                             yield json.loads(data)
+                # G04: EOF resolves a dangling CR into its line break, then
+                # dispatches frames already terminated by a blank line and
+                # discards only the truly unterminated tail (SSE spec: an
+                # unterminated tail never becomes an event). Flush the UTF-8
+                # decoder so a split multibyte tail cannot poison the next
+                # stream on a reused connection.
+                try:
+                    tail = decoder.decode(b"", final=True)
+                except Exception:
+                    tail = ""
+                if tail:
+                    text_buffer += tail.replace("\\r\\n", "\\n").replace("\\r", "\\n")
+                if pending_cr:
+                    text_buffer += "\\n"
+                    pending_cr = False
+                while "\\n\\n" in text_buffer:
+                    frame, text_buffer = text_buffer.split("\\n\\n", 1)
+                    data_lines = [
+                        line[5:].lstrip() if line[5:6] == " " else line[5:]
+                        for line in frame.split("\\n")
+                        if line.startswith("data:")
+                    ]
+                    if not data_lines:
+                        continue
+                    data = "\\n".join(data_lines)
+                    if data:
+                        yield json.loads(data)
             finally:
                 try:
                     raw.close()
@@ -882,10 +1047,29 @@ Generated by \`scripts/generate-sdk.mjs\` from \`docs/openapi.json\`.
 - \`python/qcg_client.py\` — dependency-free Python client (stdlib only).
 
 Regenerate with \`node scripts/generate-sdk.mjs\`; \`scripts/check-sdk.sh\`
-fails CI when the checked-in clients are stale. Both clients send the bearer
+fails CI when the checked-in clients are stale, and
+\`scripts/check-sdk-behavior.sh\` proves runtime behavior (SSE delivery and
+framing, redirect bounds, typed readers). Both clients send the bearer
 token only as an Authorization header and never place it in a URL.
 Authenticated redirects strip the bearer cross-origin and on TLS
 downgrades; path wildcards encode segment by segment.
+
+Redirects (TypeScript): manual same-protocol/cross-origin redirects are
+followed up to 5 hops with cycle detection; anything further fails with a
+clear redirect error instead of looping. Intermediate responses are
+released before following. Relative request URLs (default same-origin
+\`/api/...\`) resolve against the configured base URL, the document base
+in browsers, or a dummy origin in Node purely for URL resolution.
+Browser opaque-redirect responses expose no Location header and therefore
+surface as HTTP errors rather than silent follows.
+
+SSE (both clients): utilizable bytes are consumed incrementally (Python
+uses read1 so flushed tens-of-bytes events arrive while the stream stays
+open). CR/CRLF/LF framing holds a trailing CR across chunk boundaries so a
+split CRLF frames as one break, never two. Multi-data lines join with LF;
+an EOF without a terminating blank line dispatches only already-terminated
+frames and never fabricates an event from the tail. Breaking the consumer
+or a parse failure releases the connection/reader.
 `,
 );
 console.log(`generated ${pinned.length} SDK operations`);
