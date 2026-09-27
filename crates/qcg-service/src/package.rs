@@ -1285,7 +1285,9 @@ mod tests {
     /// in-toto provenance statement - to a package archive and closes it.
     /// Every unpackable archive carries exactly this pair, so a test states
     /// only its own payload entries and hands the SBOM over here. Takes the
-    /// writer by value because closing an archive consumes it.
+    /// writer by value because closing an archive consumes it. Unix-only
+    /// like its callers: every test archiving Unix modes is `#[cfg(unix)]`.
+    #[cfg(unix)]
     fn finish_archive(
         mut writer: zip::ZipWriter<File>,
         options: zip::write::SimpleFileOptions,

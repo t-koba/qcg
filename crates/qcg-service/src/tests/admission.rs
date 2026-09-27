@@ -1,7 +1,9 @@
 use super::support::*;
 use crate::*;
 use camino::Utf8PathBuf;
-use qcg_api::{AnswerPayload, ApiError, ForkRun, ForkStatePatch, RunStatus, StartRun};
+use qcg_api::{AnswerPayload, ApiError, RunStatus, StartRun};
+#[cfg(unix)]
+use qcg_api::{ForkRun, ForkStatePatch};
 use qcg_policy::DEFAULT_MAX_TRACKED_RUNS;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
