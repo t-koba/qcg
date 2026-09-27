@@ -22,7 +22,6 @@ output_file = "result.json"
 description = "Retries invalid structured LLM output until it satisfies the schema."
 id = "llm-fill-retry"
 name = "LLM Fill Retry"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [llm]

@@ -24,7 +24,6 @@ mode = "patch"
 description = "Repairs a file with hash-anchored patch edits from the fake LLM provider"
 id = "repair-patch-fake"
 name = "Repair Patch Fake"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [llm]

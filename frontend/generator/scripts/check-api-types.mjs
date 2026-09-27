@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 const uiRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const checkedIn = resolve(uiRoot, "src/api");
-const generated = mkdtempSync(resolve(tmpdir(), "qcg-generator-api."));
+const generated = mkdtempSync(resolve(tmpdir(), "generator-api."));
 
 function readOrFail(directory, file, description) {
   try {

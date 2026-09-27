@@ -4,9 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { chromium } from "playwright";
 
-const qcgPort = Number(process.env.QCG_UI_SMOKE_PORT || 58018);
-const uiPort = Number(process.env.QCG_UI_VITE_SMOKE_PORT || 58019);
-const servedAssetsPort = Math.max(qcgPort, uiPort) + 1;
+const apiPort = Number(process.env.UI_SMOKE_PORT || 58018);
+const uiPort = Number(process.env.UI_VITE_SMOKE_PORT || 58019);
+const servedAssetsPort = Math.max(apiPort, uiPort) + 1;
 const qcgBinary = join("target", "debug", process.platform === "win32" ? "qcg.exe" : "qcg");
 const viteCli = join(process.cwd(), "frontend", "generator", "node_modules", "vite", "bin", "vite.js");
 const root = await mkdtemp(join(tmpdir(), "qcg-ui-smoke."));
@@ -15,10 +15,10 @@ const logChunks = [];
 
 async function main() {
   execFileSync("npm", ["run", "build"], { cwd: "frontend/generator", stdio: "inherit" });
-  execFileSync("cargo", ["build", "-p", "qcg", "--locked"], { stdio: "inherit" });
+  execFileSync("cargo", ["build", "-p", "cli", "--locked"], { stdio: "inherit" });
   browser = await chromium.launch();
   const modes = [
-    { name: "vite-proxy", apiPort: qcgPort, frontendPort: uiPort, frontend: "vite" },
+    { name: "vite-proxy", apiPort: apiPort, frontendPort: uiPort, frontend: "vite" },
     { name: "serve-assets", apiPort: servedAssetsPort, frontend: "assets" },
   ];
   for (const mode of modes) {
@@ -62,7 +62,7 @@ async function runMode(mode) {
         [viteCli, "--host", "127.0.0.1", "--port", String(mode.frontendPort), "--strictPort"],
         {
           cwd: "frontend/generator",
-          env: { ...process.env, QCG_API_TARGET: apiBase },
+          env: { ...process.env, API_TARGET: apiBase },
           stdio: ["ignore", "pipe", "pipe"],
         },
       );
@@ -397,7 +397,6 @@ async function mergeGenerators(target) {
 id = "ui-cancelable"
 name = "Cancelable UI"
 version = "0.1.0"
-qcg_version = "^0.1"
 
 [permissions]
 side_effects = "allowed"

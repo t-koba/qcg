@@ -3,7 +3,7 @@
 qcg is a generation runtime with optional bearer authentication, not an identity provider,
 authorization server, or TLS endpoint. It has no per-user ownership model for
 runs. qcg listens on the explicitly selected network without imposing an
-authentication policy. Set `--api-token` or `QCG_API_TOKEN` when instance-level
+authentication policy. Set `--api-token` or `API_TOKEN` when instance-level
 bearer protection is wanted. One deployment configures a single token per
 instance; there is no per-user or per-run token table. Deploy one instance and runs directory per tenant
 or trust domain.
@@ -40,7 +40,7 @@ not tenant isolation. API runs receive UUID-based IDs and separate
 `meta/journal.jsonl` and `workspace/` paths. Direct runs reject concurrent use
 of the same output directory.
 
-The process-local `--max-active-runs` or `QCG_MAX_ACTIVE_RUNS` limit defaults
+The process-local `--max-active-runs` or `MAX_ACTIVE_RUNS` limit defaults
 to 8. It is a capacity control, not an access-control mechanism. Runs beyond
 the limit wait in the durable execution queue, while runs paused for human
 input or confirmation release their execution slot. All runs in one process share the configured LLM and
@@ -147,7 +147,7 @@ and HTTP file outputs). Directory-tree consumers that must parse the tree
 (`check.contract`, `check.tool`, zip sources) read a private handle-relative snapshot under
 the run metadata; the external tool process reads the snapshot, never the
 live workspace, so a parent swapped after validation cannot redirect it
-(E13). The synchronous `qcg-fs` helper writes trusted
+(E13). The synchronous `files` helper writes trusted
 internal paths (run metadata, artifacts) with the same handle-relative
 staging and replace on Unix. Windows keeps canonicalize-based checks;
 non-cooperative concurrent modification of the workspace by another process
@@ -169,7 +169,7 @@ stage can never commit (the commit only runs after the stage succeeds
 without cancellation), and the commit re-validates the leaf
 handle-relative before renaming. Only a killed process can leave a
 uniquely named staging file, which is never reused and never read as an
-artifact. Run startup reaps such orphans (`.qcg-part-*` in the workspace,
+artifact. Run startup reaps such orphans (`.part-*` in the workspace,
 `.tmp-*` in `checkpoint-blobs`) older than one hour without following
 symlinks.
 
@@ -198,7 +198,7 @@ setuid, setgid, or sticky bits); executable bits are preserved deliberately
 and dangerous bits are dropped, and restored scripts may be executed
 directly: executability is a preserved contract property, not a side
 channel. Unpacking sanitizes every archived mode
-(`sanitize_restored_mode` in `crates/qcg-service/src/package.rs`): setuid,
+(`sanitize_restored_mode` in `crates/service/src/package.rs`): setuid,
 setgid, and sticky bits are stripped by the `0o777` mask and the
 world-writable bit is cleared, so an archived `0777` restores `0775`, never
 world-writable. Least privilege for shipped files remains the generator
@@ -258,7 +258,7 @@ repair instead. Terminal journal records and operation mappings
 (`operation_started` / `operation_finished`) are fsynced individually with
 parent directory sync (`JournalWriter::event` fast path and
 `append_events_if` batch path in
-`crates/qcg-engine/src/journal/writer.rs`); non-terminal appends
+`crates/engine/src/journal/writer.rs`); non-terminal appends
 rely on the next terminal sync or clean shutdown, and a crash-truncated tail
 without a trailing newline is repaired on the next open under the journal
 lock. Repair marker: a terminal event writes `.clean_shutdown` next to the
@@ -324,7 +324,7 @@ selection resolves to. Discovery requests reuse the provider's configured
 credential, do not follow redirects, are time-bounded, and enforce a response
 size limit. Credentials and environment-variable values are never returned by
 `GET /api/llm/catalog` or `qcg models`. Fetched external catalogs are cached
-under `$QCG_HOME` (or the configured path) as metadata; `sha256` pins fetched
+under `$DATA_HOME` (or the configured path) as metadata; `sha256` pins fetched
 bytes, and corrupt or stale caches are reported instead of silently trusted.
 
 The `web.search` agent tool is an explicit opt-in. Its contract declaration
@@ -456,7 +456,7 @@ the drain open, and the client reconnects from its last sequence number. The
 server closes SSE streams, stops maintenance tasks (shared-store refresh,
 queued resumer, retention GC), then settles active runs under a 150 second
 outer deadline (`SHUTDOWN_DEADLINE` in
-`crates/qcg-server/src/server/serve.rs`, returned as `Err` to the embedding
+`crates/server/src/server/serve.rs`, returned as `Err` to the embedding
 host by `serve_with_listener_and_deadline`; see `docs/operations.md` for the
 normative shutdown contract). Startup order is policy resolve, service
 build, router build, then recovery before resident tasks; shutdown order is
@@ -498,7 +498,7 @@ runtime. JSON responses receive `default-src 'none'`. All responses use
 CORS is off by default. When one or more exact `--cors-origin` values are
 supplied, allowed request headers are `authorization`, `content-type`, and
 `idempotency-key` (`apply_cors_layer` in
-`crates/qcg-server/src/server/serve.rs`); cookies and credentialed CORS are
+`crates/server/src/server/serve.rs`); cookies and credentialed CORS are
 not supported. Availability is feature-gated: builds without the
 `server-cors` cargo feature refuse configured origins at boot/router build
 with an explicit error instead of silently serving without CORS

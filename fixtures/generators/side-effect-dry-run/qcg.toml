@@ -33,7 +33,6 @@ output_file = "done.txt"
 description = "Requires a dry-run confirmation before running a command side effect"
 id = "side-effect-dry-run"
 name = "Side Effect Dry Run"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [permissions]

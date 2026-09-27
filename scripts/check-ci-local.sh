@@ -8,7 +8,7 @@ run_step() {
 
 run_step cargo fmt --all -- --check
 run_step cargo check --workspace --locked
-run_step cargo check -p qcg-expr-wasm --target wasm32-unknown-unknown --locked
+run_step cargo check -p expr-wasm --target wasm32-unknown-unknown --locked
 run_step bash scripts/check-generated-docs.sh
 run_step bash scripts/check-third-party-notices.sh
 run_step cargo clippy --workspace --all-targets --locked -- -D warnings

@@ -6,7 +6,7 @@ trees, archives, reports, or any other bounded output supported by declared
 steps.
 
 The package proposal is a complete manifest body, including the core-required
-`generator` metadata (`id`, `version`, and `qcg_version`) and any optional
+`generator` metadata (`id` and `version`) and any optional
 `name`, `description`, and `authors` metadata, plus a typed source map. Only
 `permissions` and `secrets` are withheld for operator authority. Each
 source value is an object with `encoding = "utf8"` or `encoding = "base64"` and

@@ -12,7 +12,6 @@ command = [
 description = "Denies command side effects by policy"
 id = "side-effect-denied"
 name = "Side Effect Denied"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [permissions]

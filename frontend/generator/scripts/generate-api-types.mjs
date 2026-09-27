@@ -10,7 +10,7 @@ const openapiPath = resolve(outDir, "openapi.json");
 const typesPath = resolve(outDir, "types.d.ts");
 
 mkdirSync(dirname(openapiPath), { recursive: true });
-const openapi = execFileSync("cargo", ["run", "-q", "-p", "qcg", "--locked", "--", "docs", "openapi"], {
+const openapi = execFileSync("cargo", ["run", "-q", "-p", "cli", "--locked", "--", "docs", "openapi"], {
   cwd: root,
   encoding: "utf8",
 });

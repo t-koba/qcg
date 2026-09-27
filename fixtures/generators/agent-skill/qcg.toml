@@ -17,7 +17,6 @@ resources = ["skills"]
 description = "Deterministic llm.agent example exercising skill activation and progressive disclosure."
 id = "agent-skill"
 name = "Agent Skill"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [llm]

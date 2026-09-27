@@ -9,7 +9,7 @@ qcg serve --bind 127.0.0.1 --port 8080 \
 ```
 
 qcg listens on the selected address without forcing authentication. When
-`--api-token` or `QCG_API_TOKEN` is set, clients send `Authorization: Bearer
+`--api-token` or `API_TOKEN` is set, clients send `Authorization: Bearer
 <token>`. This authenticates an instance boundary, not individual run ownership.
 
 The bundled generator UI supports the embedded bearer token: enter it in the
@@ -50,7 +50,7 @@ domain.
 ## Concurrency and run storage
 
 The server accepts at most eight concurrently executing API runs by default.
-Set `--max-active-runs` or `QCG_MAX_ACTIVE_RUNS` to change the limit. When no
+Set `--max-active-runs` or `MAX_ACTIVE_RUNS` to change the limit. When no
 execution slot is available, accepted starts and resumed interactions remain
 in `queued` state until capacity becomes available. A run in `waiting` or
 `confirming` HITL state has stopped its engine task and does not consume a
@@ -173,7 +173,7 @@ spelling on every surface. Decoded content is limited only when the generator
 contract sets an explicit `[runtime] file_input_limit_bytes`; otherwise there
 is no mechanistic limit. Values are supplied inline with the run request.
 `qcg serve` additionally accepts an explicit `--max-request-bytes`
-(`QCG_MAX_REQUEST_BYTES`) bound for the whole request body. The bound is
+(`MAX_REQUEST_BYTES`) bound for the whole request body. The bound is
 explicit-max-only: when omitted, the server disables Axum's built-in 2 MiB
 JSON limit so FileValue and contract limits govern. The effective bound is
 the configured value when set, otherwise no mechanistic HTTP limit. The
@@ -191,7 +191,7 @@ http://127.0.0.1:8080/api/generators/generator/assets/ui/index.html
 For source development:
 
 ```bash
-QCG_API_TARGET=http://127.0.0.1:8080 \
+API_TARGET=http://127.0.0.1:8080 \
   npm --prefix frontend/generator run dev -- --host 127.0.0.1 --port 5173
 ```
 

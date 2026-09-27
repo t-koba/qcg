@@ -3,15 +3,15 @@
 This reference is generated from the OpenAPI `RunEvent` schema. Update it with
 `qcg docs run-events`.
 
-<!-- qcg-run-events:start -->
+<!-- run-events:start -->
 ## RunEvent Reference
 
 Generated from the OpenAPI `RunEvent` schema. Every event uses the required envelope fields `seq`, `ts`, `run_id`, `trace_id`, `span_id`, `kind`, and `data`; `path` is present for node-scoped events. Trace and span IDs use W3C-compatible hexadecimal widths. Unknown `kind` values are preserved with opaque `data`.
 
 | Event | Required `data` fields |
 |---|---|
-| `run_queued` | `generator`, `generator_path`, `contract_sha256`, `inputs`, `qcg`, `schema_version` |
-| `run_started` | `generator`, `generator_path`, `contract_sha256`, `inputs`, `qcg`, `schema_version` |
+| `run_queued` | `generator`, `generator_path`, `contract_sha256`, `inputs`, `schema_version` |
+| `run_started` | `generator`, `generator_path`, `contract_sha256`, `inputs`, `schema_version` |
 | `run_resumed` | none |
 | `graph_resolved` | `nodes` |
 | `resource` | `name`, `type`, `source`, `sha256`, `bytes`, `cache`, `trust`, `llm_visible` |
@@ -53,7 +53,7 @@ Generated from the OpenAPI `RunEvent` schema. Every event uses the required enve
 | `run_interrupted` | `reason` |
 | `run_finished` | `status`, `metrics` |
 | `lagged` | `action` |
-<!-- qcg-run-events:end -->
+<!-- run-events:end -->
 
 ## Durability records
 

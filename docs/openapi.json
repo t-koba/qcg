@@ -30,7 +30,7 @@
         "description": "Authentication required",
         "headers": {
           "WWW-Authenticate": {
-            "description": "Bearer realm=\"qcg\"; the request carried no valid API token",
+            "description": "Bearer realm=\"api\"; the request carried no valid API token",
             "schema": {
               "type": "string"
             }
@@ -956,17 +956,13 @@
             "default": "",
             "type": "string"
           },
-          "qcg_version": {
-            "type": "string"
-          },
           "version": {
             "type": "string"
           }
         },
         "required": [
           "id",
-          "version",
-          "qcg_version"
+          "version"
         ],
         "type": "object"
       },
@@ -3123,7 +3119,7 @@
               "type": "string"
             },
             "default": {},
-            "description": "Free-form run metadata admitted with the run. Metadata only: qcg\nnever reads identity or enforces authorization from labels.",
+            "description": "Free-form run metadata admitted with the run. Metadata only: the runtime\nnever reads identity or enforces authorization from labels.",
             "type": "object"
           },
           "parent_run_id": {
@@ -3139,9 +3135,6 @@
             "description": "Scheduling priority recorded when the run was (re)queued.",
             "format": "int32",
             "type": "integer"
-          },
-          "qcg": {
-            "type": "string"
           },
           "queued_at": {
             "default": null,
@@ -3178,7 +3171,6 @@
           "generator_path",
           "contract_sha256",
           "inputs",
-          "qcg",
           "schema_version"
         ],
         "type": "object"
@@ -3768,7 +3760,7 @@
     }
   },
   "info": {
-    "title": "qcg",
+    "title": "api",
     "version": "0.1.0"
   },
   "openapi": "3.1.0",

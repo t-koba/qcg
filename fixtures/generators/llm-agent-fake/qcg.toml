@@ -29,7 +29,6 @@ path_prefix = "drafts/"
 description = "Deterministic llm.agent example exercising specialist delegation and fs.write."
 id = "llm-agent-fake"
 name = "Fake LLM Agent"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [llm]

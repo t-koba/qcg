@@ -35,7 +35,6 @@ output_file = "decision.txt"
 description = "A schema-constrained multi-field HITL form"
 id = "dynamic-form"
 name = "Dynamic Form"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [permissions]

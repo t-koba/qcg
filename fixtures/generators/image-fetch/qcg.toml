@@ -12,7 +12,6 @@ url = "https://example.com/images?q={{ inputs.query }}"
 description = "Declares an external image API fetch through the HTTP step."
 id = "image-fetch"
 name = "Image Fetch"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [[inputs.stages]]

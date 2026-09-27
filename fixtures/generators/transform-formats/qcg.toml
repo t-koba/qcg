@@ -60,7 +60,6 @@ transform = "zip"
 description = "Exercises JSON, TOML, and zip transforms."
 id = "transform-formats"
 name = "Transform Formats"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [permissions]

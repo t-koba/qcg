@@ -44,7 +44,6 @@ source = "config.toml"
 description = "Writes JSON and TOML files and validates their formats."
 id = "format-check"
 name = "Format Check"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [permissions]

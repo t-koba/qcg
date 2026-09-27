@@ -30,7 +30,6 @@ output_file = "decision.txt"
 description = "Turns a check failure into a user decision."
 id = "on-fail-ask-user"
 name = "On Fail Ask User"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [permissions]

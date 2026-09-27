@@ -21,7 +21,6 @@ source = "bad.json"
 description = "Negative fixture: invalid JSON fails check.format."
 id = "format-check-denied"
 name = "Format Check Denied"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [permissions]

@@ -17,7 +17,6 @@ prompt = "prompts/draft.j2"
 description = "Checks that vendored SKILL.md resources can be used as LLM context."
 id = "skill-context"
 name = "Skill Context"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [llm]

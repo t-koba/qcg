@@ -21,7 +21,6 @@ tool = "qpx_validate"
 description = "Shows qpxd check as a logical validator tool with multiple sandbox backends."
 id = "qpx-tool-validator"
 name = "qpx Tool Validator"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [permissions]

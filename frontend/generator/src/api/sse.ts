@@ -2,7 +2,7 @@
 //!
 //! The bundled UI reads SSE from a fetch body so it can send an
 //! `Authorization` header, which EventSource cannot. Only `data` and `id`
-//! fields are used by qcg; comments and other fields are ignored.
+//! fields are used by the runtime; comments and other fields are ignored.
 
 export type SseFrame = { data: string; id?: string };
 

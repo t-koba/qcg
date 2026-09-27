@@ -1,0 +1,37 @@
+[package]
+name = "llm-steps"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+base64.workspace = true
+camino.workspace = true
+hex.workspace = true
+jsonschema.workspace = true
+api = { path = "../api" }
+policy = { path = "../policy" }
+contract = { path = "../contract" }
+engine = { path = "../engine" }
+files = { path = "../files" }
+llm = { path = "../llm" }
+mcp = { path = "../mcp" }
+model = { path = "../model" }
+minijinja.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["fs", "macros", "rt", "time"] }
+thiserror.workspace = true
+tokio-util.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+# Enables engine's test-support builder for approval/resume e2e tests.
+engine = { path = "../engine", features = ["test-support"] }

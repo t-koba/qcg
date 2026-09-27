@@ -18,7 +18,7 @@ server at run time.
 The registry file is resolved once per process, in this order:
 
 1. `--providers <PATH>` (CLI flag; authoritative, no fallback)
-2. `QCG_PROVIDERS` environment variable
+2. `PROVIDERS` environment variable
 3. `./providers.toml` relative to the working directory
 4. `<install prefix>/share/qcg/providers.toml` next to the binary
 
@@ -41,8 +41,8 @@ search = "tinyfish-api"
 id = "openai"
 api = "chat_completions"
 base_url = "https://api.openai.com/v1"
-base_url_env = "QCG_OPENAI_BASE_URL"
-api_key_env = "QCG_OPENAI_API_KEY"
+base_url_env = "OPENAI_BASE_URL"
+api_key_env = "OPENAI_API_KEY"
 chat_token_limit_field = "max_completion_tokens"
 max_concurrency = 16
 requests_per_minute = 500
@@ -200,7 +200,7 @@ side-effect permission.
 id = "openai"
 api = "chat_completions"
 base_url = "https://api.openai.com/v1"
-api_key_env = "QCG_OPENAI_API_KEY"
+api_key_env = "OPENAI_API_KEY"
 chat_token_limit_field = "max_completion_tokens"
 catalog_id = "openai"            # optional external-catalog provider key
 capabilities = { tool_use = true, json_schema = true }
@@ -254,7 +254,7 @@ Explicit `[[provider.models]]` entries win field by field.
 
 ```toml
 [catalog]
-cache = "~/.qcg/cache/llm-catalog.json"   # default under $QCG_HOME
+cache = "~/.data/cache/llm-catalog.json"   # default under $DATA_HOME
 refresh_seconds = 86400
 
 [[catalog.source]]
@@ -327,7 +327,7 @@ id = "local-tools"
 transport = "stdio"
 command = ["my-mcp-server", "--stdio"]
 env = { MCP_MODE = "readonly" }
-env_from = { MCP_TOKEN = "QCG_MCP_TOKEN" }
+env_from = { MCP_TOKEN = "MCP_TOKEN" }
 auth = "none"
 ```
 
@@ -613,7 +613,7 @@ local rows, it only contacts its endpoint when execution reaches a request
 using that profile; loading the registry does not contact it.
 Ollama and LM Studio are credential-free; `openai_client` requires its declared
 environment variable. `typesafe` requires `TYPESAFE_API_KEY` and permits the
-explicit `QCG_TYPESAFE_BASE_URL` override. MCP servers and REST search profiles
+explicit `TYPESAFE_BASE_URL` override. MCP servers and REST search profiles
 are opt-in: they are contacted only after a contract declares the corresponding
 tool and grants the required permission.
 
@@ -631,28 +631,28 @@ Commented templates: `anthropic`, `openai`, `openai_responses`, `openrouter`,
 
 | Provider id | API | API key environment variable | Other required environment variables |
 |---|---|---|---|
-| `anthropic` | `anthropic_messages` | `QCG_ANTHROPIC_API_KEY` | none |
-| `openai` | `chat_completions` | `QCG_OPENAI_API_KEY` | none |
-| `openai_responses` | `responses` | `QCG_OPENAI_API_KEY` | none |
-| `openai_client` (active) | `chat_completions` | `QCG_OPENAI_CLIENT_API_KEY` | none |
+| `anthropic` | `anthropic_messages` | `ANTHROPIC_API_KEY` | none |
+| `openai` | `chat_completions` | `OPENAI_API_KEY` | none |
+| `openai_responses` | `responses` | `OPENAI_API_KEY` | none |
+| `openai_client` (active) | `chat_completions` | `OPENAI_CLIENT_API_KEY` | none |
 | `ollama` (active) | `chat_completions` | none | none |
 | `lmstudio` (active) | `chat_completions` | none | none |
 | `typesafe` (active, remote) | `system_one` | `TYPESAFE_API_KEY` | none |
-| `openrouter` | `chat_completions` | `QCG_OPENROUTER_API_KEY` | none |
-| `gemini` | `chat_completions` | `QCG_GEMINI_API_KEY` | none |
-| `sakura` | `chat_completions` | `QCG_SAKURA_API_KEY` | none |
-| `cloudflare` | `chat_completions` | `QCG_CLOUDFLARE_API_KEY` | `QCG_CLOUDFLARE_ACCOUNT_ID` |
-| `opencode-go` | `chat_completions` | `QCG_OPENCODE_API_KEY` | none |
-| `opencode-zen` | `chat_completions` | `QCG_OPENCODE_API_KEY` | none |
-| `opencode-go-responses` | `responses` | `QCG_OPENCODE_API_KEY` | none |
-| `opencode-zen-responses` | `responses` | `QCG_OPENCODE_API_KEY` | none |
-| `groq` | `chat_completions` | `QCG_GROQ_API_KEY` | none |
-| `deepseek` | `chat_completions` | `QCG_DEEPSEEK_API_KEY` | none |
-| `mistral` | `chat_completions` | `QCG_MISTRAL_API_KEY` | none |
-| `xai` | `chat_completions` | `QCG_XAI_API_KEY` | none |
-| `together` | `chat_completions` | `QCG_TOGETHER_API_KEY` | none |
-| `fireworks` | `chat_completions` | `QCG_FIREWORKS_API_KEY` | none |
-| `azure-openai` | `responses` | `QCG_AZURE_OPENAI_API_KEY` | `QCG_AZURE_OPENAI_BASE_URL` |
+| `openrouter` | `chat_completions` | `OPENROUTER_API_KEY` | none |
+| `gemini` | `chat_completions` | `GEMINI_API_KEY` | none |
+| `sakura` | `chat_completions` | `SAKURA_API_KEY` | none |
+| `cloudflare` | `chat_completions` | `CLOUDFLARE_API_KEY` | `CLOUDFLARE_ACCOUNT_ID` |
+| `opencode-go` | `chat_completions` | `OPENCODE_API_KEY` | none |
+| `opencode-zen` | `chat_completions` | `OPENCODE_API_KEY` | none |
+| `opencode-go-responses` | `responses` | `OPENCODE_API_KEY` | none |
+| `opencode-zen-responses` | `responses` | `OPENCODE_API_KEY` | none |
+| `groq` | `chat_completions` | `GROQ_API_KEY` | none |
+| `deepseek` | `chat_completions` | `DEEPSEEK_API_KEY` | none |
+| `mistral` | `chat_completions` | `MISTRAL_API_KEY` | none |
+| `xai` | `chat_completions` | `XAI_API_KEY` | none |
+| `together` | `chat_completions` | `TOGETHER_API_KEY` | none |
+| `fireworks` | `chat_completions` | `FIREWORKS_API_KEY` | none |
+| `azure-openai` | `responses` | `AZURE_OPENAI_API_KEY` | `AZURE_OPENAI_BASE_URL` |
 
 | REST search profile | Method and endpoint | API key environment variable |
 |---|---|---|
@@ -685,13 +685,13 @@ Notes:
   MCP server.
 - A remote row accepts a base-URL override only when it declares
   `base_url_env`; qcg uses that exact environment-variable name and has no
-  automatic `QCG_<ID>_BASE_URL` naming rule. See `providers.toml` for each
+  automatic `<ID>_BASE_URL` naming rule. See `providers.toml` for each
   profile's declaration.
 - Azure OpenAI uses deployment names as the model value. The recommended
   `azure-openai` row uses the current Responses API and expects
-  `QCG_AZURE_OPENAI_BASE_URL` to include `/openai/v1`. It does not use an
+  `AZURE_OPENAI_BASE_URL` to include `/openai/v1`. It does not use an
   `api-version` query.
-  Cloudflare resolves `{QCG_CLOUDFLARE_ACCOUNT_ID}` inside its base URL. Rows
+  Cloudflare resolves `{CLOUDFLARE_ACCOUNT_ID}` inside its base URL. Rows
   fail validation while required placeholders remain unresolved.
 - The `tinyfish-api` REST search profile requires `TINYFISH_API_KEY` in the qcg
   process environment when a contract actually uses it. The separate `tinyfish`
@@ -771,7 +771,7 @@ id = "my-tools"
 transport = "streamable_http"
 url = "https://mcp.example.com/mcp"
 auth = "bearer"
-credential_env = "QCG_MY_MCP_TOKEN"
+credential_env = "MY_MCP_TOKEN"
 allowed_hosts = ["mcp.example.com"]
 
 [[flow]]

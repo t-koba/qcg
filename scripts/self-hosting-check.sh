@@ -10,12 +10,12 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 repo_root="$(pwd)"
 
-: "${QCG_OPENROUTER_API_KEY:?set QCG_OPENROUTER_API_KEY}"
+: "${OPENROUTER_API_KEY:?set OPENROUTER_API_KEY}"
 
-model="${QCG_LLM_MODEL:-minimax/minimax-m3:free}"
+model="${LLM_MODEL:-minimax/minimax-m3:free}"
 case "$model" in
   *[![:alnum:]_.:/-]*)
-    echo "QCG_LLM_MODEL contains unsupported characters: $model" >&2
+    echo "LLM_MODEL contains unsupported characters: $model" >&2
     exit 2
     ;;
 esac
@@ -23,7 +23,7 @@ esac
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/qcg-self-hosting.XXXXXX")"
 cleanup() {
   local status="$?"
-  if [ "$status" -ne 0 ] && [ "${QCG_SELF_HOSTING_KEEP_TEMP:-false}" = "true" ]; then
+  if [ "$status" -ne 0 ] && [ "${SELF_HOSTING_KEEP_TEMP:-false}" = "true" ]; then
     echo "self-hosting worktree retained after failure: $tmp" >&2
   else
     rm -rf "$tmp"
@@ -31,8 +31,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [ -n "${QCG_PROVIDERS:-}" ]; then
-  providers="$QCG_PROVIDERS"
+if [ -n "${PROVIDERS:-}" ]; then
+  providers="$PROVIDERS"
   if [[ "$providers" != /* ]]; then
     providers="$repo_root/$providers"
   fi
@@ -43,8 +43,8 @@ else
     'id = "openrouter"' \
     'api = "chat_completions"' \
     'base_url = "https://openrouter.ai/api/v1"' \
-    'base_url_env = "QCG_OPENROUTER_BASE_URL"' \
-    'api_key_env = "QCG_OPENROUTER_API_KEY"' \
+    'base_url_env = "OPENROUTER_BASE_URL"' \
+    'api_key_env = "OPENROUTER_API_KEY"' \
     'timeout_seconds = 300' \
     'capabilities = { tool_use = true, json_schema = true, seed = false }' \
     >"$providers"
@@ -248,7 +248,7 @@ run_generation() {
   purpose="$(purpose_for_blueprint "$blueprint")"
   (
     cd "$tmp"
-    CARGO_TARGET_DIR="$repo_root/target" cargo run --manifest-path "$repo_root/Cargo.toml" -q -p qcg --locked -- \
+    CARGO_TARGET_DIR="$repo_root/target" cargo run --manifest-path "$repo_root/Cargo.toml" -q -p cli --locked -- \
       --providers "$providers" run "$input_generator" \
       --answer "ask_purpose=$purpose" \
       --answer ask_design_mode=llm \
@@ -259,10 +259,10 @@ run_generation() {
   )
 }
 
-generation_attempts="${QCG_SELF_HOSTING_ATTEMPTS:-3}"
+generation_attempts="${SELF_HOSTING_ATTEMPTS:-3}"
 case "$generation_attempts" in
   ''|*[!0-9]*|0)
-    echo "QCG_SELF_HOSTING_ATTEMPTS must be a positive integer" >&2
+    echo "SELF_HOSTING_ATTEMPTS must be a positive integer" >&2
     exit 2
     ;;
 esac
@@ -280,7 +280,7 @@ generate_equivalent() {
       continue
     fi
     candidate="$output_dir/generator"
-    if ! CARGO_TARGET_DIR="$repo_root/target" cargo run --manifest-path "$repo_root/Cargo.toml" -q -p qcg --locked -- --providers "$providers" validate "$candidate"; then
+    if ! CARGO_TARGET_DIR="$repo_root/target" cargo run --manifest-path "$repo_root/Cargo.toml" -q -p cli --locked -- --providers "$providers" validate "$candidate"; then
       continue
     fi
     if fingerprint="$(verify_equivalent "$input_generator" "$candidate")"; then

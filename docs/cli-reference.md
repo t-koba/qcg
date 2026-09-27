@@ -42,7 +42,7 @@ JSON event output go to stdout.
   flag) plus whole-plan budget estimates. No filesystem writes, processes, or
   network requests are performed. Digests are runtime facts and are never
   predicted by plan output.
-  A previous package (`.qcg` ZIP, `blueprint-package.json`, or any file) is
+  A previous package (`.pkg` ZIP, `blueprint-package.json`, or any file) is
   re-entered as an ordinary `type = "file"` input via
   `--input-file field=path`, optionally combined with extra `--input` values
   for re-editing. See `fixtures/generators/package-reinput` for the
@@ -54,8 +54,8 @@ JSON event output go to stdout.
   optional external catalog, and per-provider discovery. `--refresh` re-fetches
   external catalog sources first; stale or failed sources are reported on
   stderr. Credentials are never printed.
-- `qcg eval <generator> --suite suite.json [--output .qcg/evals]
-  [--runs-dir .qcg/runs] [--baseline REPORT_JSON] [--json]` executes isolated
+- `qcg eval <generator> --suite suite.json [--output .data/evals]
+  [--runs-dir .data/runs] [--baseline REPORT_JSON] [--json]` executes isolated
   cases and optional repeated seed variations. Assertions cover artifacts,
   regex, JSON Schema, manifest pointers, event counts and ordered trajectories,
   plus recorded metric ceilings. Reports include per-case pass counts across
@@ -71,15 +71,15 @@ JSON event output go to stdout.
   `fixtures/generators/hello-template/suite.json` for a minimal example.
   Semantic judges are out of mechanism: use an external `command` step or
   guardrail when meaning must be judged, with explicit timeout and byte limits.
-- `qcg package <dir> [-o package.qcg] [--signing-key key.pk8]
-  [--max-entries N] [--max-bytes N] [--max-metadata-bytes N]` creates a `.qcg`
+- `qcg package <dir> [-o package.pkg] [--signing-key key.pk8]
+  [--max-entries N] [--max-bytes N] [--max-metadata-bytes N]` creates a `.pkg`
   ZIP from a directory, prints its SHA-256, and optionally writes detached
   Ed25519 `.sig` and `.pub` files. Archives are deterministic and include an
   SPDX 2.3 file inventory plus in-toto/SLSA provenance. Symlinks and output
   paths inside the source tree are rejected. There is no mechanistic size
   limit: `--max-entries`, `--max-bytes`, and `--max-metadata-bytes`
-  (`QCG_PACKAGE_MAX_ENTRIES`, `QCG_PACKAGE_MAX_BYTES`,
-  `QCG_PACKAGE_MAX_METADATA_BYTES`) enforce an explicit max only when set.
+  (`PACKAGE_MAX_ENTRIES`, `PACKAGE_MAX_BYTES`,
+  `PACKAGE_MAX_METADATA_BYTES`) enforce an explicit max only when set.
 - `qcg install <path-or-url> [--sha256 HEX] [--signature HEX --public-key HEX]
   [--generators-dir dir] [--yes] [--force]
   [--max-entries N] [--max-bytes N] [--max-archive-bytes N]
@@ -89,14 +89,14 @@ JSON event output go to stdout.
   `<id>[@version-requirement]` instead installs from configured registries
   (see below), including `[dependencies]` recursively. Archive and inventory
   bounds are explicit-only
-   (`QCG_PACKAGE_MAX_ENTRIES`, `QCG_PACKAGE_MAX_BYTES`,
-   `QCG_PACKAGE_MAX_ARCHIVE_BYTES`, `QCG_PACKAGE_MAX_METADATA_BYTES`).
+   (`PACKAGE_MAX_ENTRIES`, `PACKAGE_MAX_BYTES`,
+   `PACKAGE_MAX_ARCHIVE_BYTES`, `PACKAGE_MAX_METADATA_BYTES`).
 - `qcg registry add <name> <url>`, `qcg registry remove <name>`,
   `qcg registry list`: manage registry index URLs (`file://` or `https://`)
-  under `$QCG_HOME` (default `~/.qcg`). Everything is user-owned files; no
+  under `$DATA_HOME` (default `~/.data`). Everything is user-owned files; no
   privilege is required. `qcg search <query>` matches id, description, and
   registry. Index rows may carry an Ed25519 `signature` with `key_id`;
-  signed rows verify against `$QCG_HOME/trusted-keys.toml` (entries with an
+  signed rows verify against `$DATA_HOME/trusted-keys.toml` (entries with an
   `expires` timestamp stop verifying after it), while unsigned rows rely on
   index transport plus the entry `sha256` checked at install.
 - `qcg uninstall <id> [--generators-dir dir] [--yes]` removes one installed
@@ -172,17 +172,17 @@ Port `0` selects an available port. `qcg serve` exposes REST, SSE, and assets
 declared by generator contracts; it does not open a browser. The selected bind
 is used directly. `--api-token` optionally protects the instance but does not
 create per-user run ownership. Repeat `--cors-origin`
-for multiple exact frontend origins; a comma-separated `QCG_CORS_ORIGIN`
+for multiple exact frontend origins; a comma-separated `CORS_ORIGIN`
 environment variable is also accepted.
 
 `--max-active-runs` limits concurrently executing API runs to 8 by default.
-`QCG_MAX_ACTIVE_RUNS` sets the same value. Additional accepted runs wait in the
+`MAX_ACTIVE_RUNS` sets the same value. Additional accepted runs wait in the
 durable queue. Runs paused at a human-input or confirmation boundary release
 their execution slot until resumed. The limit and provider runtimes are process-local; LLM and
 search provider HTTP clients and MCP OAuth token managers are shared by runs in
 one service process. Each run still owns an independent MCP protocol session.
 
-`--max-total-steps` (or `QCG_MAX_TOTAL_STEPS`) caps every run below its
+`--max-total-steps` (or `MAX_TOTAL_STEPS`) caps every run below its
 contract budget; omitted means the engine default. The enforced value and its
 origin are recorded per run so admission, snapshots, and the journal agree.
 
@@ -201,60 +201,60 @@ use of the same output directory.
 
 ## Environment variables
 
-- `RUST_LOG`: tracing filter, for example `qcg=debug,qcg_engine=trace`.
-- `QCG_AUTO_GC=0|false|off`: disable serve's periodic retention task.
-- `QCG_MAX_ACTIVE_RUNS`: maximum concurrently executing API runs for `qcg serve`
+- `RUST_LOG`: tracing filter, for example `qcg=debug,engine=trace`.
+- `AUTO_GC=0|false|off`: disable serve's periodic retention task.
+- `MAX_ACTIVE_RUNS`: maximum concurrently executing API runs for `qcg serve`
   (default `8`).
-- `QCG_RUN_STORE`: `exclusive` or `shared-filesystem`.
-- `QCG_API_TOKEN`: optional bearer token applied to the server API when set.
-- `QCG_GENERATORS_DIR`: default directory for generator list/install/uninstall
+- `RUN_STORE`: `exclusive` or `shared-filesystem`.
+- `API_TOKEN`: optional bearer token applied to the server API when set.
+- `GENERATORS_DIR`: default directory for generator list/install/uninstall
   and serve; the per-command `--generators-dir` option overrides it.
-- `QCG_PROVIDERS`: default path to the unified LLM, REST search, and MCP
+- `PROVIDERS`: default path to the unified LLM, REST search, and MCP
   provider registry; the global `--providers <PATH>` option overrides it. See
   `docs/llm-provider-guide.md`. Search and MCP are opt-in: a declared
   `web.search` tool selects an explicit `[[search_provider]]` row, while a
   declared `mcp` tool selects an explicit `[[mcp_server]]` row. The selected
   hosts or exact stdio command must still be listed in the contract's
   permissions; there is no implicit fallback.
-- `QCG_RATE_LIMIT_RPS` and `QCG_RATE_LIMIT_BURST`: optional per-credential
-  token bucket for the HTTP server. Unset `QCG_RATE_LIMIT_RPS` disables rate
-  limiting; `QCG_RATE_LIMIT_BURST` defaults to the rps value. Buckets are keyed
+- `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST`: optional per-credential
+  token bucket for the HTTP server. Unset `RATE_LIMIT_RPS` disables rate
+  limiting; `RATE_LIMIT_BURST` defaults to the rps value. Buckets are keyed
   by the presented bearer credential (one anonymous bucket otherwise), so
   credentials never share a budget. Requests over the limit receive `429` with
   `Retry-After`; `GET /healthz` is exempt. Invalid values, zero, or a burst
   without an rps refuse boot.
-- `QCG_LIVE_EVENT_CHANNEL_CAPACITY` (default `512`, range `16..=65536`),
-  `QCG_JOURNAL_POLL_INTERVAL_MS` (default `250`, range `50..=5000`),
-  `QCG_MAX_DIRECTORY_SCAN_ENTRIES` (default `100000`, range `1000..=10000000`),
-  `QCG_SHARED_RESCAN_SECS` and `QCG_QUEUED_RESUMER_SECS` (default `5`, range
-  `1..=3600`), `QCG_SHUTDOWN_DRAIN_SECS` (default `30`) and
-  `QCG_SHUTDOWN_SETTLE_SECS` (default `150`, range `1..=3600`): deployment
+- `LIVE_EVENT_CHANNEL_CAPACITY` (default `512`, range `16..=65536`),
+  `JOURNAL_POLL_INTERVAL_MS` (default `250`, range `50..=5000`),
+  `MAX_DIRECTORY_SCAN_ENTRIES` (default `100000`, range `1000..=10000000`),
+  `SHARED_RESCAN_SECS` and `QUEUED_RESUMER_SECS` (default `5`, range
+  `1..=3600`), `SHUTDOWN_DRAIN_SECS` (default `30`) and
+  `SHUTDOWN_SETTLE_SECS` (default `150`, range `1..=3600`): deployment
   tuning for the live stream, shared-store cadence, directory scans, and the
   graceful shutdown phases. Out-of-range values and a settle deadline below
   the drain refuse boot.
-- `QCG_MAX_PARALLEL_STEPS`: deployment cap on parallel wave scheduling.
+- `MAX_PARALLEL_STEPS`: deployment cap on parallel wave scheduling.
   Unset uses the CPU count; `0` and invalid values refuse boot.
-- `QCG_API_TOKEN_FILE`: path to a file containing the instance bearer token.
-  `--api-token` / `QCG_API_TOKEN` wins when set; an unreadable or empty file
+- `API_TOKEN_FILE`: path to a file containing the instance bearer token.
+  `--api-token` / `API_TOKEN` wins when set; an unreadable or empty file
   refuses boot instead of starting unauthenticated.
-- `QCG_GC_KEEP` (default `50`), `QCG_GC_KEEP_FAILED` (default `10`), and
-  `QCG_GC_INTERVAL_SECS` (default `86400`, minimum `60`): automatic retention
+- `GC_KEEP` (default `50`), `GC_KEEP_FAILED` (default `10`), and
+  `GC_INTERVAL_SECS` (default `86400`, minimum `60`): automatic retention
   sweep counts and cadence for `qcg serve`. Failed runs get the additional
   post-mortem budget; a run past its contract retention window is always
   deleted. Invalid or zero values refuse boot.
-- `QCG_AUDIT_FLOOR=minimal|standard`: deployment audit floor. `standard`
+- `AUDIT_FLOOR=minimal|standard`: deployment audit floor. `standard`
   restores full observation-record persistence for every run regardless of the
   contract's `[audit]` policy; a floor can only raise persistence.
-- `QCG_CORS_ORIGIN`: comma-separated exact origins allowed for cross-origin
+- `CORS_ORIGIN`: comma-separated exact origins allowed for cross-origin
   API requests. CORS is disabled when it is unset. Allowed request headers are
   `authorization`, `content-type`, and `idempotency-key`; builds without the
   `server-cors` cargo feature refuse configured origins with an explicit error.
-- `QCG_PACKAGE_MAX_ENTRIES`, `QCG_PACKAGE_MAX_BYTES`,
-  `QCG_PACKAGE_MAX_ARCHIVE_BYTES`, `QCG_PACKAGE_MAX_METADATA_BYTES`: explicit
+- `PACKAGE_MAX_ENTRIES`, `PACKAGE_MAX_BYTES`,
+  `PACKAGE_MAX_ARCHIVE_BYTES`, `PACKAGE_MAX_METADATA_BYTES`: explicit
   max for `qcg package` and `qcg install`. Unset means no mechanistic limit.
-- `QCG_MAX_INPUTS_FILE_BYTES`: explicit max for `qcg run --inputs-file`.
+- `MAX_INPUTS_FILE_BYTES`: explicit max for `qcg run --inputs-file`.
   Unset means no mechanistic limit.
-- `QCG_MAX_REQUEST_BYTES`, `QCG_MAX_ARTIFACT_BYTES`,
-  `QCG_MAX_ARTIFACT_ENTRIES`, `QCG_MAX_ASSET_BYTES`: explicit max for
+- `MAX_REQUEST_BYTES`, `MAX_ARTIFACT_BYTES`,
+  `MAX_ARTIFACT_ENTRIES`, `MAX_ASSET_BYTES`: explicit max for
   `qcg serve` request bodies, artifact ZIP output, and generator assets.
   Unset means no mechanistic limit.

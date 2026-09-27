@@ -45,7 +45,6 @@ source = "config.json"
 description = "Runs llm.repair from a check on_fail repair cycle"
 id = "repair-cycle-fake"
 name = "Repair Cycle Fake"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [llm]

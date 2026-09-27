@@ -25,7 +25,6 @@ output_file = "answer.txt"
 description = "Asks for a declared choice during generation."
 id = "ask-user"
 name = "Ask User"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [permissions]

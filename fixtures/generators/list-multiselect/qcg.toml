@@ -11,7 +11,6 @@ template = "templates/summary.txt.j2"
 description = "Exercises first-class list and multiselect Web UI inputs."
 id = "list-multiselect"
 name = "List Multiselect"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [[inputs.stages]]

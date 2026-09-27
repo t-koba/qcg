@@ -56,7 +56,6 @@ output_file = "selection.txt"
 description = "Selects a provider, model, and effort from the live catalog."
 id = "catalog-selection"
 name = "Catalog Selection"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [permissions]

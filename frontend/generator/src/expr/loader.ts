@@ -41,7 +41,7 @@ async function loadWasm(): Promise<LoadedWasmModule> {
     // A failed load is never cached. The module is a build artifact
     // (`npm run generate:wasm`), so a cached rejection would keep every later
     // `when` evaluation broken for the rest of the session.
-    wasmPromise = import("./pkg/qcg_expr_wasm.js")
+    wasmPromise = import("./pkg/expr_wasm.js")
       .then(async (loaded) => {
         const module = loaded as WasmModule;
         if (module.default) {
@@ -54,7 +54,7 @@ async function loadWasm(): Promise<LoadedWasmModule> {
       })
       .catch((error: unknown) => {
         wasmPromise = null;
-        throw new Error(`the qcg expression module failed to load: ${describe(error)}`);
+        throw new Error(`the expression module failed to load: ${describe(error)}`);
       });
   }
   return wasmPromise;

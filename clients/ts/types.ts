@@ -2091,7 +2091,6 @@ export interface components {
             id: string;
             /** @default  */
             name: string;
-            qcg_version: string;
             version: string;
         };
         /** GeneratorSummary */
@@ -2847,7 +2846,7 @@ export interface components {
                 [key: string]: unknown;
             };
             /**
-             * @description Free-form run metadata admitted with the run. Metadata only: qcg
+             * @description Free-form run metadata admitted with the run. Metadata only: the runtime
              *     never reads identity or enforces authorization from labels.
              * @default {}
              */
@@ -2865,7 +2864,6 @@ export interface components {
              * @default 0
              */
             priority: number;
-            qcg: string;
             /**
              * @description Durable admission instant for queue ordering. Written by fork
              *     admissions and requeues; absent entries fall back to the event
@@ -3072,7 +3070,7 @@ export interface components {
         /** @description Authentication required */
         Unauthorized: {
             headers: {
-                /** @description Bearer realm="qcg"; the request carried no valid API token */
+                /** @description Bearer realm="api"; the request carried no valid API token */
                 "WWW-Authenticate"?: string;
                 [name: string]: unknown;
             };

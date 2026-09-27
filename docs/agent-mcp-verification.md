@@ -16,7 +16,7 @@ layer below must pass independently before the feature is considered working.
 | Delegation | A specialist can use only named sibling tools, cannot delegate recursively, and inherits side-effect restrictions. A deterministic integration fixture executes the complete parent-to-specialist-to-parent sequence. | `specialist_agents_are_bounded_and_inherit_delegated_side_effects`, `specialist_agents_reject_unknown_and_recursive_delegation`, `llm-agent-fake` fixture smoke |
 | Skill activation | A `skill` agent tool exposes the declared skill catalog, activates only enumerated skills, returns instructions plus a path-only resource listing, reads requested references on demand, never grants permissions, and charges per-tool calls. | `agent_skill_tool_activates_a_skill_and_reads_references`, `skill_library_fixture_scans_child_skills` |
 | Specialist schema | Specialist input and output schemas are package-relative, size/complexity bounded, compiled during validation, and output is validated locally. | manifest and step validation tests |
-| Package paths | Prompt, response schema, specialist schema, resource, asset, and bundled executable paths are resolved through one canonical package boundary. Absolute paths, parent traversal, and symlink escapes fail before built-in loader dispatch or command execution. | `qcg-contract` path tests and `contract_load_rejects_resource_paths_before_loader_dispatch` |
+| Package paths | Prompt, response schema, specialist schema, resource, asset, and bundled executable paths are resolved through one canonical package boundary. Absolute paths, parent traversal, and symlink escapes fail before built-in loader dispatch or command execution. | `contract` path tests and `contract_load_rejects_resource_paths_before_loader_dispatch` |
 | Specialist model | An override is resolved and capability-checked before the request; the parent model is not used as an intermediate validation target. | provider capability tests |
 | Parallel calls | Multiple read-only calls may be returned in one model turn and are completed in deterministic order. Interactive or side-effectful calls in a parallel batch fail before execution. | specialist and side-effect tests |
 | Interruption | Durable checkpoints preserve provider state, messages, token counts, and tool counts. An indeterminate side effect is never replayed automatically. | engine journal and agent checkpoint tests |
@@ -28,9 +28,9 @@ layer below must pass independently before the feature is considered working.
 |---|---|---|
 | Mode selection | `auto` selects native strict, native compatible, or prompt plus local validation from the schema and provider capabilities. | `explicit_native_strict_rejects_incompatible_schema_before_transport` |
 | Structured output with tools | Native schema mode is used during tool-enabled turns only when the provider advertises `structured_output_with_tools`; otherwise `auto` selects prompt mode. An explicit unsupported native mode fails. | `structured_output_with_tools_respects_the_provider_capability` |
-| Local validation | The complete supported JSON Schema dialect is compiled once per validation operation and reports every violation, including references, combinators, strings, numbers, arrays, and closed objects. Provider-native compatibility is a separate transport decision and never weakens local validation. | `qcg-engine` validation tests and response-schema step validation |
-| OpenAI Chat | Tool call IDs, arguments, finish reasons, streaming deltas, and usage are normalized. | `qcg-llm` Chat request/response and stream tests |
-| OpenAI Responses | Provider state is preserved across tool continuations and validated as an array. | `qcg-llm` Responses tests and agent checkpoint path |
+| Local validation | The complete supported JSON Schema dialect is compiled once per validation operation and reports every violation, including references, combinators, strings, numbers, arrays, and closed objects. Provider-native compatibility is a separate transport decision and never weakens local validation. | `engine` validation tests and response-schema step validation |
+| OpenAI Chat | Tool call IDs, arguments, finish reasons, streaming deltas, and usage are normalized. | `llm` Chat request/response and stream tests |
+| OpenAI Responses | Provider state is preserved across tool continuations and validated as an array. | `llm` Responses tests and agent checkpoint path |
 | Anthropic Messages | The internal structured-response tool becomes final text and cannot be mixed with external calls; streaming and non-streaming paths agree. | `parses_anthropic_schema_tool_as_text`, `streams_anthropic_schema_tool_as_a_completed_structured_response` |
 | Cancellation and limits | Requests have timeouts, bounded bodies, cancellation, and token accounting. | provider transport and engine gateway tests |
 
@@ -39,7 +39,7 @@ layer below must pass independently before the feature is considered working.
 | Area | Required behavior | Verification |
 |---|---|---|
 | Lifecycle | Profiles choose `initialize` or `discover`; no implicit protocol fallback exists. Known public profiles are pinned to the lifecycle they actually implement. | `public_defaults_are_anonymous_and_pinned_to_exact_hosts` |
-| Transport | Streamable HTTP and stdio perform real initialization, listing, calls, isolation, cancellation, timeout, and close/reap behavior. A malformed successful HTTP JSON body fails immediately instead of entering asynchronous task polling. | `qcg-mcp` HTTP and stdio integration tests, including `malformed_success_json_fails_immediately_instead_of_timing_out` |
+| Transport | Streamable HTTP and stdio perform real initialization, listing, calls, isolation, cancellation, timeout, and close/reap behavior. A malformed successful HTTP JSON body fails immediately instead of entering asynchronous task polling. | `mcp` HTTP and stdio integration tests, including `malformed_success_json_fails_immediately_instead_of_timing_out` |
 | Discovery bounds | Pagination, response size, schema size, depth, node count, object width, and string length are bounded. | MCP schema and transport bound tests |
 | Schema trust | Descriptions and annotations are sanitized, internal references/composition work, and external references are rejected. | `mcp_schema_removes_untrusted_annotations_without_dropping_property_names`, reference and complexity tests |
 | Exact binding | A contract fixes both profile ID and remote tool name; the model sees only the declared alias. | manifest validation and `McpAgentTools::prepare` |
@@ -47,7 +47,7 @@ layer below must pass independently before the feature is considered working.
 | Complete result | `content` must be an array. `isError` must be boolean when present. A successful typed result requires valid `structuredContent`; a typed tool error remains recoverable without it. | `mcp_result_requires_structured_content_only_for_successful_typed_results` |
 | Tasks and input-required | Task polling, cancellation, supported form elicitation, stable question IDs, and durable resume are bounded. Unsupported request methods fail. | `modern_mrtr_is_exposed_for_durable_hitl_and_can_resume`, MCP input-required tests |
 | Failure classification | Tool-declared errors return to the model. Transport, protocol, schema, credential-reflection, and cancellation errors fail the step explicitly. | `mcp_tool_error_is_recoverable_but_transport_error_is_not` and transport tests |
-| Secret handling | Credentials never enter model-visible schemas/events, are scanned in results/errors, and are not printed by debug formatting. | qcg-mcp credential and reflection tests |
+| Secret handling | Credentials never enter model-visible schemas/events, are scanned in results/errors, and are not printed by debug formatting. | mcp credential and reflection tests |
 
 ## Public Exa and Parallel profiles
 
@@ -89,7 +89,7 @@ limits do not rely on a timing-sensitive E2E assertion.
 ## Required validation order
 
 1. Format, compile, generated-document, fixture, and contract validation.
-2. `qcg-llm`, `qcg-mcp`, and `qcg-llm-steps` unit/integration suites.
+2. `llm`, `mcp`, and `llm-steps` unit/integration suites.
 3. The real anonymous Exa and Parallel contract test.
 4. Full workspace tests and Clippy with warnings denied.
 5. Frontend API generation check, Svelte check, and Vitest.

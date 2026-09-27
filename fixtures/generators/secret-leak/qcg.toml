@@ -11,7 +11,6 @@ prompt = "prompts/draft.j2"
 description = "Negative fixture: prompt contains a secret value and must fail"
 id = "secret-leak"
 name = "Secret Leak"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [llm]
@@ -33,4 +32,4 @@ side_effects_scope = "invocation"
 [permissions.containers]
 enabled = false
 [secrets.api_token]
-env = "QCG_TEST_TOKEN"
+env = "TEST_TOKEN"

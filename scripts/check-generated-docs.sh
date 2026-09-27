@@ -4,9 +4,9 @@ set -euo pipefail
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-cargo run -q -p qcg --locked -- docs step-schemas > "$tmp/step-schemas"
-cargo run -q -p qcg --locked -- docs run-events > "$tmp/run-events"
-cargo run -q -p qcg --locked -- docs openapi > "$tmp/openapi.json"
+cargo run -q -p cli --locked -- docs step-schemas > "$tmp/step-schemas"
+cargo run -q -p cli --locked -- docs run-events > "$tmp/run-events"
+cargo run -q -p cli --locked -- docs openapi > "$tmp/openapi.json"
 
 trim_trailing_blank_lines() {
   local source="$1"
@@ -18,8 +18,8 @@ trim_trailing_blank_lines "$tmp/step-schemas" "$tmp/step-schemas-normalized"
 trim_trailing_blank_lines "$tmp/run-events" "$tmp/run-events-normalized"
 trim_trailing_blank_lines "$tmp/openapi.json" "$tmp/openapi-normalized.json"
 
-awk '/<!-- qcg-step-schemas:start -->/{inside=1; next} /<!-- qcg-step-schemas:end -->/{inside=0} inside' docs/contract-reference.md | awk '{lines[NR]=$0; if ($0 !~ /^[[:space:]]*$/) last=NR} END {for (i=1; i<=last; i++) print lines[i]}' > "$tmp/step-schemas-doc"
-awk '/<!-- qcg-run-events:start -->/{inside=1; next} /<!-- qcg-run-events:end -->/{inside=0} inside' docs/run-event-reference.md | awk '{lines[NR]=$0; if ($0 !~ /^[[:space:]]*$/) last=NR} END {for (i=1; i<=last; i++) print lines[i]}' > "$tmp/run-events-doc"
+awk '/<!-- step-schemas:start -->/{inside=1; next} /<!-- step-schemas:end -->/{inside=0} inside' docs/contract-reference.md | awk '{lines[NR]=$0; if ($0 !~ /^[[:space:]]*$/) last=NR} END {for (i=1; i<=last; i++) print lines[i]}' > "$tmp/step-schemas-doc"
+awk '/<!-- run-events:start -->/{inside=1; next} /<!-- run-events:end -->/{inside=0} inside' docs/run-event-reference.md | awk '{lines[NR]=$0; if ($0 !~ /^[[:space:]]*$/) last=NR} END {for (i=1; i<=last; i++) print lines[i]}' > "$tmp/run-events-doc"
 
 diff -u "$tmp/step-schemas-normalized" "$tmp/step-schemas-doc"
 diff -u "$tmp/run-events-normalized" "$tmp/run-events-doc"

@@ -30,7 +30,6 @@ Optional:
 
 - `description`
 - `authors`
-- `qcg_version`
 
 ## `[dependencies]`
 
@@ -308,7 +307,7 @@ effects are denied unless explicitly declared.
   query values also bind), the header digest, body digest, and
   `sensitive_query` digest
   (`http_operation_details` in
-  `crates/qcg-engine/src/engine/run_context.rs`); for commands, the argv plus
+  `crates/engine/src/engine/run_context.rs`); for commands, the argv plus
   the stdin digest; secret values bind the digest but never enter the journal
   (see `docs/security.md` contract sandbox). URL query VALUES are redacted by
   default in journals (keys stay visible); `sensitive_query = ["name", ...]`
@@ -325,7 +324,7 @@ effects are denied unless explicitly declared.
   (`execution:<node>:<count>` invocation id), while agent `mcp` tool calls
   bind the model call id plus canonical redacted args (continuation key
   `<node>:agentmcp:<alias>:<invocation_hash>#__mcp_pending` in
-  `crates/qcg-llm-steps/src/tool_events.rs`; the suffix marks stored
+  `crates/llm-steps/src/tool_events.rs`; the suffix marks stored
   continuations), so one can never authorize the
   other.
 
@@ -342,7 +341,7 @@ effects are denied unless explicitly declared.
   retries and crash resumes keep the current identity, while a repair or
   regenerate is a new invocation that re-confirms), or the stable model call
   id for agent tool calls. The operation id (`run:node:sha256(invocation)` in
-  `crates/qcg-engine/src/state.rs`) is the remote idempotency key, never a
+  `crates/engine/src/state.rs`) is the remote idempotency key, never a
   confirmation id. Predict confirmation ids from a prior `confirm_request`
   event or run snapshot `confirm.id` (both carry the full id including scope and invocation hash); `side_effect` events carry only the content digest and never predict invocation-scoped ids alone; a second
   approval for different content and native convergence across resends are
@@ -686,7 +685,7 @@ are explicit errors.
 The following block is generated from the registered `StepExecutor::params_schema()`
 metadata. Update it with `qcg docs step-schemas`.
 
-<!-- qcg-step-schemas:start -->
+<!-- step-schemas:start -->
 ### `ask_user`
 
 ```json
@@ -3806,7 +3805,7 @@ metadata. Update it with `qcg docs step-schemas`.
   "type": "object"
 }
 ```
-<!-- qcg-step-schemas:end -->
+<!-- step-schemas:end -->
 
 `fail`
 : Fail intentionally with `content`.
@@ -4117,7 +4116,7 @@ fields are rejected when their structs define a closed schema.
    `max_cost_usd` are enforced at attempt entry (`StepContext::step_checkpoint`)
    plus per-tool-call checkpoints inside agent execution (never mid-token-stream,
    but checked on every tool call boundary as well as every attempt start) (E11).
-   Plan estimates (`--plan --diff` forecast/`estimates` in `crates/qcg/src/cli/plan.rs`,
+   Plan estimates (`--plan --diff` forecast/`estimates` in `crates/cli/src/cli/plan.rs`,
    FOREIGN) report these declared budgets read-only and enforce nothing themselves:
    they must be presented with the enforcement strengths above (elapsed is a hard
    deadline, tokens/cost are checkpoint-only), never as bounds the plan itself
@@ -4213,7 +4212,7 @@ failure stay outside the guaranteed boundary as stated above, so no test
 fault-injects them: the table below pins the process-crash contract that
 native tests do cover.
 
-Terminal-only fsync mapping (`crates/qcg-engine/src/journal/writer.rs`):
+Terminal-only fsync mapping (`crates/engine/src/journal/writer.rs`):
 
 | path | what is fsynced | when |
 |---|---|---|
@@ -4255,7 +4254,7 @@ the router, then start recovery before resident tasks; shutdown order is
 signal, stop accepting mutating work, HTTP drain bounded by 30 s
 (`DRAIN_TIMEOUT`), mark the service shutting down, then resident-task
 shutdown and active-run settlement concurrently under a 150 second outer
-deadline (`SHUTDOWN_DEADLINE` in `crates/qcg-server/src/server/serve.rs`,
+deadline (`SHUTDOWN_DEADLINE` in `crates/server/src/server/serve.rs`,
 returned as `Err` to the embedding host by `serve_with_listener_and_deadline`;
 see `docs/operations.md` for the normative shutdown contract). In shared mode,
 stopping one peer settles that peer's tracked runs only; other peers keep

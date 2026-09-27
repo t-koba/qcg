@@ -1,9 +1,8 @@
 use camino::{Utf8Path, Utf8PathBuf};
-use qcg_contract::Contract;
-use qcg_service::DirectRun;
+use contract::Contract;
 use serde_json::{Value, json};
+use service::DirectRun;
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::PathBuf;
 
 fn workspace_root() -> Utf8PathBuf {
@@ -16,7 +15,7 @@ fn workspace_root() -> Utf8PathBuf {
 
 fn run_dir(name: &str) -> Utf8PathBuf {
     Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
-        "qcg-self-hosting-{}-{}",
+        "self-hosting-{}-{}",
         std::process::id(),
         name
     )))
@@ -112,7 +111,8 @@ async fn run_generator(
 /// contaminate the contract used for the depth-2 reproduction check.
 fn generator_blueprint() -> Value {
     let root = workspace_root().join("generators/generator");
-    let text = fs::read_to_string(root.join("qcg.toml")).expect("builder qcg.toml");
+    let text =
+        std::fs::read_to_string(root.join(contract::MANIFEST_FILE)).expect("builder qcg.toml");
     let value: toml::Value = toml::from_str(&text).expect("builder manifest should parse");
     let mut manifest = serde_json::to_value(value).expect("manifest converts to JSON");
     let asset_dirs = manifest
@@ -134,7 +134,7 @@ fn generator_blueprint() -> Value {
     }
 
     let mut sources = BTreeMap::new();
-    for entry in qcg_fs::WalkDir::new(&root).filter_map(Result::ok) {
+    for entry in files::WalkDir::new(&root).filter_map(Result::ok) {
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -151,7 +151,7 @@ fn generator_blueprint() -> Value {
         {
             continue;
         }
-        let content = fs::read_to_string(path).expect("builder sources are UTF-8 text files");
+        let content = std::fs::read_to_string(path).expect("builder sources are UTF-8 text files");
         sources.insert(
             relative.as_str().replace('\\', "/"),
             json!({"encoding": "utf8", "content": content}),
@@ -194,14 +194,14 @@ fn builder_answers_with<const N: usize>(items: [(&str, Value); N]) -> BTreeMap<S
 }
 
 fn manifest_as_json(path: &Utf8Path) -> Value {
-    let text = fs::read_to_string(path).expect("manifest should be readable");
+    let text = std::fs::read_to_string(path).expect("manifest should be readable");
     let value: toml::Value = toml::from_str(&text).expect("manifest should parse as TOML");
     serde_json::to_value(value).expect("TOML converts to JSON")
 }
 
 fn file_set(root: &Utf8Path) -> Vec<String> {
     let mut files = Vec::new();
-    for entry in qcg_fs::WalkDir::new(root).filter_map(Result::ok) {
+    for entry in files::WalkDir::new(root).filter_map(Result::ok) {
         if entry.file_type().is_file() {
             files.push(
                 entry
@@ -253,7 +253,7 @@ async fn generator_reproduces_itself_and_the_clone_reproduces_again() {
     for (path, source) in blueprint_sources {
         assert_eq!(source["encoding"], "utf8");
         let expected = source["content"].as_str().expect("source content");
-        let actual = fs::read_to_string(clone_a_root.join(path))
+        let actual = std::fs::read_to_string(clone_a_root.join(path))
             .unwrap_or_else(|error| panic!("source `{path}` should exist: {error}"));
         assert_eq!(
             actual, expected,
@@ -263,7 +263,7 @@ async fn generator_reproduces_itself_and_the_clone_reproduces_again() {
 
     // Capability parity: the reproduced flow is the original flow.
     let original = manifest_as_json(&workspace_root().join("generators/generator/qcg.toml"));
-    let reproduced = manifest_as_json(&clone_a_root.join("qcg.toml"));
+    let reproduced = manifest_as_json(&clone_a_root.join(contract::MANIFEST_FILE));
     for section in [
         "generator",
         "flow",
@@ -312,8 +312,8 @@ async fn generator_reproduces_itself_and_the_clone_reproduces_again() {
     let clone_b_root = clone_b.join("generator");
     Contract::load(&clone_b_root).expect("depth 2 builder should validate");
     assert_file_eq(
-        &clone_a_root.join("qcg.toml"),
-        &clone_b_root.join("qcg.toml"),
+        &clone_a_root.join(contract::MANIFEST_FILE),
+        &clone_b_root.join(contract::MANIFEST_FILE),
     );
     assert_eq!(
         file_set(&clone_a_root),
@@ -322,13 +322,13 @@ async fn generator_reproduces_itself_and_the_clone_reproduces_again() {
     );
 
     for dir in ["clone-a", "clone-b", "runs"] {
-        let _ = fs::remove_dir_all(run_dir(dir));
+        let _ = std::fs::remove_dir_all(run_dir(dir));
     }
 }
 
 fn assert_file_eq(left: &Utf8Path, right: &Utf8Path) {
-    let left_text = fs::read_to_string(left).expect("left file should be readable");
-    let right_text = fs::read_to_string(right).expect("right file should be readable");
+    let left_text = std::fs::read_to_string(left).expect("left file should be readable");
+    let right_text = std::fs::read_to_string(right).expect("right file should be readable");
     assert_eq!(left_text, right_text);
 }
 

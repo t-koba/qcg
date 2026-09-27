@@ -1,0 +1,44 @@
+[package]
+name = "cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "qcg"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+aws-lc-rs.workspace = true
+camino.workspace = true
+chrono.workspace = true
+clap.workspace = true
+dunce.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+libc.workspace = true
+api = { path = "../api" }
+contract = { path = "../contract" }
+engine = { path = "../engine" }
+files = { path = "../files" }
+service = { path = "../service" }
+policy = { path = "../policy" }
+server = { path = "../server" }
+model = { path = "../model" }
+reqwest.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+semver.workspace = true
+sha2.workspace = true
+url.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread", "time"] }
+toml.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+zip.workspace = true

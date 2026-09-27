@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-QCG_BIN="${QCG_BIN:-target/debug/qcg}"
+BIN="${BIN:-target/debug/qcg}"
 QPXD_BIN="${QPXD_BIN:-qpxd}"
-QCG_PORT="${QCG_PORT:-18080}"
+PORT="${PORT:-18080}"
 QPX_PORT="${QPX_PORT:-18081}"
 
-if [[ ! -x "$QCG_BIN" ]]; then
-  echo "qcg binary is not executable: $QCG_BIN" >&2
+if [[ ! -x "$BIN" ]]; then
+  echo "qcg binary is not executable: $BIN" >&2
   exit 1
 fi
 if ! command -v "$QPXD_BIN" >/dev/null 2>&1 && [[ ! -x "$QPXD_BIN" ]]; then
@@ -38,7 +38,7 @@ edges:
     timeout_ms: 600000
     target:
       type: upstream
-      upstreams: ["http://127.0.0.1:$QCG_PORT"]
+      upstreams: ["http://127.0.0.1:$PORT"]
       lb: round_robin
 EOF
 
@@ -56,14 +56,14 @@ for source in fixtures/generators generators; do
   fi
 done
 
-"$QCG_BIN" serve --bind 127.0.0.1 --port "$QCG_PORT" --generators-dir "$generators_dir" \
+"$BIN" serve --bind 127.0.0.1 --port "$PORT" --generators-dir "$generators_dir" \
   --runs-dir "$tmp/runs" >"$tmp/qcg.log" 2>&1 &
 qcg_pid=$!
 for _ in {1..100}; do
-  curl -fsS "http://127.0.0.1:$QCG_PORT/healthz" >/dev/null 2>&1 && break
+  curl -fsS "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1 && break
   sleep 0.05
 done
-curl -fsS "http://127.0.0.1:$QCG_PORT/healthz" >/dev/null
+curl -fsS "http://127.0.0.1:$PORT/healthz" >/dev/null
 
 "$QPXD_BIN" run --config "$tmp/qpx.yaml" >"$tmp/qpx.log" 2>&1 &
 qpx_pid=$!

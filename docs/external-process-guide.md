@@ -2,7 +2,7 @@
 
 qcg generator packages run specialized generation and validation logic as
 ordinary external processes. They communicate through standard input and
-output, with no qcg-specific plugin interface. This keeps the generator
+output, with no product-specific plugin interface. This keeps the generator
 portable while preserving qcg's limits, workspace containment, journal,
 artifacts, and permission checks.
 

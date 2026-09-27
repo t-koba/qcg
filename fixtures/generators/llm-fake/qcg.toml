@@ -36,7 +36,6 @@ prompt = "prompts/generate.j2"
 description = "Deterministic LLM example using the fake provider"
 id = "llm-fake"
 name = "Fake LLM"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [[inputs.stages]]

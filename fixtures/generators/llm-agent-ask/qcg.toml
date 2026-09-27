@@ -27,7 +27,6 @@ output_file = "result.txt"
 description = "Deterministic llm.agent example using ask_user as a tool."
 id = "llm-agent-ask"
 name = "Fake LLM Agent Ask"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [llm]

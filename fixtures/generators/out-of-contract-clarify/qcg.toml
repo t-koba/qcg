@@ -16,7 +16,6 @@ schema = "schemas/result.schema.json"
 description = "Turns an out-of-contract LLM response into a user clarification"
 id = "out-of-contract-clarify"
 name = "Out Of Contract Clarify"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [llm]

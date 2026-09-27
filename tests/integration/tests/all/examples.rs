@@ -1,23 +1,22 @@
 use camino::{Utf8Path, Utf8PathBuf};
-use qcg_contract::{
+use contract::{
     AgentFailureAction, ContextRef, Contract, FieldType, LlmRequestPolicy, ModelRef, OnDeps,
     ResourceContextRef, RuntimeLimits, ToolDecl,
 };
-use qcg_engine::TemplateService;
-use qcg_server::ServerConfig;
-use qcg_service::{DirectRun, direct_run_meta_dir, read_events_with_audit, read_journal_events};
-use qcg_types::{StructuredOutputMode, ToolChoice};
+use engine::TemplateService;
+use model::{StructuredOutputMode, ToolChoice};
 use reqwest::header;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use server::ServerConfig;
+use service::{DirectRun, direct_run_meta_dir, read_events_with_audit, read_journal_events};
 use std::collections::BTreeMap;
-use std::fs;
 use std::sync::Arc;
 use tokio::sync::{Barrier, Mutex};
 
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
-/// Restores `QCG_TEST_TOKEN` on drop so a panicking assertion cannot leak
+/// Restores `TEST_TOKEN` on drop so a panicking assertion cannot leak
 /// the canary into the process environment for later tests. Callers hold
 /// `ENV_LOCK` for the whole mutation window, and the guard is declared
 /// after it so the variable is restored before the lock releases.
@@ -27,7 +26,7 @@ impl TestSecretEnv {
     fn set(value: &str) -> Self {
         // SAFETY: the caller holds ENV_LOCK for the whole mutation window.
         unsafe {
-            std::env::set_var("QCG_TEST_TOKEN", value);
+            std::env::set_var("TEST_TOKEN", value);
         }
         Self
     }
@@ -37,7 +36,7 @@ impl Drop for TestSecretEnv {
     fn drop(&mut self) {
         // SAFETY: the caller holds ENV_LOCK for the whole mutation window.
         unsafe {
-            std::env::remove_var("QCG_TEST_TOKEN");
+            std::env::remove_var("TEST_TOKEN");
         }
     }
 }
@@ -46,7 +45,7 @@ impl Drop for TestSecretEnv {
 async fn hello_template_writes_declared_artifact() {
     let run = run_fixture(
         "hello-template",
-        inputs([("name", json!("qcg"))]),
+        inputs([("name", json!("test"))]),
         answers([]),
     )
     .await
@@ -70,7 +69,7 @@ async fn file_input_is_journaled_and_materialized_in_the_workspace() {
     .expect("file-input should run");
     assert_file_eq(&run, "files/config_file/config.json", "{\"enabled\":true}");
     assert!(
-        fs::read_to_string(run.join("summary.md"))
+        std::fs::read_to_string(run.join("summary.md"))
             .expect("summary should be readable")
             .contains("files/config_file/config.json")
     );
@@ -340,11 +339,16 @@ async fn llm_agent_retries_child_after_specialist_budget_exhaustion() {
 
 #[tokio::test]
 async fn llm_context_includes_visible_declared_resource() {
-    let run = run_fixture("llm-context", inputs([("name", json!("qcg"))]), answers([]))
-        .await
-        .expect("llm-context should run");
-    let output = fs::read_to_string(run.join("context.txt")).expect("context output should exist");
-    assert!(output.contains("<QCG_DECLARED_CONTEXT>"));
+    let run = run_fixture(
+        "llm-context",
+        inputs([("name", json!("test"))]),
+        answers([]),
+    )
+    .await
+    .expect("llm-context should run");
+    let output =
+        std::fs::read_to_string(run.join("context.txt")).expect("context output should exist");
+    assert!(output.contains("<DECLARED_CONTEXT>"));
     assert!(output.contains("resources.note"));
 }
 
@@ -355,17 +359,16 @@ async fn exec_resource_runs_a_real_allowlisted_command_and_enters_llm_context() 
         .parent()
         .expect("fixture output should have a parent")
         .join("generator");
-    let _ = fs::remove_dir_all(&fixture_root);
-    fs::create_dir_all(fixture_root.join("prompts"))
+    let _ = std::fs::remove_dir_all(&fixture_root);
+    std::fs::create_dir_all(fixture_root.join("prompts"))
         .expect("fixture directories should be creatable");
-    fs::write(
-        fixture_root.join("qcg.toml"),
+    std::fs::write(
+        fixture_root.join(contract::MANIFEST_FILE),
         r#"
 [generator]
 id = "exec-resource-fixture"
 name = "Exec resource fixture"
 version = "0.1.0"
-qcg_version = "^0.1"
 
 [llm]
 max_tokens = 512
@@ -405,7 +408,7 @@ prompt = "prompts/draft.j2"
 output_file = "context.txt""#,
     )
     .expect("fixture manifest should be writable");
-    fs::write(fixture_root.join("prompts/draft.j2"), "Use the context.")
+    std::fs::write(fixture_root.join("prompts/draft.j2"), "Use the context.")
         .expect("fixture prompt should be writable");
 
     let run = run_generator(
@@ -416,20 +419,21 @@ output_file = "context.txt""#,
     )
     .await
     .expect("exec resource generator should run");
-    let output = fs::read_to_string(run.join("context.txt")).expect("output should be readable");
+    let output =
+        std::fs::read_to_string(run.join("context.txt")).expect("output should be readable");
     assert!(output.contains("resource-from-process"), "{output}");
-    fs::remove_dir_all(fixture_root).expect("fixture directory should be removable");
+    std::fs::remove_dir_all(fixture_root).expect("fixture directory should be removable");
 }
 
 #[tokio::test]
 async fn llm_context_byte_limit_rejects_oversized_prompt() {
     let source = workspace_root().join("fixtures/generators/llm-context");
     let fixture = run_dir("llm-context-limit-fixture");
-    let _ = fs::remove_dir_all(&fixture);
+    let _ = std::fs::remove_dir_all(&fixture);
     copy_dir(&source, &fixture);
-    let manifest_path = fixture.join("qcg.toml");
-    let manifest = fs::read_to_string(&manifest_path).expect("manifest should be readable");
-    fs::write(
+    let manifest_path = fixture.join(contract::MANIFEST_FILE);
+    let manifest = std::fs::read_to_string(&manifest_path).expect("manifest should be readable");
+    std::fs::write(
         &manifest_path,
         manifest.replace(
             "max_tokens = 512",
@@ -441,7 +445,7 @@ async fn llm_context_byte_limit_rejects_oversized_prompt() {
     let error = run_generator(
         fixture,
         "llm-context-limit",
-        inputs([("name", json!("qcg"))]),
+        inputs([("name", json!("test"))]),
         answers([]),
     )
     .await
@@ -455,12 +459,12 @@ async fn run_ref_resource_pins_another_runs_declared_artifact() {
     // to a producer run through the shared run store, copies the declared
     // artifact into the consumer workspace, and pins the revision durably.
     let root = run_dir("run-ref-store");
-    let _ = fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&root);
     let generators = root.join("generators");
     let runs = root.join("runs");
-    fs::create_dir_all(generators.join("run-ref-producer")).expect("producer dir");
-    fs::create_dir_all(generators.join("run-ref-consumer")).expect("consumer dir");
-    fs::create_dir_all(generators.join("run-ref-missing")).expect("missing dir");
+    std::fs::create_dir_all(generators.join("run-ref-producer")).expect("producer dir");
+    std::fs::create_dir_all(generators.join("run-ref-consumer")).expect("consumer dir");
+    std::fs::create_dir_all(generators.join("run-ref-missing")).expect("missing dir");
     let manifest = |id: &str, body: &str| {
         format!(
             r#"
@@ -468,7 +472,6 @@ async fn run_ref_resource_pins_another_runs_declared_artifact() {
 id = "{id}"
 name = "{id}"
 version = "0.1.0"
-qcg_version = "^0.1"
 
 [permissions]
 fs_read = ["workspace"]
@@ -484,7 +487,7 @@ enabled = false
 "#
         )
     };
-    fs::write(
+    std::fs::write(
         generators.join("run-ref-producer/qcg.toml"),
         manifest(
             "run-ref-producer",
@@ -501,7 +504,7 @@ output_file = "report.txt"
         ),
     )
     .expect("producer manifest");
-    fs::write(
+    std::fs::write(
         generators.join("run-ref-consumer/qcg.toml"),
         manifest(
             "run-ref-consumer",
@@ -525,7 +528,7 @@ max_bytes = 4096
         let generator_id = generator_id.to_string();
         async move {
             service
-                .start_run(qcg_api::StartRun {
+                .start_run(api::StartRun {
                     generator_id,
                     ..Default::default()
                 })
@@ -540,10 +543,10 @@ max_bytes = 4096
                 let snapshot = service.snapshot(id.clone()).await.expect("snapshot");
                 if matches!(
                     snapshot.state,
-                    qcg_api::RunStatus::Succeeded
-                        | qcg_api::RunStatus::Failed
-                        | qcg_api::RunStatus::Canceled
-                        | qcg_api::RunStatus::Interrupted
+                    api::RunStatus::Succeeded
+                        | api::RunStatus::Failed
+                        | api::RunStatus::Canceled
+                        | api::RunStatus::Interrupted
                 ) {
                     return snapshot;
                 }
@@ -554,16 +557,16 @@ max_bytes = 4096
     };
     let producer = start("run-ref-producer").await;
     let producer_snapshot = wait_terminal(producer.clone()).await;
-    assert_eq!(producer_snapshot.state, qcg_api::RunStatus::Succeeded);
+    assert_eq!(producer_snapshot.state, api::RunStatus::Succeeded);
     let consumer = start("run-ref-consumer").await;
     let consumer_snapshot = wait_terminal(consumer.clone()).await;
     assert_eq!(
         consumer_snapshot.state,
-        qcg_api::RunStatus::Succeeded,
+        api::RunStatus::Succeeded,
         "consumer should resolve the run reference"
     );
     assert_eq!(
-        fs::read_to_string(
+        std::fs::read_to_string(
             runs.join(&consumer)
                 .join("workspace/run-refs/prev/report.txt")
         )
@@ -590,7 +593,7 @@ max_bytes = 4096
 
     // An unresolvable selector fails the run explicitly instead of silently
     // running without the declared resource.
-    fs::write(
+    std::fs::write(
         generators.join("run-ref-missing/qcg.toml"),
         manifest(
             "run-ref-missing",
@@ -608,14 +611,14 @@ max_bytes = 4096
     .expect("missing manifest");
     let missing = start("run-ref-missing").await;
     let missing_snapshot = wait_terminal(missing.clone()).await;
-    assert_eq!(missing_snapshot.state, qcg_api::RunStatus::Failed);
-    let journal = fs::read_to_string(runs.join(&missing).join("meta/journal.jsonl"))
+    assert_eq!(missing_snapshot.state, api::RunStatus::Failed);
+    let journal = std::fs::read_to_string(runs.join(&missing).join("meta/journal.jsonl"))
         .expect("missing journal");
     assert!(
         journal.contains("no-such-generator"),
         "the failure names the missing source: {journal}"
     );
-    fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&root).ok();
 }
 
 #[tokio::test]
@@ -624,13 +627,13 @@ async fn bundled_tool_command_runs_the_structured_protocol() {
     // `permissions.commands` entry: the declared package sha256 authorizes
     // the bytes, and the process speaks the structured stdin/stdout protocol.
     let fixture = run_dir("bundled-tool-command");
-    let _ = fs::remove_dir_all(&fixture);
+    let _ = std::fs::remove_dir_all(&fixture);
     let bin_dir = fixture.join(format!(
         "resources/bin/{}/{}",
         std::env::consts::OS,
         std::env::consts::ARCH
     ));
-    fs::create_dir_all(&bin_dir).expect("bin directory should be creatable");
+    std::fs::create_dir_all(&bin_dir).expect("bin directory should be creatable");
     // Windows cannot execute shell scripts directly: ship a batch file
     // there while Unix keeps the sh script. Both speak the same
     // stdin/stdout JSON protocol.
@@ -646,23 +649,22 @@ async fn bundled_tool_command_runs_the_structured_protocol() {
         )
     };
     let script = bin_dir.join(script_name);
-    fs::write(&script, script_body).expect("tool script should be writable");
+    std::fs::write(&script, script_body).expect("tool script should be writable");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
             .expect("tool script should be executable");
     }
-    let (sha256, _) = qcg_fs::hash_file_sha256(&script, None).expect("tool script should hash");
-    fs::write(
-        fixture.join("qcg.toml"),
+    let (sha256, _) = files::hash_file_sha256(&script, None).expect("tool script should hash");
+    std::fs::write(
+        fixture.join(contract::MANIFEST_FILE),
         format!(
             r#"
 [generator]
 id = "bundled-tool-command"
 name = "Bundled Tool Command"
 version = "0.1.0"
-qcg_version = "^0.1"
 
 [permissions]
 fs_read = ["workspace"]
@@ -733,7 +735,7 @@ sha256 = "{sha256}"
         }),
         "bundled resolution must be journaled"
     );
-    fs::remove_dir_all(&fixture).expect("fixture directory should be removable");
+    std::fs::remove_dir_all(&fixture).expect("fixture directory should be removable");
 }
 
 #[tokio::test]
@@ -803,7 +805,6 @@ async fn generator_accepts_core_default_metadata_and_empty_flow() {
                             "generator": {
                                 "id": "minimal-package",
                                 "version": "0.1.0",
-                                "qcg_version": "^0.1"
                             }
                         }),
                         json!({})
@@ -862,7 +863,7 @@ async fn generator_maps_public_mcp_permission_to_exact_hosts() {
         contract.manifest.permissions.network,
         ["mcp.exa.ai", "search.parallel.ai"]
     );
-    let manifest = fs::read_to_string(run.join("generator/qcg.toml"))
+    let manifest = std::fs::read_to_string(run.join("generator/qcg.toml"))
         .expect("generated manifest should be readable");
     assert!(!manifest.contains("https://"));
 }
@@ -955,18 +956,18 @@ async fn generator_materializes_binary_sources_and_preserves_extensible_contract
         &json!({"type": "object", "additionalProperties": false, "required": ["lat", "lon"], "properties": {"lat": {"type": "number"}, "lon": {"type": "number"}}})
     );
     assert_eq!(
-        fs::read(generated.join("bin/tool")).expect("binary source"),
+        std::fs::read(generated.join("bin/tool")).expect("binary source"),
         [0, 1, 2, 255]
     );
     assert_eq!(
-        fs::read_to_string(generated.join("scripts/run.sh")).expect("script source"),
+        std::fs::read_to_string(generated.join("scripts/run.sh")).expect("script source"),
         "#!/bin/sh\nexit 0\n"
     );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
         assert_eq!(
-            fs::metadata(generated.join("bin/tool"))
+            std::fs::metadata(generated.join("bin/tool"))
                 .expect("binary metadata")
                 .permissions()
                 .mode()
@@ -974,7 +975,7 @@ async fn generator_materializes_binary_sources_and_preserves_extensible_contract
             0o755
         );
         assert_eq!(
-            fs::metadata(generated.join("scripts/run.sh"))
+            std::fs::metadata(generated.join("scripts/run.sh"))
                 .expect("script metadata")
                 .permissions()
                 .mode()
@@ -982,7 +983,7 @@ async fn generator_materializes_binary_sources_and_preserves_extensible_contract
             0o755
         );
     }
-    assert!(!generated.join(".qcg-source-staging").exists());
+    assert!(!generated.join(".source-staging").exists());
     assert_eq!(contract.graph.nodes["lookup"].kind.as_str(), "mcp.call");
 }
 
@@ -993,15 +994,14 @@ async fn structured_command_executes_real_process_and_validates_output() {
         .parent()
         .expect("fixture output should have a parent")
         .join("generator");
-    let _ = fs::remove_dir_all(&fixture_root);
-    fs::create_dir_all(&fixture_root).expect("fixture directory should be created");
-    fs::write(
-        fixture_root.join("qcg.toml"),
+    let _ = std::fs::remove_dir_all(&fixture_root);
+    std::fs::create_dir_all(&fixture_root).expect("fixture directory should be created");
+    std::fs::write(
+        fixture_root.join(contract::MANIFEST_FILE),
         r#"
 [generator]
 id = "structured-command-fixture"
 version = "0.1.0"
-qcg_version = "^0.1"
 
 [permissions]
 fs_read = []
@@ -1050,7 +1050,7 @@ content = "{{ steps.structured_out.output.output.message }}""#,
             && event.get("node").and_then(Value::as_str) == Some("structured")
             && event.pointer("/output/status").and_then(Value::as_str) == Some("success")
     });
-    fs::remove_dir_all(fixture_root).expect("fixture directory should be removed");
+    std::fs::remove_dir_all(fixture_root).expect("fixture directory should be removed");
 }
 
 #[test]
@@ -1308,7 +1308,6 @@ fn generator_templates_render_typed_package_and_operator_authority() {
                                 "id": "manual-generator",
                                 "name": "Manual Generator",
                                 "version": "1.2.3",
-                                "qcg_version": ">=0.1, <1.0",
                                 "description": "Metadata-preserving manual generator",
                                 "authors": ["qcg integration"]
                             },
@@ -1324,7 +1323,7 @@ fn generator_templates_render_typed_package_and_operator_authority() {
         }
     });
 
-    let package_template = fs::read_to_string(
+    let package_template = std::fs::read_to_string(
         workspace_root().join("generators/generator/templates/blueprint-package.json.j2"),
     )
     .expect("package template should be readable");
@@ -1346,7 +1345,7 @@ fn generator_templates_render_typed_package_and_operator_authority() {
         "utf8"
     );
 
-    let base_template = fs::read_to_string(
+    let base_template = std::fs::read_to_string(
         workspace_root().join("generators/generator/templates/blueprint-base.json.j2"),
     )
     .expect("base template should be readable");
@@ -1355,7 +1354,7 @@ fn generator_templates_render_typed_package_and_operator_authority() {
         .expect("base template should render from the typed package");
     assert!(rendered_base.contains("\"flow\""));
 
-    let overlay_template = fs::read_to_string(
+    let overlay_template = std::fs::read_to_string(
         workspace_root().join("generators/generator/templates/builder-overlay.json.j2"),
     )
     .expect("overlay template should be readable");
@@ -1397,8 +1396,8 @@ async fn generator_manual_mode_never_calls_the_llm() {
     Contract::load(run.join("generator")).expect("generated generator should validate");
 
     // The write branch must reference the first declared input field.
-    let manifest =
-        fs::read_to_string(run.join("generator/qcg.toml")).expect("manifest should be readable");
+    let manifest = std::fs::read_to_string(run.join("generator/qcg.toml"))
+        .expect("manifest should be readable");
     assert!(
         manifest.contains(r#"content = "{{ inputs.request }}""#),
         "unexpected generated manifest:\n{manifest}"
@@ -1459,8 +1458,8 @@ async fn generator_manual_llm_package_runs_with_explicit_provider() {
     .expect("manual llm generator should run with an explicit provider");
     Contract::load(run.join("generator")).expect("generated LLM generator should validate");
 
-    let manifest =
-        fs::read_to_string(run.join("generator/qcg.toml")).expect("manifest should be readable");
+    let manifest = std::fs::read_to_string(run.join("generator/qcg.toml"))
+        .expect("manifest should be readable");
     assert!(manifest.contains("provider = \"fake\""));
     assert!(manifest.contains("type = \"llm.fill\""));
     assert!(!manifest.contains(r#"content = "{{ inputs.request }}""#));
@@ -1605,8 +1604,8 @@ async fn generator_llm_mode_uses_proposal() {
     .expect("generator should run");
     Contract::load(run.join("generator")).expect("generated generator should validate");
     // The packaged proposal routes through the blueprint tier.
-    let manifest =
-        fs::read_to_string(run.join("generator/qcg.toml")).expect("manifest should be readable");
+    let manifest = std::fs::read_to_string(run.join("generator/qcg.toml"))
+        .expect("manifest should be readable");
     assert!(
         manifest.contains(r#"content = "{{ inputs.request }}""#),
         "packaged proposal should drive the generated flow:\n{manifest}"
@@ -1644,17 +1643,17 @@ async fn generator_llm_mode_uses_proposal() {
 async fn generator_llm_mode_requires_a_complete_package() {
     let source = workspace_root().join("generators/generator");
     let generator = run_dir("generator-llm-no-package-source");
-    let _ = fs::remove_dir_all(&generator);
+    let _ = std::fs::remove_dir_all(&generator);
     copy_dir(&source, &generator);
 
     let prompt_path = generator.join("prompts/design.j2");
-    let prompt = fs::read_to_string(&prompt_path).expect("design prompt should be readable");
+    let prompt = std::fs::read_to_string(&prompt_path).expect("design prompt should be readable");
     let marker = prompt
         .find("FAKE_JSON:")
         .expect("design prompt should have a fake marker");
     let payload = json!({});
     let replacement = format!("FAKE_JSON: {}", serde_json::to_string(&payload).unwrap());
-    fs::write(
+    std::fs::write(
         &prompt_path,
         format!("{}{}", &prompt[..marker], replacement),
     )
@@ -1686,18 +1685,18 @@ async fn generator_llm_mode_requires_a_complete_package() {
             .join("generator/qcg.toml")
             .exists()
     );
-    let _ = fs::remove_dir_all(&generator);
+    let _ = std::fs::remove_dir_all(&generator);
 }
 
 #[tokio::test]
 async fn generator_llm_package_preserves_a_proposed_skill_resource() {
     let source = workspace_root().join("generators/generator");
     let generator = run_dir("generator-llm-package-source");
-    let _ = fs::remove_dir_all(&generator);
+    let _ = std::fs::remove_dir_all(&generator);
     copy_dir(&source, &generator);
 
     let prompt_path = generator.join("prompts/design.j2");
-    let prompt = fs::read_to_string(&prompt_path).expect("design prompt should be readable");
+    let prompt = std::fs::read_to_string(&prompt_path).expect("design prompt should be readable");
     let marker = prompt
         .find("FAKE_JSON:")
         .expect("design prompt should have a fake marker");
@@ -1708,7 +1707,6 @@ async fn generator_llm_package_preserves_a_proposed_skill_resource() {
                     "id": "packaged-skill",
                     "name": "Packaged Skill",
                     "version": "0.2.0",
-                    "qcg_version": "^0.1",
                     "description": "Preserve package sources",
                     "authors": ["integration"]
                 },
@@ -1756,7 +1754,7 @@ async fn generator_llm_package_preserves_a_proposed_skill_resource() {
         }
     });
     let replacement = format!("FAKE_JSON: {}", serde_json::to_string(&payload).unwrap());
-    fs::write(
+    std::fs::write(
         &prompt_path,
         format!("{}{}", &prompt[..marker], replacement),
     )
@@ -1793,7 +1791,7 @@ async fn generator_llm_package_preserves_a_proposed_skill_resource() {
         .resources
         .get("packaged_skill")
         .expect("proposed skill resource should be declared");
-    assert_eq!(resource.kind, qcg_contract::ResourceKind::Skill);
+    assert_eq!(resource.kind, contract::ResourceKind::Skill);
     let draft = contract
         .manifest
         .flow
@@ -1807,11 +1805,11 @@ async fn generator_llm_package_preserves_a_proposed_skill_resource() {
                 && reference.select.as_deref() == Some("instructions")
     )));
     assert_eq!(
-        fs::read_to_string(run.join("generator/resources/skills/packaged-skill/SKILL.md"))
+        std::fs::read_to_string(run.join("generator/resources/skills/packaged-skill/SKILL.md"))
             .expect("proposed skill should exist"),
         "---\nname: packaged-skill\ndescription: Preserved skill resource.\n---\n\nBody.\n"
     );
-    let _ = fs::remove_dir_all(&generator);
+    let _ = std::fs::remove_dir_all(&generator);
 }
 
 #[tokio::test]
@@ -1840,8 +1838,8 @@ async fn secret_leak_rejects_secret_and_keeps_journal_redacted() {
     let error = result.expect_err("secret-leak should fail");
     assert!(error.contains("secret `api_token`"));
     let run = run_dir("secret-leak");
-    let journal =
-        fs::read_to_string(direct_run_meta_dir(&run).join("journal.jsonl")).unwrap_or_default();
+    let journal = std::fs::read_to_string(direct_run_meta_dir(&run).join("journal.jsonl"))
+        .unwrap_or_default();
     assert!(!journal.contains("super-secret-token"));
     assert!(!run.join("out.txt").exists());
 }
@@ -1860,8 +1858,8 @@ async fn agent_secret_tool_result_is_not_cached_before_the_output_scan() {
     let error = result.expect_err("a secret tool result must fail the run");
     assert!(error.contains("secret `api_token`"), "{error}");
     let run = run_dir("agent-secret-result");
-    let journal =
-        fs::read_to_string(direct_run_meta_dir(&run).join("journal.jsonl")).unwrap_or_default();
+    let journal = std::fs::read_to_string(direct_run_meta_dir(&run).join("journal.jsonl"))
+        .unwrap_or_default();
     assert!(
         !journal.contains(canary),
         "the rejected result must not enter the journal"
@@ -1887,7 +1885,7 @@ async fn agent_secret_tool_result_is_not_cached_before_the_output_scan() {
         finished[0]
     );
     assert_eq!(
-        fs::read_to_string(run.join("ran.txt")).unwrap_or_default(),
+        std::fs::read_to_string(run.join("ran.txt")).unwrap_or_default(),
         "ran\n",
         "the external effect must have happened exactly once"
     );
@@ -1901,7 +1899,7 @@ async fn agent_secret_tool_result_never_reaches_sse() {
     let canary = "TOPSECRETVALUE";
     let _secret = TestSecretEnv::set(canary);
     let runs_dir = run_dir("agent-secret-sse-runs");
-    let _ = fs::remove_dir_all(&runs_dir);
+    let _ = std::fs::remove_dir_all(&runs_dir);
     let Some(listener) = crate::bind_loopback().await else {
         return;
     };
@@ -1909,15 +1907,15 @@ async fn agent_secret_tool_result_never_reaches_sse() {
         .local_addr()
         .expect("listener should have addr")
         .port();
-    let server = tokio::spawn(qcg_server::serve_with_listener(
+    let server = tokio::spawn(server::serve_with_listener(
         ServerConfig {
             generators_dir: workspace_root().join("fixtures/generators"),
             providers_path: None,
             extra_generators_dirs: vec![],
             runs_dir: runs_dir.clone(),
-            max_active_runs: qcg_policy::DEFAULT_MAX_ACTIVE_RUNS,
-            max_tracked_runs: qcg_policy::DEFAULT_MAX_TRACKED_RUNS,
-            run_store_mode: qcg_service::RunStoreMode::Exclusive,
+            max_active_runs: policy::DEFAULT_MAX_ACTIVE_RUNS,
+            max_tracked_runs: policy::DEFAULT_MAX_TRACKED_RUNS,
+            run_store_mode: service::RunStoreMode::Exclusive,
             cors_origins: vec![],
             api_token: None,
             max_request_bytes: None,
@@ -1966,8 +1964,8 @@ async fn resumed_agent_secret_result_refuses_replay_without_reexecuting() {
         .expect("generator path should have a parent")
         .to_path_buf();
     let output_dir = run_dir("agent-secret-resume");
-    let _ = fs::remove_dir_all(&output_dir);
-    fs::create_dir_all(&output_dir).expect("output dir should be creatable");
+    let _ = std::fs::remove_dir_all(&output_dir);
+    std::fs::create_dir_all(&output_dir).expect("output dir should be creatable");
     let service = crate::test_service(
         generators_dir,
         output_dir
@@ -1998,12 +1996,12 @@ async fn resumed_agent_secret_result_refuses_replay_without_reexecuting() {
         "resume must refuse instead of re-executing: {error}"
     );
     assert_eq!(
-        fs::read_to_string(output_dir.join("ran.txt")).unwrap_or_default(),
+        std::fs::read_to_string(output_dir.join("ran.txt")).unwrap_or_default(),
         "ran\n",
         "resume must not re-execute the external effect"
     );
     let state =
-        qcg_engine::RunState::fold_journal(&direct_run_meta_dir(&output_dir).join("journal.jsonl"))
+        engine::RunState::fold_journal(&direct_run_meta_dir(&output_dir).join("journal.jsonl"))
             .expect("resumed journal should fold");
     let record = state
         .operation_records
@@ -2011,7 +2009,7 @@ async fn resumed_agent_secret_result_refuses_replay_without_reexecuting() {
         .next()
         .expect("the rejected operation must keep a record");
     assert!(
-        matches!(record.status, qcg_engine::OperationStatus::Succeeded),
+        matches!(record.status, engine::OperationStatus::Succeeded),
         "the external operation did succeed"
     );
     assert!(
@@ -2050,7 +2048,7 @@ async fn agent_output_guardrail_rejection_finishes_without_caching() {
         finished[0]
     );
     assert_eq!(
-        fs::read_to_string(run.join("ran.txt")).unwrap_or_default(),
+        std::fs::read_to_string(run.join("ran.txt")).unwrap_or_default(),
         "ran\n",
         "the external effect must have happened exactly once"
     );
@@ -2059,7 +2057,7 @@ async fn agent_output_guardrail_rejection_finishes_without_caching() {
 #[tokio::test]
 async fn http_sse_replays_same_journal_event_sequence_for_run() {
     let runs_dir = run_dir("server-runs");
-    let _ = fs::remove_dir_all(&runs_dir);
+    let _ = std::fs::remove_dir_all(&runs_dir);
     let Some(listener) = crate::bind_loopback().await else {
         return;
     };
@@ -2067,15 +2065,15 @@ async fn http_sse_replays_same_journal_event_sequence_for_run() {
         .local_addr()
         .expect("listener should have addr")
         .port();
-    let server = tokio::spawn(qcg_server::serve_with_listener(
+    let server = tokio::spawn(server::serve_with_listener(
         ServerConfig {
             generators_dir: workspace_root().join("fixtures/generators"),
             providers_path: None,
             extra_generators_dirs: vec![],
             runs_dir: runs_dir.clone(),
-            max_active_runs: qcg_policy::DEFAULT_MAX_ACTIVE_RUNS,
-            max_tracked_runs: qcg_policy::DEFAULT_MAX_TRACKED_RUNS,
-            run_store_mode: qcg_service::RunStoreMode::Exclusive,
+            max_active_runs: policy::DEFAULT_MAX_ACTIVE_RUNS,
+            max_tracked_runs: policy::DEFAULT_MAX_TRACKED_RUNS,
+            run_store_mode: service::RunStoreMode::Exclusive,
             cors_origins: vec![],
             api_token: None,
             max_request_bytes: None,
@@ -2138,7 +2136,7 @@ async fn http_sse_replays_same_journal_event_sequence_for_run() {
 #[tokio::test]
 async fn http_concurrent_runs_keep_artifacts_and_journals_isolated() {
     let runs_dir = run_dir("server-concurrent-runs");
-    let _ = fs::remove_dir_all(&runs_dir);
+    let _ = std::fs::remove_dir_all(&runs_dir);
     let Some(listener) = crate::bind_loopback().await else {
         return;
     };
@@ -2146,15 +2144,15 @@ async fn http_concurrent_runs_keep_artifacts_and_journals_isolated() {
         .local_addr()
         .expect("listener should have addr")
         .port();
-    let server = tokio::spawn(qcg_server::serve_with_listener(
+    let server = tokio::spawn(server::serve_with_listener(
         ServerConfig {
             generators_dir: workspace_root().join("fixtures/generators"),
             providers_path: None,
             extra_generators_dirs: vec![],
             runs_dir: runs_dir.clone(),
-            max_active_runs: qcg_policy::DEFAULT_MAX_ACTIVE_RUNS,
-            max_tracked_runs: qcg_policy::DEFAULT_MAX_TRACKED_RUNS,
-            run_store_mode: qcg_service::RunStoreMode::Exclusive,
+            max_active_runs: policy::DEFAULT_MAX_ACTIVE_RUNS,
+            max_tracked_runs: policy::DEFAULT_MAX_TRACKED_RUNS,
+            run_store_mode: service::RunStoreMode::Exclusive,
             cors_origins: vec![],
             api_token: None,
             max_request_bytes: None,
@@ -2286,19 +2284,18 @@ async fn http_concurrent_runs_keep_artifacts_and_journals_isolated() {
 #[tokio::test]
 async fn http_cancel_waits_for_the_running_process_and_returns_canceled() {
     let root = run_dir("server-cancel");
-    let _ = fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&root);
     let generators_dir = root.join("generators");
     let generator = generators_dir.join("cancelable");
     let runs_dir = root.join("runs");
-    fs::create_dir_all(&generator).expect("generator directory should be created");
-    fs::write(
-        generator.join("qcg.toml"),
+    std::fs::create_dir_all(&generator).expect("generator directory should be created");
+    std::fs::write(
+        generator.join(contract::MANIFEST_FILE),
         r#"
 [generator]
 id = "cancelable"
 name = "Cancelable"
 version = "0.1.0"
-qcg_version = "^0.1"
 
 [permissions]
 fs_read = []
@@ -2334,15 +2331,15 @@ content = "unexpected""#,
         .local_addr()
         .expect("listener should have addr")
         .port();
-    let server = tokio::spawn(qcg_server::serve_with_listener(
+    let server = tokio::spawn(server::serve_with_listener(
         ServerConfig {
             generators_dir,
             providers_path: None,
             extra_generators_dirs: vec![],
             runs_dir: runs_dir.clone(),
-            max_active_runs: qcg_policy::DEFAULT_MAX_ACTIVE_RUNS,
-            max_tracked_runs: qcg_policy::DEFAULT_MAX_TRACKED_RUNS,
-            run_store_mode: qcg_service::RunStoreMode::Exclusive,
+            max_active_runs: policy::DEFAULT_MAX_ACTIVE_RUNS,
+            max_tracked_runs: policy::DEFAULT_MAX_TRACKED_RUNS,
+            run_store_mode: service::RunStoreMode::Exclusive,
             cors_origins: vec![],
             api_token: None,
             max_request_bytes: None,
@@ -2386,7 +2383,7 @@ content = "unexpected""#,
     .await
     .expect("cancel should wait for prompt process termination");
     assert_eq!(canceled["state"], "canceled");
-    let journal = fs::read_to_string(runs_dir.join(run_id).join("meta/journal.jsonl"))
+    let journal = std::fs::read_to_string(runs_dir.join(run_id).join("meta/journal.jsonl"))
         .expect("journal should be complete when HTTP cancel returns");
     assert_eq!(journal.matches("\"t\":\"run_canceled\"").count(), 1);
     assert!(
@@ -2396,13 +2393,13 @@ content = "unexpected""#,
             .exists()
     );
     server.abort();
-    let _ = fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[tokio::test]
 async fn http_assets_are_declared_generic_and_metadata_is_verbatim() {
     let runs_dir = run_dir("server-assets-runs");
-    let _ = fs::remove_dir_all(&runs_dir);
+    let _ = std::fs::remove_dir_all(&runs_dir);
     let Some(listener) = crate::bind_loopback().await else {
         return;
     };
@@ -2410,15 +2407,15 @@ async fn http_assets_are_declared_generic_and_metadata_is_verbatim() {
         .local_addr()
         .expect("listener should have addr")
         .port();
-    let server = tokio::spawn(qcg_server::serve_with_listener(
+    let server = tokio::spawn(server::serve_with_listener(
         ServerConfig {
             generators_dir: workspace_root().join("fixtures/generators"),
             providers_path: None,
             extra_generators_dirs: vec![],
             runs_dir,
-            max_active_runs: qcg_policy::DEFAULT_MAX_ACTIVE_RUNS,
-            max_tracked_runs: qcg_policy::DEFAULT_MAX_TRACKED_RUNS,
-            run_store_mode: qcg_service::RunStoreMode::Exclusive,
+            max_active_runs: policy::DEFAULT_MAX_ACTIVE_RUNS,
+            max_tracked_runs: policy::DEFAULT_MAX_TRACKED_RUNS,
+            run_store_mode: service::RunStoreMode::Exclusive,
             cors_origins: vec!["http://demo.example".into(), "http://other.example".into()],
             api_token: None,
             max_request_bytes: None,
@@ -2556,7 +2553,7 @@ async fn http_assets_are_declared_generic_and_metadata_is_verbatim() {
 #[tokio::test]
 async fn http_server_is_unauthenticated_and_writes_need_no_extra_headers() {
     let runs_dir = run_dir("server-unauthenticated-runs");
-    let _ = fs::remove_dir_all(&runs_dir);
+    let _ = std::fs::remove_dir_all(&runs_dir);
     let Some(listener) = crate::bind_loopback().await else {
         return;
     };
@@ -2564,15 +2561,15 @@ async fn http_server_is_unauthenticated_and_writes_need_no_extra_headers() {
         .local_addr()
         .expect("listener should have addr")
         .port();
-    let server = tokio::spawn(qcg_server::serve_with_listener(
+    let server = tokio::spawn(server::serve_with_listener(
         ServerConfig {
             generators_dir: workspace_root().join("fixtures/generators"),
             providers_path: None,
             extra_generators_dirs: vec![],
             runs_dir: runs_dir.clone(),
-            max_active_runs: qcg_policy::DEFAULT_MAX_ACTIVE_RUNS,
-            max_tracked_runs: qcg_policy::DEFAULT_MAX_TRACKED_RUNS,
-            run_store_mode: qcg_service::RunStoreMode::Exclusive,
+            max_active_runs: policy::DEFAULT_MAX_ACTIVE_RUNS,
+            max_tracked_runs: policy::DEFAULT_MAX_TRACKED_RUNS,
+            run_store_mode: service::RunStoreMode::Exclusive,
             cors_origins: vec![],
             api_token: None,
             max_request_bytes: None,
@@ -2662,7 +2659,7 @@ async fn http_server_is_unauthenticated_and_writes_need_no_extra_headers() {
         .expect("inline file run id should be present");
     wait_for_success(&client, &base, inline_run_id).await;
     assert_eq!(
-        fs::read_to_string(
+        std::fs::read_to_string(
             runs_dir
                 .join(inline_run_id)
                 .join("workspace/files/config_file/http.json")
@@ -2676,8 +2673,8 @@ async fn http_server_is_unauthenticated_and_writes_need_no_extra_headers() {
 #[tokio::test]
 async fn direct_run_events_match_journal_event_sequence() {
     let output_dir = run_dir("direct-run-events");
-    let _ = fs::remove_dir_all(&output_dir);
-    fs::create_dir_all(&output_dir).expect("run directory should be creatable");
+    let _ = std::fs::remove_dir_all(&output_dir);
+    std::fs::create_dir_all(&output_dir).expect("run directory should be creatable");
     let service = crate::test_service(
         workspace_root().join("fixtures/generators"),
         output_dir
@@ -2690,7 +2687,7 @@ async fn direct_run_events_match_journal_event_sequence() {
     let result = service
         .run_generator_path_with_events(DirectRun {
             generator_path: workspace_root().join("fixtures/generators/hello-template"),
-            inputs: inputs([("name", json!("qcg"))]),
+            inputs: inputs([("name", json!("test"))]),
             output_dir: output_dir.clone(),
             json_events: false,
             interactive: false,
@@ -2717,8 +2714,8 @@ async fn direct_run_events_match_journal_event_sequence() {
 #[tokio::test]
 async fn foreach_parallelism_preserves_all_iterations_and_truncates_at_budget() {
     let output_dir = run_dir("foreach-parallel-budget");
-    let _ = fs::remove_dir_all(&output_dir);
-    fs::create_dir_all(&output_dir).expect("run directory should be creatable");
+    let _ = std::fs::remove_dir_all(&output_dir);
+    std::fs::create_dir_all(&output_dir).expect("run directory should be creatable");
     let service = crate::test_service(
         workspace_root().join("fixtures/generators"),
         output_dir
@@ -2996,12 +2993,12 @@ async fn run_generator(
     let output_dir = run_dir(name);
     // Repeated invocations in one process reuse the label directory, so the
     // first attempt starts clean: dropping the parent removes both the
-    // workspace and the direct-run metadata (`.qcg/runs/direct-<hash>`)
+    // workspace and the direct-run metadata (`.data/runs/direct-<hash>`)
     // that the engine would otherwise resume from.
     if let Some(parent) = output_dir.parent() {
-        let _ = fs::remove_dir_all(parent);
+        let _ = std::fs::remove_dir_all(parent);
     }
-    fs::create_dir_all(&output_dir).expect("run directory should be creatable");
+    std::fs::create_dir_all(&output_dir).expect("run directory should be creatable");
     let generators_dir = generator_path
         .parent()
         .expect("generator path should have a parent")
@@ -3122,7 +3119,6 @@ fn package(mut manifest: Value, sources: Value) -> Value {
             "id": "generated-test",
             "name": "Generated Test",
             "version": "0.1.0",
-            "qcg_version": "^0.1",
             "description": "Integration test generator",
             "authors": []
         })
@@ -3141,7 +3137,7 @@ fn workspace_root() -> Utf8PathBuf {
 fn run_dir(name: &str) -> Utf8PathBuf {
     Utf8PathBuf::from_path_buf(
         std::env::temp_dir()
-            .join(format!("qcg-integration-{}", std::process::id()))
+            .join(format!("integration-{}", std::process::id()))
             .join(name)
             .join("output"),
     )
@@ -3149,32 +3145,32 @@ fn run_dir(name: &str) -> Utf8PathBuf {
 }
 
 fn copy_dir(source: &Utf8Path, target: &Utf8Path) {
-    fs::create_dir_all(target).expect("target directory should be creatable");
-    for entry in fs::read_dir(source).expect("source directory should be readable") {
+    std::fs::create_dir_all(target).expect("target directory should be creatable");
+    for entry in std::fs::read_dir(source).expect("source directory should be readable") {
         let entry = entry.expect("source entry should be readable");
         let source_path = Utf8PathBuf::from_path_buf(entry.path()).expect("path should be UTF-8");
         let target_path = target.join(source_path.file_name().expect("entry should have a name"));
         if source_path.is_dir() {
             copy_dir(&source_path, &target_path);
         } else {
-            fs::copy(&source_path, &target_path).expect("fixture file should be copied");
+            std::fs::copy(&source_path, &target_path).expect("fixture file should be copied");
         }
     }
 }
 
 fn assert_file_eq(run: &Utf8Path, path: &str, expected: &str) {
-    let actual = fs::read_to_string(run.join(path)).expect("artifact should be readable");
+    let actual = std::fs::read_to_string(run.join(path)).expect("artifact should be readable");
     assert_eq!(actual, expected);
 }
 
 fn assert_json_field(run: &Utf8Path, path: &str, field: &str, expected: &str) {
-    let text = fs::read_to_string(run.join(path)).expect("json artifact should be readable");
+    let text = std::fs::read_to_string(run.join(path)).expect("json artifact should be readable");
     let value: Value = serde_json::from_str(&text).expect("artifact should be JSON");
     assert_eq!(value.get(field).and_then(Value::as_str), Some(expected));
 }
 
 fn assert_required_artifact(run: &Utf8Path, path: &str) {
-    let manifest = qcg_engine::read_output_manifest(&direct_run_meta_dir(run))
+    let manifest = engine::read_output_manifest(&direct_run_meta_dir(run))
         .expect("output manifest should exist");
     assert!(
         manifest
@@ -3306,8 +3302,8 @@ async fn skill_context_fixture_renders_spec_metadata_instructions_and_references
     let run = run_fixture("skill-context", inputs([]), answers([]))
         .await
         .expect("skill-context should run");
-    let output =
-        fs::read_to_string(run.join("skill-context.txt")).expect("context output should exist");
+    let output = std::fs::read_to_string(run.join("skill-context.txt"))
+        .expect("context output should exist");
     assert!(
         output.contains(
             "Demonstrates skill resource context. Use when a generator needs a vendored Agent Skill."
@@ -3336,7 +3332,7 @@ async fn skill_library_fixture_scans_child_skills() {
     let run = run_fixture("skill-library", inputs([]), answers([]))
         .await
         .expect("skill-library should run");
-    let output = fs::read_to_string(run.join("library-context.txt"))
+    let output = std::fs::read_to_string(run.join("library-context.txt"))
         .expect("library context output should exist");
     assert!(
         output.contains("Alpha workflow for the library fixture."),
@@ -3405,25 +3401,25 @@ async fn skill_resource_without_frontmatter_fails_contract_validation() {
         .parent()
         .expect("fixture output should have a parent")
         .join("generator");
-    let _ = fs::remove_dir_all(&fixture_root);
-    fs::create_dir_all(fixture_root.join("prompts")).expect("prompt directory should be created");
-    fs::create_dir_all(fixture_root.join("resources/notes"))
+    let _ = std::fs::remove_dir_all(&fixture_root);
+    std::fs::create_dir_all(fixture_root.join("prompts"))
+        .expect("prompt directory should be created");
+    std::fs::create_dir_all(fixture_root.join("resources/notes"))
         .expect("resource directory should be created");
-    fs::write(
+    std::fs::write(
         fixture_root.join("resources/notes/SKILL.md"),
         "# No frontmatter\n",
     )
     .expect("fixture skill should be writable");
-    fs::write(fixture_root.join("prompts/draft.j2"), "Draft.")
+    std::fs::write(fixture_root.join("prompts/draft.j2"), "Draft.")
         .expect("fixture prompt should be writable");
-    fs::write(
-        fixture_root.join("qcg.toml"),
+    std::fs::write(
+        fixture_root.join(contract::MANIFEST_FILE),
         r#"
 [generator]
 id = "skill-invalid-frontmatter"
 name = "Skill invalid frontmatter"
 version = "0.1.0"
-qcg_version = "^0.1"
 
 [llm]
 max_tokens = 512
@@ -3470,7 +3466,7 @@ output_file = "draft.txt""#,
     .await
     .expect_err("a skill without frontmatter must fail validation");
     assert!(error.contains("frontmatter"), "unexpected error: {error}");
-    let _ = fs::remove_dir_all(&fixture_root);
+    let _ = std::fs::remove_dir_all(&fixture_root);
 }
 
 #[tokio::test]
@@ -3479,25 +3475,25 @@ async fn skill_resource_without_skill_md_fails_contract_validation() {
         .parent()
         .expect("fixture output should have a parent")
         .join("generator");
-    let _ = fs::remove_dir_all(&fixture_root);
-    fs::create_dir_all(fixture_root.join("prompts")).expect("prompt directory should be created");
-    fs::create_dir_all(fixture_root.join("resources/notes"))
+    let _ = std::fs::remove_dir_all(&fixture_root);
+    std::fs::create_dir_all(fixture_root.join("prompts"))
+        .expect("prompt directory should be created");
+    std::fs::create_dir_all(fixture_root.join("resources/notes"))
         .expect("resource directory should be created");
-    fs::write(
+    std::fs::write(
         fixture_root.join("resources/notes/README.md"),
         "No skill here.",
     )
     .expect("fixture file should be writable");
-    fs::write(fixture_root.join("prompts/draft.j2"), "Draft.")
+    std::fs::write(fixture_root.join("prompts/draft.j2"), "Draft.")
         .expect("fixture prompt should be writable");
-    fs::write(
-        fixture_root.join("qcg.toml"),
+    std::fs::write(
+        fixture_root.join(contract::MANIFEST_FILE),
         r#"
 [generator]
 id = "skill-missing-file"
 name = "Skill missing file"
 version = "0.1.0"
-qcg_version = "^0.1"
 
 [llm]
 max_tokens = 512
@@ -3544,7 +3540,7 @@ output_file = "draft.txt""#,
     .await
     .expect_err("a skill directory without SKILL.md must fail validation");
     assert!(error.contains("SKILL.md"), "unexpected error: {error}");
-    let _ = fs::remove_dir_all(&fixture_root);
+    let _ = std::fs::remove_dir_all(&fixture_root);
 }
 
 #[tokio::test]
@@ -3553,32 +3549,32 @@ async fn skill_library_child_without_description_fails_contract_validation() {
         .parent()
         .expect("fixture output should have a parent")
         .join("generator");
-    let _ = fs::remove_dir_all(&fixture_root);
-    fs::create_dir_all(fixture_root.join("prompts")).expect("prompt directory should be created");
-    fs::create_dir_all(fixture_root.join("resources/skills/good"))
+    let _ = std::fs::remove_dir_all(&fixture_root);
+    std::fs::create_dir_all(fixture_root.join("prompts"))
+        .expect("prompt directory should be created");
+    std::fs::create_dir_all(fixture_root.join("resources/skills/good"))
         .expect("skill directory should be created");
-    fs::create_dir_all(fixture_root.join("resources/skills/bad"))
+    std::fs::create_dir_all(fixture_root.join("resources/skills/bad"))
         .expect("skill directory should be created");
-    fs::write(
+    std::fs::write(
         fixture_root.join("resources/skills/good/SKILL.md"),
         "---\nname: good\ndescription: A valid library skill.\n---\n",
     )
     .expect("fixture skill should be writable");
-    fs::write(
+    std::fs::write(
         fixture_root.join("resources/skills/bad/SKILL.md"),
         "---\nname: bad\n---\n",
     )
     .expect("fixture skill should be writable");
-    fs::write(fixture_root.join("prompts/draft.j2"), "Draft.")
+    std::fs::write(fixture_root.join("prompts/draft.j2"), "Draft.")
         .expect("fixture prompt should be writable");
-    fs::write(
-        fixture_root.join("qcg.toml"),
+    std::fs::write(
+        fixture_root.join(contract::MANIFEST_FILE),
         r#"
 [generator]
 id = "skill-library-invalid-child"
 name = "Skill library invalid child"
 version = "0.1.0"
-qcg_version = "^0.1"
 
 [llm]
 max_tokens = 512
@@ -3625,5 +3621,5 @@ output_file = "draft.txt""#,
     .await
     .expect_err("a library child without a description must fail validation");
     assert!(error.contains("description"), "unexpected error: {error}");
-    let _ = fs::remove_dir_all(&fixture_root);
+    let _ = std::fs::remove_dir_all(&fixture_root);
 }

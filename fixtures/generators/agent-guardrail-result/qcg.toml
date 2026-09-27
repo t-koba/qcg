@@ -28,7 +28,6 @@ command = ["sh", "-c", "echo review-required; echo ran >> ran.txt"]
 description = "Negative fixture: an output guardrail rejects the agent tool result before it is cached."
 id = "agent-guardrail-result"
 name = "Agent Guardrail Result"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [llm]

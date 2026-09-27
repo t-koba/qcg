@@ -3,7 +3,6 @@ id = "schema-ui"
 name = "Schema-driven UI"
 description = "Exercises recursive object, array, and union input controls."
 version = "0.1.0"
-qcg_version = "^0.1"
 
 [permissions]
 fs_read = []

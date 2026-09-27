@@ -57,7 +57,6 @@ output_file = "joined.txt"
 description = "Exercises parallel execution of independent DAG nodes."
 id = "parallel-wave"
 name = "Parallel Wave"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [permissions]

@@ -2,7 +2,6 @@
 id = "package-reinput"
 name = "Package Reinput"
 version = "0.1.0"
-qcg_version = "^0.1"
 description = "Accepts a prior package file plus extra info and re-emits an edited summary."
 
 [[inputs.stages]]

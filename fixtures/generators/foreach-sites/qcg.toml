@@ -33,7 +33,6 @@ output_file = "done.txt"
 description = "DAG foreach example"
 id = "foreach-sites"
 name = "Foreach Sites"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [[inputs.stages]]

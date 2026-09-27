@@ -49,7 +49,7 @@
   }
 
   type ThemeChoice = "light" | "dark" | "system";
-  const themeStorageKey = "qcg-theme";
+  const themeStorageKey = "theme";
   let theme = $state<ThemeChoice>("system");
 
   function applyTheme(choice: ThemeChoice): void {
@@ -111,13 +111,13 @@
 
 </script>
 
-<svelte:head><title>{generatorName === messages.selectGenerator ? "qcg" : `${generatorName} · qcg`}</title></svelte:head>
+<svelte:head><title>{generatorName === messages.selectGenerator ? "generator" : `${generatorName} · generator`}</title></svelte:head>
 
 <div class="app-shell">
   <aside class="sidebar">
-    <div class="brand" aria-label="qcg">
-      <div class="mark" aria-hidden="true">q</div>
-      <div><strong>qcg</strong><span>generator workspace</span></div>
+    <div class="brand" aria-label="generator">
+      <div class="mark" aria-hidden="true">g</div>
+      <div><strong>generator</strong><span>generator workspace</span></div>
     </div>
 
     <nav class="generator-nav" aria-label={messages.generators}>
@@ -174,7 +174,7 @@
 
       <header class="workspace-header">
         <div>
-          <p class="eyebrow">{store.detail?.generator?.id || "qcg"}</p>
+          <p class="eyebrow">{store.detail?.generator?.id || "generator"}</p>
           <h1>{generatorName}</h1>
           {#if store.detail?.generator?.description}
             <p class="generator-description">{store.detail.generator.description}</p>

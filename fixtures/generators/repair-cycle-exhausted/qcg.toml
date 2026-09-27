@@ -45,7 +45,6 @@ source = "config.json"
 description = "Demonstrates bounded repair exhaustion"
 id = "repair-cycle-exhausted"
 name = "Repair Cycle Exhausted"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [llm]

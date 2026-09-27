@@ -1,0 +1,40 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
+publish.workspace = true
+
+[features]
+default = ["server-cors"]
+server-cors = ["dep:tower-http"]
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+camino.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+libc.workspace = true
+policy = { path = "../policy" }
+api = { path = "../api" }
+service = { path = "../service" }
+model = { path = "../model" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["fs", "macros", "net", "rt", "signal", "sync", "time"] }
+tokio-stream.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+tower-http = { workspace = true, optional = true }
+
+[dev-dependencies]
+tower.workspace = true

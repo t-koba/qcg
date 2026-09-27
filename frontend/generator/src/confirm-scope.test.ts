@@ -77,7 +77,7 @@ describe("confirm second-time display", () => {
 
 // Q1 docs-to-key conformance: operations.md documents the MCP continuation
 // key as `<node>:agentmcp:<alias>:<invocation_hash>#__mcp_pending`. The key
-// constructor lives in FOREIGN `qcg-llm-steps/src/tool_events.rs`
+// constructor lives in FOREIGN `llm-steps/src/tool_events.rs`
 // (`pending_key_for_agent_mcp`), so this test pins the documented FORMAT
 // against a captured real key shape instead of importing foreign code.
 describe("mcp continuation key format", () => {

@@ -55,7 +55,6 @@ output_file = "fallback.txt"
 description = "Routes to a fallback node when bounded repair is exhausted."
 id = "repair-exhausted-route"
 name = "Repair Exhausted Route"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [llm]

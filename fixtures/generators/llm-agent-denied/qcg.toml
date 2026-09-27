@@ -16,7 +16,6 @@ path_prefix = "drafts/"
 description = "Negative fixture: fake agent calls an undeclared tool."
 id = "llm-agent-denied"
 name = "Denied LLM Agent"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [llm]

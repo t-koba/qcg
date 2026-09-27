@@ -12,7 +12,6 @@ prompt = "prompts/draft.j2"
 description = "Negative fixture: non-visible resource cannot enter LLM context."
 id = "llm-context-denied"
 name = "LLM Context Denied"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [llm]

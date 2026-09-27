@@ -12,7 +12,6 @@ url = "https://example.com/"
 description = "Fetches a declared URL and writes the response body."
 id = "http-fetch"
 name = "HTTP Fetch"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [permissions]

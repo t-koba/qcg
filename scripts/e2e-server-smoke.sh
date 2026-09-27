@@ -4,7 +4,7 @@ set -euo pipefail
 tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/qcg-server-smoke.XXXXXX")"
 runs_dir="$tmp_root/runs"
 generators_dir="$tmp_root/generators"
-port="${QCG_SMOKE_PORT:-58017}"
+port="${SMOKE_PORT:-58017}"
 server_pid=""
 mkdir -p "$runs_dir"
 # ShellCheck cannot infer that this function is invoked by the EXIT trap.
@@ -33,7 +33,7 @@ merge_generators() {
 }
 merge_generators "$generators_dir"
 
-cargo run -p qcg --locked -- serve \
+cargo run -p cli --locked -- serve \
   --bind 127.0.0.1 \
   --port "$port" \
   --generators-dir "$generators_dir" \

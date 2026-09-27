@@ -22,7 +22,7 @@ Open `/api/generators/generator/assets/ui/index.html` for the bundled SPA.
 
 ## Production topology
 
-qcg uses the selected listener as-is. Set `QCG_API_TOKEN` when optional
+qcg uses the selected listener as-is. Set `API_TOKEN` when optional
 instance-level bearer authentication is wanted. In production, qid may issue
 user tokens while qpx terminates TLS, enforces
 identity, and proxies accepted requests to the loopback qcg listener. The
@@ -30,7 +30,7 @@ three products remain independently deployed binaries.
 
 qcg's bearer token authenticates the instance, not a user or run owner. One
 deployment configures a single token per instance (`--api-token` /
-`QCG_API_TOKEN`); there is no per-user or per-run token table inside qcg.
+`API_TOKEN`); there is no per-user or per-run token table inside qcg.
 Use it behind a trusted shared boundary, or deploy separate qcg instances and runs directories
 for trust domains that require isolation. See `docs/security.md` (trust
 boundary) and `docs/http-server-guide.md` (bearer + CORS) for the full
@@ -50,7 +50,7 @@ owner merges peer progress on refresh and resumes answered prompts. Cancel
 from a non-owner is observed within the 5 second refresh window.
 
 The server default is eight concurrently executing API runs. Set
-`--max-active-runs` or `QCG_MAX_ACTIVE_RUNS` to change the process-local limit.
+`--max-active-runs` or `MAX_ACTIVE_RUNS` to change the process-local limit.
 Accepted work above that limit remains queued durably. Runs waiting for user
 input or side-effect confirmation release their slot until resumed. All runs in one process share the configured LLM and
 search provider runtimes and provider HTTP clients, so provider quotas and
@@ -115,9 +115,9 @@ call with its request state. Deprecated MCP sampling is not exposed.
 
 `qcg serve` periodically retains the newest 50 terminal run directories plus
 10 additional failed runs and deletes any run past its contract retention
-window. `QCG_GC_KEEP`, `QCG_GC_KEEP_FAILED`, and `QCG_GC_INTERVAL_SECS`
+window. `GC_KEEP`, `GC_KEEP_FAILED`, and `GC_INTERVAL_SECS`
 (default `86400`, minimum `60`) retune the sweep; invalid or zero values
-refuse boot. Set `QCG_AUTO_GC=0` to disable automatic retention and use:
+refuse boot. Set `AUTO_GC=0` to disable automatic retention and use:
 
 ```bash
 qcg runs gc --runs-dir /var/lib/qcg/runs --keep 50
@@ -205,7 +205,7 @@ checks the distribution bundle.
 When a qpx binary is available, verify the documented deployment boundary with:
 
 ```bash
-cargo build -p qcg
+cargo build -p cli
 QPXD_BIN=/path/to/qpxd bash scripts/e2e-qpx-smoke.sh
 ```
 
@@ -241,12 +241,12 @@ Prerequisites for any unattended run:
 
   `operation_digest` is hex SHA-256 over the target plus a `0` byte plus the
   canonical details JSON (`operation_digest(target, details)` in
-  `crates/qcg-engine/src/engine/run_context.rs`). `invocation_hash` is hex
+  `crates/engine/src/engine/run_context.rs`). `invocation_hash` is hex
   SHA-256 over the invocation id. Single-shot steps use
   `execution:<node>:<count>` (finished-execution count, so a repair or
   regenerate is a new invocation); agent tool calls use the stable model call
   id. The operation id (`run:node:sha256(invocation)` in
-  `crates/qcg-engine/src/state.rs`) is a different value: it is the remote
+  `crates/engine/src/state.rs`) is a different value: it is the remote
   idempotency key, never a confirmation id. The manifest
   `permissions.side_effects_scope` defaults to `invocation` when omitted;
   every minted `ConfirmSpec` carries an explicit `scope` and
@@ -267,7 +267,7 @@ never mix: single-shot `mcp.call` steps bind the node execution
 (`execution:<node>:<count>`), while agent `mcp` tool calls bind the model
 call id plus canonical redacted args
 (`<node>:agentmcp:<alias>:<invocation_hash>#__mcp_pending` continuation key in
-`crates/qcg-llm-steps/src/tool_events.rs` (the `#__mcp_pending` suffix marks stored continuations)), so one can never authorize the
+`crates/llm-steps/src/tool_events.rs` (the `#__mcp_pending` suffix marks stored continuations)), so one can never authorize the
 other. Doc-to-key conformance: the `<node>:agentmcp:<alias>:<64hex>#__mcp_pending`
 format is pinned by `frontend/generator/src/confirm-scope.test.ts` ("mcp
 continuation key format") against a captured real key shape, since the key
@@ -302,7 +302,7 @@ is disabled for unknown scopes in the UI.
 ### systemd timer
 
 ```ini
-# /etc/systemd/system/qcg-report.service
+# /etc/systemd/system/report.service
 [Unit]
 Description=Unattended qcg report generation
 After=network-online.target
@@ -310,7 +310,7 @@ After=network-online.target
 [Service]
 Type=oneshot
 User=qcg
-Environment=QCG_API_TOKEN_FILE=/etc/qcg/api-token
+Environment=API_TOKEN_FILE=/etc/qcg/api-token
 ExecStart=/usr/local/bin/qcg run /srv/qcg/generators/report \
   --input date=%Y-%m-%d \
   --answer scope=brief \
@@ -319,7 +319,7 @@ ExecStart=/usr/local/bin/qcg run /srv/qcg/generators/report \
 ```
 
 ```ini
-# /etc/systemd/system/qcg-report.timer
+# /etc/systemd/system/report.timer
 [Unit]
 Description=Daily unattended qcg report generation
 
@@ -341,14 +341,14 @@ runs that may still pause:
 ```bash
 BASE=http://127.0.0.1:8080
 RUN=$(curl -fsS -X POST "$BASE/api/runs" \
-  -H "Authorization: Bearer $QCG_API_TOKEN" \
+  -H "Authorization: Bearer $API_TOKEN" \
   -H "Idempotency-Key: report-$(date +%F)" \
   -H "Content-Type: application/json" \
   -d '{"generator_id":"report","inputs":{"date":"2026-09-06"},
        "answers":{"scope":"brief"},"confirmations":{"publish:http:<64hex>":true}}' \
   | jq -r .run_id)
 curl -fsSN "$BASE/api/runs/$RUN/events" -H "Last-Event-ID: 0" \
-  -H "Authorization: Bearer $QCG_API_TOKEN"
+  -H "Authorization: Bearer $API_TOKEN"
 ```
 
 Event-stream client contract: history replays first, then the live tail.
@@ -380,7 +380,7 @@ failure stay outside the guaranteed boundary as stated above, so no test
 fault-injects them: the table below pins the process-crash contract that
 native tests do cover.
 
-Terminal-only fsync mapping (`crates/qcg-engine/src/journal/writer.rs`):
+Terminal-only fsync mapping (`crates/engine/src/journal/writer.rs`):
 
 | path | what is fsynced | when |
 |---|---|---|
@@ -390,14 +390,14 @@ Terminal-only fsync mapping (`crates/qcg-engine/src/journal/writer.rs`):
 | `state.json` persist | atomic write + replace via `persist_serialized_atomic` | every append (state always follows the journal) |
 | `.clean_shutdown` marker | plain `write` / `remove_file`, no fsync | best-effort I/O, failures propagate (a failed terminal marker fails the operation; see repair marker below) |
 
-Cancel mailbox (`request_remote_cancel` in `crates/qcg-service/src/run_dirs.rs`):
+Cancel mailbox (`request_remote_cancel` in `crates/service/src/run_dirs.rs`):
 post-publish directory-sync failure is warn-only by necessity — reporting an
 error would make the caller retry under a fresh operation id and journal a
 duplicate cancel for one published request. Power loss may drop the directory
 entry; the next boot observes the request as absent and a retry publishes
 under a fresh operation id, with deduplication by cancel-drain idempotence
 (E01). Idempotency Ready commit (`store_durable_ready` in
-`crates/qcg-server/src/server/idempotency/durable.rs`): directory-sync
+`crates/server/src/server/idempotency/durable.rs`): directory-sync
 failure is likewise warn-only (the staged file is `sync_all` durable); a
 power-loss entry loss resurrects the key as unclaimed and a retry re-commits
 the same mapping instead of minting a duplicate. Duplicate execution under
@@ -444,16 +444,16 @@ Admission records vs `.admission-*.lock`: they are different mechanisms.
 
 Large operation results spill to a sidecar blob under the run meta dir when
 they exceed 64 KiB (`OPERATION_RESULT_MAX_BYTES` in
-`crates/qcg-engine/src/state.rs`); the journal carries `result_ref` (the
+`crates/engine/src/state.rs`); the journal carries `result_ref` (the
 content-hash blob name) instead of the inline bytes, and the dir-backed guard
 reloads the blob on resend. Shared per-run journal pollers serve all SSE
 subscribers of one run from a single poll task
-(`journal_pollers` in `crates/qcg-service/src/types.rs`). Snapshot live
+(`journal_pollers` in `crates/service/src/types.rs`). Snapshot live
 `duration_ms` is quantized down to whole seconds so exact-digest ETags stay
 stable within a second and conditional requests can return 304; crossing a
 second boundary advances the body (and the validator) even when nothing
 else changed, so an unrelated `200` there is correct, not stale
-(`live_metrics` in `crates/qcg-service/src/summaries/metrics.rs`).
+(`live_metrics` in `crates/service/src/summaries/metrics.rs`).
 
 A reused `Idempotency-Key` with identical content replays the original result
 instead of starting a duplicate run; the same key with different content is
@@ -477,7 +477,7 @@ configured registries after committing the parent; a missing set fails the
 install with the partial state and the repair (rerun the same command)
 instead of lingering silently. Crash recovery is not an automatic rollback:
 a commit interrupted after the backup rename leaves the target missing with
-a `.qcg-install-backup-*` sibling intact; rerun the install to converge (or
+a `.install-backup-*` sibling intact; rerun the install to converge (or
 manually rename the newest backup back to the target). Backups are retained
 on failure paths, never auto-deleted, and only reaped by the stale sweep
 after aging out.
@@ -498,7 +498,7 @@ event, a truncation carries neither). It
 closes SSE streams, stops maintenance tasks (shared-store refresh, queued
 resumer, retention GC), and then settles active runs under a 150 second
 outer deadline (`SHUTDOWN_DEADLINE` in
-`crates/qcg-server/src/server/serve.rs`, enforced by
+`crates/server/src/server/serve.rs`, enforced by
 `serve_with_listener_and_deadline`); exceeding it is reported to the
 embedding host instead of
 being logged and ignored. Total bound from shutdown signal to process exit
@@ -572,8 +572,8 @@ Unattended limits:
   generators, and per-generator top-20 counts.
   Latency histograms, error rates, queue dwell, preemption totals, and GC
   deletion or failure counts are not exported; alert thresholds live outside.
-- OTLP export exists in implementation (`QCG_OTLP_ENDPOINT`,
-  `QCG_OTLP_INTERVAL_MS`, best-effort) and `qcg runs trace` builds
+- OTLP export exists in implementation (`OTLP_ENDPOINT`,
+  `OTLP_INTERVAL_MS`, best-effort) and `qcg runs trace` builds
   hierarchical spans, but no SLO is defined here. Treat traces as mechanism
   facts for external analysis.
 

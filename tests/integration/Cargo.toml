@@ -1,5 +1,5 @@
 [package]
-name = "qcg-integration-tests"
+name = "integration-tests"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,14 +10,14 @@ publish = false
 
 [dependencies]
 camino.workspace = true
-qcg-api = { path = "../../crates/qcg-api" }
-qcg-contract = { path = "../../crates/qcg-contract" }
-qcg-engine = { path = "../../crates/qcg-engine" }
-qcg-fs = { path = "../../crates/qcg-fs" }
-qcg-policy = { path = "../../crates/qcg-policy" }
-qcg-server = { path = "../../crates/qcg-server" }
-qcg-service = { path = "../../crates/qcg-service" }
-qcg-types = { path = "../../crates/qcg-types" }
+api = { path = "../../crates/api" }
+contract = { path = "../../crates/contract" }
+engine = { path = "../../crates/engine" }
+files = { path = "../../crates/files" }
+policy = { path = "../../crates/policy" }
+server = { path = "../../crates/server" }
+service = { path = "../../crates/service" }
+model = { path = "../../crates/model" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

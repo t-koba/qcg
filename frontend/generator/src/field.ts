@@ -17,7 +17,7 @@ export function isBlockingSchemaIssue(issue: SchemaIssue): boolean {
 
 export const MAX_SCHEMA_DEPTH = 12;
 export const MAX_SCHEMA_NODES = 256;
-const FALSE_SCHEMA_MARKER = "__qcg_false_schema";
+const FALSE_SCHEMA_MARKER = "__false_schema";
 
 const BUILTIN_KINDS = new Set([
   "string", "text", "number", "boolean", "select", "multiselect", "list", "file", "json", "natural_language",
@@ -662,7 +662,7 @@ function matchesFormat(format: string, value: string): boolean {
     try { return Boolean(new URL(value)); } catch { return false; }
   }
   if (format === "uri-reference") {
-    try { return Boolean(new URL(value, "https://qcg.invalid")); } catch { return false; }
+    try { return Boolean(new URL(value, "https://example.invalid")); } catch { return false; }
   }
   if (format === "date") return /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`));
   if (format === "date-time") return !Number.isNaN(Date.parse(value));

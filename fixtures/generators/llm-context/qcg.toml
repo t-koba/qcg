@@ -15,7 +15,6 @@ prompt = "prompts/draft.j2"
 description = "Checks that declared LLM context is appended to prompts."
 id = "llm-context"
 name = "LLM Context"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [[inputs.stages]]

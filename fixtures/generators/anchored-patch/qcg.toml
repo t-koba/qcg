@@ -36,7 +36,6 @@ lines = ["BETA"]
 description = "Deterministic hash-anchored patch example"
 id = "anchored-patch"
 name = "Anchored Patch"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [[inputs.stages]]

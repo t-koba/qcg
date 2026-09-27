@@ -28,7 +28,6 @@ source = "fixed.json"
 description = "Repairs a generated file with the fake LLM provider"
 id = "llm-repair-fake"
 name = "LLM Repair Fake"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [llm]

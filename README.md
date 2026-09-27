@@ -40,8 +40,8 @@ Then start the unauthenticated loopback server (the default execution limit is
 eight active API runs):
 
 ```bash
-cargo run -p qcg -- serve --bind 127.0.0.1 --port 8080 \
-  --runs-dir /tmp/qcg-runs \
+cargo run -p cli -- serve --bind 127.0.0.1 --port 8080 \
+  --runs-dir /tmp/runs \
   --max-active-runs 8
 ```
 
@@ -59,12 +59,12 @@ For frontend development, run the source SPA through Vite's API proxy:
 npm --prefix frontend/generator ci
 npm --prefix frontend/generator run generate:api
 npm --prefix frontend/generator run generate:wasm
-QCG_API_TARGET=http://127.0.0.1:8080 \
+API_TARGET=http://127.0.0.1:8080 \
   npm --prefix frontend/generator run dev -- --host 127.0.0.1 --port 5173
 ```
 
 Every selected bind address is used as requested. Authentication is optional;
-set `--api-token` or `QCG_API_TOKEN` when instance-level bearer protection is
+set `--api-token` or `API_TOKEN` when instance-level bearer protection is
 wanted. The token protects the whole instance and does not create per-user run
 ownership. In production,
 place qpx in front for TLS and identity enforcement,
@@ -86,7 +86,7 @@ Each API run receives a UUID-based ID and its own workspace and journal below
 `--runs-dir`. The default run store exclusively owns that directory;
 `--run-store shared-filesystem` enables multiple services using run-level
 execution leases and periodic abandoned-run recovery on storage with reliable
-advisory locks. `--max-active-runs` (also `QCG_MAX_ACTIVE_RUNS`)
+advisory locks. `--max-active-runs` (also `MAX_ACTIVE_RUNS`)
 defaults to 8. Additional accepted runs enter the durable FIFO execution queue
 instead of failing under temporary saturation. A run waiting for human input
 or confirmation releases its execution slot until it resumes. Queued and active

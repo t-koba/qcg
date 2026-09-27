@@ -16,7 +16,6 @@ path_prefix = "drafts/"
 description = "Negative fixture: llm.agent exceeds max_tokens_total."
 id = "llm-agent-token-budget"
 name = "LLM Agent Token Budget"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [llm]

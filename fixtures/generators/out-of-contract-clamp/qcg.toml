@@ -25,7 +25,6 @@ output_file = "result.txt"
 description = "Clamps an out-of-contract LLM response back to schema output"
 id = "out-of-contract-clamp"
 name = "Out Of Contract Clamp"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [llm]

@@ -21,7 +21,6 @@ tool = "qpx_validate"
 description = "Exercises check.tool with an explicit host validator backend."
 id = "logical-tool-host"
 name = "Logical Tool Host"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [permissions]

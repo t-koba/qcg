@@ -19,7 +19,6 @@ source = "{{ inputs.config_file }}"
 description = "Accepts an inline JSON file and validates it inside the run workspace."
 id = "file-input"
 name = "File Input"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [[inputs.stages]]

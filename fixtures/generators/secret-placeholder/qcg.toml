@@ -21,7 +21,6 @@ secrets = ["api_token"]
 description = "LLM writes a placeholder and deterministic transform injects the secret"
 id = "secret-placeholder"
 name = "Secret Placeholder"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [llm]
@@ -44,4 +43,4 @@ fs_write = ["workspace"]
 [permissions.containers]
 enabled = false
 [secrets.api_token]
-env = "QCG_TEST_TOKEN"
+env = "TEST_TOKEN"

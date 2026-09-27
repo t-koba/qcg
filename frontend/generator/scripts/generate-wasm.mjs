@@ -19,13 +19,13 @@ const result = spawnSync(
   "wasm-pack",
   [
     "build",
-    "crates/qcg-expr-wasm",
+    "crates/expr-wasm",
     "--target",
     "web",
     "--out-dir",
     "../../frontend/generator/src/expr/pkg",
     "--out-name",
-    "qcg_expr_wasm",
+    "expr_wasm",
   ],
   {
     cwd: root,

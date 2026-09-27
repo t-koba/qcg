@@ -1,0 +1,17 @@
+[package]
+name = "files"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
+publish.workspace = true
+
+[dependencies]
+camino.workspace = true
+libc.workspace = true
+hex.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+uuid.workspace = true

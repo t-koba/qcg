@@ -24,7 +24,6 @@ source = "model.json"
 description = "Writes JSON and validates it with check.schema."
 id = "schema-check"
 name = "Schema Check"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [[inputs.stages]]

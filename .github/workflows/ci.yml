@@ -35,11 +35,11 @@ jobs:
 
       - name: Check minimal features
         run: |
-          cargo check -p qcg-mcp --no-default-features --locked
-          cargo check -p qcg-server --no-default-features --locked
+          cargo check -p mcp --no-default-features --locked
+          cargo check -p server --no-default-features --locked
 
       - name: Check expression WASM
-        run: cargo check -p qcg-expr-wasm --target wasm32-unknown-unknown --locked
+        run: cargo check -p expr-wasm --target wasm32-unknown-unknown --locked
 
       - name: Check generated documentation
         run: bash scripts/check-generated-docs.sh
@@ -61,16 +61,16 @@ jobs:
 
       - name: Test minimal features
         run: |
-          cargo test -p qcg-mcp --no-default-features --locked
-          cargo test -p qcg-server --no-default-features --locked
+          cargo test -p mcp --no-default-features --locked
+          cargo test -p server --no-default-features --locked
 
       - name: Test MCP transports against local servers
         if: matrix.os == 'ubuntu-latest'
-        run: cargo test -p qcg-mcp --features mcp-test-server --locked -- --test-threads=1
+        run: cargo test -p mcp --features mcp-test-server --locked -- --test-threads=1
 
       - name: Test MCP transports without default features
         if: matrix.os == 'ubuntu-latest'
-        run: cargo test -p qcg-mcp --no-default-features --features mcp-test-server --locked -- --test-threads=1
+        run: cargo test -p mcp --no-default-features --features mcp-test-server --locked -- --test-threads=1
 
       - name: Fixtures smoke
         shell: bash

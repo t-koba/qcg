@@ -11,7 +11,6 @@ template = "templates/summary.txt.j2"
 description = "Demonstrates conditional input stages in the Web UI and engine."
 id = "staged-inputs"
 name = "Staged Inputs"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [[inputs.stages]]

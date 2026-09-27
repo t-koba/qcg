@@ -30,7 +30,6 @@ to = "/work"
 description = "Demonstrates check.container skip behavior when no runtime is installed"
 id = "container-check-skip"
 name = "Container Check Skip"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [permissions]

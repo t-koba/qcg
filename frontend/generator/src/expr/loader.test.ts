@@ -22,7 +22,7 @@ describe("evalWhen", () => {
     if ("value" in outcome) {
       expect(outcome.value).toBe(true);
     } else {
-      expect(outcome.error).toMatch(/qcg expression module failed to load|when expression/);
+      expect(outcome.error).toMatch(/expression module failed to load|when expression/);
     }
   });
 });

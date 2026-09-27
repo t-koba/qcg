@@ -7,11 +7,11 @@ export default defineConfig({
   server: {
     proxy: {
       "/api": {
-        target: process.env.QCG_API_TARGET || process.env.VITE_QCG_API_TARGET || "http://127.0.0.1:8080",
+        target: process.env.API_TARGET || process.env.VITE_API_TARGET || "http://127.0.0.1:8080",
         changeOrigin: true,
       },
       "/healthz": {
-        target: process.env.QCG_API_TARGET || process.env.VITE_QCG_API_TARGET || "http://127.0.0.1:8080",
+        target: process.env.API_TARGET || process.env.VITE_API_TARGET || "http://127.0.0.1:8080",
         changeOrigin: true,
       },
     },

@@ -112,7 +112,7 @@ uses a distinct hierarchical path such as `emit_sites[3]/write_site`.
 Each service run stores generated files under `<run>/workspace` and durable
 `journal.jsonl`, `state.json`, `outputs.json`, and resource pins under
 `<run>/meta`. Direct CLI runs keep the same metadata under the output parent's
-`.qcg/runs/<direct-id>/meta`, so generator writes cannot overwrite execution
+`.data/runs/<direct-id>/meta`, so generator writes cannot overwrite execution
 state. The journal includes graph events, LLM calls, interactions, side-effect
 decisions, and artifact hashes.
 `qcg runs replay <id>` reruns a recorded input set and compares artifact hashes.

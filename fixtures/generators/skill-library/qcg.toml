@@ -17,7 +17,6 @@ prompt = "prompts/draft.j2"
 description = "Checks that a declared skill library auto-scans SKILL.md directories."
 id = "skill-library"
 name = "Skill Library"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [llm]

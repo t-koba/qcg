@@ -24,7 +24,6 @@ output_file = "bundle/README.md"
 description = "Produces multiple artifacts that can be downloaded as a run archive."
 id = "archive-bundle"
 name = "Archive Bundle"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [permissions]

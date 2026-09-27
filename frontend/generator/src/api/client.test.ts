@@ -4,7 +4,7 @@ import { ApiProblemError, errorMessage } from "./client";
 describe("API problem responses", () => {
   it("formats RFC 9457 details and field errors", async () => {
     const response = new Response(JSON.stringify({
-      type: "https://qcg.dev/problems/invalid",
+      type: "https://example.invalid/problems/invalid",
       title: "Invalid request",
       status: 422,
       detail: "Input validation failed",

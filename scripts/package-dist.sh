@@ -73,10 +73,10 @@ require_path "generators/generator/ui/index.html"
 build_root="$(pwd -P)"
 remap_flags="--remap-path-prefix=${build_root}=."
 if [ -n "${HOME:-}" ]; then
-  remap_flags="${remap_flags} --remap-path-prefix=${HOME}=/qcg-build"
+  remap_flags="${remap_flags} --remap-path-prefix=${HOME}=/build"
 fi
 RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }${remap_flags}" \
-  cargo build -p qcg --locked --profile "$profile"
+  cargo build -p cli --locked --profile "$profile"
 
 case "$(uname -s)" in
   Darwin) os="macos" ;;
@@ -85,26 +85,29 @@ case "$(uname -s)" in
   *) os="$(uname -s | tr '[:upper:]' '[:lower:]')" ;;
 esac
 arch="$(uname -m)"
-name="qcg-${os}-${arch}"
+# Single rename place for distribution product id. Binary name and share dir
+# follow this value; pass a different id to rebrand without code changes.
+product_id="${PRODUCT_ID:-qcg}"
+name="${product_id}-${os}-${arch}"
 staging="${out_dir}/${name}"
-bin_name="qcg"
+bin_name="${product_id}"
 if [ "$os" = "windows" ]; then
-  bin_name="qcg.exe"
+  bin_name="${product_id}.exe"
 fi
 
 rm -rf "$staging"
-mkdir -p "$staging/bin" "$staging/share/qcg"
+mkdir -p "$staging/bin" "$staging/share/${product_id}"
 cp "target/${target_profile}/${bin_name}" "$staging/bin/"
-cp README.md "$staging/share/qcg/"
-cp providers.toml "$staging/share/qcg/providers.toml"
-cp THIRD-PARTY-NOTICES "$staging/share/qcg/"
-node scripts/generate-sbom.mjs "$staging/share/qcg/SBOM.spdx.json"
-mkdir -p "$staging/share/qcg/docs"
+cp README.md "$staging/share/${product_id}/"
+cp providers.toml "$staging/share/${product_id}/providers.toml"
+cp THIRD-PARTY-NOTICES "$staging/share/${product_id}/"
+node scripts/generate-sbom.mjs "$staging/share/${product_id}/SBOM.spdx.json"
+mkdir -p "$staging/share/${product_id}/docs"
 for document in "${public_docs[@]}"; do
-  cp "docs/$document" "$staging/share/qcg/docs/"
+  cp "docs/$document" "$staging/share/${product_id}/docs/"
 done
-mkdir -p "$staging/share/qcg/generators"
-cp -R generators/generator "$staging/share/qcg/generators/generator"
+mkdir -p "$staging/share/${product_id}/generators"
+cp -R generators/generator "$staging/share/${product_id}/generators/generator"
 
 mkdir -p "$out_dir"
 if [ "$os" = "windows" ]; then
@@ -143,7 +146,7 @@ else
   echo "sha256sum or shasum is required" >&2
   exit 1
 fi
-cp "$staging/share/qcg/SBOM.spdx.json" "$out_dir/${name}.sbom.spdx.json"
+cp "$staging/share/${product_id}/SBOM.spdx.json" "$out_dir/${name}.sbom.spdx.json"
 rm -rf "$staging"
 hash_value="$($hash_tool "$archive" | awk '{print $1}')"
 checksum_file="$out_dir/SHA256SUMS-${os}-${arch}"

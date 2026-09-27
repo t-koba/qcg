@@ -1,6 +1,6 @@
 /** Codec for the persisted workspace view (screen restoration). No Svelte imports. */
 
-export const VIEW_STORAGE_KEY = "qcg-view";
+export const VIEW_STORAGE_KEY = "view";
 export const VIEW_STATE_VERSION = 1;
 export const MAX_PERSISTED_TABS = 10;
 

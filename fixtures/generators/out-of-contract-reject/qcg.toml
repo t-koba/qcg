@@ -16,7 +16,6 @@ schema = "schemas/result.schema.json"
 description = "Rejects an LLM response marked out of contract"
 id = "out-of-contract-reject"
 name = "Out Of Contract Reject"
-qcg_version = "^0.1"
 version = "0.1.0"
 
 [llm]

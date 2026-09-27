@@ -19,7 +19,7 @@ export type McpServerSummary = components["schemas"]["McpServerSummary"];
 export type McpServersResponse = components["schemas"]["McpServerList"];
 export type McpAuthorizationResponse = components["schemas"]["McpAuthorizationStart"];
 
-const TOKEN_STORAGE_KEY = "qcg.api-token";
+const TOKEN_STORAGE_KEY = "api-token";
 
 /**
  * Bearer token for authenticated instances, held in sessionStorage only.

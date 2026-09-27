@@ -19,13 +19,17 @@ const packages = metadata.packages.map((pkg, index) => ({
   licenseDeclared: pkg.license ?? "NOASSERTION",
   filesAnalyzed: false,
 }));
+const binTarget = metadata.packages
+  .flatMap((pkg) => (pkg.targets ?? []).map((target) => ({ pkg, target })))
+  .find(({ target }) => (target.kind ?? []).includes("bin"));
+const productName = process.env.PRODUCT_ID || binTarget?.target?.name || "api";
 const sbom = {
   spdxVersion: "SPDX-2.3",
   dataLicense: "CC0-1.0",
   SPDXID: "SPDXRef-DOCUMENT",
-  name: "qcg",
-  documentNamespace: `https://qcg.dev/sbom/${metadata.workspace_members.length}`,
-  creationInfo: { created: new Date().toISOString(), creators: ["Tool: qcg distribution builder"] },
+  name: productName,
+  documentNamespace: `https://example.invalid/sbom/${metadata.workspace_members.length}`,
+  creationInfo: { created: new Date().toISOString(), creators: [`Tool: ${productName} distribution builder`] },
   packages,
 };
 writeFileSync(outputPath, `${JSON.stringify(sbom, null, 2)}\n`);

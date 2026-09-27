@@ -65,7 +65,7 @@ Run the authoring flow directly:
 qcg run generators/generator \
   --answer 'ask_purpose={"description":"Makes a small file"}' \
   --answer ask_design_mode=manual \
-  --answer 'ask_manual_form={"package":{"manifest":{"generator":{"id":"my-generator","name":"My Generator","version":"0.1.0","qcg_version":"^0.1","description":"Makes a small file","authors":[]},"inputs":{"stages":[{"id":"main","fields":[{"id":"request","type":"natural_language","required":true}]}]},"flow":[{"id":"emit","type":"render","artifact":{"label":"Generated README","preview":"text","required":true},"params":{"template":"templates/readme.j2","output_file":"README.md"}}]},"sources":{"templates/readme.j2":{"encoding":"utf8","content":"# My Generator\\n{{ inputs.request }}"}}}}' \
+  --answer 'ask_manual_form={"package":{"manifest":{"generator":{"id":"my-generator","name":"My Generator","version":"0.1.0","description":"Makes a small file","authors":[]},"inputs":{"stages":[{"id":"main","fields":[{"id":"request","type":"natural_language","required":true}]}]},"flow":[{"id":"emit","type":"render","artifact":{"label":"Generated README","preview":"text","required":true},"params":{"template":"templates/readme.j2","output_file":"README.md"}}]},"sources":{"templates/readme.j2":{"encoding":"utf8","content":"# My Generator\\n{{ inputs.request }}"}}}}' \
   --answer 'ask_authority={"permissions":{"fs_read":[],"fs_write":["workspace"],"network":[],"commands":[],"containers":{"enabled":false,"images":[],"on_missing":"error"},"side_effects":"none"},"secrets":{}}' \
   --output out \
   --yes
@@ -77,7 +77,7 @@ After building the frontend, the same application is available at
 ## Re-entering a previous package
 
 A previously built package is re-entered as an ordinary `type = "file"`
-input; there is no separate package-upload API. A `.qcg` ZIP, a
+input; there is no separate package-upload API. A `.pkg` ZIP, a
 `blueprint-package.json`, or any other file travels through the standard
 `FileValue` input, is materialized under the run workspace, and is expanded
 or interpreted by the generator's own steps (for example a declared `command`
@@ -86,9 +86,9 @@ Additional information for re-editing arrives as further inputs or answers in
 the same run. `fixtures/generators/package-reinput` demonstrates the pattern:
 
 ```bash
-qcg package fixtures/generators/file-input -o /tmp/file-input.qcg
+qcg package fixtures/generators/file-input -o /tmp/file-input.pkg
 qcg run fixtures/generators/package-reinput \
-  --input-file package_file=/tmp/file-input.qcg \
+  --input-file package_file=/tmp/file-input.pkg \
   --input extra_note="second edit" \
   --output /tmp/reinput-out \
   --yes
@@ -105,5 +105,5 @@ Run the real-provider two-generation equivalence check with:
 bash scripts/self-hosting-check.sh
 ```
 
-The script uses `QCG_OPENROUTER_API_KEY` when set, otherwise reads the
+The script uses `OPENROUTER_API_KEY` when set, otherwise reads the
 OpenRouter key from the OpenCode authentication file without printing it.
