@@ -494,7 +494,10 @@ mod tests {
 
         /// Creates a real directory at `relative` inside the workspace, for
         /// the test that must remove it again before planting a symlink in
-        /// its place.
+        /// its place. Unix-only like its sole caller: symlink planting has
+        /// no portable equivalent, so other platforms must not see an
+        /// unused helper.
+        #[cfg(unix)]
         fn create_workspace_dir(&self, relative: &str) {
             std::fs::create_dir_all(self.workspace.join(relative).as_std_path())
                 .expect("workspace dir");
