@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use qcg_contract::{Contract, RuntimeLimits};
-use qcg_policy::validate_bounded_json_schema;
 use qcg_service::DirectRun;
 use qcg_types::OutputManifest;
 use serde::{Deserialize, Serialize};
@@ -323,15 +322,9 @@ fn validate_eval_suite(suite: &EvalSuite) -> Result<()> {
                     })?;
                 }
                 EvalAssertion::ArtifactJsonSchema { schema, .. } => {
-                    validate_bounded_json_schema(schema).map_err(|error| {
-                        anyhow::anyhow!(
-                            "eval case `{}` has invalid or unsafe JSON Schema: {error}",
-                            case.name
-                        )
-                    })?;
                     qcg_policy::compile_bounded_validator(schema).map_err(|error| {
                         anyhow::anyhow!(
-                            "eval case `{}` has invalid JSON Schema: {error}",
+                            "eval case `{}` has invalid or unsafe JSON Schema: {error}",
                             case.name
                         )
                     })?;

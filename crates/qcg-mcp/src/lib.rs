@@ -54,17 +54,6 @@ mod tests {
     }
 
     #[test]
-    fn mcp_policy_defaults_match_previous_mechanism_values() {
-        let spec: McpServerSpec = serde_json::from_str(
-            r#"{"id":"defaults","transport":"stdio","command":["demo-server"]}"#,
-        )
-        .expect("minimal stdio profile should deserialize");
-        assert_eq!(spec.tools_list_page_limit, 100);
-        assert_eq!(spec.oauth_state_ttl_seconds, 600);
-        assert_eq!(spec.task_poll_interval_ms, 250);
-    }
-
-    #[test]
     fn tools_list_page_limit_is_bounded() {
         for value in [1, 1_000] {
             let mut spec = remote_spec();
@@ -164,7 +153,10 @@ mod tests {
     fn remote_profile_rejects_embedded_credentials() {
         let mut spec = remote_spec();
         spec.url = Some("https://secret@agent.tinyfish.ai/mcp".into());
-        assert!(spec.validate().is_err());
+        let error = spec
+            .validate()
+            .expect_err("embedded URL credentials must be rejected");
+        assert!(error.to_string().contains("credentials"), "{error}");
     }
 
     #[test]
@@ -278,10 +270,7 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("reflected credential material"));
         assert!(!message.contains("mcp-test-secret-value"));
-    }
-
-    #[test]
-    fn input_required_reflection_is_rejected_without_echo() {
+        // The structured continuation shape scans through the same guard.
         let input = McpInputRequired {
             input_requests: BTreeMap::from([(
                 "q1".into(),

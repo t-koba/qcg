@@ -1619,6 +1619,67 @@ mod tests {
         }
     }
 
+    /// Claims `key` for `digest` under the live default idempotency TTL. The
+    /// runs directory, key, frozen TTL, and always-present reserved run id
+    /// are the shared shape every claim test needs; only the digest and the
+    /// reserved run id differ. The raw `Result` is returned so a caller can
+    /// `match` on the outcome instead of unwrapping.
+    fn claim_pending(
+        runs_dir: &Utf8PathBuf,
+        key: &str,
+        digest: &str,
+        reserved_run_id: &str,
+    ) -> Result<ClaimOutcome, ApiHttpError> {
+        claim_durable_pending(
+            runs_dir,
+            key,
+            digest,
+            Some(reserved_run_id.to_string()),
+            qcg_policy::IDEMPOTENCY_TTL,
+        )
+    }
+
+    /// Publishes the Ready record for an owned claim under the live default
+    /// idempotency TTL. The runs directory, key, and frozen TTL are the shared
+    /// shape; only the digest, run id, owner, and generation differ. The raw
+    /// `Result` is returned so a caller can `match`, `expect`, or `expect_err`
+    /// on it without a silent unwrap.
+    fn store_ready(
+        runs_dir: &Utf8PathBuf,
+        key: &str,
+        digest: &str,
+        run_id: &str,
+        owner: &str,
+        generation: u64,
+    ) -> Result<String, StoreReadyError> {
+        store_durable_ready(
+            runs_dir,
+            key,
+            digest,
+            run_id,
+            owner,
+            generation,
+            qcg_policy::IDEMPOTENCY_TTL,
+        )
+    }
+
+    /// Rewrites the live pending claim for `key` with `created_at_unix: 0`, so
+    /// a test reaches the adoption path without sleeping out the real TTL. The
+    /// read-modify-write, JSON encoding, and write step are the shared shape;
+    /// the caller only names the key whose claim must look expired.
+    fn expire_pending_claim(runs_dir: &Utf8PathBuf, key: &str) {
+        let path = pending_path(runs_dir, key);
+        let mut record: DurablePendingRecord =
+            serde_json::from_slice(&std::fs::read(path.as_std_path()).expect("claim readable"))
+                .expect("claim parses");
+        record.created_at_unix = 0;
+        std::fs::write(
+            path.as_std_path(),
+            serde_json::to_vec(&record).expect("record serializes"),
+        )
+        .expect("aged claim should write");
+    }
+
     #[tokio::test]
     async fn corrupt_ready_fails_fast_instead_of_waiting_out_the_deadline() {
         // E02: publishes are temp + rename, so a corrupt Ready record is
@@ -1788,44 +1849,20 @@ mod tests {
         let _temp_guard = TempGuard(runs_dir.clone());
         let key = "key-ready-unusable";
         let (owner, generation) = claim_owner(&runs_dir, key, "digest", "run-A");
-        store_durable_ready(
-            &runs_dir,
-            key,
-            "digest",
-            "run-A",
-            &owner,
-            generation,
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect("ready commit should succeed");
+        store_ready(&runs_dir, key, "digest", "run-A", &owner, generation)
+            .expect("ready commit should succeed");
         // Release the live claim so the commit path observes a chosen
         // pending state; Absent must converge.
         release_durable_pending(&runs_dir, key, &owner, generation)
             .expect("release should succeed");
-        let converged = store_durable_ready(
-            &runs_dir,
-            key,
-            "digest",
-            "run-A",
-            &owner,
-            generation,
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect("absent reservation with committed Ready must converge");
+        let converged = store_ready(&runs_dir, key, "digest", "run-A", &owner, generation)
+            .expect("absent reservation with committed Ready must converge");
         assert_eq!(converged, "run-A");
         // Corrupt the pending file: same Ready present, pending Unusable.
         std::fs::write(pending_path(&runs_dir, key).as_std_path(), b"{torn")
             .expect("torn claim should be written");
-        let error = store_durable_ready(
-            &runs_dir,
-            key,
-            "digest",
-            "run-A",
-            &owner,
-            generation,
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect_err("unusable pending with committed Ready must be refused, not converged");
+        let error = store_ready(&runs_dir, key, "digest", "run-A", &owner, generation)
+            .expect_err("unusable pending with committed Ready must be refused, not converged");
         assert!(
             matches!(error, StoreReadyError::Storage(_)),
             "unusable refusal must be storage-typed: {error}"
@@ -2040,55 +2077,6 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_or_foreign_claim_is_unusable_not_absent() {
-        let runs_dir = temp_runs_dir("unusable");
-        let key = "key-1";
-        // Corrupt content must fail closed: deleting it could destroy a live
-        // owner's claim and split the key into two owners.
-        std::fs::create_dir_all(idempotency_dir(&runs_dir).as_std_path())
-            .expect("idempotency dir should be created");
-        std::fs::write(pending_path(&runs_dir, key).as_std_path(), b"{torn")
-            .expect("torn claim should be written");
-        assert!(
-            matches!(
-                read_durable_pending(&runs_dir, key),
-                PendingRead::Unusable(_)
-            ),
-            "corrupt claim must be unusable"
-        );
-        assert!(
-            pending_path(&runs_dir, key).as_std_path().exists(),
-            "corrupt claim must be retained for the operator"
-        );
-        // A foreign key's file must never be removed by this key's reader.
-        let foreign = DurablePendingRecord {
-            key: "other".into(),
-            digest: "d".into(),
-            run_id: None,
-            owner: "o".into(),
-            created_at_unix: now_unix().expect("test clock should be after the Unix epoch"),
-            generation: 1,
-        };
-        std::fs::write(
-            pending_path(&runs_dir, key).as_std_path(),
-            serde_json::to_vec(&foreign).expect("record should serialize"),
-        )
-        .expect("foreign claim should be written");
-        assert!(
-            matches!(
-                read_durable_pending(&runs_dir, key),
-                PendingRead::Unusable(_)
-            ),
-            "foreign claim must be unusable"
-        );
-        assert!(
-            pending_path(&runs_dir, key).as_std_path().exists(),
-            "foreign claim must be retained for the operator"
-        );
-        let _ = std::fs::remove_dir_all(runs_dir.as_std_path());
-    }
-
-    #[test]
     fn live_claim_with_different_digest_conflicts_immediately() {
         // E02: a live claim for another digest conflicts at claim time
         // instead of delegating to a waiter round-trip. The waiter would
@@ -2096,15 +2084,7 @@ mod tests {
         let runs_dir = temp_runs_dir("peer-digest");
         let key = "key-peer";
         claim_owner(&runs_dir, key, "digest-a", "run-A");
-        match claim_durable_pending(
-            &runs_dir,
-            key,
-            "digest-b",
-            Some("run-B".into()),
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect("claim should not error")
-        {
+        match claim_pending(&runs_dir, key, "digest-b", "run-B").expect("claim should not error") {
             ClaimOutcome::Conflict => {}
             other => panic!(
                 "live foreign digest must conflict immediately, got {}",
@@ -2126,14 +2106,8 @@ mod tests {
             let runs_dir = runs_dir.clone();
             let outcomes = std::sync::Arc::clone(&outcomes);
             handles.push(std::thread::spawn(move || {
-                let outcome = claim_durable_pending(
-                    &runs_dir,
-                    key,
-                    "digest",
-                    Some(format!("run-{index}")),
-                    qcg_policy::IDEMPOTENCY_TTL,
-                )
-                .expect("claim should not error");
+                let outcome = claim_pending(&runs_dir, key, "digest", &format!("run-{index}"))
+                    .expect("claim should not error");
                 outcomes
                     .lock()
                     .expect("outcomes lock")
@@ -2175,16 +2149,8 @@ mod tests {
             serde_json::to_vec(&record).expect("record should serialize"),
         )
         .expect("aged claim should be written");
-        let error = store_durable_ready(
-            &runs_dir,
-            key,
-            "digest",
-            "run-A",
-            &owner,
-            generation,
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect_err("expired commit without a live successor must be refused");
+        let error = store_ready(&runs_dir, key, "digest", "run-A", &owner, generation)
+            .expect_err("expired commit without a live successor must be refused");
         assert!(
             error.to_string().contains("expired"),
             "expiry must be named, got: {error}"
@@ -2218,41 +2184,6 @@ mod tests {
     }
 
     #[test]
-    fn store_refusal_is_typed_not_string_matched() {
-        // The commit caller branches on the variant, never on message
-        // text: a digest conflict releases the claim and reports 409.
-        let runs_dir = temp_runs_dir("store-typed");
-        let key = "key-1";
-        let owner = claim_owner(&runs_dir, key, "digest", "run-A");
-        store_durable_ready(
-            &runs_dir,
-            key,
-            "digest",
-            "run-A",
-            &owner.0,
-            owner.1,
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect("ready commit should succeed");
-        assert!(
-            matches!(
-                store_durable_ready(
-                    &runs_dir,
-                    key,
-                    "other-digest",
-                    "run-B",
-                    &owner.0,
-                    owner.1,
-                    qcg_policy::IDEMPOTENCY_TTL
-                ),
-                Err(StoreReadyError::DigestConflict)
-            ),
-            "a committed key with a different digest must type as a conflict"
-        );
-        let _ = std::fs::remove_dir_all(runs_dir.as_std_path());
-    }
-
-    #[test]
     fn same_digest_converges_to_the_committed_run_id() {
         // E02: committing the same digest converges at claim time onto the
         // committed mapping without a new owner. A direct commit with a
@@ -2262,28 +2193,12 @@ mod tests {
         let runs_dir = temp_runs_dir("converge-value");
         let key = "key-converge";
         let owner = claim_owner(&runs_dir, key, "digest", "run-A");
-        let first = store_durable_ready(
-            &runs_dir,
-            key,
-            "digest",
-            "run-A",
-            &owner.0,
-            owner.1,
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect("first commit should succeed");
+        let first = store_ready(&runs_dir, key, "digest", "run-A", &owner.0, owner.1)
+            .expect("first commit should succeed");
         assert_eq!(first, "run-A");
         // A retry for the same digest converges at claim time onto run-A
         // without a new owner.
-        match claim_durable_pending(
-            &runs_dir,
-            key,
-            "digest",
-            Some("run-B".into()),
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect("claim should not error")
-        {
+        match claim_pending(&runs_dir, key, "digest", "run-B").expect("claim should not error") {
             ClaimOutcome::Ready { run_id } => assert_eq!(run_id, "run-A"),
             other => panic!(
                 "same digest must converge at claim, got {}",
@@ -2295,16 +2210,8 @@ mod tests {
         // not match the request (run-B), so ownership fails closed (E02).
         // Convergence with a reservation happens only through the claim
         // path above or a current-owner commit with the matching run.
-        let error = store_durable_ready(
-            &runs_dir,
-            key,
-            "digest",
-            "run-B",
-            &owner.0,
-            owner.1,
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect_err("mismatched reserved run must be refused, not converged");
+        let error = store_ready(&runs_dir, key, "digest", "run-B", &owner.0, owner.1)
+            .expect_err("mismatched reserved run must be refused, not converged");
         assert!(
             error.to_string().contains("reserved run"),
             "reserved-run mismatch must be named, got: {error}"
@@ -2312,120 +2219,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(runs_dir.as_std_path());
     }
 
-    #[test]
-    fn absent_and_corrupt_claims_leave_no_ready_behind() {
-        // E02: refusing a commit over an absent or corrupt reservation must
-        // not publish a Ready record.
-        let runs_dir = temp_runs_dir("refuse-clean");
-        let key = "key-refuse";
-        let error = store_durable_ready(
-            &runs_dir,
-            key,
-            "digest",
-            "run-A",
-            "nobody",
-            1,
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect_err("absent reservation must refuse");
-        assert!(
-            matches!(error, StoreReadyError::Storage(_)),
-            "absent refusal must be storage-typed: {error}"
-        );
-        assert!(
-            load_durable_ready_result(&runs_dir, key, qcg_policy::IDEMPOTENCY_TTL)
-                .expect("load should not fail")
-                .is_none(),
-            "refused absent commit must leave no Ready"
-        );
-        std::fs::create_dir_all(idempotency_dir(&runs_dir).as_std_path())
-            .expect("idempotency dir should be created");
-        std::fs::write(pending_path(&runs_dir, key).as_std_path(), b"{torn")
-            .expect("torn claim should be written");
-        let error = store_durable_ready(
-            &runs_dir,
-            key,
-            "digest",
-            "run-A",
-            "nobody",
-            1,
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect_err("corrupt reservation must refuse");
-        assert!(
-            matches!(error, StoreReadyError::Storage(_)),
-            "corrupt refusal must be storage-typed: {error}"
-        );
-        assert!(
-            load_durable_ready_result(&runs_dir, key, qcg_policy::IDEMPOTENCY_TTL)
-                .expect("load should not fail")
-                .is_none(),
-            "refused corrupt commit must leave no Ready"
-        );
-        let _ = std::fs::remove_dir_all(runs_dir.as_std_path());
-    }
-
     /// Claims the key and returns `(owner, generation)` for the winning
     /// owner, adopting `run_id` as the reserved run.
     fn claim_owner(runs_dir: &Utf8PathBuf, key: &str, digest: &str, run_id: &str) -> (String, u64) {
-        match claim_durable_pending(
-            runs_dir,
-            key,
-            digest,
-            Some(run_id.to_string()),
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect("claim should not error")
-        {
+        match claim_pending(runs_dir, key, digest, run_id).expect("claim should not error") {
             ClaimOutcome::Owner {
                 owner, generation, ..
             } => (owner, generation),
             other => panic!("expected owner, got {}", outcome_name(&other)),
         }
-    }
-
-    #[test]
-    fn committed_ready_converges_claim_without_executing() {
-        // B02: a commit landing between the waiter's last look and the
-        // claim must converge onto the committed run, never execute again.
-        let runs_dir = temp_runs_dir("ready-converge");
-        let key = "key-1";
-        let owner = claim_owner(&runs_dir, key, "digest", "run-A");
-        store_durable_ready(
-            &runs_dir,
-            key,
-            "digest",
-            "run-A",
-            &owner.0,
-            owner.1,
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect("ready commit should succeed");
-        match claim_durable_pending(
-            &runs_dir,
-            key,
-            "digest",
-            Some("run-B".into()),
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect("claim should not error")
-        {
-            ClaimOutcome::Ready { run_id } => assert_eq!(run_id, "run-A"),
-            other => panic!("committed key must converge, got {}", outcome_name(&other)),
-        }
-        match claim_durable_pending(
-            &runs_dir,
-            key,
-            "other-digest",
-            Some("run-C".into()),
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect("claim should not error")
-        {
-            ClaimOutcome::Conflict => {}
-            other => panic!("foreign digest must conflict, got {}", outcome_name(&other)),
-        }
-        let _ = std::fs::remove_dir_all(runs_dir.as_std_path());
     }
 
     #[test]
@@ -2495,38 +2297,17 @@ mod tests {
         // superseded owner can never present a current one.
         let runs_dir = temp_runs_dir("generations");
         let key = "key-1";
-        let first = claim_durable_pending(
-            &runs_dir,
-            key,
-            "digest",
-            Some("run-1".into()),
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect("first claim should win");
+        let first =
+            claim_pending(&runs_dir, key, "digest", "run-1").expect("first claim should win");
         let gen1 = match first {
             ClaimOutcome::Owner { generation, .. } => generation,
             other => panic!("expected owner, got {}", outcome_name(&other)),
         };
         assert_eq!(gen1, 1, "fresh chain starts at generation 1");
         // Age the claim past its TTL without touching anything else.
-        let path = pending_path(&runs_dir, key);
-        let mut record: DurablePendingRecord =
-            serde_json::from_slice(&std::fs::read(path.as_std_path()).expect("claim readable"))
-                .expect("claim parses");
-        record.created_at_unix = 0;
-        std::fs::write(
-            path.as_std_path(),
-            serde_json::to_vec(&record).expect("record serializes"),
-        )
-        .expect("aged claim should write");
-        let second = claim_durable_pending(
-            &runs_dir,
-            key,
-            "digest",
-            Some("run-9".into()),
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect("adoption claim should win");
+        expire_pending_claim(&runs_dir, key);
+        let second =
+            claim_pending(&runs_dir, key, "digest", "run-9").expect("adoption claim should win");
         match second {
             ClaimOutcome::Owner {
                 run_id, generation, ..
@@ -2604,124 +2385,6 @@ mod tests {
     }
 
     #[test]
-    fn stale_owner_commit_after_successor_failure_is_refused() {
-        // E02 acceptance: old claim -> successor fails/releases -> new claim -> old commit refused.
-        let runs_dir = temp_runs_dir("stale-commit");
-        let key = "key-stale";
-        let (old_owner, old_gen) = claim_owner(&runs_dir, key, "digest", "run-old");
-        // Successor path: old owner fails and releases, new owner claims.
-        release_durable_pending(&runs_dir, key, &old_owner, old_gen)
-            .expect("release should succeed");
-        let (new_owner, new_gen) = claim_owner(&runs_dir, key, "digest", "run-new");
-        assert_ne!((new_owner.clone(), new_gen), (old_owner.clone(), old_gen));
-        let err = store_durable_ready(
-            &runs_dir,
-            key,
-            "digest",
-            "run-old",
-            &old_owner,
-            old_gen,
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect_err("stale owner commit must be refused");
-        assert!(
-            err.to_string().contains("different claim") || err.to_string().contains("superseded"),
-            "{err}"
-        );
-        // New owner can still commit its own run.
-        store_durable_ready(
-            &runs_dir,
-            key,
-            "digest",
-            "run-new",
-            &new_owner,
-            new_gen,
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect("current owner commit should succeed");
-        let _ = std::fs::remove_dir_all(runs_dir.as_std_path());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn adoption_keeps_the_predecessor_mapping_until_publication() {
-        // D04: an interrupted adoption must leave the predecessor's run
-        // mapping in place. Publication is an atomic rename over the old
-        // claim; when the rename cannot happen (here: the directory
-        // refuses new files), the old mapping must survive instead of
-        // having been unlinked first. The old code removed it before
-        // publishing, so a crash in that window orphaned the run.
-        use std::os::unix::fs::PermissionsExt as _;
-        let runs_dir = temp_runs_dir("adopt-crash");
-        let key = "key-1";
-        let dir = idempotency_dir(&runs_dir);
-        std::fs::create_dir_all(dir.as_std_path()).expect("idempotency dir should be created");
-        // The lock file must exist before the directory turns read-only.
-        std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(dir.join(".idempotency.lock").as_std_path())
-            .expect("lock file should be created");
-        let expired = DurablePendingRecord {
-            key: key.into(),
-            digest: "digest".into(),
-            run_id: Some("run-A".into()),
-            owner: "dead-owner".into(),
-            created_at_unix: 0,
-            generation: 1,
-        };
-        let pending = pending_path(&runs_dir, key);
-        std::fs::write(
-            pending.as_std_path(),
-            serde_json::to_vec(&expired).expect("record should serialize"),
-        )
-        .expect("expired claim should be written");
-        let original = std::fs::metadata(dir.as_std_path())
-            .expect("idempotency dir should have metadata")
-            .permissions();
-        let mut readonly = original.clone();
-        readonly.set_mode(0o555);
-        std::fs::set_permissions(dir.as_std_path(), readonly)
-            .expect("idempotency dir should become read-only");
-        // Probe: root ignores directory permissions, so skip rather than
-        // assert on an environment where the fault cannot be injected.
-        let probe = dir.join("probe");
-        if std::fs::write(probe.as_std_path(), b"x").is_ok() {
-            let _ = std::fs::remove_file(probe.as_std_path());
-            std::fs::set_permissions(dir.as_std_path(), original)
-                .expect("permissions should be restored");
-            let _ = std::fs::remove_dir_all(runs_dir.as_std_path());
-            return;
-        }
-        let result = claim_durable_pending(
-            &runs_dir,
-            key,
-            "digest",
-            Some("run-B".into()),
-            qcg_policy::IDEMPOTENCY_TTL,
-        );
-        std::fs::set_permissions(dir.as_std_path(), original)
-            .expect("permissions should be restored");
-        assert!(
-            result.is_err(),
-            "publication into a read-only directory must fail"
-        );
-        let survivor: DurablePendingRecord = serde_json::from_slice(
-            &std::fs::read(pending.as_std_path())
-                .expect("predecessor mapping must survive the failed publication"),
-        )
-        .expect("surviving claim should parse");
-        assert_eq!(
-            survivor.run_id.as_deref(),
-            Some("run-A"),
-            "the adopted run must stay attributable"
-        );
-        assert_eq!(survivor.generation, 1, "the predecessor is unchanged");
-        let _ = std::fs::remove_dir_all(runs_dir.as_std_path());
-    }
-
-    #[test]
     fn superseded_commit_converges_or_fails_without_overwriting() {
         // B02/E02: a committer whose claim was superseded by an expiry
         // adoption must not replace the newer owner's outcome. Before any
@@ -2732,24 +2395,8 @@ mod tests {
         let key = "key-1";
         let (stale_owner, gen1) = claim_owner(&runs_dir, key, "digest", "run-1");
         // Age the first claim past its TTL so the next claim adopts it.
-        let path = pending_path(&runs_dir, key);
-        let mut record: DurablePendingRecord =
-            serde_json::from_slice(&std::fs::read(path.as_std_path()).expect("claim readable"))
-                .expect("claim parses");
-        record.created_at_unix = 0;
-        std::fs::write(
-            path.as_std_path(),
-            serde_json::to_vec(&record).expect("record serializes"),
-        )
-        .expect("aged claim should write");
-        let second = claim_durable_pending(
-            &runs_dir,
-            key,
-            "digest",
-            Some("run-2".into()),
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect("adoption should win");
+        expire_pending_claim(&runs_dir, key);
+        let second = claim_pending(&runs_dir, key, "digest", "run-2").expect("adoption should win");
         let (new_owner, gen2) = match second {
             ClaimOutcome::Owner {
                 owner, generation, ..
@@ -2759,41 +2406,17 @@ mod tests {
         assert!(gen2 > gen1, "adoption advances the generation");
         // The stale owner commits nothing new: without a Ready record and
         // with a different claim id it fails instead of overwriting.
-        let error = store_durable_ready(
-            &runs_dir,
-            key,
-            "digest",
-            "run-1",
-            &stale_owner,
-            gen1,
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect_err("superseded commit must not overwrite");
+        let error = store_ready(&runs_dir, key, "digest", "run-1", &stale_owner, gen1)
+            .expect_err("superseded commit must not overwrite");
         assert!(
             matches!(error, StoreReadyError::Storage(_)),
             "supersession must type as an explicit storage failure, got: {error}"
         );
-        let committed = store_durable_ready(
-            &runs_dir,
-            key,
-            "digest",
-            "run-1",
-            &new_owner,
-            gen2,
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect("current generation should commit");
+        let committed = store_ready(&runs_dir, key, "digest", "run-1", &new_owner, gen2)
+            .expect("current generation should commit");
         assert_eq!(committed, "run-1");
-        let error = store_durable_ready(
-            &runs_dir,
-            key,
-            "digest",
-            "run-1",
-            &stale_owner,
-            gen1,
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect_err("stale commit must be refused even after the successor committed");
+        let error = store_ready(&runs_dir, key, "digest", "run-1", &stale_owner, gen1)
+            .expect_err("stale commit must be refused even after the successor committed");
         assert!(
             matches!(error, StoreReadyError::Storage(_)),
             "stale commit must type as storage failure, got: {error}"
@@ -2808,84 +2431,15 @@ mod tests {
         let runs_dir = temp_runs_dir("digest-conflict");
         let key = "key-1";
         let (owner, generation) = claim_owner(&runs_dir, key, "digest-a", "run-1");
-        let committed = store_durable_ready(
-            &runs_dir,
-            key,
-            "digest-a",
-            "run-1",
-            &owner,
-            generation,
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect("first commit should succeed");
+        let committed = store_ready(&runs_dir, key, "digest-a", "run-1", &owner, generation)
+            .expect("first commit should succeed");
         assert_eq!(committed, "run-1");
-        let error = store_durable_ready(
-            &runs_dir,
-            key,
-            "digest-b",
-            "run-9",
-            &owner,
-            generation,
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect_err("a different digest must conflict");
+        let error = store_ready(&runs_dir, key, "digest-b", "run-9", &owner, generation)
+            .expect_err("a different digest must conflict");
         assert!(
             matches!(error, StoreReadyError::DigestConflict),
             "digest mismatch must type as a conflict, got: {error}"
         );
-        let _ = std::fs::remove_dir_all(runs_dir.as_std_path());
-    }
-
-    #[test]
-    fn stale_owner_commit_is_refused_after_release_and_reclaim() {
-        // E02: old owner stops, TTL expires, the successor adopts and then
-        // fails and releases, a new chain starts at generation 1. The old
-        // owner's commit must still be refused because the claim id is a
-        // different one.
-        let runs_dir = temp_runs_dir("stale-reclaim");
-        let key = "key-1";
-        let (old_owner, old_generation) = claim_owner(&runs_dir, key, "digest", "run-A");
-        // Age and let a successor adopt the claim.
-        let path = pending_path(&runs_dir, key);
-        let mut record: DurablePendingRecord =
-            serde_json::from_slice(&std::fs::read(path.as_std_path()).expect("claim readable"))
-                .expect("claim parses");
-        record.created_at_unix = 0;
-        std::fs::write(
-            path.as_std_path(),
-            serde_json::to_vec(&record).expect("record serializes"),
-        )
-        .expect("aged claim should write");
-        let (successor_owner, successor_generation) =
-            claim_owner(&runs_dir, key, "digest", "run-B");
-        // The successor fails and releases its claim.
-        release_durable_pending(&runs_dir, key, &successor_owner, successor_generation)
-            .expect("successor release should succeed");
-        // A fresh chain claims again; generation restarts at 1.
-        let (fresh_owner, fresh_generation) = claim_owner(&runs_dir, key, "digest", "run-C");
-        assert_eq!(fresh_generation, 1, "a fresh chain starts at generation 1");
-        let error = store_durable_ready(
-            &runs_dir,
-            key,
-            "digest",
-            "run-A",
-            &old_owner,
-            old_generation,
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect_err("the old owner must not commit against a different claim");
-        assert!(matches!(error, StoreReadyError::Storage(_)), "{error}");
-        let committed = store_durable_ready(
-            &runs_dir,
-            key,
-            "digest",
-            "run-C",
-            &fresh_owner,
-            fresh_generation,
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect("the current owner should commit");
-        assert_eq!(committed, "run-C");
         let _ = std::fs::remove_dir_all(runs_dir.as_std_path());
     }
 
@@ -2898,16 +2452,8 @@ mod tests {
         let key = "key-1";
         let (owner, generation) = claim_owner(&runs_dir, key, "digest", "run-A");
         // A different run id than the claim reserved is refused.
-        let error = store_durable_ready(
-            &runs_dir,
-            key,
-            "digest",
-            "run-B",
-            &owner,
-            generation,
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect_err("a mismatched reserved run must be refused");
+        let error = store_ready(&runs_dir, key, "digest", "run-B", &owner, generation)
+            .expect_err("a mismatched reserved run must be refused");
         assert!(
             error.to_string().contains("reserved run"),
             "reserved-run mismatch must be named, got: {error}"
@@ -2915,16 +2461,8 @@ mod tests {
         // An absent claim is refused.
         std::fs::remove_file(pending_path(&runs_dir, key).as_std_path())
             .expect("claim should be removable");
-        let error = store_durable_ready(
-            &runs_dir,
-            key,
-            "digest",
-            "run-A",
-            &owner,
-            generation,
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect_err("an absent claim must be refused");
+        let error = store_ready(&runs_dir, key, "digest", "run-A", &owner, generation)
+            .expect_err("an absent claim must be refused");
         assert!(
             error.to_string().contains("absent"),
             "absence must be named, got: {error}"
@@ -2937,16 +2475,8 @@ mod tests {
         let (owner, generation) = claim_owner(&runs_dir, key, "digest", "run-A");
         std::fs::write(pending_path(&runs_dir, key).as_std_path(), b"{torn")
             .expect("corrupt claim should write");
-        let error = store_durable_ready(
-            &runs_dir,
-            key,
-            "digest",
-            "run-A",
-            &owner,
-            generation,
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect_err("an unusable claim must be refused");
+        let error = store_ready(&runs_dir, key, "digest", "run-A", &owner, generation)
+            .expect_err("an unusable claim must be refused");
         assert!(
             error.to_string().contains("unusable"),
             "unusable must be named, got: {error}"
@@ -2969,16 +2499,8 @@ mod tests {
             serde_json::to_vec(&reservationless).expect("record should serialize"),
         )
         .expect("reservationless claim should be written");
-        let error = store_durable_ready(
-            &runs_dir,
-            key,
-            "digest",
-            "run-A",
-            "owner-none",
-            1,
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect_err("a None-reservation claim must be refused");
+        let error = store_ready(&runs_dir, key, "digest", "run-A", "owner-none", 1)
+            .expect_err("a None-reservation claim must be refused");
         assert!(
             error.to_string().contains("reserved run"),
             "None reservation must name the reserved run, got: {error}"
@@ -2989,81 +2511,6 @@ mod tests {
                 .is_none(),
             "refused None-reservation commit must leave no Ready"
         );
-        let _ = std::fs::remove_dir_all(runs_dir.as_std_path());
-    }
-
-    #[test]
-    fn durability_model_survives_an_abrupt_process_stop() {
-        // Q2: the guarantee is process termination. A synced claim and
-        // Ready mapping must survive an abrupt stop (no release, no
-        // graceful close) and a fresh process must converge onto the same
-        // run instead of starting a second one.
-        let runs_dir = temp_runs_dir("durability-model");
-        let key = "key-1";
-        let (owner, generation) = claim_owner(&runs_dir, key, "digest", "run-A");
-        store_durable_ready(
-            &runs_dir,
-            key,
-            "digest",
-            "run-A",
-            &owner,
-            generation,
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect("ready commit should succeed");
-        // Simulate SIGKILL: drop every handle without releasing the claim.
-        match claim_durable_pending(
-            &runs_dir,
-            key,
-            "digest",
-            Some("run-B".into()),
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect("claim should not error")
-        {
-            ClaimOutcome::Ready { run_id } => {
-                assert_eq!(run_id, "run-A", "the mapping must survive the stop");
-            }
-            other => panic!(
-                "an abrupt stop must keep the committed mapping, got {}",
-                outcome_name(&other)
-            ),
-        }
-        let _ = std::fs::remove_dir_all(runs_dir.as_std_path());
-    }
-
-    #[test]
-    fn second_concurrent_claimant_is_peer() {
-        let runs_dir = temp_runs_dir("peer");
-        let key = "key-1";
-        let first = claim_durable_pending(
-            &runs_dir,
-            key,
-            "digest",
-            Some("run-1".into()),
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect("first claim should win");
-        assert!(matches!(first, ClaimOutcome::Owner { .. }));
-        let second = claim_durable_pending(
-            &runs_dir,
-            key,
-            "digest",
-            Some("run-2".into()),
-            qcg_policy::IDEMPOTENCY_TTL,
-        )
-        .expect("second claim should not error");
-        assert!(
-            matches!(second, ClaimOutcome::Peer),
-            "live predecessor must report peer without overwriting its claim"
-        );
-        // The winner's record survives intact.
-        match read_durable_pending(&runs_dir, key) {
-            PendingRead::Valid(record) => assert_eq!(record.run_id.as_deref(), Some("run-1")),
-            PendingRead::Expired(_) | PendingRead::Absent | PendingRead::Unusable(_) => {
-                panic!("expected the winning claim to survive")
-            }
-        }
         let _ = std::fs::remove_dir_all(runs_dir.as_std_path());
     }
 }

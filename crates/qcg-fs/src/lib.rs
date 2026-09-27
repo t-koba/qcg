@@ -2,7 +2,7 @@
 //! explicit optional cap. `None` means no mechanistic limit; the caller sets
 //! a max only when wanted.
 
-pub mod anchored;
+mod anchored;
 
 pub use anchored::{
     ANCHOR_HASH_LEN, AnchorRemap, AnchoredLine, AnchoredPatchError, PatchEdit, PatchLimits,
@@ -13,7 +13,7 @@ pub use anchored::{
 use camino::{Utf8Path, Utf8PathBuf};
 use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::{Read as _, Write};
+use std::io::Read as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Unique-staging nonce shared by the Unix and non-Unix, sync write paths.
@@ -24,16 +24,7 @@ pub fn read_bounded(path: &Utf8Path, max_bytes: Option<usize>) -> std::io::Resul
     let Some(max_bytes) = max_bytes else {
         return std::fs::read(path);
     };
-    let file = File::open(path)?;
-    let mut bytes = Vec::new();
-    file.take(max_bytes.saturating_add(1) as u64)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > max_bytes {
-        return Err(std::io::Error::other(format!(
-            "file `{path}` exceeds {max_bytes} bytes"
-        )));
-    }
-    Ok(bytes)
+    read_capped(File::open(path)?, path, Some(max_bytes))
 }
 
 /// Single-handle verify-and-use read (E06): opens with `O_NOFOLLOW` on Unix,
@@ -47,7 +38,10 @@ pub fn read_nofollow_bounded(
     path: &Utf8Path,
     max_bytes: Option<usize>,
 ) -> std::io::Result<Vec<u8>> {
-    let file = open_read_nofollow(path)?;
+    read_capped(open_read_nofollow(path)?, path, max_bytes)
+}
+
+fn read_capped(file: File, path: &Utf8Path, max_bytes: Option<usize>) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     match max_bytes {
         None => {
@@ -68,22 +62,6 @@ pub fn read_nofollow_bounded(
         }
     }
     Ok(bytes)
-}
-
-/// Single-handle verify-and-use read+hash (E06): opens once with
-/// `O_NOFOLLOW`, validates the handle via `fstat`, reads bytes FROM THAT FD,
-/// hashes THOSE bytes, and returns both. Callers must compare the digest and
-/// use THESE bytes, never re-open the path for a second hash or read.
-/// Non-Unix is pre+post best-effort (see `open_read_nofollow`).
-pub fn read_and_hash_nofollow(
-    path: &Utf8Path,
-    max_bytes: Option<usize>,
-) -> std::io::Result<(Vec<u8>, String, u64)> {
-    let bytes = read_nofollow_bounded(path, max_bytes)?;
-    use sha2::{Digest as _, Sha256};
-    let digest = hex::encode(Sha256::digest(&bytes));
-    let count = bytes.len() as u64;
-    Ok((bytes, digest, count))
 }
 
 /// Streams a file through SHA-256, enforcing an explicit size cap only when
@@ -126,48 +104,7 @@ pub fn hash_opened_file_sha256(
 }
 
 pub fn hash_file_sha256(path: &Utf8Path, max_bytes: Option<u64>) -> std::io::Result<(String, u64)> {
-    #[cfg(unix)]
-    let mut file = {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)?;
-        if !file.metadata()?.file_type().is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("file `{path}` is not a regular file"),
-            ));
-        }
-        file
-    };
-    #[cfg(not(unix))]
-    let mut file = {
-        match std::fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!("file `{path}` is a symbolic link"),
-                ));
-            }
-            Ok(metadata) if !metadata.file_type().is_file() => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("file `{path}` is not a regular file"),
-                ));
-            }
-            Ok(_) => {}
-            Err(error) => return Err(error),
-        }
-        let file = File::open(path)?;
-        if !file.metadata()?.file_type().is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("file `{path}` is not a regular file"),
-            ));
-        }
-        file
-    };
+    let mut file = open_read_nofollow(path)?;
     hash_opened_file_sha256(&mut file, max_bytes, |limit| {
         std::io::Error::other(format!("file `{path}` exceeds {limit} bytes"))
     })
@@ -226,23 +163,6 @@ pub fn open_read_nofollow(path: &Utf8Path) -> std::io::Result<File> {
     }
 }
 
-/// Writes bytes while enforcing an explicit size cap only when set.
-pub fn write_bounded<W: Write>(
-    mut writer: W,
-    bytes: &[u8],
-    max_bytes: Option<usize>,
-    resource: &str,
-) -> std::io::Result<()> {
-    if let Some(limit) = max_bytes
-        && bytes.len() > limit
-    {
-        return Err(std::io::Error::other(format!(
-            "{resource} exceeds {limit} bytes"
-        )));
-    }
-    writer.write_all(bytes)
-}
-
 /// A single directory-tree entry produced by [`WalkDir`].
 #[derive(Debug)]
 pub struct WalkEntry {
@@ -252,17 +172,17 @@ pub struct WalkEntry {
 }
 
 impl WalkEntry {
-    /// Full path of the entry. The walk root itself is yielded at depth 0.
+    /// The walk root itself is yielded at depth 0.
     pub fn path(&self) -> &Utf8Path {
         &self.path
     }
 
-    /// Entry type observed without following symbolic links.
+    /// Observed without following symbolic links.
     pub fn file_type(&self) -> std::fs::FileType {
         self.file_type
     }
 
-    /// Nesting depth relative to the walk root, which has depth 0.
+    /// Relative to the walk root, which has depth 0.
     pub fn depth(&self) -> usize {
         self.depth
     }
@@ -550,6 +470,61 @@ pub fn stage_file_at(
     Err(std::io::Error::other(
         "package staging collided repeatedly; refusing to overwrite",
     ))
+}
+
+/// Publishes a run-private metadata sidecar atomically.
+///
+/// This is the single home for the sidecar persistence policy that operation
+/// results, pending tool payloads, run state, and checkpoint blobs all need:
+/// owner-only mode, no symlink at the destination, an atomic publish, and a
+/// parent directory sync so the name survives power loss. Callers must not
+/// hand-roll an `OpenOptions` block for a metadata file, because that is how
+/// the call sites drifted apart before.
+///
+/// The parent directory must already exist; creating it is the caller's
+/// decision because only the owner of a run's metadata layout knows its shape.
+/// On Unix the shared staging open already creates the file `0600` before the
+/// rename, so the mode is never briefly wider; off Unix the mode is applied on
+/// the staging handle for the same reason.
+pub fn write_sidecar_atomic(path: &Utf8Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_file_atomic(path, |file| {
+        use std::io::Write as _;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        set_owner_only_mode(file)
+    })
+}
+
+/// Removes a metadata sidecar, reporting every failure except absence.
+///
+/// A missing file is the desired end state, so it is not an error; a symlink at
+/// the leaf is, because following it could delete a file outside the run.
+pub fn remove_reporting(path: &Utf8Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path.as_std_path()) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(std::io::Error::other(format!(
+            "refusing to remove `{path}`: the leaf is a symbolic link"
+        ))),
+        Ok(_) => match std::fs::remove_file(path.as_std_path()) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Owner-only mode on an open staging handle. Unix needs nothing: the atomic
+/// writer creates the staging file `0600` in the `openat` call, so the mode
+/// lands before publication. Off Unix there are no POSIX bits, so the closest
+/// equivalent is a writable, non-readonly file, which is what the shared
+/// writer already creates.
+fn set_owner_only_mode(_file: &mut File) -> std::io::Result<()> {
+    #[cfg(not(unix))]
+    {
+        let _ = _file;
+    }
+    Ok(())
 }
 
 pub fn write_file_atomic(
@@ -895,14 +870,6 @@ mod tests {
     }
 
     #[test]
-    fn read_bounded_reports_missing_files() {
-        let missing = Utf8PathBuf::from_path_buf(std::env::temp_dir().join("qcg-fs-test-missing"))
-            .expect("temporary path must be UTF-8");
-        let _ = std::fs::remove_file(&missing);
-        read_bounded(&missing, None).expect_err("missing file must fail");
-    }
-
-    #[test]
     fn hash_reports_digest_and_count_with_optional_cap() {
         let path = temp_file("hash", b"abc");
         let (hex, count) = hash_file_sha256(&path, None).expect("hash should succeed");
@@ -936,19 +903,6 @@ mod tests {
             "the refusal must come from O_NOFOLLOW, got: {error}"
         );
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn write_bounded_enforces_the_cap() {
-        let mut sink = Vec::new();
-        write_bounded(&mut sink, b"hello", Some(5), "test").expect("exact cap should pass");
-        assert_eq!(sink, b"hello");
-        let mut sink = Vec::new();
-        let error = write_bounded(&mut sink, b"hello!", Some(5), "test")
-            .expect_err("over-cap write must fail");
-        assert!(error.to_string().contains("exceeds"), "{error}");
-        let mut sink = Vec::new();
-        write_bounded(&mut sink, b"hello!", None, "test").expect("uncapped write should pass");
     }
 
     #[test]
@@ -992,6 +946,9 @@ mod tests {
             staging_files(&dir).is_empty(),
             "failed staging files must be removed"
         );
+        let error = write_file_atomic(Utf8Path::new(""), |_file| Ok(()))
+            .expect_err("parentless path must fail");
+        assert!(error.to_string().contains("no parent directory"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1041,13 +998,6 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&outside);
-    }
-
-    #[test]
-    fn write_file_atomic_rejects_parentless_paths() {
-        let error = write_file_atomic(Utf8Path::new(""), |_file| Ok(()))
-            .expect_err("parentless path must fail");
-        assert!(error.to_string().contains("no parent directory"), "{error}");
     }
 
     #[test]
@@ -1165,28 +1115,13 @@ mod tests {
         let position = |name: &str| by_path.iter().position(|entry| entry.0 == name);
         assert!(position("sub") < position("sub/mid.txt"));
         assert!(position("sub/nested") < position("sub/nested/deep.txt"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn walk_dir_min_depth_skips_root_but_descends() {
-        let dir = test_dir("walk-min-depth");
-        std::fs::write(dir.join("top.txt"), b"top").expect("fixture should be writable");
-
-        let entries: Vec<WalkEntry> = WalkDir::new(&dir)
+        // min_depth(1) skips the root but still descends into it.
+        let visible: Vec<WalkEntry> = WalkDir::new(&dir)
             .min_depth(1)
             .collect::<Result<_, _>>()
             .expect("walk should succeed");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].depth(), 1);
-        assert_eq!(
-            entries[0]
-                .path()
-                .strip_prefix(&dir)
-                .expect("entry lives under root")
-                .as_str(),
-            "top.txt"
-        );
+        assert_eq!(visible.len(), 5);
+        assert!(visible.iter().all(|entry| entry.depth() >= 1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -11,8 +11,13 @@ pub use writer::{journal_lock_path, read_last_seq_from_tail, repair_truncated_ta
 #[cfg(test)]
 mod tests {
     use super::*;
-    use camino::Utf8PathBuf;
+    use camino::{Utf8Path, Utf8PathBuf};
     use serde_json::{Value, json};
+
+    /// A real state-free durable kind for the bookkeeping tests below. The
+    /// fold gate refuses invented kinds, and seq assignment, event counts,
+    /// and tail windows behave identically for every durable record.
+    const BOOKKEEPING_KIND: &str = "audit_degraded";
 
     fn test_limits(
         max_event_bytes: usize,
@@ -27,6 +32,84 @@ mod tests {
             max_state_bytes: Some(max_state_bytes),
             scan_window_bytes: None,
         }
+    }
+
+    /// A fresh temporary directory and the journal path inside it, named
+    /// `qcg-journal-<label>` so a leftover from a crashed run is
+    /// identifiable. The pid and a v7 uuid keep two concurrent runs of
+    /// the same test from sharing a journal. The caller removes the
+    /// directory when the test is done with it.
+    fn test_journal_paths(label: &str) -> (std::path::PathBuf, Utf8PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "qcg-journal-{label}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&dir).expect("test directory should be created");
+        let path = Utf8PathBuf::from_path_buf(dir.join("journal.jsonl"))
+            .expect("temporary path must be UTF-8");
+        (dir, path)
+    }
+
+    /// The `run_started` payload the bookkeeping tests share: a complete
+    /// generator descriptor for `label` plus the placeholder digests and
+    /// envelope fields the fold copies through without inspecting. A test
+    /// that needs a field beyond these keeps its own explicit payload.
+    fn run_started_event(label: &str) -> Value {
+        json!({
+            "generator": format!("{label}@1.0.0"),
+            "generator_path": label,
+            "contract_sha256": "abc",
+            "inputs": {},
+            "resource_hashes": [],
+            "qcg": "0.1.0",
+            "schema_version": 1,
+        })
+    }
+
+    /// One `step_started` record for `node`. The metrics fold counts these
+    /// events, and `attempt` is the counter a retry would advance.
+    fn step_started_event(node: &str) -> Value {
+        json!({ "node": node, "type": "test", "attempt": 1 })
+    }
+
+    /// One `step_finished` record for `node`. `status` is the durable
+    /// outcome the metrics fold splits succeeded from failed.
+    fn step_finished_event(node: &str, status: &str) -> Value {
+        json!({ "node": node, "status": status })
+    }
+
+    /// One `llm_call` record for `node` charging `input`, `output` and
+    /// `cached_input` tokens plus `cost_microusd`. The budget fold sums
+    /// these fields verbatim, so the caller's numbers are exactly what the
+    /// assertions count.
+    fn llm_call_event(
+        node: &str,
+        input: u64,
+        output: u64,
+        cached_input: u64,
+        cost_microusd: u64,
+    ) -> Value {
+        json!({
+            "node": node,
+            "provider": "fake",
+            "model": "fake",
+            "max_tokens": 128,
+            "tokens": { "input": input, "output": output, "cached_input": cached_input },
+            "cost_microusd": cost_microusd,
+        })
+    }
+
+    /// Appends a torn trailing line with no terminator, exactly what a
+    /// crash between the payload write and its newline leaves behind.
+    fn append_torn_tail(path: &Utf8Path) {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .expect("journal should open for append");
+        file.write_all(b"{\"t\":\"step_started\",\"node\":")
+            .expect("the torn tail should be written");
     }
 
     #[test]
@@ -141,33 +224,26 @@ mod tests {
         // enforce limits against what is on disk, not its stale counters.
         // Event cap 2: A writes 1, B writes 1 externally, A's next write
         // must be rejected (3rd event), not admitted on stale stats.
-        let dir = std::env::temp_dir().join(format!(
-            "qcg-journal-resync-stats-{}-{}",
-            std::process::id(),
-            uuid::Uuid::now_v7()
-        ));
-        std::fs::create_dir_all(&dir).expect("test directory should be created");
-        let path = Utf8PathBuf::from_path_buf(dir.join("journal.jsonl"))
-            .expect("temporary path must be UTF-8");
+        let (dir, path) = test_journal_paths("resync-stats");
         let limits = test_limits(64 * 1024, 1024 * 1024, 2, 128 * 1024);
         let writer_a =
             crate::JournalWriter::create_with_limits(&path, "resync-stats", false, None, limits)
                 .expect("writer A should open");
         writer_a
-            .event("note", json!({"n": 1}))
+            .event(BOOKKEEPING_KIND, json!({"reason": "test", "n": 1}))
             .expect("first event should append");
         // Peer append bypassing A's memory.
         crate::JournalWriter::append_single_event(
             &path,
             "resync-stats",
-            "note",
-            json!({"n": 2}),
+            BOOKKEEPING_KIND,
+            json!({"reason": "test", "n": 2}),
             limits,
             None,
         )
         .expect("peer event should append");
         let error = writer_a
-            .event("note", json!({"n": 3}))
+            .event(BOOKKEEPING_KIND, json!({"reason": "test", "n": 3}))
             .expect_err("third event must breach the cap of 2");
         assert!(
             matches!(error, JournalError::EventCountExceeded { .. }),
@@ -181,20 +257,13 @@ mod tests {
         // B09: durable history that shrinks outside the journal lock must
         // refuse seq assignment instead of reusing seq values on top of
         // the truncated file.
-        let dir = std::env::temp_dir().join(format!(
-            "qcg-journal-truncate-guard-{}-{}",
-            std::process::id(),
-            uuid::Uuid::now_v7()
-        ));
-        std::fs::create_dir_all(&dir).expect("test directory should be created");
-        let path = Utf8PathBuf::from_path_buf(dir.join("journal.jsonl"))
-            .expect("temporary path must be UTF-8");
+        let (dir, path) = test_journal_paths("truncate-guard");
         let writer = crate::JournalWriter::create(&path, "truncate-guard", false, None).unwrap();
         writer
-            .event("note", json!({"n": 1}))
+            .event(BOOKKEEPING_KIND, json!({"reason": "test", "n": 1}))
             .expect("first event should append");
         writer
-            .event("note", json!({"n": 2}))
+            .event(BOOKKEEPING_KIND, json!({"reason": "test", "n": 2}))
             .expect("second event should append");
         // External actor truncates committed history without the lock.
         std::fs::OpenOptions::new()
@@ -204,7 +273,7 @@ mod tests {
             .set_len(0)
             .expect("truncation should succeed");
         let error = writer
-            .event("note", json!({"n": 3}))
+            .event(BOOKKEEPING_KIND, json!({"reason": "test", "n": 3}))
             .expect_err("append over truncated history must fail closed");
         assert!(
             error.to_string().contains("truncated"),
@@ -218,27 +287,20 @@ mod tests {
         // B09: the bounded backward scan honors the caller's event limit,
         // never a fixed default. A final line within the configured limit
         // resolves; one beyond it fails closed.
-        let dir = std::env::temp_dir().join(format!(
-            "qcg-journal-huge-limit-{}-{}",
-            std::process::id(),
-            uuid::Uuid::now_v7()
-        ));
-        std::fs::create_dir_all(&dir).expect("test directory should be created");
-        let path = Utf8PathBuf::from_path_buf(dir.join("journal.jsonl"))
-            .expect("temporary path must be UTF-8");
+        let (dir, path) = test_journal_paths("huge-limit");
         let generous = test_limits(4 * 1024 * 1024, 64 * 1024 * 1024, 100, 128 * 1024);
         let writer =
             crate::JournalWriter::create_with_limits(&path, "huge-limit", false, None, generous)
                 .expect("writer should open");
         writer
-            .event("note", json!({"n": 1}))
+            .event(BOOKKEEPING_KIND, json!({"reason": "test", "n": 1}))
             .expect("first event should append");
         let big = "x".repeat(2 * 1024 * 1024);
         crate::JournalWriter::append_single_event(
             &path,
             "huge-limit",
-            "note",
-            json!({"blob": big}),
+            BOOKKEEPING_KIND,
+            json!({"reason": "test", "blob": big}),
             generous,
             None,
         )
@@ -279,34 +341,27 @@ mod tests {
     fn resync_sees_huge_tail_events_for_seq_assignment() {
         // B09: a final event larger than the tail window must still count
         // for seq assignment; treating it as absent duplicates its seq.
-        let dir = std::env::temp_dir().join(format!(
-            "qcg-journal-huge-tail-{}-{}",
-            std::process::id(),
-            uuid::Uuid::now_v7()
-        ));
-        std::fs::create_dir_all(&dir).expect("test directory should be created");
-        let path = Utf8PathBuf::from_path_buf(dir.join("journal.jsonl"))
-            .expect("temporary path must be UTF-8");
+        let (dir, path) = test_journal_paths("huge-tail");
         let limits = test_limits(4 * 1024 * 1024, 64 * 1024 * 1024, 100, 128 * 1024);
         let writer_a =
             crate::JournalWriter::create_with_limits(&path, "huge-tail", false, None, limits)
                 .expect("writer A should open");
         writer_a
-            .event("note", json!({"n": 1}))
+            .event(BOOKKEEPING_KIND, json!({"reason": "test", "n": 1}))
             .expect("first event should append");
         // Peer appends a single event larger than the tail window.
         let big = "x".repeat(2 * 1024 * 1024);
         crate::JournalWriter::append_single_event(
             &path,
             "huge-tail",
-            "note",
-            json!({"blob": big}),
+            BOOKKEEPING_KIND,
+            json!({"reason": "test", "blob": big}),
             limits,
             None,
         )
         .expect("huge peer event should append");
         writer_a
-            .event("note", json!({"n": 3}))
+            .event(BOOKKEEPING_KIND, json!({"reason": "test", "n": 3}))
             .expect("post-huge-tail append should succeed");
         let scan = read_journal_values(&path, JournalLimits::default())
             .expect("journal should be readable");
@@ -326,14 +381,7 @@ mod tests {
 
     #[test]
     fn journal_event_rejects_state_at_the_byte_limit() {
-        let dir = std::env::temp_dir().join(format!(
-            "qcg-journal-state-limit-{}-{}",
-            std::process::id(),
-            uuid::Uuid::now_v7()
-        ));
-        std::fs::create_dir_all(&dir).expect("test directory should be created");
-        let path = Utf8PathBuf::from_path_buf(dir.join("journal.jsonl"))
-            .expect("temporary path must be UTF-8");
+        let (dir, path) = test_journal_paths("state-limit");
         // Creation seeds the writer run id into the persisted state, so
         // the exact-fit baseline carries it too.
         let seeded_state = crate::RunState {
@@ -348,18 +396,7 @@ mod tests {
                 .expect("the empty state should fit exactly at the state limit");
 
         let error = journal
-            .event(
-                "run_started",
-                json!({
-                    "generator": "state-limit@1.0.0",
-                    "generator_path": "state-limit",
-                    "contract_sha256": "abc",
-                    "inputs": {},
-                    "resource_hashes": [],
-                    "qcg": "0.1.0",
-                    "schema_version": 1,
-                }),
-            )
+            .event("run_started", run_started_event("state-limit"))
             .expect_err("state growth over the limit should reject the event");
         assert!(matches!(
             error,
@@ -385,14 +422,7 @@ mod tests {
 
     #[test]
     fn read_rejects_a_large_newline_free_record_while_reading() {
-        let dir = std::env::temp_dir().join(format!(
-            "qcg-journal-newline-free-limit-{}-{}",
-            std::process::id(),
-            uuid::Uuid::now_v7()
-        ));
-        std::fs::create_dir_all(&dir).expect("test directory should be created");
-        let path = Utf8PathBuf::from_path_buf(dir.join("journal.jsonl"))
-            .expect("temporary path must be UTF-8");
+        let (dir, path) = test_journal_paths("newline-free-limit");
         let limits = test_limits(8, 64, 4, 64);
         std::fs::write(&path, vec![b'x'; limits.max_event_bytes.unwrap_or(8) + 2])
             .expect("the oversized newline-free record should be written");
@@ -412,11 +442,7 @@ mod tests {
 
     #[test]
     fn fold_journal_ignores_only_a_truncated_final_record() {
-        let dir =
-            std::env::temp_dir().join(format!("qcg-journal-truncated-tail-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("test directory should be created");
-        let path = camino::Utf8PathBuf::from_path_buf(dir.join("journal.jsonl"))
-            .expect("temporary path must be UTF-8");
+        let (_dir, path) = test_journal_paths("truncated-tail");
         std::fs::write(
             &path,
             concat!(
@@ -434,47 +460,22 @@ mod tests {
 
     #[test]
     fn run_finished_includes_accumulated_metrics() {
-        let dir = std::env::temp_dir().join(format!(
-            "qcg-journal-metrics-{}",
-            uuid::Uuid::now_v7().as_simple()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = camino::Utf8PathBuf::from_path_buf(dir.join("journal.jsonl")).unwrap();
+        let (dir, path) = test_journal_paths("metrics");
         let journal = JournalWriter::create(&path, "metrics-run", false, None).unwrap();
         journal
-            .event(
-                "run_started",
-                json!({
-                    "generator": "metrics@1.0.0",
-                    "generator_path": "metrics",
-                    "contract_sha256": "abc",
-                    "inputs": {},
-                    "resource_hashes": [],
-                    "qcg": "0.1.0",
-                    "schema_version": 1,
-                }),
-            )
+            .event("run_started", run_started_event("metrics"))
             .unwrap();
         journal
-            .event(
-                "step_started",
-                json!({ "node": "a", "type": "test", "attempt": 1 }),
-            )
+            .event("step_started", step_started_event("a"))
             .unwrap();
         journal
-            .event("step_finished", json!({ "node": "a", "status": "success" }))
+            .event("step_finished", step_finished_event("a", "success"))
             .unwrap();
         journal
-            .event(
-                "step_started",
-                json!({ "node": "b", "type": "test", "attempt": 1 }),
-            )
+            .event("step_started", step_started_event("b"))
             .unwrap();
         journal
-            .event(
-                "step_finished",
-                json!({ "node": "b", "status": "check_failed" }),
-            )
+            .event("step_finished", step_finished_event("b", "check_failed"))
             .unwrap();
         journal
             .event(
@@ -495,17 +496,7 @@ mod tests {
             )
             .unwrap();
         journal
-            .event(
-                "llm_call",
-                json!({
-                    "node": "r",
-                    "provider": "fake",
-                    "model": "fake",
-                    "max_tokens": 128,
-                    "tokens": { "input": 7, "output": 3, "cached_input": 2 },
-                    "cost_microusd": 25,
-                }),
-            )
+            .event("llm_call", llm_call_event("r", 7, 3, 2, 25))
             .unwrap();
         journal
             .event("run_finished", json!({ "status": "failed" }))
@@ -543,40 +534,13 @@ mod tests {
                 ) }),
             ),
         ] {
-            let dir = std::env::temp_dir().join(format!(
-                "qcg-journal-terminal-{}-{}",
-                kind,
-                uuid::Uuid::now_v7()
-            ));
-            std::fs::create_dir_all(&dir).unwrap();
-            let path = camino::Utf8PathBuf::from_path_buf(dir.join("journal.jsonl")).unwrap();
+            let (_dir, path) = test_journal_paths(&format!("terminal-{kind}"));
             let journal = JournalWriter::create(&path, "terminal-run", false, None).unwrap();
             journal
-                .event(
-                    "run_started",
-                    json!({
-                        "generator": "terminal@1.0.0",
-                        "generator_path": "terminal",
-                        "contract_sha256": "abc",
-                        "inputs": {},
-                        "resource_hashes": [],
-                        "qcg": "0.1.0",
-                        "schema_version": 1,
-                    }),
-                )
+                .event("run_started", run_started_event("terminal"))
                 .unwrap();
             journal
-                .event(
-                    "llm_call",
-                    json!({
-                        "node": "r",
-                        "provider": "fake",
-                        "model": "fake",
-                        "max_tokens": 128,
-                        "tokens": { "input": 7, "output": 3, "cached_input": 2 },
-                        "cost_microusd": 25,
-                    }),
-                )
+                .event("llm_call", llm_call_event("r", 7, 3, 2, 25))
                 .unwrap();
             journal.event(kind, payload).unwrap();
 
@@ -595,9 +559,7 @@ mod tests {
 
     #[test]
     fn poisoned_mutexes_do_not_leave_journal_unusable() {
-        let dir = std::env::temp_dir().join(format!("qcg-journal-poison-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = camino::Utf8PathBuf::from_path_buf(dir.join("journal.jsonl")).unwrap();
+        let (_dir, path) = test_journal_paths("poison");
         let journal = JournalWriter::create(&path, "poison-run", false, None).unwrap();
 
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -616,14 +578,7 @@ mod tests {
 
     #[test]
     fn budget_state_accumulates_across_journal_reopen() {
-        let dir = std::env::temp_dir().join(format!(
-            "qcg-journal-budget-{}-{}",
-            std::process::id(),
-            uuid::Uuid::now_v7()
-        ));
-        std::fs::create_dir_all(&dir).expect("test directory should be created");
-        let path = camino::Utf8PathBuf::from_path_buf(dir.join("journal.jsonl"))
-            .expect("temporary path must be UTF-8");
+        let (_dir, path) = test_journal_paths("budget");
         {
             let journal = JournalWriter::create(&path, "budget-run", false, None)
                 .expect("first journal round should open");
@@ -643,29 +598,13 @@ mod tests {
                 )
                 .expect("run should start");
             journal
-                .event(
-                    "step_started",
-                    json!({ "node": "first", "type": "test", "attempt": 1 }),
-                )
+                .event("step_started", step_started_event("first"))
                 .expect("first step should start");
             journal
-                .event(
-                    "step_finished",
-                    json!({ "node": "first", "status": "success" }),
-                )
+                .event("step_finished", step_finished_event("first", "success"))
                 .expect("first step should finish");
             journal
-                .event(
-                    "llm_call",
-                    json!({
-                        "node": "first",
-                        "provider": "fake",
-                        "model": "fake",
-                        "max_tokens": 128,
-                        "tokens": { "input": 7, "output": 3, "cached_input": 2 },
-                        "cost_microusd": 25,
-                    }),
-                )
+                .event("llm_call", llm_call_event("first", 7, 3, 2, 25))
                 .expect("first LLM call should be recorded");
         }
 
@@ -675,29 +614,13 @@ mod tests {
             .event("run_resumed", json!({ "run_id": "budget-run" }))
             .expect("run should resume");
         journal
-            .event(
-                "step_started",
-                json!({ "node": "second", "type": "test", "attempt": 1 }),
-            )
+            .event("step_started", step_started_event("second"))
             .expect("second step should start");
         journal
-            .event(
-                "step_finished",
-                json!({ "node": "second", "status": "success" }),
-            )
+            .event("step_finished", step_finished_event("second", "success"))
             .expect("second step should finish");
         journal
-            .event(
-                "llm_call",
-                json!({
-                    "node": "second",
-                    "provider": "fake",
-                    "model": "fake",
-                    "max_tokens": 128,
-                    "tokens": { "input": 11, "output": 5, "cached_input": 4 },
-                    "cost_microusd": 75,
-                }),
-            )
+            .event("llm_call", llm_call_event("second", 11, 5, 4, 75))
             .expect("second LLM call should be recorded");
         journal
             .event("run_finished", json!({ "status": "success" }))
@@ -720,9 +643,7 @@ mod tests {
 
     #[test]
     fn agent_checkpoint_is_durable_and_cleared_by_step_completion() {
-        let dir = std::env::temp_dir().join(format!("qcg-agent-checkpoint-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = Utf8PathBuf::from_path_buf(dir.join("journal.jsonl")).unwrap();
+        let (dir, path) = test_journal_paths("agent-checkpoint");
         let journal = JournalWriter::create(&path, "checkpoint-run", false, None).unwrap();
         journal
             .event(
@@ -753,47 +674,19 @@ mod tests {
 
     #[test]
     fn truncated_tail_is_repaired_before_append() {
-        let dir = std::env::temp_dir().join(format!(
-            "qcg-journal-truncate-{}-{}",
-            std::process::id(),
-            uuid::Uuid::now_v7()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = Utf8PathBuf::from_path_buf(dir.join("journal.jsonl")).unwrap();
+        let (dir, path) = test_journal_paths("truncate");
         {
             let journal = JournalWriter::create(&path, "truncate-run", false, None).unwrap();
             journal
-                .event(
-                    "run_started",
-                    json!({
-                        "generator": "truncate@1.0.0",
-                        "generator_path": "truncate",
-                        "contract_sha256": "abc",
-                        "inputs": {},
-                        "resource_hashes": [],
-                        "qcg": "0.1.0",
-                        "schema_version": 1,
-                    }),
-                )
+                .event("run_started", run_started_event("truncate"))
                 .unwrap();
         }
         // Simulate a crash leaving a torn trailing line without a newline.
-        {
-            use std::io::Write as _;
-            let mut file = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .unwrap();
-            file.write_all(b"{\"t\":\"step_started\",\"node\":")
-                .unwrap();
-        }
+        append_torn_tail(&path);
         let journal = JournalWriter::create(&path, "truncate-run", false, None)
             .expect("reopen must repair the torn tail");
         journal
-            .event(
-                "step_started",
-                json!({ "node": "after", "type": "test", "attempt": 1 }),
-            )
+            .event("step_started", step_started_event("after"))
             .expect("append after repair must succeed");
         let scan = read_journal_values(&path, JournalLimits::default())
             .expect("fold after repair must succeed");
@@ -807,45 +700,28 @@ mod tests {
         // Sensitive-8: a graceful terminal event seals the journal with a
         // `.clean_shutdown` marker; a later non-terminal append clears it
         // so a continued run never carries a stale shutdown claim.
-        let dir = std::env::temp_dir().join(format!(
-            "qcg-journal-marker-{}-{}",
-            std::process::id(),
-            uuid::Uuid::now_v7()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = Utf8PathBuf::from_path_buf(dir.join("journal.jsonl")).unwrap();
+        let (dir, path) = test_journal_paths("marker");
         let marker = path.with_file_name(".clean_shutdown");
         let journal = JournalWriter::create(&path, "marker-run", false, None).unwrap();
         journal
-            .event(
-                "run_started",
-                json!({
-                    "generator": "marker@1.0.0",
-                    "generator_path": "marker",
-                    "contract_sha256": "abc",
-                    "inputs": {},
-                    "resource_hashes": [],
-                    "qcg": "0.1.0",
-                    "schema_version": 1,
-                }),
-            )
+            .event("run_started", run_started_event("marker"))
             .unwrap();
         assert!(
             !marker.exists(),
             "a non-terminal event must not leave a shutdown marker"
         );
         journal
-            .event("run_finished", json!({ "status": "success" }))
+            .event(
+                "run_interrupted",
+                json!({ "reason": {"code": "interrupted", "message": "grace"} }),
+            )
             .unwrap();
         assert!(
             marker.exists(),
             "a graceful terminal event must write the shutdown marker"
         );
         journal
-            .event(
-                "step_started",
-                json!({ "node": "after", "type": "test", "attempt": 1 }),
-            )
+            .event("step_started", step_started_event("after"))
             .unwrap();
         assert!(
             !marker.exists(),
@@ -858,43 +734,18 @@ mod tests {
     fn truncated_tail_with_marker_refuses_repair_as_tampering() {
         // Sensitive-8: a torn tail on a cleanly shut down journal is damage
         // to durable history, not a crash remnant, and refuses repair.
-        let dir = std::env::temp_dir().join(format!(
-            "qcg-journal-tamper-{}-{}",
-            std::process::id(),
-            uuid::Uuid::now_v7()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = Utf8PathBuf::from_path_buf(dir.join("journal.jsonl")).unwrap();
+        let (dir, path) = test_journal_paths("tamper");
         {
             let journal = JournalWriter::create(&path, "tamper-run", false, None).unwrap();
             journal
-                .event(
-                    "run_started",
-                    json!({
-                        "generator": "tamper@1.0.0",
-                        "generator_path": "tamper",
-                        "contract_sha256": "abc",
-                        "inputs": {},
-                        "resource_hashes": [],
-                        "qcg": "0.1.0",
-                        "schema_version": 1,
-                    }),
-                )
+                .event("run_started", run_started_event("tamper"))
                 .unwrap();
             journal
                 .event("run_finished", json!({ "status": "success" }))
                 .unwrap();
         }
         // Damage durable history after the clean shutdown.
-        {
-            use std::io::Write as _;
-            let mut file = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .unwrap();
-            file.write_all(b"{\"t\":\"step_started\",\"node\":")
-                .unwrap();
-        }
+        append_torn_tail(&path);
         let error = match JournalWriter::create(&path, "tamper-run", false, None) {
             Ok(_) => panic!("a torn tail with a shutdown marker must refuse repair"),
             Err(error) => error,
@@ -910,43 +761,18 @@ mod tests {
     fn truncated_tail_without_marker_repairs_as_a_crash() {
         // Sensitive-8: without a shutdown marker the same torn tail is a
         // crash remnant and repairs as before.
-        let dir = std::env::temp_dir().join(format!(
-            "qcg-journal-crash-{}-{}",
-            std::process::id(),
-            uuid::Uuid::now_v7()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = Utf8PathBuf::from_path_buf(dir.join("journal.jsonl")).unwrap();
+        let (dir, path) = test_journal_paths("crash");
         {
             let journal = JournalWriter::create(&path, "crash-run", false, None).unwrap();
             journal
-                .event(
-                    "run_started",
-                    json!({
-                        "generator": "crash@1.0.0",
-                        "generator_path": "crash",
-                        "contract_sha256": "abc",
-                        "inputs": {},
-                        "resource_hashes": [],
-                        "qcg": "0.1.0",
-                        "schema_version": 1,
-                    }),
-                )
+                .event("run_started", run_started_event("crash"))
                 .unwrap();
         }
         assert!(
             !path.with_file_name(".clean_shutdown").exists(),
             "a crashed run must carry no shutdown marker"
         );
-        {
-            use std::io::Write as _;
-            let mut file = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .unwrap();
-            file.write_all(b"{\"t\":\"step_started\",\"node\":")
-                .unwrap();
-        }
+        append_torn_tail(&path);
         JournalWriter::create(&path, "crash-run", false, None)
             .expect("a torn tail without a marker must repair as a crash");
         let _ = std::fs::remove_dir_all(dir);
@@ -957,27 +783,10 @@ mod tests {
         // A01: service-side single appends and a live engine writer share
         // the cross-process journal lock, so seq values never duplicate even
         // when writers interleave create/event boundaries.
-        let dir = std::env::temp_dir().join(format!(
-            "qcg-journal-concurrent-{}-{}",
-            std::process::id(),
-            uuid::Uuid::now_v7()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = Utf8PathBuf::from_path_buf(dir.join("journal.jsonl")).unwrap();
+        let (dir, path) = test_journal_paths("concurrent");
         let engine = JournalWriter::create(&path, "concurrent-run", false, None).unwrap();
         engine
-            .event(
-                "run_started",
-                json!({
-                    "generator": "concurrent@1.0.0",
-                    "generator_path": "concurrent",
-                    "contract_sha256": "abc",
-                    "inputs": {},
-                    "resource_hashes": [],
-                    "qcg": "0.1.0",
-                    "schema_version": 1,
-                }),
-            )
+            .event("run_started", run_started_event("concurrent"))
             .unwrap();
         // Simulate a service control write racing the engine writer: the
         // single-append path re-folds under the same lock.
@@ -991,10 +800,7 @@ mod tests {
         )
         .unwrap();
         engine
-            .event(
-                "step_started",
-                json!({ "node": "n", "type": "test", "attempt": 1 }),
-            )
+            .event("step_started", step_started_event("n"))
             .unwrap();
         let scan = read_journal_values(&path, JournalLimits::default()).unwrap();
         let mut seqs: Vec<u64> = scan
@@ -1010,28 +816,11 @@ mod tests {
 
     #[test]
     fn complete_tail_without_newline_is_committed() {
-        let dir = std::env::temp_dir().join(format!(
-            "qcg-journal-commit-{}-{}",
-            std::process::id(),
-            uuid::Uuid::now_v7()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = Utf8PathBuf::from_path_buf(dir.join("journal.jsonl")).unwrap();
+        let (dir, path) = test_journal_paths("commit");
         {
             let journal = JournalWriter::create(&path, "commit-run", false, None).unwrap();
             journal
-                .event(
-                    "run_started",
-                    json!({
-                        "generator": "commit@1.0.0",
-                        "generator_path": "commit",
-                        "contract_sha256": "abc",
-                        "inputs": {},
-                        "resource_hashes": [],
-                        "qcg": "0.1.0",
-                        "schema_version": 1,
-                    }),
-                )
+                .event("run_started", run_started_event("commit"))
                 .unwrap();
             // Strip the final newline to simulate a committed event that
             // missed its terminator.
@@ -1042,10 +831,7 @@ mod tests {
         let journal = JournalWriter::create(&path, "commit-run", false, None)
             .expect("reopen must commit the complete tail");
         journal
-            .event(
-                "step_started",
-                json!({ "node": "after", "type": "test", "attempt": 1 }),
-            )
+            .event("step_started", step_started_event("after"))
             .unwrap();
         let scan = read_journal_values(&path, JournalLimits::default()).unwrap();
         assert_eq!(scan.events.len(), 2);

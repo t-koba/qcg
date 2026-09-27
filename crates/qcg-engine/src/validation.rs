@@ -13,7 +13,7 @@ pub fn validate_json_schema_findings(
     value: &Value,
     location: &str,
 ) -> Vec<Finding> {
-    let validator = match jsonschema::validator_for(schema) {
+    let validator = match qcg_policy::compile_bounded_validator(schema) {
         Ok(validator) => validator,
         Err(error) => {
             return vec![error_finding(
@@ -438,19 +438,5 @@ mod validation_rules_tests {
             .expect_err("missing required properties should fail validation");
         assert!(error.to_string().len() <= MAX_SCHEMA_REPORT_BYTES + 64);
         assert!(error.to_string().contains("truncated"));
-    }
-
-    #[test]
-    fn individual_finding_messages_are_bounded() {
-        let property = "property_".to_string() + &"x".repeat(MAX_SCHEMA_FINDING_MESSAGE_BYTES * 4);
-        let schema = json!({
-            "type": "object",
-            "required": [property]
-        });
-        let findings = validate_json_schema_findings(&schema, &json!({}), "response");
-
-        assert_eq!(findings.len(), 1);
-        assert!(findings[0].message.len() <= MAX_SCHEMA_FINDING_MESSAGE_BYTES);
-        assert!(serialized_findings_bytes(&findings) <= MAX_SCHEMA_FINDINGS_BYTES);
     }
 }

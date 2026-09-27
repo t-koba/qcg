@@ -5,6 +5,7 @@ pub mod llm;
 pub mod output;
 pub mod path;
 pub mod report;
+pub use encoding::*;
 pub use failure::*;
 pub use file_value::*;
 pub use llm::*;

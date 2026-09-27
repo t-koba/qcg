@@ -1,4 +1,4 @@
-use super::super::run_dirs::journal_is_empty;
+use super::super::run_dirs::{is_regular_directory, is_regular_file, journal_is_empty};
 use super::super::types::{RunRecord, ServiceError};
 use camino::{Utf8Path, Utf8PathBuf};
 use qcg_api::{RunEvent, RunStatus};
@@ -10,9 +10,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use super::reads::{
-    read_journal_events, read_persisted_hitl_from_values, read_queued_identity_from_values,
-};
+use super::reads::read_journal_events;
 use super::summary::run_meta_dir;
 
 pub(crate) fn fold_run_state(run_dir: &Utf8Path) -> Result<RunState, ServiceError> {
@@ -82,6 +80,7 @@ pub(crate) fn status_from_journal(status: &str) -> Result<RunStatus, ServiceErro
         "running" => Ok(RunStatus::Running),
         "waiting" => Ok(RunStatus::Waiting),
         "confirming" => Ok(RunStatus::Confirming),
+        "cancel_requested" => Ok(RunStatus::CancelRequested),
         "success" => Ok(RunStatus::Succeeded),
         "failed" => Ok(RunStatus::Failed),
         "canceled" => Ok(RunStatus::Canceled),
@@ -114,7 +113,7 @@ pub(crate) fn rehydrate_runs(
             ServiceError::Invalid(format!("run path is not valid UTF-8: {}", path.display()))
         })?;
         let journal_path = run_meta_dir(&run_dir).join("journal.jsonl");
-        if !run_dir.is_dir() || !journal_path.is_file() {
+        if !is_regular_directory(&run_dir)? || !is_regular_file(&journal_path)? {
             continue;
         }
         if journal_is_empty(&journal_path)? {
@@ -158,16 +157,18 @@ pub(crate) fn rehydrate_runs(
         } else {
             record_state
         };
-        let generator_path =
-            super::runs::read_run_generator_path_from_events(&run_dir, &journal_events)?;
+        let (_, started) = super::run_identity_event(&run_dir, &journal_events)?;
+        let generator_path = Utf8PathBuf::from(&started.generator_path);
         let contract = Contract::load(&generator_path)
             .map_err(|error| ServiceError::Invalid(error.to_string()))?;
-        let inputs = super::runs::read_run_inputs_from_events(&run_dir, &journal_events)?;
-        let queued_identity = read_queued_identity_from_values(&journal_values);
+        // Folded inputs, not the admission event: a fork patches inputs, and
+        // the folded state is the only view that includes the patch.
+        let inputs = state.inputs.clone().unwrap_or_default();
+        let queued_identity = (state.priority, state.parent_run_id.clone());
         // Journal I/O failures fail rehydration instead of recovering with
         // half-read maps. Continuations live in the typed journal store, so
         // only user answers join the memory map.
-        let (answers, confirmations) = read_persisted_hitl_from_values(&journal_values)?;
+        let (answers, confirmations) = (state.answers.clone(), state.confirmations.clone());
         // Restore FIFO admission order from the last run_queued timestamp so
         // a restart preserves cross-generator submission order instead of
         // falling back to run_id string order.

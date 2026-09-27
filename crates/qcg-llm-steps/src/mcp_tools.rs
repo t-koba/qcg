@@ -6,7 +6,6 @@ use qcg_mcp::{
     McpAccess, McpCallOutcome, McpCommandAccess, McpCommandIsolation, McpContainerRuntime,
     McpError, McpSession,
 };
-use qcg_policy::validate_bounded_json_schema;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -183,7 +182,7 @@ impl McpAgentTools {
                         ),
                     ));
                 }
-                validate_bounded_json_schema(&tool.input_schema).map_err(|message| {
+                let input_validator = qcg_policy::compile_bounded_validator(&tool.input_schema).map_err(|message| {
                     StepError::failed(
                         &node.id,
                         format!(
@@ -191,31 +190,15 @@ impl McpAgentTools {
                         ),
                     )
                 })?;
-                let input_validator = qcg_policy::compile_bounded_validator(&tool.input_schema).map_err(|_| {
-                    StepError::failed(
-                        &node.id,
-                        format!(
-                            "MCP server `{server}` tool `{remote_name}` returned an invalid input schema"
-                        ),
-                    )
-                })?;
                 let output_validator = tool
                     .output_schema
                     .as_ref()
                     .map(|schema| {
-                        validate_bounded_json_schema(schema).map_err(|message| {
+                        qcg_policy::compile_bounded_validator(schema).map_err(|message| {
                             StepError::failed(
                                 &node.id,
                                 format!(
                                     "MCP server `{server}` tool `{remote_name}` output schema is invalid or unsafe: {message}"
-                                ),
-                            )
-                        })?;
-                        qcg_policy::compile_bounded_validator(schema).map_err(|_| {
-                            StepError::failed(
-                                &node.id,
-                                format!(
-                                    "MCP server `{server}` tool `{remote_name}` returned an invalid output schema"
                                 ),
                             )
                         })

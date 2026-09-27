@@ -466,6 +466,41 @@ mod tests {
         format!("file://{}", path.as_str().replace('\\', "/"))
     }
 
+    /// A unique temp root for one test. `name` names the case so a leaked
+    /// directory stays attributable to the test that created it.
+    fn test_root(name: &str) -> Utf8PathBuf {
+        Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("qcg-install-{name}-{}", uuid::Uuid::now_v7())),
+        )
+        .expect("temporary path must be UTF-8")
+    }
+
+    /// The install options every test uses: no providers file, no
+    /// confirmation prompts, no forced replacement, and the given package
+    /// limits. A test that needs another mode overrides only that field.
+    fn test_config<'a>(
+        limits: &'a qcg_service::PackageLimits,
+        generators_dir: &'a Utf8Path,
+    ) -> InstallConfig<'a> {
+        InstallConfig {
+            providers_path: None,
+            generators_dir,
+            yes: false,
+            force: false,
+            limits,
+        }
+    }
+
+    /// No digest and no signature: a local directory source is verified by
+    /// staging against its own contents, never against a pinned digest.
+    fn test_verification() -> InstallVerification<'static> {
+        InstallVerification {
+            sha256: None,
+            signature: None,
+            public_key: None,
+        }
+    }
+
     fn write_installed(dir: &Utf8Path, id: &str, dependency: &str) {
         std::fs::create_dir_all(dir).expect("installed generator dir");
         let manifest = format!(
@@ -569,10 +604,7 @@ qcg_version = "^0.1"
     async fn installed_parent_repairs_a_missing_dependency_closure() {
         // E14: re-running an installed parent must verify (and attempt to
         // repair) its dependency closure instead of returning success.
-        let root = Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-install-closure-{}", uuid::Uuid::now_v7())),
-        )
-        .expect("temporary path must be UTF-8");
+        let root = test_root("closure");
         let home = root.join("home");
         let generators = root.join("generators");
         std::fs::create_dir_all(&home).expect("home dir");
@@ -584,24 +616,12 @@ qcg_version = "^0.1"
         write_installed(&generators.join("b"), "b", "");
         let requirement = semver::VersionReq::parse("^1").expect("requirement");
         let limits = qcg_service::PackageLimits::default();
-        let config = InstallConfig {
-            providers_path: None,
-            generators_dir: &generators,
-            yes: false,
-            force: false,
-            limits: &limits,
-        };
+        let config = test_config(&limits, &generators);
         install_registry_package(config, "a", &requirement, &mut BTreeSet::new())
             .await
             .expect("a complete closure must re-validate without a registry");
         std::fs::remove_dir_all(generators.join("b")).expect("remove dependency");
-        let config = InstallConfig {
-            providers_path: None,
-            generators_dir: &generators,
-            yes: false,
-            force: false,
-            limits: &limits,
-        };
+        let config = test_config(&limits, &generators);
         let error = install_registry_package(config, "a", &requirement, &mut BTreeSet::new())
             .await
             .expect_err("a missing dependency must not be silently accepted");
@@ -616,10 +636,7 @@ qcg_version = "^0.1"
     async fn installed_package_tamper_fails_inventory_verification() {
         // E14: a modified installed package must fail inventory
         // verification instead of being silently reused.
-        let root = Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-install-tamper-{}", uuid::Uuid::now_v7())),
-        )
-        .expect("temporary path must be UTF-8");
+        let root = test_root("tamper");
         let home = root.join("home");
         let generators = root.join("generators");
         std::fs::create_dir_all(&home).expect("home dir");
@@ -635,13 +652,7 @@ qcg_version = "^0.1"
         .expect("tamper should write");
         let requirement = semver::VersionReq::parse("^1").expect("requirement");
         let limits = qcg_service::PackageLimits::default();
-        let config = InstallConfig {
-            providers_path: None,
-            generators_dir: &generators,
-            yes: false,
-            force: false,
-            limits: &limits,
-        };
+        let config = test_config(&limits, &generators);
         let error = install_registry_package(config, "a", &requirement, &mut BTreeSet::new())
             .await
             .expect_err("a tampered dependency must fail closed");
@@ -656,10 +667,7 @@ qcg_version = "^0.1"
     async fn installed_parent_fails_closed_when_registry_fetch_fails() {
         // E14: a configured but unreachable registry must fail the repair
         // instead of being skipped as if the closure were complete.
-        let root = Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-install-fetch-{}", uuid::Uuid::now_v7())),
-        )
-        .expect("temporary path must be UTF-8");
+        let root = test_root("fetch");
         let home = root.join("home");
         let generators = root.join("generators");
         std::fs::create_dir_all(&home).expect("home dir");
@@ -673,13 +681,7 @@ qcg_version = "^0.1"
         write_installed(&generators.join("a"), "a", "\n[dependencies]\nb = \"^1\"\n");
         let requirement = semver::VersionReq::parse("^1").expect("requirement");
         let limits = qcg_service::PackageLimits::default();
-        let config = InstallConfig {
-            providers_path: None,
-            generators_dir: &generators,
-            yes: false,
-            force: false,
-            limits: &limits,
-        };
+        let config = test_config(&limits, &generators);
         let error = install_registry_package(config, "a", &requirement, &mut BTreeSet::new())
             .await
             .expect_err("an unreachable registry must fail the repair");
@@ -694,10 +696,7 @@ qcg_version = "^0.1"
     async fn installed_cycle_is_rejected() {
         // E14: a true A -> B -> A dependency cycle fails closed instead of
         // recursing forever or being silently accepted.
-        let root = Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-install-cycle-{}", uuid::Uuid::now_v7())),
-        )
-        .expect("temporary path must be UTF-8");
+        let root = test_root("cycle");
         let home = root.join("home");
         let generators = root.join("generators");
         std::fs::create_dir_all(&home).expect("home dir");
@@ -706,13 +705,7 @@ qcg_version = "^0.1"
         write_installed(&generators.join("b"), "b", "\n[dependencies]\na = \"^1\"\n");
         let requirement = semver::VersionReq::parse("^1").expect("requirement");
         let limits = qcg_service::PackageLimits::default();
-        let config = InstallConfig {
-            providers_path: None,
-            generators_dir: &generators,
-            yes: false,
-            force: false,
-            limits: &limits,
-        };
+        let config = test_config(&limits, &generators);
         let error = install_registry_package(config, "a", &requirement, &mut BTreeSet::new())
             .await
             .expect_err("a dependency cycle must fail closed");
@@ -728,10 +721,7 @@ qcg_version = "^0.1"
         // E14: a diamond (A -> {B, C} -> D) must resolve without false
         // cycle detection and without consulting a registry once every
         // package in the closure is installed.
-        let root = Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-install-diamond-{}", uuid::Uuid::now_v7())),
-        )
-        .expect("temporary path must be UTF-8");
+        let root = test_root("diamond");
         let home = root.join("home");
         let generators = root.join("generators");
         std::fs::create_dir_all(&home).expect("home dir");
@@ -747,13 +737,7 @@ qcg_version = "^0.1"
         let requirement = semver::VersionReq::parse("^1").expect("requirement");
         let limits = qcg_service::PackageLimits::default();
         for id in ["a", "b", "c"] {
-            let config = InstallConfig {
-                providers_path: None,
-                generators_dir: &generators,
-                yes: false,
-                force: false,
-                limits: &limits,
-            };
+            let config = test_config(&limits, &generators);
             install_registry_package(config, id, &requirement, &mut BTreeSet::new())
                 .await
                 .unwrap_or_else(|error| panic!("diamond closure `{id}` must resolve: {error}"));
@@ -769,10 +753,7 @@ qcg_version = "^0.1"
         // to a sibling's sweep. A cutoff of `UNIX_EPOCH` reaps nothing,
         // proving the age gate direction without touching mtimes.
         use std::time::SystemTime;
-        let root = Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-install-reap-{}", uuid::Uuid::now_v7())),
-        )
-        .expect("temporary path must be UTF-8");
+        let root = test_root("reap");
         let _temp_guard = TempGuard(root.clone());
         std::fs::create_dir_all(&root).expect("root should be created");
         let own_pid = std::process::id();
@@ -837,10 +818,7 @@ qcg_version = "^0.1"
         // F14-02: a backup whose target is missing restores instead of
         // being swept, even when the backup directory mtime looks old
         // (rename preserves it).
-        let root = Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-install-recover-{}", uuid::Uuid::now_v7())),
-        )
-        .expect("temporary path must be UTF-8");
+        let root = test_root("recover");
         let _temp_guard = TempGuard(root.clone());
         std::fs::create_dir_all(&root).expect("root should be created");
         let backup = root.join(format!(
@@ -871,10 +849,7 @@ qcg_version = "^0.1"
         // F14-01: a just-made backup keeps its old directory mtime after
         // rename; the fresh marker mtime protects it from a concurrent
         // foreign sweep while its target exists.
-        let root = Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-install-fresh-{}", uuid::Uuid::now_v7())),
-        )
-        .expect("temporary path must be UTF-8");
+        let root = test_root("fresh");
         let _temp_guard = TempGuard(root.clone());
         std::fs::create_dir_all(&root).expect("root should be created");
         std::fs::create_dir_all(root.join("mygen")).expect("target exists");
@@ -905,10 +880,7 @@ qcg_version = "^0.1"
         // staging converges. The rollback-failure arm (retained backup +
         // reported path) is structural: the sweep half is covered by
         // backup_with_missing_target_recovers_before_sweep.
-        let root = Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-install-commitfail-{}", uuid::Uuid::now_v7())),
-        )
-        .expect("temporary path must be UTF-8");
+        let root = test_root("commitfail");
         let _temp_guard = TempGuard(root.clone());
         let target = root.join("mygen");
         std::fs::create_dir_all(&target).expect("target should be created");
@@ -958,10 +930,7 @@ qcg_version = "^0.1"
         // A marker that cannot be parsed may still guard the sole copy of
         // an interrupted commit: the sweep must keep it (fail closed)
         // instead of treating it as age-gated scratch.
-        let root = Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-install-corrupt-{}", uuid::Uuid::now_v7())),
-        )
-        .expect("temporary path must be UTF-8");
+        let root = test_root("corrupt");
         let _temp_guard = TempGuard(root.clone());
         std::fs::create_dir_all(&root).expect("root should be created");
         let backup = root.join(format!(
@@ -987,10 +956,7 @@ qcg_version = "^0.1"
     fn no_replace_probe_refuses_an_existing_target() {
         // E14: the non-Linux fallback must fail closed when the target is
         // observed, never silently replace it. Runs on every platform.
-        let root = Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-install-noreplace-{}", uuid::Uuid::now_v7())),
-        )
-        .expect("temporary path must be UTF-8");
+        let root = test_root("noreplace");
         let _temp_guard = TempGuard(root.clone());
         std::fs::create_dir_all(&root).expect("root should be created");
         let target = root.join("a");
@@ -1009,10 +975,7 @@ qcg_version = "^0.1"
         // FULL closure before any commit. With an unsatisfiable dependency
         // the install refuses pre-commit and never leaves a committed
         // parent behind (no rerun repair demand).
-        let root = Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-install-direct-{}", uuid::Uuid::now_v7())),
-        )
-        .expect("temporary path must be UTF-8");
+        let root = test_root("direct");
         let _temp_guard = TempGuard(root.clone());
         let home = root.join("home");
         let generators = root.join("generators");
@@ -1028,11 +991,7 @@ qcg_version = "^0.1"
             "[generator]\nid = \"direct-a\"\nname = \"Direct A\"\nversion = \"1.0.0\"\nqcg_version = \"^0.1\"\n\n[dependencies]\nmissing-dep = \"^1\"\n",
         );
         let limits = qcg_service::PackageLimits::default();
-        let verification = InstallVerification {
-            sha256: None,
-            signature: None,
-            public_key: None,
-        };
+        let verification = test_verification();
         // The live source must never become the staged path: staging copies
         // into private staging.
         let live_source = source.join("sub");
@@ -1084,10 +1043,7 @@ qcg_version = "^0.1"
     fn finish_install_force_replaces_existing_generator() {
         // E14: --force must replace an existing install; without it the
         // second install fails closed instead of silently merging.
-        let root = Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-install-force-{}", uuid::Uuid::now_v7())),
-        )
-        .expect("temporary path must be UTF-8");
+        let root = test_root("force");
         let _temp_guard = TempGuard(root.clone());
         let generators = root.join("generators");
         let staged = root.join("staged");
@@ -1133,10 +1089,7 @@ qcg_version = "^0.1"
         // E14-3: a diamond requiring two different versions of D cannot
         // converge on one install dir; the second branch fails closed
         // instead of silently last-winning.
-        let root = Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-install-vdiamond-{}", uuid::Uuid::now_v7())),
-        )
-        .expect("temporary path must be UTF-8");
+        let root = test_root("vdiamond");
         let _temp_guard = TempGuard(root.clone());
         let home = root.join("home");
         let generators = root.join("generators");
@@ -1160,13 +1113,7 @@ qcg_version = "^0.1"
         write_installed(&generators.join("d"), "d", "");
         let requirement = semver::VersionReq::parse("^1").expect("requirement");
         let limits = qcg_service::PackageLimits::default();
-        let config = InstallConfig {
-            providers_path: None,
-            generators_dir: &generators,
-            yes: false,
-            force: false,
-            limits: &limits,
-        };
+        let config = test_config(&limits, &generators);
         let error = install_registry_package(config, "a", &requirement, &mut BTreeSet::new())
             .await
             .expect_err("a version-mismatch diamond must fail closed");
@@ -1181,10 +1128,7 @@ qcg_version = "^0.1"
     async fn direct_self_dependency_fails_closed() {
         // E14-3: a generator depending on itself is a cycle and fails
         // closed, never recursing forever.
-        let root = Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-install-selfdep-{}", uuid::Uuid::now_v7())),
-        )
-        .expect("temporary path must be UTF-8");
+        let root = test_root("selfdep");
         let _temp_guard = TempGuard(root.clone());
         let home = root.join("home");
         let generators = root.join("generators");
@@ -1193,13 +1137,7 @@ qcg_version = "^0.1"
         write_installed(&generators.join("s"), "s", "\n[dependencies]\ns = \"^1\"\n");
         let requirement = semver::VersionReq::parse("^1").expect("requirement");
         let limits = qcg_service::PackageLimits::default();
-        let config = InstallConfig {
-            providers_path: None,
-            generators_dir: &generators,
-            yes: false,
-            force: false,
-            limits: &limits,
-        };
+        let config = test_config(&limits, &generators);
         let error = install_registry_package(config, "s", &requirement, &mut BTreeSet::new())
             .await
             .expect_err("a self-dependency must fail closed");
@@ -1214,63 +1152,6 @@ qcg_version = "^0.1"
     }
 
     #[tokio::test]
-    async fn missing_diamond_fill_converges_on_retry() {
-        // E14-10: a diamond with a missing leaf fails, then converges once
-        // the leaf is filled and the install is rerun.
-        let root = Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-install-fill-{}", uuid::Uuid::now_v7())),
-        )
-        .expect("temporary path must be UTF-8");
-        let _temp_guard = TempGuard(root.clone());
-        let home = root.join("home");
-        let generators = root.join("generators");
-        std::fs::create_dir_all(&home).expect("home dir");
-        let _env = set_qcg_home(&home).await;
-        write_installed(
-            &generators.join("a"),
-            "a",
-            "\n[dependencies]\nb = \"^1\"\nc = \"^1\"\n",
-        );
-        write_installed(&generators.join("b"), "b", "\n[dependencies]\nd = \"^1\"\n");
-        write_installed(&generators.join("c"), "c", "\n[dependencies]\nd = \"^1\"\n");
-        write_installed(&generators.join("d"), "d", "");
-        let requirement = semver::VersionReq::parse("^1").expect("requirement");
-        let limits = qcg_service::PackageLimits::default();
-        let config = InstallConfig {
-            providers_path: None,
-            generators_dir: &generators,
-            yes: false,
-            force: false,
-            limits: &limits,
-        };
-        install_registry_package(config, "a", &requirement, &mut BTreeSet::new())
-            .await
-            .expect("a complete diamond must resolve");
-        std::fs::remove_dir_all(generators.join("d")).expect("remove diamond leaf");
-        let config = InstallConfig {
-            providers_path: None,
-            generators_dir: &generators,
-            yes: false,
-            force: false,
-            limits: &limits,
-        };
-        install_registry_package(config, "a", &requirement, &mut BTreeSet::new())
-            .await
-            .expect_err("a missing diamond leaf must fail");
-        write_installed(&generators.join("d"), "d", "");
-        let config = InstallConfig {
-            providers_path: None,
-            generators_dir: &generators,
-            yes: false,
-            force: false,
-            limits: &limits,
-        };
-        install_registry_package(config, "a", &requirement, &mut BTreeSet::new())
-            .await
-            .expect("the filled diamond must converge");
-    }
-
-    #[tokio::test]
     async fn first_failure_then_rerun_converges_via_real_install() {
         // E14 TRUE first-failure e2e (not manual fill): a direct parent
         // install with a missing dependency fails pre-commit with no parent
@@ -1279,10 +1160,7 @@ qcg_version = "^0.1"
         // staging + commit), and rerunning the parent converges. No
         // `write_installed` manual fill is used for the dependency — both
         // installs go through `install` (stage + commit).
-        let root = Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-install-e2e-{}", uuid::Uuid::now_v7())),
-        )
-        .expect("temporary path must be UTF-8");
+        let root = test_root("e2e");
         let _temp_guard = TempGuard(root.clone());
         let home = root.join("home");
         let generators = root.join("generators");
@@ -1299,11 +1177,7 @@ qcg_version = "^0.1"
             "[generator]\nid = \"e2e-dep\"\nname = \"E2E Dep\"\nversion = \"1.0.0\"\nqcg_version = \"^0.1\"\n",
         );
         let limits = qcg_service::PackageLimits::default();
-        let verification = InstallVerification {
-            sha256: None,
-            signature: None,
-            public_key: None,
-        };
+        let verification = test_verification();
         // First attempt fails: missing dependency, no parent committed.
         let error = install(
             None,
@@ -1332,11 +1206,7 @@ qcg_version = "^0.1"
             &generators,
             true,
             false,
-            InstallVerification {
-                sha256: None,
-                signature: None,
-                public_key: None,
-            },
+            test_verification(),
             &limits,
         )
         .await
@@ -1350,11 +1220,7 @@ qcg_version = "^0.1"
             &generators,
             true,
             false,
-            InstallVerification {
-                sha256: None,
-                signature: None,
-                public_key: None,
-            },
+            test_verification(),
             &limits,
         )
         .await
@@ -1380,10 +1246,7 @@ qcg_version = "^0.1"
     async fn post_cycle_state_converges_without_residue() {
         // E14-10: after a cycle failure, retrying fails the same way without
         // wedging on residue; no backup or temp dirs linger.
-        let root = Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-install-postcycle-{}", uuid::Uuid::now_v7())),
-        )
-        .expect("temporary path must be UTF-8");
+        let root = test_root("postcycle");
         let _temp_guard = TempGuard(root.clone());
         let home = root.join("home");
         let generators = root.join("generators");
@@ -1394,13 +1257,7 @@ qcg_version = "^0.1"
         let requirement = semver::VersionReq::parse("^1").expect("requirement");
         let limits = qcg_service::PackageLimits::default();
         for _ in 0..2 {
-            let config = InstallConfig {
-                providers_path: None,
-                generators_dir: &generators,
-                yes: false,
-                force: false,
-                limits: &limits,
-            };
+            let config = test_config(&limits, &generators);
             let error = install_registry_package(config, "a", &requirement, &mut BTreeSet::new())
                 .await
                 .expect_err("a cycle must keep failing closed");
@@ -1427,10 +1284,7 @@ qcg_version = "^0.1"
     fn parallel_replace_installs_serialize_without_residue() {
         // E14-10 (non-Linux-parallel-equivalent): concurrent --force commits
         // of the same id serialize in-process and leave no backup residue.
-        let root = Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-install-parallel-{}", uuid::Uuid::now_v7())),
-        )
-        .expect("temporary path must be UTF-8");
+        let root = test_root("parallel");
         let _temp_guard = TempGuard(root.clone());
         let generators = root.join("generators");
         std::fs::create_dir_all(&generators).expect("generators dir");
@@ -1480,10 +1334,7 @@ qcg_version = "^0.1"
     fn uninstall_refuses_when_dependents_exist() {
         // E14-9: uninstall fails closed when another installed generator
         // depends on the target; there is no force flag.
-        let root = Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-install-uninstall-{}", uuid::Uuid::now_v7())),
-        )
-        .expect("temporary path must be UTF-8");
+        let root = test_root("uninstall");
         let _temp_guard = TempGuard(root.clone());
         let generators = root.join("generators");
         write_installed(&generators.join("a"), "a", "\n[dependencies]\nb = \"^1\"\n");
@@ -1509,10 +1360,7 @@ qcg_version = "^0.1"
     fn uninstall_refuses_through_symlinks() {
         // E14: removing through a planted symlink would delete outside the
         // generators dir. The outside tree must survive untouched.
-        let root = Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-install-unlink-{}", uuid::Uuid::now_v7())),
-        )
-        .expect("temporary path must be UTF-8");
+        let root = test_root("unlink");
         let _temp_guard = TempGuard(root.clone());
         let generators = root.join("generators");
         let outside = root.join("outside");
@@ -1538,10 +1386,7 @@ qcg_version = "^0.1"
         // Gap 9: a directory source must be copied into private staging;
         // the staged path is never the live path, so later live mutations
         // cannot redirect the commit.
-        let root = Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-install-stage-copy-{}", uuid::Uuid::now_v7())),
-        )
-        .expect("temporary path must be UTF-8");
+        let root = test_root("stage-copy");
         let _temp_guard = TempGuard(root.clone());
         // Serialize with other installs: the stale-temp sweep reaps
         // own-pid private staging aggressively, so a concurrent install
@@ -1585,53 +1430,12 @@ qcg_version = "^0.1"
     }
 
     #[tokio::test]
-    async fn staged_contract_is_parsed_once_and_threaded() {
-        // Gap 10: the manifest is parsed once at stage time; the contract
-        // travels with the staging and its root denotes the staged copy.
-        let root = Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-install-parse-once-{}", uuid::Uuid::now_v7())),
-        )
-        .expect("temporary path must be UTF-8");
-        let _temp_guard = TempGuard(root.clone());
-        // Serialize with other installs for the same stale-sweep reason as
-        // the private-copy test above.
-        let home = root.join("home");
-        std::fs::create_dir_all(&home).expect("home dir should be created");
-        let _env = set_qcg_home(&home).await;
-        let live = root.join("live");
-        write_source_with_sbom(
-            &live,
-            "[generator]\nid = \"once-a\"\nname = \"Once A\"\nversion = \"1.0.0\"\nqcg_version = \"^0.1\"\n",
-        );
-        let limits = qcg_service::PackageLimits::default();
-        let staged = stage_install_source(live.as_str(), None, None, &limits)
-            .await
-            .expect("dir source should stage");
-        assert_eq!(
-            staged.contract.root, staged.path,
-            "threaded contract root must be the staged copy"
-        );
-        assert_eq!(staged.contract.manifest.generator.id, "once-a");
-        assert_eq!(staged.contract.manifest.generator.version, "1.0.0");
-        // Committing via the threaded contract installs the same id without
-        // any caller-side re-parse.
-        let generators = root.join("generators");
-        let id = finish_install(None, staged, &generators, true, false, &limits)
-            .expect("commit with threaded contract should succeed");
-        assert_eq!(id, "once-a");
-        assert!(generators.join("once-a/qcg.toml").exists());
-    }
-
-    #[tokio::test]
     async fn registry_fetch_failure_then_rerun_repairs_via_registry() {
         // E14: a dependency whose archive fetch fails first leaves no parent
         // behind; once the recording file:// registry serves the archive, a
         // rerun repairs the closure through the real registry path (no manual
         // fill). Both attempts go through `install`.
-        let root = Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-install-regretry-{}", uuid::Uuid::now_v7())),
-        )
-        .expect("temporary path must be UTF-8");
+        let root = test_root("regretry");
         let _temp_guard = TempGuard(root.clone());
         let home = root.join("home");
         let generators = root.join("generators");
@@ -1666,11 +1470,7 @@ qcg_version = "^0.1"
         )
         .expect("index should write");
         let limits = qcg_service::PackageLimits::default();
-        let verification = InstallVerification {
-            sha256: None,
-            signature: None,
-            public_key: None,
-        };
+        let verification = test_verification();
         let error = install(
             None,
             parent_src.as_str(),
@@ -1707,11 +1507,7 @@ qcg_version = "^0.1"
             &generators,
             true,
             false,
-            InstallVerification {
-                sha256: None,
-                signature: None,
-                public_key: None,
-            },
+            test_verification(),
             &limits,
         )
         .await
@@ -1726,10 +1522,7 @@ qcg_version = "^0.1"
         // E14: a dependency commit failure leaves already-committed earlier
         // dependencies behind (documented, not rolled back); removing the
         // blocker and rerunning converges the full closure.
-        let root = Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-install-commitseq-{}", uuid::Uuid::now_v7())),
-        )
-        .expect("temporary path must be UTF-8");
+        let root = test_root("commitseq");
         let _temp_guard = TempGuard(root.clone());
         let home = root.join("home");
         let generators = root.join("generators");
@@ -1780,11 +1573,7 @@ qcg_version = "^0.1"
             &generators,
             true,
             false,
-            InstallVerification {
-                sha256: None,
-                signature: None,
-                public_key: None,
-            },
+            test_verification(),
             &limits,
         )
         .await
@@ -1807,11 +1596,7 @@ qcg_version = "^0.1"
             &generators,
             true,
             false,
-            InstallVerification {
-                sha256: None,
-                signature: None,
-                public_key: None,
-            },
+            test_verification(),
             &limits,
         )
         .await
@@ -1825,21 +1610,15 @@ qcg_version = "^0.1"
     async fn registry_missing_package_leaves_no_parent_behind() {
         // Gap 7: resolution happens before any commit, so an unresolvable
         // fresh package never leaves a parent directory behind.
-        let root = Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-install-noparent-{}", uuid::Uuid::now_v7())),
-        )
-        .expect("temporary path must be UTF-8");
+        let root = test_root("noparent");
         let home = root.join("home");
         let generators = root.join("generators");
         std::fs::create_dir_all(&home).expect("home dir should be created");
         let _env = set_qcg_home(&home).await;
         let limits = qcg_service::PackageLimits::default();
         let config = InstallConfig {
-            providers_path: None,
-            generators_dir: &generators,
             yes: true,
-            force: false,
-            limits: &limits,
+            ..test_config(&limits, &generators)
         };
         let requirement = semver::VersionReq::parse("^1").expect("requirement should parse");
         let error =
@@ -1857,11 +1636,7 @@ qcg_version = "^0.1"
         // Gap 11: the dependents re-check plus removal holds the install
         // locks, so concurrent uninstalls of the same id serialize instead
         // of racing; exactly one succeeds and no residue remains.
-        let root = Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
-            "qcg-install-uninstall-race-{}",
-            uuid::Uuid::now_v7()
-        )))
-        .expect("temporary path must be UTF-8");
+        let root = test_root("uninstall-race");
         let _temp_guard = TempGuard(root.clone());
         let generators = root.join("generators");
         write_installed(&generators.join("x"), "x", "");
@@ -1890,10 +1665,7 @@ qcg_version = "^0.1"
     fn uninstall_refuses_when_dependent_is_tampered() {
         // Gap 12: the dependents scan uses verified loads, so a tampered
         // dependent fails closed instead of silently permitting removal.
-        let root = Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-install-tamper-dep-{}", uuid::Uuid::now_v7())),
-        )
-        .expect("temporary path must be UTF-8");
+        let root = test_root("tamper-dep");
         let _temp_guard = TempGuard(root.clone());
         let generators = root.join("generators");
         write_installed(&generators.join("a"), "a", "\n[dependencies]\nb = \"^1\"\n");
@@ -1923,10 +1695,7 @@ qcg_version = "^0.1"
     fn parallel_installs_of_different_ids_proceed_together() {
         // Gap 13: per-id locks let unrelated ids commit in parallel; all
         // must succeed with no backup residue.
-        let root = Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-install-shard-{}", uuid::Uuid::now_v7())),
-        )
-        .expect("temporary path must be UTF-8");
+        let root = test_root("shard");
         let _temp_guard = TempGuard(root.clone());
         let generators = root.join("generators");
         std::fs::create_dir_all(&generators).expect("generators dir should be created");

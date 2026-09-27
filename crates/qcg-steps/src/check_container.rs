@@ -23,8 +23,6 @@ struct CheckContainerParams {
     #[serde(default)]
     image: Option<String>,
     #[serde(default)]
-    content: Option<String>,
-    #[serde(default)]
     mounts: Vec<MountDef>,
     #[serde(default)]
     expect: Option<ExpectDef>,
@@ -41,7 +39,6 @@ impl StepExecutor for CheckContainerStep {
             &["command"],
             json!({
                 "image": string_schema(),
-                "content": string_schema(),
                 "command": string_array_schema(),
                 "mounts": {
                     "type": "array",
@@ -271,7 +268,6 @@ fn check_container_image<'a>(
     params
         .image
         .as_deref()
-        .or(params.content.as_deref())
         .ok_or_else(|| StepError::failed(&node.id, "image is required"))
 }
 

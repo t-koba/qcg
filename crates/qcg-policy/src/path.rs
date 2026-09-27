@@ -17,6 +17,12 @@ pub fn is_safe_relative_path(path: &str) -> bool {
             .any(|part| part.is_empty() || part == "." || part == "..")
 }
 
+pub fn is_safe_path_component(path: &str) -> bool {
+    is_safe_relative_path(path)
+        && !path.contains('/')
+        && !path.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
+}
+
 /// Joins path components with `/` for archive entries and manifests.
 pub fn portable_relative_path(path: &Utf8Path) -> String {
     path.components()
@@ -52,6 +58,16 @@ mod tests {
                 continue;
             }
             assert!(is_safe_relative_path(good), "{good:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_unsafe_single_components() {
+        for bad in ["", ".", "..", "a/b", "a\\b", "a\0b", "a\nb", "a\x7fb"] {
+            assert!(!is_safe_path_component(bad), "{bad:?}");
+        }
+        for good in ["a", "generator-1", "run_2", "a.b"] {
+            assert!(is_safe_path_component(good), "{good:?}");
         }
     }
 }

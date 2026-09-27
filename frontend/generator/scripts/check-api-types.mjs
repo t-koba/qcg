@@ -1,19 +1,38 @@
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const tmp = mkdtempSync(resolve(tmpdir(), "qcg-generator-api."));
+const uiRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const checkedIn = resolve(uiRoot, "src/api");
+const generated = mkdtempSync(resolve(tmpdir(), "qcg-generator-api."));
+
+function readOrFail(directory, file, description) {
+  try {
+    return readFileSync(resolve(directory, file), "utf8");
+  } catch (error) {
+    throw new Error(
+      `${description} is unreadable at ${resolve(directory, file)}; run npm run generate:api in frontend/generator: ${error.message}`,
+    );
+  }
+}
 
 try {
-  const beforeOpenapi = readFileSync("src/api/openapi.json", "utf8");
-  const beforeTypes = readFileSync("src/api/types.d.ts", "utf8");
-  execFileSync("npm", ["run", "generate:api"], { stdio: "inherit" });
-  const afterOpenapi = readFileSync("src/api/openapi.json", "utf8");
-  const afterTypes = readFileSync("src/api/types.d.ts", "utf8");
-  if (beforeOpenapi !== afterOpenapi || beforeTypes !== afterTypes) {
-    throw new Error("generated API types are stale; run npm run generate:api in frontend/generator");
+  execFileSync(process.execPath, [resolve(uiRoot, "scripts/generate-api-types.mjs"), generated], {
+    cwd: uiRoot,
+    stdio: "inherit",
+  });
+  for (const file of ["openapi.json", "types.d.ts"]) {
+    const expected = readOrFail(checkedIn, file, `checked-in ${file}`);
+    const actual = readOrFail(generated, file, `generated ${file}`);
+    if (expected !== actual) {
+      throw new Error(
+        `generated ${file} is stale; run npm run generate:api in frontend/generator (fresh output: ${resolve(generated, file)})`,
+      );
+    }
   }
 } finally {
-  rmSync(tmp, { recursive: true, force: true });
+  rmSync(generated, { recursive: true, force: true });
 }
+console.log("generated API types match the checked-in copies");

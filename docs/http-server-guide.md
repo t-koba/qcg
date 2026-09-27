@@ -166,7 +166,10 @@ or:
 ```
 
 `name` must be one safe filename component. `text` and `content_base64` are
-mutually exclusive. Decoded content is limited only when the generator
+mutually exclusive. `content_base64` is canonical RFC 4648 base64 with the
+standard alphabet and required padding; unpadded or non-canonical values are
+refused rather than normalized, so one byte string has exactly one accepted
+spelling on every surface. Decoded content is limited only when the generator
 contract sets an explicit `[runtime] file_input_limit_bytes`; otherwise there
 is no mechanistic limit. Values are supplied inline with the run request.
 `qcg serve` additionally accepts an explicit `--max-request-bytes`

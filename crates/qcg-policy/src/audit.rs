@@ -7,6 +7,7 @@
 //! Any kind not listed is durable, so a newly added durable record is never
 //! silently dropped by an unclassified audit policy.
 
+use crate::limits::DEFAULT_MAX_AUDIT_TOTAL_BYTES;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -19,8 +20,11 @@ pub enum EventClass {
     Observation,
 }
 
-/// Observation record kinds. Keep in sync with `RunState::apply`: a kind
-/// that folds must never appear here, and a kind that does not fold must.
+/// Observation record kinds. A kind that `RunState::apply` folds into state
+/// must never appear here, and a kind listed here must not fold. Durable
+/// records that carry no state (operator diagnostics such as
+/// `foreach_sibling_ignored`) stay durable on purpose: they are journal
+/// history that an audit policy must not be able to filter away.
 pub const OBSERVATION_EVENT_KINDS: &[&str] = &[
     "graph_resolved",
     "step_retry",
@@ -202,10 +206,13 @@ pub struct AuditLimits {
 }
 
 impl AuditLimits {
+    /// Resolves the effective observation bounds. An unset `max_bytes` is not
+    /// "unbounded": it takes [`DEFAULT_MAX_AUDIT_TOTAL_BYTES`], so both the
+    /// writer and every reader share one hard cap.
     pub fn from_config(config: &AuditConfig) -> Self {
         Self {
             max_event_bytes: None,
-            max_total_bytes: config.max_bytes,
+            max_total_bytes: Some(config.max_bytes.unwrap_or(DEFAULT_MAX_AUDIT_TOTAL_BYTES)),
             max_event_count: config.max_events,
         }
     }

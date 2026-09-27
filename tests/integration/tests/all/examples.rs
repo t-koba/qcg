@@ -1902,10 +1902,8 @@ async fn agent_secret_tool_result_never_reaches_sse() {
     let _secret = TestSecretEnv::set(canary);
     let runs_dir = run_dir("agent-secret-sse-runs");
     let _ = fs::remove_dir_all(&runs_dir);
-    let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
-        Ok(listener) => listener,
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
-        Err(error) => panic!("listener should bind: {error}"),
+    let Some(listener) = crate::bind_loopback().await else {
+        return;
     };
     let port = listener
         .local_addr()
@@ -2062,10 +2060,8 @@ async fn agent_output_guardrail_rejection_finishes_without_caching() {
 async fn http_sse_replays_same_journal_event_sequence_for_run() {
     let runs_dir = run_dir("server-runs");
     let _ = fs::remove_dir_all(&runs_dir);
-    let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
-        Ok(listener) => listener,
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
-        Err(error) => panic!("listener should bind: {error}"),
+    let Some(listener) = crate::bind_loopback().await else {
+        return;
     };
     let port = listener
         .local_addr()
@@ -2143,10 +2139,8 @@ async fn http_sse_replays_same_journal_event_sequence_for_run() {
 async fn http_concurrent_runs_keep_artifacts_and_journals_isolated() {
     let runs_dir = run_dir("server-concurrent-runs");
     let _ = fs::remove_dir_all(&runs_dir);
-    let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
-        Ok(listener) => listener,
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
-        Err(error) => panic!("listener should bind: {error}"),
+    let Some(listener) = crate::bind_loopback().await else {
+        return;
     };
     let port = listener
         .local_addr()
@@ -2333,10 +2327,8 @@ output_file = "must-not-exist.txt"
 content = "unexpected""#,
     )
     .expect("generator manifest should be written");
-    let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
-        Ok(listener) => listener,
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
-        Err(error) => panic!("listener should bind: {error}"),
+    let Some(listener) = crate::bind_loopback().await else {
+        return;
     };
     let port = listener
         .local_addr()
@@ -2411,10 +2403,8 @@ content = "unexpected""#,
 async fn http_assets_are_declared_generic_and_metadata_is_verbatim() {
     let runs_dir = run_dir("server-assets-runs");
     let _ = fs::remove_dir_all(&runs_dir);
-    let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
-        Ok(listener) => listener,
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
-        Err(error) => panic!("listener should bind: {error}"),
+    let Some(listener) = crate::bind_loopback().await else {
+        return;
     };
     let port = listener
         .local_addr()
@@ -2567,10 +2557,8 @@ async fn http_assets_are_declared_generic_and_metadata_is_verbatim() {
 async fn http_server_is_unauthenticated_and_writes_need_no_extra_headers() {
     let runs_dir = run_dir("server-unauthenticated-runs");
     let _ = fs::remove_dir_all(&runs_dir);
-    let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
-        Ok(listener) => listener,
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
-        Err(error) => panic!("listener should bind: {error}"),
+    let Some(listener) = crate::bind_loopback().await else {
+        return;
     };
     let port = listener
         .local_addr()

@@ -77,14 +77,6 @@ impl NodeDef {
         self.param(key).and_then(toml::Value::as_str)
     }
 
-    pub fn param_array(&self, key: &str) -> Option<&toml::value::Array> {
-        self.param(key).and_then(toml::Value::as_array)
-    }
-
-    pub fn param_table(&self, key: &str) -> Option<&toml::Table> {
-        self.param(key).and_then(toml::Value::as_table)
-    }
-
     pub fn params_json(&self) -> Value {
         let mut object = serde_json::Map::new();
         for (key, value) in &self.params {
@@ -148,13 +140,12 @@ fn toml_value_to_json(value: &toml::Value) -> Value {
 pub struct StepType(String);
 
 impl StepType {
-    pub fn new(value: impl Into<String>) -> Self {
-        let value = value.into();
-        debug_assert!(
-            validate_step_type(&value).is_ok(),
-            "invalid step type `{value}`"
-        );
-        Self(value)
+    /// Checked constructor for a literal that the caller already knows is
+    /// valid, such as a test fixture or a hard-coded step kind. It still runs
+    /// the full rule, so a typo panics at the call site instead of producing an
+    /// invalid `StepType` that only fails later.
+    pub fn literal(value: &str) -> Self {
+        Self::parse(value).unwrap_or_else(|error| panic!("invalid step type `{value}`: {error}"))
     }
 
     pub fn parse(value: impl Into<String>) -> Result<Self, String> {
@@ -188,18 +179,6 @@ impl<'de> Deserialize<'de> for StepType {
     {
         let value = String::deserialize(deserializer)?;
         StepType::parse(value).map_err(D::Error::custom)
-    }
-}
-
-impl From<&str> for StepType {
-    fn from(value: &str) -> Self {
-        Self::new(value)
-    }
-}
-
-impl From<String> for StepType {
-    fn from(value: String) -> Self {
-        Self::new(value)
     }
 }
 

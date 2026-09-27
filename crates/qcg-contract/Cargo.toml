@@ -11,7 +11,6 @@ publish.workspace = true
 [dependencies]
 camino.workspace = true
 hex.workspace = true
-jsonschema.workspace = true
 mime.workspace = true
 regex.workspace = true
 qcg-policy = { path = "../qcg-policy" }

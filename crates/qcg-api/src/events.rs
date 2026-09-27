@@ -25,8 +25,9 @@ pub use tools::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::run_event_reference_markdown;
     use qcg_types::NodePath;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     #[test]
     fn run_event_decodes_flat_step_finished_into_closed_data() {
@@ -358,6 +359,40 @@ mod tests {
         match event.data {
             RunEventData::Unknown(data) => assert_eq!(data, json!({ "percent": 50 })),
             other => panic!("expected unknown event data, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn terminal_kinds_decode_to_closed_typed_event_data() {
+        // Q2: the registry is the single source for terminal kinds, so every
+        // one of them must decode to closed typed data instead of falling
+        // through to the unknown-kind passthrough.
+        for kind in TERMINAL_EVENT_KINDS {
+            assert!(is_terminal_event_kind(kind), "{kind}");
+            assert!(
+                RunEventData::parse(kind, Value::Null).is_err(),
+                "terminal kind `{kind}` must be a registered typed event"
+            );
+        }
+        let components = crate::openapi_components();
+        for (kind, schema) in run_event_data_schemas() {
+            assert!(
+                components["schemas"]
+                    .get(&schema)
+                    .is_some_and(|value| value.is_object()),
+                "event `{kind}` must reference a published schema `{schema}`"
+            );
+        }
+    }
+
+    #[test]
+    fn run_event_reference_lists_every_registered_kind() {
+        let markdown = run_event_reference_markdown();
+        for (kind, _) in run_event_data_schemas() {
+            assert!(
+                markdown.contains(&format!("| `{kind}` |")),
+                "run event reference must document `{kind}`"
+            );
         }
     }
 

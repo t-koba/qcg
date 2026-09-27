@@ -326,10 +326,6 @@ impl SearchProfile {
         self.endpoint.as_ref().and_then(Url::host_str)
     }
 
-    pub fn credential_env_name(&self) -> Option<&str> {
-        self.credential_env.as_deref()
-    }
-
     pub fn credential(&self) -> Result<Option<String>, String> {
         let Some(name) = self.credential_env.as_deref() else {
             return Ok(None);

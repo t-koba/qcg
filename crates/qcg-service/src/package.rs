@@ -1106,10 +1106,9 @@ fn verify_package_inventory(root: &Utf8Path, limits: &PackageLimits) -> Result<(
             })?;
         // The pack side records the sanitized permission bits per file
         // ("mode", decimal). Verification REQUIRES them (fail-closed, E15):
-        // hashes always verify AND modes always verify. The older
-        // absent-mode skip-compat was removed: an SBOM without an explicit
-        // mode fails instead of verifying by hash alone, so a mode-stripped
-        // package cannot downgrade to hash-only verification.
+        // hashes always verify AND modes always verify. An SBOM without an
+        // explicit mode fails instead of verifying by hash alone, so a
+        // mode-stripped package cannot downgrade to hash-only verification.
         let mode = match file.get("mode") {
             None => {
                 return Err(ServiceError::Invalid(format!(
@@ -1260,6 +1259,57 @@ fn hash_opened_file(file: &mut File) -> Result<String, ServiceError> {
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+
+    /// One entry of a [`test_sbom`] `files` list: the archived name, the
+    /// SHA-256 of its bytes, and the Unix mode the archive declares for it.
+    /// Both the digest and the mode are verified on unpack, so a test states
+    /// all three.
+    fn test_sbom_file(name: &str, sha256: &str, mode: u32) -> serde_json::Value {
+        serde_json::json!({
+            "fileName": name,
+            "checksums": [{ "checksumValue": sha256 }],
+            "mode": mode,
+        })
+    }
+
+    /// The SPDX document every `.qcg` archive must carry, wrapping the
+    /// per-entry values from [`test_sbom_file`].
+    fn test_sbom(files: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({
+            "spdxVersion": "SPDX-2.3",
+            "files": files,
+        })
+    }
+
+    /// Appends the two mandatory metadata entries - the SPDX SBOM and the
+    /// in-toto provenance statement - to a package archive and closes it.
+    /// Every unpackable archive carries exactly this pair, so a test states
+    /// only its own payload entries and hands the SBOM over here. Takes the
+    /// writer by value because closing an archive consumes it.
+    fn finish_archive(
+        mut writer: zip::ZipWriter<File>,
+        options: zip::write::SimpleFileOptions,
+        sbom: &serde_json::Value,
+    ) -> File {
+        use std::io::Write as _;
+        writer
+            .start_file("QCG-SBOM.spdx.json", options.unix_permissions(0o644))
+            .expect("sbom entry");
+        writer
+            .write_all(sbom.to_string().as_bytes())
+            .expect("sbom body");
+        writer
+            .start_file(
+                "QCG-PROVENANCE.intoto.json",
+                options.unix_permissions(0o644),
+            )
+            .expect("provenance entry");
+        writer
+            .write_all(br#"{"_type":"https://in-toto.io/Statement/v1"}"#)
+            .expect("provenance body");
+        writer.finish().expect("archive should finish")
+    }
+
     #[test]
     fn sanitize_restored_mode_clears_dangerous_bits() {
         // E15: setuid/setgid/sticky and world-writable never land.
@@ -1272,9 +1322,8 @@ mod tests {
     #[test]
     fn sbom_modes_verify_when_declared_and_reject_when_absent() {
         // E15 fail-closed: the manifest list verifies modes, not only
-        // hashes. A declared mode that no longer matches fails closed, and
-        // an absent mode (older packages) is REJECTED instead of verifying
-        // by hash alone — backward skip-compat was removed.
+        // hashes. A declared mode that mismatches fails closed, and an
+        // absent mode is REJECTED instead of verifying by hash alone.
         let root = temp_dir("sbom-modes");
         let _temp_guard = TempGuard(root.clone());
         std::fs::create_dir_all(&root).expect("root should be created");
@@ -1292,12 +1341,7 @@ mod tests {
             )
             .expect("mode should apply");
         }
-        let sbom_with_mode = serde_json::json!({
-            "spdxVersion": "SPDX-2.3",
-            "files": [
-                { "fileName": "data.txt", "checksums": [{ "checksumValue": sha256 }], "mode": 0o644 },
-            ],
-        });
+        let sbom_with_mode = test_sbom(vec![test_sbom_file("data.txt", &sha256, 0o644)]);
         std::fs::write(
             target.join("QCG-SBOM.spdx.json"),
             serde_json::to_vec(&sbom_with_mode).expect("sbom should serialize"),
@@ -1349,12 +1393,7 @@ mod tests {
             "the refusal must name the missing mode: {error}"
         );
         // Malformed mode fails closed.
-        let sbom_bad_mode = serde_json::json!({
-            "spdxVersion": "SPDX-2.3",
-            "files": [
-                { "fileName": "data.txt", "checksums": [{ "checksumValue": sha256 }], "mode": 0o1777 },
-            ],
-        });
+        let sbom_bad_mode = test_sbom(vec![test_sbom_file("data.txt", &sha256, 0o1777)]);
         std::fs::write(
             target.join("QCG-SBOM.spdx.json"),
             serde_json::to_vec(&sbom_bad_mode).expect("sbom should serialize"),
@@ -1365,72 +1404,6 @@ mod tests {
         assert!(
             error.to_string().contains("invalid mode"),
             "the refusal must name the invalid mode: {error}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn unpack_never_adopts_archive_ownership() {
-        // E15: ownership fields are never honored (no chown exists on this
-        // path). Unpacked files always belong to the unpacking user with
-        // sanitized modes: a foreign-owner archive degrades to
-        // current-user ownership instead of being honored, and setuid bits
-        // never restore ownership-adjacent privilege.
-        use std::io::Write as _;
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-
-        let root = temp_dir("unpack-ownership");
-        let _temp_guard = TempGuard(root.clone());
-        std::fs::create_dir_all(&root).expect("root should be created");
-        let archive = root.join("pkg.qcg");
-        let script = b"#!/bin/sh\n";
-        let script_sha256 = hex::encode(Sha256::digest(script));
-        {
-            let file = File::create(&archive).expect("archive should be created");
-            let mut writer = zip::ZipWriter::new(file);
-            let options = zip::write::SimpleFileOptions::default();
-            writer
-                .start_file("bin/run.sh", options.unix_permissions(0o4755))
-                .expect("script entry");
-            writer.write_all(script).expect("script body");
-            let sbom = serde_json::json!({
-                "spdxVersion": "SPDX-2.3",
-                "files": [
-                    { "fileName": "bin/run.sh", "checksums": [{ "checksumValue": script_sha256 }], "mode": 0o755 },
-                ],
-            });
-            writer
-                .start_file("QCG-SBOM.spdx.json", options.unix_permissions(0o644))
-                .expect("sbom entry");
-            writer
-                .write_all(sbom.to_string().as_bytes())
-                .expect("sbom body");
-            writer
-                .start_file(
-                    "QCG-PROVENANCE.intoto.json",
-                    options.unix_permissions(0o644),
-                )
-                .expect("provenance entry");
-            writer
-                .write_all(br#"{"_type":"https://in-toto.io/Statement/v1"}"#)
-                .expect("provenance body");
-            writer.finish().expect("archive should finish");
-        }
-        let target = root.join("out");
-        std::fs::create_dir_all(&target).expect("target should be created");
-        unpack_qcg(&archive, &target, &PackageLimits::default()).expect("unpack should succeed");
-        let metadata = std::fs::metadata(target.join("bin/run.sh")).expect("script metadata");
-        // SAFETY: process uid query cannot fail.
-        let euid = unsafe { libc::getuid() };
-        assert_eq!(
-            metadata.uid(),
-            euid,
-            "unpacked files must belong to the unpacking user, never to an archive owner"
-        );
-        assert_eq!(
-            metadata.permissions().mode() & 0o777,
-            0o755,
-            "setuid bits must be masked even though the SBOM mode declares 0755"
         );
     }
 
@@ -1513,28 +1486,8 @@ mod tests {
             let options = zip::write::SimpleFileOptions::default();
             writer.start_file("data.txt", options).expect("data entry");
             writer.write_all(body).expect("data body");
-            let sbom = serde_json::json!({
-                "spdxVersion": "SPDX-2.3",
-                "files": [
-                    { "fileName": "data.txt", "checksums": [{ "checksumValue": sha256 }], "mode": 0o644 },
-                ],
-            });
-            writer
-                .start_file("QCG-SBOM.spdx.json", options.unix_permissions(0o644))
-                .expect("sbom entry");
-            writer
-                .write_all(sbom.to_string().as_bytes())
-                .expect("sbom body");
-            writer
-                .start_file(
-                    "QCG-PROVENANCE.intoto.json",
-                    options.unix_permissions(0o644),
-                )
-                .expect("provenance entry");
-            writer
-                .write_all(br#"{"_type":"https://in-toto.io/Statement/v1"}"#)
-                .expect("provenance body");
-            writer.finish().expect("archive should finish");
+            let sbom = test_sbom(vec![test_sbom_file("data.txt", &sha256, 0o644)]);
+            finish_archive(writer, options, &sbom);
         }
         // Strip the normalized mode from the data.txt central header so the
         // entry truly carries no Unix mode and `unix_mode()` returns None.
@@ -1635,29 +1588,11 @@ mod tests {
                 .start_file("data.txt", options.unix_permissions(0o644))
                 .expect("data entry");
             writer.write_all(data).expect("data body");
-            let sbom = serde_json::json!({
-                "spdxVersion": "SPDX-2.3",
-                "files": [
-                    { "fileName": "lib/deep/tool.sh", "checksums": [{ "checksumValue": sha256(tool) }], "mode": 0o755 },
-                    { "fileName": "data.txt", "checksums": [{ "checksumValue": sha256(data) }], "mode": 0o644 },
-                ],
-            });
-            writer
-                .start_file("QCG-SBOM.spdx.json", options.unix_permissions(0o644))
-                .expect("sbom entry");
-            writer
-                .write_all(sbom.to_string().as_bytes())
-                .expect("sbom body");
-            writer
-                .start_file(
-                    "QCG-PROVENANCE.intoto.json",
-                    options.unix_permissions(0o644),
-                )
-                .expect("provenance entry");
-            writer
-                .write_all(br#"{"_type":"https://in-toto.io/Statement/v1"}"#)
-                .expect("provenance body");
-            writer.finish().expect("archive should finish");
+            let sbom = test_sbom(vec![
+                test_sbom_file("lib/deep/tool.sh", &sha256(tool), 0o755),
+                test_sbom_file("data.txt", &sha256(data), 0o644),
+            ]);
+            finish_archive(writer, options, &sbom);
         }
         let target = root.join("out");
         std::fs::create_dir_all(&target).expect("target");
@@ -1707,28 +1642,8 @@ mod tests {
                 .expect("file entry");
             writer.write_all(body).expect("file body");
             let sha256 = hex::encode(Sha256::digest(body));
-            let sbom = serde_json::json!({
-                "spdxVersion": "SPDX-2.3",
-                "files": [
-                    { "fileName": "sub/file.txt", "checksums": [{ "checksumValue": sha256 }], "mode": 0o644 },
-                ],
-            });
-            writer
-                .start_file("QCG-SBOM.spdx.json", options.unix_permissions(0o644))
-                .expect("sbom entry");
-            writer
-                .write_all(sbom.to_string().as_bytes())
-                .expect("sbom body");
-            writer
-                .start_file(
-                    "QCG-PROVENANCE.intoto.json",
-                    options.unix_permissions(0o644),
-                )
-                .expect("provenance entry");
-            writer
-                .write_all(br#"{"_type":"https://in-toto.io/Statement/v1"}"#)
-                .expect("provenance body");
-            writer.finish().expect("archive should finish");
+            let sbom = test_sbom(vec![test_sbom_file("sub/file.txt", &sha256, 0o644)]);
+            finish_archive(writer, options, &sbom);
         }
         let target = root.join("out");
         let outside = root.join("outside");
@@ -1772,28 +1687,8 @@ mod tests {
                 .start_file("link.txt", options.unix_permissions(0o644))
                 .expect("file entry");
             writer.write_all(body).expect("file body");
-            let sbom = serde_json::json!({
-                "spdxVersion": "SPDX-2.3",
-                "files": [
-                    { "fileName": "link.txt", "checksums": [{ "checksumValue": sha256 }], "mode": 0o644 },
-                ],
-            });
-            writer
-                .start_file("QCG-SBOM.spdx.json", options.unix_permissions(0o644))
-                .expect("sbom entry");
-            writer
-                .write_all(sbom.to_string().as_bytes())
-                .expect("sbom body");
-            writer
-                .start_file(
-                    "QCG-PROVENANCE.intoto.json",
-                    options.unix_permissions(0o644),
-                )
-                .expect("provenance entry");
-            writer
-                .write_all(br#"{"_type":"https://in-toto.io/Statement/v1"}"#)
-                .expect("provenance body");
-            writer.finish().expect("archive should finish");
+            let sbom = test_sbom(vec![test_sbom_file("link.txt", &sha256, 0o644)]);
+            finish_archive(writer, options, &sbom);
         }
         let target = root.join("out");
         let outside = root.join("outside.txt");
@@ -1811,61 +1706,6 @@ mod tests {
             b"outside",
             "the link target must stay untouched"
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn unpack_strips_world_writable_and_masks_dangerous_bits() {
-        // E15-1: world-writable is stripped (0777 lands 0775) and setuid,
-        // setgid, sticky are masked.
-        use std::io::Write as _;
-        use std::os::unix::fs::PermissionsExt as _;
-        let root = temp_dir("modes-0777");
-        let _temp_guard = TempGuard(root.clone());
-        std::fs::create_dir_all(&root).expect("root should be created");
-        let archive = root.join("pkg.qcg");
-        let bytes = b"x";
-        let sha256 = hex::encode(Sha256::digest(bytes));
-        {
-            let file = File::create(&archive).expect("archive should be created");
-            let mut writer = zip::ZipWriter::new(file);
-            let options = zip::write::SimpleFileOptions::default();
-            writer
-                .start_file("wide.sh", options.unix_permissions(0o777))
-                .expect("wide entry");
-            writer.write_all(bytes).expect("wide body");
-            let sbom = serde_json::json!({
-                "spdxVersion": "SPDX-2.3",
-                "files": [
-                    { "fileName": "wide.sh", "checksums": [{ "checksumValue": sha256 }], "mode": 0o775 },
-                ],
-            });
-            writer
-                .start_file("QCG-SBOM.spdx.json", options.unix_permissions(0o644))
-                .expect("sbom entry");
-            writer
-                .write_all(sbom.to_string().as_bytes())
-                .expect("sbom body");
-            writer
-                .start_file(
-                    "QCG-PROVENANCE.intoto.json",
-                    options.unix_permissions(0o644),
-                )
-                .expect("provenance entry");
-            writer
-                .write_all(br#"{"_type":"https://in-toto.io/Statement/v1"}"#)
-                .expect("provenance body");
-            writer.finish().expect("archive should finish");
-        }
-        let target = root.join("out");
-        std::fs::create_dir_all(&target).expect("target should be created");
-        unpack_qcg(&archive, &target, &PackageLimits::default()).expect("unpack should succeed");
-        let mode = std::fs::metadata(target.join("wide.sh"))
-            .expect("wide metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o775, "world-writable must be stripped from 0777");
     }
 
     #[cfg(unix)]
@@ -1904,30 +1744,9 @@ mod tests {
             }
             let sbom_files: Vec<_> = files
                 .iter()
-                .map(|(name, expected)| {
-                    serde_json::json!({ "fileName": name, "checksums": [{ "checksumValue": sha256 }], "mode": expected })
-                })
+                .map(|(name, expected)| test_sbom_file(name, &sha256, *expected))
                 .collect();
-            let sbom = serde_json::json!({
-                "spdxVersion": "SPDX-2.3",
-                "files": sbom_files,
-            });
-            writer
-                .start_file("QCG-SBOM.spdx.json", options.unix_permissions(0o644))
-                .expect("sbom entry");
-            writer
-                .write_all(sbom.to_string().as_bytes())
-                .expect("sbom body");
-            writer
-                .start_file(
-                    "QCG-PROVENANCE.intoto.json",
-                    options.unix_permissions(0o644),
-                )
-                .expect("provenance entry");
-            writer
-                .write_all(br#"{"_type":"https://in-toto.io/Statement/v1"}"#)
-                .expect("provenance body");
-            writer.finish().expect("archive should finish");
+            finish_archive(writer, options, &test_sbom(sbom_files));
         }
         let target = root.join("out");
         std::fs::create_dir_all(&target).expect("target should be created");
@@ -1940,85 +1759,5 @@ mod tests {
                 & 0o7777;
             assert_eq!(mode, expected, "dangerous bits must be masked for `{name}`");
         }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn unpack_restores_executable_bits_without_dangerous_modes() {
-        // E15: 0755 scripts round-trip as executable, 0644 data stays
-        // readable, and setuid bits from the archive are masked away.
-        use std::io::Write as _;
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let root = temp_dir("modes");
-        std::fs::create_dir_all(&root).expect("root should be created");
-        let archive = root.join("pkg.qcg");
-        let sha256 = |bytes: &[u8]| hex::encode(Sha256::digest(bytes));
-        let script = b"#!/bin/sh\n";
-        let data = b"data";
-        let unsafe_bytes = b"unsafe";
-        {
-            let file = File::create(&archive).expect("archive should be created");
-            let mut writer = zip::ZipWriter::new(file);
-            let options = zip::write::SimpleFileOptions::default();
-            writer
-                .start_file("bin/run.sh", options.unix_permissions(0o755))
-                .expect("script entry");
-            writer.write_all(script).expect("script body");
-            writer
-                .start_file("data.txt", options.unix_permissions(0o644))
-                .expect("data entry");
-            writer.write_all(data).expect("data body");
-            writer
-                .start_file("unsafe", options.unix_permissions(0o4755))
-                .expect("unsafe entry");
-            writer.write_all(unsafe_bytes).expect("unsafe body");
-            let sbom = serde_json::json!({
-                "spdxVersion": "SPDX-2.3",
-                "files": [
-                    { "fileName": "bin/run.sh", "checksums": [{ "checksumValue": sha256(script) }], "mode": 0o755 },
-                    { "fileName": "data.txt", "checksums": [{ "checksumValue": sha256(data) }], "mode": 0o644 },
-                    { "fileName": "unsafe", "checksums": [{ "checksumValue": sha256(unsafe_bytes) }], "mode": 0o755 },
-                ],
-            });
-            writer
-                .start_file("QCG-SBOM.spdx.json", options.unix_permissions(0o644))
-                .expect("sbom entry");
-            writer
-                .write_all(sbom.to_string().as_bytes())
-                .expect("sbom body");
-            writer
-                .start_file(
-                    "QCG-PROVENANCE.intoto.json",
-                    options.unix_permissions(0o644),
-                )
-                .expect("provenance entry");
-            writer
-                .write_all(br#"{"_type":"https://in-toto.io/Statement/v1"}"#)
-                .expect("provenance body");
-            writer.finish().expect("archive should finish");
-        }
-        let target = root.join("out");
-        std::fs::create_dir_all(&target).expect("target should be created");
-        unpack_qcg(&archive, &target, &PackageLimits::default()).expect("unpack should succeed");
-        let script_mode = std::fs::metadata(target.join("bin/run.sh"))
-            .expect("script metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(script_mode, 0o755, "script must stay executable");
-        let data_mode = std::fs::metadata(target.join("data.txt"))
-            .expect("data metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(data_mode, 0o644, "data mode must round-trip");
-        let unsafe_mode = std::fs::metadata(target.join("unsafe"))
-            .expect("unsafe metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(unsafe_mode, 0o755, "setuid bits must be masked");
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -168,8 +168,32 @@ impl StepExecutor for PatchStep {
         StepTraits::parallel()
     }
 
-    fn validate(&self, node: &NodeDef, _contract: &Contract) -> Result<(), StepError> {
+    fn validate(&self, node: &NodeDef, contract: &Contract) -> Result<(), StepError> {
         let params = patch_params(node)?;
+        if !contract
+            .manifest
+            .permissions
+            .fs_read
+            .iter()
+            .any(|scope| scope == "workspace")
+        {
+            return Err(StepError::failed(
+                &node.id,
+                "patch requires permissions.fs_read to include workspace",
+            ));
+        }
+        if !contract
+            .manifest
+            .permissions
+            .fs_write
+            .iter()
+            .any(|scope| scope == "workspace")
+        {
+            return Err(StepError::failed(
+                &node.id,
+                "patch requires permissions.fs_write to include workspace",
+            ));
+        }
         if params.edits.is_empty() || params.edits.len() > qcg_policy::MAX_PATCH_EDITS {
             return Err(StepError::failed(
                 &node.id,

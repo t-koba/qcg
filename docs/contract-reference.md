@@ -377,7 +377,8 @@ Common fields:
 - `kind`: currently `validator`
 - `input`: default input path for the tool
 - `command`: logical command vector. `{input}` is replaced with the node input.
-- `network`: `none` or `permissioned`
+- `network`: `none`. The set is closed: no tool backend grants network access,
+  so any other value is refused when the contract loads.
 - `workspace`: `read_only`, `writable`, or `none`
 - `timeout_seconds`
 - `output_limit_bytes`
@@ -819,9 +820,6 @@ metadata. Update it with `qcg docs step-schemas`.
       },
       "type": "array"
     },
-    "content": {
-      "type": "string"
-    },
     "expect": {
       "properties": {
         "exit_code": {
@@ -1066,7 +1064,8 @@ metadata. Update it with `qcg docs step-schemas`.
   "required": [
     "items",
     "subflow",
-    "max_iterations"
+    "max_iterations",
+    "parallel"
   ],
   "type": "object"
 }
@@ -3831,7 +3830,10 @@ text field. Answers are durable and resume through the normal run boundary.
 ## Agent Tools
 
 Every declaration has a unique non-empty `name`, a `kind`, and an optional
-`description`. `llm.agent` accepts these closed tool variants:
+`description`. `llm.agent` accepts these closed tool variants. `fs.read`
+requires `permissions.fs_read` to include `workspace`, `fs.write` requires
+`permissions.fs_write`, and `fs.patch` requires both because it anchors
+against the current file contents.
 
 - `fs.write`: `path_prefix`, plus an optional `input_schema`. Creates or
   replaces whole files; prefer `fs.patch` for edits to existing files.

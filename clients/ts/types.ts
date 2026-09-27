@@ -30,6 +30,8 @@ export interface paths {
                         "application/json": components["schemas"]["GeneratorSummary"][];
                     };
                 };
+                401: components["responses"]["Unauthorized"];
+                429: components["responses"]["TooManyRequests"];
                 /** @description Internal server error */
                 500: {
                     headers: {
@@ -100,6 +102,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                401: components["responses"]["Unauthorized"];
                 /** @description Resource not found */
                 404: {
                     headers: {
@@ -109,6 +112,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                429: components["responses"]["TooManyRequests"];
                 /** @description Internal server error */
                 500: {
                     headers: {
@@ -166,6 +170,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                401: components["responses"]["Unauthorized"];
                 /** @description Resource not found */
                 404: {
                     headers: {
@@ -175,6 +180,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                429: components["responses"]["TooManyRequests"];
                 /** @description Internal server error */
                 500: {
                     headers: {
@@ -222,6 +228,8 @@ export interface paths {
                         "application/json": components["schemas"]["LlmCatalogResponse"];
                     };
                 };
+                401: components["responses"]["Unauthorized"];
+                429: components["responses"]["TooManyRequests"];
                 /** @description Internal server error */
                 500: {
                     headers: {
@@ -281,6 +289,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                401: components["responses"]["Unauthorized"];
                 /** @description Request failed */
                 403: {
                     headers: {
@@ -290,6 +299,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                429: components["responses"]["TooManyRequests"];
                 /** @description Internal server error */
                 500: {
                     headers: {
@@ -335,6 +345,8 @@ export interface paths {
                         "application/json": components["schemas"]["McpServerList"];
                     };
                 };
+                401: components["responses"]["Unauthorized"];
+                429: components["responses"]["TooManyRequests"];
                 /** @description Internal server error */
                 500: {
                     headers: {
@@ -393,6 +405,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                401: components["responses"]["Unauthorized"];
                 /** @description Request failed */
                 403: {
                     headers: {
@@ -402,6 +415,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                429: components["responses"]["TooManyRequests"];
             };
         };
         /** Clear stored MCP OAuth authorization */
@@ -432,6 +446,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                401: components["responses"]["Unauthorized"];
                 /** @description Request failed */
                 403: {
                     headers: {
@@ -441,6 +456,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                429: components["responses"]["TooManyRequests"];
             };
         };
         options?: never;
@@ -486,6 +502,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                401: components["responses"]["Unauthorized"];
                 /** @description Request failed */
                 403: {
                     headers: {
@@ -495,6 +512,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                429: components["responses"]["TooManyRequests"];
             };
         };
         options?: never;
@@ -528,6 +546,8 @@ export interface paths {
                         "application/json": unknown;
                     };
                 };
+                401: components["responses"]["Unauthorized"];
+                429: components["responses"]["TooManyRequests"];
                 /** @description Internal server error */
                 500: {
                     headers: {
@@ -589,6 +609,8 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                401: components["responses"]["Unauthorized"];
+                429: components["responses"]["TooManyRequests"];
                 /** @description Internal server error */
                 500: {
                     headers: {
@@ -638,6 +660,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                401: components["responses"]["Unauthorized"];
                 /** @description Resource conflict */
                 409: {
                     headers: {
@@ -665,6 +688,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                429: components["responses"]["TooManyRequests"];
                 /** @description Internal server error */
                 500: {
                     headers: {
@@ -742,6 +766,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                401: components["responses"]["Unauthorized"];
                 /** @description Resource not found */
                 404: {
                     headers: {
@@ -751,6 +776,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                429: components["responses"]["TooManyRequests"];
                 /** @description Internal server error */
                 500: {
                     headers: {
@@ -783,6 +809,7 @@ export interface paths {
                     };
                     content?: never;
                 };
+                401: components["responses"]["Unauthorized"];
                 /** @description Resource not found */
                 404: {
                     headers: {
@@ -801,6 +828,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                429: components["responses"]["TooManyRequests"];
                 /** @description Internal server error */
                 500: {
                     headers: {
@@ -868,6 +896,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                401: components["responses"]["Unauthorized"];
                 /** @description Resource not found */
                 404: {
                     headers: {
@@ -877,6 +906,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                429: components["responses"]["TooManyRequests"];
                 /** @description Internal server error */
                 500: {
                     headers: {
@@ -933,6 +963,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                401: components["responses"]["Unauthorized"];
                 /** @description Resource not found */
                 404: {
                     headers: {
@@ -942,6 +973,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                429: components["responses"]["TooManyRequests"];
                 /** @description Internal server error */
                 500: {
                     headers: {
@@ -999,6 +1031,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                401: components["responses"]["Unauthorized"];
                 /** @description Resource not found */
                 404: {
                     headers: {
@@ -1008,6 +1041,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                429: components["responses"]["TooManyRequests"];
                 /** @description Internal server error */
                 500: {
                     headers: {
@@ -1064,6 +1098,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                401: components["responses"]["Unauthorized"];
                 /** @description Resource not found */
                 404: {
                     headers: {
@@ -1073,6 +1108,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                429: components["responses"]["TooManyRequests"];
                 /** @description Internal server error */
                 500: {
                     headers: {
@@ -1138,6 +1174,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                401: components["responses"]["Unauthorized"];
                 /** @description Resource not found */
                 404: {
                     headers: {
@@ -1165,6 +1202,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                429: components["responses"]["TooManyRequests"];
                 /** @description Internal server error */
                 500: {
                     headers: {
@@ -1232,6 +1270,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                401: components["responses"]["Unauthorized"];
                 /** @description Resource not found */
                 404: {
                     headers: {
@@ -1241,6 +1280,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                429: components["responses"]["TooManyRequests"];
                 /** @description Internal server error */
                 500: {
                     headers: {
@@ -1308,6 +1348,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                401: components["responses"]["Unauthorized"];
                 /** @description Resource conflict */
                 409: {
                     headers: {
@@ -1335,6 +1376,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                429: components["responses"]["TooManyRequests"];
                 /** @description Internal server error */
                 500: {
                     headers: {
@@ -1398,6 +1440,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                401: components["responses"]["Unauthorized"];
                 /** @description Resource not found */
                 404: {
                     headers: {
@@ -1407,6 +1450,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                429: components["responses"]["TooManyRequests"];
                 /** @description Internal server error */
                 500: {
                     headers: {
@@ -1463,6 +1507,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                401: components["responses"]["Unauthorized"];
                 /** @description Resource not found */
                 404: {
                     headers: {
@@ -1472,6 +1517,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                429: components["responses"]["TooManyRequests"];
                 /** @description Internal server error */
                 500: {
                     headers: {
@@ -1537,6 +1583,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                401: components["responses"]["Unauthorized"];
                 /** @description Resource not found */
                 404: {
                     headers: {
@@ -1564,6 +1611,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                429: components["responses"]["TooManyRequests"];
                 /** @description Internal server error */
                 500: {
                     headers: {
@@ -1624,6 +1672,7 @@ export interface paths {
                         "application/json": components["schemas"]["RunSnapshot"];
                     };
                 };
+                401: components["responses"]["Unauthorized"];
                 /** @description Resource not found */
                 404: {
                     headers: {
@@ -1642,6 +1691,7 @@ export interface paths {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                429: components["responses"]["TooManyRequests"];
                 /** @description Internal server error */
                 500: {
                     headers: {
@@ -1685,6 +1735,7 @@ export interface paths {
                         "application/json": unknown;
                     };
                 };
+                401: components["responses"]["Unauthorized"];
                 /** @description Internal server error */
                 500: {
                     headers: {
@@ -1730,6 +1781,8 @@ export interface paths {
                         "text/plain; version=0.0.4": string;
                     };
                 };
+                401: components["responses"]["Unauthorized"];
+                429: components["responses"]["TooManyRequests"];
                 /** @description Internal server error */
                 500: {
                     headers: {
@@ -1983,36 +2036,22 @@ export interface components {
         };
         /** ForkRun */
         ForkRun: {
-            /**
-             * @description Pre-provisioned answers keyed by question id, consumed without interaction.
-             * @default {}
-             */
-            answers: {
+            /** @description Pre-provisioned answers keyed by question id, consumed without interaction. */
+            answers?: {
                 [key: string]: unknown;
             };
             /** Format: uint64 */
             at_seq: number;
-            /**
-             * @description Pre-provisioned confirmation decisions keyed by confirmation id.
-             * @default {}
-             */
-            confirmations: {
+            /** @description Pre-provisioned confirmation decisions keyed by confirmation id. */
+            confirmations?: {
                 [key: string]: boolean;
             };
             /**
              * Format: int32
              * @description Scheduling priority, higher runs first. Defaults to 0.
-             * @default null
              */
-            priority: number | null;
-            /**
-             * @default {
-             *       "inputs": {},
-             *       "step_outputs": {},
-             *       "step_statuses": {}
-             *     }
-             */
-            state_patch: components["schemas"]["ForkStatePatch"];
+            priority?: number | null;
+            state_patch?: components["schemas"]["ForkStatePatch"];
         };
         /** ForkStatePatch */
         ForkStatePatch: {
@@ -2585,7 +2624,8 @@ export interface components {
         /** RunEvent */
         RunEvent: {
             data: components["schemas"]["RunEventData"];
-            kind: string;
+            /** @enum {string} */
+            kind: "agent_checkpoint" | "agent_completed" | "agent_delegated" | "agent_failed" | "agent_handoff" | "artifact" | "audit_degraded" | "budget_charged" | "confirm_request" | "context_compacted" | "dry_run" | "elapsed_exceeded" | "foreach_budget_exhausted" | "foreach_iteration" | "foreach_sibling_ignored" | "graph_resolved" | "guardrail_error" | "guardrail_evaluated" | "guardrail_tripwire" | "hook_failed" | "hook_replayed" | "hook_skipped" | "lagged" | "llm_call" | "llm_delta" | "llm_route_failed" | "llm_validation_failed" | "mcp_continuation_consumed" | "mcp_continuation_resumed" | "mcp_input_pending" | "operation_finished" | "operation_repeated" | "operation_started" | "out_of_contract" | "regenerate_attempt_finished" | "regenerate_attempt_started" | "repair_attempt_finished" | "repair_attempt_started" | "resource" | "run_canceled" | "run_error" | "run_finished" | "run_forked" | "run_interrupted" | "run_queued" | "run_resumed" | "run_started" | "run_waiting" | "shutdown" | "side_effect" | "state_patched" | "step_finished" | "step_interrupted" | "step_replayed" | "step_retry" | "step_skipped" | "step_started" | "step_timeout" | "stream_error" | "tool_backend_resolved" | "tool_call" | "user_answered" | "user_cancel_requested" | "user_confirmed" | "user_interaction";
             /** @default null */
             parent_span_id: string | null;
             /** @default null */
@@ -2875,22 +2915,17 @@ export interface components {
             /**
              * @description Pre-provisioned answers keyed by question id, consumed without interaction.
              *     Same semantics as eval suite answers.
-             * @default {}
              */
-            answers: {
+            answers?: {
                 [key: string]: unknown;
             };
             /**
              * @description Requests a higher observation-audit level for this run. The
              *     deployment floor and the generator policy can only be raised.
-             * @default null
              */
-            audit_level: components["schemas"]["AuditLevel"] | null;
-            /**
-             * @description Pre-provisioned confirmation decisions keyed by confirmation id.
-             * @default {}
-             */
-            confirmations: {
+            audit_level?: components["schemas"]["AuditLevel"] | null;
+            /** @description Pre-provisioned confirmation decisions keyed by confirmation id. */
+            confirmations?: {
                 [key: string]: boolean;
             };
             generator_id: string;
@@ -2900,17 +2935,15 @@ export interface components {
             /**
              * @description Free-form run metadata (for example `owner`). Metadata only: it is
              *     stored and returned with the run, and never confers authorization.
-             * @default {}
              */
-            labels: {
+            labels?: {
                 [key: string]: string;
             };
             /**
              * Format: int32
              * @description Scheduling priority, higher runs first. Defaults to 0.
-             * @default null
              */
-            priority: number | null;
+            priority?: number | null;
         };
         StepFinishedEventData: {
             /** @default null */
@@ -3024,7 +3057,30 @@ export interface components {
             source: string | null;
         };
     };
-    responses: never;
+    responses: {
+        /** @description Rate limited */
+        TooManyRequests: {
+            headers: {
+                /** @description Whole seconds to wait before retrying, always at least one */
+                "Retry-After"?: string;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/problem+json": components["schemas"]["ProblemDetails"];
+            };
+        };
+        /** @description Authentication required */
+        Unauthorized: {
+            headers: {
+                /** @description Bearer realm="qcg"; the request carried no valid API token */
+                "WWW-Authenticate"?: string;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/problem+json": components["schemas"]["ProblemDetails"];
+            };
+        };
+    };
     parameters: never;
     requestBodies: never;
     headers: never;

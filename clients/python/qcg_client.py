@@ -260,22 +260,12 @@ class QcgClient:
         with contextlib.closing(raw):
             decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
             text_buffer = ""
-            byte_remainder = b""
             try:
                 while True:
-                    chunk = raw.read(1)
+                    chunk = raw.read(1 << 16)
                     if not chunk:
                         break
-                    byte_remainder += chunk
-                    try:
-                        text_buffer += decoder.decode(byte_remainder, final=False)
-                        byte_remainder = b""
-                    except UnicodeDecodeError:
-                        # Incomplete multi-byte sequence: read more bytes.
-                        if len(byte_remainder) > 4:
-                            text_buffer += decoder.decode(byte_remainder, final=True)
-                            byte_remainder = b""
-                        continue
+                    text_buffer += decoder.decode(chunk, final=False)
                     # Normalize CRLF/CR per the SSE spec before framing.
                     text_buffer = text_buffer.replace("\r\n", "\n").replace("\r", "\n")
                     while "\n\n" in text_buffer:

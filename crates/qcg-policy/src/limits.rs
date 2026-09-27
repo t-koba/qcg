@@ -35,6 +35,22 @@ pub const DEFAULT_JOURNAL_SCAN_WINDOW_BYTES: usize = 1024 * 1024;
 pub const MIN_JOURNAL_SCAN_WINDOW_BYTES: usize = 4_096;
 pub const MAX_JOURNAL_SCAN_WINDOW_BYTES: usize = 64 * 1024 * 1024;
 
+pub const DEFAULT_MAX_JOURNAL_EVENT_BYTES: usize = 8 * 1024 * 1024;
+pub const DEFAULT_MAX_JOURNAL_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+pub const DEFAULT_MAX_JOURNAL_EVENT_COUNT: usize = 1_000_000;
+pub const DEFAULT_MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Hard cap for one run's observation stream when `[audit].max_bytes` is
+/// unset. The writer degrades instead of exceeding it, and every reader
+/// refuses a stream that already did, so an audit trail can never become the
+/// unbounded allocation a durable journal is not allowed to be.
+pub const DEFAULT_MAX_AUDIT_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+
+/// Hard cap for one served generator package asset when
+/// `QCG_MAX_ASSET_BYTES` is unset. The asset is read into memory to be
+/// returned, so "no operator limit" must not mean "no limit".
+pub const DEFAULT_MAX_ASSET_BYTES: usize = 16 * 1024 * 1024;
+
 /// Inclusive mechanism bounds for the graceful shutdown phases, in
 /// seconds. The settle deadline must be at least the drain timeout.
 pub const MIN_SHUTDOWN_PHASE_SECS: u64 = 1;

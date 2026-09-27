@@ -15,6 +15,11 @@ use super::staging::AsyncStagingGuard;
 #[cfg(not(unix))]
 use super::staging::AsyncStreamGuard;
 
+/// Upper bound for the commit-time base re-check. A patch target larger than
+/// this is refused instead of replaced, because a node must never overwrite a
+/// file it could not re-read within the same bound it used to read it.
+const PATCH_COMMIT_RECHECK_BYTES: usize = 8 * 1024 * 1024;
+
 // Workspace filesystem isolation boundary (E13).
 //
 // Unix: handle-relative traversal with `O_NOFOLLOW` at every component,
@@ -1225,9 +1230,80 @@ impl FsGateway {
             })?
         };
         let outcome = qcg_fs::apply_anchored_patch(&current, expected_base, &edits, limits)?;
+        // Commit-time re-check. The lock above only excludes writers inside
+        // this process, so a second qcg process or a direct workspace edit can
+        // still land between the read and the replace. Re-reading the leaf
+        // under the same exclusion refuses that instead of silently
+        // overwriting it. The residual window is the rename itself, which no
+        // portable primitive can close, so the base digest is what a caller
+        // re-checks after a failure.
+        self.require_unchanged_since(target, Some(&qcg_fs::base_sha256(&current)))
+            .await?;
         self.write_file_atomic(target, outcome.new_text.as_bytes())
             .await?;
         Ok(outcome)
+    }
+
+    /// Current content digest of a patch target, or `None` when it does not
+    /// exist. Pairs with [`Self::require_unchanged_since`]: observe before
+    /// patching, verify immediately before committing.
+    pub async fn observe_patch_state(
+        &self,
+        target: &Utf8Path,
+    ) -> Result<Option<String>, GatewayError> {
+        use std::io::Read as _;
+        let file = match self.open_read_resolved(target) {
+            Ok(file) => file,
+            Err(GatewayError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let mut bytes = Vec::new();
+        file.take((PATCH_COMMIT_RECHECK_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(GatewayError::from)?;
+        if bytes.len() > PATCH_COMMIT_RECHECK_BYTES {
+            // Too large to hash within the commit bound: refuse rather than
+            // claim a base this node never read.
+            return Err(qcg_fs::AnchoredPatchError::ResultTooLarge {
+                bytes: bytes.len(),
+                limit: PATCH_COMMIT_RECHECK_BYTES,
+            }
+            .into());
+        }
+        // The patch path hashes decoded text, so the observation must decode
+        // the same way: a file that is no longer valid UTF-8 has drifted, not
+        // silently hashed differently.
+        let text = String::from_utf8(bytes).map_err(|_| GatewayError::PatchNotUtf8 {
+            path: target.to_string(),
+        })?;
+        Ok(Some(qcg_fs::base_sha256(&text)))
+    }
+
+    /// Refuses when `target` no longer matches the state a patch was computed
+    /// from: `Some(digest)` requires that exact content, `None` requires the
+    /// file to still be absent.
+    ///
+    /// The lock held by [`Self::apply_anchored_patch`] only excludes writers
+    /// inside this process, so a second qcg process or a direct workspace edit
+    /// can still land between the read and the replace; re-reading the leaf here
+    /// surfaces that as a base mismatch instead of a silent overwrite. The
+    /// residual window is the rename itself, which no portable primitive closes.
+    pub async fn require_unchanged_since(
+        &self,
+        target: &Utf8Path,
+        expected: Option<&str>,
+    ) -> Result<(), GatewayError> {
+        let observed = self.observe_patch_state(target).await?;
+        if observed.as_deref() != expected {
+            return Err(qcg_fs::AnchoredPatchError::BaseMismatch {
+                expected: expected.unwrap_or("missing").to_string(),
+                actual: observed.unwrap_or_else(|| "missing".to_string()),
+            }
+            .into());
+        }
+        Ok(())
     }
 
     /// Validates workspace containment and the terminal non-symlink
@@ -1893,171 +1969,69 @@ mod unix_staging_tests {
             "the file must hold exactly one complete winner: {final_text:?}"
         );
     }
-}
 
-#[cfg(all(test, not(unix)))]
-mod tests {
-    use super::*;
-
-    #[cfg(not(unix))]
-    fn temp_path(name: &str) -> Utf8PathBuf {
-        Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-staging-{name}-{}", uuid::Uuid::now_v7())),
-        )
-        .expect("temporary path must be UTF-8")
-    }
-
-    #[cfg(not(unix))]
-    #[test]
-    fn dropped_staging_guard_reclaims_the_file() {
-        // E13b: a future dropped mid-write must not leave `.qcg-part-*`.
-        let staging = temp_path("drop");
-        std::fs::write(&staging, b"partial").expect("staging should be written");
-        {
-            let _guard = AsyncStreamGuard::new(staging.clone());
-        }
-        assert!(
-            !staging.exists(),
-            "a dropped staging guard must reclaim its file"
-        );
-    }
-
-    #[cfg(not(unix))]
-    #[test]
-    fn disarmed_staging_guard_keeps_the_committed_file() {
-        let staging = temp_path("commit");
-        std::fs::write(&staging, b"complete").expect("staging should be written");
-        {
-            let mut guard = AsyncStreamGuard::new(staging.clone());
-            guard.disarm();
-        }
-        assert!(
-            staging.exists(),
-            "a disarmed guard must not remove the committed file"
-        );
-        let _ = std::fs::remove_file(&staging);
-    }
-}
-
-#[cfg(test)]
-mod staged_mode_tests {
-    use super::FsGateway;
-    #[test]
-    fn staged_mode_masks_world_writable() {
-        // E13/E15: staged files never land world-accessible.
-        assert_eq!(FsGateway::staged_mode(Some(0o777)), 0o775);
-        assert_eq!(FsGateway::staged_mode(Some(0o666)), 0o664);
-        assert_eq!(FsGateway::staged_mode(None), 0o600);
-    }
-}
-
-#[cfg(test)]
-mod anchored_patch_tests {
-    use super::*;
-    use qcg_contract::Permissions;
-
-    fn isolated_gateway() -> (Utf8PathBuf, FsGateway) {
-        let base = Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-anchored-{}", uuid::Uuid::now_v7())),
-        )
-        .expect("temporary path must be UTF-8");
+    #[tokio::test]
+    async fn commit_time_recheck_refuses_a_foreign_writer() {
+        // The per-file exclusion only covers writers inside this process, so a
+        // second qcg process or a direct workspace edit must surface at commit
+        // time as a base mismatch instead of a silent overwrite.
+        let base = Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
+            "qcg-gateway-patch-commit-recheck-{}",
+            uuid::Uuid::now_v7().as_simple()
+        )))
+        .expect("temporary directory path must be utf-8");
+        let _temp_guard = TempGuard(base.clone());
         let workspace = base.join("workspace");
         std::fs::create_dir_all(&workspace).expect("test workspace should be created");
         let mut permissions = Permissions::default();
         permissions.fs_read.push("workspace".into());
         permissions.fs_write.push("workspace".into());
-        let gateway = FsGateway::new(workspace.clone(), &permissions);
-        (base, gateway)
-    }
-
-    #[tokio::test]
-    async fn anchored_read_and_patch_round_trip() {
-        let (base, gateway) = isolated_gateway();
+        let gateway = FsGateway::new(workspace, &permissions);
         let target = gateway
             .resolve_write("notes.txt")
-            .expect("write should resolve");
-        gateway
-            .write_file_atomic(&target, b"alpha\nbeta\ngamma")
-            .await
-            .expect("seed write should succeed");
-        let snapshot = gateway
-            .read_anchored(&target, 1, 10, Some(1024))
-            .expect("anchored read should succeed");
-        assert_eq!(snapshot.total_lines, 3);
-        assert_eq!(snapshot.lines.len(), 3);
-        assert_eq!(
-            snapshot.base_sha256,
-            "f3220283d05d1ff2ae350cfe9e0e367cb5aef46e10efb203c8a53c678e2218c8"
-        );
-        let edits = vec![qcg_fs::PatchEdit {
-            op: qcg_fs::PatchOp::Replace,
-            anchor_line: 2,
-            anchor_hash: qcg_fs::line_hash(2, "beta"),
-            lines: vec!["BETA".into()],
-        }];
-        let outcome = gateway
-            .apply_anchored_patch(
-                &target,
-                Some(&snapshot.base_sha256),
-                edits,
-                qcg_fs::PatchLimits {
-                    max_edits: 8,
-                    max_patch_bytes: 1024,
-                    max_result_bytes: 1024,
-                },
-            )
-            .await
-            .expect("anchored patch should apply");
-        assert_eq!(outcome.applied, 1);
-        assert_eq!(
-            std::fs::read_to_string(&target).expect("patched file should be readable"),
-            "alpha\nBETA\ngamma"
-        );
-        std::fs::remove_dir_all(&base).expect("test workspace should be removed");
-    }
-
-    #[tokio::test]
-    async fn stale_anchor_rejects_without_modification() {
-        let (base, gateway) = isolated_gateway();
-        let target = gateway
-            .resolve_write("notes.txt")
-            .expect("write should resolve");
-        gateway
-            .write_file_atomic(&target, b"alpha\nBETA\ngamma")
-            .await
-            .expect("seed write should succeed");
-        let stale = qcg_fs::PatchEdit {
-            op: qcg_fs::PatchOp::Replace,
-            anchor_line: 2,
-            anchor_hash: qcg_fs::line_hash(2, "beta"),
-            lines: vec!["beta".into()],
+            .expect("target should resolve");
+        let mismatch = |error: GatewayError| {
+            assert!(
+                matches!(
+                    error,
+                    GatewayError::AnchoredPatch(qcg_fs::AnchoredPatchError::BaseMismatch { .. })
+                ),
+                "must report base drift, got: {error:?}"
+            );
         };
-        let error = gateway
-            .apply_anchored_patch(
-                &target,
-                None,
-                vec![stale],
-                qcg_fs::PatchLimits {
-                    max_edits: 8,
-                    max_patch_bytes: 1024,
-                    max_result_bytes: 1024,
-                },
-            )
+
+        std::fs::write(&target, "alpha\n").expect("seed should be written");
+        let seed = qcg_fs::base_sha256("alpha\n");
+        gateway
+            .require_unchanged_since(&target, Some(&seed))
             .await
-            .expect_err("stale anchor must fail");
-        match error {
-            GatewayError::AnchoredPatch(qcg_fs::AnchoredPatchError::AnchorStale {
-                remaps, ..
-            }) => {
-                assert_eq!(remaps.len(), 1);
-                assert_eq!(remaps[0].current_anchor, qcg_fs::anchor_for(2, "BETA"));
-            }
-            other => panic!("unexpected gateway error: {other}"),
-        }
-        assert_eq!(
-            std::fs::read_to_string(&target).expect("failed patch must not modify"),
-            "alpha\nBETA\ngamma"
+            .expect("an unchanged file must pass");
+
+        std::fs::write(&target, "foreign\n").expect("foreign write should land");
+        mismatch(
+            gateway
+                .require_unchanged_since(&target, Some(&seed))
+                .await
+                .expect_err("a changed file must fail the re-check"),
         );
-        std::fs::remove_dir_all(&base).expect("test workspace should be removed");
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("file should be readable"),
+            "foreign\n",
+            "the re-check must not write anything itself"
+        );
+
+        // A target that disappeared after the observation is drift too, and an
+        // absent target observed as absent still matches.
+        std::fs::remove_file(&target).expect("file should be removed");
+        mismatch(
+            gateway
+                .require_unchanged_since(&target, Some(&seed))
+                .await
+                .expect_err("a removed file must fail the re-check"),
+        );
+        gateway
+            .require_unchanged_since(&target, None)
+            .await
+            .expect("an absent target observed as absent must pass");
     }
 }

@@ -1,6 +1,5 @@
 use super::super::types::ServiceError;
 use camino::{Utf8Path, Utf8PathBuf};
-use qcg_api::{RunCompletionStatus, RunEventData};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -12,35 +11,13 @@ use qcg_api::RunEvent;
 
 pub fn read_run_generator_path(run_dir: &Utf8Path) -> Result<Utf8PathBuf, ServiceError> {
     let events = read_durable_run_events(run_dir)?;
-    read_run_generator_path_from_events(run_dir, &events)
-}
-
-pub fn read_run_generator_path_from_events(
-    run_dir: &Utf8Path,
-    events: &[RunEvent],
-) -> Result<Utf8PathBuf, ServiceError> {
-    let (_, started) = run_identity_event(run_dir, events)?;
+    let (_, started) = run_identity_event(run_dir, &events)?;
     Ok(Utf8PathBuf::from(&started.generator_path))
-}
-
-pub(crate) fn read_run_contract_sha256(
-    run_dir: &Utf8Path,
-    events: &[RunEvent],
-) -> Result<String, ServiceError> {
-    let (_, started) = run_identity_event(run_dir, events)?;
-    Ok(started.contract_sha256.clone())
 }
 
 pub fn read_run_inputs(run_dir: &Utf8Path) -> Result<BTreeMap<String, Value>, ServiceError> {
     let events = read_durable_run_events(run_dir)?;
-    read_run_inputs_from_events(run_dir, &events)
-}
-
-pub fn read_run_inputs_from_events(
-    run_dir: &Utf8Path,
-    events: &[RunEvent],
-) -> Result<BTreeMap<String, Value>, ServiceError> {
-    let (_, started) = run_identity_event(run_dir, events)?;
+    let (_, started) = run_identity_event(run_dir, &events)?;
     Ok(started.inputs.clone())
 }
 
@@ -52,51 +29,37 @@ pub fn run_summary(run_dir: &Utf8Path) -> Result<RunSummary, ServiceError> {
 /// paths use this so one run never costs a summary scan plus a second fold.
 pub fn run_summary_with_seq(run_dir: &Utf8Path) -> Result<(RunSummary, u64), ServiceError> {
     let values = read_journal_events(run_dir)?;
-    let folded = qcg_engine::RunState::fold_values(&values)
+    let state = qcg_engine::RunState::fold_values(&values)
         .map_err(|error| ServiceError::Invalid(error.to_string()))?;
     let events = values
         .iter()
         .map(|event| RunEvent::from_flat(event).map_err(ServiceError::Invalid))
         .collect::<Result<Vec<_>, _>>()?;
-    let summary = run_summary_from_events(run_dir, &events)?;
-    Ok((summary, folded.last_seq))
+    let summary = run_summary_from_state(run_dir, &events, &state)?;
+    Ok((summary, state.last_seq))
 }
 
-fn run_summary_from_events(
+/// Status and settled time come from the folded state, not from a second scan
+/// of lifecycle events: one journal read, one projection, no second source of
+/// truth for what a run is doing.
+fn run_summary_from_state(
     run_dir: &Utf8Path,
     events: &[RunEvent],
+    state: &qcg_engine::RunState,
 ) -> Result<RunSummary, ServiceError> {
     let (started_event, started) = run_identity_event(run_dir, events)?;
-    let lifecycle = events
-        .iter()
-        .rev()
-        .find(|event| {
-            matches!(
-                event.kind.as_str(),
-                "run_queued"
-                    | "run_started"
-                    | "run_waiting"
-                    | "confirm_request"
-                    | "run_finished"
-                    | "run_error"
-                    | "run_canceled"
-                    | "run_interrupted"
-            )
-        })
-        .ok_or_else(|| ServiceError::Invalid("run has no lifecycle event".into()))?;
-    let status = match &lifecycle.data {
-        RunEventData::RunQueued(_) => "queued",
-        RunEventData::RunStarted(_) => "running",
-        RunEventData::RunWaiting(_) => "waiting",
-        RunEventData::ConfirmRequest(_) => "confirming",
-        RunEventData::RunError(_) => "failed",
-        RunEventData::RunCanceled(_) => "canceled",
-        RunEventData::RunInterrupted(_) => "interrupted",
-        RunEventData::RunFinished(data) => match data.status {
-            RunCompletionStatus::Success => "success",
-            RunCompletionStatus::Failed => "failed",
-        },
-        _ => return Err(ServiceError::Invalid("unsupported lifecycle event".into())),
+    use qcg_engine::{Interaction, TerminalState};
+    let status = match (&state.terminal, &state.pending) {
+        (Some(TerminalState::Succeeded), _) => "success",
+        (Some(TerminalState::Failed), _) => "failed",
+        (Some(TerminalState::Canceled), _) => "canceled",
+        (Some(TerminalState::Interrupted), _) => "interrupted",
+        // A journaled cancel is acceptance, not settlement.
+        (None, _) if state.cancel_requested => "cancel_requested",
+        (None, Some(Interaction::Question { .. })) => "waiting",
+        (None, Some(Interaction::Confirmation { .. })) => "confirming",
+        (None, None) if state.execution_started => "running",
+        (None, None) => "queued",
     };
     let artifacts = read_optional_output_manifest(run_dir)?
         .map(|manifest| manifest.artifacts)
@@ -117,8 +80,7 @@ fn run_summary_from_events(
         contract_sha256: started.contract_sha256.clone(),
         inputs: started.inputs.clone(),
         started_at: started_event.ts.clone(),
-        finished_at: matches!(status, "success" | "failed" | "canceled" | "interrupted")
-            .then(|| lifecycle.ts.clone()),
+        finished_at: state.finished_at.clone(),
         artifacts,
         retention_days,
     })

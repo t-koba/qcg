@@ -1,15 +1,16 @@
-use crate::artifacts::{api_bad_request, api_internal, api_not_found, event_kinds, is_safe_id};
+use crate::artifacts::{api_bad_request, api_internal, api_not_found, event_kinds, is_safe_run_id};
 use crate::queue::{PriorityPermits, queue_head};
 use crate::run_dirs::{
     app_registry, claim_run_execution_owner, consume_cancel_control, direct_run_id,
-    direct_run_meta_dir, list_pending_cancel_controls, lock_direct_run, lock_runs_directory,
-    lock_runs_directory_shared, read_run_execution_owner, try_lock_run_execution,
-    try_lock_store_maintenance, warn_if_shared_runs_dir_owned, write_run_event,
+    direct_run_meta_dir, is_regular_directory, is_regular_file, list_pending_cancel_controls,
+    lock_direct_run, lock_runs_directory, lock_runs_directory_shared, read_run_execution_owner,
+    try_lock_run_execution, try_lock_store_maintenance, warn_if_shared_runs_dir_owned,
+    write_run_event,
 };
 use crate::summaries::{
-    fold_run_state, gc_run_directories, has_remote_cancel_request, read_last_queued_at,
-    read_merged_events_from_meta, read_optional_output_manifest, read_persisted_hitl,
-    rehydrate_runs, run_meta_dir, run_workspace_dir, status_from_journal,
+    fold_run_state, gc_run_directories, has_remote_cancel_request, read_merged_events_from_meta,
+    read_optional_output_manifest, rehydrate_runs, run_meta_dir, run_workspace_dir,
+    status_from_journal,
 };
 use crate::types::{
     DirectRun, DirectRunEvents, FinishTransition, LocalQcgService, LocalQcgServiceInner, RunRecord,
@@ -48,6 +49,20 @@ fn terminal_status(terminal: &qcg_engine::TerminalState) -> RunStatus {
 /// `remove_ephemeral_now` and forgets the guard, so the spawned fallback
 /// never double-removes on success. Shutdown must not rely on the fallback
 /// alone: it races the same shutdown it cleans up after.
+/// Whether a direct execution collects its events or only the output
+/// manifest. Both modes run the identical pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectEventMode {
+    None,
+    Collect,
+}
+
+/// Result of the shared direct execution pipeline.
+enum DirectRunOutput {
+    Manifest(OutputManifest),
+    Events(DirectRunEvents),
+}
+
 struct RemoveEphemeralOnDrop {
     service: LocalQcgService,
     run_id: String,
@@ -437,8 +452,12 @@ impl LocalQcgService {
                 // Filesystem observations without any run-map lock.
                 let cancel_probe = has_remote_cancel_request(&run_dir)?;
                 let state = fold_run_state(&run_dir)?;
-                let hitl = read_persisted_hitl(&run_dir)?;
-                let journal_queued_at = read_last_queued_at(&run_dir);
+                let hitl = (state.answers.clone(), state.confirmations.clone());
+                let journal_queued_at = state.queued_at.as_deref().and_then(|at| {
+                    chrono::DateTime::parse_from_rfc3339(at)
+                        .ok()
+                        .map(|at| at.with_timezone(&chrono::Utc))
+                });
                 // Short write lock for the in-memory merge only.
                 let mut runs = self.inner.runs.write().await;
                 let Some(record) = runs.get_mut(run_id.as_str()) else {
@@ -1027,11 +1046,17 @@ impl LocalQcgService {
             true,
             self.inner.deployment_policy.max_directory_scan_entries,
         )?;
-        self.inner
-            .runs
-            .write()
-            .await
-            .retain(|_, record| !record.state.is_terminal() || record.run_dir.is_dir());
+        let mut runs = self.inner.runs.write().await;
+        let mut removed = Vec::new();
+        for (id, record) in runs.iter() {
+            if record.state.is_terminal() && !is_regular_directory(&record.run_dir)? {
+                removed.push(id.clone());
+            }
+        }
+        for id in removed {
+            runs.remove(&id);
+        }
+        drop(runs);
         drop(maintenance_lock);
         Ok(())
     }
@@ -1047,7 +1072,13 @@ impl LocalQcgService {
         Ok(record.events.subscribe())
     }
 
+    /// The single entry point for resolving a run id to its directory. A run
+    /// id names one directory under the runs root, so it must be a single safe
+    /// path component before any path is built from it.
     pub async fn run_dir_for(&self, id: &str) -> Result<Utf8PathBuf, ApiError> {
+        if !is_safe_run_id(id) {
+            return Err(api_bad_request(format!("run id `{id}` is not allowed")));
+        }
         let memory = self
             .inner
             .runs
@@ -1058,11 +1089,8 @@ impl LocalQcgService {
         if let Some(run_dir) = memory {
             return Ok(run_dir);
         }
-        if !is_safe_id(id) {
-            return Err(api_bad_request(format!("run id `{id}` is not allowed")));
-        }
         let run_dir = self.inner.runs_dir.join(id);
-        if !run_meta_dir(&run_dir).join("journal.jsonl").is_file() {
+        if !is_regular_file(&run_meta_dir(&run_dir).join("journal.jsonl")).map_err(api_internal)? {
             return Err(api_not_found(format!("run `{id}` was not found")));
         }
         Ok(run_dir)
@@ -1110,7 +1138,9 @@ impl LocalQcgService {
     }
 
     pub(crate) fn load_generator(&self, id: &str) -> Result<Contract, ApiError> {
-        if !is_safe_id(id) {
+        // A generator id names one directory under a generator root, so it
+        // obeys the same single-component rule as a run id.
+        if !is_safe_run_id(id) {
             return Err(api_bad_request(format!(
                 "generator id `{id}` is not allowed"
             )));
@@ -1549,12 +1579,36 @@ impl LocalQcgService {
         self.inner.queue_notify.notify_waiters();
     }
 
+    /// Runs a generator directly, without the API admission path.
     pub async fn run_generator_path(&self, run: DirectRun) -> Result<OutputManifest, ApiError> {
-        if self.is_shutting_down() {
-            return Err(ApiError::Unavailable {
-                detail: "server is shutting down".into(),
-            });
+        match self.execute_direct(run, DirectEventMode::None).await? {
+            DirectRunOutput::Manifest(manifest) => Ok(manifest),
+            DirectRunOutput::Events(events) => Ok(events.manifest),
         }
+    }
+
+    /// Same execution as [`Self::run_generator_path`], additionally returning
+    /// the run's events. The two differ only in what they do with the live
+    /// tail, so they share one implementation instead of two drifting copies.
+    pub async fn run_generator_path_with_events(
+        &self,
+        run: DirectRun,
+    ) -> Result<DirectRunEvents, ApiError> {
+        match self.execute_direct(run, DirectEventMode::Collect).await? {
+            DirectRunOutput::Events(events) => Ok(events),
+            DirectRunOutput::Manifest(_) => Err(api_internal("direct run collected no events")),
+        }
+    }
+
+    /// The one direct execution pipeline: contract load, audit floor, input
+    /// canonicalization, run lock, run-ref resolution, ephemeral scheduler
+    /// record, queue wait, policy resolution, engine run, and cleanup.
+    async fn execute_direct(
+        &self,
+        run: DirectRun,
+        mode: DirectEventMode,
+    ) -> Result<DirectRunOutput, ApiError> {
+        self.ensure_running()?;
         let mut contract = Contract::load(&run.generator_path).map_err(api_internal)?;
         contract.apply_audit_floor(self.inner.deployment_policy.audit_floor);
         // Admission canonicalization matches the API path so memory records
@@ -1587,7 +1641,7 @@ impl LocalQcgService {
         // Unified scheduler: direct executions register an ephemeral Queued
         // record so the same queue_head ordering governs API and direct runs.
         // Priority 0, FIFO by admission; removed on completion.
-        let (events, _) =
+        let (events, mut receiver) =
             broadcast::channel(self.inner.deployment_policy.live_event_channel_capacity);
         let ephemeral_dir = metadata_dir
             .parent()
@@ -1668,157 +1722,11 @@ impl LocalQcgService {
             self.max_total_steps(),
             self.inner.deployment_policy.max_parallel_steps,
         );
-        let result = Engine::new(app_registry(Arc::clone(&runtime)))
+        let json_events = matches!(mode, DirectEventMode::None) && run.json_events;
+        let manifest = Engine::new(app_registry(Arc::clone(&runtime)))
             .with_snapshot_source(Arc::new(ServiceSnapshotSource {
                 service: self.clone(),
             }))
-            .run_with_id(
-                run_id.clone(),
-                metadata_dir,
-                contract,
-                canonical_direct_inputs.clone(),
-                RunOptions {
-                    output_dir: run.output_dir,
-                    json_events: run.json_events,
-                    event_sender: None,
-                    interactive: run.interactive,
-                    answers: run.answers,
-                    confirmations: run.confirmations,
-                    max_total_steps: policy.max_total_steps,
-                    max_parallel_steps: policy.max_parallel_steps,
-                    llm_provider: Some(Arc::clone(&runtime.provider)),
-                    llm_seed_override: run.llm_seed_override,
-                    run_refs: run_refs.clone(),
-                    cancellation: CancellationToken::new(),
-                    // Direct executions observe the service drain like
-                    // spawned runs: a shutdown mid-run ends the wait
-                    // instead of overrunning it (E05).
-                    shutdown: Some(self.shutdown_token()),
-                },
-            )
-            .await
-            .map_err(api_internal);
-        self.remove_ephemeral_now(&run_id).await;
-        std::mem::forget(_ephemeral_guard);
-        result
-    }
-
-    pub async fn run_generator_path_with_events(
-        &self,
-        run: DirectRun,
-    ) -> Result<DirectRunEvents, ApiError> {
-        if self.is_shutting_down() {
-            return Err(ApiError::Unavailable {
-                detail: "server is shutting down".into(),
-            });
-        }
-        let mut contract = Contract::load(&run.generator_path).map_err(api_internal)?;
-        contract.apply_audit_floor(self.inner.deployment_policy.audit_floor);
-        let canonical_direct_inputs = match contract.manifest.resolve_inputs(run.inputs.clone()) {
-            Ok(resolved) => qcg_engine::canonical_file_inputs(&contract, resolved)
-                .map_err(|error| ApiError::invalid_field("inputs", error.to_string()))?,
-            Err(qcg_contract::ContractError::PayloadTooLarge {
-                actual_bytes,
-                limit_bytes,
-                ..
-            }) => {
-                return Err(ApiError::TooLarge {
-                    actual_bytes,
-                    limit_bytes,
-                });
-            }
-            Err(error) => return Err(ApiError::invalid_field("inputs", error.to_string())),
-        };
-        let runtime = Arc::clone(&self.inner.llm_runtime);
-        let (events, mut receiver) =
-            broadcast::channel(self.inner.deployment_policy.live_event_channel_capacity);
-        let run_id = direct_run_id(&run.output_dir);
-        let metadata_dir = direct_run_meta_dir(&run.output_dir);
-        let _run_lock = lock_direct_run(&metadata_dir).map_err(api_internal)?;
-        let run_refs = crate::run_refs::load_or_resolve_run_refs(
-            &self.inner.runs_dir,
-            &contract,
-            &metadata_dir,
-        )?;
-        warn_if_shared_runs_dir_owned(&run.output_dir);
-        let ephemeral_dir = metadata_dir
-            .parent()
-            .map(|parent| parent.to_owned())
-            .unwrap_or_else(|| metadata_dir.clone());
-        {
-            let mut runs = self.inner.runs.write().await;
-            if runs
-                .get(&run_id)
-                .is_none_or(|record| record.state.is_terminal())
-            {
-                runs.insert(
-                    run_id.clone(),
-                    RunRecord {
-                        contract: contract.clone(),
-                        contract_sha256: contract.sha256.clone(),
-                        inputs: canonical_direct_inputs.clone(),
-                        answers: run.answers.clone(),
-                        confirmations: run.confirmations.clone(),
-                        priority: 0,
-                        parent_run_id: None,
-                        preempted: false,
-                        state: RunStatus::Queued,
-                        run_dir: ephemeral_dir,
-                        artifacts: None,
-                        question: None,
-                        confirm: None,
-                        events: events.clone(),
-                        cancellation: CancellationToken::new(),
-                        task: Arc::new(Mutex::new(None)),
-                        queued_at: Some(chrono::Utc::now()),
-                        owner_id: self.inner.owner_id.clone(),
-                        ephemeral: true,
-                    },
-                );
-            }
-        }
-        let _ephemeral_guard = RemoveEphemeralOnDrop {
-            service: self.clone(),
-            run_id: run_id.clone(),
-        };
-        let _permit = loop {
-            let notified = self.inner.queue_notify.notified();
-            let shutdown = self.inner.shutdown.cancelled();
-            let head = {
-                let runs = self.inner.runs.read().await;
-                queue_head(&runs)
-            };
-            if head.as_deref() == Some(run_id.as_str())
-                && let Some(permit) = PriorityPermits::try_take(
-                    &self.inner.execution_permits,
-                    Arc::clone(&self.inner.queue_notify),
-                )
-            {
-                break permit;
-            }
-            // Shutdown ends the wait instead of hanging the direct caller
-            // past the drain (E05).
-            tokio::select! {
-                _ = shutdown => {
-                    return Err(ApiError::Unavailable {
-                        detail: "server is shutting down".into(),
-                    });
-                }
-                _ = notified => continue,
-            }
-        };
-        {
-            let mut runs = self.inner.runs.write().await;
-            if let Some(record) = runs.get_mut(&run_id) {
-                record.state = RunStatus::Running;
-            }
-        }
-        let policy = crate::types::ResolvedExecutionPolicy::resolve(
-            contract.manifest.budget.max_steps,
-            self.max_total_steps(),
-            self.inner.deployment_policy.max_parallel_steps,
-        );
-        let manifest = Engine::new(app_registry(Arc::clone(&runtime)))
             .run_with_id(
                 run_id.clone(),
                 metadata_dir.clone(),
@@ -1826,8 +1734,11 @@ impl LocalQcgService {
                 canonical_direct_inputs.clone(),
                 RunOptions {
                     output_dir: run.output_dir.clone(),
-                    json_events: false,
-                    event_sender: Some(events),
+                    json_events,
+                    event_sender: match mode {
+                        DirectEventMode::None => None,
+                        DirectEventMode::Collect => Some(events),
+                    },
                     interactive: run.interactive,
                     answers: run.answers,
                     confirmations: run.confirmations,
@@ -1843,50 +1754,68 @@ impl LocalQcgService {
                     shutdown: Some(self.shutdown_token()),
                 },
             )
-            .await
-            .map_err(api_internal)?;
-        let mut collected = Vec::new();
-        loop {
-            match receiver.try_recv() {
-                Ok(event) => collected.push(event),
-                Err(broadcast::error::TryRecvError::Empty) => break,
-                Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
-                    // Single lag rule shared with the subscribe path: never
-                    // fabricate a cursor from the dropped count (E12a).
-                    let last_seq = collected.last().map_or(0, |event| event.seq);
-                    collected.push(RunEvent::lagged(
-                        run_id.clone(),
-                        crate::runs_api::lagged_resync_seq(last_seq, skipped),
-                    ));
-                }
-                Err(broadcast::error::TryRecvError::Closed) => break,
+            .await;
+        let manifest = match manifest {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                self.remove_ephemeral_now(&run_id).await;
+                std::mem::forget(_ephemeral_guard);
+                return Err(api_internal(error));
             }
-        }
-        let journal_events = read_merged_events_from_meta(&metadata_dir)
-            .map_err(api_internal)?
-            .into_iter()
-            .map(|event| RunEvent::from_flat(&event))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(api_internal)?;
-        if collected.is_empty() {
-            collected = journal_events;
-        } else if collected.iter().any(|event| event.kind == "lagged") {
-            // A lagged live tail dropped broadcasts; the durable journal is
-            // authoritative, so converge onto it instead of erroring (E12).
-            collected = journal_events;
-        } else if event_kinds(&collected) != event_kinds(&journal_events) {
-            self.remove_ephemeral_now(&run_id).await;
-            std::mem::forget(_ephemeral_guard);
-            return Err(api_internal(format!(
-                "direct run event stream diverged from journal in `{}`",
-                run.output_dir
-            )));
-        }
+        };
+        let collected = match mode {
+            DirectEventMode::None => Vec::new(),
+            DirectEventMode::Collect => {
+                let mut collected = Vec::new();
+                loop {
+                    match receiver.try_recv() {
+                        Ok(event) => collected.push(event),
+                        Err(broadcast::error::TryRecvError::Empty) => break,
+                        Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                            // Single lag rule shared with the subscribe path:
+                            // never fabricate a cursor from the dropped count
+                            // (E12a).
+                            let last_seq = collected.last().map_or(0, |event| event.seq);
+                            collected.push(RunEvent::lagged(
+                                run_id.clone(),
+                                crate::runs_api::lagged_resync_seq(last_seq, skipped),
+                            ));
+                        }
+                        Err(broadcast::error::TryRecvError::Closed) => break,
+                    }
+                }
+                let journal_events = read_merged_events_from_meta(&metadata_dir)
+                    .map_err(api_internal)?
+                    .into_iter()
+                    .map(|event| RunEvent::from_flat(&event))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(api_internal)?;
+                if collected.is_empty() {
+                    collected = journal_events;
+                } else if collected.iter().any(|event| event.kind == "lagged") {
+                    // A lagged live tail dropped broadcasts; the durable
+                    // journal is authoritative, so converge onto it instead of
+                    // erroring (E12).
+                    collected = journal_events;
+                } else if event_kinds(&collected) != event_kinds(&journal_events) {
+                    self.remove_ephemeral_now(&run_id).await;
+                    std::mem::forget(_ephemeral_guard);
+                    return Err(api_internal(format!(
+                        "direct run event stream diverged from journal in `{}`",
+                        run.output_dir
+                    )));
+                }
+                collected
+            }
+        };
         self.remove_ephemeral_now(&run_id).await;
         std::mem::forget(_ephemeral_guard);
-        Ok(DirectRunEvents {
-            manifest,
-            events: collected,
+        Ok(match mode {
+            DirectEventMode::None => DirectRunOutput::Manifest(manifest),
+            DirectEventMode::Collect => DirectRunOutput::Events(DirectRunEvents {
+                manifest,
+                events: collected,
+            }),
         })
     }
 
@@ -1950,10 +1879,10 @@ impl LocalQcgService {
         if service.is_shutting_down() {
             return false;
         }
-        let (answers, confirmations) = match crate::summaries::read_persisted_hitl(run_dir) {
-            Ok(maps) => maps,
+        let (answers, confirmations) = match crate::summaries::fold_run_state(run_dir) {
+            Ok(state) => (state.answers, state.confirmations),
             Err(error) => {
-                tracing::error!(run_id = %run_id, %error, "early answer requeue failed to read HITL maps");
+                tracing::error!(run_id = %run_id, %error, "early answer requeue failed to fold HITL maps");
                 return false;
             }
         };

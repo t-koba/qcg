@@ -1,4 +1,4 @@
-pub mod types;
+mod types;
 
 pub use types::*;
 
@@ -19,13 +19,31 @@ mod tests {
         let bytes = FileValue::from_bytes("bytes.bin", &[0, 255]).expect("bytes should encode");
         assert_eq!(bytes.content_base64.as_deref(), Some("AP8="));
         assert_eq!(bytes.decode().expect("base64 should decode"), [0, 255]);
+    }
 
-        let unpadded: FileValue = serde_json::from_value(json!({
-            "name": "note.txt",
-            "content_base64": "aGk"
-        }))
-        .expect("unpadded base64 should be accepted and normalized");
-        assert_eq!(unpadded.content_base64.as_deref(), Some("aGk="));
+    #[test]
+    fn base64_policy_is_canonical_padded_everywhere() {
+        // One spelling per byte string: padded RFC 4648 only, so a value cannot
+        // mean two things on two surfaces. Unpadded and non-canonical inputs are
+        // refused rather than normalized.
+        for rejected in ["aGk", "aGk=aGk=", "aGk=x", "aGl=", "YWJj="] {
+            assert!(
+                crate::types::encoding::decode_canonical_base64(rejected).is_err(),
+                "`{rejected}` must not be accepted"
+            );
+            assert!(
+                serde_json::from_value::<FileValue>(json!({
+                    "name": "note.txt",
+                    "content_base64": rejected,
+                }))
+                .is_err(),
+                "`{rejected}` must not be accepted as a FileValue"
+            );
+        }
+        assert_eq!(
+            crate::types::encoding::decode_canonical_base64("AP8=").expect("canonical decodes"),
+            [0, 255]
+        );
     }
 
     #[test]

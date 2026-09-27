@@ -95,10 +95,7 @@ pub(crate) fn validate_mcp_call_arguments(
     let Some(schema) = schema else {
         return Ok(());
     };
-    validate_bounded_json_schema(schema).map_err(|error| {
-        StepError::failed(&node.id, format!("invalid mcp.call input_schema: {error}"))
-    })?;
-    let validator = jsonschema::validator_for(schema).map_err(|error| {
+    let validator = qcg_policy::compile_bounded_validator(schema).map_err(|error| {
         StepError::failed(&node.id, format!("invalid mcp.call input_schema: {error}"))
     })?;
     if let Err(error) = validator.validate(arguments) {

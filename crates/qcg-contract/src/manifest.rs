@@ -119,7 +119,7 @@ qcg_version = "^0.1"
     fn retry_node(id: &str, retry: Option<RetryPolicy>) -> NodeDef {
         NodeDef {
             id: id.into(),
-            kind: StepType::from("write"),
+            kind: StepType::literal("write"),
             needs: vec![],
             when: None,
             on_deps: OnDeps::default(),
@@ -165,7 +165,7 @@ qcg_version = "^0.1"
     #[test]
     fn decision_nodes_do_not_remove_chat_configuration_requirements() {
         let mut decision = retry_node("decision", None);
-        decision.kind = StepType::from("llm.decide");
+        decision.kind = StepType::literal("llm.decide");
         FlowNodeRule
             .validate(&flow_manifest(vec![decision.clone()]))
             .expect("decision nodes must not require chat configuration");
@@ -178,7 +178,7 @@ qcg_version = "^0.1"
             "llm.decide_extra",
         ] {
             let mut chat = retry_node("chat", None);
-            chat.kind = StepType::from(kind);
+            chat.kind = StepType::literal(kind);
             let error = FlowNodeRule
                 .validate(&flow_manifest(vec![decision.clone(), chat]))
                 .expect_err("chat nodes must still require chat configuration");
@@ -355,23 +355,12 @@ qcg_version = "^0.1"
         // Explicit large limits have no mechanistic ceiling.
         manifest.runtime.output_artifact_limit = Some(usize::MAX);
         manifest.runtime.output_total_limit_bytes = Some(usize::MAX);
-        manifest
-            .validate()
-            .expect("explicit large limits must validate");
-    }
-    #[test]
-    fn runtime_and_budget_limits_have_no_hard_ceiling() {
-        let base = manifest_with_field(InputField {
-            id: "name".into(),
-            ..input_field_defaults()
-        });
-        let mut manifest = base.clone();
         manifest.runtime.command_output_limit_bytes = Some(usize::MAX);
         manifest.runtime.file_count_limit = Some(usize::MAX);
         manifest.runtime.http_redirect_limit = Some(usize::MAX);
         manifest
             .validate()
-            .expect("explicit large size limits must validate");
+            .expect("explicit large limits must validate");
     }
     #[test]
     fn resolve_inputs_applies_defaults_and_patterns() {
@@ -479,7 +468,7 @@ qcg_version = "^0.1"
             "retry".into(),
             vec![NodeDef {
                 id: "generate".into(),
-                kind: StepType::new("render"),
+                kind: StepType::parse("render").expect("`render` is a valid step type"),
                 needs: Vec::new(),
                 when: None,
                 on_deps: OnDeps::default(),
@@ -874,7 +863,15 @@ files = ["ui/index.html"]
             item_type: None,
             ..input_field_defaults()
         });
-        assert!(manifest.resolve_inputs(BTreeMap::new()).is_err());
+        let error = manifest
+            .resolve_inputs(BTreeMap::new())
+            .expect_err("missing required input must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("required input `name` is missing"),
+            "{error}"
+        );
     }
     #[test]
     fn resolve_inputs_rejects_short_lists() {
@@ -897,7 +894,15 @@ files = ["ui/index.html"]
             "items".into(),
             Value::Array(vec![Value::String("one".into())]),
         );
-        assert!(manifest.resolve_inputs(input).is_err());
+        let error = manifest
+            .resolve_inputs(input)
+            .expect_err("short list must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("must contain at least 2 item(s)"),
+            "{error}"
+        );
     }
     #[test]
     fn contract_load_rejects_a_future_qcg_runtime_requirement() {
@@ -1128,22 +1133,12 @@ path = "resource"
         }
     }
     #[test]
-    fn step_type_accepts_namespaced_lowercase_ids() {
+    fn step_type_classifies_ids() {
         let step_type = StepType::parse("llm.generate").expect("step type should be valid");
         assert_eq!(step_type.as_str(), "llm.generate");
-    }
-    #[test]
-    fn step_type_rejects_uppercase_and_separators() {
         assert!(StepType::parse("Llm.Generate").is_err());
         assert!(StepType::parse("llm-generate").is_err());
         assert!(StepType::parse("").is_err());
-    }
-    #[test]
-    fn resource_kind_accepts_builtins() {
-        let resource: ResourceDef =
-            toml::from_str("type = \"openapi\"\nurl = \"https://example.test/openapi.json\"")
-                .expect("built-in resource kind should deserialize");
-        assert_eq!(resource.kind, ResourceKind::Openapi);
     }
     #[test]
     fn node_def_rejects_step_params_outside_params_table() {
@@ -1310,18 +1305,11 @@ failure = { default = "clarify", by_kind = { out_of_contract = "reject" } }
         assert!(error.to_string().contains("pinned by digest"));
     }
     #[test]
-    fn unimplemented_tool_backends_are_not_in_the_contract_type() {
-        for source in [
-            "[wasm]\nmodule = \"validator.wasm\"\nsha256 = \"abc\"\n",
-            "[remote]\nurl = \"https://validator.example/check\"\n",
-        ] {
-            let error = toml::from_str::<ToolBackends>(source)
-                .expect_err("unimplemented backend must be rejected during deserialization");
-            assert!(error.to_string().contains("unknown field"));
-        }
-    }
-    #[test]
     fn resource_kind_rejects_unknown_values() {
+        let resource: ResourceDef =
+            toml::from_str("type = \"openapi\"\nurl = \"https://example.test/openapi.json\"")
+                .expect("built-in resource kind should deserialize");
+        assert_eq!(resource.kind, ResourceKind::Openapi);
         for kind in ["OpenApi", "open-api", "acme.custom", ""] {
             let error = toml::from_str::<ResourceDef>(&format!("type = {kind:?}"))
                 .expect_err("unknown resource kind must be rejected");

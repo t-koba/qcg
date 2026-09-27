@@ -1,24 +1,21 @@
+use super::super::run_dirs::is_regular_file;
 use super::super::types::ServiceError;
 use camino::{Utf8Path, Utf8PathBuf};
 use qcg_api::RunEvent;
 use qcg_engine::{JournalLimits, read_journal_values};
+use qcg_policy::is_safe_path_component;
 use serde_json::Value;
-use std::collections::BTreeMap;
 
 use super::summary::run_meta_dir;
 
-/// Durably accepted HITL responses: answers by question id and confirmations
-/// by confirmation id.
-pub(crate) type PersistedHitlMaps = (BTreeMap<String, Value>, BTreeMap<String, bool>);
-
 pub fn resolve_run_dir(runs_dir: &Utf8Path, id: &str) -> Result<Utf8PathBuf, ServiceError> {
-    if id.contains('/') || id.contains('\\') || id == "." || id == ".." {
+    if !is_safe_path_component(id) {
         return Err(ServiceError::Invalid(format!(
             "run id `{id}` is not allowed"
         )));
     }
     let run_dir = runs_dir.join(id);
-    if !run_meta_dir(&run_dir).join("journal.jsonl").exists() {
+    if !is_regular_file(&run_meta_dir(&run_dir).join("journal.jsonl"))? {
         return Err(ServiceError::Invalid(format!(
             "run `{id}` was not found under `{runs_dir}`"
         )));
@@ -218,81 +215,6 @@ fn truncate_to_last_non_canceled(path: &Utf8Path) -> Result<bool, ServiceError> 
 /// read as zero priority with no parent.
 /// Priority and parent from already-read journal values. Pure scan over
 /// memory: infallible by construction, so no Result to swallow.
-pub(crate) fn read_queued_identity_from_values(events: &[Value]) -> (i32, Option<String>) {
-    let mut priority = 0;
-    let mut parent = None;
-    for event in events {
-        if event.get("t").and_then(Value::as_str) != Some("run_queued") {
-            continue;
-        }
-        if let Some(value) = event.get("priority").and_then(Value::as_i64) {
-            priority = value.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-        }
-        parent = event
-            .get("parent_run_id")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .or(parent);
-    }
-    (priority, parent)
-}
-
-/// Durably accepted HITL responses folded from the journal.
-///
-/// `run_queued` may carry pre-provided `answers` / `confirmations` for
-/// unattended runs, while later `user_answered` / `user_confirmed` events
-/// record interactive acceptance. Later events win on the same key so a
-/// restart resumes with the same values the API already acknowledged.
-/// This wrapper is I/O plus the pure fold below: callers with an
-/// already-read snapshot use `_from_values` directly to avoid a second
-/// journal read (E03).
-pub(crate) fn read_persisted_hitl(run_dir: &Utf8Path) -> Result<PersistedHitlMaps, ServiceError> {
-    read_persisted_hitl_from_values(&read_journal_events(run_dir)?)
-}
-
-pub(crate) fn read_persisted_hitl_from_values(
-    events: &[Value],
-) -> Result<PersistedHitlMaps, ServiceError> {
-    let mut answers: BTreeMap<String, Value> = BTreeMap::new();
-    let mut confirmations: BTreeMap<String, bool> = BTreeMap::new();
-    for event in events {
-        match event.get("t").and_then(Value::as_str) {
-            Some("run_queued") => {
-                if let Some(map) = event.get("answers").and_then(Value::as_object) {
-                    for (key, value) in map {
-                        answers.insert(key.clone(), value.clone());
-                    }
-                }
-                if let Some(map) = event.get("confirmations").and_then(Value::as_object) {
-                    for (key, value) in map {
-                        if let Some(approved) = value.as_bool() {
-                            confirmations.insert(key.clone(), approved);
-                        }
-                    }
-                }
-            }
-            Some("user_answered") => {
-                if let (Some(id), Some(values)) = (
-                    event.get("question_id").and_then(Value::as_str),
-                    event.get("values").cloned(),
-                ) {
-                    answers.insert(id.to_string(), values);
-                }
-            }
-            Some("user_confirmed") => {
-                if let (Some(id), Some(approved)) = (
-                    event.get("confirmation_id").and_then(Value::as_str),
-                    event.get("approved").and_then(Value::as_bool),
-                ) {
-                    confirmations.insert(id.to_string(), approved);
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok((answers, confirmations))
-}
-
 /// Whether the shared journal holds a peer cancel request for this run.
 /// Control mailbox files count as pending requests so an owner running an
 /// engine task observes peer cancellation even before the journal event

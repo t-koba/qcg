@@ -336,7 +336,7 @@ pub(crate) async fn run_events(
             .collect();
         let terminal_seen = tail.last().is_some_and(|event| {
             qcg_api::is_terminal_event_kind(event.kind.as_str())
-                || event.kind.as_str() == "stream_error"
+                || qcg_api::TRANSPORT_RUN_EVENT_KINDS.contains(&event.kind.as_str())
         });
         let last_delivered = tail.last().map_or(clamped_after, |event| event.seq);
         let history_stream = futures_util::stream::iter(tail.into_iter().map(|event| {
@@ -347,14 +347,16 @@ pub(crate) async fn run_events(
                     tracing::error!(seq, %error, "closing SSE stream after an unserializable event");
                     let marker = serde_json::json!({
                         "seq": seq,
-                        "kind": "stream_error",
+                        "kind": qcg_api::STREAM_ERROR_KIND,
                         "data": {"reason": "unserializable event"},
                     });
                     let data = serde_json::to_string(&marker)
-                        .unwrap_or_else(|_| r#"{"kind":"stream_error"}"#.to_string());
+                        .unwrap_or_else(|_| {
+                            r#"{"kind":"stream_error"}"#.to_string()
+                        });
                     Ok(Event::default()
                         .id(seq.to_string())
-                        .event("stream_error")
+                        .event(qcg_api::STREAM_ERROR_KIND)
                         .data(data))
                 }
             }
@@ -403,7 +405,7 @@ pub(crate) async fn run_events(
             // A `stream_error` marker ends the stream after delivery like a
             // terminal event, but it is a failure-close, never a normal
             // outcome: consumers distinguish it by kind (E05).
-            let is_failure = event.kind.as_str() == "stream_error";
+            let is_failure = event.kind == qcg_api::STREAM_ERROR_KIND;
             let is_terminal = qcg_api::is_terminal_event_kind(event.kind.as_str()) || is_failure;
             *done = is_terminal;
             if is_terminal {
@@ -426,14 +428,14 @@ pub(crate) async fn run_events(
                     // truncated stream from a terminal outcome (E05).
                     let marker = serde_json::json!({
                         "seq": event.seq,
-                        "kind": "stream_error",
+                        "kind": qcg_api::STREAM_ERROR_KIND,
                         "data": {"reason": "unserializable event"},
                     });
                     let data = serde_json::to_string(&marker)
                         .unwrap_or_else(|_| r#"{"kind":"stream_error"}"#.to_string());
                     std::future::ready(Some(Some(Ok(Event::default()
                         .id(event.seq.to_string())
-                        .event("stream_error")
+                        .event(qcg_api::STREAM_ERROR_KIND)
                         .data(data)))))
                 }
             }
@@ -487,7 +489,7 @@ fn shutdown_marker_stream_dynamic(
                 .saturating_add(1);
             let data = serde_json::json!({
                 "seq": seq,
-                "kind": "shutdown",
+                "kind": qcg_api::SHUTDOWN_KIND,
                 "data": {"reason": "server is shutting down"},
             });
             let text = serde_json::to_string(&data)
@@ -495,7 +497,7 @@ fn shutdown_marker_stream_dynamic(
             Some((
                 Some(Ok(Event::default()
                     .id(seq.to_string())
-                    .event("shutdown")
+                    .event(qcg_api::SHUTDOWN_KIND)
                     .data(text))),
                 true,
             ))
@@ -1030,10 +1032,30 @@ pub(crate) async fn read_journal(
         }
         let mut observed = Vec::new();
         if let Some(mut audit) = stream.audit {
-            audit
-                .read_to_end(&mut observed)
-                .await
-                .map_err(ApiHttpError::internal)?;
+            // Bounded exactly like the durable branch: the limit was checked
+            // against the file size at open, and `take` keeps the allocation
+            // inside that same bound even if the file grows mid-read.
+            match stream.audit_limit {
+                Some(limit) => {
+                    audit
+                        .take(limit.saturating_add(1) as u64)
+                        .read_to_end(&mut observed)
+                        .await
+                        .map_err(ApiHttpError::internal)?;
+                    if observed.len() > limit {
+                        return Err(ApiHttpError::from_api(qcg_api::ApiError::TooLarge {
+                            actual_bytes: observed.len(),
+                            limit_bytes: limit,
+                        }));
+                    }
+                }
+                None => {
+                    audit
+                        .read_to_end(&mut observed)
+                        .await
+                        .map_err(ApiHttpError::internal)?;
+                }
+            }
         }
         let merged = merge_record_streams(&bytes, &observed)?;
         return conditional_response(&headers, merged, "application/x-ndjson");

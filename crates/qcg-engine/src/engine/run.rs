@@ -39,9 +39,7 @@ use super::types::{
 };
 
 /// Staging filename fragment reaped at startup (E13): the single current
-/// `.qcg-part-` prefix. Retired prefixes (`zip-source-*`, `contract-check-*`,
-/// legacy `.fork-part-`) were removed with no compat retention (C-2): no
-/// current writer emits them.
+/// `.qcg-part-` prefix. No current writer emits any other prefix.
 pub(crate) const STARTUP_SWEEP_FRAGMENTS: [&str; 1] = [".qcg-part-"];
 
 impl Engine {
@@ -417,8 +415,7 @@ impl Engine {
         }
         // Fork blob staging uses the same `.qcg-part-` atomic-write prefix
         // as workspace writes (E06/E13); the blob sweep above only covers
-        // `.tmp-`, so also reap `.qcg-part-` orphans here (C-2: the legacy
-        // `.fork-part-` entry was removed with the workspace one above).
+        // `.tmp-`, so also reap `.qcg-part-` orphans here.
         for fragment in [".qcg-part-"] {
             if let Err(error) = crate::FsGateway::sweep_orphaned_staging_files(
                 &metadata_dir.join("checkpoint-blobs"),
@@ -612,8 +609,7 @@ impl Engine {
                 .min(context.contract.manifest.budget.max_steps),
             // Durable budget seed (F13): journals with `budget_charged`
             // deltas resume from the same consumption live execution saw;
-            // older journals without the event keep the legacy
-            // `steps_executed` seed.
+            // journals without the event seed from `steps_executed`.
             if replay.state.budget.has_budget_charges {
                 replay.state.budget.budget_charged
             } else {

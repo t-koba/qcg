@@ -1968,7 +1968,6 @@ version = "0.1.0"
 dependencies = [
  "camino",
  "hex",
- "jsonschema",
  "mime",
  "qcg-policy",
  "qcg-types",
@@ -1991,7 +1990,6 @@ dependencies = [
  "chrono",
  "dunce",
  "hex",
- "jsonschema",
  "libc",
  "minijinja",
  "qcg-api",
@@ -2220,7 +2218,6 @@ dependencies = [
  "camino",
  "chrono",
  "hex",
- "jsonschema",
  "qcg-api",
  "qcg-container",
  "qcg-contract",

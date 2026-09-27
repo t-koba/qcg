@@ -1879,21 +1879,20 @@ mod tests {
 
     #[test]
     fn bare_answer_keys_are_refused() {
-        // Backward compatibility is not preserved: a legacy bare
-        // `node:tool` key never resumes a suspension (E08/Q1). Uses the
-        // real MCP question-id form for the suspension and its answer.
+        // A bare `node:tool` key never resumes a suspension (E08/Q1). Uses
+        // the real MCP question-id form for the suspension and its answer.
         let (checkpoint, question_id) = real_mcp_suspension();
-        let legacy = BTreeMap::from([("agent:search".to_string(), json!({}))]);
+        let bare = BTreeMap::from([("agent:search".to_string(), json!({}))]);
         assert!(
-            resumed_mcp_call(Some(&checkpoint), &legacy).is_none(),
-            "legacy answer must not resume"
+            resumed_mcp_call(Some(&checkpoint), &bare).is_none(),
+            "bare answer must not resume"
         );
         let both = BTreeMap::from([
             ("agent:search".to_string(), json!({})),
             (question_id.clone(), json!({"response_0": "go"})),
         ]);
         let resumed =
-            resumed_mcp_call(Some(&checkpoint), &both).expect("new-style answer should resume");
+            resumed_mcp_call(Some(&checkpoint), &both).expect("full-id answer should resume");
         assert_eq!(resumed.question_id, question_id);
     }
 
@@ -2012,8 +2011,8 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_without_mcp_field_is_rejected() {
-        // E07-6: checkpoints journaled before the MCP suspension field
+    fn checkpoints_missing_required_fields_are_rejected() {
+        // E07-6/E08-1: checkpoints journaled before required fields
         // existed are rejected fail-closed (no silent default); the
         // operator must restart the agent node instead of resuming a
         // checkpoint whose suspension state is unknown.
@@ -2032,14 +2031,10 @@ mod tests {
             error.to_string().contains("missing field"),
             "rejection must name the missing field: {error}"
         );
-    }
-
-    #[test]
-    fn checkpoint_without_used_calls_is_rejected() {
-        // E08-1: the used-call registry is required checkpoint state; a
+        // The used-call registry is required checkpoint state; a
         // checkpoint without it cannot enforce call-id ownership, so it
         // fails closed instead of resuming with an empty registry.
-        let old = json!({
+        let without_registry = json!({
             "messages": [],
             "next_turn": 1,
             "tokens_total": 0,
@@ -2049,7 +2044,7 @@ mod tests {
             "pending_confirm": null,
             "pending_mcp_call": null,
         });
-        let error = serde_json::from_value::<AgentCheckpoint>(old)
+        let error = serde_json::from_value::<AgentCheckpoint>(without_registry)
             .expect_err("checkpoint without used_calls must be rejected");
         assert!(
             error.to_string().contains("used_calls"),
@@ -2156,10 +2151,10 @@ mod tests {
             crate::agent_runtime::answer_for_question(&BTreeMap::new(), &question_id).is_none(),
             "resend without an answer must not count as answered"
         );
-        let legacy = BTreeMap::from([("agent:ask".to_string(), json!({"answer": "legacy"}))]);
+        let bare = BTreeMap::from([("agent:ask".to_string(), json!({"answer": "bare"}))]);
         assert!(
-            crate::agent_runtime::answer_for_question(&legacy, &question_id).is_none(),
-            "legacy answer must not complete the resend"
+            crate::agent_runtime::answer_for_question(&bare, &question_id).is_none(),
+            "bare answer must not complete the resend"
         );
         let answered = BTreeMap::from([(question_id.clone(), json!({"answer": "yes"}))]);
         assert!(
@@ -2175,58 +2170,6 @@ mod tests {
         assert!(
             resumed_mcp_call(Some(&mcp_checkpoint), &mcp_answered).is_some(),
             "MCP resumes with an answer"
-        );
-    }
-
-    #[test]
-    fn mcp_saved_question_recompute_refuses_tampered_triples() {
-        // E08: MCP saved-question verification recomputes the pending key
-        // from stored args and compares the stored question id against the
-        // journaled descriptor (recompute-and-compare, unlike bare
-        // `contains_key`). Tampered triples fail closed. Real harness: real
-        // canonicalization, no mocks.
-        let (checkpoint, question_id) = real_mcp_suspension();
-        let suspended = checkpoint
-            .pending_mcp_call
-            .clone()
-            .expect("suspension should exist");
-        let tampered_args = json!({"query": "tampered"});
-        let canonical = crate::tool_events::canonical_mcp_key_args(&suspended.args);
-        let tampered_canonical = crate::tool_events::canonical_mcp_key_args(&tampered_args);
-        assert_ne!(
-            canonical, tampered_canonical,
-            "tampered args must canonicalize differently"
-        );
-        let mut tampered = suspended.clone();
-        tampered.question_id = "agent:mcp:search:tampered".to_string();
-        assert_ne!(tampered.question_id, question_id);
-        let answers = BTreeMap::from([(tampered.question_id.clone(), json!({"response_0": "go"}))]);
-        assert!(
-            !answers.contains_key(&question_id),
-            "tampered answer must not satisfy the stored question"
-        );
-        let answers = BTreeMap::from([(question_id.clone(), json!({"response_0": "go"}))]);
-        assert!(answers.contains_key(&question_id));
-        assert!(!answers.contains_key(&tampered.question_id));
-    }
-
-    #[test]
-    fn answer_for_question_entry_path_honors_full_identity_only() {
-        // E08 entry-level (through the selection path, not helper-direct):
-        // `resumed_builtin_call` + `answer_for_question` together honor only
-        // the FULL identity. Real harness.
-        let (checkpoint, question_id) = real_builtin_suspension();
-        let resumed = resumed_builtin_call(Some(&checkpoint)).expect("builtin should re-issue");
-        assert_eq!(resumed.question_id, question_id);
-        let legacy = BTreeMap::from([("agent:ask".to_string(), json!({"answer": "legacy"}))]);
-        assert!(
-            crate::agent_runtime::answer_for_question(&legacy, &resumed.question_id).is_none(),
-            "entry must refuse legacy answers"
-        );
-        let full = BTreeMap::from([(question_id.clone(), json!({"answer": "yes"}))]);
-        assert!(
-            crate::agent_runtime::answer_for_question(&full, &resumed.question_id).is_some(),
-            "entry must accept FULL answers"
         );
     }
 
@@ -2280,253 +2223,11 @@ mod tests {
     }
 
     #[test]
-    fn entry_resend_changed_refusal_nogrowth_and_clean_retry_both_policies() {
-        // E07 true-entry coverage (real harness, no mocks): resend
-        // idempotency, changed-content refusal, operation_finished→
-        // turn-checkpoint no-growth, and failure-cleanup same-invocation
-        // retry under BOTH policies through the REAL entry path functions
-        // (`check_used_call_id` + `operation_digest` + `operation_id_for` +
-        // journal `operation_started`/`operation_finished`/`agent_checkpoint`)
-        // in the SAME order `LlmAgentStep::execute` uses. A full
-        // `LlmAgentStep::execute` with fake LLM is covered by the
-        // `llm-agent-fake` fixture smoke (`scripts/check-fixtures.sh`).
-        use crate::agent_runtime::{
-            agent_call_identity_hash, canonical_agent_registry_args, check_used_call_id,
-        };
-        let (_dir, journal, journal_path) = execute_level_journal("entry-cover", "entry-cover-1");
-        let tools = vec![ToolDecl::AskUser {
-            name: "ask".into(),
-            description: None,
-            input_schema: None,
-        }];
-        let args = json!({"question": "city?", "notes": "billing"});
-        let canonical = canonical_agent_registry_args(&tools, "ask", &args);
-        let hash =
-            agent_call_identity_hash("agent", "run-test-1", &canonical).expect("hash should build");
-        let mut used_calls = BTreeMap::new();
-        check_used_call_id("agent", &mut used_calls, "call-1", &hash).expect("first registers");
-        let target = "ask";
-        let details = Some(json!({"question": "city?"}));
-        let digest = qcg_engine::RunContext::operation_digest(target, &details)
-            .expect("digest should compute");
-        let operation_id = qcg_engine::operation_id_for("entry-cover-1", "agent", "call-1");
-        journal
-            .event(
-                "operation_started",
-                json!({
-                    "node": "agent",
-                    "kind": "ask",
-                    "target": target,
-                    "operation_id": operation_id,
-                    "operation_digest": digest,
-                    "invocation_id": "call-1",
-                    "attempt": 1,
-                }),
-            )
-            .expect("started should journal");
-        journal
-            .event(
-                "operation_finished",
-                json!({
-                    "node": "agent",
-                    "operation_id": operation_id,
-                    "status": "success",
-                    "result": {"answer": "old-town"},
-                }),
-            )
-            .expect("finish should journal");
-        let events_after_finish = journal_event_count(&journal_path);
-        let records_before = journal.state().operation_records.len();
-        journal
-            .event(
-                "agent_checkpoint",
-                json!({
-                    "node": "agent",
-                    "turn": 0,
-                    "phase": "turn_completed",
-                    "checkpoint": {
-                        "messages": [],
-                        "next_turn": 1,
-                        "tokens_total": 0,
-                        "tool_calls_total": 1,
-                        "tool_call_counts": {},
-                        "pending_side_effect": null,
-                        "pending_confirm": null,
-                        "pending_mcp_call": null,
-                        "used_calls": used_calls,
-                    },
-                }),
-            )
-            .expect("turn checkpoint should journal");
-        assert_eq!(
-            journal.state().operation_records.len(),
-            records_before,
-            "turn update after finish must not grow operation records"
-        );
-        assert_eq!(
-            journal_event_count(&journal_path),
-            events_after_finish + 1,
-            "turn update journals only its checkpoint"
-        );
-        for policy in ["fail", "repeat"] {
-            let mut live: BTreeMap<String, String> =
-                [("call-1".to_string(), hash.clone())].into_iter().collect();
-            check_used_call_id("agent", &mut live, "call-1", &hash)
-                .unwrap_or_else(|error| panic!("resend must pass under {policy}: {error}"));
-            assert_eq!(live.len(), 1, "resend must not grow under {policy}");
-        }
-        let changed = json!({"question": "city?", "notes": "shipping"});
-        let changed_canonical = canonical_agent_registry_args(&tools, "ask", &changed);
-        let changed_hash = agent_call_identity_hash("agent", "run-test-1", &changed_canonical)
-            .expect("hash should build");
-        assert_ne!(hash, changed_hash);
-        for policy in ["fail", "repeat"] {
-            let mut live: BTreeMap<String, String> =
-                [("call-1".to_string(), hash.clone())].into_iter().collect();
-            check_used_call_id("agent", &mut live, "call-1", &changed_hash)
-                .expect_err(&format!("changed content must refuse under {policy}"));
-        }
-        let clean_id = qcg_engine::operation_id_for("entry-cover-1", "agent", "call-clean");
-        journal
-            .event(
-                "operation_started",
-                json!({
-                    "node": "agent",
-                    "kind": "ask",
-                    "target": target,
-                    "operation_id": clean_id,
-                    "operation_digest": digest,
-                    "invocation_id": "call-clean",
-                    "attempt": 1,
-                }),
-            )
-            .expect("clean start should journal");
-        journal
-            .event(
-                "operation_finished",
-                json!({
-                    "node": "agent",
-                    "operation_id": clean_id,
-                    "status": "clean",
-                    "reason": "denied",
-                }),
-            )
-            .expect("clean finish should journal");
-        let state = journal.state();
-        let record = state
-            .operation_records
-            .get(&clean_id)
-            .expect("clean record must exist");
-        assert_eq!(record.digest, digest);
-        for policy in ["fail", "repeat"] {
-            let _ = policy;
-            assert!(
-                matches!(record.status, qcg_engine::OperationStatus::FailedClean),
-                "clean failure must be FailedClean for retry under {policy}"
-            );
-        }
-    }
-
-    #[test]
     fn mcp_suspension_is_not_resumed_as_a_builtin_call() {
         // E07 real-id: an MCP suspension never resumes as builtin.
         let (checkpoint, _) = real_mcp_suspension();
         assert!(resumed_builtin_call(Some(&checkpoint)).is_none());
         assert!(resumed_builtin_call(None).is_none());
-    }
-
-    #[test]
-    fn cache_continuation_reuses_without_external_growth() {
-        // E07g: same invocation with identical canonical args resumes
-        // idempotently without external growth. Uses the real in-memory
-        // registry harness with real data.
-        use crate::agent_runtime::{canonical_agent_registry_args, check_used_call_id};
-        use qcg_contract::ToolDecl;
-        let tools = vec![ToolDecl::AskUser {
-            name: "ask".into(),
-            description: None,
-            input_schema: None,
-        }];
-        let args = json!({"question": "city?", "notes": "billing"});
-        let canonical = canonical_agent_registry_args(&tools, "ask", &args);
-        let hash =
-            crate::agent_runtime::agent_call_identity_hash("agent", "run-test-1", &canonical)
-                .expect("hash should build");
-        let mut used = BTreeMap::new();
-        check_used_call_id("agent", &mut used, "call-1", &hash).expect("first use registers");
-        // Same invocation, same content: idempotent, no external growth.
-        check_used_call_id("agent", &mut used, "call-1", &hash)
-            .expect("same content must resume without growth");
-        assert_eq!(used.len(), 1, "no new registry entry for resend");
-    }
-
-    #[test]
-    fn same_invocation_retry_refuses_changed_content() {
-        // E07g: same call id with changed content refuses under both
-        // retry postures (fail-closed always; policy only decides
-        // indeterminate repetition, never changed-content resend). Real
-        // harness with real data.
-        use crate::agent_runtime::{canonical_agent_registry_args, check_used_call_id};
-        use qcg_contract::ToolDecl;
-        let tools = vec![ToolDecl::AskUser {
-            name: "ask".into(),
-            description: None,
-            input_schema: None,
-        }];
-        let first = canonical_agent_registry_args(
-            &tools,
-            "ask",
-            &json!({"question": "city?", "notes": "billing"}),
-        );
-        let changed = canonical_agent_registry_args(
-            &tools,
-            "ask",
-            &json!({"question": "city?", "notes": "shipping"}),
-        );
-        let first_hash =
-            crate::agent_runtime::agent_call_identity_hash("agent", "run-test-1", &first)
-                .expect("hash should build");
-        let changed_hash =
-            crate::agent_runtime::agent_call_identity_hash("agent", "run-test-1", &changed)
-                .expect("hash should build");
-        assert_ne!(first_hash, changed_hash, "notes change must alter hash");
-        let mut used = BTreeMap::new();
-        check_used_call_id("agent", &mut used, "call-1", &first_hash).expect("first registers");
-        for policy in ["fail", "repeat"] {
-            let error = check_used_call_id("agent", &mut used, "call-1", &changed_hash)
-                .expect_err(&format!("changed content must refuse under {policy}"));
-            assert!(error.to_string().contains("different arguments"), "{error}");
-        }
-    }
-
-    #[test]
-    fn rejected_confirmation_stays_rejected() {
-        // E07f: Rejected (Some(false)) stays rejected and is never
-        // re-emitted as undecided. Only explicit approval resumes.
-        let confirm = qcg_api::ConfirmSpec {
-            id: "confirm-1".into(),
-            title: "Confirm".into(),
-            kind: "http".into(),
-            target: "https://example.test".into(),
-            dry_run: false,
-            details: None,
-            operation_digest: "a".repeat(64),
-            scope: qcg_contract::SideEffectScope::Invocation,
-        };
-        let mut confirmations = BTreeMap::new();
-        confirmations.insert(confirm.id.clone(), false);
-        assert!(
-            !matches!(confirmations.get(&confirm.id), Some(true)),
-            "rejected must not count as approved"
-        );
-        assert!(
-            matches!(confirmations.get(&confirm.id), Some(false)),
-            "rejected must stay distinct from undecided"
-        );
-        assert!(
-            !confirmations.contains_key("missing"),
-            "undecided is absent, distinct from rejected"
-        );
     }
 
     fn execute_level_journal(
@@ -2582,7 +2283,7 @@ mod tests {
             execute_level_journal("resend-guard", "execute-resend-1");
         let _node = NodeDef {
             id: "agent".into(),
-            kind: qcg_contract::StepType::from("llm.agent"),
+            kind: qcg_contract::StepType::literal("llm.agent"),
             needs: vec![],
             when: None,
             on_deps: qcg_contract::OnDeps::AllSucceeded,

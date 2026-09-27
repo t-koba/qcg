@@ -410,7 +410,7 @@ base_url = "https://example.invalid/v1"
         assert!(fixture.contract.manifest.llm.is_none());
         let mut registry = StepRegistry::new();
         crate::register_llm_steps(&mut registry, Arc::clone(&fixture.step.runtime));
-        assert!(registry.get(&StepType::from("llm.decide")).is_some());
+        assert!(registry.get(&StepType::literal("llm.decide")).is_some());
         registry
             .validate_contract(&fixture.contract)
             .expect("decision should validate");
@@ -671,7 +671,8 @@ system = "Chat only"
     fn schema_and_question_validation_accept_only_primitive_question_shapes() {
         let fixture = Fixture::new("");
         let schema = fixture.step.params_schema().unwrap();
-        let validator = jsonschema::validator_for(&schema).expect("decision schema should compile");
+        let validator =
+            qcg_policy::compile_bounded_validator(&schema).expect("decision schema should compile");
         for question in [
             json!({"type": "noul", "instructions": "Accept?"}),
             json!({"type": "noul", "instructions": {}, "criteria": {"true": "Yes", "false": "No"}}),

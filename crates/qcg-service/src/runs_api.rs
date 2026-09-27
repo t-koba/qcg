@@ -7,14 +7,15 @@
 //! queue cache to `queue_cache.rs` with no behavior change.
 use crate::artifacts::{
     api_bad_request, api_internal, api_not_found, check_verified_artifact_hashes,
-    collect_verified_artifacts,
+    collect_verified_artifacts, is_safe_run_id,
 };
 use crate::lifecycle::SpawnRun;
-use crate::run_dirs::{prepare_api_run_directory, prepare_checkpoint_fork, write_run_event};
+use crate::run_dirs::{
+    is_regular_directory, prepare_api_run_directory, prepare_checkpoint_fork, write_run_event,
+};
 use crate::summaries::{
-    fold_run_state, poll_journal_events, read_optional_output_manifest, read_run_contract_sha256,
-    read_run_events, read_run_generator_path, run_meta_dir, run_workspace_dir,
-    truncate_trailing_canceled_events,
+    fold_run_state, poll_journal_events, read_optional_output_manifest, read_run_events,
+    read_run_generator_path, run_meta_dir, run_workspace_dir, truncate_trailing_canceled_events,
 };
 use crate::types::{LocalQcgService, RunBundleParts, RunRecord, RunStoreMode};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -25,6 +26,7 @@ use qcg_api::{
 };
 use qcg_api::{RunEvent, RunEventData};
 use qcg_contract::{Contract, ContractError, validate_form_values};
+use qcg_engine::RunState;
 use qcg_engine::{JournalLimits, read_output_manifest, resolve_artifact_path};
 use qcg_types::{FailureCode, FailureDetail, OutputArtifact, OutputManifest};
 use serde_json::{Value, json};
@@ -153,8 +155,7 @@ fn seed_adopted_run_from_state(
             ),
         });
     }
-    let (recorded_priority, recorded_parent) =
-        crate::summaries::read_queued_identity_from_values(journal_values);
+    let (recorded_priority, recorded_parent) = (state.priority, state.parent_run_id.clone());
     if recorded_priority != expected.priority {
         let expected_priority = expected.priority;
         return Err(ApiError::Conflict {
@@ -237,9 +238,10 @@ fn seed_adopted_run_from_state(
             .cloned()
             .collect()
     };
-    let (admitted_answers, admitted_confirmations) =
-        crate::summaries::read_persisted_hitl_from_values(&admission_values)
-            .map_err(api_internal)?;
+    // Folded from the admission events alone: a retry is compared against what
+    // admission carried, not against answers accepted since.
+    let admitted = RunState::fold_values(&admission_values).map_err(api_internal)?;
+    let (admitted_answers, admitted_confirmations) = (admitted.answers, admitted.confirmations);
     if &admitted_answers != expected.answers {
         return Err(ApiError::Conflict {
             detail: format!(
@@ -260,9 +262,15 @@ fn seed_adopted_run_from_state(
     // The seed itself carries the full durable state, including answers
     // and confirmations accepted after admission, so the resumed engine
     // observes exactly what the API already acknowledged.
-    let (answers, confirmations) =
-        crate::summaries::read_persisted_hitl_from_values(journal_values).map_err(api_internal)?;
-    let queued_at = crate::summaries::read_last_queued_at_from_values(journal_values);
+    // The seed carries the folded HITL maps and queue instant, so no second
+    // scan of the same read is needed.
+    let answers = state.answers.clone();
+    let confirmations = state.confirmations.clone();
+    let queued_at = state
+        .queued_at
+        .as_deref()
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+        .map(|at| at.with_timezone(&chrono::Utc));
     Ok(Some(AdoptedRunSeed {
         answers,
         confirmations,
@@ -398,6 +406,16 @@ enum ProbeRejection {
 }
 
 impl LocalQcgService {
+    /// Fails write-path API calls during shutdown (E05).
+    pub(crate) fn ensure_running(&self) -> Result<(), ApiError> {
+        if self.is_shutting_down() {
+            return Err(ApiError::Unavailable {
+                detail: "server is shutting down".into(),
+            });
+        }
+        Ok(())
+    }
+
     /// Phase-2a admission probe shared by start and fork (E03). Decides
     /// shutdown, duplicate, and capacity under the run-map lock before the
     /// caller allocates a broadcast channel, a cancellation token, a task
@@ -440,11 +458,7 @@ impl LocalQcgService {
         // Re-check under the admission lock: a shutdown that started
         // between the probe and here must not register a record whose
         // spawn the shutdown guard will refuse (E05).
-        if self.is_shutting_down() {
-            return Err(ApiError::Unavailable {
-                detail: "server is shutting down".into(),
-            });
-        }
+        self.ensure_running()?;
         if runs.contains_key(&run_id) {
             return Ok(AdmissionVerdict::Converged);
         }
@@ -521,7 +535,10 @@ impl LocalQcgService {
     /// Reserves the run id for a start request before any side effect, so an
     /// idempotency claim can bind retries to one run directory.
     pub fn reserve_start_run_id(&self, generator_id: &str) -> Result<String, ApiError> {
-        if !crate::artifacts::is_safe_id(generator_id) {
+        // The reserved id becomes a run directory name, so a generator id that
+        // carries a separator (`nested/generator`) or `..` is refused here
+        // instead of producing a run id that escapes the runs directory.
+        if !is_safe_run_id(generator_id) {
             return Err(api_bad_request(format!(
                 "generator id `{generator_id}` is not allowed"
             )));
@@ -534,11 +551,19 @@ impl LocalQcgService {
         let source_dir = self.run_dir_for(source_id).await?;
         let generator_path = read_run_generator_path(&source_dir).map_err(api_internal)?;
         let contract = Contract::load(&generator_path).map_err(api_internal)?;
-        Ok(format!(
+        let reserved = format!(
             "{}-fork-{}",
             contract.manifest.generator.id,
             uuid::Uuid::now_v7()
-        ))
+        );
+        // The composed id names a run directory, so it is validated as one even
+        // though it is derived from an already-loaded contract.
+        if !is_safe_run_id(&reserved) {
+            return Err(api_bad_request(format!(
+                "fork run id `{reserved}` is not allowed"
+            )));
+        }
+        Ok(reserved)
     }
 
     pub async fn start_run(&self, req: StartRun) -> Result<String, ApiError> {
@@ -550,11 +575,7 @@ impl LocalQcgService {
         req: StartRun,
         reserved_run_id: Option<String>,
     ) -> Result<String, ApiError> {
-        if self.is_shutting_down() {
-            return Err(ApiError::Unavailable {
-                detail: "server is shutting down".into(),
-            });
-        }
+        self.ensure_running()?;
         let mut contract = self.load_generator(&req.generator_id)?;
         // Run metadata is metadata only: it never confers authorization and
         // is bounded so a request cannot grow journals without limit.
@@ -605,6 +626,9 @@ impl LocalQcgService {
         };
         let run_id = reserved_run_id
             .unwrap_or_else(|| format!("{}-{}", req.generator_id, uuid::Uuid::now_v7()));
+        if !is_safe_run_id(&run_id) {
+            return Err(api_bad_request(format!("run id `{run_id}` is not allowed")));
+        }
         let run_dir = self.inner.runs_dir.join(&run_id);
         // Only one admission may prepare, wipe, or adopt this run id at a
         // time; a concurrent caller fails closed and retries instead of
@@ -687,7 +711,7 @@ impl LocalQcgService {
                 }
                 // The adopted run already settled: converge onto its
                 // durable terminal state (E03).
-                None => return Ok(run_id),
+                None => return Ok(run_id.to_string()),
             }
         }
         // Phase 2a first: losers allocate no channel, no token, no task, and no record. The
@@ -836,7 +860,7 @@ impl LocalQcgService {
         // race is not worth the divergent path.
         match self
             .register_admission(
-                run_id.clone(),
+                run_id.to_string(),
                 staged,
                 created_fresh.then_some(run_dir.as_path()),
             )
@@ -901,7 +925,7 @@ impl LocalQcgService {
             .await;
         self.inner.queue_notify.notify_waiters();
         self.preempt_for_priority(priority).await;
-        Ok(run_id)
+        Ok(run_id.to_string())
     }
 
     pub async fn fork_run(&self, source_id: &str, request: ForkRun) -> Result<String, ApiError> {
@@ -914,11 +938,7 @@ impl LocalQcgService {
         request: ForkRun,
         reserved_run_id: Option<String>,
     ) -> Result<String, ApiError> {
-        if self.is_shutting_down() {
-            return Err(ApiError::Unavailable {
-                detail: "server is shutting down".into(),
-            });
-        }
+        self.ensure_running()?;
         if request.at_seq == 0 {
             return Err(ApiError::invalid_field(
                 "at_seq",
@@ -945,6 +965,9 @@ impl LocalQcgService {
                 uuid::Uuid::now_v7()
             )
         });
+        if !is_safe_run_id(&run_id) {
+            return Err(api_bad_request(format!("run id `{run_id}` is not allowed")));
+        }
         let run_dir = self.inner.runs_dir.join(&run_id);
         let _admission = crate::run_dirs::try_lock_run_admission(&run_dir)
             .map_err(api_internal)?
@@ -1086,7 +1109,7 @@ impl LocalQcgService {
                 }
                 // The adopted fork already settled: converge onto its
                 // durable terminal state (E03).
-                None => return Ok(run_id),
+                None => return Ok(run_id.to_string()),
             }
         }
         // Phase 2a first: losers allocate no channel, no token, no task, and no record. The
@@ -1235,7 +1258,7 @@ impl LocalQcgService {
         // re-verifies identity and returns without spawning (E03).
         match self
             .register_admission(
-                run_id.clone(),
+                run_id.to_string(),
                 staged,
                 (!adopted).then_some(run_dir.as_path()),
             )
@@ -1300,7 +1323,7 @@ impl LocalQcgService {
                 "t": "run_queued",
                 "ts": chrono::Utc::now().to_rfc3339(),
                 "seq": next_seq,
-                "run_id": &run_id,
+                "run_id": run_id.as_str(),
                 "trace_id": qcg_api::trace_id_for_run(&run_id),
                 "span_id": qcg_api::span_id_for_seq(next_seq),
                 "generator": format!("{}@{}", contract.manifest.generator.id, contract.manifest.generator.version),
@@ -1336,7 +1359,7 @@ impl LocalQcgService {
             .await;
         self.inner.queue_notify.notify_waiters();
         self.preempt_for_priority(fork_priority).await;
-        Ok(run_id)
+        Ok(run_id.to_string())
     }
 
     /// Delete a terminal run directory. Active runs are rejected so deletion
@@ -1347,11 +1370,7 @@ impl LocalQcgService {
         // Deletion during the shutdown drain could remove a directory that
         // shutdown settlement is still writing; refuse it like every other
         // mutating operation (E05).
-        if self.is_shutting_down() {
-            return Err(ApiError::Unavailable {
-                detail: "server is shutting down".into(),
-            });
-        }
+        self.ensure_running()?;
         let run_dir = self.run_dir_for(id).await?;
         // A peer may own execution while this process sees no local task:
         // verify the execution lease and pending cancel mailbox in addition
@@ -1382,11 +1401,7 @@ impl LocalQcgService {
         // Re-check under the execution lease: a shutdown that started after
         // the outer gate must not let the drain race a directory removal
         // (E05).
-        if self.is_shutting_down() {
-            return Err(ApiError::Unavailable {
-                detail: "server is shutting down".into(),
-            });
-        }
+        self.ensure_running()?;
         let terminal = match self.inner.runs.read().await.get(id) {
             Some(record) => {
                 // A still-running local task means the run is active even if
@@ -1443,8 +1458,7 @@ impl LocalQcgService {
                 artifacts.clone(),
             )
             .await?;
-        let inputs = crate::summaries::read_run_inputs_from_events(&run_dir, &journal_events)
-            .map_err(api_internal)?;
+        let inputs = crate::summaries::read_run_inputs(&run_dir).map_err(api_internal)?;
         let journal = run_meta_dir(&run_dir).join("journal.jsonl");
         let outputs = artifacts;
         // Runs without collected outputs (active or failed early) export
@@ -1527,7 +1541,11 @@ impl LocalQcgService {
             .unwrap_or(RunStatus::Queued);
         let contract_sha256 = match memory.as_ref() {
             Some(record) => Some(record.contract_sha256.clone()),
-            None => Some(read_run_contract_sha256(run_dir, journal_events).map_err(api_internal)?),
+            None => Some(
+                crate::summaries::run_identity_event(run_dir, journal_events)
+                    .map(|(_, started)| started.contract_sha256.clone())
+                    .map_err(api_internal)?,
+            ),
         };
         let memory_priority = memory.as_ref().map(|record| record.priority);
         let memory_parent = memory
@@ -1568,9 +1586,12 @@ impl LocalQcgService {
             // only a fallback when the journal holds no instant (the read
             // above already succeeded, so an unreadable journal cannot
             // occur here).
-            let displayed = crate::summaries::read_last_queued_at_from_values(journal_values)
-                .or_else(|| memory.as_ref().and_then(|record| record.queued_at))
-                .map(|at| at.to_rfc3339());
+            let displayed = disk_state.queued_at.clone().or_else(|| {
+                memory
+                    .as_ref()
+                    .and_then(|record| record.queued_at)
+                    .map(|at| at.to_rfc3339())
+            });
             let position = self
                 .queued_position_for_snapshot(&id, journal_values)
                 .await?;
@@ -1590,7 +1611,7 @@ impl LocalQcgService {
         // Priority and parent derive from the same single read above, so
         // disk-only snapshots never trigger another scan of the journal.
         let (journal_priority, journal_parent) =
-            crate::summaries::read_queued_identity_from_values(journal_values);
+            (disk_state.priority, disk_state.parent_run_id.clone());
         Ok(RunSnapshot {
             run_id: id,
             state,
@@ -1645,9 +1666,15 @@ impl LocalQcgService {
         // just queued ones: a Running record's stale disk journal still
         // shows `run_queued`, and counting it would duplicate the live run
         // as an extra queued rival and shift positions (E16).
-        let (target_priority, _) =
-            crate::summaries::read_queued_identity_from_values(journal_values);
-        let target_queued_at = crate::summaries::read_last_queued_at_from_values(journal_values);
+        let target = RunState::fold_values(journal_values).map_err(api_internal)?;
+        let (target_priority, target_queued_at) = (
+            target.priority,
+            target
+                .queued_at
+                .as_deref()
+                .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+                .map(|at| at.with_timezone(&chrono::Utc)),
+        );
         // The target may already be present in the memory set below; push
         // only when absent so followers are never shifted by a duplicate
         // entry (E12/E16). Positions stay exact for every run, not just the
@@ -1792,7 +1819,7 @@ impl LocalQcgService {
             let run_dir = Utf8PathBuf::from_path_buf(entry.path()).map_err(|path| {
                 ApiError::internal(format!("run path is not UTF-8: {}", path.display()))
             })?;
-            if !run_dir.is_dir() {
+            if !is_regular_directory(&run_dir).map_err(api_internal)? {
                 continue;
             }
             let journal_path = crate::summaries::run_meta_dir(&run_dir).join("journal.jsonl");
@@ -1841,9 +1868,13 @@ impl LocalQcgService {
             if last_started > last_queued {
                 continue;
             }
-            let (priority, _) = crate::summaries::read_queued_identity_from_values(&values);
-            let queued_at = crate::summaries::read_last_queued_at_from_values(&values);
-            entries.push((file_name, priority, queued_at));
+            let state = RunState::fold_values(&values).map_err(api_internal)?;
+            let queued_at = state
+                .queued_at
+                .as_deref()
+                .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+                .map(|at| at.with_timezone(&chrono::Utc));
+            entries.push((file_name, state.priority, queued_at));
         }
         if truncated {
             // Explicit truncated indicator for the graceful-degrade path
@@ -2014,7 +2045,7 @@ impl LocalQcgService {
         tokio::spawn(async move {
             let mut poll_stream = poll_journal_events(
                 run_dir,
-                run_id.clone(),
+                run_id.to_string(),
                 start_seq,
                 poll_interval_millis,
                 shutdown,
@@ -2379,11 +2410,7 @@ impl LocalQcgService {
         question_id: String,
         payload: AnswerPayload,
     ) -> Result<(), ApiError> {
-        if self.is_shutting_down() {
-            return Err(ApiError::Unavailable {
-                detail: "server is shutting down".into(),
-            });
-        }
+        self.ensure_running()?;
         let answer = json!(payload.values);
         // Memory fast paths first; durable acceptance is decided atomically
         // under the journal lock below, so racing peers serialize and exactly
@@ -2404,11 +2431,7 @@ impl LocalQcgService {
             // Re-check under the admission lock: a shutdown that started
             // between the outer check and this block must not accept an
             // answer it can no longer execute (E05).
-            if self.is_shutting_down() {
-                return Err(ApiError::Unavailable {
-                    detail: "server is shutting down".into(),
-                });
-            }
+            self.ensure_running()?;
             let record = runs
                 .get_mut(&id)
                 .ok_or_else(|| api_not_found(format!("run `{id}` was not found")))?;
@@ -2585,11 +2608,7 @@ impl LocalQcgService {
         confirmation_id: String,
         decision: ConfirmDecision,
     ) -> Result<(), ApiError> {
-        if self.is_shutting_down() {
-            return Err(ApiError::Unavailable {
-                detail: "server is shutting down".into(),
-            });
-        }
+        self.ensure_running()?;
         let approved = decision.decision == ConfirmationDecision::Approve;
         // Validate, persist, and mutate under one write lock so concurrent
         // decisions cannot both journal conflicting values with last-wins.
@@ -2610,11 +2629,7 @@ impl LocalQcgService {
             // Re-check under the admission lock: a shutdown that started
             // between the outer check and this block must not accept a
             // decision it can no longer execute (E05).
-            if self.is_shutting_down() {
-                return Err(ApiError::Unavailable {
-                    detail: "server is shutting down".into(),
-                });
-            }
+            self.ensure_running()?;
             let record = runs
                 .get_mut(&id)
                 .ok_or_else(|| api_not_found(format!("run `{id}` was not found")))?;
@@ -2913,11 +2928,7 @@ impl LocalQcgService {
         {
             return Ok(());
         }
-        if self.is_shutting_down() {
-            return Err(ApiError::Unavailable {
-                detail: "server is shutting down".into(),
-            });
-        }
+        self.ensure_running()?;
         // Durable cross-process cancel mailbox first so a peer owner observes
         // the request even when this process tracks no local task (A02).
         // Control-file creation is fail-closed: I/O errors are reported
@@ -3256,6 +3267,7 @@ impl LocalQcgService {
                 }
             }
         }
+        truncate_trailing_canceled_events(&staged.run_dir).map_err(api_internal)?;
         // Preemption requeues preserve the journaled effective policy:
         // re-resolving under a changed ceiling would diverge admission from
         // execution (E04). An unreadable journal fails the requeue instead
@@ -3307,11 +3319,6 @@ impl LocalQcgService {
             let Some(record) = runs.get(id) else {
                 return Ok(());
             };
-            // The preempted engine task records its own cancellation before
-            // exiting. That bookkeeping event would read as terminal on
-            // resume, so drop it: the requeue above is the true outcome and
-            // no terminal settlement ran.
-            truncate_trailing_canceled_events(&record.run_dir).map_err(api_internal)?;
             self.clone()
                 .spawn_engine_run(SpawnRun {
                     run_id: id.to_string(),
@@ -3730,9 +3737,22 @@ impl LocalQcgService {
             });
         }
         let audit_path = path.with_file_name("audit.jsonl");
+        let audit_limit =
+            qcg_policy::AuditLimits::from_config(&contract.manifest.audit).max_total_bytes;
         let (audit, audit_len) = match tokio::fs::File::open(&audit_path).await {
             Ok(file) => {
                 let len = file.metadata().await.map_err(api_internal)?.len();
+                // Same rule as the durable stream: an oversized observation
+                // stream is refused before delivery, never truncated into a
+                // silently incomplete merged view.
+                if let Some(limit) = audit_limit
+                    && len > limit as u64
+                {
+                    return Err(ApiError::TooLarge {
+                        actual_bytes: len as usize,
+                        limit_bytes: limit,
+                    });
+                }
                 (Some(file), len)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, 0),
@@ -3744,6 +3764,7 @@ impl LocalQcgService {
             limit: limits.max_total_bytes,
             audit,
             audit_len,
+            audit_limit,
         })
     }
 }

@@ -6,45 +6,65 @@ export type NodeProgress = {
   detail: string;
 };
 
-export function collectNodeProgress(events: RunEvent[]): NodeProgress[] {
-  const nodes = new Map<string, NodeProgress>();
-  const order: string[] = [];
+/**
+ * Node-status aggregate over the run event stream.
+ *
+ * Progress is state, not a view of the retained event window: the store keeps
+ * only a bounded tail of events for display, so folding them on every render
+ * would lose the status of nodes whose events scrolled out. The aggregate is
+ * therefore updated one event at a time and never derived from the window.
+ */
+export type NodeProgressAggregate = {
+  nodes: Map<string, NodeProgress>;
+  order: string[];
+};
+
+export function emptyNodeProgress(): NodeProgressAggregate {
+  return { nodes: new Map(), order: [] };
+}
+
+export function applyNodeProgress(
+  aggregate: NodeProgressAggregate,
+  event: RunEvent,
+): NodeProgressAggregate {
   const ensure = (id: unknown) => {
     if (typeof id !== "string" || id.length === 0) return undefined;
-    if (!nodes.has(id)) {
-      nodes.set(id, { id, status: "pending", detail: "pending" });
-      order.push(id);
+    if (!aggregate.nodes.has(id)) {
+      aggregate.nodes.set(id, { id, status: "pending", detail: "pending" });
+      aggregate.order.push(id);
     }
-    return nodes.get(id);
+    return aggregate.nodes.get(id);
   };
 
-  for (const event of events) {
-    const data = record(event.data);
-    if (event.kind === "graph_resolved" && Array.isArray(data.nodes)) {
-      for (const id of data.nodes) ensure(id);
-      continue;
-    }
-    const node = ensure(event.path || data.node);
-    if (!node) continue;
-    if (event.kind === "step_started") {
-      node.status = "running";
-      node.detail = string(data.type, "running");
-    } else if (event.kind === "step_replayed") {
-      node.status = "succeeded";
-      node.detail = "replayed";
-    } else if (event.kind === "step_skipped") {
-      node.status = "skipped";
-      node.detail = string(data.reason, "skipped");
-    } else if (event.kind === "run_waiting" || event.kind === "confirm_request") {
-      node.status = "waiting";
-      node.detail = event.kind;
-    } else if (event.kind === "step_finished") {
-      const status = string(data.status, "finished");
-      node.status = statusClass(status);
-      node.detail = status;
-    }
+  const data = record(event.data);
+  if (event.kind === "graph_resolved" && Array.isArray(data.nodes)) {
+    for (const id of data.nodes) ensure(id);
+    return aggregate;
   }
-  return order.flatMap((id) => nodes.get(id) || []);
+  const node = ensure(event.path || data.node);
+  if (!node) return aggregate;
+  if (event.kind === "step_started") {
+    node.status = "running";
+    node.detail = string(data.type, "running");
+  } else if (event.kind === "step_replayed") {
+    node.status = "succeeded";
+    node.detail = "replayed";
+  } else if (event.kind === "step_skipped") {
+    node.status = "skipped";
+    node.detail = string(data.reason, "skipped");
+  } else if (event.kind === "run_waiting" || event.kind === "confirm_request") {
+    node.status = "waiting";
+    node.detail = event.kind;
+  } else if (event.kind === "step_finished") {
+    const status = string(data.status, "finished");
+    node.status = statusClass(status);
+    node.detail = status;
+  }
+  return aggregate;
+}
+
+export function materialize(aggregate: NodeProgressAggregate): NodeProgress[] {
+  return aggregate.order.flatMap((id) => aggregate.nodes.get(id) || []);
 }
 
 function statusClass(status: string): NodeProgress["status"] {

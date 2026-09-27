@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use qcg_contract::{NodeDef, ToolBackendKind, ToolDef, ToolFallback, ToolNetwork, ToolWorkspace};
+use qcg_contract::{NodeDef, ToolBackendKind, ToolDef, ToolFallback, ToolWorkspace};
 use qcg_engine::{StepContext, StepError, StepExecutor, StepOutcome, StepTraits};
 use qcg_policy::{params_schema, string_schema};
 use qcg_types::{Finding, Severity};
@@ -120,12 +120,6 @@ impl StepExecutor for CheckToolStep {
         } else {
             (input.clone(), SnapshotCleanup { path: None })
         };
-        if !matches!(tool.network, ToolNetwork::None) {
-            return Err(StepError::failed(
-                &node.id,
-                "check.tool currently supports network = \"none\" only for local backends",
-            ));
-        }
         let order = tool_backend_order(tool);
         let mut unavailable = Vec::new();
         for (index, backend) in order.iter().enumerate() {

@@ -14,7 +14,6 @@ base64.workspace = true
 camino.workspace = true
 chrono.workspace = true
 hex.workspace = true
-jsonschema.workspace = true
 qcg-policy = { path = "../qcg-policy" }
 qcg-api = { path = "../qcg-api" }
 qcg-container = { path = "../qcg-container" }

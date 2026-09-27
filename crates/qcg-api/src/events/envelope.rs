@@ -5,7 +5,7 @@ use serde::{Deserialize, Deserializer, de::Error as DeError};
 use serde_json::Value;
 
 use super::completion::{LaggedAction, LaggedEventData};
-use super::core::RunEventData;
+use super::core::{RunEventData, TERMINAL_EVENT_KINDS, run_event_data_schemas};
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct RunEvent {
@@ -22,15 +22,60 @@ pub struct RunEvent {
     pub data: RunEventData,
 }
 
-/// Terminal run-event kinds shared by the service live tail, the SSE
-/// wrapper, and the shared poller, so the three layers can never disagree
-/// on what ends a stream (E12).
-pub const TERMINAL_EVENT_KINDS: [&str; 4] = [
-    "run_finished",
-    "run_error",
-    "run_canceled",
-    "run_interrupted",
+/// Journal record kinds that are part of the run-event wire vocabulary without
+/// a public payload schema: engine bookkeeping, HITL markers, operation
+/// records, the fork marker, and the observation-stream degradation marker.
+///
+/// They live next to the public registry because the events endpoint streams
+/// them to clients, so this crate owns the run-event vocabulary and both the
+/// engine fold gate and the OpenAPI document read these lists.
+pub const INTERNAL_RUN_EVENT_KINDS: &[&str] = &[
+    "audit_degraded",
+    "budget_charged",
+    "elapsed_exceeded",
+    "foreach_sibling_ignored",
+    "hook_failed",
+    "hook_replayed",
+    "hook_skipped",
+    "mcp_continuation_consumed",
+    "mcp_continuation_resumed",
+    "mcp_input_pending",
+    "operation_finished",
+    "operation_repeated",
+    "operation_started",
+    "run_forked",
+    "state_patched",
+    "step_interrupted",
+    "step_timeout",
+    "user_answered",
+    "user_cancel_requested",
+    "user_confirmed",
 ];
+
+/// Kinds the events endpoint synthesizes for the transport itself rather than
+/// from a journal record. They carry an opaque payload, and
+/// [`STREAM_ERROR_KIND`] ends the stream as a failure close rather than a
+/// normal outcome.
+pub const TRANSPORT_RUN_EVENT_KINDS: &[&str] = &["shutdown", STREAM_ERROR_KIND];
+
+/// Failure-close marker the events endpoint synthesizes.
+pub const STREAM_ERROR_KIND: &str = "stream_error";
+
+/// Shutdown marker the events endpoint synthesizes while the server drains.
+pub const SHUTDOWN_KIND: &str = "shutdown";
+
+/// Every kind the run-event stream can deliver: the public registry, the
+/// internal journal records, and the transport markers.
+pub fn all_run_event_kinds() -> Vec<&'static str> {
+    let mut kinds: Vec<&'static str> = run_event_data_schemas()
+        .into_iter()
+        .map(|(kind, _)| kind)
+        .collect();
+    kinds.extend_from_slice(INTERNAL_RUN_EVENT_KINDS);
+    kinds.extend_from_slice(TRANSPORT_RUN_EVENT_KINDS);
+    kinds.sort_unstable();
+    kinds
+}
 
 /// Reports whether a run-event kind ends its stream.
 pub fn is_terminal_event_kind(kind: &str) -> bool {

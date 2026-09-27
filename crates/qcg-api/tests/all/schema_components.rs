@@ -51,8 +51,122 @@ fn every_route_documents_exact_declared_errors() {
             .filter(|status| *status >= 400)
             .collect::<Vec<_>>();
         actual.sort_unstable();
-        assert_eq!(actual, route.errors, "{} {}", route.method, route.path);
+        // The handler's own failures plus the statuses every route inherits
+        // from the bearer-auth middleware and the rate limiter, taken from the
+        // same function the document is generated from.
+        let mut expected = route.errors.to_vec();
+        expected.extend(qcg_api::middleware_error_statuses(route.path));
+        expected.sort_unstable();
+        assert_eq!(actual, expected, "{} {}", route.method, route.path);
     }
+}
+
+#[test]
+fn middleware_failures_are_documented_once_and_referenced() {
+    // The server answers 401 and 429 in front of every route, so the document
+    // must say so; each response body is defined once under `components` and
+    // referenced per route, and the 429 exemption matches the server.
+    let document = qcg_api::openapi_document("test");
+    let shared = &document["components"]["responses"];
+    assert!(shared["Unauthorized"]["headers"]["WWW-Authenticate"].is_object());
+    assert!(shared["TooManyRequests"]["headers"]["Retry-After"].is_object());
+    for (path, item) in document["paths"].as_object().expect("paths") {
+        for (method, operation) in item.as_object().expect("path item") {
+            if !operation.is_object() {
+                continue;
+            }
+            let responses = &operation["responses"];
+            let reference = |status: &str, name: &str| {
+                responses[status]["$ref"] == Value::String(format!("#/components/responses/{name}"))
+            };
+            assert!(
+                reference("401", "Unauthorized"),
+                "{method} {path} must reference Unauthorized"
+            );
+            assert_eq!(
+                responses.get("429").is_some(),
+                path != qcg_api::RATE_LIMIT_EXEMPT_PATH,
+                "{method} {path} rate limiting must match the server exemption"
+            );
+            if path != qcg_api::RATE_LIMIT_EXEMPT_PATH {
+                assert!(
+                    reference("429", "TooManyRequests"),
+                    "{method} {path} must reference TooManyRequests"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn run_event_kind_is_published_as_the_full_stream_vocabulary() {
+    // A client narrows an event by its kind, so the document must list every
+    // kind the events endpoint can deliver: the public registry, the internal
+    // journal records, and the transport markers.
+    let document = qcg_api::openapi_document("test");
+    let kind = &document["components"]["schemas"]["RunEvent"]["properties"]["kind"];
+    let published: Vec<&str> = kind["enum"]
+        .as_array()
+        .expect("RunEvent.kind must be an enum")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    let expected = qcg_api::all_run_event_kinds();
+    assert_eq!(
+        published.len(),
+        expected.len(),
+        "every kind must be published"
+    );
+    for name in &expected {
+        assert!(
+            published.contains(name),
+            "`{name}` reaches clients but is missing from the document"
+        );
+    }
+    // The vocabulary is owned here, so the engine fold gate and the document
+    // cannot drift, and a transport marker is not a journal record.
+    assert!(qcg_api::INTERNAL_RUN_EVENT_KINDS.contains(&"step_interrupted"));
+    assert!(!qcg_api::is_known_run_event_kind("step_interrupted"));
+    assert!(qcg_api::TRANSPORT_RUN_EVENT_KINDS.contains(&qcg_api::STREAM_ERROR_KIND));
+    assert!(!qcg_api::INTERNAL_RUN_EVENT_KINDS.contains(&qcg_api::STREAM_ERROR_KIND));
+}
+
+#[test]
+fn request_body_defaults_stay_optional_for_generated_clients() {
+    // A generator infers "required" from a `default` annotation, which would
+    // force every SDK caller to send `answers`, `priority`, and the rest. The
+    // document therefore carries `required` as the only source of requiredness
+    // for request bodies, while response schemas keep their defaults.
+    let components = qcg_api::openapi_components();
+    for route in qcg_api::API_ROUTES {
+        let Some(name) = route.request_schema else {
+            continue;
+        };
+        let schema = &components["schemas"][name];
+        let required = schema["required"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for (property, definition) in schema["properties"].as_object().expect("properties") {
+            assert!(
+                required.iter().any(|entry| entry == property)
+                    || definition.get("default").is_none(),
+                "request schema `{name}` must not mark optional property `{property}` required through a default"
+            );
+        }
+    }
+    assert!(
+        components["schemas"]["RunSnapshot"]["properties"]["queue_position"]
+            .get("default")
+            .is_some(),
+        "response schemas must keep their defaults"
+    );
 }
 
 #[test]

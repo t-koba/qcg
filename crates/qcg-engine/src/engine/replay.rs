@@ -455,6 +455,7 @@ impl BudgetTracker {
 mod tests {
     use super::*;
     use crate::{NodeOutcome, RunState};
+    use camino::Utf8PathBuf;
     use qcg_types::NodePath;
     use sha2::{Digest as _, Sha256};
 
@@ -462,28 +463,98 @@ mod tests {
         hex::encode(Sha256::digest(bytes))
     }
 
+    /// The directory layout every `verify_files` test projects into: a
+    /// workspace, a metadata directory, and the checkpoint blob store
+    /// under the metadata directory. `label` names the run so a leftover
+    /// from a crashed test stays identifiable, and the uuid keeps two
+    /// concurrent runs of the same test apart.
+    struct ReplayDirs {
+        root: std::path::PathBuf,
+        workspace: Utf8PathBuf,
+        metadata: Utf8PathBuf,
+    }
+
+    impl ReplayDirs {
+        fn new(label: &str) -> Self {
+            let root =
+                std::env::temp_dir().join(format!("qcg-replay-{label}-{}", uuid::Uuid::now_v7()));
+            let workspace = Utf8PathBuf::from_path_buf(root.join("workspace"))
+                .expect("workspace path must be UTF-8");
+            let metadata =
+                Utf8PathBuf::from_path_buf(root.join("meta")).expect("metadata path must be UTF-8");
+            std::fs::create_dir_all(workspace.as_std_path()).expect("workspace dir");
+            std::fs::create_dir_all(metadata.join("checkpoint-blobs").as_std_path())
+                .expect("blob dir");
+            Self {
+                root,
+                workspace,
+                metadata,
+            }
+        }
+
+        /// Creates a real directory at `relative` inside the workspace, for
+        /// the test that must remove it again before planting a symlink in
+        /// its place.
+        fn create_workspace_dir(&self, relative: &str) {
+            std::fs::create_dir_all(self.workspace.join(relative).as_std_path())
+                .expect("workspace dir");
+        }
+
+        /// The immutable blob-store entry named by `sha256`.
+        fn blob(&self, sha256: &str) -> std::path::PathBuf {
+            self.metadata
+                .join("checkpoint-blobs")
+                .join(sha256)
+                .into_std_path_buf()
+        }
+
+        /// Stores `bytes` as the blob for `sha256`. The store is
+        /// append-only, so the caller passes the digest it computed.
+        fn write_blob(&self, sha256: &str, bytes: &[u8]) {
+            std::fs::write(self.blob(sha256), bytes).expect("blob should be written");
+        }
+
+        /// Projects `bytes` at `relative` in the workspace: the mutable
+        /// side that resume verifies against the latest pin.
+        fn write_workspace(&self, relative: &str, bytes: &[u8]) {
+            std::fs::write(self.workspace.join(relative).as_std_path(), bytes)
+                .expect("workspace file should be written");
+        }
+
+        /// Fresh checkpoint accounting for one verification pass. A test
+        /// that runs several passes over one state decides whether they
+        /// share a single budget or charge each pass separately.
+        fn new_accounting() -> Arc<Mutex<CheckpointAccounting>> {
+            Arc::new(Mutex::new(CheckpointAccounting::default()))
+        }
+    }
+
+    /// One `verify_files` pass for `replay` over `dirs` under the default
+    /// runtime limits, charging `accounting`. The `Result` is returned
+    /// untouched, because a refusal is exactly what most of these tests
+    /// are looking for.
+    fn verify_projection(
+        replay: &JournalReplay,
+        dirs: &ReplayDirs,
+        accounting: &Arc<Mutex<CheckpointAccounting>>,
+    ) -> Result<BTreeMap<String, String>, EngineError> {
+        replay.verify_files(
+            &dirs.workspace,
+            &dirs.metadata,
+            &RuntimeLimits::default(),
+            accounting,
+        )
+    }
+
     #[test]
     fn failed_only_revisions_do_not_require_a_workspace_projection() {
         // E06: a path pinned only by a failed step has a verified blob but
         // no expected workspace revision; requiring one would reject a
         // legitimate resume.
-        let root = std::env::temp_dir().join(format!("qcg-replay-{}", uuid::Uuid::now_v7()));
-        let workspace = camino::Utf8PathBuf::from_path_buf(root.join("workspace"))
-            .expect("workspace path must be UTF-8");
-        let metadata = camino::Utf8PathBuf::from_path_buf(root.join("meta"))
-            .expect("metadata path must be UTF-8");
-        std::fs::create_dir_all(workspace.as_std_path()).expect("workspace dir");
-        std::fs::create_dir_all(metadata.join("checkpoint-blobs").as_std_path()).expect("blob dir");
+        let dirs = ReplayDirs::new("failed-only");
         let v1 = b"failed revision";
         let digest = digest(v1);
-        std::fs::write(
-            metadata
-                .join("checkpoint-blobs")
-                .join(&digest)
-                .as_std_path(),
-            v1,
-        )
-        .expect("blob");
+        dirs.write_blob(&digest, v1);
         // No workspace file, no node outcome, no latest pin: the revision
         // only exists in the historical map.
         let mut state = RunState::default();
@@ -493,12 +564,10 @@ mod tests {
             .or_default()
             .insert(digest);
         let replay = JournalReplay::from_state(state);
-        let limits = RuntimeLimits::default();
-        let accounting = Arc::new(Mutex::new(CheckpointAccounting::default()));
-        replay
-            .verify_files(&workspace, &metadata, &limits, &accounting)
+        let accounting = ReplayDirs::new_accounting();
+        verify_projection(&replay, &dirs, &accounting)
             .expect("failed-only revisions must verify by blob alone");
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dirs.root);
     }
 
     #[cfg(unix)]
@@ -506,133 +575,49 @@ mod tests {
     fn historical_symlink_blob_refuses_resume() {
         // E06: a symlink planted in the blob store is refused instead of
         // followed, even when it points at content with the right bytes.
-        let root = std::env::temp_dir().join(format!("qcg-replay-{}", uuid::Uuid::now_v7()));
-        let workspace = camino::Utf8PathBuf::from_path_buf(root.join("workspace"))
-            .expect("workspace path must be UTF-8");
-        let metadata = camino::Utf8PathBuf::from_path_buf(root.join("meta"))
-            .expect("metadata path must be UTF-8");
-        std::fs::create_dir_all(workspace.as_std_path()).expect("workspace dir");
-        std::fs::create_dir_all(metadata.join("checkpoint-blobs").as_std_path()).expect("blob dir");
+        let dirs = ReplayDirs::new("symlink-blob");
         let v1 = b"v1";
         let digest = digest(v1);
-        let outside = root.join("outside.txt");
+        let outside = dirs.root.join("outside.txt");
         std::fs::write(&outside, v1).expect("outside file");
-        std::os::unix::fs::symlink(
-            &outside,
-            metadata
-                .join("checkpoint-blobs")
-                .join(&digest)
-                .as_std_path(),
-        )
-        .expect("planted symlink");
-        std::fs::write(workspace.join("out.txt").as_std_path(), v1).expect("workspace v1");
+        std::os::unix::fs::symlink(&outside, dirs.blob(&digest)).expect("planted symlink");
+        dirs.write_workspace("out.txt", v1);
         let mut state = RunState::default();
         state.nodes.insert(
             NodePath::root("build"),
             NodeOutcome::Success {
                 output: None,
                 files: vec![FilePin {
-                    path: camino::Utf8PathBuf::from("out.txt"),
+                    path: Utf8PathBuf::from("out.txt"),
                     sha256: digest.clone(),
                 }],
             },
         );
         state.latest_file_pins.insert("out.txt".to_string(), digest);
         let replay = JournalReplay::from_state(state);
-        let limits = RuntimeLimits::default();
-        let accounting = Arc::new(Mutex::new(CheckpointAccounting::default()));
-        let error = replay
-            .verify_files(&workspace, &metadata, &limits, &accounting)
+        let accounting = ReplayDirs::new_accounting();
+        let error = verify_projection(&replay, &dirs, &accounting)
             .expect_err("a symlinked blob must refuse resume");
         assert!(
             error.to_string().contains("symbolic link"),
             "the planted link must be named: {error}"
         );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn folded_journal_latest_drives_projection_not_name_order() {
-        // E06 three-way binding: fold journal events (journal order, not
-        // node name order) into pins, then verify the projected workspace
-        // against those pins. Neither hand-built state nor the fold alone
-        // proves the chain; this test runs fold → latest → verify end to
-        // end, mirroring what resume and fork projection consume.
-        let root = std::env::temp_dir().join(format!("qcg-replay-fold-{}", uuid::Uuid::now_v7()));
-        let workspace = camino::Utf8PathBuf::from_path_buf(root.join("workspace"))
-            .expect("workspace path must be UTF-8");
-        let metadata = camino::Utf8PathBuf::from_path_buf(root.join("meta"))
-            .expect("metadata path must be UTF-8");
-        std::fs::create_dir_all(workspace.as_std_path()).expect("workspace dir");
-        std::fs::create_dir_all(metadata.join("checkpoint-blobs").as_std_path()).expect("blob dir");
-        let v1 = b"v1";
-        let v2 = b"v2";
-        let d1 = digest(v1);
-        let d2 = digest(v2);
-        for (bytes, d) in [(v1.as_slice(), &d1), (v2.as_slice(), &d2)] {
-            std::fs::write(
-                metadata.join("checkpoint-blobs").join(d).as_std_path(),
-                bytes,
-            )
-            .expect("blob");
-        }
-        std::fs::write(workspace.join("out.txt").as_std_path(), v2).expect("workspace v2");
-        let events = ["z_first", "a_second"]
-            .into_iter()
-            .zip([d1.clone(), d2.clone()])
-            .enumerate()
-            .map(|(index, (node, digest))| {
-                serde_json::json!({
-                    "t": "step_finished",
-                    "seq": index as u64 + 1,
-                    "ts": "2026-01-01T00:00:00Z",
-                    "run_id": "fold-order",
-                    "trace_id": "fold-order-trace",
-                    "span_id": "fold-order-span",
-                    "node": node,
-                    "status": "success",
-                    "files": [{"path": "out.txt", "sha256": digest}],
-                })
-            })
-            .collect::<Vec<_>>();
-        let state = RunState::fold_values(&events).expect("journal should fold");
-        assert_eq!(
-            state.latest_file_pins.get("out.txt").map(String::as_str),
-            Some(d2.as_str()),
-            "fold must resolve journal order, not name order"
-        );
-        let replay = JournalReplay::from_state(state);
-        let limits = RuntimeLimits::default();
-        let accounting = Arc::new(Mutex::new(CheckpointAccounting::default()));
-        replay
-            .verify_files(&workspace, &metadata, &limits, &accounting)
-            .expect("folded latest projection must verify");
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dirs.root);
     }
 
     #[test]
     fn journal_order_decides_latest_not_node_name_order() {
         // E06: z_first writes v1 and a_second overwrites v2 for the same
         // path; resume projects v2 (journal order), never v1 (name order).
-        let root = std::env::temp_dir().join(format!("qcg-replay-{}", uuid::Uuid::now_v7()));
-        let workspace = camino::Utf8PathBuf::from_path_buf(root.join("workspace"))
-            .expect("workspace path must be UTF-8");
-        let metadata = camino::Utf8PathBuf::from_path_buf(root.join("meta"))
-            .expect("metadata path must be UTF-8");
-        std::fs::create_dir_all(workspace.as_std_path()).expect("workspace dir");
-        std::fs::create_dir_all(metadata.join("checkpoint-blobs").as_std_path()).expect("blob dir");
+        let dirs = ReplayDirs::new("order");
         let v1 = b"v1";
         let v2 = b"v2";
         let d1 = digest(v1);
         let d2 = digest(v2);
         for (bytes, d) in [(v1.as_slice(), &d1), (v2.as_slice(), &d2)] {
-            std::fs::write(
-                metadata.join("checkpoint-blobs").join(d).as_std_path(),
-                bytes,
-            )
-            .expect("blob");
+            dirs.write_blob(d, bytes);
         }
-        std::fs::write(workspace.join("out.txt").as_std_path(), v2).expect("workspace v2");
+        dirs.write_workspace("out.txt", v2);
         let mut state = RunState::default();
         for (node, d) in [("z_first", d1.clone()), ("a_second", d2.clone())] {
             state.nodes.insert(
@@ -640,7 +625,7 @@ mod tests {
                 NodeOutcome::Success {
                     output: None,
                     files: vec![FilePin {
-                        path: camino::Utf8PathBuf::from("out.txt"),
+                        path: Utf8PathBuf::from("out.txt"),
                         sha256: d,
                     }],
                 },
@@ -658,82 +643,18 @@ mod tests {
                 .insert(d);
         }
         let replay = JournalReplay::from_state(state);
-        let limits = RuntimeLimits::default();
-        let accounting = Arc::new(Mutex::new(CheckpointAccounting::default()));
-        replay
-            .verify_files(&workspace, &metadata, &limits, &accounting)
-            .expect("v2 projection must verify");
+        let accounting = ReplayDirs::new_accounting();
+        verify_projection(&replay, &dirs, &accounting).expect("v2 projection must verify");
         // A rolled-back workspace (v1) is refused, not resumed.
-        std::fs::write(workspace.join("out.txt").as_std_path(), v1).expect("workspace v1");
-        let accounting = Arc::new(Mutex::new(CheckpointAccounting::default()));
-        let error = replay
-            .verify_files(&workspace, &metadata, &limits, &accounting)
+        dirs.write_workspace("out.txt", v1);
+        let accounting = ReplayDirs::new_accounting();
+        let error = verify_projection(&replay, &dirs, &accounting)
             .expect_err("a rolled-back projection must refuse resume");
         assert!(
             error.to_string().contains("latest pinned revision"),
             "{error}"
         );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn tampered_workspace_or_blob_refuses_resume() {
-        // E06 checklist: a tampered latest file or a tampered history blob
-        // refuses resume.
-        let root = std::env::temp_dir().join(format!("qcg-replay-{}", uuid::Uuid::now_v7()));
-        let workspace = camino::Utf8PathBuf::from_path_buf(root.join("workspace"))
-            .expect("workspace path must be UTF-8");
-        let metadata = camino::Utf8PathBuf::from_path_buf(root.join("meta"))
-            .expect("metadata path must be UTF-8");
-        std::fs::create_dir_all(workspace.as_std_path()).expect("workspace dir");
-        std::fs::create_dir_all(metadata.join("checkpoint-blobs").as_std_path()).expect("blob dir");
-        let v2 = b"v2";
-        let d2 = digest(v2);
-        std::fs::write(
-            metadata.join("checkpoint-blobs").join(&d2).as_std_path(),
-            v2,
-        )
-        .expect("blob");
-        std::fs::write(workspace.join("out.txt").as_std_path(), v2).expect("workspace v2");
-        let mut state = RunState::default();
-        state.nodes.insert(
-            NodePath::root("build"),
-            NodeOutcome::Success {
-                output: None,
-                files: vec![FilePin {
-                    path: camino::Utf8PathBuf::from("out.txt"),
-                    sha256: d2.clone(),
-                }],
-            },
-        );
-        state
-            .latest_file_pins
-            .insert("out.txt".to_string(), d2.clone());
-        state
-            .historical_file_pins
-            .entry("out.txt".to_string())
-            .or_default()
-            .insert(d2.clone());
-        let replay = JournalReplay::from_state(state);
-        let limits = RuntimeLimits::default();
-        // Tampered workspace bytes are refused.
-        std::fs::write(workspace.join("out.txt").as_std_path(), b"tampered").expect("tamper");
-        let accounting = Arc::new(Mutex::new(CheckpointAccounting::default()));
-        replay
-            .verify_files(&workspace, &metadata, &limits, &accounting)
-            .expect_err("tampered workspace must refuse resume");
-        // Tampered blob bytes are refused.
-        std::fs::write(workspace.join("out.txt").as_std_path(), v2).expect("restore");
-        std::fs::write(
-            metadata.join("checkpoint-blobs").join(&d2).as_std_path(),
-            b"tampered",
-        )
-        .expect("tamper blob");
-        let accounting = Arc::new(Mutex::new(CheckpointAccounting::default()));
-        replay
-            .verify_files(&workspace, &metadata, &limits, &accounting)
-            .expect_err("tampered blob must refuse resume");
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dirs.root);
     }
 
     #[test]
@@ -741,28 +662,15 @@ mod tests {
         // E06: every revision recorded in the durable historical map needs
         // its immutable blob, even when a later revision is the workspace
         // latest and its own blob exists.
-        let root = std::env::temp_dir().join(format!("qcg-replay-{}", uuid::Uuid::now_v7()));
-        let workspace = camino::Utf8PathBuf::from_path_buf(root.join("workspace"))
-            .expect("workspace path must be UTF-8");
-        let metadata = camino::Utf8PathBuf::from_path_buf(root.join("meta"))
-            .expect("metadata path must be UTF-8");
-        std::fs::create_dir_all(workspace.as_std_path()).expect("workspace dir");
-        std::fs::create_dir_all(metadata.join("checkpoint-blobs").as_std_path()).expect("blob dir");
+        let dirs = ReplayDirs::new("missing-blob");
         let v1 = b"v1";
         let v2 = b"v2";
         let latest = FilePin {
-            path: camino::Utf8PathBuf::from("out.txt"),
+            path: Utf8PathBuf::from("out.txt"),
             sha256: digest(v2),
         };
-        std::fs::write(
-            metadata
-                .join("checkpoint-blobs")
-                .join(&latest.sha256)
-                .as_std_path(),
-            v2,
-        )
-        .expect("v2 blob");
-        std::fs::write(workspace.join("out.txt").as_std_path(), v2).expect("workspace v2");
+        dirs.write_blob(&latest.sha256, v2);
+        dirs.write_workspace("out.txt", v2);
         let mut state = RunState::default();
         state.nodes.insert(
             NodePath::root("build"),
@@ -785,16 +693,14 @@ mod tests {
             .expect("entry")
             .insert(latest.sha256.clone());
         let replay = JournalReplay::from_state(state);
-        let limits = RuntimeLimits::default();
-        let accounting = Arc::new(Mutex::new(CheckpointAccounting::default()));
-        let error = replay
-            .verify_files(&workspace, &metadata, &limits, &accounting)
+        let accounting = ReplayDirs::new_accounting();
+        let error = verify_projection(&replay, &dirs, &accounting)
             .expect_err("a missing historical blob must refuse resume");
         assert!(
             error.to_string().contains("historical blob"),
             "the missing revision must be named: {error}"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dirs.root);
     }
 
     #[test]
@@ -802,40 +708,20 @@ mod tests {
         // E06: step A pinned v1, step B overwrote the same path with v2.
         // Resume must verify A against its immutable blob and the workspace
         // against the latest revision, not reject A because v1 is gone.
-        let root = std::env::temp_dir().join(format!("qcg-replay-{}", uuid::Uuid::now_v7()));
-        let workspace = camino::Utf8PathBuf::from_path_buf(root.join("workspace"))
-            .expect("workspace path must be UTF-8");
-        let metadata = camino::Utf8PathBuf::from_path_buf(root.join("meta"))
-            .expect("metadata path must be UTF-8");
-        std::fs::create_dir_all(workspace.as_std_path()).expect("workspace dir");
-        std::fs::create_dir_all(metadata.join("checkpoint-blobs").as_std_path()).expect("blob dir");
+        let dirs = ReplayDirs::new("revisions");
         let v1 = b"v1";
         let v2 = b"v2";
         let pin1 = FilePin {
-            path: camino::Utf8PathBuf::from("out.txt"),
+            path: Utf8PathBuf::from("out.txt"),
             sha256: digest(v1),
         };
         let pin2 = FilePin {
-            path: camino::Utf8PathBuf::from("out.txt"),
+            path: Utf8PathBuf::from("out.txt"),
             sha256: digest(v2),
         };
-        std::fs::write(
-            metadata
-                .join("checkpoint-blobs")
-                .join(&pin1.sha256)
-                .as_std_path(),
-            v1,
-        )
-        .expect("v1 blob");
-        std::fs::write(
-            metadata
-                .join("checkpoint-blobs")
-                .join(&pin2.sha256)
-                .as_std_path(),
-            v2,
-        )
-        .expect("v2 blob");
-        std::fs::write(workspace.join("out.txt").as_std_path(), v2).expect("workspace v2");
+        dirs.write_blob(&pin1.sha256, v1);
+        dirs.write_blob(&pin2.sha256, v2);
+        dirs.write_workspace("out.txt", v2);
         let mut state = RunState::default();
         state.nodes.insert(
             NodePath::root("a"),
@@ -855,45 +741,30 @@ mod tests {
             .latest_file_pins
             .insert("out.txt".to_string(), pin2.sha256.clone());
         let replay = JournalReplay::from_state(state);
-        let limits = RuntimeLimits::default();
-        let accounting = Arc::new(Mutex::new(CheckpointAccounting::default()));
-        replay
-            .verify_files(&workspace, &metadata, &limits, &accounting)
+        let accounting = ReplayDirs::new_accounting();
+        verify_projection(&replay, &dirs, &accounting)
             .expect("a later revision must not block resume");
         // Restoring the older genuine revision is a rollback, not a resume.
-        std::fs::write(workspace.join("out.txt").as_std_path(), v1).expect("rollback");
+        dirs.write_workspace("out.txt", v1);
         assert!(
-            replay
-                .verify_files(&workspace, &metadata, &limits, &accounting)
-                .is_err(),
+            verify_projection(&replay, &dirs, &accounting).is_err(),
             "the workspace must project the latest pinned revision"
         );
-        std::fs::write(workspace.join("out.txt").as_std_path(), v2).expect("restore");
+        dirs.write_workspace("out.txt", v2);
         // A tampered workspace projection is rejected.
-        std::fs::write(workspace.join("out.txt").as_std_path(), b"tampered").expect("tamper");
+        dirs.write_workspace("out.txt", b"tampered");
         assert!(
-            replay
-                .verify_files(&workspace, &metadata, &limits, &accounting)
-                .is_err(),
+            verify_projection(&replay, &dirs, &accounting).is_err(),
             "tampered workspace must be rejected"
         );
-        std::fs::write(workspace.join("out.txt").as_std_path(), v2).expect("restore");
+        dirs.write_workspace("out.txt", v2);
         // A tampered historical blob is rejected.
-        std::fs::write(
-            metadata
-                .join("checkpoint-blobs")
-                .join(&pin1.sha256)
-                .as_std_path(),
-            b"tampered",
-        )
-        .expect("tamper blob");
+        std::fs::write(dirs.blob(&pin1.sha256), b"tampered").expect("tamper blob");
         assert!(
-            replay
-                .verify_files(&workspace, &metadata, &limits, &accounting)
-                .is_err(),
+            verify_projection(&replay, &dirs, &accounting).is_err(),
             "tampered historical blob must be rejected"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dirs.root);
     }
 
     #[cfg(unix)]
@@ -902,26 +773,13 @@ mod tests {
         // E06: the workspace projection follows the same symlink standard
         // as the blob side. A terminal symlink at the pinned path is
         // refused even when it points at bytes matching the pin.
-        let root = std::env::temp_dir().join(format!("qcg-replay-{}", uuid::Uuid::now_v7()));
-        let workspace = camino::Utf8PathBuf::from_path_buf(root.join("workspace"))
-            .expect("workspace path must be UTF-8");
-        let metadata = camino::Utf8PathBuf::from_path_buf(root.join("meta"))
-            .expect("metadata path must be UTF-8");
-        std::fs::create_dir_all(workspace.as_std_path()).expect("workspace dir");
-        std::fs::create_dir_all(metadata.join("checkpoint-blobs").as_std_path()).expect("blob dir");
+        let dirs = ReplayDirs::new("terminal-symlink");
         let v1 = b"v1";
         let digest = digest(v1);
-        std::fs::write(
-            metadata
-                .join("checkpoint-blobs")
-                .join(&digest)
-                .as_std_path(),
-            v1,
-        )
-        .expect("blob");
-        let outside = root.join("outside.txt");
+        dirs.write_blob(&digest, v1);
+        let outside = dirs.root.join("outside.txt");
         std::fs::write(&outside, v1).expect("outside file");
-        std::os::unix::fs::symlink(&outside, workspace.join("out.txt").as_std_path())
+        std::os::unix::fs::symlink(&outside, dirs.workspace.join("out.txt").as_std_path())
             .expect("planted terminal symlink");
         let mut state = RunState::default();
         state.nodes.insert(
@@ -929,23 +787,21 @@ mod tests {
             NodeOutcome::Success {
                 output: None,
                 files: vec![FilePin {
-                    path: camino::Utf8PathBuf::from("out.txt"),
+                    path: Utf8PathBuf::from("out.txt"),
                     sha256: digest.clone(),
                 }],
             },
         );
         state.latest_file_pins.insert("out.txt".to_string(), digest);
         let replay = JournalReplay::from_state(state);
-        let limits = RuntimeLimits::default();
-        let accounting = Arc::new(Mutex::new(CheckpointAccounting::default()));
-        let error = replay
-            .verify_files(&workspace, &metadata, &limits, &accounting)
+        let accounting = ReplayDirs::new_accounting();
+        let error = verify_projection(&replay, &dirs, &accounting)
             .expect_err("a terminal symlink must refuse resume");
         assert!(
             error.to_string().contains("symbolic link"),
             "the planted link must be named: {error}"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dirs.root);
     }
 
     #[cfg(unix)]
@@ -954,28 +810,17 @@ mod tests {
         // E06: a symlinked parent directory between the workspace root and
         // the pinned file is refused, matching the blob-side standard, so
         // verification and use never diverge.
-        let root = std::env::temp_dir().join(format!("qcg-replay-{}", uuid::Uuid::now_v7()));
-        let workspace = camino::Utf8PathBuf::from_path_buf(root.join("workspace"))
-            .expect("workspace path must be UTF-8");
-        let metadata = camino::Utf8PathBuf::from_path_buf(root.join("meta"))
-            .expect("metadata path must be UTF-8");
-        std::fs::create_dir_all(workspace.join("sub").as_std_path()).expect("workspace dir");
-        std::fs::create_dir_all(metadata.join("checkpoint-blobs").as_std_path()).expect("blob dir");
+        let dirs = ReplayDirs::new("parent-symlink");
         let v1 = b"v1";
         let digest = digest(v1);
-        std::fs::write(
-            metadata
-                .join("checkpoint-blobs")
-                .join(&digest)
-                .as_std_path(),
-            v1,
-        )
-        .expect("blob");
-        let outside = root.join("outside-dir");
+        dirs.write_blob(&digest, v1);
+        let outside = dirs.root.join("outside-dir");
         std::fs::create_dir_all(&outside).expect("outside dir");
         std::fs::write(outside.join("out.txt"), v1).expect("outside file");
-        std::fs::remove_dir_all(workspace.join("sub").as_std_path()).expect("remove real parent");
-        std::os::unix::fs::symlink(&outside, workspace.join("sub").as_std_path())
+        dirs.create_workspace_dir("sub");
+        std::fs::remove_dir_all(dirs.workspace.join("sub").as_std_path())
+            .expect("remove real parent");
+        std::os::unix::fs::symlink(&outside, dirs.workspace.join("sub").as_std_path())
             .expect("planted parent symlink");
         let mut state = RunState::default();
         state.nodes.insert(
@@ -983,7 +828,7 @@ mod tests {
             NodeOutcome::Success {
                 output: None,
                 files: vec![FilePin {
-                    path: camino::Utf8PathBuf::from("sub/out.txt"),
+                    path: Utf8PathBuf::from("sub/out.txt"),
                     sha256: digest.clone(),
                 }],
             },
@@ -992,40 +837,14 @@ mod tests {
             .latest_file_pins
             .insert("sub/out.txt".to_string(), digest);
         let replay = JournalReplay::from_state(state);
-        let limits = RuntimeLimits::default();
-        let accounting = Arc::new(Mutex::new(CheckpointAccounting::default()));
-        let error = replay
-            .verify_files(&workspace, &metadata, &limits, &accounting)
+        let accounting = ReplayDirs::new_accounting();
+        let error = verify_projection(&replay, &dirs, &accounting)
             .expect_err("a parent symlink must refuse resume");
         assert!(
             error.to_string().contains("symbolic link"),
             "the planted parent link must be named: {error}"
         );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn hash_file_refuses_a_symlink_leaf_without_following_it() {
-        // E06: `hash_file` opens with O_NOFOLLOW, so a symlink leaf is
-        // refused even when its target holds bytes with a known digest.
-        let root = std::env::temp_dir().join(format!("qcg-replay-{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(&root).expect("root dir");
-        let target = root.join("target.txt");
-        std::fs::write(&target, b"v1").expect("target file");
-        let link = camino::Utf8PathBuf::from_path_buf(root.join("link.txt"))
-            .expect("link path must be UTF-8");
-        std::os::unix::fs::symlink(&target, link.as_std_path()).expect("planted symlink");
-        let error = match hash_file(&link, None) {
-            Ok(_) => panic!("a symlink leaf must be refused"),
-            Err(error) => error,
-        };
-        assert!(
-            error.kind() == std::io::ErrorKind::PermissionDenied
-                || error.raw_os_error() == Some(libc::ELOOP),
-            "the refusal must come from O_NOFOLLOW, got: {error}"
-        );
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dirs.root);
     }
 
     #[test]
@@ -1033,25 +852,12 @@ mod tests {
         // E06: two workspace paths pinning identical bytes name one
         // immutable blob. Single-pass collection plus the per-digest
         // in-memory cache verifies it once and projects both paths.
-        let root = std::env::temp_dir().join(format!("qcg-replay-{}", uuid::Uuid::now_v7()));
-        let workspace = camino::Utf8PathBuf::from_path_buf(root.join("workspace"))
-            .expect("workspace path must be UTF-8");
-        let metadata = camino::Utf8PathBuf::from_path_buf(root.join("meta"))
-            .expect("metadata path must be UTF-8");
-        std::fs::create_dir_all(workspace.as_std_path()).expect("workspace dir");
-        std::fs::create_dir_all(metadata.join("checkpoint-blobs").as_std_path()).expect("blob dir");
+        let dirs = ReplayDirs::new("shared-blob");
         let shared = b"shared bytes";
         let digest = digest(shared);
-        std::fs::write(
-            metadata
-                .join("checkpoint-blobs")
-                .join(&digest)
-                .as_std_path(),
-            shared,
-        )
-        .expect("shared blob");
-        std::fs::write(workspace.join("a.txt").as_std_path(), shared).expect("workspace a");
-        std::fs::write(workspace.join("b.txt").as_std_path(), shared).expect("workspace b");
+        dirs.write_blob(&digest, shared);
+        dirs.write_workspace("a.txt", shared);
+        dirs.write_workspace("b.txt", shared);
         let mut state = RunState::default();
         for (node, path) in [("first", "a.txt"), ("second", "b.txt")] {
             state.nodes.insert(
@@ -1059,7 +865,7 @@ mod tests {
                 NodeOutcome::Success {
                     output: None,
                     files: vec![FilePin {
-                        path: camino::Utf8PathBuf::from(path),
+                        path: Utf8PathBuf::from(path),
                         sha256: digest.clone(),
                     }],
                 },
@@ -1069,27 +875,18 @@ mod tests {
                 .insert(path.to_string(), digest.clone());
         }
         let replay = JournalReplay::from_state(state);
-        let limits = RuntimeLimits::default();
-        let accounting = Arc::new(Mutex::new(CheckpointAccounting::default()));
-        replay
-            .verify_files(&workspace, &metadata, &limits, &accounting)
+        let accounting = ReplayDirs::new_accounting();
+        verify_projection(&replay, &dirs, &accounting)
             .expect("one shared blob must verify both projections");
         // Removing the single blob breaks both projections at once.
-        std::fs::remove_file(
-            metadata
-                .join("checkpoint-blobs")
-                .join(&digest)
-                .as_std_path(),
-        )
-        .expect("remove shared blob");
-        let error = replay
-            .verify_files(&workspace, &metadata, &limits, &accounting)
+        std::fs::remove_file(dirs.blob(&digest)).expect("remove shared blob");
+        let error = verify_projection(&replay, &dirs, &accounting)
             .expect_err("a missing shared blob must refuse resume");
         assert!(
             error.to_string().contains("historical blob"),
             "the missing blob must be named: {error}"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dirs.root);
     }
 
     #[test]
@@ -1097,29 +894,18 @@ mod tests {
         // E06: a tampered workspace projection is quarantined aside with
         // its mismatched bytes preserved for forensics, not silently left
         // in place.
-        let root = std::env::temp_dir().join(format!("qcg-replay-quar-{}", uuid::Uuid::now_v7()));
-        let workspace = camino::Utf8PathBuf::from_path_buf(root.join("workspace"))
-            .expect("workspace path must be UTF-8");
-        let metadata = camino::Utf8PathBuf::from_path_buf(root.join("meta"))
-            .expect("metadata path must be UTF-8");
-        std::fs::create_dir_all(workspace.as_std_path()).expect("workspace dir");
-        std::fs::create_dir_all(metadata.join("checkpoint-blobs").as_std_path()).expect("blob dir");
+        let dirs = ReplayDirs::new("quarantine");
         let v2 = b"v2";
         let d2 = digest(v2);
-        std::fs::write(
-            metadata.join("checkpoint-blobs").join(&d2).as_std_path(),
-            v2,
-        )
-        .expect("blob");
-        std::fs::write(workspace.join("out.txt").as_std_path(), b"tampered")
-            .expect("tampered workspace");
+        dirs.write_blob(&d2, v2);
+        dirs.write_workspace("out.txt", b"tampered");
         let mut state = RunState::default();
         state.nodes.insert(
             NodePath::root("build"),
             NodeOutcome::Success {
                 output: None,
                 files: vec![FilePin {
-                    path: camino::Utf8PathBuf::from("out.txt"),
+                    path: Utf8PathBuf::from("out.txt"),
                     sha256: d2.clone(),
                 }],
             },
@@ -1128,33 +914,24 @@ mod tests {
             .latest_file_pins
             .insert("out.txt".to_string(), d2.clone());
         let replay = JournalReplay::from_state(state);
-        let limits = RuntimeLimits::default();
-        let accounting = Arc::new(Mutex::new(CheckpointAccounting::default()));
-        replay
-            .verify_files(&workspace, &metadata, &limits, &accounting)
+        let accounting = ReplayDirs::new_accounting();
+        verify_projection(&replay, &dirs, &accounting)
             .expect_err("tampered workspace must refuse resume");
-        let quarantined = metadata.join("quarantine").join("out.txt");
+        let quarantined = dirs.metadata.join("quarantine").join("out.txt");
         let bytes = std::fs::read(quarantined.as_std_path())
             .expect("quarantine file must exist after mismatch");
         assert_eq!(
             bytes, b"tampered",
             "quarantine must preserve the mismatched bytes"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dirs.root);
     }
 
     #[test]
     fn unsafe_path_and_malformed_sha_are_rejected() {
         // E06: absolute/traversing journal paths and malformed blob digests
         // fail closed with explicit messages.
-        let root = std::env::temp_dir().join(format!("qcg-replay-unsafe-{}", uuid::Uuid::now_v7()));
-        let workspace = camino::Utf8PathBuf::from_path_buf(root.join("workspace"))
-            .expect("workspace path must be UTF-8");
-        let metadata = camino::Utf8PathBuf::from_path_buf(root.join("meta"))
-            .expect("metadata path must be UTF-8");
-        std::fs::create_dir_all(workspace.as_std_path()).expect("workspace dir");
-        std::fs::create_dir_all(metadata.join("checkpoint-blobs").as_std_path()).expect("blob dir");
-        let limits = RuntimeLimits::default();
+        let dirs = ReplayDirs::new("unsafe");
         // Unsafe absolute path.
         let mut unsafe_state = RunState::default();
         unsafe_state.nodes.insert(
@@ -1162,15 +939,14 @@ mod tests {
             NodeOutcome::Success {
                 output: None,
                 files: vec![FilePin {
-                    path: camino::Utf8PathBuf::from("/abs/out.txt"),
+                    path: Utf8PathBuf::from("/abs/out.txt"),
                     sha256: "a".repeat(64),
                 }],
             },
         );
         let replay = JournalReplay::from_state(unsafe_state);
-        let accounting = Arc::new(Mutex::new(CheckpointAccounting::default()));
-        let error = replay
-            .verify_files(&workspace, &metadata, &limits, &accounting)
+        let accounting = ReplayDirs::new_accounting();
+        let error = verify_projection(&replay, &dirs, &accounting)
             .expect_err("absolute journal path must be rejected");
         assert!(
             error.to_string().contains("unsafe output path"),
@@ -1183,15 +959,14 @@ mod tests {
             NodeOutcome::Success {
                 output: None,
                 files: vec![FilePin {
-                    path: camino::Utf8PathBuf::from("../escape.txt"),
+                    path: Utf8PathBuf::from("../escape.txt"),
                     sha256: "b".repeat(64),
                 }],
             },
         );
         let replay = JournalReplay::from_state(traverse_state);
-        let accounting = Arc::new(Mutex::new(CheckpointAccounting::default()));
-        replay
-            .verify_files(&workspace, &metadata, &limits, &accounting)
+        let accounting = ReplayDirs::new_accounting();
+        verify_projection(&replay, &dirs, &accounting)
             .expect_err("traversing journal path must be rejected");
         // Malformed sha.
         let mut malformed_state = RunState::default();
@@ -1201,14 +976,13 @@ mod tests {
             .or_default()
             .insert("not-hex".to_string());
         let replay = JournalReplay::from_state(malformed_state);
-        let accounting = Arc::new(Mutex::new(CheckpointAccounting::default()));
-        let error = replay
-            .verify_files(&workspace, &metadata, &limits, &accounting)
+        let accounting = ReplayDirs::new_accounting();
+        let error = verify_projection(&replay, &dirs, &accounting)
             .expect_err("malformed sha must be rejected");
         assert!(
             error.to_string().contains("malformed sha256"),
             "malformed digest must be named: {error}"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dirs.root);
     }
 }

@@ -4,7 +4,6 @@ use qcg_contract::InputField;
 use qcg_contract::{FieldType, NodeDef};
 use qcg_engine::{ResultExt, RunContext, StepContext, StepError, tool_call_sources};
 use qcg_mcp::{McpCallOutcome, McpError, McpInputRequired, McpSession};
-use qcg_policy::validate_bounded_json_schema;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -40,18 +39,13 @@ pub(crate) async fn execute_direct_mcp_call(
                 ),
             )
         })?;
-    validate_bounded_json_schema(&tool.input_schema).map_err(|error| {
-        StepError::failed(
-            &node.id,
-            format!("MCP tool {tool_name} input schema is invalid or unsafe: {error}"),
-        )
-    })?;
-    let input_validator = jsonschema::validator_for(&tool.input_schema).map_err(|error| {
-        StepError::failed(
-            &node.id,
-            format!("MCP tool {} input schema is invalid: {error}", tool_name),
-        )
-    })?;
+    let input_validator =
+        qcg_policy::compile_bounded_validator(&tool.input_schema).map_err(|error| {
+            StepError::failed(
+                &node.id,
+                format!("MCP tool {tool_name} input schema is invalid or unsafe: {error}"),
+            )
+        })?;
     if let Err(error) = input_validator.validate(&arguments) {
         return Err(StepError::failed(
             &node.id,
@@ -66,27 +60,29 @@ pub(crate) async fn execute_direct_mcp_call(
         .output_schema
         .as_ref()
         .map(|schema| {
-            validate_bounded_json_schema(schema).map_err(|error| {
+            qcg_policy::compile_bounded_validator(schema).map_err(|error| {
                 StepError::failed(
                     &node.id,
                     format!("MCP tool {tool_name} output schema is invalid or unsafe: {error}"),
-                )
-            })?;
-            jsonschema::validator_for(schema).map_err(|error| {
-                StepError::failed(
-                    &node.id,
-                    format!("MCP tool {tool_name} output schema is invalid: {error}"),
                 )
             })
         })
         .transpose()?;
     let mut input_responses = None;
     let mut request_state: Option<String> = None;
+    let invocation = RunContext::execution_invocation(ctx.journal, node);
     // Resume a previously interrupted input-required round instead of
     // starting a new remote request. The typed journal continuation store
     // carries the pending descriptor, so a HITL restart continues the same
     // remote call with its original request_state.
-    match resume_direct_mcp_continuation(ctx, node, session.server_id(), tool_name, &arguments)? {
+    match resume_direct_mcp_continuation(
+        ctx,
+        node,
+        session.server_id(),
+        tool_name,
+        &arguments,
+        &invocation,
+    )? {
         ContinuationDecision::Fresh => {}
         ContinuationDecision::Resume {
             request_state: resumed_state,
@@ -102,7 +98,6 @@ pub(crate) async fn execute_direct_mcp_call(
     // restarts recompute the same id until the execution finishes, while a
     // repair or regenerate is a new invocation (Q1).
     let target = format!("{}/{}", session.server_id(), tool_name);
-    let invocation = RunContext::execution_invocation(ctx.journal, node);
     let operation_id = if fresh {
         match ctx.run.guard_external_operation(
             ctx.journal,
@@ -244,6 +239,7 @@ pub(crate) async fn execute_direct_mcp_call(
                     session.server_id(),
                     tool_name,
                     &arguments,
+                    &invocation,
                 )?;
                 if let Some(operation_id) = &operation_id {
                     ctx.run.finish_external_operation(
@@ -268,14 +264,20 @@ pub(crate) async fn execute_direct_mcp_call(
                     session.server_id(),
                     tool_name,
                     &arguments,
+                    &invocation,
                     &required,
                 );
                 let Some(answer) = ctx.run.answers.get(&question_id) else {
                     // Durably record the continuation before suspending so a
                     // restart resumes this remote call instead of starting a
                     // new one with request_state=None.
-                    let cont_key =
-                        mcp_continuation_key(&node.id, session.server_id(), tool_name, &arguments);
+                    let cont_key = mcp_continuation_key(
+                        &node.id,
+                        session.server_id(),
+                        tool_name,
+                        &arguments,
+                        &invocation,
+                    );
                     ctx.journal
                         .event(
                             "mcp_input_pending",
@@ -285,7 +287,7 @@ pub(crate) async fn execute_direct_mcp_call(
                                 "question_id": question_id,
                                 "server": session.server_id(),
                                 "tool": tool_name,
-                                "arguments": arguments,
+                                "arguments": qcg_engine::redact_mcp_args_for_journal(&arguments),
                                 "request_state": required.request_state,
                                 "input_requests": required.input_requests,
                             }),
@@ -335,10 +337,7 @@ pub(crate) fn validate_direct_mcp_result(
             .get("structuredContent")
             .or_else(|| object.get("structured_content"))
             .unwrap_or(&result);
-        validate_bounded_json_schema(schema).map_err(|error| {
-            StepError::failed(&node.id, format!("invalid mcp.call output_schema: {error}"))
-        })?;
-        let validator = jsonschema::validator_for(schema).map_err(|error| {
+        let validator = qcg_policy::compile_bounded_validator(schema).map_err(|error| {
             StepError::failed(&node.id, format!("invalid mcp.call output_schema: {error}"))
         })?;
         if let Err(error) = validator.validate(value) {
@@ -359,6 +358,7 @@ fn direct_mcp_question_id(
     server: &str,
     tool: &str,
     arguments: &Value,
+    invocation: &str,
     required: &McpInputRequired,
 ) -> String {
     let mut requests = required
@@ -374,6 +374,7 @@ fn direct_mcp_question_id(
         "server": server,
         "tool": tool,
         "arguments": arguments,
+        "invocation": invocation,
         "requests": requests,
     }))
     .expect("MCP question identity is always serializable");
@@ -458,12 +459,19 @@ fn direct_mcp_input_responses(
     Ok(responses)
 }
 
-fn mcp_continuation_key(node_id: &str, server: &str, tool: &str, arguments: &Value) -> String {
+fn mcp_continuation_key(
+    node_id: &str,
+    server: &str,
+    tool: &str,
+    arguments: &Value,
+    invocation: &str,
+) -> String {
     let bytes = serde_json::to_vec(&json!({
         "node": node_id,
         "server": server,
         "tool": tool,
         "arguments": arguments,
+        "invocation": invocation,
     }))
     .expect("MCP continuation identity is always serializable");
     let digest = hex::encode(Sha256::digest(bytes));
@@ -506,8 +514,9 @@ fn decide_direct_mcp_continuation(
     server: &str,
     tool: &str,
     arguments: &Value,
+    invocation: &str,
 ) -> Result<DirectResumeLookup, String> {
-    let cont_key = mcp_continuation_key(node_id, server, tool, arguments);
+    let cont_key = mcp_continuation_key(node_id, server, tool, arguments, invocation);
     let pending_key = mcp_pending_reserved_key(&cont_key);
     let Some(pending) = state.mcp_pending.get(&pending_key) else {
         return Ok(DirectResumeLookup::Absent);
@@ -532,7 +541,8 @@ fn decide_direct_mcp_continuation(
             "MCP continuation `{pending_key}` targets a different remote; refusing resume"
         ));
     }
-    if pending.get("arguments") != Some(arguments) {
+    let canonical_arguments = qcg_engine::redact_mcp_args_for_journal(arguments);
+    if pending.get("arguments") != Some(&canonical_arguments) {
         return Err(format!(
             "MCP continuation `{pending_key}` holds different arguments; refusing resume"
         ));
@@ -606,6 +616,7 @@ fn resume_direct_mcp_continuation(
     server: &str,
     tool: &str,
     arguments: &Value,
+    invocation: &str,
 ) -> Result<ContinuationDecision, StepError> {
     let state = ctx.journal.state();
     match decide_direct_mcp_continuation(
@@ -615,6 +626,7 @@ fn resume_direct_mcp_continuation(
         server,
         tool,
         arguments,
+        invocation,
     )
     .map_err(|message| StepError::failed(&node.id, message))?
     {
@@ -667,9 +679,10 @@ fn consume_direct_mcp_continuation(
     server: &str,
     tool: &str,
     arguments: &Value,
+    invocation: &str,
 ) -> Result<(), StepError> {
     use qcg_engine::ResultExt as _;
-    let cont_key = mcp_continuation_key(&node.id, server, tool, arguments);
+    let cont_key = mcp_continuation_key(&node.id, server, tool, arguments, invocation);
     ctx.journal
         .event(
             "mcp_continuation_consumed",
@@ -818,7 +831,13 @@ mod tests {
         arguments: Value,
         question_id: Option<&str>,
     ) -> (String, Value) {
-        let key = mcp_pending_reserved_key(&mcp_continuation_key(node, server, tool, &arguments));
+        let key = mcp_pending_reserved_key(&mcp_continuation_key(
+            node,
+            server,
+            tool,
+            &arguments,
+            "invocation-1",
+        ));
         let mut descriptor = json!({
             "node": node,
             "server": server,
@@ -860,6 +879,7 @@ mod tests {
                 "server",
                 "tool",
                 &json!({"q": "x"}),
+                "invocation-1",
             ),
             Ok(DirectResumeLookup::Absent)
         );
@@ -877,6 +897,7 @@ mod tests {
             "server",
             "tool",
             &arguments,
+            "invocation-1",
         ) {
             Ok(DirectResumeLookup::Resume {
                 pending_key,
@@ -924,6 +945,7 @@ mod tests {
                 "server",
                 "tool",
                 &arguments,
+                "invocation-1",
             ),
             Ok(DirectResumeLookup::Absent)
         );
@@ -936,6 +958,7 @@ mod tests {
                 "server",
                 "tool",
                 &json!({"q": "y"}),
+                "invocation-1",
             ),
             Ok(DirectResumeLookup::Absent)
         );
@@ -948,6 +971,7 @@ mod tests {
                 "other-server",
                 "tool",
                 &arguments,
+                "invocation-1",
             ),
             Ok(DirectResumeLookup::Absent)
         );
@@ -969,6 +993,7 @@ mod tests {
                 "server",
                 "tool",
                 &arguments,
+                "invocation-1",
             )
             .is_err()
         );
@@ -988,6 +1013,7 @@ mod tests {
                 "server",
                 "tool",
                 &arguments,
+                "invocation-1",
             )
             .is_err()
         );
@@ -1004,6 +1030,7 @@ mod tests {
                 "server",
                 "tool",
                 &arguments,
+                "invocation-1",
             )
             .is_err()
         );
@@ -1017,6 +1044,7 @@ mod tests {
                 "server",
                 "tool",
                 &arguments,
+                "invocation-1",
             ),
             Ok(DirectResumeLookup::Resume { .. })
         ));
@@ -1035,6 +1063,7 @@ mod tests {
                 "server",
                 "tool",
                 &arguments,
+                "invocation-1",
             ),
             Ok(DirectResumeLookup::Absent)
         );
@@ -1043,18 +1072,18 @@ mod tests {
     #[test]
     fn continuation_keys_bind_the_full_invocation() {
         let arguments = json!({"q": "x"});
-        let local = mcp_continuation_key("node", "server", "tool", &arguments);
+        let local = mcp_continuation_key("node", "server", "tool", &arguments, "invocation-1");
         assert_ne!(
             local,
-            mcp_continuation_key("other-node", "server", "tool", &arguments)
+            mcp_continuation_key("other-node", "server", "tool", &arguments, "invocation-1")
         );
         assert_ne!(
             local,
-            mcp_continuation_key("node", "server", "tool", &json!({"q": "y"}))
+            mcp_continuation_key("node", "server", "tool", &json!({"q": "y"}), "invocation-1")
         );
         assert_ne!(
             local,
-            mcp_continuation_key("node", "other-server", "tool", &arguments)
+            mcp_continuation_key("node", "other-server", "tool", &arguments, "invocation-1")
         );
     }
 }

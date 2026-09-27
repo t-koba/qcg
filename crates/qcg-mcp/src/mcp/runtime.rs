@@ -40,6 +40,13 @@ use qcg_policy::{DEFAULT_MCP_MAX_RESPONSE_BYTES, DEFAULT_MCP_TIMEOUT_SECONDS};
 
 pub(crate) struct QcgMcpClient;
 
+#[cfg(not(feature = "mcp-oauth"))]
+fn oauth_feature_error(server_id: &str) -> McpError {
+    McpError::Configuration(format!(
+        "MCP server `{server_id}` uses OAuth, which requires the `mcp-oauth` cargo feature"
+    ))
+}
+
 impl ClientHandler for QcgMcpClient {
     fn get_info(&self) -> ClientInfo {
         let mut capabilities = ClientCapabilities::default();
@@ -365,9 +372,7 @@ impl McpRuntime {
         _profile: &McpProfile,
         _redirect_uri: &str,
     ) -> Result<String, McpError> {
-        Err(McpError::Configuration(format!(
-            "MCP server `{server_id}` uses OAuth, which requires the `mcp-oauth` cargo feature"
-        )))
+        Err(oauth_feature_error(server_id))
     }
 
     pub async fn complete_authorization(&self, callback_url: &str) -> Result<String, McpError> {
@@ -466,9 +471,7 @@ impl McpRuntime {
         server_id: &str,
         _profile: &McpProfile,
     ) -> Result<(), McpError> {
-        Err(McpError::Configuration(format!(
-            "MCP server `{server_id}` uses OAuth, which requires the `mcp-oauth` cargo feature"
-        )))
+        Err(oauth_feature_error(server_id))
     }
 
     pub async fn cancel_pending_authorization(&self, server_id: &str) -> Result<(), McpError> {
@@ -503,9 +506,7 @@ impl McpRuntime {
         server_id: &str,
         _profile: &McpProfile,
     ) -> Result<(), McpError> {
-        Err(McpError::Configuration(format!(
-            "MCP server `{server_id}` uses OAuth, which requires the `mcp-oauth` cargo feature"
-        )))
+        Err(oauth_feature_error(server_id))
     }
 
     #[cfg(feature = "mcp-oauth")]

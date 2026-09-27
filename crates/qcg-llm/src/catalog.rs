@@ -1178,12 +1178,6 @@ pub(crate) fn map_models_dev(text: &str) -> Result<ExternalCatalog, String> {
     Ok(mapped)
 }
 
-/// Default cache location used by the service when `[catalog].cache` is
-/// omitted. Exposed so the CLI and docs agree with the service.
-pub fn default_cache_path() -> Option<PathBuf> {
-    cache_path(&CatalogConfig::default())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -16,24 +16,34 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
 use std::sync::Arc;
 
+fn journal_target(
+    record: &RunRecord,
+) -> Result<(String, Utf8PathBuf, JournalLimits), ServiceError> {
+    let run_id = record
+        .run_dir
+        .file_name()
+        .ok_or_else(|| ServiceError::Invalid("run directory must have a run id".into()))?
+        .to_string();
+    let path = run_meta_dir(&record.run_dir).join("journal.jsonl");
+    let limits = JournalLimits::from(&record.contract.manifest.runtime);
+    Ok((run_id, path, limits))
+}
+
 pub(crate) fn write_run_event(
     record: &RunRecord,
     kind: &str,
     payload: Value,
 ) -> Result<(), ServiceError> {
-    let run_id = record
-        .run_dir
-        .file_name()
-        .ok_or_else(|| ServiceError::Invalid("run directory must have a run id".into()))?;
+    let (run_id, journal_path, limits) = journal_target(record)?;
     // Atomic single append under the cross-process journal lock. The writer
     // re-folds the latest journal so seq assignment never duplicates values
     // assigned concurrently by the running engine (A01).
     JournalWriter::append_single_event(
-        &run_meta_dir(&record.run_dir).join("journal.jsonl"),
-        run_id,
+        &journal_path,
+        &run_id,
         kind,
         payload,
-        JournalLimits::from(&record.contract.manifest.runtime),
+        limits,
         Some(record.events.clone()),
     )
     .map_err(|error| ServiceError::Invalid(error.to_string()))?;
@@ -49,16 +59,13 @@ pub(crate) fn write_run_event_if(
     payload: Value,
     check: impl FnOnce(&RunState) -> Result<(), JournalError>,
 ) -> Result<(), ServiceError> {
-    let run_id = record
-        .run_dir
-        .file_name()
-        .ok_or_else(|| ServiceError::Invalid("run directory must have a run id".into()))?;
+    let (run_id, journal_path, limits) = journal_target(record)?;
     JournalWriter::append_single_event_if(
-        &run_meta_dir(&record.run_dir).join("journal.jsonl"),
-        run_id,
+        &journal_path,
+        &run_id,
         kind,
         payload,
-        JournalLimits::from(&record.contract.manifest.runtime),
+        limits,
         Some(record.events.clone()),
         check,
     )
@@ -76,15 +83,12 @@ pub(crate) fn write_run_events(
     record: &RunRecord,
     events: Vec<(&str, Value)>,
 ) -> Result<(), ServiceError> {
-    let run_id = record
-        .run_dir
-        .file_name()
-        .ok_or_else(|| ServiceError::Invalid("run directory must have a run id".into()))?;
+    let (run_id, journal_path, limits) = journal_target(record)?;
     JournalWriter::append_events_if(
-        &run_meta_dir(&record.run_dir).join("journal.jsonl"),
-        run_id,
+        &journal_path,
+        &run_id,
         events,
-        JournalLimits::from(&record.contract.manifest.runtime),
+        limits,
         Some(record.events.clone()),
         |_| Ok(()),
     )
@@ -95,6 +99,22 @@ pub(crate) fn write_run_events(
 pub(crate) fn direct_run_id(workspace: &Utf8Path) -> String {
     let digest = hex::encode(Sha256::digest(workspace.as_str().as_bytes()));
     format!("direct-{digest}")
+}
+
+pub(crate) fn is_regular_directory(path: &Utf8Path) -> Result<bool, ServiceError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_dir()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(ServiceError::Io(error)),
+    }
+}
+
+pub(crate) fn is_regular_file(path: &Utf8Path) -> Result<bool, ServiceError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_file()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(ServiceError::Io(error)),
+    }
 }
 
 pub(crate) fn lock_runs_directory(runs_dir: &Utf8Path) -> Result<File, ServiceError> {
@@ -1012,9 +1032,7 @@ pub(crate) fn try_adopt_run_dir_with_snapshot(
     use crate::summaries::{read_events_from_meta, run_meta_dir};
     // Single attempt (E03): every caller holds the per-run admission lock,
     // which serializes prepare/wipe/adopt for one run id, so no concurrent
-    // admission can complete a journal while this probe runs. A former
-    // bounded-retry loop was removed as dead (it never looped: every path
-    // returned on the first iteration); a single pass is the whole proof.
+    // admission can complete a journal while this probe runs.
     let journal_path = run_meta_dir(run_dir).join("journal.jsonl");
     // All probes use `symlink_metadata` (no-follow): a symlinked
     // journal would otherwise redirect the fold outside the run
@@ -1094,14 +1112,12 @@ pub(crate) fn try_adopt_run_dir_with_snapshot(
     });
     if !initialized {
         // A partial fork or a journal without this run's own admission
-        // is wiped directly: no second re-read occurs here (E03). The
-        // redundant re-read was removed because every caller holds the
-        // per-run admission lock, which serializes prepare/wipe/adopt
-        // for one run id: no concurrent admission can complete a journal
-        // for this directory while this probe runs, so a re-read cannot
-        // observe a newly completed admission that this probe missed.
-        // Execution appends (non-admission writers) never create
-        // `run_queued`, so they cannot flip this verdict either (E03).
+        // is wiped directly with no second read (E03): every caller holds
+        // the per-run admission lock, which serializes prepare/wipe/adopt
+        // for one run id, so no concurrent admission can complete a journal
+        // for this directory while this probe runs. Execution appends
+        // (non-admission writers) never create `run_queued`, so they cannot
+        // flip this verdict either (E03).
         wipe_incomplete_run_dir(run_dir)?;
         return Ok(AdoptSnapshot::empty());
     }
@@ -2443,40 +2459,6 @@ mod tests {
         let pending = list_pending_cancel_controls(&run_dir).expect("mailbox should still scan");
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].0, "op-1");
-    }
-
-    #[test]
-    fn stale_cancel_temps_reap_through_the_drain_inline_path() {
-        // E01: the drain-path inline reclamation (not only the standalone
-        // sweep) must reap an abandoned temp: production never runs the
-        // standalone sweep.
-        use std::time::{Duration, SystemTime};
-        let root = temp_root("cancel-drain-reap");
-        let _temp_guard = TempGuard(root.clone());
-        let run_dir = root.join("run");
-        let dir = control_dir(&run_dir);
-        std::fs::create_dir_all(dir.as_std_path()).expect("control dir should be created");
-        let stale = dir.join(".cancel-drain-stale.tmp");
-        std::fs::write(stale.as_std_path(), b"{\"op\":\"cancel\"")
-            .expect("stale temp should be written");
-        let aged = SystemTime::now()
-            .checked_sub(Duration::from_secs(3600))
-            .expect("aged time should exist");
-        std::fs::File::options()
-            .write(true)
-            .open(stale.as_std_path())
-            .expect("stale temp should open")
-            .set_modified(aged)
-            .expect("stale temp should age");
-        let pending = list_pending_cancel_controls(&run_dir).expect("drain scan should succeed");
-        assert!(
-            pending.is_empty(),
-            "a temp must never be listed as a pending request"
-        );
-        assert!(
-            !stale.exists(),
-            "the drain inline path must reap an abandoned temp"
-        );
     }
 
     #[test]

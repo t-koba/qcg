@@ -248,7 +248,7 @@ run_generation() {
   purpose="$(purpose_for_blueprint "$blueprint")"
   (
     cd "$tmp"
-    CARGO_TARGET_DIR="$repo_root/target" cargo run --manifest-path "$repo_root/Cargo.toml" -q -p qcg -- \
+    CARGO_TARGET_DIR="$repo_root/target" cargo run --manifest-path "$repo_root/Cargo.toml" -q -p qcg --locked -- \
       --providers "$providers" run "$input_generator" \
       --answer "ask_purpose=$purpose" \
       --answer ask_design_mode=llm \
@@ -280,7 +280,7 @@ generate_equivalent() {
       continue
     fi
     candidate="$output_dir/generator"
-    if ! CARGO_TARGET_DIR="$repo_root/target" cargo run --manifest-path "$repo_root/Cargo.toml" -q -p qcg -- --providers "$providers" validate "$candidate"; then
+    if ! CARGO_TARGET_DIR="$repo_root/target" cargo run --manifest-path "$repo_root/Cargo.toml" -q -p qcg --locked -- --providers "$providers" validate "$candidate"; then
       continue
     fi
     if fingerprint="$(verify_equivalent "$input_generator" "$candidate")"; then

@@ -15,7 +15,7 @@ const logChunks = [];
 
 async function main() {
   execFileSync("npm", ["run", "build"], { cwd: "frontend/generator", stdio: "inherit" });
-  execFileSync("cargo", ["build", "-p", "qcg"], { stdio: "inherit" });
+  execFileSync("cargo", ["build", "-p", "qcg", "--locked"], { stdio: "inherit" });
   browser = await chromium.launch();
   const modes = [
     { name: "vite-proxy", apiPort: qcgPort, frontendPort: uiPort, frontend: "vite" },

@@ -5,7 +5,6 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use uuid::Uuid;
 
 use super::types::EngineError;
 
@@ -260,8 +259,15 @@ fn persist_checkpoint_blob(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(EngineError::Io(error)),
     }
-    let temporary = blobs.join(format!(".{sha256}.tmp-{}", Uuid::now_v7()));
-    let copy_result = (|| -> Result<(), std::io::Error> {
+    // Publish through the shared sidecar writer: owner-only staging created
+    // with O_EXCL, a symlink refused at the destination, an atomic rename, and
+    // a parent directory sync. The previous hand-rolled temp-plus-rename left
+    // its temp name behind whenever the copy failed and had no owner-only
+    // guarantee. A writer that publishes the same digest inside the race
+    // window is now simply overwritten with identical verified content instead
+    // of failing the run; genuinely divergent content is still refused by the
+    // digest check above before staging starts.
+    qcg_fs::write_file_atomic(&destination, |file| {
         // Open without following a terminal symlink, matching the hash
         // above: a link swapped in after verification is refused instead
         // of copied (E06). Non-Unix falls back to a pre-open probe.
@@ -283,58 +289,20 @@ fn persist_checkpoint_blob(
             }
             std::fs::File::open(source)?
         };
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)?;
-        {
-            let mut writer = LimitedFileWriter {
-                file: &mut file,
-                bytes: 0,
-                limit: file_limit
-                    .map(|limit| {
-                        u64::try_from(limit).map_err(|_| {
-                            std::io::Error::other("output file limit does not fit in u64")
-                        })
-                    })
-                    .transpose()?,
-            };
-            std::io::copy(&mut input, &mut writer)?;
-        }
-        file.sync_all()?;
+        let mut writer = LimitedFileWriter {
+            file,
+            bytes: 0,
+            limit: file_limit
+                .map(|limit| {
+                    u64::try_from(limit)
+                        .map_err(|_| std::io::Error::other("output file limit does not fit in u64"))
+                })
+                .transpose()?,
+        };
+        std::io::copy(&mut input, &mut writer)?;
         Ok(())
-    })();
-    if let Err(error) = copy_result {
-        // Best-effort reclaim documented here: the copy error below stays
-        // authoritative, and the startup sweep reaps anything left behind.
-        let _ = std::fs::remove_file(&temporary);
-        return Err(error.into());
-    }
-    match std::fs::rename(&temporary, &destination) {
-        Ok(()) => Ok(()),
-        Err(_rename_error)
-            if matches!(
-                std::fs::symlink_metadata(&destination).map(|m| m.file_type().is_symlink()),
-                Ok(false)
-            ) =>
-        {
-            // Best-effort reclaim documented here: the digest check below
-            // decides the outcome. A symlink at the destination is never
-            // treated as a competing writer (E06).
-            let _ = std::fs::remove_file(&temporary);
-            if hash_file(&destination, file_limit)?.sha256 == sha256 {
-                Ok(())
-            } else {
-                Err(EngineError::Failed(format!(
-                    "checkpoint blob `{sha256}` was replaced with invalid content"
-                )))
-            }
-        }
-        Err(error) => {
-            let _ = std::fs::remove_file(&temporary);
-            Err(error.into())
-        }
-    }
+    })?;
+    Ok(())
 }
 
 pub(crate) struct FileDigest {

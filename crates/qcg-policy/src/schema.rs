@@ -9,10 +9,9 @@ pub const MAX_JSON_SCHEMA_NODES: usize = 8_192;
 pub const MAX_JSON_SCHEMA_OBJECT_MEMBERS: usize = 1_024;
 pub const MAX_JSON_SCHEMA_STRING_BYTES: usize = 16 * 1024;
 
-/// Rejects oversized, over-nested, or externally-referenced schemas, then
-/// proves the schema compiles. Iterative so untrusted input cannot overflow
-/// the call stack.
-pub fn validate_bounded_json_schema(schema: &Value) -> Result<(), String> {
+/// Rejects oversized, over-nested, or externally-referenced schemas. Iterative
+/// so untrusted input cannot overflow the call stack.
+fn check_bounded_json_schema(schema: &Value) -> Result<(), String> {
     let encoded = serde_json::to_vec(schema)
         .map_err(|error| format!("failed to encode JSON Schema: {error}"))?;
     if encoded.len() > MAX_JSON_SCHEMA_BYTES {
@@ -68,9 +67,13 @@ pub fn validate_bounded_json_schema(schema: &Value) -> Result<(), String> {
         }
     }
 
-    jsonschema::validator_for(schema)
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+    Ok(())
+}
+
+/// Rejects oversized, over-nested, or externally-referenced schemas, then
+/// proves the schema compiles.
+pub fn validate_bounded_json_schema(schema: &Value) -> Result<(), String> {
+    compile_bounded_validator(schema).map(|_| ())
 }
 
 /// Bounds-checks then compiles a schema, returning the reusable validator.
@@ -78,7 +81,7 @@ pub fn validate_bounded_json_schema(schema: &Value) -> Result<(), String> {
 /// of calling `jsonschema::validator_for` directly, so traversal bounds and
 /// the external-reference ban apply uniformly.
 pub fn compile_bounded_validator(schema: &Value) -> Result<jsonschema::Validator, String> {
-    validate_bounded_json_schema(schema)?;
+    check_bounded_json_schema(schema)?;
     jsonschema::validator_for(schema).map_err(|error| error.to_string())
 }
 

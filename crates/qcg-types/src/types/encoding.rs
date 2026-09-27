@@ -64,62 +64,69 @@ pub(crate) fn encode_base64(bytes: &[u8]) -> String {
     output
 }
 
-pub(crate) fn decode_base64(input: &str) -> Result<Vec<u8>, FileValueError> {
-    if input.len() % 4 == 1 {
-        return Err(FileValueError::InvalidBase64(
-            "length must not leave a single trailing sextet".into(),
-        ));
+/// The single base64 decoder for every wire and file surface.
+///
+/// Canonical RFC 4648 with the standard alphabet and required padding, and
+/// nothing else: an unpadded value, interior whitespace, or non-zero trailing
+/// bits are rejected instead of being normalized, so one encoding of the same
+/// bytes is the only accepted spelling. `qcg-steps` and the design schema
+/// enforce the same rule.
+pub fn decode_canonical_base64(input: &str) -> Result<Vec<u8>, String> {
+    if !input.len().is_multiple_of(4) {
+        return Err("base64 length must be a multiple of four with required padding".to_string());
     }
     let bytes = input.as_bytes();
-    let mut output = Vec::with_capacity(input.len().div_ceil(4) * 3);
+    let mut output = Vec::with_capacity(bytes.len() / 4 * 3);
     let mut index = 0;
     while index < bytes.len() {
-        let remaining = bytes.len() - index;
-        let chunk_len = remaining.min(4);
-        if chunk_len < 4 {
-            let first = base64_value(bytes[index])?;
-            let second = base64_value(bytes[index + 1])?;
-            output.push((first << 2) | (second >> 4));
-            if chunk_len == 3 {
-                let third = base64_value(bytes[index + 2])?;
-                output.push((second << 4) | (third >> 2));
-            }
-            break;
-        }
-        let first = base64_value(bytes[index])?;
-        let second = base64_value(bytes[index + 1])?;
-        output.push((first << 2) | (second >> 4));
+        let first = base64_value(bytes[index]).map_err(|error| error.to_string())?;
+        let second = base64_value(bytes[index + 1]).map_err(|error| error.to_string())?;
         if bytes[index + 2] == b'=' {
-            if bytes[index + 3] != b'=' || index + 4 != bytes.len() {
-                return Err(FileValueError::InvalidBase64("invalid padding".into()));
+            // `xx==` carries one byte: the second sextet must have no low bits.
+            if bytes[index + 3] != b'=' || second & 0x0f != 0 {
+                return Err("base64 padding is not canonical".to_string());
+            }
+            output.push((first << 2) | (second >> 4));
+            index += 4;
+            if index != bytes.len() {
+                return Err("base64 data appeared after terminal padding".to_string());
             }
             break;
         }
-        let third = base64_value(bytes[index + 2])?;
-        output.push((second << 4) | (third >> 2));
+        let third = base64_value(bytes[index + 2]).map_err(|error| error.to_string())?;
         if bytes[index + 3] == b'=' {
-            if index + 4 != bytes.len() {
-                return Err(FileValueError::InvalidBase64("invalid padding".into()));
+            // `xxx=` carries two bytes: the third sextet must have no low bits.
+            if third & 0x03 != 0 {
+                return Err("base64 padding is not canonical".to_string());
+            }
+            output.push((first << 2) | (second >> 4));
+            output.push((second << 4) | (third >> 2));
+            index += 4;
+            if index != bytes.len() {
+                return Err("base64 data appeared after terminal padding".to_string());
             }
             break;
         }
-        let fourth = base64_value(bytes[index + 3])?;
+        let fourth = base64_value(bytes[index + 3]).map_err(|error| error.to_string())?;
+        output.push((first << 2) | (second >> 4));
+        output.push((second << 4) | (third >> 2));
         output.push((third << 6) | fourth);
         index += 4;
     }
     Ok(output)
 }
 
-fn base64_value(byte: u8) -> Result<u8, FileValueError> {
+pub(crate) fn decode_base64(input: &str) -> Result<Vec<u8>, FileValueError> {
+    decode_canonical_base64(input).map_err(FileValueError::InvalidBase64)
+}
+
+fn base64_value(byte: u8) -> Result<u8, String> {
     match byte {
         b'A'..=b'Z' => Ok(byte - b'A'),
         b'a'..=b'z' => Ok(byte - b'a' + 26),
         b'0'..=b'9' => Ok(byte - b'0' + 52),
         b'+' => Ok(62),
         b'/' => Ok(63),
-        _ => Err(FileValueError::InvalidBase64(format!(
-            "invalid character `{}`",
-            char::from(byte)
-        ))),
+        _ => Err("base64 contains a non-alphabet character".to_string()),
     }
 }

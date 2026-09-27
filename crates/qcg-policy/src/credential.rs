@@ -596,12 +596,12 @@ mod tests {
 
     #[test]
     fn debug_helpers_cover_url_header_body_and_args_sentinels() {
-        // E09h support: the redacting Debug wrappers for args-carrying
-        // types (`RedactedToolCall`/`RedactedMessage` in `qcg-llm-steps`)
-        // delegate to these helpers. This pins each helper against sentinel
-        // secrets for URL query values, credential headers, and credential
-        // assignments (body/args/content) so a wrapper regression fails here
-        // with the exact helper at fault.
+        // E09h support: every surface that must not carry plaintext
+        // (`redacted_tool_call_args` and the message-text path in
+        // `qcg-llm-steps`) delegates to these helpers. This pins each helper
+        // against sentinel secrets for URL query values, credential headers,
+        // and credential assignments (body/args/content) so a regression fails
+        // here with the exact helper at fault.
         let url = redact_all_query_values(
             "https://example.test/search?q=SENTINEL_URL&api_key=SENTINEL_KEY",
         );

@@ -17,9 +17,6 @@ export function isBlockingSchemaIssue(issue: SchemaIssue): boolean {
 
 export const MAX_SCHEMA_DEPTH = 12;
 export const MAX_SCHEMA_NODES = 256;
-// No mechanistic file size limit in the frontend. Size bounds are set
-// explicitly via qcg.toml [runtime] and enforced by the server.
-export const MAX_FILE_INPUT_BYTES: number | undefined = undefined;
 const FALSE_SCHEMA_MARKER = "__qcg_false_schema";
 
 const BUILTIN_KINDS = new Set([
@@ -44,12 +41,8 @@ export function isSafeFileName(name: string): boolean {
     && !name.includes("\0");
 }
 
-export function validateFileInput(file: File | undefined, maxBytes?: number): void {
+export function validateFileInput(file: File | undefined): void {
   if (!file) return;
-  const limit = maxBytes ?? MAX_FILE_INPUT_BYTES;
-  if (limit !== undefined && file.size > limit) {
-    throw new Error(`file input exceeds the ${limit} byte limit`);
-  }
   if (!isSafeFileName(file.name)) {
     throw new Error(`file name must be one safe path component: ${file.name}`);
   }
@@ -327,31 +320,7 @@ export function schemaDefault(schema: JsonSchema): unknown {
 
 /** Count JSON values up to the renderer budget so a hostile schema cannot force a full scan. */
 export function schemaNodeCount(schema: JsonSchema, max = MAX_SCHEMA_NODES): number {
-  const stack: unknown[] = [schema];
-  const seen = new Set<object>();
-  let count = 0;
-  while (stack.length > 0) {
-    const value = stack.pop();
-    count += 1;
-    if (count > max) return count;
-    if (value === null || typeof value !== "object") continue;
-    if (seen.has(value)) continue;
-    seen.add(value);
-    if (Array.isArray(value)) {
-      if (value.length > max) return max + 1;
-      for (let index = value.length - 1; index >= 0; index -= 1) stack.push(value[index]);
-      continue;
-    }
-    const object = value as Record<string, unknown>;
-    let properties = 0;
-    for (const key in object) {
-      if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
-      properties += 1;
-      if (properties > max) return max + 1;
-      stack.push(object[key]);
-    }
-  }
-  return count;
+  return countNodesCapped(schema, max);
 }
 
 /**
@@ -359,31 +328,35 @@ export function schemaNodeCount(schema: JsonSchema, max = MAX_SCHEMA_NODES): num
  * This is deliberately iterative so untrusted JSON cannot overflow the call stack.
  */
 export function valueNodeCountExceeded(value: unknown, max = MAX_SCHEMA_NODES): boolean {
+  return countNodesCapped(value, max) > max;
+}
+
+function countNodesCapped(value: unknown, max: number): number {
   const stack: unknown[] = [value];
   const seen = new Set<object>();
   let count = 0;
   while (stack.length > 0) {
     const current = stack.pop();
     count += 1;
-    if (count > max) return true;
+    if (count > max) return count;
     if (current === null || typeof current !== "object") continue;
     if (seen.has(current)) continue;
     seen.add(current);
     if (Array.isArray(current)) {
-      if (current.length > max) return true;
+      if (current.length > max) return max + 1;
       for (let index = current.length - 1; index >= 0; index -= 1) stack.push(current[index]);
-    } else {
-      const object = current as Record<string, unknown>;
-      let properties = 0;
-      for (const key in object) {
-        if (!Object.prototype.hasOwnProperty.call(object, key)) continue;
-        properties += 1;
-        if (properties > max) return true;
-        stack.push(object[key]);
-      }
+      continue;
+    }
+    const object = current as Record<string, unknown>;
+    let properties = 0;
+    for (const key in object) {
+      if (!Object.prototype.hasOwnProperty.call(object, key)) continue;
+      properties += 1;
+      if (properties > max) return max + 1;
+      stack.push(object[key]);
     }
   }
-  return false;
+  return count;
 }
 
 /** Resolve local JSON Schema references for display while leaving external refs untouched. */

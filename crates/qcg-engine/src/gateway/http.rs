@@ -614,6 +614,19 @@ pub fn redact_credential_values(value: &serde_json::Value) -> serde_json::Value 
     redact(value, false)
 }
 
+pub fn redact_mcp_args_for_journal(args: &serde_json::Value) -> serde_json::Value {
+    let redacted = redact_credential_values(args);
+    if redacted
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .is_some()
+    {
+        redact_http_args_for_journal(&redacted)
+    } else {
+        redacted
+    }
+}
+
 pub(crate) fn ensure_url_allowed(permissions: &Permissions, url: &str) -> Result<(), GatewayError> {
     let redacted = qcg_policy::redact_all_query_values(url);
     let parsed = Url::parse(url).map_err(|_| GatewayError::UnsupportedUrl {

@@ -219,6 +219,12 @@ impl LlmRepairStep {
         // an in-process writer racing this node can only surface as an
         // explicit base mismatch, never as a silent overwrite.
         let source_target = ctx.run.fs.resolve_read(&snapshot.path).step_err(&node.id)?;
+        let target_before = ctx
+            .run
+            .fs
+            .observe_patch_state(&target)
+            .await
+            .map_err(|error| StepError::from_gateway(&node.id, error))?;
         let _guard =
             qcg_engine::lock_patch_paths(&[source_target.as_path(), target.as_path()]).await;
         let current = read_repair_target_text(ctx, node, &snapshot.path, &source_target)?;
@@ -226,6 +232,16 @@ impl LlmRepairStep {
             qcg_fs::apply_anchored_patch(&current, Some(&snapshot.base_sha256), &edits, limits)
                 .map_err(|error| StepError::failed(&node.id, repair_patch_error(&error)))?;
 
+        // Commit-time state re-check on the target, matching the anchored-patch
+        // contract: a writer outside this process's exclusion must surface as
+        // an explicit base mismatch instead of being silently overwritten. The
+        // observed state is read before the patch, so a target that did not
+        // exist must still not exist.
+        ctx.run
+            .fs
+            .require_unchanged_since(&target, target_before.as_deref())
+            .await
+            .map_err(|error| StepError::from_gateway(&node.id, error))?;
         ctx.run
             .fs
             .write_file_atomic(&target, outcome.new_text.as_bytes())

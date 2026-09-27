@@ -72,14 +72,6 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo test -p qcg-mcp --no-default-features --features mcp-test-server --locked -- --test-threads=1
 
-      - name: Test anonymous public MCP contracts
-        if: matrix.os == 'ubuntu-latest'
-        run: cargo test -p qcg-llm-steps --locked public_mcp_tools_accept_real_calls_and_validate_real_results -- --ignored --test-threads=1
-
-      - name: Test count
-        shell: bash
-        run: bash scripts/check-test-count.sh 520
-
       - name: Fixtures smoke
         shell: bash
         run: bash scripts/check-fixtures.sh

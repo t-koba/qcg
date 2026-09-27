@@ -10,6 +10,73 @@ use super::dto::{
 use super::openapi_doc::{insert_schema, openapi_paths};
 use crate::events::RunEvent;
 
+/// Publishes the run-event kind vocabulary and relaxes request-body defaults.
+///
+/// `required` is the only source of requiredness in the document. A generator
+/// infers "required" from a `default` annotation, which would force every SDK
+/// caller to send `answers`, `priority`, and the rest of a request the server
+/// already defaults, so the annotation is dropped for request bodies only.
+fn normalize_request_schemas(schemas: &mut serde_json::Map<String, Value>) {
+    for route in crate::api::routes::API_ROUTES {
+        let Some(name) = route.request_schema else {
+            continue;
+        };
+        let Some(Value::Object(schema)) = schemas.get_mut(name) else {
+            continue;
+        };
+        let required = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default();
+        if let Some(Value::Object(properties)) = schema.get_mut("properties") {
+            for (property, definition) in properties.iter_mut() {
+                if !required.iter().any(|entry| entry == property)
+                    && let Value::Object(definition) = definition
+                {
+                    definition.remove("default");
+                }
+            }
+        }
+    }
+}
+
+/// Publishes `RunEvent.kind` as the closed set the events endpoint can deliver
+/// so a generated client narrows an event by its kind instead of parsing `data`
+/// blind. The Rust wire type stays open: `RunEvent.kind` remains a `String` and
+/// an unknown kind from a newer server still decodes into
+/// `RunEventData::Unknown`, so an older client keeps the raw payload.
+fn narrow_event_kind(schemas: &mut serde_json::Map<String, Value>) {
+    let Some(Value::Object(event)) = schemas.get_mut("RunEvent") else {
+        return;
+    };
+    let Some(Value::Object(kind)) = event
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .and_then(|properties| properties.get_mut("kind"))
+    else {
+        return;
+    };
+    kind.insert("type".into(), Value::String("string".into()));
+    kind.insert(
+        "enum".into(),
+        Value::Array(
+            crate::events::all_run_event_kinds()
+                .into_iter()
+                .map(|kind| Value::from(kind.to_string()))
+                .collect(),
+        ),
+    );
+}
+
+/// Schemas of the document. Exposed as a map for callers that build a
+/// sub-document; the document itself nests it under `components.schemas`.
 pub fn openapi_components() -> Value {
     let mut schemas = serde_json::Map::new();
     insert_schema::<GeneratorSummary>(&mut schemas, "GeneratorSummary");
@@ -36,24 +103,29 @@ pub fn openapi_components() -> Value {
     insert_schema::<McpAuthorizationStart>(&mut schemas, "McpAuthorizationStart");
     insert_schema::<ProblemDetails>(&mut schemas, "ProblemDetails");
     insert_schema::<OutputManifest>(&mut schemas, "OutputManifest");
-    json!({
-        "schemas": schemas,
-        "securitySchemes": {
-            "bearerAuth": {
-                "type": "http",
-                "scheme": "bearer"
-            }
-        }
-    })
+    normalize_request_schemas(&mut schemas);
+    narrow_event_kind(&mut schemas);
+    json!({ "schemas": schemas })
 }
 
 pub fn openapi_document(version: &str) -> Value {
+    let mut components = openapi_components();
+    if let Value::Object(map) = &mut components {
+        map.insert(
+            "securitySchemes".into(),
+            json!({ "bearerAuth": { "type": "http", "scheme": "bearer" } }),
+        );
+        map.insert(
+            "responses".into(),
+            crate::api::openapi_doc::shared_error_responses(),
+        );
+    }
     json!({
         "openapi": "3.1.0",
         "info": { "title": "qcg", "version": version },
         "security": [{}, { "bearerAuth": [] }],
         "paths": openapi_paths(),
-        "components": openapi_components()
+        "components": components
     })
 }
 

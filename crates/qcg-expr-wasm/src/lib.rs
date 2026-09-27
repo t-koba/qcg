@@ -194,6 +194,28 @@ mod tests {
     }
 
     #[test]
+    fn eval_bool_json_agrees_with_the_shared_corpus() {
+        // The wasm adapter is held to the same corpus as the native evaluator,
+        // through its own entry point, so the two can never drift.
+        let (context, cases) =
+            qcg_contract::expr::corpus_fixture().expect("the corpus fixture should parse");
+        let context_json = serde_json::to_string(&context).expect("context should serialize");
+        let diverged: Vec<&str> = cases
+            .iter()
+            .filter(|(expr, expected)| {
+                eval_bool_json_inner(expr, &context_json).ok() != Some(*expected)
+            })
+            .map(|(expr, _)| expr.as_str())
+            .collect();
+        assert!(
+            diverged.is_empty(),
+            "the wasm adapter diverged from the corpus: {}",
+            diverged.join(", ")
+        );
+        assert!(cases.len() >= 50, "the corpus must keep its coverage");
+    }
+
+    #[test]
     fn eval_bool_json_reports_invalid_context() {
         let error = eval_bool_json_inner("true", "{").expect_err("invalid JSON should fail");
         assert!(error.contains("invalid expression context JSON"));

@@ -1,11 +1,10 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
+/// Decodes canonical padded base64 through the single shared decoder in
+/// `qcg-types`, so an HTTP body and a `FileValue` cannot disagree about which
+/// spellings are valid.
 pub(crate) fn strict_base64_decode(encoded: &str) -> Result<Vec<u8>, String> {
-    let decoded = BASE64.decode(encoded).map_err(|error| error.to_string())?;
-    if BASE64.encode(&decoded) != encoded {
-        return Err("value is not canonical padded base64".into());
-    }
-    Ok(decoded)
+    qcg_types::decode_canonical_base64(encoded)
 }
 
 /// Decodes a workspace file to a target through the gateway: the source is

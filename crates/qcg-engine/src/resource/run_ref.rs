@@ -58,7 +58,10 @@ impl ResourceLoader for RunRefResourceLoader {
             .fs
             .resolve_write(relative.as_str())
             .map_err(|error| EngineError::Failed(format!("run reference `{name}`: {error}")))?;
-        match std::fs::read(&destination) {
+        // The pinned length is known, so a copy that grew cannot pass as the
+        // same revision: read one byte past it and let the cap refuse.
+        let pinned_len = material.bytes.len();
+        match qcg_fs::read_nofollow_bounded(&destination, Some(pinned_len)) {
             // Resume: the pinned copy must still be the exact revision.
             Ok(existing) if existing == material.bytes => {}
             Ok(existing) => {

@@ -6,12 +6,28 @@ use qcg_types::{FailureCode, FailureDetail, NodePath};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(unix)]
-use std::fs::File;
-use std::fs::OpenOptions;
-use std::io::Write;
 
 pub const RUN_STATE_SCHEMA_VERSION: u32 = 1;
+
+/// Durable diagnostics that the journal keeps for operators but that carry no
+/// folded state. They are listed as explicit arms so the fold never depends on
+/// a silent catch-all to accept them.
+/// Durable diagnostics the journal keeps for operators but that carry no folded
+/// state. `internal_journal_kinds_pass_the_fold_gate` pins that every entry is
+/// declared in `qcg_api::INTERNAL_RUN_EVENT_KINDS`.
+const STATE_FREE_JOURNAL_EVENT_KINDS: &[&str] = &[
+    "audit_degraded",
+    "elapsed_exceeded",
+    "foreach_sibling_ignored",
+    "hook_replayed",
+    "operation_repeated",
+    "step_interrupted",
+    "step_timeout",
+];
+
+fn is_known_journal_event_kind(kind: &str) -> bool {
+    qcg_api::is_known_run_event_kind(kind) || qcg_api::INTERNAL_RUN_EVENT_KINDS.contains(&kind)
+}
 
 /// Requires a field to be PRESENT on read while still accepting an explicit
 /// null for `Option` fields. Serde implicitly defaults missing `Option`
@@ -65,10 +81,12 @@ pub enum NodeOutcome {
     },
 }
 
-// No `#[serde(default)]` compat shims below (E07): every field is required
-// on read so a partial or old-format record fails closed instead of
-// silently degrading to zero values. Writers always persist complete
-// records, so a missing field is corruption, not a version to tolerate.
+// No `#[serde(default)]` compat shims (E07): every field is required on read,
+// so a partial or old-format record fails closed instead of silently
+// degrading to zero values. Writers always persist complete records, so a
+// missing field is corruption, not a version to tolerate. `Option` fields use
+// `required_presence` so an explicit null is accepted and an absent key is
+// not.
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BudgetState {
@@ -77,12 +95,11 @@ pub struct BudgetState {
     /// Live execution and journal recovery share this counter so retry and
     /// foreach charge rules mean the same after a restart. `steps_executed`
     /// stays as the observational event count (step_started events).
-    #[serde(default)]
     pub budget_charged: usize,
-    /// Whether any `budget_charged` event folded (F13 migration): new
-    /// journals seed the live tracker from `budget_charged`; journals that
-    /// predate the event fall back to `steps_executed`.
-    #[serde(default)]
+    /// Whether any `budget_charged` event folded. A run resumes its budget
+    /// from `budget_charged` when this is set and from the observational
+    /// `steps_executed` count otherwise, so the two counters never disagree
+    /// about how much of the ceiling is spent.
     pub has_budget_charges: bool,
     pub steps_succeeded: u64,
     pub steps_failed: u64,
@@ -158,6 +175,17 @@ pub struct RunState {
     #[serde(deserialize_with = "required_presence")]
     pub terminal: Option<TerminalState>,
     pub execution_started: bool,
+    /// Journal timestamp of the terminal event, or `None` while the run is
+    /// live. Projections report the settled time from here instead of
+    /// re-deriving it by scanning lifecycle events.
+    #[serde(deserialize_with = "required_presence")]
+    pub finished_at: Option<String>,
+    /// Admission identity from the last `run_queued`: scheduling priority,
+    /// the parent run this one forked, and the recorded queue instant. A
+    /// restart reads these from the fold instead of rescanning the journal.
+    pub priority: i32,
+    pub parent_run_id: Option<String>,
+    pub queued_at: Option<String>,
     /// External side-effect operations by operation_id. Identity binds
     /// run, node, and invocation ONLY: the content digest lives on the
     /// record as a compared attribute, never in the key, so distinct
@@ -197,7 +225,6 @@ pub struct RunState {
     /// processed, not pending. Resume skips it instead of re-executing so a
     /// HITL resume after a warned `run_started` hook has no undeclared
     /// duplicate execution. Successful hooks replay via node outcomes.
-    #[serde(default)]
     pub hooks_settled: BTreeSet<String>,
 }
 
@@ -224,6 +251,10 @@ impl Default for RunState {
             pending_seq: None,
             terminal: None,
             execution_started: false,
+            finished_at: None,
+            priority: 0,
+            parent_run_id: None,
+            queued_at: None,
             operation_records: BTreeMap::new(),
             operation_attempts: BTreeMap::new(),
             answers: BTreeMap::new(),
@@ -278,15 +309,6 @@ pub struct OperationRecord {
 /// to a sidecar blob under the run meta dir, and replays load the blob
 /// instead of routing to manual recovery or returning truncated results.
 pub const OPERATION_RESULT_MAX_BYTES: usize = 64 * 1024;
-
-/// Returns `Some(value)` when the value serializes within the inline
-/// resend-cache bound, else `None` (the caller spills to a sidecar blob).
-/// Serialization failures propagate with context instead of silently
-/// reading as "too large": an unserializable result must fail closed (E07).
-pub fn cacheable_operation_result(value: &Value) -> Result<Option<Value>, serde_json::Error> {
-    let bytes = serde_json::to_vec(value)?;
-    Ok((bytes.len() <= OPERATION_RESULT_MAX_BYTES).then(|| value.clone()))
-}
 
 /// Stable operation id for an external side effect. The logical key is run,
 /// node, and invocation ONLY: the content digest lives on the record as a
@@ -383,6 +405,43 @@ impl RunState {
             .get("t")
             .and_then(Value::as_str)
             .ok_or_else(|| crate::JournalError::InvalidEvent("event kind is required".into()))?;
+        // Identity is established by the admission records, so those are the
+        // only kinds allowed to name a run: a fork journal carries the
+        // source's `run_queued` before its own, and `run_forked` rebinds the
+        // journal to the fork. Every other record must match the identity the
+        // journal already folded, so a foreign or spliced event fails closed.
+        if !matches!(kind, "run_queued" | "run_started" | "run_forked")
+            && let Some(expected) = self.run_id.as_deref()
+            && let Some(actual) = event.get("run_id").and_then(Value::as_str)
+            && actual != expected
+        {
+            return Err(crate::JournalError::InvalidEvent(format!(
+                "run event belongs to `{actual}`, expected `{expected}`"
+            )));
+        }
+        if !is_known_journal_event_kind(kind) {
+            return Err(crate::JournalError::InvalidEvent(format!(
+                "unknown run event kind `{kind}`"
+            )));
+        }
+        // A final outcome can only be followed by an explicit lifecycle
+        // restart (`run_queued`/`run_started`/`run_resumed` re-arm the fold).
+        // Any other record after success, failure, or cancellation means the
+        // journal settled twice or was appended out of order, and it is
+        // refused instead of silently continuing the dead run. `run_interrupted`
+        // needs no exemption: it is not final, and a HITL resume appends
+        // straight after it.
+        if self.terminal.as_ref().is_some_and(|terminal| {
+            matches!(
+                terminal,
+                TerminalState::Succeeded | TerminalState::Failed | TerminalState::Canceled
+            )
+        }) && !matches!(kind, "run_queued" | "run_started" | "run_resumed")
+        {
+            return Err(crate::JournalError::InvalidEvent(format!(
+                "final run cannot accept `{kind}`"
+            )));
+        }
         // Journal format gate: the identity record declares the schema
         // version. An unknown version is refused instead of being folded
         // under current assumptions (fail closed, no compatibility branch).
@@ -397,6 +456,18 @@ impl RunState {
         }
         match kind {
             "run_queued" | "run_started" => {
+                // A different run id in the same journal is only a fork, and
+                // only when the admission names the run it forked from.
+                if let (Some(previous), Some(next)) = (
+                    self.run_id.as_deref(),
+                    event.get("run_id").and_then(Value::as_str),
+                ) && previous != next
+                    && event.get("parent_run_id").and_then(Value::as_str) != Some(previous)
+                {
+                    return Err(crate::JournalError::InvalidEvent(format!(
+                        "admission for `{next}` does not name `{previous}` as its parent"
+                    )));
+                }
                 self.run_id = event
                     .get("run_id")
                     .and_then(Value::as_str)
@@ -439,6 +510,23 @@ impl RunState {
                 // Pre-provided answers and confirmations ride on run_queued
                 // for unattended runs; later events win on the same key.
                 if kind == "run_queued" {
+                    if let Some(priority) = event.get("priority").and_then(Value::as_i64) {
+                        self.priority =
+                            i32::try_from(priority.clamp(i64::from(i32::MIN), i64::from(i32::MAX)))
+                                .unwrap_or_default();
+                    }
+                    self.parent_run_id = event
+                        .get("parent_run_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    // Requeue order must survive restarts, and an answer can
+                    // arrive long after admission, so the latest acceptance
+                    // restamps the instant too (C04).
+                    self.queued_at = event
+                        .get("queued_at")
+                        .and_then(Value::as_str)
+                        .or_else(|| event.get("ts").and_then(Value::as_str))
+                        .map(str::to_string);
                     if let Some(map) = event.get("answers").and_then(Value::as_object) {
                         for (key, value) in map {
                             self.answers.insert(key.clone(), value.clone());
@@ -683,22 +771,49 @@ impl RunState {
                 }
             }
             "user_answered" | "user_confirmed" => {
+                self.queued_at = event
+                    .get("queued_at")
+                    .and_then(Value::as_str)
+                    .or_else(|| event.get("ts").and_then(Value::as_str))
+                    .map(str::to_string);
                 // Durability record for an accepted HITL response. The engine
                 // consumes the persisted answers map on resume, so the
                 // pending prompt is cleared here and rehydrate restores the
                 // values from the same events. Later events win on the same
                 // key, matching read_persisted_hitl.
                 if kind == "user_answered" {
-                    if let (Some(id), Some(values)) = (
-                        event.get("question_id").and_then(Value::as_str),
-                        event.get("values").cloned(),
-                    ) {
-                        self.answers.insert(id.to_string(), values);
-                    }
-                } else if let (Some(id), Some(approved)) = (
-                    event.get("confirmation_id").and_then(Value::as_str),
-                    event.get("approved").and_then(Value::as_bool),
-                ) {
+                    let id = event
+                        .get("question_id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            crate::JournalError::InvalidEvent(
+                                "user_answered question_id is required".into(),
+                            )
+                        })?;
+                    let values = event.get("values").cloned().ok_or_else(|| {
+                        crate::JournalError::InvalidEvent(
+                            "user_answered values are required".into(),
+                        )
+                    })?;
+                    self.answers.insert(id.to_string(), values);
+                } else {
+                    let id = event
+                        .get("confirmation_id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            crate::JournalError::InvalidEvent(
+                                "user_confirmed confirmation_id is required".into(),
+                            )
+                        })?;
+                    let approved =
+                        event
+                            .get("approved")
+                            .and_then(Value::as_bool)
+                            .ok_or_else(|| {
+                                crate::JournalError::InvalidEvent(
+                                    "user_confirmed approved must be boolean".into(),
+                                )
+                            })?;
                     self.confirmations.insert(id.to_string(), approved);
                 }
                 self.pending = None;
@@ -784,6 +899,7 @@ impl RunState {
                 }
             }
             "run_finished" => {
+                self.finished_at = event.get("ts").and_then(Value::as_str).map(str::to_string);
                 self.pending = None;
                 self.pending_seq = None;
                 self.terminal = Some(
@@ -795,16 +911,27 @@ impl RunState {
                 );
             }
             "run_error" => {
+                self.finished_at = event.get("ts").and_then(Value::as_str).map(str::to_string);
                 self.pending = None;
                 self.pending_seq = None;
                 self.terminal = Some(TerminalState::Failed);
             }
             "run_canceled" => {
+                self.finished_at = event.get("ts").and_then(Value::as_str).map(str::to_string);
                 self.pending = None;
                 self.pending_seq = None;
                 self.terminal = Some(TerminalState::Canceled);
             }
+            "run_forked" => {
+                // The fork marker rebinds the copied journal to the fork's
+                // identity; everything after it must carry that run id.
+                self.run_id = event
+                    .get("run_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
             "run_interrupted" => {
+                self.finished_at = event.get("ts").and_then(Value::as_str).map(str::to_string);
                 self.pending = None;
                 self.pending_seq = None;
                 self.terminal = Some(TerminalState::Interrupted);
@@ -898,6 +1025,10 @@ impl RunState {
                     // sidecar on resend (E07).
                     record.result_ref = result_ref;
                 }
+            }
+            kind if STATE_FREE_JOURNAL_EVENT_KINDS.contains(&kind) => {
+                // Durable operator diagnostics with no folded state. The arm
+                // exists so accepting them is a decision, not a fallthrough.
             }
             _ => {}
         }
@@ -1024,17 +1155,11 @@ impl RunState {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "state path has no parent")
         })?;
         std::fs::create_dir_all(parent)?;
-        let tmp = path.with_extension("json.tmp");
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_data()?;
-        std::fs::rename(&tmp, path)?;
-        #[cfg(unix)]
-        File::open(parent)?.sync_data()?;
+        // The shared sidecar publisher: owner-only staging, refusal of a
+        // planted symlink at the destination, atomic publish, and a parent
+        // directory sync. The previous hand-rolled `state.json.tmp` sequence
+        // followed symlinks and left the temp name behind on failure.
+        qcg_fs::write_sidecar_atomic(path, bytes)?;
         Ok(())
     }
 }

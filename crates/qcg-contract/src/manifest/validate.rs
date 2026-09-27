@@ -3,7 +3,7 @@ use crate::{
     parse_skill_doc, validate_skill_doc,
 };
 use camino::Utf8Path;
-use qcg_policy::validate_bounded_json_schema;
+use qcg_policy::{is_safe_path_component, validate_bounded_json_schema};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -352,6 +352,11 @@ struct ResourceRule;
 impl ResourceRule {
     pub(crate) fn validate(&self, manifest: &Manifest) -> Result<(), ContractError> {
         for (name, resource) in &manifest.resources {
+            if !is_safe_path_component(name) {
+                return Err(ContractError::Invalid(format!(
+                    "resource name `{name}` must be a safe path component"
+                )));
+            }
             match resource.kind {
                 ResourceKind::File
                 | ResourceKind::Dir

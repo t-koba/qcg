@@ -1,5 +1,43 @@
 {
   "components": {
+    "responses": {
+      "TooManyRequests": {
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProblemDetails"
+            }
+          }
+        },
+        "description": "Rate limited",
+        "headers": {
+          "Retry-After": {
+            "description": "Whole seconds to wait before retrying, always at least one",
+            "schema": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProblemDetails"
+            }
+          }
+        },
+        "description": "Authentication required",
+        "headers": {
+          "WWW-Authenticate": {
+            "description": "Bearer realm=\"qcg\"; the request carried no valid API token",
+            "schema": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
     "schemas": {
       "AgentCheckpointEventData": {
         "additionalProperties": false,
@@ -786,7 +824,6 @@
         "properties": {
           "answers": {
             "additionalProperties": true,
-            "default": {},
             "description": "Pre-provisioned answers keyed by question id, consumed without interaction.",
             "type": "object"
           },
@@ -799,12 +836,10 @@
             "additionalProperties": {
               "type": "boolean"
             },
-            "default": {},
             "description": "Pre-provisioned confirmation decisions keyed by confirmation id.",
             "type": "object"
           },
           "priority": {
-            "default": null,
             "description": "Scheduling priority, higher runs first. Defaults to 0.",
             "format": "int32",
             "type": [
@@ -813,12 +848,7 @@
             ]
           },
           "state_patch": {
-            "$ref": "#/components/schemas/ForkStatePatch",
-            "default": {
-              "inputs": {},
-              "step_outputs": {},
-              "step_statuses": {}
-            }
+            "$ref": "#/components/schemas/ForkStatePatch"
           }
         },
         "required": [
@@ -2455,6 +2485,73 @@
             "$ref": "#/components/schemas/RunEventData"
           },
           "kind": {
+            "enum": [
+              "agent_checkpoint",
+              "agent_completed",
+              "agent_delegated",
+              "agent_failed",
+              "agent_handoff",
+              "artifact",
+              "audit_degraded",
+              "budget_charged",
+              "confirm_request",
+              "context_compacted",
+              "dry_run",
+              "elapsed_exceeded",
+              "foreach_budget_exhausted",
+              "foreach_iteration",
+              "foreach_sibling_ignored",
+              "graph_resolved",
+              "guardrail_error",
+              "guardrail_evaluated",
+              "guardrail_tripwire",
+              "hook_failed",
+              "hook_replayed",
+              "hook_skipped",
+              "lagged",
+              "llm_call",
+              "llm_delta",
+              "llm_route_failed",
+              "llm_validation_failed",
+              "mcp_continuation_consumed",
+              "mcp_continuation_resumed",
+              "mcp_input_pending",
+              "operation_finished",
+              "operation_repeated",
+              "operation_started",
+              "out_of_contract",
+              "regenerate_attempt_finished",
+              "regenerate_attempt_started",
+              "repair_attempt_finished",
+              "repair_attempt_started",
+              "resource",
+              "run_canceled",
+              "run_error",
+              "run_finished",
+              "run_forked",
+              "run_interrupted",
+              "run_queued",
+              "run_resumed",
+              "run_started",
+              "run_waiting",
+              "shutdown",
+              "side_effect",
+              "state_patched",
+              "step_finished",
+              "step_interrupted",
+              "step_replayed",
+              "step_retry",
+              "step_skipped",
+              "step_started",
+              "step_timeout",
+              "stream_error",
+              "tool_backend_resolved",
+              "tool_call",
+              "user_answered",
+              "user_cancel_requested",
+              "user_confirmed",
+              "user_interaction"
+            ],
             "type": "string"
           },
           "parent_span_id": {
@@ -3204,7 +3301,6 @@
         "properties": {
           "answers": {
             "additionalProperties": true,
-            "default": {},
             "description": "Pre-provisioned answers keyed by question id, consumed without interaction.\nSame semantics as eval suite answers.",
             "type": "object"
           },
@@ -3217,14 +3313,12 @@
                 "type": "null"
               }
             ],
-            "default": null,
             "description": "Requests a higher observation-audit level for this run. The\ndeployment floor and the generator policy can only be raised."
           },
           "confirmations": {
             "additionalProperties": {
               "type": "boolean"
             },
-            "default": {},
             "description": "Pre-provisioned confirmation decisions keyed by confirmation id.",
             "type": "object"
           },
@@ -3239,12 +3333,10 @@
             "additionalProperties": {
               "type": "string"
             },
-            "default": {},
             "description": "Free-form run metadata (for example `owner`). Metadata only: it is\nstored and returned with the run, and never confers authorization.",
             "type": "object"
           },
           "priority": {
-            "default": null,
             "description": "Scheduling priority, higher runs first. Defaults to 0.",
             "format": "int32",
             "type": [
@@ -3697,6 +3789,12 @@
             },
             "description": "Available generators"
           },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -3772,6 +3870,9 @@
             },
             "description": "Invalid request"
           },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
           "404": {
             "content": {
               "application/problem+json": {
@@ -3781,6 +3882,9 @@
               }
             },
             "description": "Resource not found"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           },
           "500": {
             "content": {
@@ -3838,6 +3942,9 @@
             },
             "description": "Invalid request"
           },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
           "404": {
             "content": {
               "application/problem+json": {
@@ -3847,6 +3954,9 @@
               }
             },
             "description": "Resource not found"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           },
           "500": {
             "content": {
@@ -3884,6 +3994,12 @@
               }
             },
             "description": "Selectable provider, model, and reasoning effort metadata"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           },
           "500": {
             "content": {
@@ -3956,6 +4072,9 @@
             },
             "description": "Invalid request"
           },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
           "403": {
             "content": {
               "application/problem+json": {
@@ -3965,6 +4084,9 @@
               }
             },
             "description": "Request failed"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           },
           "500": {
             "content": {
@@ -3992,6 +4114,12 @@
               }
             },
             "description": "Configured MCP servers"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           },
           "500": {
             "content": {
@@ -4033,6 +4161,9 @@
             },
             "description": "Invalid request"
           },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
           "403": {
             "content": {
               "application/problem+json": {
@@ -4042,6 +4173,9 @@
               }
             },
             "description": "Request failed"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           }
         },
         "summary": "Clear stored MCP OAuth authorization"
@@ -4078,6 +4212,9 @@
             },
             "description": "Invalid request"
           },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
           "403": {
             "content": {
               "application/problem+json": {
@@ -4087,6 +4224,9 @@
               }
             },
             "description": "Request failed"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           }
         },
         "summary": "Start MCP OAuth authorization"
@@ -4118,6 +4258,9 @@
             },
             "description": "Invalid request"
           },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
           "403": {
             "content": {
               "application/problem+json": {
@@ -4127,6 +4270,9 @@
               }
             },
             "description": "Request failed"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           }
         },
         "summary": "Cancel a pending MCP OAuth authorization"
@@ -4140,6 +4286,12 @@
               "application/json": {}
             },
             "description": "OpenAPI document"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           },
           "500": {
             "content": {
@@ -4232,6 +4384,12 @@
             },
             "description": "Invalid request"
           },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -4296,6 +4454,9 @@
             },
             "description": "Invalid request"
           },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
           "409": {
             "content": {
               "application/problem+json": {
@@ -4325,6 +4486,9 @@
               }
             },
             "description": "Validation failed"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           },
           "500": {
             "content": {
@@ -4366,6 +4530,9 @@
           "204": {
             "description": "Run deleted"
           },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
           "404": {
             "content": {
               "application/problem+json": {
@@ -4385,6 +4552,9 @@
               }
             },
             "description": "Resource conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           },
           "500": {
             "content": {
@@ -4459,6 +4629,9 @@
             },
             "description": "Invalid request"
           },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
           "404": {
             "content": {
               "application/problem+json": {
@@ -4468,6 +4641,9 @@
               }
             },
             "description": "Resource not found"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           },
           "500": {
             "content": {
@@ -4544,6 +4720,9 @@
             },
             "description": "Invalid request"
           },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
           "404": {
             "content": {
               "application/problem+json": {
@@ -4553,6 +4732,9 @@
               }
             },
             "description": "Resource not found"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           },
           "500": {
             "content": {
@@ -4602,6 +4784,9 @@
             },
             "description": "Invalid request"
           },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
           "404": {
             "content": {
               "application/problem+json": {
@@ -4611,6 +4796,9 @@
               }
             },
             "description": "Resource not found"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           },
           "500": {
             "content": {
@@ -4668,6 +4856,9 @@
             },
             "description": "Invalid request"
           },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
           "404": {
             "content": {
               "application/problem+json": {
@@ -4677,6 +4868,9 @@
               }
             },
             "description": "Resource not found"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           },
           "500": {
             "content": {
@@ -4726,6 +4920,9 @@
             },
             "description": "Invalid request"
           },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
           "404": {
             "content": {
               "application/problem+json": {
@@ -4735,6 +4932,9 @@
               }
             },
             "description": "Resource not found"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           },
           "500": {
             "content": {
@@ -4810,6 +5010,9 @@
             },
             "description": "Invalid request"
           },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
           "404": {
             "content": {
               "application/problem+json": {
@@ -4839,6 +5042,9 @@
               }
             },
             "description": "Validation failed"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           },
           "500": {
             "content": {
@@ -4906,6 +5112,9 @@
             },
             "description": "Invalid request"
           },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
           "404": {
             "content": {
               "application/problem+json": {
@@ -4915,6 +5124,9 @@
               }
             },
             "description": "Resource not found"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           },
           "500": {
             "content": {
@@ -4990,6 +5202,9 @@
             },
             "description": "Invalid request"
           },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
           "409": {
             "content": {
               "application/problem+json": {
@@ -5019,6 +5234,9 @@
               }
             },
             "description": "Validation failed"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           },
           "500": {
             "content": {
@@ -5077,6 +5295,9 @@
             },
             "description": "Invalid request"
           },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
           "404": {
             "content": {
               "application/problem+json": {
@@ -5086,6 +5307,9 @@
               }
             },
             "description": "Resource not found"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           },
           "500": {
             "content": {
@@ -5134,6 +5358,9 @@
             },
             "description": "Invalid request"
           },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
           "404": {
             "content": {
               "application/problem+json": {
@@ -5143,6 +5370,9 @@
               }
             },
             "description": "Resource not found"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           },
           "500": {
             "content": {
@@ -5218,6 +5448,9 @@
             },
             "description": "Invalid request"
           },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
           "404": {
             "content": {
               "application/problem+json": {
@@ -5247,6 +5480,9 @@
               }
             },
             "description": "Validation failed"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           },
           "500": {
             "content": {
@@ -5304,6 +5540,9 @@
             },
             "description": "Settled run snapshot"
           },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
           "404": {
             "content": {
               "application/problem+json": {
@@ -5323,6 +5562,9 @@
               }
             },
             "description": "Resource conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           },
           "500": {
             "content": {
@@ -5346,6 +5588,9 @@
               "application/json": {}
             },
             "description": "Server is healthy"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
           },
           "500": {
             "content": {
@@ -5373,6 +5618,12 @@
               }
             },
             "description": "Prometheus text exposition"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           },
           "500": {
             "content": {

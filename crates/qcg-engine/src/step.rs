@@ -365,10 +365,6 @@ impl StepContext<'_> {
             )
             .step_err(&node.id)
     }
-
-    pub fn assert_secret_absent(&self, node: &NodeDef, text: &str) -> Result<(), StepError> {
-        self.run.secrets.assert_absent(text).step_err(&node.id)
-    }
 }
 
 pub(crate) fn usd_to_microusd(value: f64) -> u64 {

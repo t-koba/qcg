@@ -28,7 +28,7 @@ impl StepExecutor for ForeachStep {
 
     fn params_schema(&self) -> Option<Value> {
         Some(params_schema(
-            &["items", "subflow", "max_iterations"],
+            &["items", "subflow", "max_iterations", "parallel"],
             json!({
                 "items": string_schema(),
                 "subflow": string_schema(),

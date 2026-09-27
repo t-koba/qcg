@@ -814,12 +814,8 @@ mod tests {
         let skill = parse_skill_doc(source).expect("BOM and CRLF should parse");
         assert_eq!(skill.name, "demo");
         assert!(skill.instructions.is_empty());
-    }
-
-    #[test]
-    fn accepts_delimiter_trailing_spaces() {
-        let source = "---\nname: demo\ndescription: Demo\n---   \nBody.\n";
-        let skill = parse_skill_doc(source).expect("trailing spaces should parse");
+        let trailing = "---\nname: demo\ndescription: Demo\n---   \nBody.\n";
+        let skill = parse_skill_doc(trailing).expect("trailing spaces should parse");
         assert_eq!(skill.instructions, "Body.");
     }
 

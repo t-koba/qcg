@@ -2,6 +2,13 @@ use super::openapi_types::{
     ApiHeader, ApiParameter, ApiResponse, ApiRoute, ParameterSchema, ResponseBody, ResponseSchema,
 };
 
+/// Statuses every route can answer regardless of its own handler, because the
+/// bearer-auth middleware and the rate limiter run in front of all of them.
+/// Declared once here so the document cannot describe a route as unable to
+/// return 401 or 429 while the server does exactly that.
+pub const ERR_AUTH: &[u16] = &[401];
+pub const ERR_RATE_LIMITED: &[u16] = &[429];
+
 const ERR_INTERNAL: &[u16] = &[500];
 const ERR_RESOURCE: &[u16] = &[400, 404, 500];
 const ERR_INVALID: &[u16] = &[400, 500];
@@ -15,6 +22,22 @@ const NO_HEADERS: &[ApiHeader] = &[];
 const NO_QUERY_PARAMETERS: &[ApiParameter] = &[];
 /// Pagination bounds for `GET /api/runs`, shared by the OpenAPI document and
 /// the server handler so the documented and enforced ranges cannot diverge.
+/// Path that bypasses the rate limiter so a saturated limiter can never make
+/// the process look unhealthy. The document and the middleware share this
+/// constant instead of each naming the path.
+pub const RATE_LIMIT_EXEMPT_PATH: &str = "/healthz";
+
+/// Every status the shared middleware can produce for `path`, independent of
+/// the route handler: bearer authentication applies to all routes and rate
+/// limiting applies to every route except the exempt one.
+pub fn middleware_error_statuses(path: &str) -> Vec<u16> {
+    let mut statuses = ERR_AUTH.to_vec();
+    if path != RATE_LIMIT_EXEMPT_PATH {
+        statuses.extend_from_slice(ERR_RATE_LIMITED);
+    }
+    statuses
+}
+
 pub const RUN_LIST_LIMIT_MIN: usize = 1;
 pub const RUN_LIST_LIMIT_MAX: usize = 200;
 pub const RUN_LIST_LIMIT_DEFAULT: usize = 50;

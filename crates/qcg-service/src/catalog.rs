@@ -61,14 +61,6 @@ impl LocalQcgService {
         })
     }
 
-    pub async fn read_generator_asset(
-        &self,
-        id: String,
-        path: String,
-    ) -> Result<Vec<u8>, ApiError> {
-        self.read_generator_asset_with_limit(id, path, None).await
-    }
-
     pub async fn read_generator_asset_with_limit(
         &self,
         id: String,
@@ -121,12 +113,9 @@ impl LocalQcgService {
                 "generator asset `{path}` was not found"
             )));
         }
-        if max_bytes.is_none() {
-            return tokio::fs::read(&requested).await.map_err(api_internal);
-        }
-        let Some(limit) = max_bytes else {
-            return Err(api_internal("generator asset limit is missing"));
-        };
+        // An unset operator limit is not "unbounded": a package asset is read
+        // into memory to be served, so it inherits the hard default.
+        let limit = max_bytes.unwrap_or(qcg_policy::DEFAULT_MAX_ASSET_BYTES);
         let file = tokio::fs::File::open(requested)
             .await
             .map_err(api_internal)?;

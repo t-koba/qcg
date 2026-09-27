@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 
 function generated(command) {
-  return execFileSync("cargo", ["run", "-q", "-p", "qcg", "--", "docs", command], { encoding: "utf8" });
+  return execFileSync("cargo", ["run", "-q", "-p", "qcg", "--locked", "--", "docs", command], { encoding: "utf8" });
 }
 
 function replaceBlock(path, marker, content) {

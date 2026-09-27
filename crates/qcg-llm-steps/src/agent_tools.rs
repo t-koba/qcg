@@ -113,6 +113,21 @@ pub(crate) fn validate_agent_tool(
             if !contract
                 .manifest
                 .permissions
+                .fs_read
+                .iter()
+                .any(|scope| scope == "workspace")
+            {
+                return Err(StepError::failed(
+                    &node.id,
+                    format!(
+                        "tool `{}` requires permissions.fs_read to include workspace",
+                        name
+                    ),
+                ));
+            }
+            if !contract
+                .manifest
+                .permissions
                 .fs_write
                 .iter()
                 .any(|scope| scope == "workspace")
@@ -751,7 +766,7 @@ mod tests {
     fn agent_node() -> NodeDef {
         NodeDef {
             id: "agent".into(),
-            kind: StepType::from("llm.agent"),
+            kind: StepType::literal("llm.agent"),
             needs: vec![],
             when: None,
             on_deps: qcg_contract::OnDeps::AllSucceeded,

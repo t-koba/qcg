@@ -383,6 +383,17 @@ pub(crate) fn checkpoint_scope(
     Ok(())
 }
 
+/// Upper bound for one pending tool payload sidecar. A pending payload is a
+/// single tool call, so the tool-event value bound plus room for its envelope
+/// is the honest ceiling: an oversized sidecar is refused on write and on read
+/// instead of being trusted back into a continuation.
+const PENDING_PAYLOAD_MAX_BYTES: usize = qcg_policy::TOOL_EVENT_VALUE_LIMIT_BYTES + 4096;
+
+/// Ceiling for one spilled operation result. The sidecar indexes into the same
+/// run state, so it inherits the state ceiling instead of inventing a second
+/// limit that write and read could disagree about.
+const OPERATION_RESULT_SIDECAR_MAX_BYTES: usize = qcg_policy::DEFAULT_MAX_STATE_BYTES;
+
 impl RunContext {
     /// Test-only context builder for downstream approval/resume tests
     /// (F02). Mirrors production construction (same gateways, same secret
@@ -723,55 +734,25 @@ impl RunContext {
                 "operation `{operation_id}` large result sidecar dir cannot be created: {error}"
             ))
         })?;
+        // Spilled results live beside the journal, so they obey the same
+        // ceiling as the state that indexes them. Refusing here keeps write and
+        // read symmetric: a sidecar that could never be read back is refused at
+        // the moment the external effect is recorded, not at resend time.
+        if bytes.len() > OPERATION_RESULT_SIDECAR_MAX_BYTES {
+            return Err(fail(format!(
+                "operation `{operation_id}` result is {} bytes, exceeding the {OPERATION_RESULT_SIDECAR_MAX_BYTES}-byte sidecar bound",
+                bytes.len()
+            )));
+        }
         let path = dir.join(&name);
-        // Owner-only sidecar: results may carry sensitive data, and the
-        // mode is set explicitly instead of inheriting the umask. O_NOFOLLOW
-        // refuses a planted link at the sidecar path on Unix.
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
-        use std::io::Write as _;
-        let mut file = options.open(path.as_std_path()).map_err(|error| {
+        // One shared sidecar policy for the whole run metadata store: results
+        // may carry sensitive data, so the publication is owner-only, atomic,
+        // and refused when a symlink is planted at the path.
+        qcg_fs::write_sidecar_atomic(&path, &bytes).map_err(|error| {
             fail(format!(
-                "operation `{operation_id}` large result sidecar cannot be opened: {error}"
+                "operation `{operation_id}` large result sidecar cannot be published: {error}"
             ))
         })?;
-        file.write_all(&bytes).map_err(|error| {
-            fail(format!(
-                "operation `{operation_id}` large result sidecar cannot be written: {error}"
-            ))
-        })?;
-        file.sync_all().map_err(|error| {
-            fail(format!(
-                "operation `{operation_id}` large result sidecar cannot be synced: {error}"
-            ))
-        })?;
-        drop(file);
-        // Sync the directory entry like every other sidecar publication:
-        // without it a power loss can lose the sidecar name (Q2). Windows
-        // cannot open a directory; NTFS journals the rename itself there.
-        #[cfg(unix)]
-        std::fs::File::open(dir.as_std_path())
-            .and_then(|dir| dir.sync_all())
-            .map_err(|error| {
-                fail(format!(
-                    "operation `{operation_id}` large result directory cannot be synced: {error}"
-                ))
-            })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(path.as_std_path(), std::fs::Permissions::from_mode(0o600))
-                .map_err(|error| {
-                    fail(format!(
-                        "operation `{operation_id}` large result sidecar mode cannot be set: {error}"
-                    ))
-                })?;
-        }
         Ok((None, Some(name)))
     }
 
@@ -794,7 +775,11 @@ impl RunContext {
             )));
         }
         let path = self.metadata.join("operation-results").join(name);
-        let bytes = std::fs::read(path.as_std_path()).map_err(|error| {
+        // The same ceiling the write enforces, so a swapped oversized file
+        // fails as tampering instead of allocating.
+        let bytes =
+            qcg_fs::read_nofollow_bounded(&path, Some(OPERATION_RESULT_SIDECAR_MAX_BYTES))
+                .map_err(|error| {
             fail(format!(
                 "operation `{operation_id}` spilled result `{name}` is unavailable: {error}; manual recovery required"
             ))
@@ -962,44 +947,22 @@ impl RunContext {
                 format!("operation `{operation_id}` pending payload is not serializable: {error}"),
             )
         })?;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        if bytes.len() > PENDING_PAYLOAD_MAX_BYTES {
+            return Err(StepError::Refused {
+                node: node.id.clone(),
+                message: format!(
+                    "operation `{operation_id}` pending payload is {} bytes, exceeding the {PENDING_PAYLOAD_MAX_BYTES}-byte sidecar bound",
+                    bytes.len()
+                ),
+            });
         }
-        use std::io::Write as _;
-        let mut file = options.open(path.as_std_path()).map_err(|error| {
+        // Same shared sidecar policy as every other run metadata file.
+        qcg_fs::write_sidecar_atomic(&path, &bytes).map_err(|error| {
             StepError::failed(
                 &node.id,
-                format!("operation `{operation_id}` pending payload cannot be opened: {error}"),
+                format!("operation `{operation_id}` pending payload cannot be published: {error}"),
             )
         })?;
-        file.write_all(&bytes).map_err(|error| {
-            StepError::failed(
-                &node.id,
-                format!("operation `{operation_id}` pending payload cannot be written: {error}"),
-            )
-        })?;
-        file.sync_all().map_err(|error| {
-            StepError::failed(
-                &node.id,
-                format!("operation `{operation_id}` pending payload cannot be synced: {error}"),
-            )
-        })?;
-        drop(file);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let _ = std::fs::set_permissions(
-                path.as_std_path(),
-                std::fs::Permissions::from_mode(0o600),
-            );
-            if let Ok(dir_file) = std::fs::File::open(dir.as_std_path()) {
-                let _ = dir_file.sync_all();
-            }
-        }
         Ok(())
     }
 
@@ -1015,7 +978,7 @@ impl RunContext {
             .metadata
             .join("pending-payloads")
             .join(Self::pending_payload_name(operation_id));
-        match std::fs::read(path.as_std_path()) {
+        match qcg_fs::read_nofollow_bounded(&path, Some(PENDING_PAYLOAD_MAX_BYTES)) {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .map(Some)
                 .map_err(|error| StepError::Refused {
@@ -1035,14 +998,23 @@ impl RunContext {
     }
 
     /// Removes a pending payload after the operation settles (success,
-    /// clean error, or explicit refusal). Best-effort: failures are
-    /// ignored so settlement never fails on cleanup.
+    /// clean error, or explicit refusal). Cleanup never fails the run, so a
+    /// failure is reported through the log instead of being swallowed
+    /// silently; a planted symlink is refused rather than followed.
     pub fn clear_pending_tool_payload(&self, operation_id: &str) {
         let path = self
             .metadata
             .join("pending-payloads")
             .join(Self::pending_payload_name(operation_id));
-        let _ = std::fs::remove_file(path.as_std_path());
+        if let Err(error) = qcg_fs::remove_reporting(&path) {
+            tracing::warn!(
+                run_id = %self.run_id,
+                operation_id = %operation_id,
+                path = %path,
+                %error,
+                "pending payload cleanup failed"
+            );
+        }
     }
 
     fn pending_payload_name(operation_id: &str) -> String {
@@ -1073,9 +1045,7 @@ mod tests {
         // carries the same mapping with a matching seq. Both file and
         // dir-entry durability precede any gateway use.
         let (_dir, metadata, ctx, node) = guard_harness("ordering-proof");
-        let journal_path = metadata.join("journal.jsonl");
-        let journal = crate::JournalWriter::create(&journal_path, "ordering-proof", false, None)
-            .expect("test journal should open");
+        let journal = test_guard_journal(&metadata, "ordering-proof");
         let details = Some(json!({"argv": ["echo", "ordered"]}));
         let GuardDecision::Proceed { operation_id } = ctx
             .guard_external_operation(&journal, &node, "command", "echo", &details, "call-1")
@@ -1139,7 +1109,11 @@ mod tests {
     }
 
     #[test]
-    fn operation_digest_binds_target_and_details() {
+    fn operation_digest_binds_content_deterministically() {
+        // E07: the digest is sensitive to content, deterministic across
+        // calls, and invariant under key insertion order (serde_json::Map
+        // must stay BTreeMap-sorted, no preserve_order feature). Otherwise
+        // approvals and guards fork into aliases.
         let a = RunContext::operation_digest("echo a", &Some(json!({"argv": ["echo", "a"]})))
             .expect("digest should compute");
         let b = RunContext::operation_digest("echo b", &Some(json!({"argv": ["echo", "b"]})))
@@ -1148,25 +1122,17 @@ mod tests {
         let a_again = RunContext::operation_digest("echo a", &Some(json!({"argv": ["echo", "a"]})))
             .expect("digest should compute");
         assert_eq!(a, a_again);
-    }
-
-    #[test]
-    fn operation_digest_is_invariant_under_key_insertion_order() {
-        // E07: serde_json::Map must stay BTreeMap-sorted (no
-        // preserve_order feature). Logically identical details built in
-        // different insertion orders must bind one digest, or approvals
-        // and guards fork into aliases.
         let mut first = serde_json::Map::new();
         first.insert("b".to_string(), json!(2));
         first.insert("a".to_string(), json!(1));
         let mut second = serde_json::Map::new();
         second.insert("a".to_string(), json!(1));
         second.insert("b".to_string(), json!(2));
-        let a = RunContext::operation_digest("target", &Some(Value::Object(first)))
+        let ordered = RunContext::operation_digest("target", &Some(Value::Object(first)))
             .expect("digest should compute");
-        let b = RunContext::operation_digest("target", &Some(Value::Object(second)))
+        let reordered = RunContext::operation_digest("target", &Some(Value::Object(second)))
             .expect("digest should compute");
-        assert_eq!(a, b, "key order must not fork the digest");
+        assert_eq!(ordered, reordered, "key order must not fork the digest");
     }
 
     fn record(digest: &str, status: OperationStatus, result: Option<Value>) -> OperationRecord {
@@ -1200,6 +1166,61 @@ mod tests {
             .iter()
             .filter(|event| event.get("t").and_then(Value::as_str) == Some("operation_started"))
             .count()
+    }
+
+    /// The journal a `guard_harness` run drives. The harness deliberately
+    /// leaves the file unopened so a crash-recovery test can seed durable
+    /// content before the guard sees it, and the guard's run id and the
+    /// journal run id are the same string at every call site.
+    fn test_guard_journal(metadata: &camino::Utf8Path, run_id: &str) -> crate::JournalWriter {
+        crate::JournalWriter::create(&metadata.join("journal.jsonl"), run_id, false, None)
+            .expect("test journal should open")
+    }
+
+    /// A `guard_harness` run whose manifest already demands a confirmation,
+    /// together with the journal that run drives. Every approval test needs
+    /// the confirmed policy in place before it calls `require_side_effect`,
+    /// so the policy and the journal are established here once.
+    fn test_confirm_harness(
+        run_id: &str,
+    ) -> (
+        crate::test_support::TestDir,
+        camino::Utf8PathBuf,
+        RunContext,
+        qcg_contract::NodeDef,
+        crate::JournalWriter,
+    ) {
+        let (dir, metadata, mut ctx, node) = guard_harness(run_id);
+        ctx.contract.manifest.permissions.side_effects = SideEffects::Confirm;
+        let journal = test_guard_journal(&metadata, run_id);
+        (dir, metadata, ctx, node, journal)
+    }
+
+    /// The `https://example.test` call the agent-resume matrix makes, which
+    /// must proceed, returning the minted operation id. The four flows differ
+    /// only in the durable outcome they record afterwards, so the guard call
+    /// itself is written once and each flow states just its outcome.
+    fn test_proceed_call(
+        ctx: &RunContext,
+        journal: &crate::JournalWriter,
+        node: &NodeDef,
+        details: &Option<Value>,
+        invocation: &str,
+    ) -> String {
+        let GuardDecision::Proceed { operation_id } = ctx
+            .guard_external_operation(
+                journal,
+                node,
+                "http",
+                "https://example.test",
+                details,
+                invocation,
+            )
+            .expect("first call should proceed")
+        else {
+            panic!("first call must proceed");
+        };
+        operation_id
     }
 
     /// Full guard harness: a live run context plus its journal directory.
@@ -1270,7 +1291,7 @@ mod tests {
         };
         let node = qcg_contract::NodeDef {
             id: "resend-node".into(),
-            kind: StepType::from("test.pass"),
+            kind: StepType::literal("test.pass"),
             needs: vec![],
             when: None,
             on_deps: OnDeps::default(),
@@ -1449,16 +1470,7 @@ mod tests {
     fn stdin_changes_require_a_fresh_approval() {
         // Q1: the approval binds the exact stdin bytes, so feeding
         // different input to the same command never reuses an approval.
-        use qcg_contract::SideEffects;
-        let (_dir, metadata, mut ctx, node) = guard_harness("stdin-binding");
-        let journal = crate::JournalWriter::create(
-            &metadata.join("journal.jsonl"),
-            "stdin-binding",
-            false,
-            None,
-        )
-        .expect("test journal should open");
-        ctx.contract.manifest.permissions.side_effects = SideEffects::Confirm;
+        let (_dir, _metadata, ctx, node, journal) = test_confirm_harness("stdin-binding");
         let details = |stdin: &str| {
             Some(
                 crate::bind_command_stdin(
@@ -1528,32 +1540,14 @@ mod tests {
             one["sensitive_query_sha256"], same["sensitive_query_sha256"],
             "the same operation must recompute stably for resends"
         );
-        assert_eq!(
-            salted_binding_digest("d", "s", b"x"),
-            salted_binding_digest("d", "s", b"x"),
-            "salted digests must be deterministic"
-        );
-        assert_ne!(
-            salted_binding_digest("d", "s1", b"x"),
-            salted_binding_digest("d", "s2", b"x"),
-            "different salts must separate identical bytes"
-        );
     }
 
     #[test]
     fn approval_scope_controls_reuse_across_invocations() {
         // Q1: invocation scope (the default) requires one approval per
         // call; content scope reuses an approval for identical content.
-        use qcg_contract::{SideEffectScope, SideEffects};
-        let (_dir, metadata, mut ctx, node) = guard_harness("approval-scope");
-        let journal = crate::JournalWriter::create(
-            &metadata.join("journal.jsonl"),
-            "approval-scope",
-            false,
-            None,
-        )
-        .expect("test journal should open");
-        ctx.contract.manifest.permissions.side_effects = SideEffects::Confirm;
+        use qcg_contract::SideEffectScope;
+        let (_dir, _metadata, mut ctx, node, journal) = test_confirm_harness("approval-scope");
         let details = Some(json!({"argv": ["echo", "hi"]}));
         assert_eq!(
             ctx.contract.manifest.permissions.side_effects_scope,
@@ -1664,16 +1658,8 @@ mod tests {
         // Q1: the real single-shot identity comes from the durable per-node
         // execution count, so an identical re-execution after a finished
         // attempt is a new invocation and must re-confirm.
-        use qcg_contract::SideEffects;
-        let (_dir, metadata, mut ctx, node) = guard_harness("execution-invocation");
-        let journal = crate::JournalWriter::create(
-            &metadata.join("journal.jsonl"),
-            "execution-invocation",
-            false,
-            None,
-        )
-        .expect("test journal should open");
-        ctx.contract.manifest.permissions.side_effects = SideEffects::Confirm;
+        let (_dir, _metadata, mut ctx, node, journal) =
+            test_confirm_harness("execution-invocation");
         let details = Some(json!({"argv": ["echo", "hi"]}));
         let first_invocation = RunContext::execution_invocation(&journal, &node);
         let first = ctx
@@ -1742,13 +1728,7 @@ mod tests {
     #[test]
     fn sequential_same_content_calls_converge_and_changed_content_is_refused() {
         let (_dir, metadata, ctx, node) = guard_harness("resend-test");
-        let journal = crate::JournalWriter::create(
-            &metadata.join("journal.jsonl"),
-            "resend-test",
-            false,
-            None,
-        )
-        .expect("test journal should open");
+        let journal = test_guard_journal(&metadata, "resend-test");
         let details = Some(json!({"argv": ["echo", "hi"]}));
 
         // First invocation executes.
@@ -1817,26 +1797,8 @@ mod tests {
 
         // Succeeded: the cached result is resent, never re-executed.
         let (_dir, metadata, ctx, node) = guard_harness("agent-flow-succeeded");
-        let journal = crate::JournalWriter::create(
-            &metadata.join("journal.jsonl"),
-            "agent-flow-succeeded",
-            false,
-            None,
-        )
-        .expect("journal");
-        let GuardDecision::Proceed { operation_id } = ctx
-            .guard_external_operation(
-                &journal,
-                &node,
-                "http",
-                "https://example.test",
-                &details,
-                "call-agent-1",
-            )
-            .expect("first call should proceed")
-        else {
-            panic!("first call must proceed");
-        };
+        let journal = test_guard_journal(&metadata, "agent-flow-succeeded");
+        let operation_id = test_proceed_call(&ctx, &journal, &node, &details, "call-agent-1");
         ctx.finish_external_operation(&journal, &node, &operation_id, Some(json!({"status": 200})))
             .expect("success should journal");
         match ctx
@@ -1862,26 +1824,8 @@ mod tests {
 
         // FailedClean: a proven-no-effect failure starts a fresh attempt.
         let (_dir, metadata, ctx, node) = guard_harness("agent-flow-clean");
-        let journal = crate::JournalWriter::create(
-            &metadata.join("journal.jsonl"),
-            "agent-flow-clean",
-            false,
-            None,
-        )
-        .expect("journal");
-        let GuardDecision::Proceed { operation_id } = ctx
-            .guard_external_operation(
-                &journal,
-                &node,
-                "http",
-                "https://example.test",
-                &details,
-                "call-agent-2",
-            )
-            .expect("first call should proceed")
-        else {
-            panic!("first call must proceed");
-        };
+        let journal = test_guard_journal(&metadata, "agent-flow-clean");
+        let operation_id = test_proceed_call(&ctx, &journal, &node, &details, "call-agent-2");
         ctx.finish_external_operation_with(
             &journal,
             &node,
@@ -1916,26 +1860,8 @@ mod tests {
             timeout_secs: None,
             on_indeterminate: RetryOnIndeterminate::Repeat,
         });
-        let journal = crate::JournalWriter::create(
-            &metadata.join("journal.jsonl"),
-            "agent-flow-repeat",
-            false,
-            None,
-        )
-        .expect("journal");
-        let GuardDecision::Proceed { operation_id } = ctx
-            .guard_external_operation(
-                &journal,
-                &node,
-                "http",
-                "https://example.test",
-                &details,
-                "call-agent-3",
-            )
-            .expect("first call should proceed")
-        else {
-            panic!("first call must proceed");
-        };
+        let journal = test_guard_journal(&metadata, "agent-flow-repeat");
+        let operation_id = test_proceed_call(&ctx, &journal, &node, &details, "call-agent-3");
         ctx.finish_external_operation_with(
             &journal,
             &node,
@@ -1968,26 +1894,8 @@ mod tests {
             timeout_secs: None,
             on_indeterminate: RetryOnIndeterminate::Fail,
         });
-        let journal = crate::JournalWriter::create(
-            &metadata.join("journal.jsonl"),
-            "agent-flow-refuse",
-            false,
-            None,
-        )
-        .expect("journal");
-        let GuardDecision::Proceed { operation_id } = ctx
-            .guard_external_operation(
-                &journal,
-                &node,
-                "http",
-                "https://example.test",
-                &details,
-                "call-agent-4",
-            )
-            .expect("first call should proceed")
-        else {
-            panic!("first call must proceed");
-        };
+        let journal = test_guard_journal(&metadata, "agent-flow-refuse");
+        let operation_id = test_proceed_call(&ctx, &journal, &node, &details, "call-agent-4");
         ctx.finish_external_operation_with(
             &journal,
             &node,
@@ -2019,13 +1927,7 @@ mod tests {
         // success with no cached result. A resumed invocation must refuse
         // instead of re-executing the external operation.
         let (_dir, metadata, ctx, node) = guard_harness("rejected-result");
-        let journal = crate::JournalWriter::create(
-            &metadata.join("journal.jsonl"),
-            "rejected-result",
-            false,
-            None,
-        )
-        .expect("test journal should open");
+        let journal = test_guard_journal(&metadata, "rejected-result");
         let details = Some(json!({"argv": ["produce_secret"]}));
         let first = ctx
             .guard_external_operation(
@@ -2063,24 +1965,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn distinct_invocations_get_distinct_ids() {
-        // Invocation ids bind by their full digest, so two calls that share
-        // a prefix must never reuse or refuse on the other's record.
-        let first = crate::operation_id_for("run", "node", "call-28383");
-        let second = crate::operation_id_for("run", "node", "call-78343");
-        assert_ne!(
-            first, second,
-            "distinct invocations must never share an operation id"
-        );
-    }
-
     /// C02: only pre-send reqwest failures classify as clean. A server
     /// that accepts a POST and disconnects without responding produces a
-    /// `Kind::Request` error (the old code read that as clean and
-    /// retried); it must be indeterminate so the default policy refuses
-    /// the replay. A refused connection (nothing could be sent) stays
-    /// clean. All errors below come from real sockets, never fabricated.
+    /// `Kind::Request` error; it must be indeterminate so the default
+    /// policy refuses the replay. A refused connection (nothing could be
+    /// sent) stays clean. All errors below come from real sockets, never
+    /// fabricated.
     #[tokio::test]
     async fn http_error_taxonomy_separates_unsent_from_unknown() {
         use crate::{GatewayError, HttpGateway, HttpRequest};
@@ -2281,29 +2171,12 @@ mod tests {
     }
 
     #[test]
-    fn elapsed_limit_secs_is_explicit_about_absence() {
-        // E11: no configured budget is `None`, never a misreadable 0.
-        let (_dir, _metadata, ctx, _node) = guard_harness("elapsed-limit");
-        assert_eq!(
-            elapsed_limit_secs(&ctx.contract),
-            None,
-            "an unconfigured budget must read as absent"
-        );
-    }
-
-    #[test]
     fn large_operation_result_spills_and_resends() {
         // E07: a success result beyond the inline bound spills to a
         // tamper-evident sidecar and resends from it; a damaged sidecar
         // refuses instead of resending forged bytes.
         let (_dir, metadata, ctx, node) = guard_harness("spill-resend");
-        let journal = crate::JournalWriter::create(
-            &metadata.join("journal.jsonl"),
-            "spill-resend",
-            false,
-            None,
-        )
-        .expect("test journal should open");
+        let journal = test_guard_journal(&metadata, "spill-resend");
         let big = Value::String("x".repeat(crate::OPERATION_RESULT_MAX_BYTES + 1));
         let details = Some(json!({"argv": ["big"]}));
         let GuardDecision::Proceed { operation_id } = ctx

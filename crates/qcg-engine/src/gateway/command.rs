@@ -98,20 +98,6 @@ impl CmdGateway {
             .await
     }
 
-    pub async fn run_with_stdin(
-        &self,
-        argv: &[String],
-        stdin: &[u8],
-    ) -> Result<CommandOutput, GatewayError> {
-        self.run_with_limits_and_stdin(
-            argv,
-            self.bounds.timeout_seconds,
-            self.bounds.output_limit_bytes,
-            Some(stdin),
-        )
-        .await
-    }
-
     pub async fn run_with_limits_and_stdin(
         &self,
         argv: &[String],

@@ -14,6 +14,10 @@ import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const spec = JSON.parse(readFileSync(resolve(root, "docs/openapi.json"), "utf8"));
+// The output root is overridable so `scripts/check-sdk.sh` can generate into
+// a temporary directory and compare, leaving the checked-in `clients/` tree
+// untouched instead of rewriting the worktree and reverting it.
+const outRoot = resolve(process.argv[2] ?? resolve(root, "clients"));
 
 const OPERATION_NAMES = {
   "GET /healthz": "health",
@@ -276,8 +280,6 @@ export type QcgClientOptions = {
   token?: string;
   /** Fetch implementation override (tests, Node runtimes). */
   fetch?: typeof fetch;
-  /** Redirect policy for authenticated requests: same-origin only by default. */
-  redirect?: "same-origin" | "follow";
 };
 
 export type RequestOptions = {
@@ -315,13 +317,11 @@ export class QcgClient {
   private readonly baseUrl: string;
   private token?: string;
   private readonly fetchImpl: typeof fetch;
-  private readonly redirectPolicy: "same-origin" | "follow";
 
   constructor(options: QcgClientOptions = {}) {
     this.baseUrl = (options.baseUrl ?? "").replace(/\\/$/, "");
     this.token = options.token;
     this.fetchImpl = options.fetch ?? globalThis.fetch;
-    this.redirectPolicy = options.redirect ?? "same-origin";
   }
 
   /** Replaces the bearer token for subsequent requests. */
@@ -355,21 +355,9 @@ export class QcgClient {
     return { ...extra, "idempotency-key": idempotencyKey };
   }
 
-  private sameOrigin(url: string): boolean {
-    if (!this.baseUrl) return true;
-    try {
-      const base = new URL(this.baseUrl);
-      const target = new URL(url, this.baseUrl);
-      return base.origin === target.origin;
-    } catch {
-      return false;
-    }
-  }
-
   private async checkedFetch(url: string, init: RequestInit): Promise<Response> {
     // F04: never forward the bearer cross-origin or over a downgrade.
-    // The token lives only in memory; cross-origin redirects are followed
-    // without it (same-origin policy by default).
+    // The token lives only in memory; redirects are followed without it.
     const response = await this.fetchImpl(url, { ...init, redirect: "manual" });
     const location = response.headers.get("location");
     if (
@@ -383,11 +371,6 @@ export class QcgClient {
       const initHeaders = new Headers(init.headers);
       if ((crossOrigin || downgrade) && initHeaders.has("authorization")) {
         initHeaders.delete("authorization");
-      }
-      if (crossOrigin && this.redirectPolicy === "same-origin") {
-        // Follow same-origin redirects with the (possibly stripped)
-        // headers; cross-origin is followed once without credentials.
-        // Further hops re-enter this method via recursion below.
       }
       const nextInit: RequestInit = { ...init, headers: initHeaders };
       // 303 always becomes GET (except HEAD); 301/302 POST becomes GET.
@@ -845,22 +828,12 @@ class QcgClient:
         with contextlib.closing(raw):
             decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
             text_buffer = ""
-            byte_remainder = b""
             try:
                 while True:
-                    chunk = raw.read(1)
+                    chunk = raw.read(1 << 16)
                     if not chunk:
                         break
-                    byte_remainder += chunk
-                    try:
-                        text_buffer += decoder.decode(byte_remainder, final=False)
-                        byte_remainder = b""
-                    except UnicodeDecodeError:
-                        # Incomplete multi-byte sequence: read more bytes.
-                        if len(byte_remainder) > 4:
-                            text_buffer += decoder.decode(byte_remainder, final=True)
-                            byte_remainder = b""
-                        continue
+                    text_buffer += decoder.decode(chunk, final=False)
                     # Normalize CRLF/CR per the SSE spec before framing.
                     text_buffer = text_buffer.replace("\\r\\n", "\\n").replace("\\r", "\\n")
                     while "\\n\\n" in text_buffer:
@@ -885,22 +858,22 @@ class QcgClient:
 ${pinned.map(pyOperation).join("\n\n")}
 `;
 
-mkdirSync(resolve(root, "clients/ts"), { recursive: true });
-mkdirSync(resolve(root, "clients/python"), { recursive: true });
+mkdirSync(resolve(outRoot, "ts"), { recursive: true });
+mkdirSync(resolve(outRoot, "python"), { recursive: true });
 execFileSync(
   // Windows spawns .cmd shims only through a shell.
   "npx",
-  ["openapi-typescript", "../../docs/openapi.json", "-o", "../../clients/ts/types.ts"],
+  ["openapi-typescript", "../../docs/openapi.json", "-o", resolve(outRoot, "ts/types.ts")],
   {
     cwd: resolve(root, "frontend/generator"),
     stdio: "inherit",
     shell: process.platform === "win32",
   },
 );
-writeFileSync(resolve(root, "clients/ts/client.ts"), ts);
-writeFileSync(resolve(root, "clients/python/qcg_client.py"), py);
+writeFileSync(resolve(outRoot, "ts/client.ts"), ts);
+writeFileSync(resolve(outRoot, "python/qcg_client.py"), py);
 writeFileSync(
-  resolve(root, "clients/README.md"),
+  resolve(outRoot, "README.md"),
   `# qcg clients
 
 Generated by \`scripts/generate-sdk.mjs\` from \`docs/openapi.json\`.

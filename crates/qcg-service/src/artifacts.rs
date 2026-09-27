@@ -4,37 +4,14 @@ use crate::types::ServiceError;
 use camino::{Utf8Path, Utf8PathBuf};
 use qcg_api::RunEvent;
 use qcg_api::{ApiError, RunSnapshot};
-use qcg_engine::{
-    JournalLimits, append_serialized_json_line, read_journal_values, read_output_manifest,
-    resolve_artifact_path, serialize_bounded,
-};
-use qcg_policy::is_safe_relative_path;
+use qcg_engine::{read_output_manifest, resolve_artifact_path};
+use qcg_policy::is_safe_path_component;
 use qcg_types::OutputManifest;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Cursor, Write};
 use zip::write::SimpleFileOptions;
-
-pub fn append_journal_event(run_dir: &Utf8Path, event: &Value) -> Result<(), ServiceError> {
-    let meta_dir = run_meta_dir(run_dir);
-    std::fs::create_dir_all(&meta_dir)?;
-    let limits = JournalLimits::default();
-    let journal_path = meta_dir.join("journal.jsonl");
-    let scan = read_journal_values(&journal_path, limits)
-        .map_err(|error| ServiceError::Invalid(error.to_string()))?;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(journal_path)?;
-    let bytes = serialize_bounded(event, limits.max_event_bytes, "event")
-        .map_err(|error| ServiceError::Invalid(error.to_string()))?;
-    let mut stats = scan.stats;
-    append_serialized_json_line(&mut file, bytes, &mut stats, limits)
-        .map_err(|error| ServiceError::Invalid(error.to_string()))?;
-    file.sync_data()?;
-    Ok(())
-}
 
 pub fn read_artifacts_zip(run_dir: &Utf8Path) -> Result<Vec<u8>, ServiceError> {
     read_artifacts_zip_with_limits(run_dir, &ArtifactZipLimits::default())
@@ -47,13 +24,6 @@ pub fn read_artifacts_zip_with_limits(
     let mut cursor = Cursor::new(Vec::new());
     write_artifacts_zip_stream_with_limits(run_dir, &mut cursor, limits)?;
     Ok(cursor.into_inner())
-}
-
-pub fn write_artifacts_zip_stream<W: Write>(
-    run_dir: &Utf8Path,
-    writer: W,
-) -> Result<(), ServiceError> {
-    write_artifacts_zip_stream_with_limits(run_dir, writer, &ArtifactZipLimits::default())
 }
 
 /// Verified workspace files behind an output manifest: logical path,
@@ -413,8 +383,8 @@ pub(crate) fn api_internal(error: impl std::fmt::Display) -> ApiError {
     ApiError::internal(error.to_string())
 }
 
-pub(crate) fn is_safe_id(id: &str) -> bool {
-    is_safe_relative_path(id)
+pub(crate) fn is_safe_run_id(id: &str) -> bool {
+    is_safe_path_component(id)
 }
 
 pub(crate) fn event_kinds(events: &[RunEvent]) -> Vec<String> {

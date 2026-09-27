@@ -51,9 +51,7 @@ impl Graph {
             }
         }
         let order = topo_sort(&nodes)?;
-        let graph = Self { nodes, order };
-        graph.warn_unreachable();
-        Ok(graph)
+        Ok(Self { nodes, order })
     }
 
     pub fn roots(&self) -> Vec<&NodeDef> {
@@ -61,10 +59,6 @@ impl Graph {
             .values()
             .filter(|node| node.needs.is_empty())
             .collect()
-    }
-
-    fn warn_unreachable(&self) {
-        let _ = self;
     }
 
     pub fn needs_satisfied(&self, node: &NodeDef, states: &BTreeMap<String, NodeState>) -> bool {

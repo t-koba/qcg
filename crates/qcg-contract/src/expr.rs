@@ -4,8 +4,62 @@ mod eval;
 mod lexer;
 mod parser;
 
+use serde_json::{Value, json};
+
 pub use bag::*;
 pub use error::*;
+
+/// The shared expression corpus, parsed with the same TOML reader the native
+/// evaluator's own test uses, so the frontend corpus test and the Rust corpus
+/// test can never disagree about what the fixture says.
+///
+/// Returns the evaluation context and the cases as JSON-ready values.
+pub fn corpus_fixture() -> Result<(Value, Vec<(String, bool)>), String> {
+    let fixture = include_str!("../../../fixtures/expr-corpus.toml");
+    let parsed = toml::from_str::<toml::Value>(fixture).map_err(|error| error.to_string())?;
+    let context = parsed
+        .get("context")
+        .ok_or_else(|| "expression corpus fixture must contain `context`".to_string())?;
+    let cases = parsed
+        .get("cases")
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| "expression corpus fixture must contain `cases`".to_string())?;
+    let cases = cases
+        .iter()
+        .map(|case| {
+            let expr = case
+                .get("expr")
+                .and_then(toml::Value::as_str)
+                .ok_or_else(|| "each corpus case must carry `expr`".to_string())?;
+            let expected = case
+                .get("expected")
+                .and_then(toml::Value::as_bool)
+                .ok_or_else(|| "each corpus case must carry `expected`".to_string())?;
+            Ok((expr.to_string(), expected))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok((toml_to_json(context), cases))
+}
+
+/// TOML to JSON with the one fixture-specific rule: the string `null` is the
+/// corpus' null value, matching how the native fixture test reads it.
+fn toml_to_json(value: &toml::Value) -> Value {
+    match value {
+        toml::Value::String(value) if value == "null" => Value::Null,
+        toml::Value::String(value) => Value::String(value.clone()),
+        toml::Value::Integer(value) => json!(value),
+        toml::Value::Float(value) => json!(value),
+        toml::Value::Boolean(value) => Value::Bool(*value),
+        toml::Value::Datetime(value) => Value::String(value.to_string()),
+        toml::Value::Array(values) => Value::Array(values.iter().map(toml_to_json).collect()),
+        toml::Value::Table(values) => Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), toml_to_json(value)))
+                .collect(),
+        ),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -125,28 +179,6 @@ mod tests {
                 "expression `{case}` should fail"
             );
         }
-    }
-
-    #[test]
-    fn evaluates_contract_expression_subset() {
-        let mut inputs = BTreeMap::new();
-        inputs.insert("tls".into(), Value::Bool(true));
-        inputs.insert("name".into(), Value::String("example.com".into()));
-        let bag = ValueBag::with_inputs(inputs);
-        assert!(
-            bag.eval_bool(Some(&Expr("inputs.tls == true".into())))
-                .unwrap()
-        );
-        assert!(
-            bag.eval_bool(Some(&Expr(
-                "inputs.name == 'example.com' && inputs.tls".into()
-            )))
-            .unwrap()
-        );
-        assert!(
-            !bag.eval_bool(Some(&Expr("inputs.name == 'other'".into())))
-                .unwrap()
-        );
     }
 
     #[test]
@@ -305,173 +337,175 @@ mod tests {
     }
 
     fn json_from_toml(value: &toml::Value) -> Value {
-        match value {
-            toml::Value::String(value) if value == "null" => Value::Null,
-            toml::Value::String(value) => Value::String(value.clone()),
-            toml::Value::Integer(value) => json!(value),
-            toml::Value::Float(value) => json!(value),
-            toml::Value::Boolean(value) => Value::Bool(*value),
-            toml::Value::Datetime(value) => Value::String(value.to_string()),
-            toml::Value::Array(values) => Value::Array(values.iter().map(json_from_toml).collect()),
-            toml::Value::Table(values) => Value::Object(
-                values
-                    .iter()
-                    .map(|(key, value)| (key.clone(), json_from_toml(value)))
-                    .collect(),
+        toml_to_json(value)
+    }
+
+    #[test]
+    fn expression_corpus_bool_cases() {
+        let bag = corpus_bag();
+        let cases: &[(&str, &str, bool)] = &[
+            ("expr_corpus_absent_expression_is_true", "", false),
+            (
+                "expr_corpus_or_false_true",
+                "inputs.disabled || inputs.enabled",
+                true,
             ),
+            (
+                "expr_corpus_and_precedence_left_split",
+                "inputs.enabled && inputs.count == 3",
+                true,
+            ),
+            (
+                "expr_corpus_or_precedence_left_split",
+                "inputs.disabled || inputs.count == 3",
+                true,
+            ),
+            (
+                "expr_corpus_string_order_ge_equal",
+                "inputs.name >= 'alpha'",
+                true,
+            ),
+            (
+                "expr_corpus_number_decimal_equal",
+                "inputs.count == 3.0",
+                true,
+            ),
+            (
+                "expr_corpus_bool_not_equal_false",
+                "inputs.enabled != false",
+                true,
+            ),
+            (
+                "expr_corpus_path_to_path_number_equal",
+                "inputs.count != inputs.limit",
+                true,
+            ),
+            (
+                "expr_corpus_right_literal_whitespace_trimmed",
+                "inputs.name ==   'alpha'  ",
+                true,
+            ),
+            (
+                "expr_corpus_left_path_whitespace_trimmed",
+                "  inputs.count   >= 3",
+                true,
+            ),
+            (
+                "expr_corpus_neq_with_type_mismatch",
+                "inputs.name != inputs.count",
+                true,
+            ),
+            (
+                "expr_corpus_non_empty_string_is_truthy",
+                "inputs.name",
+                true,
+            ),
+            (
+                "expr_corpus_non_zero_number_is_truthy",
+                "inputs.count",
+                true,
+            ),
+            (
+                "expr_corpus_unknown_left_path_is_null",
+                "inputs.missing == true",
+                false,
+            ),
+            (
+                "expr_parentheses_override_precedence",
+                "inputs.disabled && (inputs.count == 3 || inputs.enabled)",
+                false,
+            ),
+            (
+                "expr_nested_parentheses",
+                "(inputs.disabled || inputs.enabled) && (3 < inputs.limit)",
+                true,
+            ),
+            (
+                "expr_prefix_not_binds_tighter_than_equality",
+                "!inputs.disabled == true",
+                true,
+            ),
+            (
+                "expr_literal_can_be_comparison_left_operand",
+                "3 < inputs.limit",
+                true,
+            ),
+            (
+                "expr_arithmetic_obeys_precedence",
+                "inputs.count + 2 * 2 == 7",
+                true,
+            ),
+            (
+                "expr_contains_and_len_functions",
+                "contains(inputs.name, 'ph') && len(inputs.name) == 5",
+                true,
+            ),
+            (
+                "expr_escaped_quote_in_string",
+                "contains(\"it\\\'s alpha\", inputs.name)",
+                true,
+            ),
+            (
+                "expr_step_status_is_available",
+                "steps.render.status == 'succeeded'",
+                true,
+            ),
+        ];
+        let mut diverged = Vec::new();
+        for (name, expr, expected) in cases {
+            if bag.eval_bool(Some(&Expr((*expr).into()))).unwrap() != *expected {
+                diverged.push(*name);
+            }
         }
+        assert!(
+            diverged.is_empty(),
+            "bool cases diverged: {}",
+            diverged.join(", ")
+        );
     }
 
-    macro_rules! bool_case {
-        ($name:ident, $expr:expr, $expected:expr) => {
-            #[test]
-            fn $name() {
-                let bag = corpus_bag();
-                assert_eq!(bag.eval_bool(Some(&Expr($expr.into()))).unwrap(), $expected);
+    #[test]
+    fn expression_corpus_error_cases() {
+        let bag = corpus_bag();
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "expr_corpus_unsupported_literal_errors",
+                "inputs.name == alpha",
+                "unsupported literal",
+            ),
+            (
+                "expr_corpus_ordering_boolean_errors",
+                "inputs.enabled > false",
+                "not valid for booleans",
+            ),
+            (
+                "expr_corpus_ordering_null_errors",
+                "inputs.nullish > null",
+                "not valid for null",
+            ),
+            (
+                "expr_corpus_ordering_type_mismatch_errors",
+                "inputs.name > 3",
+                "type mismatch",
+            ),
+            (
+                "expr_corpus_unexpected_character_errors",
+                "inputs.name == {1}",
+                "unexpected character",
+            ),
+        ];
+        let mut diverged = Vec::new();
+        for (name, expr, needle) in cases {
+            match bag.eval_bool(Some(&Expr((*expr).into()))) {
+                Err(error) if error.contains(*needle) => {}
+                Err(error) => diverged.push(format!("{name}: {error}")),
+                Ok(value) => diverged.push(format!("{name}: unexpectedly ok ({value:?})")),
             }
-        };
+        }
+        assert!(
+            diverged.is_empty(),
+            "error cases diverged: {}",
+            diverged.join(", ")
+        );
     }
-
-    macro_rules! error_case {
-        ($name:ident, $expr:expr, $needle:expr) => {
-            #[test]
-            fn $name() {
-                let bag = corpus_bag();
-                let error = bag
-                    .eval_bool(Some(&Expr($expr.into())))
-                    .expect_err("expression should fail");
-                assert!(
-                    error.contains($needle),
-                    "expected `{error}` to contain `{}`",
-                    $needle
-                );
-            }
-        };
-    }
-
-    bool_case!(expr_corpus_absent_expression_is_true, "", false);
-    bool_case!(
-        expr_corpus_or_false_true,
-        "inputs.disabled || inputs.enabled",
-        true
-    );
-    bool_case!(
-        expr_corpus_and_precedence_left_split,
-        "inputs.enabled && inputs.count == 3",
-        true
-    );
-    bool_case!(
-        expr_corpus_or_precedence_left_split,
-        "inputs.disabled || inputs.count == 3",
-        true
-    );
-    bool_case!(
-        expr_corpus_string_order_ge_equal,
-        "inputs.name >= 'alpha'",
-        true
-    );
-    bool_case!(
-        expr_corpus_number_decimal_equal,
-        "inputs.count == 3.0",
-        true
-    );
-    bool_case!(
-        expr_corpus_bool_not_equal_false,
-        "inputs.enabled != false",
-        true
-    );
-    bool_case!(
-        expr_corpus_path_to_path_number_equal,
-        "inputs.count != inputs.limit",
-        true
-    );
-    bool_case!(
-        expr_corpus_right_literal_whitespace_trimmed,
-        "inputs.name ==   'alpha'  ",
-        true
-    );
-    bool_case!(
-        expr_corpus_left_path_whitespace_trimmed,
-        "  inputs.count   >= 3",
-        true
-    );
-    bool_case!(
-        expr_corpus_neq_with_type_mismatch,
-        "inputs.name != inputs.count",
-        true
-    );
-
-    bool_case!(expr_corpus_non_empty_string_is_truthy, "inputs.name", true);
-    bool_case!(expr_corpus_non_zero_number_is_truthy, "inputs.count", true);
-    bool_case!(
-        expr_corpus_unknown_left_path_is_null,
-        "inputs.missing == true",
-        false
-    );
-    error_case!(
-        expr_corpus_unsupported_literal_errors,
-        "inputs.name == alpha",
-        "unsupported literal"
-    );
-    error_case!(
-        expr_corpus_ordering_boolean_errors,
-        "inputs.enabled > false",
-        "not valid for booleans"
-    );
-    error_case!(
-        expr_corpus_ordering_null_errors,
-        "inputs.nullish > null",
-        "not valid for null"
-    );
-    error_case!(
-        expr_corpus_ordering_type_mismatch_errors,
-        "inputs.name > 3",
-        "type mismatch"
-    );
-    error_case!(
-        expr_corpus_unexpected_character_errors,
-        "inputs.name == {1}",
-        "unexpected character"
-    );
-
-    bool_case!(
-        expr_parentheses_override_precedence,
-        "inputs.disabled && (inputs.count == 3 || inputs.enabled)",
-        false
-    );
-    bool_case!(
-        expr_nested_parentheses,
-        "(inputs.disabled || inputs.enabled) && (3 < inputs.limit)",
-        true
-    );
-    bool_case!(
-        expr_prefix_not_binds_tighter_than_equality,
-        "!inputs.disabled == true",
-        true
-    );
-    bool_case!(
-        expr_literal_can_be_comparison_left_operand,
-        "3 < inputs.limit",
-        true
-    );
-    bool_case!(
-        expr_arithmetic_obeys_precedence,
-        "inputs.count + 2 * 2 == 7",
-        true
-    );
-    bool_case!(
-        expr_contains_and_len_functions,
-        "contains(inputs.name, 'ph') && len(inputs.name) == 5",
-        true
-    );
-    bool_case!(
-        expr_escaped_quote_in_string,
-        "contains(\"it\\\'s alpha\", inputs.name)",
-        true
-    );
-    bool_case!(
-        expr_step_status_is_available,
-        "steps.render.status == 'succeeded'",
-        true
-    );
 }

@@ -33,7 +33,7 @@ merge_generators() {
 }
 merge_generators "$generators_dir"
 
-cargo run -p qcg -- serve \
+cargo run -p qcg --locked -- serve \
   --bind 127.0.0.1 \
   --port "$port" \
   --generators-dir "$generators_dir" \

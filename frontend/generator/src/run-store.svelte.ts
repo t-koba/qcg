@@ -1,8 +1,14 @@
-import { ApiClient, ApiProblemError, type ConfirmSpec, type FormSpec, type GeneratorDetail, type GeneratorSummary, type InputField, type OutputArtifact, type RunEvent, type RunListResponse, type RunSnapshot, type RunStatus } from "./api/client";
+import { ApiClient, type ConfirmSpec, type FormSpec, type GeneratorDetail, type GeneratorSummary, type InputField, type OutputArtifact, type RunEvent, type RunListResponse, type RunSnapshot, type RunStatus } from "./api/client";
 import { parseSseFrames } from "./api/sse";
 import { evalWhen } from "./expr/loader";
 import { encodeBase64, validateFileInput } from "./field";
-import { collectNodeProgress, record } from "./progress";
+import {
+  applyNodeProgress,
+  emptyNodeProgress,
+  materialize,
+  record,
+  type NodeProgressAggregate,
+} from "./progress";
 import {
   decodeView,
   encodeView,
@@ -12,6 +18,26 @@ import {
 } from "./view-persistence";
 
 const CANCEL_REQUEST_TIMEOUT_MS = 15_000;
+// Run-level state (status, pending question or confirmation, artifacts, queue
+// position) only arrives on the snapshot, so these kinds require a refresh. The
+// four terminal kinds are the server's stream-ending contract: a terminal event
+// is the last frame a stream delivers, so a missed refresh freezes the tab.
+const SNAPSHOT_REFRESH_EVENT_KINDS = new Set([
+  "run_finished",
+  "run_error",
+  "run_canceled",
+  "run_interrupted",
+  "run_queued",
+  "run_started",
+  "run_resumed",
+  "run_waiting",
+  "confirm_request",
+]);
+const RETRYABLE_STREAM_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+// Events retained per tab for the technical detail list. Trimming is
+// display-only: node progress is a separate aggregate and stream resumption
+// uses `lastStreamSeq`, so nothing observable is lost.
+const MAX_RETAINED_EVENTS = 500;
 const RUN_HASH_PREFIX = "#/runs/";
 type PendingAction = "starting" | "answering" | "approving" | "denying" | "canceling";
 
@@ -22,6 +48,11 @@ export interface RunTab {
   generatorName: string;
   runState: RunStatus | "idle" | "loading";
   events: RunEvent[];
+  /**
+   * Node status folded from the whole stream, kept outside `events` so a
+   * trimmed display window never loses a node's outcome.
+   */
+  nodeProgressState: NodeProgressAggregate;
   artifacts: OutputArtifact[];
   question: FormSpec | null;
   confirm: ConfirmSpec | null;
@@ -31,6 +62,12 @@ export interface RunTab {
   queuedAt: string | null;
   pendingAction: PendingAction | null;
   lastSnapshotSeq: number;
+  /**
+   * Last sequence position seen on the event stream. Distinct from
+   * `lastSnapshotSeq` (snapshot and fork cursor) and independent of the
+   * trimmed display window, so a reconnect resumes exactly where it stopped.
+   */
+  lastStreamSeq: number;
   snapshotVersion: number;
   /** Operation token owning pendingAction, independent of snapshotVersion. */
   pendingOp: string | null;
@@ -49,6 +86,7 @@ function emptyTab(runId: string, generatorId: string, generatorName: string): Ru
     generatorName,
     runState: "running",
     events: [],
+    nodeProgressState: emptyNodeProgress(),
     artifacts: [],
     question: null,
     confirm: null,
@@ -57,6 +95,7 @@ function emptyTab(runId: string, generatorId: string, generatorName: string): Ru
     queuedAt: null,
     pendingAction: null,
     lastSnapshotSeq: 0,
+    lastStreamSeq: 0,
     snapshotVersion: 0,
     pendingOp: null,
     startKey: null,
@@ -92,7 +131,12 @@ export class RunStore {
   queuedAt = $state<string | null>(null);
   errorText = $state("");
   pendingAction = $state<PendingAction | null>(null);
-  nodeProgress = $derived(collectNodeProgress(this.events));
+  nodeProgress = $derived(
+    materialize(
+      (this.currentRun ? this.tabs[this.currentRun]?.nodeProgressState : undefined) ??
+        emptyNodeProgress(),
+    ),
+  );
 
   #sources: Record<string, { close(): void }> = {};
   #selectionController: AbortController | null = null;
@@ -499,17 +543,31 @@ export class RunStore {
     );
   }
 
+  /** Guard a tab snapshot mutation with operation ownership and version tracking. */
+  private beginTabOp(tab: RunTab, action: PendingAction): { op: string; version: number } {
+    tab.pendingAction = action;
+    this.pendingAction = action;
+    const op = randomId();
+    tab.pendingOp = op;
+    tab.snapshotVersion += 1;
+    return { op, version: tab.snapshotVersion };
+  }
+
+  /** Release a tab operation started by {@link beginTabOp} when it still owns the tab. */
+  private endTabOp(tab: RunTab, op: string): void {
+    if (tab.pendingOp === op) {
+      tab.pendingAction = null;
+      tab.pendingOp = null;
+      if (this.currentRun === tab.runId) this.pendingAction = null;
+    }
+  }
+
   async answerQuestion(overrideValues?: Record<string, unknown>): Promise<void> {
     const tab = this.currentTab();
     if (!tab || !this.question || tab.pendingAction) return;
     const values = overrideValues || Object.fromEntries(this.question.fields.map((field) => [field.id, this.values[`question:${field.id}`] ?? field.default]));
     const key = await sha256Hex(canonicalJson({ run: tab.runId, question: this.question.id, values }));
-    tab.pendingAction = "answering";
-    this.pendingAction = "answering";
-    const op = randomId();
-    tab.pendingOp = op;
-    tab.snapshotVersion += 1;
-    const version = tab.snapshotVersion;
+    const { op, version } = this.beginTabOp(tab, "answering");
     try {
       const snapshot = await this.api.put<RunSnapshot>(
         `/api/runs/${encodeURIComponent(tab.runId)}/questions/${encodeURIComponent(this.question.id)}`,
@@ -519,11 +577,7 @@ export class RunStore {
       if (version !== tab.snapshotVersion) return;
       this.applySnapshot(snapshot);
     } finally {
-      if (tab.pendingOp === op) {
-        tab.pendingAction = null;
-        tab.pendingOp = null;
-        if (this.currentRun === tab.runId) this.pendingAction = null;
-      }
+      this.endTabOp(tab, op);
     }
   }
 
@@ -536,12 +590,7 @@ export class RunStore {
     // forged or unknown-scope id fails as Conflict server-side (Q1).
     const action = decision === "approve" ? "approving" : "denying";
     const key = await sha256Hex(canonicalJson({ run: tab.runId, confirmation: this.confirm.id, decision }));
-    tab.pendingAction = action;
-    this.pendingAction = action;
-    const op = randomId();
-    tab.pendingOp = op;
-    tab.snapshotVersion += 1;
-    const version = tab.snapshotVersion;
+    const { op, version } = this.beginTabOp(tab, action);
     try {
       const snapshot = await this.api.put<RunSnapshot>(
         `/api/runs/${encodeURIComponent(tab.runId)}/confirmations/${encodeURIComponent(this.confirm.id)}`,
@@ -551,23 +600,14 @@ export class RunStore {
       if (version !== tab.snapshotVersion) return;
       this.applySnapshot(snapshot);
     } finally {
-      if (tab.pendingOp === op) {
-        tab.pendingAction = null;
-        tab.pendingOp = null;
-        if (this.currentRun === tab.runId) this.pendingAction = null;
-      }
+      this.endTabOp(tab, op);
     }
   }
 
   async cancelRun(): Promise<void> {
     const tab = this.currentTab();
-    if (!tab || tab.pendingAction || !isCancelable(tab.runState)) return;
-    tab.pendingAction = "canceling";
-    this.pendingAction = "canceling";
-    const op = randomId();
-    tab.pendingOp = op;
-    tab.snapshotVersion += 1;
-    const version = tab.snapshotVersion;
+    if (!tab || tab.pendingAction || !isActive(tab.runState)) return;
+    const { op, version } = this.beginTabOp(tab, "canceling");
     if (!tab.cancelKey) {
       tab.cancelKey = randomId();
       this.tabs = { ...this.tabs };
@@ -592,11 +632,7 @@ export class RunStore {
     } finally {
       clearTimeout(timeout);
       if (this.#cancelController === controller) this.#cancelController = null;
-      if (tab.pendingOp === op) {
-        tab.pendingAction = null;
-        tab.pendingOp = null;
-        if (this.currentRun === tab.runId) this.pendingAction = null;
-      }
+      this.endTabOp(tab, op);
     }
   }
 
@@ -684,7 +720,9 @@ export class RunStore {
     while (!controller.signal.aborted) {
       const tab = this.tabs[runId];
       if (!tab || !isActive(tab.runState)) break;
-      const last = tab.events.length > 0 ? tab.events[tab.events.length - 1].seq : 0;
+      // Resume from the last stream position, not the last retained event:
+      // the window is trimmed for display and its tail is not the cursor.
+      const last = tab.lastStreamSeq;
       try {
         const response = await this.api.events(runId, last || undefined, controller.signal);
         const reader = response.body?.getReader();
@@ -707,8 +745,17 @@ export class RunStore {
         }
       } catch (error) {
         if (controller.signal.aborted) return;
-        if (error instanceof ApiProblemError && error.status === 401) {
+        // A refusal the server keeps returning stops the loop and says why; a
+        // dropped connection reconnects silently from the last stream position.
+        const status = (error as { status?: number }).status;
+        if (status === 401) {
           if (runId === this.currentRun) this.errorText = this.tokenRequiredMessage();
+          return;
+        }
+        if (status !== undefined && !RETRYABLE_STREAM_STATUSES.has(status)) {
+          if (runId === this.currentRun) {
+            this.errorText = `The event stream was refused (${status}) and will not reconnect.`;
+          }
           return;
         }
       }
@@ -742,8 +789,12 @@ export class RunStore {
       return;
     }
     if (tab.events.some((candidate) => candidate.seq === event.seq)) return;
-    tab.events = [...tab.events, event].sort((left, right) => left.seq - right.seq);
+    // Progress folds from every event, including the ones the display window
+    // later drops, so the aggregate and the window are updated separately.
+    applyNodeProgress(tab.nodeProgressState, event);
+    tab.events = [...tab.events, event].slice(-MAX_RETAINED_EVENTS);
     tab.lastSnapshotSeq = Math.max(tab.lastSnapshotSeq, event.seq);
+    tab.lastStreamSeq = Math.max(tab.lastStreamSeq, event.seq);
     this.tabs = { ...this.tabs };
     if (runId === this.currentRun) {
       this.events = tab.events;
@@ -752,7 +803,7 @@ export class RunStore {
         this.errorText = typeof data.error === "string" ? data.error : JSON.stringify(data);
       }
     }
-    if (["run_finished", "run_canceled", "run_error", "run_started", "run_interrupted", "run_waiting", "run_resumed", "run_queued", "confirm_request"].includes(event.kind)) {
+    if (SNAPSHOT_REFRESH_EVENT_KINDS.has(event.kind)) {
       void this.withError(() => this.refreshRun(runId));
     }
   }
@@ -877,10 +928,6 @@ export class RunStore {
 }
 
 function isActive(state: RunStatus | "idle" | "loading"): boolean {
-  return state === "queued" || state === "running" || state === "waiting" || state === "confirming" || state === "cancel_requested";
-}
-
-function isCancelable(state: RunStatus | "idle" | "loading"): boolean {
   return state === "queued" || state === "running" || state === "waiting" || state === "confirming" || state === "cancel_requested";
 }
 

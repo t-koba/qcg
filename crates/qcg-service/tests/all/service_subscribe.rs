@@ -16,10 +16,8 @@ impl Drop for TempGuard {
     }
 }
 
-/// Test-only service construction through the policy constructor (E04).
-/// Integration tests are external crates, so the unit-test-only
-/// `LocalQcgService::new` is unavailable; every test service is built here
-/// with explicit defaults instead of a legacy constructor.
+/// Test-only service construction through the policy constructor (E04)
+/// with explicit defaults.
 fn test_service(
     generators_dir: Utf8PathBuf,
     runs_dir: Utf8PathBuf,

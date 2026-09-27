@@ -66,7 +66,7 @@ pub(crate) fn load_confirmations(
             format!("failed to parse confirmations file `{file}` as a JSON id-to-boolean map")
         })?;
         // File-loaded ids are validated exactly like CLI pairs: a
-        // shortened or legacy id in a file must not alias another scope
+        // shortened id in a file must not alias another scope
         // (Q1).
         for key in parsed.keys() {
             validate_confirmation_id(key).with_context(|| {
@@ -82,7 +82,7 @@ pub(crate) fn load_confirmations(
             .split_once('=')
             .with_context(|| format!("confirm `{pair}` must be ID=approve|deny"))?;
         // Fail closed on malformed confirmation ids: accept only
-        // `node:kind:64hex[:scope]` so a shortened or legacy 2-part id
+        // `node:kind:64hex[:scope]` so a shortened 2-part id
         // cannot alias another approval scope (Q1).
         validate_confirmation_id(key)
             .with_context(|| format!("confirm `{pair}` has an invalid confirmation id"))?;
@@ -161,7 +161,7 @@ fn validate_confirmation_id(id: &str) -> anyhow::Result<()> {
 mod tests {
     use super::validate_confirmation_id;
     #[test]
-    fn confirmation_ids_reject_legacy_two_part_forms() {
+    fn confirmation_ids_reject_two_part_forms() {
         // Q1: only 3-part content and 4-part invocation ids are accepted,
         // and the fourth element is a 64-hex invocation hash, never a
         // scope word or a shortened value. Colon-containing node segments
@@ -176,7 +176,7 @@ mod tests {
         );
         assert!(
             validate_confirmation_id("node:kind").is_err(),
-            "legacy 2-part must be refused"
+            "2-part must be refused"
         );
         assert!(validate_confirmation_id("node:kind:short").is_err());
         assert!(validate_confirmation_id("node:kind:ZZZZ").is_err());
@@ -219,7 +219,7 @@ mod tests {
         std::fs::write(path.as_std_path(), r#"{"node:kind": true}"#)
             .expect("file should be written");
         let error = super::load_confirmations(Vec::new(), Some(path.clone()))
-            .expect_err("legacy id in file must be refused");
+            .expect_err("2-part id in file must be refused");
         assert!(
             format!("{error:#}").contains("invalid confirmation id"),
             "{error:#}"

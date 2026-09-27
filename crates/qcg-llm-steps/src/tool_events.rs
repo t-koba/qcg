@@ -1,7 +1,7 @@
 use qcg_api::{ToolCallError, ToolCallErrorCode, ToolCallEventData, ToolCallPhase, ToolCallStatus};
 use qcg_contract::NodeDef;
 use qcg_engine::{ResultExt, StepContext, StepError, tool_call_sources};
-use qcg_llm::{ChatMessage, ChatToolCall};
+use qcg_llm::ChatToolCall;
 use qcg_mcp::McpCallOutcome;
 use serde_json::{Value, json};
 use sha2::Digest;
@@ -51,24 +51,8 @@ pub(crate) fn tool_call_event(
     // additionally redacted by default (keys stay visible) so an
     // undeclared secret never reaches the journal (E09-1). Execution
     // always uses the raw call; only this journaled copy is redacted.
-    let mut redacted_args =
-        qcg_engine::redact_credential_values(&qcg_engine::redact_fs_patch_args_for_journal(
-            &qcg_engine::redact_fs_write_args_for_journal(
-                &qcg_engine::redact_http_args_for_journal(&call.args),
-            ),
-        ));
-    if let Some(url) = redacted_args
-        .get("url")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        && let Some(object) = redacted_args.as_object_mut()
-    {
-        object.insert(
-            "url".into(),
-            Value::String(qcg_policy::redact_all_query_values(&url)),
-        );
-    }
-    let (arguments, arguments_truncated) = bounded_event_value(&redacted_args)?;
+    let (arguments, arguments_truncated) =
+        bounded_event_value(&redacted_tool_call_args(&call.args))?;
     // E09-3: journaled results never carry plaintext credential headers or
     // query values. Authorization-like response headers are redacted and
     // result URLs are query-redacted before the explicit 32 KiB truncation
@@ -255,18 +239,16 @@ pub(crate) fn bounded_event_value(value: &Value) -> Result<(Value, bool), serde_
     }
 }
 
-/// Redacted args for Debug display (E09h). Mirrors the journal redaction
-/// in [`tool_call_event`]: HTTP query values, credential headers, bodies,
-/// `fs.write` contents, `fs.patch` replacement lines, and generic
-/// credential-like keys are redacted, so a Debug dump never
-/// carries plaintext secrets. Execution always uses the raw args; only
-/// this Debug copy is redacted.
-#[allow(dead_code)]
-pub(crate) fn redacted_tool_call_args_for_debug(call: &ChatToolCall) -> Value {
+/// Redacts one tool call's arguments for every out-of-band surface: HTTP query
+/// values, credential headers, bodies, `fs.write` contents, `fs.patch`
+/// replacement lines, and any remaining credential-like key. Keys stay
+/// visible. Execution always uses the raw arguments; this is the only copy
+/// that may be journaled, emitted, or logged.
+pub(crate) fn redacted_tool_call_args(args: &Value) -> Value {
     let mut redacted =
         qcg_engine::redact_credential_values(&qcg_engine::redact_fs_patch_args_for_journal(
             &qcg_engine::redact_fs_write_args_for_journal(
-                &qcg_engine::redact_http_args_for_journal(&call.args),
+                &qcg_engine::redact_http_args_for_journal(args),
             ),
         ));
     if let Some(url) = redacted
@@ -281,63 +263,6 @@ pub(crate) fn redacted_tool_call_args_for_debug(call: &ChatToolCall) -> Value {
         );
     }
     redacted
-}
-
-/// Redacting Debug wrapper for [`ChatToolCall`] (E09h). The orphan rule
-/// forbids implementing `Debug` for the foreign `qcg_llm` type itself, so
-/// any future log site must format through this wrapper (or the
-/// field-by-field redaction above): URL, header, body, and args values
-/// never reach logs in plaintext. Direct `{:?}` on `ChatToolCall` must
-/// never be logged. No production site formats these types today, so the
-/// wrappers are scaffolding pinned by tests: the safe path exists before
-/// the first log site needs it, not after a leak.
-#[allow(dead_code)]
-pub(crate) struct RedactedToolCall<'a>(pub &'a ChatToolCall);
-
-impl std::fmt::Debug for RedactedToolCall<'_> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ChatToolCall")
-            .field("id", &self.0.id)
-            .field("name", &self.0.name)
-            .field("args", &redacted_tool_call_args_for_debug(self.0))
-            .finish()
-    }
-}
-
-/// Redacting Debug wrapper for [`ChatMessage`] (E09h). Content is
-/// credential/URL-redacted and length-bounded (shape plus hash beyond 256
-/// chars); tool calls delegate to the redacted form above; provider state
-/// shows shape only (count), never values. Direct `{:?}` on `ChatMessage`
-/// must never be logged. Like [`RedactedToolCall`], this is scaffolding
-/// with no production call site yet: pinned by tests, ready before use.
-#[allow(dead_code)]
-pub(crate) struct RedactedMessage<'a>(pub &'a ChatMessage);
-
-impl std::fmt::Debug for RedactedMessage<'_> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let redacted_content = qcg_policy::redact_credential_assignments_in_text(
-            &qcg_policy::redact_urls_in_text(&self.0.content),
-        );
-        let content = crate::prompting::truncate_with_digest(&redacted_content, 256);
-        let tool_calls: Vec<RedactedToolCall<'_>> =
-            self.0.tool_calls.iter().map(RedactedToolCall).collect();
-        formatter
-            .debug_struct("ChatMessage")
-            .field("role", &self.0.role)
-            .field("content", &content)
-            .field("tool_calls", &tool_calls)
-            .field("tool_call_id", &self.0.tool_call_id)
-            .field(
-                "provider_state",
-                &self
-                    .0
-                    .provider_state
-                    .as_ref()
-                    .map(|state| format!("[{} items]", state.len())),
-            )
-            .finish()
-    }
 }
 
 pub(crate) async fn execute_mcp_tool(
@@ -568,12 +493,7 @@ pub(crate) async fn execute_mcp_tool(
 /// use this form. This mirrors the checkpoint redaction in
 /// `record_agent_checkpoint`, which must stay byte-identical.
 pub(crate) fn canonical_mcp_key_args(args: &Value) -> Value {
-    let redacted = qcg_engine::redact_credential_values(args);
-    if redacted.get("url").and_then(Value::as_str).is_some() {
-        qcg_engine::redact_http_args_for_journal(&redacted)
-    } else {
-        redacted
-    }
+    qcg_engine::redact_mcp_args_for_journal(args)
 }
 
 /// Invocation-scoped continuation key binding run node, resolved server,
@@ -994,8 +914,7 @@ mod tests {
 
     #[test]
     fn bare_answer_keys_are_refused() {
-        // Backward compatibility is not preserved: a legacy bare
-        // `node:alias` answer never resumes a suspension (E08/Q1).
+        // A bare `node:alias` answer never resumes a suspension (E08/Q1).
         let args = json!({"q": "x"});
         let (key, descriptor) = pending(
             "node",
@@ -1006,16 +925,16 @@ mod tests {
             Some("node:mcp:alias:deadbeef"),
         );
         let state = state_with(&key, descriptor);
-        let legacy = BTreeMap::from([("node:alias".to_string(), json!({"response_0": "go"}))]);
+        let bare = BTreeMap::from([("node:alias".to_string(), json!({"response_0": "go"}))]);
         assert!(
             matches!(
-                decide(&state, &legacy, "node", "server", "alias", &args, "call-1"),
+                decide(&state, &bare, "node", "server", "alias", &args, "call-1"),
                 Ok(AgentResumeLookup::Absent)
             ),
-            "legacy answer must not resume"
+            "bare answer must not resume"
         );
         let both = BTreeMap::from([
-            ("node:alias".to_string(), json!({"response_0": "legacy"})),
+            ("node:alias".to_string(), json!({"response_0": "stale"})),
             (
                 "node:mcp:alias:deadbeef".to_string(),
                 json!({"response_0": "fresh"}),
@@ -1303,14 +1222,13 @@ mod tests {
     }
 
     #[test]
-    fn redacting_debug_covers_url_header_body_and_args() {
-        // E09h: args-carrying types must never reach logs in plaintext.
-        // The orphan rule forbids a direct `Debug` impl on the foreign
-        // `qcg_llm` types, so this pins the redacting wrappers that all log
-        // sites must use. Sentinel secrets cover URL query values, credential
-        // headers, bodies, fs.write contents, fs.patch lines, and generic
-        // credential-like args.
-        use qcg_llm::{ChatMessage, ChatToolCall};
+    fn redacted_tool_call_args_cover_url_header_body_and_args() {
+        // E09h: args-carrying values must never reach a journal, event, or log
+        // in plaintext, and `redacted_tool_call_args` is the one function every
+        // such surface must use. Sentinel secrets cover URL query values,
+        // credential headers, bodies, fs.write contents, fs.patch lines, and
+        // generic credential-like args.
+        use qcg_llm::ChatToolCall;
         let call = ChatToolCall {
             id: "call-sentinel".into(),
             name: "fetch-sentinel".into(),
@@ -1326,7 +1244,8 @@ mod tests {
                 "edits": [{"op": "replace", "anchor": "2:015cadfe", "lines": ["SENTINEL_PATCH_SECRET"]}],
             }),
         };
-        let debug = format!("{:?}", super::RedactedToolCall(&call));
+        let debug = serde_json::to_string(&super::redacted_tool_call_args(&call.args))
+            .expect("redacted args should serialize");
         for sentinel in [
             "SENTINEL_URL_SECRET",
             "SENTINEL_KEY_SECRET",
@@ -1341,24 +1260,22 @@ mod tests {
                 "redacted tool-call Debug must not leak {sentinel}: {debug}"
             );
         }
-        assert!(debug.contains("fetch-sentinel"), "{debug}");
-        assert!(debug.contains("call-sentinel"), "{debug}");
         assert!(debug.contains("api_key="), "keys stay visible: {debug}");
-        let message = ChatMessage::assistant_tool_calls("hello".to_string(), vec![call]);
-        let debug = format!("{:?}", super::RedactedMessage(&message));
         assert!(
-            !debug.contains("SENTINEL"),
-            "redacted message Debug must not leak sentinels: {debug}"
+            debug.contains("X-Tenant"),
+            "non-credential headers stay visible: {debug}"
         );
-        // Content secrets are redacted too, with shape preserved.
-        let secret_message = ChatMessage::text(
-            "user",
-            "deploy with api_key=SENTINEL_CONTENT_SECRET at https://example.test/?token=SENTINEL_URL2",
+        // Message text travels through the same helpers before it can be
+        // logged: credential assignments and URL query values are redacted
+        // while the key stays visible.
+        let text = qcg_policy::redact_credential_assignments_in_text(
+            &qcg_policy::redact_urls_in_text(
+                "deploy with api_key=SENTINEL_CONTENT_SECRET at https://example.test/?token=SENTINEL_URL2",
+            ),
         );
-        let debug = format!("{:?}", super::RedactedMessage(&secret_message));
-        assert!(!debug.contains("SENTINEL_CONTENT_SECRET"), "{debug}");
-        assert!(!debug.contains("SENTINEL_URL2"), "{debug}");
-        assert!(debug.contains("api_key="), "keys stay visible: {debug}");
+        assert!(!text.contains("SENTINEL_CONTENT_SECRET"), "{text}");
+        assert!(!text.contains("SENTINEL_URL2"), "{text}");
+        assert!(text.contains("api_key="), "keys stay visible: {text}");
     }
 
     #[test]

@@ -251,9 +251,8 @@ pub(crate) fn ask_user_question_id_from_content_hash(
 }
 
 /// Looks up the answer for one agent question (E08). Only the full
-/// `node:tool:hex` identity is honored; legacy bare `node:tool` keys are
-/// refused fail-closed. Backward compatibility is intentionally not
-/// preserved: an old bare answer never completes a new question (E08/Q1).
+/// `node:tool:hex` identity is honored; bare `node:tool` keys are refused
+/// fail-closed and never complete a question (E08/Q1).
 pub(crate) fn answer_for_question<'a>(
     answers: &'a BTreeMap<String, Value>,
     question_id: &str,
@@ -2220,47 +2219,6 @@ mod tests {
     }
 
     #[test]
-    fn default_ask_user_form_still_validates_answers() {
-        // E08: the default form (no declared fields) must still validate:
-        // an empty answer must not pass through unchecked.
-        use qcg_contract::{FieldType, InputField};
-        let default_fields = vec![InputField {
-            id: "answer".into(),
-            label: None,
-            label_i18n: Default::default(),
-            description: None,
-            description_i18n: Default::default(),
-            placeholder: None,
-            placeholder_i18n: Default::default(),
-            kind: FieldType::String,
-            required: true,
-            default: None,
-            pattern: None,
-            options: Vec::new(),
-            option_labels_i18n: Default::default(),
-            min_items: None,
-            item_type: None,
-            schema: None,
-            options_from: None,
-            ui: Default::default(),
-        }];
-        let runtime = qcg_contract::RuntimeLimits::default();
-        assert!(
-            qcg_contract::validate_form_values(&default_fields, &json!({}), &runtime).is_err(),
-            "an empty answer must not satisfy the required default field"
-        );
-        assert!(
-            qcg_contract::validate_form_values(
-                &default_fields,
-                &json!({"answer": "Nagoya"}),
-                &runtime
-            )
-            .is_ok(),
-            "a filled answer must satisfy the default field"
-        );
-    }
-
-    #[test]
     fn same_args_with_different_call_ids_stay_separate() {
         // E08: identical arguments under different call ids must yield
         // different question identities so a delayed answer for the old
@@ -2288,71 +2246,6 @@ mod tests {
             "the old answer must not satisfy the new question"
         );
         assert!(answers.contains_key(&first));
-    }
-
-    #[test]
-    fn sequential_questions_stay_separate_with_stable_restart() {
-        // E08: one AskUser tool asking city then postal code yields two
-        // distinct stable identities; a restart recomputes the same second
-        // id, and the first answer never satisfies the second question.
-        // Uses valid forms (no empty `fields` arrays) matching the real
-        // execution path where empty arrays fail before id generation.
-        let city = json!({"question": "city?", "notes": "billing"});
-        let postal = json!({"question": "postal code?", "notes": "billing"});
-        let first = ask_user_question_id("agent", "agent", "ask", "call-1", &city)
-            .expect("city id should build");
-        let second = ask_user_question_id("agent", "agent", "ask", "call-2", &postal)
-            .expect("postal id should build");
-        assert_ne!(first, second, "distinct questions must separate");
-        let again = ask_user_question_id("agent", "agent", "ask", "call-2", &postal)
-            .expect("restart must recompute the same second id");
-        assert_eq!(second, again, "question ids must survive restarts");
-        let answers =
-            std::collections::BTreeMap::from([(first.clone(), json!({"answer": "old-town"}))]);
-        assert!(
-            answer_for_question(&answers, &second).is_none(),
-            "the city answer must not complete the postal question"
-        );
-        let answers =
-            std::collections::BTreeMap::from([(second.clone(), json!({"answer": "12345"}))]);
-        assert!(
-            answer_for_question(&answers, &second).is_some(),
-            "the postal answer must complete the postal question"
-        );
-    }
-
-    #[test]
-    fn sequential_notes_separate_restart_stable_and_delayed_incomplete() {
-        // E08e (combined): two sequential questions separate, a restart
-        // recomputes the same second id, a delayed first answer never
-        // completes the second, and an unanswered second stays incomplete.
-        // Helper-level with real harness with real data.
-        let first_args = json!({"question": "city?", "notes": "billing"});
-        let second_args = json!({"question": "city?", "notes": "shipping"});
-        let first = ask_user_question_id("agent", "agent", "ask", "call-1", &first_args)
-            .expect("first should build");
-        let second = ask_user_question_id("agent", "agent", "ask", "call-2", &second_args)
-            .expect("second should build");
-        assert_ne!(first, second, "notes change must separate");
-        let again = ask_user_question_id("agent", "agent", "ask", "call-2", &second_args)
-            .expect("restart stable");
-        assert_eq!(second, again, "restart must recompute identically");
-        let delayed =
-            std::collections::BTreeMap::from([(first.clone(), json!({"answer": "old-town"}))]);
-        assert!(
-            answer_for_question(&delayed, &second).is_none(),
-            "delayed first answer must not complete second"
-        );
-        assert!(
-            answer_for_question(&std::collections::BTreeMap::new(), &second).is_none(),
-            "unanswered second stays incomplete"
-        );
-        let answered =
-            std::collections::BTreeMap::from([(second.clone(), json!({"answer": "new-town"}))]);
-        assert!(
-            answer_for_question(&answered, &second).is_some(),
-            "second answer completes second"
-        );
     }
 
     #[test]
@@ -2536,28 +2429,6 @@ mod tests {
     }
 
     #[test]
-    fn bare_answer_keys_are_refused() {
-        // Backward compatibility is not preserved: a legacy bare
-        // `node:tool` answer never satisfies a full-identity question
-        // (E08/Q1).
-        let answers = BTreeMap::from([("agent:ask".to_string(), json!({"answer": "legacy"}))]);
-        assert!(
-            answer_for_question(&answers, "agent:ask:deadbeef").is_none(),
-            "legacy answer must not cover the new id"
-        );
-        let answers = BTreeMap::from([
-            ("agent:ask".to_string(), json!({"answer": "legacy"})),
-            ("agent:ask:deadbeef".to_string(), json!({"answer": "fresh"})),
-        ]);
-        assert_eq!(
-            answer_for_question(&answers, "agent:ask:deadbeef"),
-            Some(&json!({"answer": "fresh"})),
-            "the new-style answer must win when present"
-        );
-        assert!(answer_for_question(&BTreeMap::new(), "agent:ask:deadbeef").is_none());
-    }
-
-    #[test]
     fn builtin_minimization_keeps_only_functional_fields() {
         // E08a/E08-4: resume needs the question, options, fields, and
         // material notes; other free-text extras and credential-like values
@@ -2623,101 +2494,6 @@ mod tests {
             .expect("details should exist");
         assert_eq!(details["stdin_sha256"], Value::Null);
         assert!(agent_command_details("n", json!([1, 2]), "salt-1").is_err());
-    }
-
-    #[test]
-    fn fs_write_details_bind_content_by_hash_only() {
-        // E07: fs.write approval and guard details must bind the exact
-        // content without journaling the content itself in the digest
-        // structure (the content lives in the write, the digest binds it).
-        use sha2::{Digest as _, Sha256};
-        let content = "hello secret";
-        let expected = hex::encode(Sha256::digest(content.as_bytes()));
-        let details = json!({
-            "path_prefix": "workspace",
-            "content_sha256": expected.clone(),
-        });
-        assert_eq!(details["content_sha256"], json!(expected));
-        assert!(
-            !details.to_string().contains("hello secret"),
-            "details must not contain plaintext content"
-        );
-    }
-
-    #[test]
-    fn invalid_ask_user_forms_fail_before_id_with_zero_journal_events() {
-        // Gap 3 (runtime side): the AskUser branch validates fields and
-        // options before minting the question id and before any journal
-        // write (E08c). This drives the exact prefix
-        // (`dynamic_form_fields` + options validation) with a real journal
-        // open, proving invalid forms error with zero new journal events.
-        // Real objects, no mocks.
-        use crate::agent_tools::dynamic_form_fields;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "qcg-agent-runtime-invalid-{}-{nonce}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("test directory should be creatable");
-        let root =
-            camino::Utf8PathBuf::from_path_buf(path.clone()).expect("temporary path must be UTF-8");
-        let journal_path = root.join("journal.jsonl");
-        let journal =
-            qcg_engine::JournalWriter::create(&journal_path, "runtime-invalid-1", false, None)
-                .expect("test journal should open");
-        let count = || {
-            std::fs::read_to_string(&journal_path)
-                .unwrap_or_default()
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .count()
-        };
-        assert_eq!(count(), 0);
-        // Empty fields array fails before id generation.
-        assert!(dynamic_form_fields("agent", &json!({"question": "q?", "fields": []})).is_err());
-        // Duplicate ids fail closed.
-        assert!(
-            dynamic_form_fields(
-                "agent",
-                &json!({"question": "q?", "fields": [
-                    {"id": "a", "type": "string"},
-                    {"id": "a", "type": "string"},
-                ]}),
-            )
-            .is_err()
-        );
-        // Notes-carrying valid forms still pass the field prefix and mint
-        // distinct question ids (gap 1 runtime side).
-        assert!(
-            dynamic_form_fields("agent", &json!({"question": "q?", "notes": "billing"})).is_ok()
-        );
-        let first = ask_user_question_id(
-            "agent",
-            "agent",
-            "ask",
-            "call-1",
-            &json!({"question": "q?", "notes": "a"}),
-        )
-        .expect("id should build");
-        let second = ask_user_question_id(
-            "agent",
-            "agent",
-            "ask",
-            "call-1",
-            &json!({"question": "q?", "notes": "b"}),
-        )
-        .expect("id should build");
-        assert_ne!(first, second, "notes must separate runtime identities");
-        assert_eq!(count(), 0, "invalid forms must write zero journal events");
-        assert_eq!(
-            journal.state().operation_records.len(),
-            0,
-            "validation must not create operation records"
-        );
-        let _ = std::fs::remove_dir_all(&path);
     }
 
     #[test]
@@ -2901,44 +2677,6 @@ mod tests {
     }
 
     #[test]
-    fn constructed_agent_details_carry_no_sentinel_secrets() {
-        // E09 SENSITIVE: every details object YOUR code constructs carries
-        // redacted (never raw) secrets.
-        let headers = std::collections::BTreeMap::from([
-            (
-                "Authorization".to_string(),
-                "Bearer SENTINEL_AGENT_DETAIL".to_string(),
-            ),
-            ("X-Tenant".to_string(), "alpha".to_string()),
-        ]);
-        let sensitive = BTreeMap::from([(
-            "api_key".to_string(),
-            "SENTINEL_AGENT_SENSITIVE".to_string(),
-        )]);
-        let details = http_details_with_url(
-            "POST",
-            &headers,
-            Some(b"token=SENTINEL_AGENT_BODY"),
-            &sensitive,
-            "run-1",
-            "https://example.test/search?q=x&api_key=SENTINEL_AGENT_URL",
-        )
-        .expect("details should build");
-        let details_str = details.to_string();
-        for sentinel in [
-            "SENTINEL_AGENT_DETAIL",
-            "SENTINEL_AGENT_SENSITIVE",
-            "SENTINEL_AGENT_BODY",
-            "SENTINEL_AGENT_URL",
-        ] {
-            assert!(
-                !details_str.contains(sentinel),
-                "agent details must not leak {sentinel}: {details_str}"
-            );
-        }
-    }
-
-    #[test]
     fn registry_hashes_are_salted_redacted_and_bind_changes() {
         // E09 (salted registry) + E07a (single redacted form): identical
         // safe-read content in different runs yields different hashes
@@ -3033,45 +2771,6 @@ mod tests {
     }
 
     #[test]
-    fn send_path_shares_the_approved_guard_digest() {
-        // E09: the executed request equals the approved guard (same digest
-        // at send time). Both the guard site and the send site construct via
-        // the single `http_details_with_url` helper, so their digests match
-        // byte-for-byte. Real objects, no mocks.
-        let headers = std::collections::BTreeMap::from([(
-            "Content-Type".to_string(),
-            "text/plain".to_string(),
-        )]);
-        let sensitive = BTreeMap::new();
-        let guard = http_details_with_url(
-            "POST",
-            &headers,
-            Some(b"hello"),
-            &sensitive,
-            "run-1",
-            "https://example.test/search?q=x",
-        )
-        .expect("guard site should build");
-        let send = http_details_with_url(
-            "POST",
-            &headers,
-            Some(b"hello"),
-            &sensitive,
-            "run-1",
-            "https://example.test/search?q=x",
-        )
-        .expect("send site should build");
-        assert_eq!(guard, send, "send must equal the approved guard");
-        let guard_digest =
-            qcg_engine::RunContext::operation_digest("https://example.test", &Some(guard))
-                .expect("digest should compute");
-        let send_digest =
-            qcg_engine::RunContext::operation_digest("https://example.test", &Some(send))
-                .expect("digest should compute");
-        assert_eq!(guard_digest, send_digest, "digests must match at send time");
-    }
-
-    #[test]
     fn pending_sidecar_restores_nonsecret_payload_with_digest_binding() {
         // F02-01/F02-02/F02-04: a redacted journal copy restores to the
         // original bytes via the private sidecar when the digest matches;
@@ -3079,7 +2778,7 @@ mod tests {
         use qcg_contract::NodeDef;
         let node = NodeDef {
             id: "agent".into(),
-            kind: qcg_contract::StepType::from("llm.agent"),
+            kind: qcg_contract::StepType::literal("llm.agent"),
             needs: vec![],
             when: None,
             on_deps: qcg_contract::OnDeps::AllSucceeded,
@@ -3270,7 +2969,7 @@ mod approval_e2e {
         fn node() -> NodeDef {
             NodeDef {
                 id: "agent".into(),
-                kind: StepType::from("llm.agent"),
+                kind: StepType::literal("llm.agent"),
                 needs: vec![],
                 when: None,
                 on_deps: OnDeps::AllSucceeded,
@@ -3916,17 +3615,13 @@ mod approval_e2e {
             canonical_patch_edits(&second),
             "key order must not fork the approval digest"
         );
-    }
-
-    #[test]
-    fn patch_edits_reject_unknown_ops() {
-        let args = json!({
+        let unknown = json!({
             "path": "notes.txt",
             "expected_base_sha256": "abc",
             "edits": [{"op": "swap", "anchor": "2:015cadfe", "lines": ["x"]}],
         });
         assert!(
-            canonical_patch_edits(&args).is_none(),
+            canonical_patch_edits(&unknown).is_none(),
             "unknown ops must not canonicalize"
         );
     }

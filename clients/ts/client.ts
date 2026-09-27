@@ -8,8 +8,6 @@ export type QcgClientOptions = {
   token?: string;
   /** Fetch implementation override (tests, Node runtimes). */
   fetch?: typeof fetch;
-  /** Redirect policy for authenticated requests: same-origin only by default. */
-  redirect?: "same-origin" | "follow";
 };
 
 export type RequestOptions = {
@@ -47,13 +45,11 @@ export class QcgClient {
   private readonly baseUrl: string;
   private token?: string;
   private readonly fetchImpl: typeof fetch;
-  private readonly redirectPolicy: "same-origin" | "follow";
 
   constructor(options: QcgClientOptions = {}) {
     this.baseUrl = (options.baseUrl ?? "").replace(/\/$/, "");
     this.token = options.token;
     this.fetchImpl = options.fetch ?? globalThis.fetch;
-    this.redirectPolicy = options.redirect ?? "same-origin";
   }
 
   /** Replaces the bearer token for subsequent requests. */
@@ -87,21 +83,9 @@ export class QcgClient {
     return { ...extra, "idempotency-key": idempotencyKey };
   }
 
-  private sameOrigin(url: string): boolean {
-    if (!this.baseUrl) return true;
-    try {
-      const base = new URL(this.baseUrl);
-      const target = new URL(url, this.baseUrl);
-      return base.origin === target.origin;
-    } catch {
-      return false;
-    }
-  }
-
   private async checkedFetch(url: string, init: RequestInit): Promise<Response> {
     // F04: never forward the bearer cross-origin or over a downgrade.
-    // The token lives only in memory; cross-origin redirects are followed
-    // without it (same-origin policy by default).
+    // The token lives only in memory; redirects are followed without it.
     const response = await this.fetchImpl(url, { ...init, redirect: "manual" });
     const location = response.headers.get("location");
     if (
@@ -115,11 +99,6 @@ export class QcgClient {
       const initHeaders = new Headers(init.headers);
       if ((crossOrigin || downgrade) && initHeaders.has("authorization")) {
         initHeaders.delete("authorization");
-      }
-      if (crossOrigin && this.redirectPolicy === "same-origin") {
-        // Follow same-origin redirects with the (possibly stripped)
-        // headers; cross-origin is followed once without credentials.
-        // Further hops re-enter this method via recursion below.
       }
       const nextInit: RequestInit = { ...init, headers: initHeaders };
       // 303 always becomes GET (except HEAD); 301/302 POST becomes GET.

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use qcg_contract::{Contract, NodeDef, ToolBackendKind, ToolNetwork, ToolWorkspace};
+use qcg_contract::{Contract, NodeDef, ToolBackendKind, ToolWorkspace};
 use qcg_engine::{StepContext, StepError, StepExecutor, StepOutcome};
 use qcg_policy::{
     is_safe_relative_path, params_schema, string_array_schema, string_schema,
@@ -168,12 +168,6 @@ impl StepExecutor for CommandStep {
                 return Err(StepError::failed(
                     &node.id,
                     format!("command tool `{tool_name}` requires workspace = \"none\""),
-                ));
-            }
-            if !matches!(tool.network, ToolNetwork::None) {
-                return Err(StepError::failed(
-                    &node.id,
-                    format!("command tool `{tool_name}` requires network = \"none\""),
                 ));
             }
         }

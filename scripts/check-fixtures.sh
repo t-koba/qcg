@@ -9,7 +9,7 @@ scratch_root="$(mktemp -d "${TMPDIR:-/tmp}/qcg-example-smoke.XXXXXX")"
 trap 'rm -rf "$scratch_root"' EXIT
 
 run_qcg() {
-  (cd "$scratch_root" && CARGO_TARGET_DIR="$repo_root/target" cargo run --manifest-path "$repo_root/Cargo.toml" -p qcg -- "$@")
+  (cd "$scratch_root" && CARGO_TARGET_DIR="$repo_root/target" cargo run --manifest-path "$repo_root/Cargo.toml" -p qcg --locked -- "$@")
 }
 
 for dir in generators/* fixtures/generators/*; do

@@ -1,31 +1,53 @@
 use camino::Utf8PathBuf;
 use qcg_api::RunEvent;
 use qcg_contract::RuntimeLimits;
-use qcg_policy::{AuditLimits, AuditPolicy};
+use qcg_policy::{
+    AuditLimits, AuditPolicy, DEFAULT_JOURNAL_SCAN_WINDOW_BYTES, DEFAULT_MAX_JOURNAL_EVENT_BYTES,
+    DEFAULT_MAX_JOURNAL_EVENT_COUNT, DEFAULT_MAX_JOURNAL_TOTAL_BYTES, DEFAULT_MAX_STATE_BYTES,
+};
 use serde::Serialize;
 use serde_json::Value;
 use std::fs::File;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JournalLimits {
     pub max_event_bytes: Option<usize>,
     pub max_total_bytes: Option<usize>,
     pub max_event_count: Option<usize>,
     pub max_state_bytes: Option<usize>,
-    /// In-memory tail/repair scan window; `None` uses the default.
     pub scan_window_bytes: Option<usize>,
+}
+
+impl Default for JournalLimits {
+    fn default() -> Self {
+        Self {
+            max_event_bytes: Some(DEFAULT_MAX_JOURNAL_EVENT_BYTES),
+            max_total_bytes: Some(DEFAULT_MAX_JOURNAL_TOTAL_BYTES),
+            max_event_count: Some(DEFAULT_MAX_JOURNAL_EVENT_COUNT),
+            max_state_bytes: Some(DEFAULT_MAX_STATE_BYTES),
+            scan_window_bytes: Some(DEFAULT_JOURNAL_SCAN_WINDOW_BYTES),
+        }
+    }
 }
 
 impl From<&RuntimeLimits> for JournalLimits {
     fn from(runtime: &RuntimeLimits) -> Self {
         Self {
-            max_event_bytes: runtime.journal_event_limit_bytes,
-            max_total_bytes: runtime.journal_total_limit_bytes,
-            max_event_count: runtime.journal_event_count_limit,
-            max_state_bytes: runtime.state_limit_bytes,
-            scan_window_bytes: runtime.journal_scan_window_bytes,
+            max_event_bytes: runtime
+                .journal_event_limit_bytes
+                .or(Some(DEFAULT_MAX_JOURNAL_EVENT_BYTES)),
+            max_total_bytes: runtime
+                .journal_total_limit_bytes
+                .or(Some(DEFAULT_MAX_JOURNAL_TOTAL_BYTES)),
+            max_event_count: runtime
+                .journal_event_count_limit
+                .or(Some(DEFAULT_MAX_JOURNAL_EVENT_COUNT)),
+            max_state_bytes: runtime.state_limit_bytes.or(Some(DEFAULT_MAX_STATE_BYTES)),
+            scan_window_bytes: runtime
+                .journal_scan_window_bytes
+                .or(Some(DEFAULT_JOURNAL_SCAN_WINDOW_BYTES)),
         }
     }
 }

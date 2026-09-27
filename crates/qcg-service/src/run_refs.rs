@@ -14,6 +14,7 @@ use qcg_contract::{Contract, ResourceKind};
 use qcg_engine::RunRefMaterial;
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
+use std::io::Write as _;
 
 /// Persisted resolution result: the bytes live beside this index, so resume
 /// reads them without touching the source run.
@@ -108,8 +109,14 @@ fn resolve_source_run(
     };
     match *kind {
         "run_id" => {
-            let meta_dir = crate::summaries::run_meta_dir(&runs_dir.join(value));
-            let summary = crate::summaries::run_summary(&runs_dir.join(value))
+            if !qcg_policy::is_safe_path_component(value) {
+                return Err(format!(
+                    "source run id `{value}` is not a safe path component"
+                ));
+            }
+            let source_dir = runs_dir.join(value);
+            let meta_dir = crate::summaries::run_meta_dir(&source_dir);
+            let summary = crate::summaries::run_summary(&source_dir)
                 .map_err(|error| format!("source run `{value}` is unreadable: {error}"))?;
             if summary.status != "success" {
                 return Err(format!(
@@ -253,7 +260,7 @@ fn load_persisted(
     referenced: &[(&str, &qcg_contract::ResourceDef)],
 ) -> Result<Option<BTreeMap<String, RunRefMaterial>>, ApiError> {
     let index_path = metadata_dir.join(RUN_REF_INDEX);
-    let bytes = match std::fs::read(&index_path) {
+    let bytes = match qcg_fs::read_nofollow_bounded(&index_path, Some(1024 * 1024)) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
@@ -272,7 +279,7 @@ fn load_persisted(
             )));
         };
         let path = metadata_dir.join(RUN_REF_DIR).join(format!("{name}.bin"));
-        let bytes = std::fs::read(&path).map_err(|error| {
+        let bytes = qcg_fs::read_nofollow_bounded(&path, Some(entry.bytes)).map_err(|error| {
             ApiError::internal(format!(
                 "run reference `{name}` bytes are unreadable: {error}"
             ))
@@ -304,7 +311,8 @@ fn persist(
     std::fs::create_dir_all(&dir)?;
     let mut index = BTreeMap::new();
     for (name, material) in materials {
-        std::fs::write(dir.join(format!("{name}.bin")), &material.bytes)?;
+        let path = dir.join(format!("{name}.bin"));
+        qcg_fs::write_file_atomic(&path, |file| file.write_all(&material.bytes))?;
         index.insert(
             name.clone(),
             PersistedRunRef {
@@ -317,7 +325,5 @@ fn persist(
     }
     let encoded = serde_json::to_vec_pretty(&index)?;
     let target = metadata_dir.join(RUN_REF_INDEX);
-    let staging = target.with_extension("json.tmp");
-    std::fs::write(&staging, encoded)?;
-    std::fs::rename(&staging, &target)
+    qcg_fs::write_file_atomic(&target, |file| file.write_all(&encoded))
 }

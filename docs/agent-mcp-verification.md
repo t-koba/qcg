@@ -38,12 +38,12 @@ layer below must pass independently before the feature is considered working.
 
 | Area | Required behavior | Verification |
 |---|---|---|
-| Lifecycle | Profiles choose `initialize` or `discover`; no implicit protocol fallback exists. Known public profiles are pinned to the lifecycle they actually implement. | `public_defaults_are_anonymous_and_pinned_to_exact_hosts`, live public contract test |
+| Lifecycle | Profiles choose `initialize` or `discover`; no implicit protocol fallback exists. Known public profiles are pinned to the lifecycle they actually implement. | `public_defaults_are_anonymous_and_pinned_to_exact_hosts` |
 | Transport | Streamable HTTP and stdio perform real initialization, listing, calls, isolation, cancellation, timeout, and close/reap behavior. A malformed successful HTTP JSON body fails immediately instead of entering asynchronous task polling. | `qcg-mcp` HTTP and stdio integration tests, including `malformed_success_json_fails_immediately_instead_of_timing_out` |
 | Discovery bounds | Pagination, response size, schema size, depth, node count, object width, and string length are bounded. | MCP schema and transport bound tests |
 | Schema trust | Descriptions and annotations are sanitized, internal references/composition work, and external references are rejected. | `mcp_schema_removes_untrusted_annotations_without_dropping_property_names`, reference and complexity tests |
 | Exact binding | A contract fixes both profile ID and remote tool name; the model sees only the declared alias. | manifest validation and `McpAgentTools::prepare` |
-| Input | Model arguments are validated locally against the discovered input schema before transport. | real Parallel wire-shape and live public tests |
+| Input | Model arguments are validated locally against the discovered input schema before transport. | `parallel_public_search_contract_validates_real_wire_shapes` |
 | Complete result | `content` must be an array. `isError` must be boolean when present. A successful typed result requires valid `structuredContent`; a typed tool error remains recoverable without it. | `mcp_result_requires_structured_content_only_for_successful_typed_results` |
 | Tasks and input-required | Task polling, cancellation, supported form elicitation, stable question IDs, and durable resume are bounded. Unsupported request methods fail. | `modern_mrtr_is_exposed_for_durable_hitl_and_can_resume`, MCP input-required tests |
 | Failure classification | Tool-declared errors return to the model. Transport, protocol, schema, credential-reflection, and cancellation errors fail the step explicitly. | `mcp_tool_error_is_recoverable_but_transport_error_is_not` and transport tests |
@@ -52,22 +52,13 @@ layer below must pass independently before the feature is considered working.
 ## Public Exa and Parallel profiles
 
 The `exa-public` and `parallel-public` profiles are anonymous defaults, but a
-generator must still declare exact tools and network hosts. Their acceptance
-test performs real network operations and is intentionally separate from the
-local transport suite:
-
-```bash
-cargo test -p qcg-llm-steps --locked \
-  public_mcp_tools_accept_real_calls_and_validate_real_results \
-  -- --ignored --test-threads=1
-```
-
-The test connects through qcg's MCP runtime, lists the real tools, validates
-representative arguments with the discovered schemas, calls both services,
-validates the actual results, extracts public source URLs, and closes both
-sessions. CI runs it on Ubuntu. A captured real Parallel wire-shape test remains
-in the ordinary unit suite so incompatible parsing is caught even when an
-external service is unavailable.
+generator must still declare exact tools and network hosts. What is verified
+offline is everything that does not depend on the remote service being up: the
+pinned profile identity, transport and host allowlist, discovery bounds, schema
+sanitization, argument validation against the discovered input schema, result
+validation, credential reflection, and task/input-required handling. The real
+services are anonymous by contract (`McpAuth::None`, no credential env), so
+nothing in the local suite can pass while the profile silently requires a secret.
 
 ## Observability and demo UX
 
@@ -77,7 +68,7 @@ external service is unavailable.
 | Specialist events | Start, handoff, completion, and failure are typed events with budgets, tools, turn, token totals, and stable failure codes. | run-event schema generation and frontend type checks |
 | Browser display | The event log labels tool and specialist activity and renders public HTTP(S) sources as safe external links. | Svelte type check and browser E2E |
 | Artifact UX | Artifact descriptions, preview metadata, safe inline preview, download, and deterministic archive behavior remain separate from agent/MCP output. | service/API/UI tests and distribution checks |
-| Demo use | The built-in generator defaults to Exa plus Parallel, assigns schemas and explicit budgets to parent and specialist agents, and validates the generated package as the source of truth. | generator validation, fixture check, UI E2E, live public contract test |
+| Demo use | The built-in generator defaults to Exa plus Parallel, assigns schemas and explicit budgets to parent and specialist agents, and validates the generated package as the source of truth. | generator validation, fixture check, UI E2E |
 
 ## Performance and resource boundaries
 

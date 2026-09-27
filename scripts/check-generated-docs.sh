@@ -4,9 +4,9 @@ set -euo pipefail
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-cargo run -q -p qcg -- docs step-schemas > "$tmp/step-schemas"
-cargo run -q -p qcg -- docs run-events > "$tmp/run-events"
-cargo run -q -p qcg -- docs openapi > "$tmp/openapi.json"
+cargo run -q -p qcg --locked -- docs step-schemas > "$tmp/step-schemas"
+cargo run -q -p qcg --locked -- docs run-events > "$tmp/run-events"
+cargo run -q -p qcg --locked -- docs openapi > "$tmp/openapi.json"
 
 trim_trailing_blank_lines() {
   local source="$1"

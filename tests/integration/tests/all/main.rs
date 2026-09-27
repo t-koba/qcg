@@ -26,6 +26,33 @@ pub(crate) fn answer_for_question<'a>(
         .flatten()
 }
 
+/// Opt-in that lets a test report a skipped loopback bind instead of
+/// failing. Unset by default so a bind refusal can never masquerade as a
+/// passing server test.
+pub(crate) const SKIP_WITHOUT_LOOPBACK_ENV: &str = "QCG_TEST_SKIP_IF_NO_LOOPBACK";
+
+/// Binds an ephemeral loopback port for a test server.
+///
+/// Every failure but an explicit opt-in is a test failure: a silently
+/// returned `None` reads as a pass while asserting nothing. An environment
+/// that genuinely cannot bind loopback (a sandboxed network namespace) opts
+/// into skipping through `QCG_TEST_SKIP_IF_NO_LOOPBACK=1`, which reports the
+/// skip on stderr before the caller returns.
+pub(crate) async fn bind_loopback() -> Option<tokio::net::TcpListener> {
+    match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+        Ok(listener) => Some(listener),
+        Err(error) => {
+            if std::env::var(SKIP_WITHOUT_LOOPBACK_ENV).is_ok_and(|value| value == "1") {
+                eprintln!(
+                    "skipping test: loopback bind failed and {SKIP_WITHOUT_LOOPBACK_ENV}=1 opted in: {error}"
+                );
+                return None;
+            }
+            panic!("listener should bind on loopback: {error}");
+        }
+    }
+}
+
 /// Test-only service construction through the policy constructor (E04).
 /// Integration tests are external crates, so the unit-test-only
 /// `LocalQcgService::new` is unavailable; every test service is built here

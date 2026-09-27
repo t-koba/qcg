@@ -320,11 +320,17 @@ pub enum ToolFallback {
     None,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// Network reach for a command-backed tool.
+///
+/// The set is closed at `none`: no tool backend ever granted network access,
+/// so a `permissioned` value could only be a declaration that silently never
+/// took effect. It is refused at contract load instead of being accepted and
+/// rejected again at execution.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolNetwork {
+    #[default]
     None,
-    Permissioned,
 }
 
 fn default_tool_network() -> ToolNetwork {

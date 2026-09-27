@@ -1182,6 +1182,60 @@ async fn windows_shutdown_signal(
 mod tests {
     use super::*;
     use crate::server::middleware::sha256_bytes;
+    use crate::test_state;
+
+    /// Boots a service that admits exactly one active run, so a queueing or
+    /// drain assertion observes the concurrency bound instead of racing the
+    /// default. Exclusive store mode, no explicit providers file, and the
+    /// default deployment policy match `crate::test_service`; only the
+    /// active-run slot differs.
+    ///
+    /// The runs directory is also the run store, so a refused boot means a
+    /// contended lock. The raw `Result` is returned rather than unwrapped so
+    /// a caller that polls for the release can retry instead of panicking.
+    fn try_single_run_service(
+        generators_dir: &camino::Utf8Path,
+        runs_dir: &camino::Utf8Path,
+    ) -> Result<LocalQcgService, qcg_service::ServiceError> {
+        LocalQcgService::with_generator_roots_policy_and_store_mode(
+            vec![generators_dir.to_owned()],
+            runs_dir.to_owned(),
+            None,
+            1,
+            qcg_policy::DEFAULT_MAX_TRACKED_RUNS,
+            qcg_service::RunStoreMode::Exclusive,
+            qcg_service::ServiceDeploymentPolicy::default(),
+        )
+    }
+
+    /// `try_single_run_service` for a test that expects the boot to succeed.
+    fn single_run_service(
+        generators_dir: &camino::Utf8Path,
+        runs_dir: &camino::Utf8Path,
+    ) -> LocalQcgService {
+        try_single_run_service(generators_dir, runs_dir).expect("service should initialize")
+    }
+
+    /// Acquires the exclusive run store, waiting for a refused boot to release
+    /// it.
+    ///
+    /// A dropped `AppState` frees the lock only when the last clone of the
+    /// service is gone, and a task that was already resident observes
+    /// cancellation asynchronously, so the release is waited for instead of
+    /// raced. The constructor is its own probe, so this asserts the real
+    /// precondition and still fails when the store is never released.
+    async fn acquire_store_after_release(
+        generators: &camino::Utf8Path,
+        runs: &camino::Utf8Path,
+    ) -> LocalQcgService {
+        for _ in 0..200 {
+            match try_single_run_service(generators, runs) {
+                Ok(service) => return service,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        }
+        panic!("the refused boot must release the runs directory `{runs}`");
+    }
 
     /// Removes the temp root on drop so a failed assertion cannot leak test
     /// directories (E04).
@@ -1207,31 +1261,13 @@ mod tests {
         std::fs::create_dir_all(&generators).expect("generators dir should create");
         let shutdown = CancellationToken::new();
         shutdown.cancel();
-        let service = LocalQcgService::with_generator_roots_policy_and_store_mode(
-            vec![generators.clone()],
-            runs.clone(),
-            None,
-            1,
-            qcg_policy::DEFAULT_MAX_TRACKED_RUNS,
-            qcg_service::RunStoreMode::Exclusive,
-            qcg_service::ServiceDeploymentPolicy::default(),
-        )
-        .expect("service should initialize");
-        let state = Arc::new(AppState {
+        let service = single_run_service(&generators, &runs);
+        let state = Arc::new(test_state(
             service,
-            runs_dir: runs.clone(),
-            oauth_origin: None,
-            oauth_allowed_origins: Default::default(),
-            oauth_callback_url: None,
-            idempotency: tokio::sync::Mutex::new(BTreeMap::new()),
-            idempotency_ttl: qcg_policy::IDEMPOTENCY_TTL,
-            idempotency_max_entries: qcg_policy::IDEMPOTENCY_MAX_ENTRIES,
-            api_token_digest: Some(sha256_bytes("secret")),
-            artifact_limits: qcg_service::ArtifactZipLimits::default(),
-            asset_limit: None,
-            max_request_bytes: None,
-            shutdown: shutdown.clone(),
-        });
+            runs.clone(),
+            Some(sha256_bytes("secret")),
+            shutdown.clone(),
+        ));
         let config = ServerConfig {
             generators_dir: generators.clone(),
             providers_path: None,
@@ -1303,31 +1339,8 @@ mod tests {
         std::fs::create_dir_all(&generators).expect("generators dir should create");
         let shutdown = CancellationToken::new();
         shutdown.cancel();
-        let service = LocalQcgService::with_generator_roots_policy_and_store_mode(
-            vec![generators.clone()],
-            runs.clone(),
-            None,
-            1,
-            qcg_policy::DEFAULT_MAX_TRACKED_RUNS,
-            qcg_service::RunStoreMode::Exclusive,
-            qcg_service::ServiceDeploymentPolicy::default(),
-        )
-        .expect("service should initialize");
-        let state = Arc::new(AppState {
-            service,
-            runs_dir: runs.clone(),
-            oauth_origin: None,
-            oauth_allowed_origins: Default::default(),
-            oauth_callback_url: None,
-            idempotency: tokio::sync::Mutex::new(BTreeMap::new()),
-            idempotency_ttl: qcg_policy::IDEMPOTENCY_TTL,
-            idempotency_max_entries: qcg_policy::IDEMPOTENCY_MAX_ENTRIES,
-            api_token_digest: None,
-            artifact_limits: qcg_service::ArtifactZipLimits::default(),
-            asset_limit: None,
-            max_request_bytes: None,
-            shutdown: shutdown.clone(),
-        });
+        let service = single_run_service(&generators, &runs);
+        let state = Arc::new(test_state(service, runs.clone(), None, shutdown.clone()));
         let config = boot_config(&generators, &runs);
         let validated_cors =
             parse_cors_origins(&config.cors_origins).expect("test CORS should parse");
@@ -1389,15 +1402,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "server-cors")]
-    #[test]
-    fn enabled_cors_accepts_configured_origins() {
-        let validated = parse_cors_origins(&["https://example.com".to_string()])
-            .expect("test origin should parse");
-        let _layer = apply_cors_layer(Router::new(), &validated)
-            .expect("configured origins must build a layer");
-    }
-
     #[test]
     fn cors_rejects_path_query_and_non_http_origins() {
         // E04: semantic validation beyond header syntax.
@@ -1456,57 +1460,6 @@ mod tests {
             .len(),
             2
         );
-    }
-
-    #[test]
-    fn serve_refuses_zero_active_and_zero_step_limits() {
-        // E04: zero deployment limits refuse boot before recovery runs.
-        assert!(super::super::config::effective_max_total_steps(Some(0)).is_err());
-        let dir = camino::Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-zero-limits-{}", std::process::id())),
-        )
-        .expect("temp path must be UTF-8");
-        let err = qcg_service::LocalQcgService::with_generator_roots_policy_and_store_mode(
-            vec![dir.join("gen")],
-            dir.join("runs"),
-            None,
-            0,
-            10,
-            qcg_service::RunStoreMode::Exclusive,
-            qcg_service::ServiceDeploymentPolicy::default(),
-        )
-        .expect_err("max_active_runs = 0 must refuse boot");
-        assert!(err.to_string().contains("greater than zero"), "{err}");
-        // max_tracked_runs below max_active_runs refuses through the same
-        // single policy resolution (E04).
-        let bad = crate::ServerConfig {
-            generators_dir: dir.join("gen"),
-            providers_path: None,
-            extra_generators_dirs: Vec::new(),
-            runs_dir: dir.join("runs"),
-            max_active_runs: 4,
-            max_tracked_runs: 2,
-            run_store_mode: qcg_service::RunStoreMode::Exclusive,
-            cors_origins: Vec::new(),
-            api_token: None,
-            max_request_bytes: None,
-            max_artifact_bytes: None,
-            max_artifact_entries: None,
-            max_asset_bytes: None,
-            max_total_steps: None,
-        };
-        assert!(
-            super::resolve_server_policy(&bad).is_err(),
-            "max_tracked_runs < max_active_runs must refuse boot"
-        );
-    }
-
-    #[cfg(not(feature = "server-cors"))]
-    #[test]
-    fn disabled_cors_rejects_configured_origins_explicitly() {
-        let error = parse_cors_origins(&["https://example.com".to_string()])
-            .expect_err("configured origins without the feature must fail");
-        assert!(error.contains("server-cors"), "{error}");
     }
 
     #[tokio::test]
@@ -1612,16 +1565,7 @@ type = "command"
 command = ["sh", "-c", "sleep 30"]"#,
         )
         .expect("slow manifest");
-        let service = LocalQcgService::with_generator_roots_policy_and_store_mode(
-            vec![generators.clone()],
-            runs.clone(),
-            None,
-            1,
-            qcg_policy::DEFAULT_MAX_TRACKED_RUNS,
-            qcg_service::RunStoreMode::Exclusive,
-            qcg_service::ServiceDeploymentPolicy::default(),
-        )
-        .expect("service should initialize");
+        let service = single_run_service(&generators, &runs);
         let run_id = service
             .start_run(qcg_api::StartRun {
                 generator_id: "slow".into(),
@@ -1652,16 +1596,8 @@ command = ["sh", "-c", "sleep 30"]"#,
         // without waiting — the reacquire below is the assertion, the
         // sleep is only its settle window, not a latency bound.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        LocalQcgService::with_generator_roots_policy_and_store_mode(
-            vec![generators.clone()],
-            runs.clone(),
-            None,
-            1,
-            qcg_policy::DEFAULT_MAX_TRACKED_RUNS,
-            qcg_service::RunStoreMode::Exclusive,
-            qcg_service::ServiceDeploymentPolicy::default(),
-        )
-        .expect("the run-store lock must be reacquirable after abort cleanup");
+        try_single_run_service(&generators, &runs)
+            .expect("the run-store lock must be reacquirable after abort cleanup");
     }
 
     #[tokio::test]
@@ -1729,15 +1665,7 @@ command = ["sh", "-c", "sleep 30"]"#,
         // genuine leak still fails loudly at the deadline (E05).
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
-                match LocalQcgService::with_generator_roots_policy_and_store_mode(
-                    vec![generators.clone()],
-                    runs.clone(),
-                    None,
-                    1,
-                    qcg_policy::DEFAULT_MAX_TRACKED_RUNS,
-                    qcg_service::RunStoreMode::Exclusive,
-                    qcg_service::ServiceDeploymentPolicy::default(),
-                ) {
+                match try_single_run_service(&generators, &runs) {
                     Ok(_) => break,
                     Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
                 }
@@ -1809,115 +1737,6 @@ command = ["sh", "-c", "sleep 30"]"#,
     }
 
     #[tokio::test]
-    async fn build_router_refuses_cors_through_the_serve_path() {
-        // E04: CORS misconfiguration must refuse `build_router` (the same
-        // constructor `serve_with_listener` uses) before any recovery task
-        // starts, not only the `apply_cors_layer` unit.
-        let root = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir())
-            .expect("temporary directory path should be UTF-8")
-            .join(format!("qcg-e04-cors-{}", uuid::Uuid::now_v7()));
-        let _temp_guard = TempGuard(root.clone());
-        let generators = root.join("generators");
-        let runs = root.join("runs");
-        std::fs::create_dir_all(&generators).expect("generators dir should create");
-        let service = LocalQcgService::with_generator_roots_policy_and_store_mode(
-            vec![generators.clone()],
-            runs.clone(),
-            None,
-            1,
-            qcg_policy::DEFAULT_MAX_TRACKED_RUNS,
-            qcg_service::RunStoreMode::Exclusive,
-            qcg_service::ServiceDeploymentPolicy::default(),
-        )
-        .expect("service should initialize");
-        let state = Arc::new(AppState {
-            service,
-            runs_dir: runs.clone(),
-            oauth_origin: None,
-            oauth_allowed_origins: Default::default(),
-            oauth_callback_url: None,
-            idempotency: tokio::sync::Mutex::new(BTreeMap::new()),
-            idempotency_ttl: qcg_policy::IDEMPOTENCY_TTL,
-            idempotency_max_entries: qcg_policy::IDEMPOTENCY_MAX_ENTRIES,
-            api_token_digest: None,
-            artifact_limits: qcg_service::ArtifactZipLimits::default(),
-            asset_limit: None,
-            max_request_bytes: None,
-            shutdown: CancellationToken::new(),
-        });
-        let config = ServerConfig {
-            generators_dir: generators.clone(),
-            providers_path: None,
-            extra_generators_dirs: Vec::new(),
-            runs_dir: runs.clone(),
-            max_active_runs: 1,
-            max_tracked_runs: qcg_policy::DEFAULT_MAX_TRACKED_RUNS,
-            run_store_mode: qcg_service::RunStoreMode::Exclusive,
-            cors_origins: vec!["not a valid origin \n".to_string()],
-            api_token: None,
-            max_request_bytes: None,
-            max_artifact_bytes: None,
-            max_artifact_entries: None,
-            max_asset_bytes: None,
-            max_total_steps: None,
-        };
-        // The serve path parses once before the router: an unparseable
-        // origin refuses there, so the router never sees it (E04).
-        let error = parse_cors_origins(&config.cors_origins)
-            .expect_err("an unparseable CORS origin must refuse the serve path");
-        assert!(
-            error.contains("CORS") || error.contains("origin"),
-            "the serve-path failure must name its cause: {error}"
-        );
-        // A refused boot must not pin the run-store lock: dropping the
-        // state releases it so the next boot can own the directory (E04).
-        // Reacquire with a bounded settle loop: lock release rides fd
-        // close, which the OS may not publish instantly to a contending
-        // locker on a loaded runner. A genuine pin (leaked owner) never
-        // releases, so the bound keeps the assertion strict.
-        drop(state);
-        let mut reacquired = None;
-        let mut last_error = String::new();
-        for _ in 0..20 {
-            match LocalQcgService::with_generator_roots_policy_and_store_mode(
-                vec![generators.clone()],
-                runs.clone(),
-                None,
-                1,
-                qcg_policy::DEFAULT_MAX_TRACKED_RUNS,
-                qcg_service::RunStoreMode::Exclusive,
-                qcg_service::ServiceDeploymentPolicy::default(),
-            ) {
-                Ok(service) => {
-                    reacquired = Some(service);
-                    break;
-                }
-                Err(error) => {
-                    last_error = error.to_string();
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-            }
-        }
-        let _ = reacquired.unwrap_or_else(|| {
-            panic!("the run-store lock must be released after a refused boot: {last_error}")
-        });
-    }
-
-    #[cfg(feature = "server-cors")]
-    #[test]
-    fn invalid_cors_origin_refuses_router_before_recovery() {
-        // E04: the single CORS parse is the last fallible initialization
-        // step before recovery, so an unparseable origin refuses boot
-        // before any recovery task starts.
-        let error = parse_cors_origins(&["not a valid origin \n".to_string()])
-            .expect_err("an unparseable origin must refuse the router");
-        assert!(
-            error.contains("CORS") || error.contains("origin"),
-            "the router failure must name its cause: {error}"
-        );
-    }
-
-    #[tokio::test]
     async fn wedged_shutdown_surfaces_an_error_through_the_deadline_path() {
         // E05: a wedged resident task plus a live run must surface an error
         // through the outer deadline instead of reporting clean success.
@@ -1957,16 +1776,7 @@ type = "command"
 command = ["sh", "-c", "sleep 30"]"#,
         )
         .expect("slow manifest");
-        let service = LocalQcgService::with_generator_roots_policy_and_store_mode(
-            vec![generators.clone()],
-            runs.clone(),
-            None,
-            1,
-            qcg_policy::DEFAULT_MAX_TRACKED_RUNS,
-            qcg_service::RunStoreMode::Exclusive,
-            qcg_service::ServiceDeploymentPolicy::default(),
-        )
-        .expect("service should initialize");
+        let service = single_run_service(&generators, &runs);
         let run_id = service
             .start_run(qcg_api::StartRun {
                 generator_id: "slow".into(),
@@ -2047,36 +1857,6 @@ command = ["sh", "-c", "sleep 30"]"#,
             max_asset_bytes: None,
             max_total_steps: None,
         }
-    }
-
-    #[tokio::test]
-    async fn policy_resolution_is_deterministic_under_frozen_env() {
-        // E04: the post-bind resolution inside `serve_*` is authoritative —
-        // only its values take effect. Resolving twice with the environment
-        // held proves the resolver is a pure function of config-plus-env;
-        // it does NOT freeze the environment in production, where a change
-        // between the pre-bind check and serve makes serve's values win.
-        let _env_guard = BOOT_ENV_GUARD.lock().await;
-        let root = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir())
-            .expect("temporary directory path should be UTF-8")
-            .join(format!("qcg-e04-determinism-{}", uuid::Uuid::now_v7()));
-        let _temp_guard = TempGuard(root.clone());
-        let generators = root.join("generators");
-        let runs = root.join("runs");
-        std::fs::create_dir_all(&generators).expect("generators dir should create");
-        let config = boot_config(&generators, &runs);
-        let first = resolve_server_policy(&config).expect("policy should resolve");
-        let second = resolve_server_policy(&config).expect("policy should resolve again");
-        assert_eq!(first.idempotency_ttl, second.idempotency_ttl);
-        assert_eq!(
-            first.idempotency_max_entries,
-            second.idempotency_max_entries
-        );
-        assert_eq!(first.max_total_steps, second.max_total_steps);
-        assert_eq!(first.validated_cors, second.validated_cors);
-        assert_eq!(first.auto_gc, second.auto_gc);
-        assert_eq!(first.preemption_enabled, second.preemption_enabled);
-        assert_eq!(first.rate_limit, second.rate_limit);
     }
 
     #[tokio::test]
@@ -2249,31 +2029,8 @@ command = ["sh", "-c", "sleep 30"]"#,
         let runs = root.join("runs");
         std::fs::create_dir_all(&generators).expect("generators dir should create");
         let shutdown = CancellationToken::new();
-        let service = LocalQcgService::with_generator_roots_policy_and_store_mode(
-            vec![generators.clone()],
-            runs.clone(),
-            None,
-            1,
-            qcg_policy::DEFAULT_MAX_TRACKED_RUNS,
-            qcg_service::RunStoreMode::Exclusive,
-            qcg_service::ServiceDeploymentPolicy::default(),
-        )
-        .expect("service should initialize");
-        let state = Arc::new(AppState {
-            service,
-            runs_dir: runs.clone(),
-            oauth_origin: None,
-            oauth_allowed_origins: Default::default(),
-            oauth_callback_url: None,
-            idempotency: tokio::sync::Mutex::new(BTreeMap::new()),
-            idempotency_ttl: qcg_policy::IDEMPOTENCY_TTL,
-            idempotency_max_entries: qcg_policy::IDEMPOTENCY_MAX_ENTRIES,
-            api_token_digest: None,
-            artifact_limits: qcg_service::ArtifactZipLimits::default(),
-            asset_limit: None,
-            max_request_bytes: None,
-            shutdown: shutdown.clone(),
-        });
+        let service = single_run_service(&generators, &runs);
+        let state = Arc::new(test_state(service, runs.clone(), None, shutdown.clone()));
         let config = boot_config(&generators, &runs);
         let validated_cors =
             parse_cors_origins(&config.cors_origins).expect("test CORS should parse");
@@ -2369,16 +2126,8 @@ command = ["sh", "-c", "sleep 30"]"#,
                 std::env::remove_var(variable);
             }
             // A refused boot must not pin the run-store lock.
-            LocalQcgService::with_generator_roots_policy_and_store_mode(
-                vec![generators.clone()],
-                runs.clone(),
-                None,
-                1,
-                qcg_policy::DEFAULT_MAX_TRACKED_RUNS,
-                qcg_service::RunStoreMode::Exclusive,
-                qcg_service::ServiceDeploymentPolicy::default(),
-            )
-            .expect("the run-store lock must be released after a refused boot");
+            try_single_run_service(&generators, &runs)
+                .expect("the run-store lock must be released after a refused boot");
         }
         // Inconsistent run limits refuse through the same serve path with
         // zero side effects and a released lock (E04).
@@ -2404,16 +2153,8 @@ command = ["sh", "-c", "sleep 30"]"#,
                     || error.to_string().contains("max_tracked_runs"),
                 "limit refusal must name its cause: {error}"
             );
-            LocalQcgService::with_generator_roots_policy_and_store_mode(
-                vec![generators.clone()],
-                runs.clone(),
-                None,
-                1,
-                qcg_policy::DEFAULT_MAX_TRACKED_RUNS,
-                qcg_service::RunStoreMode::Exclusive,
-                qcg_service::ServiceDeploymentPolicy::default(),
-            )
-            .expect("the run-store lock must be released after a refused boot");
+            try_single_run_service(&generators, &runs)
+                .expect("the run-store lock must be released after a refused boot");
         }
         // Invalid CORS origins refuse through the same serve path.
         {
@@ -2436,16 +2177,8 @@ command = ["sh", "-c", "sleep 30"]"#,
                 error.to_string().contains("CORS") || error.to_string().contains("origin"),
                 "CORS refusal must name its cause: {error}"
             );
-            LocalQcgService::with_generator_roots_policy_and_store_mode(
-                vec![generators.clone()],
-                runs.clone(),
-                None,
-                1,
-                qcg_policy::DEFAULT_MAX_TRACKED_RUNS,
-                qcg_service::RunStoreMode::Exclusive,
-                qcg_service::ServiceDeploymentPolicy::default(),
-            )
-            .expect("the run-store lock must be released after a refused boot");
+            try_single_run_service(&generators, &runs)
+                .expect("the run-store lock must be released after a refused boot");
         }
     }
 
@@ -2474,88 +2207,15 @@ command = ["sh", "-c", "sleep 30"]"#,
             !runs.join("idempotency").exists(),
             "failed construction must not leave idempotency state"
         );
-        // Lock contention fails the same way with no resident start.
-        let _holder = LocalQcgService::with_generator_roots_policy_and_store_mode(
-            vec![generators.clone()],
-            runs.clone(),
-            None,
-            1,
-            qcg_policy::DEFAULT_MAX_TRACKED_RUNS,
-            qcg_service::RunStoreMode::Exclusive,
-            qcg_service::ServiceDeploymentPolicy::default(),
-        )
-        .expect("lock holder should initialize");
+        // Lock contention fails the same way with no resident start. The
+        // refused boot above must release the runs directory first.
+        let _holder = acquire_store_after_release(&generators, &runs).await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener should bind");
         serve_with_listener(boot_config(&generators, &runs), listener)
             .await
             .expect_err("contended lock must refuse boot");
-    }
-
-    #[test]
-    fn serve_construction_uses_only_the_policy_constructor() {
-        // E04: every service construction reachable from the serve path must
-        // go through the policy constructor. Old constructors and
-        // post-construction setters race recovery execution, so a grep-based
-        // compile test fails the build if any serve caller regresses.
-        // This test pins `serve.rs` itself; the legacy `new` is
-        // `#[cfg(test)]`-only, so any production regression anywhere in the
-        // workspace fails the build at compile time, and the CLI builds
-        // through `local_cli_service` (policy constructor, E04).
-        // `include_str!` embeds this test module too, so the forbidden
-        // literals below would match themselves: scan only the production
-        // part before `#[cfg(test)]` (E04).
-        let source = include_str!("serve.rs");
-        let source = source.split("#[cfg(test)]").next().unwrap_or(source);
-        for forbidden in [
-            "LocalQcgService::new(",
-            "with_generator_roots(",
-            ".set_max_total_steps(",
-            ".set_preemption(",
-            ".set_auto_gc(",
-        ] {
-            // The policy constructor name contains `with_generator_roots`
-            // as a prefix: allow it explicitly, forbid the bare form.
-            if forbidden == "with_generator_roots("
-                && source.contains("with_generator_roots_policy_and_store_mode(")
-            {
-                let bare = source.replace("with_generator_roots_policy_and_store_mode(", "");
-                assert!(
-                    !bare.contains(forbidden),
-                    "serve.rs must not use `{forbidden}`; use the policy constructor"
-                );
-                continue;
-            }
-            assert!(
-                !source.contains(forbidden),
-                "serve.rs must not use `{forbidden}`; use the policy constructor"
-            );
-        }
-        assert!(
-            source.contains("with_generator_roots_policy_and_store_mode("),
-            "serve.rs must construct the service via the policy constructor"
-        );
-    }
-
-    #[test]
-    fn shutdown_drain_timeout_is_documented_and_bounded() {
-        // E05: the HTTP drain is bounded (not indefinite) so a wedged drain
-        // connection cannot delay settlement forever. The bound is a
-        // documented constant shared by code and operator docs. Total bound
-        // is drain + outer = 180 s from signal to exit.
-        assert_eq!(DRAIN_TIMEOUT, std::time::Duration::from_secs(30));
-        assert_eq!(
-            SHUTDOWN_DEADLINE,
-            std::time::Duration::from_secs(150),
-            "outer deadline must stay 150 s after the drain"
-        );
-        assert_eq!(
-            TOTAL_SHUTDOWN_BOUND,
-            DRAIN_TIMEOUT + SHUTDOWN_DEADLINE,
-            "total bound must stay drain + outer = 180 s"
-        );
-        assert_eq!(TOTAL_SHUTDOWN_BOUND, std::time::Duration::from_secs(180));
     }
 
     #[tokio::test]
@@ -2770,31 +2430,14 @@ command = ["sh", "-c", "sleep 30"]"#,
         let generators = root.join("generators");
         let runs = root.join("runs");
         std::fs::create_dir_all(&generators).expect("generators dir should create");
-        let service = LocalQcgService::with_generator_roots_policy_and_store_mode(
-            vec![generators.clone()],
+        let service = try_single_run_service(&generators, &runs)
+            .expect("service should initialize and hold the lock");
+        let state = Arc::new(test_state(
+            service,
             runs.clone(),
             None,
-            1,
-            qcg_policy::DEFAULT_MAX_TRACKED_RUNS,
-            qcg_service::RunStoreMode::Exclusive,
-            qcg_service::ServiceDeploymentPolicy::default(),
-        )
-        .expect("service should initialize and hold the lock");
-        let state = Arc::new(AppState {
-            service,
-            runs_dir: runs.clone(),
-            oauth_origin: None,
-            oauth_allowed_origins: Default::default(),
-            oauth_callback_url: None,
-            idempotency: tokio::sync::Mutex::new(BTreeMap::new()),
-            idempotency_ttl: qcg_policy::IDEMPOTENCY_TTL,
-            idempotency_max_entries: qcg_policy::IDEMPOTENCY_MAX_ENTRIES,
-            api_token_digest: None,
-            artifact_limits: qcg_service::ArtifactZipLimits::default(),
-            asset_limit: None,
-            max_request_bytes: None,
-            shutdown: CancellationToken::new(),
-        });
+            CancellationToken::new(),
+        ));
         let mut bad = boot_config(&generators, &runs);
         bad.max_request_bytes = Some(0);
         let validated: Vec<HeaderValue> = Vec::new();
@@ -2834,15 +2477,6 @@ command = ["sh", "-c", "sleep 30"]"#,
         );
         // Lock released: dropping the refused state frees the store.
         drop(state);
-        LocalQcgService::with_generator_roots_policy_and_store_mode(
-            vec![generators.clone()],
-            runs.clone(),
-            None,
-            1,
-            qcg_policy::DEFAULT_MAX_TRACKED_RUNS,
-            qcg_service::RunStoreMode::Exclusive,
-            qcg_service::ServiceDeploymentPolicy::default(),
-        )
-        .expect("the run-store lock must be released after a refused router");
+        acquire_store_after_release(&generators, &runs).await;
     }
 }

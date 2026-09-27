@@ -11,7 +11,7 @@ mod tests {
     use super::*;
     use crate::{JournalWriter, SecretStore, StepError};
     use async_trait::async_trait;
-    use camino::Utf8PathBuf;
+    use camino::{Utf8Path, Utf8PathBuf};
     use qcg_contract::{ModelRef, NodeDef, OnDeps, StepType};
     use qcg_llm::{Capabilities, ChatMessage, LlmErrorKind, StopReason, TokenUsage, ToolSpec};
     use qcg_llm::{ChatContent, ChatRequest, ChatResponse, LlmError, LlmProvider};
@@ -32,6 +32,56 @@ mod tests {
     struct ToolLeakingProvider;
 
     struct RouteProvider;
+
+    /// A fresh temporary directory for `label`. The pid and a v7 uuid keep
+    /// two concurrent runs of the same test from sharing a journal, so no
+    /// caller has to pre-clean the path.
+    fn test_dir(label: &str) -> Utf8PathBuf {
+        Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
+            "qcg-llm-{label}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        )))
+        .expect("temporary path must be UTF-8")
+    }
+
+    /// The journal a gateway test asserts against, opened under `run_id`
+    /// inside that test's directory. The directory is named after the
+    /// behaviour and the run id after the fixture, so the two are passed
+    /// separately.
+    fn test_journal(dir: &Utf8Path, run_id: &str) -> JournalWriter {
+        JournalWriter::create(&dir.join("journal.jsonl"), run_id, false, None)
+            .expect("journal should be created")
+    }
+
+    /// A gateway over `provider` with no cost budget, no pricing table, and
+    /// a live cancellation token: the shape every routing and secret-scan
+    /// test needs. A test that exercises a budget, pricing, or a specific
+    /// secret store passes its own.
+    fn test_gateway<'a>(
+        provider: Arc<dyn LlmProvider>,
+        secrets: &'a SecretStore,
+        journal: &'a JournalWriter,
+    ) -> LlmGateway<'a> {
+        LlmGateway::new(
+            provider,
+            secrets,
+            journal,
+            CancellationToken::new(),
+            LlmCostBudget {
+                max_tokens: None,
+                max_cost_microusd: None,
+                require_pricing: false,
+            },
+            Vec::new(),
+        )
+    }
+
+    /// The registered secret the leak tests scan against: one token whose
+    /// value must never reach a persisted stream.
+    fn test_secret_store() -> SecretStore {
+        SecretStore::from_values(BTreeMap::from([("token".into(), "secret-value".into())]))
+    }
 
     #[async_trait]
     impl LlmProvider for LeakingProvider {
@@ -251,27 +301,10 @@ mod tests {
 
     #[tokio::test]
     async fn gateway_routes_retryable_failures_to_declared_fallback_model() {
-        let dir = Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
-            "qcg-llm-route-test-{}-{}",
-            std::process::id(),
-            uuid::Uuid::now_v7()
-        )))
-        .expect("temporary path must be UTF-8");
-        let journal = JournalWriter::create(&dir.join("journal.jsonl"), "route-test", false, None)
-            .expect("journal should be created");
+        let dir = test_dir("route-test");
+        let journal = test_journal(&dir, "route-test");
         let secrets = SecretStore::default();
-        let gateway = LlmGateway::new(
-            Arc::new(RouteProvider),
-            &secrets,
-            &journal,
-            CancellationToken::new(),
-            LlmCostBudget {
-                max_tokens: None,
-                max_cost_microusd: None,
-                require_pricing: false,
-            },
-            Vec::new(),
-        );
+        let gateway = test_gateway(Arc::new(RouteProvider), &secrets, &journal);
         let node = test_node();
         let mut request = test_request();
         request.provider = "primary".into();
@@ -294,23 +327,10 @@ mod tests {
 
     #[tokio::test]
     async fn gateway_records_failure_for_a_single_route_once() {
-        let dir = route_test_dir("single");
-        let journal =
-            JournalWriter::create(&dir.join("journal.jsonl"), "single-route-test", false, None)
-                .expect("journal should be created");
+        let dir = test_dir("route-single");
+        let journal = test_journal(&dir, "single-route-test");
         let secrets = SecretStore::default();
-        let gateway = LlmGateway::new(
-            Arc::new(RouteProvider),
-            &secrets,
-            &journal,
-            CancellationToken::new(),
-            LlmCostBudget {
-                max_tokens: None,
-                max_cost_microusd: None,
-                require_pricing: false,
-            },
-            Vec::new(),
-        );
+        let gateway = test_gateway(Arc::new(RouteProvider), &secrets, &journal);
         let mut request = test_request();
         request.provider = "primary".into();
 
@@ -334,27 +354,10 @@ mod tests {
 
     #[tokio::test]
     async fn gateway_records_nonretryable_failure_without_trying_fallback() {
-        let dir = route_test_dir("nonretryable");
-        let journal = JournalWriter::create(
-            &dir.join("journal.jsonl"),
-            "nonretryable-route-test",
-            false,
-            None,
-        )
-        .expect("journal should be created");
+        let dir = test_dir("route-nonretryable");
+        let journal = test_journal(&dir, "nonretryable-route-test");
         let secrets = SecretStore::default();
-        let gateway = LlmGateway::new(
-            Arc::new(RouteProvider),
-            &secrets,
-            &journal,
-            CancellationToken::new(),
-            LlmCostBudget {
-                max_tokens: None,
-                max_cost_microusd: None,
-                require_pricing: false,
-            },
-            Vec::new(),
-        );
+        let gateway = test_gateway(Arc::new(RouteProvider), &secrets, &journal);
         let node = test_node();
         let mut request = test_request();
         request.provider = "nonretryable".into();
@@ -383,23 +386,10 @@ mod tests {
 
     #[tokio::test]
     async fn gateway_records_the_final_fallback_failure_without_duplication() {
-        let dir = route_test_dir("final");
-        let journal =
-            JournalWriter::create(&dir.join("journal.jsonl"), "final-route-test", false, None)
-                .expect("journal should be created");
+        let dir = test_dir("route-final");
+        let journal = test_journal(&dir, "final-route-test");
         let secrets = SecretStore::default();
-        let gateway = LlmGateway::new(
-            Arc::new(RouteProvider),
-            &secrets,
-            &journal,
-            CancellationToken::new(),
-            LlmCostBudget {
-                max_tokens: None,
-                max_cost_microusd: None,
-                require_pricing: false,
-            },
-            Vec::new(),
-        );
+        let gateway = test_gateway(Arc::new(RouteProvider), &secrets, &journal);
         let node = test_node();
         let mut request = test_request();
         request.provider = "primary".into();
@@ -429,15 +419,6 @@ mod tests {
         assert_eq!(events[1]["kind"], json!({"http_status": 503}));
     }
 
-    fn route_test_dir(label: &str) -> Utf8PathBuf {
-        Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
-            "qcg-llm-route-{label}-{}-{}",
-            std::process::id(),
-            uuid::Uuid::now_v7()
-        )))
-        .expect("temporary path must be UTF-8")
-    }
-
     /// Merged public record view: observation records live in the sibling
     /// `audit.jsonl` (ADR 0001), so assertions read both streams.
     fn persisted_text(dir: &Utf8PathBuf) -> String {
@@ -460,27 +441,10 @@ mod tests {
 
     #[tokio::test]
     async fn gateway_scans_response_text_for_secrets() {
-        let dir = Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("qcg-llm-gateway-test-{}", std::process::id())),
-        )
-        .expect("temporary path must be UTF-8");
-        let _ = std::fs::remove_dir_all(&dir);
-        let journal = JournalWriter::create(&dir.join("journal.jsonl"), "secret-test", false, None)
-            .expect("journal should be created");
-        let secrets =
-            SecretStore::from_values(BTreeMap::from([("token".into(), "secret-value".into())]));
-        let gateway = LlmGateway::new(
-            Arc::new(LeakingProvider),
-            &secrets,
-            &journal,
-            CancellationToken::new(),
-            LlmCostBudget {
-                max_tokens: None,
-                max_cost_microusd: None,
-                require_pricing: false,
-            },
-            Vec::new(),
-        );
+        let dir = test_dir("gateway-test");
+        let journal = test_journal(&dir, "secret-test");
+        let secrets = test_secret_store();
+        let gateway = test_gateway(Arc::new(LeakingProvider), &secrets, &journal);
         let node = test_node();
         let error = gateway
             .complete(
@@ -497,28 +461,10 @@ mod tests {
 
     #[tokio::test]
     async fn split_stream_deltas_do_not_persist_secrets() {
-        let dir = Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
-            "qcg-llm-split-test-{}-{}",
-            std::process::id(),
-            uuid::Uuid::now_v7()
-        )))
-        .expect("temporary path must be UTF-8");
-        let journal = JournalWriter::create(&dir.join("journal.jsonl"), "split-test", false, None)
-            .expect("journal should be created");
-        let secrets =
-            SecretStore::from_values(BTreeMap::from([("token".into(), "secret-value".into())]));
-        let gateway = LlmGateway::new(
-            Arc::new(SplitStreamLeakingProvider),
-            &secrets,
-            &journal,
-            CancellationToken::new(),
-            LlmCostBudget {
-                max_tokens: None,
-                max_cost_microusd: None,
-                require_pricing: false,
-            },
-            Vec::new(),
-        );
+        let dir = test_dir("split-test");
+        let journal = test_journal(&dir, "split-test");
+        let secrets = test_secret_store();
+        let gateway = test_gateway(Arc::new(SplitStreamLeakingProvider), &secrets, &journal);
         let node = test_node();
         let mut request = test_request();
         request.provider = "split-leak".into();
@@ -555,29 +501,11 @@ mod tests {
 
     #[tokio::test]
     async fn safe_stream_still_publishes_deltas_with_secrets_configured() {
-        let dir = Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
-            "qcg-llm-safe-split-test-{}-{}",
-            std::process::id(),
-            uuid::Uuid::now_v7()
-        )))
-        .expect("temporary path must be UTF-8");
-        let journal = JournalWriter::create(&dir.join("journal.jsonl"), "safe-split", false, None)
-            .expect("journal should be created");
+        let dir = test_dir("safe-split-test");
+        let journal = test_journal(&dir, "safe-split");
         // Unrelated secret: holdback applies but clean text must keep streaming.
-        let secrets =
-            SecretStore::from_values(BTreeMap::from([("token".into(), "secret-value".into())]));
-        let gateway = LlmGateway::new(
-            Arc::new(SafeSplitStreamProvider),
-            &secrets,
-            &journal,
-            CancellationToken::new(),
-            LlmCostBudget {
-                max_tokens: None,
-                max_cost_microusd: None,
-                require_pricing: false,
-            },
-            Vec::new(),
-        );
+        let secrets = test_secret_store();
+        let gateway = test_gateway(Arc::new(SafeSplitStreamProvider), &secrets, &journal);
         let node = test_node();
         let mut request = test_request();
         request.provider = "safe-split".into();
@@ -609,31 +537,13 @@ mod tests {
 
     #[tokio::test]
     async fn gateway_scans_decoded_tool_arguments_for_secrets() {
-        let dir = Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
-            "qcg-llm-tool-gateway-test-{}-{}",
-            std::process::id(),
-            uuid::Uuid::now_v7()
-        )))
-        .expect("temporary path must be UTF-8");
-        let journal =
-            JournalWriter::create(&dir.join("journal.jsonl"), "tool-secret-test", false, None)
-                .expect("journal should be created");
+        let dir = test_dir("tool-gateway-test");
+        let journal = test_journal(&dir, "tool-secret-test");
         let secrets = SecretStore::from_values(BTreeMap::from([(
             "token".into(),
             "secret-\"value\nline".into(),
         )]));
-        let gateway = LlmGateway::new(
-            Arc::new(ToolLeakingProvider),
-            &secrets,
-            &journal,
-            CancellationToken::new(),
-            LlmCostBudget {
-                max_tokens: None,
-                max_cost_microusd: None,
-                require_pricing: false,
-            },
-            Vec::new(),
-        );
+        let gateway = test_gateway(Arc::new(ToolLeakingProvider), &secrets, &journal);
         let node = test_node();
 
         let error = gateway
@@ -651,15 +561,11 @@ mod tests {
 
     #[tokio::test]
     async fn gateway_enforces_accumulated_cost_budget_after_recording_usage() {
-        let dir = Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
-            "qcg-llm-budget-test-{}-{}",
-            std::process::id(),
-            uuid::Uuid::now_v7()
-        )))
-        .expect("temporary path must be UTF-8");
-        let journal = JournalWriter::create(&dir.join("journal.jsonl"), "budget-test", false, None)
-            .expect("journal should be created");
+        let dir = test_dir("budget-test");
+        let journal = test_journal(&dir, "budget-test");
         let secrets = SecretStore::default();
+        // The one test that needs a real budget and a real pricing row, so
+        // it builds the gateway itself instead of using `test_gateway`.
         let gateway = LlmGateway::new(
             Arc::new(MeteredProvider),
             &secrets,
@@ -734,7 +640,7 @@ mod tests {
     fn test_node() -> NodeDef {
         NodeDef {
             id: "llm".into(),
-            kind: StepType::from("llm.generate"),
+            kind: StepType::literal("llm.generate"),
             needs: vec![],
             when: None,
             on_deps: OnDeps::default(),

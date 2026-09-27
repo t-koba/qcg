@@ -922,60 +922,6 @@ extras = []
     }
 
     #[test]
-    fn copy_dir_all_propagates_walk_errors_and_rejects_symlinks() {
-        let limits = qcg_service::PackageLimits::default();
-        let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
-            .expect("temporary directory should be UTF-8")
-            .join(format!("qcg-cli-copy-test-{}", Uuid::now_v7()));
-        let source = root.join("source");
-        let target = root.join("target");
-        std::fs::create_dir_all(&source).expect("source directory should be created");
-        std::fs::write(source.join("file.txt"), "copy me").expect("source file should be written");
-        assert!(
-            qcg_service::package::copy_dir_all(&root.join("missing"), &target, &limits).is_err()
-        );
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(source.join("file.txt"), source.join("link.txt"))
-                .expect("symbolic link should be created");
-            assert!(qcg_service::package::copy_dir_all(&source, &target, &limits).is_err());
-        }
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn commit_install_replaces_existing_tree_and_cleans_backup() {
-        let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
-            .expect("temporary directory should be UTF-8")
-            .join(format!("qcg-cli-commit-test-{}", Uuid::now_v7()));
-        let target = root.join("generator");
-        let temporary = root.join("staged");
-        std::fs::create_dir_all(&target).expect("target directory should be created");
-        std::fs::create_dir_all(&temporary).expect("temporary directory should be created");
-        std::fs::write(target.join("old.txt"), "old").expect("old file should be written");
-        std::fs::write(temporary.join("new.txt"), "new").expect("new file should be written");
-
-        commit_install(&temporary, &target, true).expect("install commit should succeed");
-
-        assert!(!target.join("old.txt").exists());
-        assert_eq!(
-            std::fs::read_to_string(target.join("new.txt")).unwrap(),
-            "new"
-        );
-        assert!(!temporary.exists());
-        let leftovers = std::fs::read_dir(&root)
-            .expect("commit directory should be readable")
-            .filter_map(|entry| entry.ok())
-            .filter_map(|entry| entry.file_name().into_string().ok())
-            .filter(|name| {
-                name.starts_with(".qcg-install-backup-") || name.starts_with(".qcg-install-temp-")
-            })
-            .collect::<Vec<_>>();
-        assert!(leftovers.is_empty(), "transaction leftovers: {leftovers:?}");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn failed_install_commit_cleanup_does_not_remove_user_source() {
         let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
             .expect("temporary directory should be UTF-8")

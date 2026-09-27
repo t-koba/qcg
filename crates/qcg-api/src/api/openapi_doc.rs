@@ -6,17 +6,7 @@ use super::openapi_types::{
     openapi_components,
 };
 use super::routes::API_ROUTES;
-use crate::events::RUN_EVENT_DATA_SCHEMAS;
-
-pub fn openapi_route_paths() -> Vec<&'static str> {
-    let mut paths = API_ROUTES
-        .iter()
-        .map(|route| route.path)
-        .collect::<Vec<_>>();
-    paths.sort();
-    paths.dedup();
-    paths
-}
+use crate::events::run_event_data_schemas;
 
 pub(crate) fn openapi_paths() -> Value {
     let mut paths = serde_json::Map::new();
@@ -59,21 +49,86 @@ fn route_operation(route: &ApiRoute) -> Value {
     for additional in route.additional_responses {
         responses.insert(additional.status.to_string(), response(additional));
     }
-    for status in route.errors {
-        responses.insert(
-            status.to_string(),
-            json!({
-                "description": error_description(*status),
-                "content": {
-                    "application/problem+json": {
-                        "schema": { "$ref": "#/components/schemas/ProblemDetails" }
-                    }
-                }
-            }),
-        );
+    // The handler's own failures plus the middleware statuses every route
+    // inherits, so an SDK generated from this document knows about 401 and 429
+    // without reading the server source.
+    for status in route
+        .errors
+        .iter()
+        .copied()
+        .chain(crate::api::routes::middleware_error_statuses(route.path))
+    {
+        // The two failures every route inherits are referenced, not inlined, so
+        // the document defines each response body once.
+        if let Some(name) = middleware_response_name(status) {
+            responses.insert(
+                status.to_string(),
+                json!({ "$ref": format!("#/components/responses/{name}") }),
+            );
+        } else {
+            responses
+                .entry(status.to_string())
+                .or_insert_with(|| error_response(status));
+        }
     }
     operation.insert("responses".into(), Value::Object(responses));
     Value::Object(operation)
+}
+
+/// Component name for a failure every route inherits from the middleware.
+fn middleware_response_name(status: u16) -> Option<&'static str> {
+    match status {
+        401 => Some("Unauthorized"),
+        429 => Some("TooManyRequests"),
+        _ => None,
+    }
+}
+
+/// The shared middleware failure responses, defined once and referenced by
+/// every route.
+pub(crate) fn shared_error_responses() -> Value {
+    json!({
+        "Unauthorized": {
+            "description": error_description(401),
+            "headers": {
+                "WWW-Authenticate": {
+                    "description": "Bearer realm=\"qcg\"; the request carried no valid API token",
+                    "schema": { "type": "string" }
+                }
+            },
+            "content": {
+                "application/problem+json": {
+                    "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+                }
+            }
+        },
+        "TooManyRequests": {
+            "description": error_description(429),
+            "headers": {
+                "Retry-After": {
+                    "description": "Whole seconds to wait before retrying, always at least one",
+                    "schema": { "type": "string" }
+                }
+            },
+            "content": {
+                "application/problem+json": {
+                    "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+                }
+            }
+        }
+    })
+}
+
+/// Failure response for a status the route handler itself produces.
+fn error_response(status: u16) -> Value {
+    json!({
+        "description": error_description(status),
+        "content": {
+            "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+            }
+        }
+    })
 }
 
 fn error_description(status: u16) -> &'static str {
@@ -83,6 +138,8 @@ fn error_description(status: u16) -> &'static str {
         409 => "Resource conflict",
         413 => "Payload too large",
         422 => "Validation failed",
+        401 => "Authentication required",
+        429 => "Rate limited",
         500 => "Internal server error",
         503 => "Service unavailable",
         _ => "Request failed",
@@ -192,7 +249,7 @@ pub fn run_event_reference_markdown() -> String {
     let mut markdown = String::from(
         "## RunEvent Reference\n\nGenerated from the OpenAPI `RunEvent` schema. Every event uses the required envelope fields `seq`, `ts`, `run_id`, `trace_id`, `span_id`, `kind`, and `data`; `path` is present for node-scoped events. Trace and span IDs use W3C-compatible hexadecimal widths. Unknown `kind` values are preserved with opaque `data`.\n\n| Event | Required `data` fields |\n|---|---|\n",
     );
-    for (event, schema_name) in RUN_EVENT_DATA_SCHEMAS {
+    for (event, schema_name) in run_event_data_schemas() {
         let required = components["schemas"][schema_name]
             .get("required")
             .and_then(Value::as_array)

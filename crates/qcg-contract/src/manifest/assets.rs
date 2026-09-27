@@ -1,5 +1,5 @@
 use crate::{FieldType, InputField};
-use qcg_policy::{is_safe_relative_path, validate_bounded_json_schema};
+use qcg_policy::is_safe_relative_path;
 use qcg_types::{FileValue, FileValueError};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -202,14 +202,12 @@ pub(crate) fn validate_field_value(
         }
     }
     if let Some(schema) = &field.schema {
-        validate_bounded_json_schema(schema).map_err(|error| {
+        let validator = qcg_policy::compile_bounded_validator(schema).map_err(|error| {
             ContractError::Invalid(format!(
                 "input `{}` has invalid or unsafe JSON Schema: {error}",
                 field.id
             ))
         })?;
-        let validator = jsonschema::validator_for(schema)
-            .expect("bounded JSON Schema was compiled during contract validation");
         if let Err(error) = validator.validate(value) {
             return Err(ContractError::Invalid(format!(
                 "input `{}` does not satisfy its JSON Schema at `{}`: {error}",

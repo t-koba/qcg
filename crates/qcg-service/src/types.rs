@@ -207,6 +207,11 @@ pub struct JournalStream {
     /// seeing one ordered record stream (ADR 0001).
     pub audit: Option<tokio::fs::File>,
     pub audit_len: u64,
+    /// Effective byte bound for the observation stream, checked at open
+    /// before a single audit byte is served and re-applied while reading, so
+    /// the audit side can never be the unbounded allocation the durable
+    /// journal is not allowed to be.
+    pub audit_limit: Option<usize>,
 }
 
 /// Owned inputs for a self-contained run bundle export.
@@ -301,7 +306,7 @@ impl ResolvedExecutionPolicy {
     /// change mid-run cannot diverge admission from execution (E04).
     /// A journal without the recorded field is an explicit error, never a
     /// silent fresh resolution: every admission path records the field, so
-    /// its absence means a legacy or corrupt journal (E04).
+    /// its absence means a corrupt journal (E04).
     pub(crate) fn for_execution(
         journal_values: &[serde_json::Value],
         service_max_parallel: Option<usize>,
