@@ -4094,6 +4094,11 @@ fields are rejected when their structs define a closed schema.
    `state_limit_bytes`, `template_output_limit_bytes`, and `template_fuel`.
    Template output is streamed through a bounded writer and each render gets a
    fresh fuel budget; exceeding either limit fails the render explicitly.
+   Hash-anchored patch and repair targets larger than 8 MiB
+   (`policy::MAX_PATCH_TARGET_BYTES`) are refused even when
+   `output_file_limit_bytes` / `output_total_limit_bytes` allow more: 8 MiB is
+   the effective patch target ceiling, and callers asking for more fail fast
+   with the ceiling displayed (Q01).
    Template source and serialized context are bounded before compilation and
    evaluation. `file_input_limit_bytes` bounds every individual input value
    (including `file`, `json`, and schema-backed custom fields), while

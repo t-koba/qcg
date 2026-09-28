@@ -15,10 +15,15 @@ use super::staging::AsyncStagingGuard;
 #[cfg(not(unix))]
 use super::staging::AsyncStreamGuard;
 
-/// Upper bound for the commit-time base re-check. A patch target larger than
-/// this is refused instead of replaced, because a node must never overwrite a
-/// file it could not re-read within the same bound it used to read it.
-const PATCH_COMMIT_RECHECK_BYTES: usize = 8 * 1024 * 1024;
+/// Q01: effective patch target ceiling for the commit-time base re-check.
+/// A patch target larger than this is refused instead of replaced, because a
+/// node must never overwrite a file it could not re-read within the same
+/// bound it used to read it. This is the supported upper bound for patch and
+/// repair targets regardless of higher caller `PatchLimits`: callers asking
+/// for more fail fast at admission (see `apply_anchored_patch`) with this
+/// ceiling displayed instead of failing later at the re-check.
+/// Must equal `policy::MAX_PATCH_TARGET_BYTES`.
+const PATCH_COMMIT_RECHECK_BYTES: usize = policy::MAX_PATCH_TARGET_BYTES;
 
 // Workspace filesystem isolation boundary (E13).
 //
@@ -1030,7 +1035,16 @@ impl FsGateway {
             let staging = super::handle::staging_name_for(&leaf);
             let mut guard =
                 AsyncStagingGuard::new(workspace.clone(), resolved.clone(), staging.clone());
+            // H03: the fence is commit authority for both workers below.
+            // A cancelled outer future revokes it on drop; each worker
+            // refuses to commit once revoked, so a stale worker cannot
+            // overwrite a newer writer (spawn_blocking abort is best-effort
+            // only and never stops a started worker).
+            let stage_fence = guard.fence();
             let stage_task = tokio::task::spawn_blocking(move || {
+                if stage_fence.is_revoked() {
+                    return Err::<_, std::io::Error>(super::staging::interrupted_error());
+                }
                 let parent = super::handle::ParentHandle::open(&workspace, &resolved, true)?;
                 parent.stage(&staging, mode, |file| {
                     use std::io::Write as _;
@@ -1044,9 +1058,20 @@ impl FsGateway {
                 .await
                 .map_err(std::io::Error::other)?
                 .map_err(GatewayError::Io)?;
+            // H03: the outer future may have been cancelled while the stage
+            // worker ran (guard would already be revoked on the abort path,
+            // but a racing cancel lands here): refuse before committing.
+            if guard.fence().is_revoked() {
+                return Err(GatewayError::Io(super::staging::interrupted_error()));
+            }
             let staging_commit = guard.staging().to_string();
-            let commit_task =
-                tokio::task::spawn_blocking(move || parent.commit_with_mode(&staging_commit, mode));
+            let commit_fence = guard.fence();
+            let commit_task = tokio::task::spawn_blocking(move || {
+                if commit_fence.is_revoked() {
+                    return Err(super::staging::interrupted_error());
+                }
+                parent.commit_with_mode(&staging_commit, mode)
+            });
             guard.track(&commit_task);
             commit_task
                 .await
@@ -1094,6 +1119,14 @@ impl FsGateway {
                 permissions.set_readonly(readonly);
                 tokio::fs::set_permissions(&temporary, permissions).await?;
                 drop(file);
+                // H03 barrier 3 (byte path): refuse the replace itself when
+                // the outer future was cancelled while staging ran, so a
+                // stale byte write never overwrites a newer writer's result.
+                // The residual window is the atomic rename itself.
+                if staging.fence().is_revoked() {
+                    let _ = tokio::fs::remove_file(&temporary).await;
+                    return Err(super::staging::interrupted_error());
+                }
                 replace_file(&temporary, &resolved).await
             }
             .await;
@@ -1166,19 +1199,45 @@ impl FsGateway {
             let staging = super::handle::staging_name_for(&leaf);
             let mut guard =
                 AsyncStagingGuard::new(workspace.clone(), resolved.clone(), staging.clone());
+            // H03: same commit fence as the byte-write path (see above).
+            let stage_fence = guard.fence();
             let stage_task = tokio::task::spawn_blocking(move || {
+                if stage_fence.is_revoked() {
+                    return Err::<_, std::io::Error>(super::staging::interrupted_error());
+                }
                 let parent = super::handle::ParentHandle::open(&workspace, &resolved, true)?;
                 let value = parent.stage(&staging, mode, write)?;
+                // H03: a cancel that landed during the producer must not
+                // commit its partial staging afterwards.
+                if stage_fence.is_revoked() {
+                    return Err(super::staging::interrupted_error());
+                }
                 Ok::<_, std::io::Error>((parent, value))
             });
             guard.track(&stage_task);
-            let (parent, value) = stage_task
+            let stage_outcome: Result<(super::handle::ParentHandle, T), GatewayError> = stage_task
                 .await
                 .map_err(std::io::Error::other)?
-                .map_err(GatewayError::Io)?;
+                .map_err(GatewayError::Io);
+            let (parent, value) = match stage_outcome {
+                Ok(pair) => pair,
+                Err(error) => {
+                    // H03: a revoked producer stages nothing committable;
+                    // surface cancellation instead of committing.
+                    return Err(error);
+                }
+            };
+            if guard.fence().is_revoked() {
+                return Err(GatewayError::Io(super::staging::interrupted_error()));
+            }
             let staging_commit = guard.staging().to_string();
-            let commit_task =
-                tokio::task::spawn_blocking(move || parent.commit_with_mode(&staging_commit, mode));
+            let commit_fence = guard.fence();
+            let commit_task = tokio::task::spawn_blocking(move || {
+                if commit_fence.is_revoked() {
+                    return Err(super::staging::interrupted_error());
+                }
+                parent.commit_with_mode(&staging_commit, mode)
+            });
             guard.track(&commit_task);
             commit_task
                 .await
@@ -1193,6 +1252,9 @@ impl FsGateway {
             // Symmetric with the Unix path above: the staging leaf is
             // generated before spawning so this future owns it across the
             // await, and the guard tracks the blocking task (E13).
+            // H03: the fence is commit authority for the single blocking
+            // worker below (see Unix path); abort cannot stop a started
+            // worker, so the worker refuses to commit once revoked.
             let leaf = resolved
                 .file_name()
                 .ok_or_else(|| GatewayError::PathDenied {
@@ -1203,14 +1265,26 @@ impl FsGateway {
             let temporary = resolved
                 .with_file_name(format!(".{leaf}.part-{}", uuid::Uuid::now_v7().as_simple()));
             let mut guard = AsyncStreamGuard::new(temporary.clone());
+            let fence = guard.fence();
             let stage_task = tokio::task::spawn_blocking(move || {
-                write_file_atomic_stream_path(&resolved, &temporary, Self::staged_mode(mode), write)
+                write_file_atomic_stream_path(
+                    &resolved,
+                    &temporary,
+                    Self::staged_mode(mode),
+                    fence,
+                    write,
+                )
             });
             guard.track(&stage_task);
             let value = stage_task
                 .await
                 .map_err(std::io::Error::other)?
                 .map_err(GatewayError::Io)?;
+            // H03: a cancel that landed while the worker ran must surface
+            // here (the worker already refused to commit when revoked).
+            if guard.fence().is_revoked() {
+                return Err(GatewayError::Io(super::staging::interrupted_error()));
+            }
             guard.disarm();
             Ok(value)
         }
@@ -1277,6 +1351,15 @@ impl FsGateway {
         limits: files::PatchLimits,
     ) -> Result<files::PatchOutcome, GatewayError> {
         use std::io::Read as _;
+        // Q01: fail fast when the caller asks for more than the effective
+        // patch ceiling instead of failing later at the commit re-check.
+        if limits.max_result_bytes > PATCH_COMMIT_RECHECK_BYTES {
+            return Err(files::AnchoredPatchError::ResultTooLarge {
+                bytes: limits.max_result_bytes,
+                limit: PATCH_COMMIT_RECHECK_BYTES,
+            }
+            .into());
+        }
         let _guard = super::lock_patch_paths(&[target]).await;
         let current = {
             let file = self.open_read_resolved(target)?;
@@ -1657,20 +1740,38 @@ fn replace_file_blocking(temporary: &Utf8Path, target: &Utf8Path) -> std::io::Re
 /// owns it across the `spawn_blocking` await (symmetric with the Unix
 /// `AsyncStagingGuard` path); the inner guard covers producer failures,
 /// the outer `AsyncStreamGuard` covers outer abandonment (E13).
+///
+/// H03: `fence` is commit authority shared with the outer future. The
+/// worker checks it before creating, after the producer, and immediately
+/// before the replace: a cancelled outer future revokes the fence on drop,
+/// and the worker refuses to commit instead of overwriting a newer writer
+/// (abort cannot stop this started worker). On refusal the staging file is
+/// reclaimed and `Interrupted` is returned.
 #[cfg(not(unix))]
 fn write_file_atomic_stream_path<T>(
     target: &Utf8Path,
     temporary: &Utf8Path,
     mode: u32,
+    fence: super::staging::CommitFence,
     write: impl FnOnce(&mut std::fs::File) -> std::io::Result<T>,
 ) -> std::io::Result<T> {
     let mut staging = AsyncStreamGuard::new(temporary.to_path_buf());
     let result = (|| -> std::io::Result<T> {
+        // H03 barrier 1: worker started but outer already gone.
+        if fence.is_revoked() {
+            return Err(super::staging::interrupted_error());
+        }
         let mut file = std::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(temporary.as_std_path())?;
         let value = write(&mut file)?;
+        // H03 barrier 2: producer ran while the outer was cancelled.
+        if fence.is_revoked() {
+            drop(file);
+            let _ = std::fs::remove_file(temporary.as_std_path());
+            return Err(super::staging::interrupted_error());
+        }
         file.sync_all()?;
         // Non-Unix cannot carry POSIX modes; map the owner-write bit to the
         // read-only flag so an explicit 0o4xx mode is still honored instead
@@ -1679,6 +1780,12 @@ fn write_file_atomic_stream_path<T>(
         permissions.set_readonly(mode & 0o200 == 0);
         std::fs::set_permissions(temporary.as_std_path(), permissions)?;
         drop(file);
+        // H03 barrier 3: refuse the replace itself when revoked, so a stale
+        // worker never overwrites the newer writer's committed result.
+        if fence.is_revoked() {
+            let _ = std::fs::remove_file(temporary.as_std_path());
+            return Err(super::staging::interrupted_error());
+        }
         replace_file_blocking(temporary, target)?;
         Ok(value)
     })();
@@ -1692,6 +1799,113 @@ fn write_file_atomic_stream_path<T>(
         staging.disarm();
     }
     result
+}
+
+/// H03 Windows streaming barriers (runs on Windows CI): the real
+/// non-Unix helper with barriers at worker-start/pre-create, producer, and
+/// pre-replace. Cancelling the outer future at each barrier must never
+/// commit afterwards, and a newer writer's result must survive (H03-01..03).
+/// Unix behavior is covered by `h03_cancelled_stream_never_commits_stale_result`;
+/// Unix stage/commit split is covered by the existing outer-drop test (H03-04).
+#[cfg(all(test, windows))]
+mod h03_windows_stream_tests {
+    use super::*;
+    use contract::Permissions;
+
+    #[tokio::test]
+    async fn windows_cancelled_stream_never_commits_stale_result() {
+        let base = Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("gateway-h03w-{}", uuid::Uuid::now_v7().as_simple())),
+        )
+        .expect("temporary directory path must be utf-8");
+        struct TempGuard(Utf8PathBuf);
+        impl Drop for TempGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(self.0.as_std_path());
+            }
+        }
+        let _temp_guard = TempGuard(base.clone());
+        let workspace = base.join("workspace");
+        std::fs::create_dir_all(workspace.join("out")).expect("workspace");
+        let mut permissions = Permissions::default();
+        permissions.fs_write.push("workspace".into());
+        let gateway = FsGateway::new(workspace.clone(), &permissions);
+        let target = gateway.resolve_write("out/data.txt").expect("target");
+        gateway
+            .write_file_atomic(&target, b"original")
+            .await
+            .expect("seed");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let entered_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(entered_tx)));
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release_clone = release.clone();
+        let gateway_clone = gateway.clone();
+        let target_clone = target.clone();
+        let stale = tokio::spawn(async move {
+            gateway_clone
+                .write_file_atomic_stream(&target_clone, None, move |file| -> std::io::Result<()> {
+                    use std::io::Write as _;
+                    file.write_all(b"stale-cancelled")?;
+                    if let Some(tx) = entered_tx.lock().expect("lock").take() {
+                        let _ = tx.send(());
+                    }
+                    while !release_clone.load(std::sync::atomic::Ordering::SeqCst) {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    file.write_all(b"-tail")?;
+                    Ok(())
+                })
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), entered_rx)
+            .await
+            .expect("producer should enter")
+            .expect("signal");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        stale.abort();
+        let _ = stale.await;
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        gateway
+            .write_file_atomic(&target, b"new-successful-writer")
+            .await
+            .expect("new writer");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            std::fs::read(workspace.join("out/data.txt")).expect("target"),
+            b"new-successful-writer",
+            "H03: cancelled Windows worker must not overwrite the newer result"
+        );
+    }
+}
+
+/// H03 commit-fence unit tests (platform-independent): the fence is the
+/// commit authority shared by outer futures and blocking workers.
+#[cfg(test)]
+mod commit_fence_tests {
+    use super::super::staging::CommitFence;
+
+    #[test]
+    fn fence_starts_armed_and_revokes_once() {
+        let fence = CommitFence::new();
+        assert!(!fence.is_revoked(), "a fresh fence must allow commit");
+        fence.revoke();
+        assert!(fence.is_revoked(), "revoke must refuse later commits");
+        fence.revoke();
+        assert!(fence.is_revoked(), "revoke must be idempotent");
+    }
+
+    #[test]
+    fn cloned_fence_shares_revocation() {
+        let fence = CommitFence::new();
+        let worker = fence.clone();
+        assert!(!worker.is_revoked());
+        fence.revoke();
+        assert!(
+            worker.is_revoked(),
+            "the worker clone must observe the outer revoke"
+        );
+    }
 }
 
 /// Platform-independent staging tests. The non-Unix guard tests below run
@@ -1760,6 +1974,88 @@ mod unix_staging_tests {
 
     use super::*;
     use contract::Permissions;
+
+    #[tokio::test]
+    async fn h03_cancelled_stream_never_commits_stale_result() {
+        // H03-01/H03-02 (Unix analogue): a stream whose outer future is
+        // cancelled mid-producer must never commit afterwards, and a newer
+        // writer's result must survive the stale worker finishing late.
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let base = Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("gateway-h03-{}", uuid::Uuid::now_v7().as_simple())),
+        )
+        .expect("temporary directory path must be utf-8");
+        let _temp_guard = TempGuard(base.clone());
+        let workspace = base.join("workspace");
+        std::fs::create_dir_all(workspace.join("out")).expect("workspace");
+        let mut permissions = Permissions::default();
+        permissions.fs_write.push("workspace".into());
+        let gateway = FsGateway::new(workspace.clone(), &permissions);
+        let target = gateway.resolve_write("out/data.txt").expect("target");
+        gateway
+            .write_file_atomic(&target, b"original")
+            .await
+            .expect("seed");
+        // Async-aware rendezvous: never block the executor thread (the
+        // `#[tokio::test]` current-thread runtime would deadlock on a
+        // `std::sync::Barrier`).
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let entered_tx = Arc::new(std::sync::Mutex::new(Some(entered_tx)));
+        let release = Arc::new(AtomicBool::new(false));
+        let release_clone = release.clone();
+        let gateway_clone = gateway.clone();
+        let target_clone = target.clone();
+        let stale = tokio::spawn(async move {
+            gateway_clone
+                .write_file_atomic_stream(&target_clone, None, move |file| -> std::io::Result<()> {
+                    use std::io::Write as _;
+                    file.write_all(b"stale-cancelled")?;
+                    if let Some(tx) = entered_tx.lock().expect("entered lock").take() {
+                        let _ = tx.send(());
+                    }
+                    // Producer blocks until the outer is cancelled below.
+                    while !release_clone.load(Ordering::SeqCst) {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    file.write_all(b"-tail")?;
+                    Ok(())
+                })
+                .await
+        });
+        // Wait until the producer is inside the worker, then cancel outer.
+        tokio::time::timeout(std::time::Duration::from_secs(10), entered_rx)
+            .await
+            .expect("producer should enter")
+            .expect("entered signal");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        stale.abort();
+        let _ = stale.await;
+        // The stale worker may still be running (abort never stops a started
+        // blocking worker): let it finish, then run the newer writer.
+        release.store(true, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        gateway
+            .write_file_atomic(&target, b"new-successful-writer")
+            .await
+            .expect("new writer should succeed");
+        // Give any late stale commit a chance to (incorrectly) land.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            std::fs::read(workspace.join("out/data.txt")).expect("target"),
+            b"new-successful-writer",
+            "H03-02: a cancelled worker must not overwrite the newer result"
+        );
+        let leaked: Vec<String> = std::fs::read_dir(workspace.join("out"))
+            .expect("out dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("part"))
+            .collect();
+        assert!(leaked.is_empty(), "no staging may leak: {leaked:?}");
+    }
 
     #[tokio::test]
     async fn aborted_outer_write_leaves_no_staging_and_keeps_target() {
@@ -2081,6 +2377,52 @@ mod unix_staging_tests {
         assert!(
             final_text == "winner-a\nbeta\n" || final_text == "winner-b\nbeta\n",
             "the file must hold exactly one complete winner: {final_text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn q01_patch_limits_above_ceiling_fail_fast() {
+        // Q01: a caller asking for more than the effective patch ceiling
+        // fails fast with the ceiling displayed, instead of failing later
+        // at the commit re-check.
+        let base = Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("gateway-q01-{}", uuid::Uuid::now_v7().as_simple())),
+        )
+        .expect("temporary directory path must be utf-8");
+        let _temp_guard = TempGuard(base.clone());
+        let workspace = base.join("workspace");
+        std::fs::create_dir_all(workspace.join("out")).expect("workspace");
+        let mut permissions = contract::Permissions::default();
+        permissions.fs_write.push("workspace".into());
+        let gateway = FsGateway::new(workspace.clone(), &permissions);
+        let target = gateway.resolve_write("out/data.txt").expect("target");
+        std::fs::write(workspace.join("out/data.txt"), b"hello").expect("seed");
+        let anchor = files::anchor_for(1, "hello");
+        let (_, hash) = files::parse_anchor(&anchor).expect("anchor");
+        let over = files::PatchLimits {
+            max_edits: 8,
+            max_patch_bytes: 1024,
+            max_result_bytes: policy::MAX_PATCH_TARGET_BYTES + 1,
+        };
+        let error = gateway
+            .apply_anchored_patch(
+                &target,
+                Some(&files::base_sha256("hello")),
+                vec![files::PatchEdit {
+                    op: files::PatchOp::Replace,
+                    anchor_line: 1,
+                    anchor_hash: hash,
+                    lines: vec!["hi".into()],
+                }],
+                over,
+            )
+            .await
+            .expect_err("over-ceiling limits must fail fast");
+        assert!(
+            error
+                .to_string()
+                .contains(&policy::MAX_PATCH_TARGET_BYTES.to_string()),
+            "the ceiling must be displayed: {error}"
         );
     }
 

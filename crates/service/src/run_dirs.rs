@@ -173,7 +173,7 @@ pub(crate) fn lock_runs_directory_shared(runs_dir: &Utf8Path) -> Result<File, Se
 /// run ids (one file per shard, not per run), so lifetime admissions never
 /// accumulate entries in the runs directory. Same-run admissions map to the
 /// same shard and still exclude each other; distinct ids sharing a shard
-/// only wait briefly. Legacy per-run `.admission-<digest>.lock` files from
+/// wait cancellably (see [`lock_run_admission`]). Legacy per-run `.admission-<digest>.lock` files from
 /// earlier releases are never created here and are ignored by every store
 /// scan (see [`is_store_coordination_name`]).
 pub(crate) struct RunAdmissionLock(File);
@@ -240,6 +240,34 @@ pub(crate) fn try_lock_run_admission(
         Ok(()) => Ok(Some(RunAdmissionLock(file))),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(error)) => Err(ServiceError::Io(error)),
+    }
+}
+
+/// H01: cancellable admission-shard acquisition.
+///
+/// A `None` from [`try_lock_run_admission`] is physical shard contention,
+/// not a same-run conflict: distinct run ids share 64 shards, so a busy
+/// shard must be waited on, not reported as "this run is already in
+/// progress". The caller distinguishes the semantic duplicate only after
+/// acquiring the shard, via the adoption/identity checks. The wait is
+/// async and shutdown-cancellable: `None` is returned when `shutdown` fires
+/// first, and the caller must refuse without starting any work (H01-03).
+/// Lock files are never unlinked and no blocking mutex is held across the
+/// wait, so cross-process holders still release on crash.
+pub(crate) async fn lock_run_admission(
+    run_dir: &Utf8Path,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> Result<Option<RunAdmissionLock>, ServiceError> {
+    loop {
+        match try_lock_run_admission(run_dir)? {
+            Some(lock) => return Ok(Some(lock)),
+            None => {
+                tokio::select! {
+                    _ = shutdown.cancelled() => return Ok(None),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+                }
+            }
+        }
     }
 }
 

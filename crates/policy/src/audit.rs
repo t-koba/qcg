@@ -145,6 +145,29 @@ impl AuditConfig {
             self.classes.retain(|_, mode| *mode == AuditMode::Full);
         }
     }
+
+    /// H02: applies a per-run audit raise recorded at admission. A
+    /// `Standard` raise upgrades a `Minimal` contract to `Standard`; any
+    /// other combination is a no-op (a raise never loosens a `Standard`
+    /// contract, and `Minimal` stays `Minimal` without a raise).
+    pub fn apply_raise(&mut self, raise: Option<AuditLevel>) {
+        if raise == Some(AuditLevel::Standard) && self.level == AuditLevel::Minimal {
+            self.level = AuditLevel::Standard;
+        }
+    }
+}
+
+/// H02: the single effective-audit resolution shared by admission,
+/// restart recovery, and peer takeover. `raise` is the journaled per-run
+/// request, `floor` the current deployment floor. Both can only tighten:
+/// a `Minimal` contract without either stays `Minimal`.
+pub fn resolve_effective_audit(
+    config: &mut AuditConfig,
+    raise: Option<AuditLevel>,
+    floor: AuditFloor,
+) {
+    config.apply_raise(raise);
+    config.apply_floor(floor);
 }
 
 /// Resolved audit policy handed to the writer.

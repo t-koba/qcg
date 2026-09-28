@@ -64,6 +64,28 @@ pub(crate) fn read_last_queued_at_from_values(
         .next()
 }
 
+/// H02: journaled per-run audit raise from already-read journal values.
+///
+/// The admission writes `audit_raise` ("standard" or null) on its
+/// `run_queued` event. The last `run_queued` wins (fork-aware: a fork's own
+/// admission carries no raise, so a forked run correctly resolves to no
+/// raise). Unknown/missing values read as no raise, never as a foreign
+/// level.
+pub(crate) fn audit_raise_from_values(events: &[serde_json::Value]) -> Option<policy::AuditLevel> {
+    events
+        .iter()
+        .rev()
+        .filter(|event| event.get("t").and_then(serde_json::Value::as_str) == Some("run_queued"))
+        .find_map(|event| match event.get("audit_raise") {
+            Some(serde_json::Value::String(level)) => match level.as_str() {
+                "standard" => Some(policy::AuditLevel::Standard),
+                "minimal" => Some(policy::AuditLevel::Minimal),
+                _ => None,
+            },
+            _ => None,
+        })
+}
+
 pub(crate) fn read_optional_output_manifest(
     run_dir: &Utf8Path,
 ) -> Result<Option<OutputManifest>, ServiceError> {
@@ -171,8 +193,12 @@ pub(crate) fn rehydrate_runs(
         };
         let (_, started) = super::run_identity_event(&run_dir, &journal_events)?;
         let generator_path = Utf8PathBuf::from(&started.generator_path);
-        let contract = Contract::load(&generator_path)
+        let mut contract = Contract::load(&generator_path)
             .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+        // H02: re-apply the journaled per-run raise so a restart does not
+        // drop it. The deployment floor is re-applied at spawn time from
+        // the current policy (see `spawn_engine_run`); both are idempotent.
+        contract.apply_audit_raise(audit_raise_from_values(&journal_values));
         // Folded inputs, not the admission event: a fork patches inputs, and
         // the folded state is the only view that includes the patch.
         let inputs = state.inputs.clone().unwrap_or_default();

@@ -157,6 +157,14 @@ pub const MAX_ANCHORED_READ_LINES: usize = 2_000;
 pub const DEFAULT_PATCH_EDITS: usize = 32;
 pub const DEFAULT_PATCH_BYTES: usize = 64 * 1024;
 
+/// Q01: effective patch target ceiling, in bytes. Hash-anchored patch and
+/// repair refuse targets larger than this at the commit-time re-check, no
+/// matter how high the caller sets `output_file_limit_bytes` /
+/// `output_total_limit_bytes`. Adopted as the supported upper bound (not a
+/// request for larger capacity): callers asking for more fail fast with the
+/// ceiling displayed instead of failing later at the re-check.
+pub const MAX_PATCH_TARGET_BYTES: usize = 8 * 1024 * 1024;
+
 /// Default timeout, in seconds, for MCP server operations.
 pub const DEFAULT_MCP_TIMEOUT_SECONDS: u64 = 120;
 

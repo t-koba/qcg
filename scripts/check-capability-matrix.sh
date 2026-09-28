@@ -35,15 +35,34 @@ fi
 extracted="$(mktemp "${TMPDIR:-/tmp}/qcg-capability-names.XXXXXX")"
 trap 'rm -f "$extracted"' EXIT
 
-# G07: the extraction pipeline runs under pipefail in an explicit check so
-# a failing producer cannot hide behind the consumer's exit status (the old
-# process-substitution form masked it). Test names are backtick-quoted
-# anywhere in a matrix row, independent of the column layout. A grep with
-# no matches is an empty matrix (G07-02), not a pipeline error, so its
-# status is tolerated here and judged by the non-empty check below.
-set +o pipefail
+# H06: the extraction pipeline runs with pipefail enabled and every stage
+# status is inspected explicitly. `grep` exit 1 (no matches) is an empty
+# matrix judged by the non-empty check below; `grep` >= 2 (I/O error etc.)
+# and any `tr`/`sort` failure fail closed instead of validating a partial
+# prefix. `set +e` only spans the pipeline so `set -e` cannot exit before
+# PIPESTATUS is captured.
+set +e
 grep -oE '`[a-z0-9_]+`' "$matrix" | tr -d '`' | sort -u >"$extracted"
-set -o pipefail
+pipeline_status=("${PIPESTATUS[@]}")
+set -e
+grep_status="${pipeline_status[0]:-0}"
+tr_status="${pipeline_status[1]:-0}"
+sort_status="${pipeline_status[2]:-0}"
+if [[ "$grep_status" -gt 1 ]]; then
+  echo "capability matrix extraction failed (grep exit $grep_status): $matrix" >&2
+  exit 1
+fi
+if [[ "$tr_status" -ne 0 ]]; then
+  echo "capability matrix extraction failed (tr exit $tr_status): $matrix" >&2
+  exit 1
+fi
+if [[ "$sort_status" -ne 0 ]]; then
+  echo "capability matrix extraction failed (sort exit $sort_status): $matrix" >&2
+  exit 1
+fi
+# Note: a redirection failure (`>"$extracted"`) leaves an empty file and
+# fails closed at the non-empty check below; no separate pipeline-exit
+# variable is kept because reading PIPESTATUS already resets `$?`.
 
 # G07-02: an empty, header-only, or otherwise name-free matrix is not a
 # passing gate. Zero extracted names fail closed.

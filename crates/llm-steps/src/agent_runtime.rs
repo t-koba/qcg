@@ -609,6 +609,17 @@ pub(crate) fn resolve_patch_limits(
             .output_total_limit_bytes
             .unwrap_or(policy::DEFAULT_LLM_CONTEXT_LIMIT_BYTES),
     );
+    // Q01: the effective patch target ceiling applies regardless of higher
+    // caller output limits; fail fast with the ceiling displayed.
+    if max_result_bytes > policy::MAX_PATCH_TARGET_BYTES {
+        return Err(StepError::failed(
+            &node.id,
+            format!(
+                "resolved output limit {max_result_bytes} exceeds the effective patch target ceiling {}",
+                policy::MAX_PATCH_TARGET_BYTES
+            ),
+        ));
+    }
     Ok(files::PatchLimits {
         max_edits,
         max_patch_bytes,

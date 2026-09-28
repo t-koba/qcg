@@ -1252,7 +1252,7 @@ impl LocalService {
             let service = self.clone();
             let SpawnRun {
                 run_id,
-                contract,
+                mut contract,
                 inputs,
                 run_dir,
                 events,
@@ -1447,6 +1447,17 @@ impl LocalService {
                         }
                     },
                 };
+                // H02: single effective-audit enforcement for every execution
+                // path (fresh, restart recovery, resumer, peer takeover).
+                // The journaled `audit_raise` plus the current deployment
+                // floor are re-applied to the execution contract, so a
+                // restart or peer hand-off cannot drop a raise the admission
+                // granted. Idempotent: re-applying the same raise/floor is
+                // a no-op, and Minimal without either stays Minimal.
+                contract.apply_effective_audit(
+                    crate::summaries::audit_raise_from_values(&journaled),
+                    self.inner.deployment_policy.audit_floor,
+                );
                 let policy = match crate::types::ResolvedExecutionPolicy::for_execution(
                     &journaled,
                     self.inner.deployment_policy.max_parallel_steps,

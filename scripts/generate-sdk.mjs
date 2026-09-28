@@ -587,11 +587,16 @@ export class QcgClient {
       const decoder = new TextDecoder();
       let buffer = "";
       let pendingCr = false;
+      // H05: SSE ignores one leading BOM. TextDecoder already strips a
+      // complete BOM, but a split BOM or a decoder that preserves it must
+      // not drop the first event; only the stream-start U+FEFF is removed.
+      let bomChecked = false;
       while (true) {
         const { done, value } = await reader.read();
         if (done) {
-          // G04: EOF resolves a dangling CR, then dispatches frames already
-          // terminated by a blank line and discards only the truly
+          // H05: the trailing CR was already emitted immediately, so EOF
+          // only clears the split-CRLF guard, then dispatches frames
+          // already terminated by a blank line and discards only the truly
           // unterminated tail (SSE spec). The decoder flush only completes
           // a split multibyte character, which can never create the ASCII
           // blank line that frames an event.
@@ -600,10 +605,7 @@ export class QcgClient {
           } catch {
             // Best-effort flush: a malformed tail is still discarded.
           }
-          if (pendingCr) {
-            buffer += "\\n";
-            pendingCr = false;
-          }
+          pendingCr = false;
           let tail = buffer.indexOf("\\n\\n");
           while (tail >= 0) {
             const frame = buffer.slice(0, tail);
@@ -615,24 +617,35 @@ export class QcgClient {
           return;
         }
         let piece = decoder.decode(value, { stream: true });
-        // G04: a CRLF split across chunks frames as one break, never two.
-        // A trailing CR is held until the next chunk proves LF pairing.
+        if (!bomChecked && piece) {
+          if (piece.charCodeAt(0) === 0xfeff) piece = piece.slice(1);
+          bomChecked = true;
+        }
+        // H05: CR is a complete line break immediately; pendingCr only
+        // swallows one LF of a CRLF pair split across chunks. Holding the
+        // CR would delay a CRLF/CR-terminated event past its flush.
         if (pendingCr) {
           if (piece.startsWith("\\n")) {
-            buffer += "\\n";
             piece = piece.slice(1);
-          } else {
-            buffer += "\\n";
           }
           pendingCr = false;
         }
+        let trailingCr = false;
         if (piece.endsWith("\\r")) {
           piece = piece.slice(0, -1);
           pendingCr = true;
+          trailingCr = true;
         }
         if (piece) {
           piece = piece.replace(/\\r\\n/g, "\\n").replace(/\\r/g, "\\n");
           buffer += piece;
+        }
+        if (trailingCr) {
+          buffer += "\\n";
+        }
+        if (!bomChecked && buffer.charCodeAt(0) === 0xfeff) {
+          buffer = buffer.slice(1);
+          bomChecked = true;
         }
         let boundary = buffer.indexOf("\\n\\n");
         while (boundary >= 0) {
@@ -940,6 +953,11 @@ class QcgClient:
             decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
             text_buffer = ""
             pending_cr = False
+            # H05: SSE ignores one leading BOM at the stream start. The
+            # incremental decoder reassembles split BOM bytes, so strip the
+            # decoded U+FEFF once on the first non-empty text (all byte
+            # splits covered). Mid-stream U+FEFF content is never stripped.
+            bom_checked = False
             try:
                 while True:
                     # G04: read1 returns available bytes without waiting for
@@ -955,25 +973,33 @@ class QcgClient:
                     if not chunk:
                         break
                     piece = decoder.decode(chunk, final=False)
-                    # G04: a CRLF split across chunks must frame as one line
-                    # break, never two. A trailing CR is held back until the
-                    # next chunk proves whether it pairs with LF: a following
-                    # LF completes one break (consumed here); anything else
-                    # means the held CR was already a full break and the new
-                    # piece is left intact for normal normalization.
+                    if not bom_checked and piece:
+                        if piece.startswith("\\ufeff"):
+                            piece = piece[1:]
+                        bom_checked = True
+                    # H05: CR is a complete line break immediately; the
+                    # pending flag only swallows one LF of a CRLF pair split
+                    # across chunks. Holding the CR until the next chunk
+                    # would delay a CR-terminated event past its flush.
                     if pending_cr:
                         if piece.startswith("\\n"):
-                            text_buffer += "\\n"
                             piece = piece[1:]
-                        else:
-                            text_buffer += "\\n"
                         pending_cr = False
+                    trailing_cr = False
                     if piece.endswith("\\r"):
                         piece = piece[:-1]
                         pending_cr = True
+                        trailing_cr = True
                     if piece:
                         piece = piece.replace("\\r\\n", "\\n").replace("\\r", "\\n")
                         text_buffer += piece
+                    if trailing_cr:
+                        text_buffer += "\\n"
+                    # Strip a BOM that arrived as the very first buffered
+                    # text (e.g. decoder emitted it together with payload).
+                    if not bom_checked and text_buffer.startswith("\\ufeff"):
+                        text_buffer = text_buffer[1:]
+                        bom_checked = True
                     while "\\n\\n" in text_buffer:
                         frame, text_buffer = text_buffer.split("\\n\\n", 1)
                         data_lines = [
@@ -987,7 +1013,8 @@ class QcgClient:
                         data = "\\n".join(data_lines)
                         if data:
                             yield json.loads(data)
-                # G04: EOF resolves a dangling CR into its line break, then
+                # H05: the trailing CR was already emitted immediately,
+                # so EOF only swallows a dangling split-CRLF LF, then
                 # dispatches frames already terminated by a blank line and
                 # discards only the truly unterminated tail (SSE spec: an
                 # unterminated tail never becomes an event). Flush the UTF-8
@@ -997,11 +1024,16 @@ class QcgClient:
                     tail = decoder.decode(b"", final=True)
                 except Exception:
                     tail = ""
+                if not bom_checked and tail.startswith("\\ufeff"):
+                    tail = tail[1:]
+                    bom_checked = True
                 if tail:
+                    if pending_cr and tail.startswith("\\n"):
+                        tail = tail[1:]
                     text_buffer += tail.replace("\\r\\n", "\\n").replace("\\r", "\\n")
-                if pending_cr:
-                    text_buffer += "\\n"
-                    pending_cr = False
+                # Pending was already emitted; clearing without re-emitting
+                # keeps a split CRLF at EOF as one break, not two.
+                pending_cr = False
                 while "\\n\\n" in text_buffer:
                     frame, text_buffer = text_buffer.split("\\n\\n", 1)
                     data_lines = [

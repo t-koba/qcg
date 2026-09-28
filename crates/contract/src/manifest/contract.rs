@@ -50,6 +50,22 @@ impl Contract {
         self.manifest.audit.apply_floor(floor);
     }
 
+    /// H02: applies a journaled per-run raise. Idempotent with
+    /// [`Self::apply_audit_floor`]: recovery re-applies both.
+    pub fn apply_audit_raise(&mut self, raise: Option<policy::AuditLevel>) {
+        self.manifest.audit.apply_raise(raise);
+    }
+
+    /// H02: shared effective-audit resolution for admission, recovery, and
+    /// peer takeover. See `policy::resolve_effective_audit`.
+    pub fn apply_effective_audit(
+        &mut self,
+        raise: Option<policy::AuditLevel>,
+        floor: policy::AuditFloor,
+    ) {
+        policy::resolve_effective_audit(&mut self.manifest.audit, raise, floor);
+    }
+
     /// Load a contract, enforcing an explicit manifest size limit only when set.
     /// `None` means no mechanistic limit; the caller sets a max only when desired.
     pub fn load_with_limit(

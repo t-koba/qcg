@@ -577,8 +577,13 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
     // overruns are returned to the embedding host instead of being logged
     // and swallowed (E05).
     let outcome = tokio::time::timeout(shutdown_deadline, async move {
+        let mut tasks = tasks;
         let (tasks_result, runs_result) =
             tokio::join!(tasks.shutdown(), service.shutdown_active_runs());
+        // H04: both sides are done here (join! completed), so the abort
+        // guard is disarmed exactly once. The timeout path drops `tasks`
+        // without reaching this line, preserving forced recovery.
+        tasks.disarm_engine_cleanup();
         tasks_result?;
         runs_result.map_err(anyhow::Error::from)
     })
@@ -718,7 +723,12 @@ impl ResidentTasks {
         self.otlp_handle = Some(handle);
     }
 
-    async fn shutdown(mut self) -> Result<()> {
+    /// H04: borrows instead of consuming so the abort guard (`Drop`)
+    /// lives until BOTH resident join and run settlement complete. The
+    /// caller disarms engine cleanup only after the join (see
+    /// [`Self::disarm_engine_cleanup`]); dropping `self` after a lone
+    /// resident join must not abort still-settling engine tasks.
+    async fn shutdown(&mut self) -> Result<()> {
         // The token was already cancelled when the signal fired, so the
         // loops exit at their next select. Await them instead of aborting:
         // aborting mid-iteration could strand a run that the task just
@@ -804,14 +814,23 @@ impl ResidentTasks {
             )),
         }
     }
+
+    /// H04: disarms the abort-path engine cleanup after BOTH resident join
+    /// and run settlement complete. Called once by the shutdown owner after
+    /// the `join!`; the abort path (outer deadline, serve abort) never calls
+    /// it, so forced recovery still fires there.
+    fn disarm_engine_cleanup(&mut self) {
+        self.service = None;
+    }
 }
 
 impl Drop for ResidentTasks {
     fn drop(&mut self) {
-        // Abort-path cleanup: the graceful path already settled every
-        // engine task, so this only fires when the serve future itself
-        // was aborted or panicked (including an outer-deadline timeout,
-        // which drops the shutdown future holding this struct). Without it
+        // Abort-path cleanup (H04): the graceful path disarms via
+        // `disarm_engine_cleanup` only after BOTH resident join and run
+        // settlement complete, so this fires solely on the abort path
+        // (serve abort/panic, including an outer-deadline timeout which
+        // drops the shutdown future holding this struct). Without it
         // the per-run engine tasks keep their service clones (and the
         // run-store lock) alive forever, and rebuilding on the same
         // directory fails (E05). Both the waiter set and the resident
@@ -1468,7 +1487,7 @@ mod tests {
             #[allow(unreachable_code)]
             Ok::<(), service::ServiceError>(())
         });
-        let tasks = ResidentTasks {
+        let mut tasks = ResidentTasks {
             handles: vec![handle],
             abort_handles: vec![],
             waiters: tokio::task::JoinSet::new(),
@@ -1499,7 +1518,7 @@ mod tests {
             std::future::pending::<()>().await;
             Ok::<(), service::ServiceError>(())
         });
-        let tasks = ResidentTasks {
+        let mut tasks = ResidentTasks {
             handles: vec![first, second],
             abort_handles: vec![],
             waiters: tokio::task::JoinSet::new(),
@@ -1733,6 +1752,99 @@ command = ["sh", "-c", "sleep 30"]"#,
     }
 
     #[tokio::test]
+    async fn h04_graceful_join_keeps_guard_until_both_sides_done() {
+        // H04-01/H04-02: the abort guard must live across the
+        // `join!(resident, runs)` in both orders and disarm only after both
+        // complete. Borrowed shutdown (not consuming) is what keeps it alive.
+        let root = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .expect("temporary directory path should be UTF-8")
+            .join(format!("h04-graceful-{}", uuid::Uuid::now_v7()));
+        let _temp_guard = TempGuard(root.clone());
+        let generators = root.join("generators");
+        let runs = root.join("runs");
+        std::fs::create_dir_all(&generators).expect("generators dir");
+        let service = single_run_service(&generators, &runs);
+        for order in ["resident-first", "run-first"] {
+            let mut tasks = ResidentTasks {
+                handles: vec![],
+                abort_handles: vec![],
+                waiters: tokio::task::JoinSet::new(),
+                service: Some(service.clone()),
+                otlp_handle: None,
+                otlp_abort: None,
+            };
+            // Resident side is immediate; run side needs its grace period.
+            // Both orders must complete without the guard firing mid-join:
+            // the guard is still owned here after shutdown returns.
+            let fake_run_settlement = async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                Ok::<(), anyhow::Error>(())
+            };
+            if order == "resident-first" {
+                let (tasks_result, runs_result) =
+                    tokio::join!(tasks.shutdown(), fake_run_settlement);
+                tasks_result.expect("resident join should succeed");
+                runs_result.expect("run settlement should succeed");
+            } else {
+                let (runs_result, tasks_result) =
+                    tokio::join!(fake_run_settlement, tasks.shutdown(),);
+                runs_result.expect("run settlement should succeed");
+                tasks_result.expect("resident join should succeed");
+            }
+            // Still owned after the join: disarm exactly once, then drop
+            // must not abort (service cleared).
+            assert!(
+                tasks.service.is_some(),
+                "H04 ({order}): guard must survive the join"
+            );
+            tasks.disarm_engine_cleanup();
+            assert!(
+                tasks.service.is_none(),
+                "H04 ({order}): disarm must release engine cleanup"
+            );
+        }
+        drop(service);
+    }
+
+    #[tokio::test]
+    async fn h04_abort_path_still_armed_without_disarm() {
+        // H04-03: the abort path (outer deadline, serve abort) never disarms,
+        // so Drop must still fire forced recovery. Assert the guard stays
+        // armed when shutdown is abandoned mid-wait and that Drop aborts
+        // resident handles.
+        let handle = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+            Ok::<(), service::ServiceError>(())
+        });
+        let abort = handle.abort_handle();
+        let root = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .expect("temporary directory path should be UTF-8")
+            .join(format!("h04-abort-{}", uuid::Uuid::now_v7()));
+        let _temp_guard = TempGuard(root.clone());
+        let generators = root.join("generators");
+        let runs = root.join("runs");
+        std::fs::create_dir_all(&generators).expect("generators dir");
+        let service = single_run_service(&generators, &runs);
+        {
+            let _tasks = ResidentTasks {
+                handles: vec![handle],
+                abort_handles: vec![abort.clone()],
+                waiters: tokio::task::JoinSet::new(),
+                service: Some(service.clone()),
+                otlp_handle: None,
+                otlp_abort: None,
+            };
+            // Drop without disarm = abort path.
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            abort.is_finished(),
+            "H04-03: abort-path Drop must still force recovery"
+        );
+        drop(service);
+    }
+
+    #[tokio::test]
     async fn wedged_shutdown_surfaces_an_error_through_the_deadline_path() {
         // E05: a wedged resident task plus a live run must surface an error
         // through the outer deadline instead of reporting clean success.
@@ -1817,8 +1929,10 @@ command = ["sh", "-c", "sleep 30"]"#,
         // concurrently under one deadline), never serial awaits that would
         // let one phase consume the other's budget.
         let outcome = tokio::time::timeout(std::time::Duration::from_millis(200), async move {
+            let mut tasks = tasks;
             let (tasks_result, runs_result) =
                 tokio::join!(tasks.shutdown(), service.shutdown_active_runs());
+            tasks.disarm_engine_cleanup();
             tasks_result?;
             runs_result.map_err(anyhow::Error::from)
         })

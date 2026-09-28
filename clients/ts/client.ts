@@ -315,11 +315,16 @@ export class QcgClient {
       const decoder = new TextDecoder();
       let buffer = "";
       let pendingCr = false;
+      // H05: SSE ignores one leading BOM. TextDecoder already strips a
+      // complete BOM, but a split BOM or a decoder that preserves it must
+      // not drop the first event; only the stream-start U+FEFF is removed.
+      let bomChecked = false;
       while (true) {
         const { done, value } = await reader.read();
         if (done) {
-          // G04: EOF resolves a dangling CR, then dispatches frames already
-          // terminated by a blank line and discards only the truly
+          // H05: the trailing CR was already emitted immediately, so EOF
+          // only clears the split-CRLF guard, then dispatches frames
+          // already terminated by a blank line and discards only the truly
           // unterminated tail (SSE spec). The decoder flush only completes
           // a split multibyte character, which can never create the ASCII
           // blank line that frames an event.
@@ -328,10 +333,7 @@ export class QcgClient {
           } catch {
             // Best-effort flush: a malformed tail is still discarded.
           }
-          if (pendingCr) {
-            buffer += "\n";
-            pendingCr = false;
-          }
+          pendingCr = false;
           let tail = buffer.indexOf("\n\n");
           while (tail >= 0) {
             const frame = buffer.slice(0, tail);
@@ -343,24 +345,35 @@ export class QcgClient {
           return;
         }
         let piece = decoder.decode(value, { stream: true });
-        // G04: a CRLF split across chunks frames as one break, never two.
-        // A trailing CR is held until the next chunk proves LF pairing.
+        if (!bomChecked && piece) {
+          if (piece.charCodeAt(0) === 0xfeff) piece = piece.slice(1);
+          bomChecked = true;
+        }
+        // H05: CR is a complete line break immediately; pendingCr only
+        // swallows one LF of a CRLF pair split across chunks. Holding the
+        // CR would delay a CRLF/CR-terminated event past its flush.
         if (pendingCr) {
           if (piece.startsWith("\n")) {
-            buffer += "\n";
             piece = piece.slice(1);
-          } else {
-            buffer += "\n";
           }
           pendingCr = false;
         }
+        let trailingCr = false;
         if (piece.endsWith("\r")) {
           piece = piece.slice(0, -1);
           pendingCr = true;
+          trailingCr = true;
         }
         if (piece) {
           piece = piece.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
           buffer += piece;
+        }
+        if (trailingCr) {
+          buffer += "\n";
+        }
+        if (!bomChecked && buffer.charCodeAt(0) === 0xfeff) {
+          buffer = buffer.slice(1);
+          bomChecked = true;
         }
         let boundary = buffer.indexOf("\n\n");
         while (boundary >= 0) {

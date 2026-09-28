@@ -706,9 +706,11 @@ command = ["sh", "-c", "sleep 30"]"#,
 }
 
 #[tokio::test]
-async fn concurrent_admission_of_one_run_id_fails_closed() {
-    // E03: while one admission is preparing a reserved run id, a second
-    // caller must fail closed instead of wiping the live prepare.
+async fn concurrent_admission_of_one_run_id_waits_then_converges() {
+    // E03/H01: while one admission holds this run's shard, a second caller
+    // for the SAME run id waits cancellably instead of wiping the live
+    // prepare. The waiter converges after the holder releases: no second
+    // journal init, no Conflict for the same semantic admission.
     let runs = temp_run_dir("admission-lock");
     let _ = std::fs::remove_dir_all(&runs);
     let generators =
@@ -723,22 +725,214 @@ async fn concurrent_admission_of_one_run_id_fails_closed() {
         inputs: BTreeMap::new(),
         ..Default::default()
     };
-    let error = service
-        .start_run_with_id(request(), Some(run_id.clone()))
-        .await
-        .expect_err("a concurrent admission must fail closed");
+    // The waiter must still be pending while the shard is held: shard
+    // contention is physical waiting, not an immediate semantic conflict.
+    let waiter = tokio::spawn({
+        let service = service.clone();
+        let run_id = run_id.clone();
+        async move { service.start_run_with_id(request(), Some(run_id)).await }
+    });
+    // Give the waiter a chance to block on the held shard.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert!(
-        matches!(error, ApiError::Conflict { .. }),
-        "admission contention must be a conflict: {error}"
+        !waiter.is_finished(),
+        "same-shard waiter must block while the shard is held (H01)"
     );
     drop(held);
-    let id = service
-        .start_run_with_id(request(), Some(run_id.clone()))
+    let id = waiter
         .await
-        .expect("retry after the lock is released should succeed");
+        .expect("waiter should join")
+        .expect("admission after release should succeed");
     assert_eq!(id, run_id);
     wait_for_snapshot(&service, &id, RunStatus::Waiting).await;
     drop(service);
+}
+
+#[tokio::test]
+async fn h01_distinct_ids_sharing_a_shard_both_admit() {
+    // H01-01: two independent run ids that hash to the same admission
+    // shard must both admit as distinct runs, serializing on the shard
+    // instead of rejecting one as "already in progress".
+    let root = temp_run_dir("h01-distinct-shard");
+    let _ = std::fs::remove_dir_all(&root);
+    write_generator_package(&root.join("generators"), "h01-gen");
+    let service = test_service(vec![root.join("generators")], root.join("runs"));
+    let (first_id, second_id) = colliding_reserved_ids();
+    assert_ne!(first_id, second_id);
+    let request = || StartRun {
+        generator_id: "h01-gen".into(),
+        inputs: BTreeMap::from([("name".into(), json!("test"))]),
+        ..Default::default()
+    };
+    // Force shard contention deterministically: hold the shared shard
+    // externally, queue both distinct admissions on it, then release so
+    // they serialize instead of rejecting one as a duplicate.
+    let held = crate::run_dirs::try_lock_run_admission(&root.join("runs").join(&first_id))
+        .expect("shard lock should open")
+        .expect("shard should be free");
+    let first = tokio::spawn({
+        let service = service.clone();
+        let id = first_id.clone();
+        async move { service.start_run_with_id(request(), Some(id)).await }
+    });
+    let second_handle = tokio::spawn({
+        let service = service.clone();
+        let id = second_id.clone();
+        async move { service.start_run_with_id(request(), Some(id)).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !first.is_finished() && !second_handle.is_finished(),
+        "both distinct waiters must block on the held shard (H01-01)"
+    );
+    drop(held);
+    let first = first
+        .await
+        .expect("first should join")
+        .expect("first distinct admission must succeed");
+    let second = second_handle
+        .await
+        .expect("second should join")
+        .expect("distinct id sharing a shard must admit (H01-01)");
+    assert_eq!(second, second_id);
+    assert_ne!(first, second);
+    // Both runs exist as distinct journals.
+    for id in [&first, &second] {
+        let journal = root
+            .join("runs")
+            .join(id)
+            .join("meta")
+            .join("journal.jsonl");
+        assert!(
+            journal.exists(),
+            "distinct run {id} must have its own journal"
+        );
+    }
+    drop(service);
+}
+
+#[tokio::test]
+async fn h01_same_id_concurrent_admission_initializes_once() {
+    // H01-02: two concurrent admissions for the SAME run id serialize on
+    // the shard and converge: exactly one journal init, no double execution.
+    let root = temp_run_dir("h01-same-id");
+    let _ = std::fs::remove_dir_all(&root);
+    write_generator_package(&root.join("generators"), "h01-same-gen");
+    let service = test_service(vec![root.join("generators")], root.join("runs"));
+    let run_id = "h01-same-run-1".to_string();
+    let request = || StartRun {
+        generator_id: "h01-same-gen".into(),
+        inputs: BTreeMap::from([("name".into(), json!("test"))]),
+        ..Default::default()
+    };
+    let first = tokio::spawn({
+        let service = service.clone();
+        let id = run_id.clone();
+        async move { service.start_run_with_id(request(), Some(id)).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let second = service
+        .start_run_with_id(request(), Some(run_id.clone()))
+        .await
+        .expect("same-id rival must converge, not duplicate");
+    let first = first.await.expect("join").expect("first must succeed");
+    assert_eq!(first, run_id);
+    assert_eq!(second, run_id);
+    let journal = std::fs::read_to_string(
+        root.join("runs")
+            .join(&run_id)
+            .join("meta")
+            .join("journal.jsonl"),
+    )
+    .expect("journal should read");
+    // Exactly one run_queued event: a second init would fork the journal.
+    assert_eq!(
+        journal.matches("run_queued").count(),
+        1,
+        "same-id admissions must initialize once: {journal}"
+    );
+    drop(service);
+}
+
+#[tokio::test]
+async fn h01_shard_wait_aborts_on_shutdown_without_starting() {
+    // H01-03: a shard wait cancelled by shutdown refuses without starting
+    // the refused work afterwards.
+    let root = temp_run_dir("h01-shutdown-wait");
+    let _ = std::fs::remove_dir_all(&root);
+    write_generator_package(&root.join("generators"), "h01-shut-gen");
+    let service = test_service(vec![root.join("generators")], root.join("runs"));
+    let run_id = "h01-shut-run-1".to_string();
+    let held = crate::run_dirs::try_lock_run_admission(&root.join("runs").join(&run_id))
+        .expect("lock open")
+        .expect("lock acquire");
+    let waiter = tokio::spawn({
+        let service = service.clone();
+        let id = run_id.clone();
+        async move {
+            service
+                .start_run_with_id(
+                    StartRun {
+                        generator_id: "h01-shut-gen".into(),
+                        inputs: BTreeMap::from([("name".into(), json!("test"))]),
+                        ..Default::default()
+                    },
+                    Some(id),
+                )
+                .await
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(!waiter.is_finished(), "waiter must block on the held shard");
+    service.mark_shutting_down();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+        .await
+        .expect("shutdown must end the shard wait")
+        .expect("join");
+    assert!(
+        matches!(outcome, Err(ApiError::Unavailable { .. })),
+        "shutdown wait must refuse as unavailable: {outcome:?}"
+    );
+    drop(held);
+    // The refused run never started: no journal, no record.
+    assert!(
+        !root
+            .join("runs")
+            .join(&run_id)
+            .join("meta")
+            .join("journal.jsonl")
+            .exists(),
+        "refused admission must not leave a journal behind"
+    );
+    assert!(
+        service.inner.runs.read().await.get(&run_id).is_none(),
+        "refused admission must not register a record"
+    );
+    drop(service);
+}
+
+fn colliding_reserved_ids() -> (String, String) {
+    // Find two distinct safe ids mapping to one admission shard by
+    // reusing the service's shard function through contended locking:
+    // probe candidate ids until two share a shard file.
+    fn shard_of(id: &str) -> usize {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for byte in id.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        (hash as usize) & (crate::run_dirs::ADMISSION_SHARD_COUNT - 1)
+    }
+    let mut seen: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
+    for index in 0..4096u32 {
+        let id = format!("h01-{index:08x}");
+        let shard = shard_of(&id);
+        if let Some(first) = seen.get(&shard) {
+            return (first.clone(), id);
+        }
+        seen.insert(shard, id);
+    }
+    panic!("no colliding ids found");
 }
 
 #[tokio::test]
@@ -1442,4 +1636,205 @@ async fn g03_concurrent_same_run_admission_stays_exclusive() {
         "shard files must stay bounded at {}: {shard_files}",
         crate::run_dirs::ADMISSION_SHARD_COUNT
     );
+}
+
+#[tokio::test]
+async fn h02_effective_audit_resolution_matrix() {
+    // H02 unit matrix: raise + floor can only tighten, never loosen.
+    use policy::{AuditConfig, AuditFloor, AuditLevel, resolve_effective_audit};
+    let mut minimal = AuditConfig {
+        level: AuditLevel::Minimal,
+        ..Default::default()
+    };
+    resolve_effective_audit(&mut minimal, None, AuditFloor::Minimal);
+    assert_eq!(
+        minimal.level,
+        AuditLevel::Minimal,
+        "H02-04: bare minimal stays minimal"
+    );
+    let mut raised = AuditConfig {
+        level: AuditLevel::Minimal,
+        ..Default::default()
+    };
+    resolve_effective_audit(&mut raised, Some(AuditLevel::Standard), AuditFloor::Minimal);
+    assert_eq!(
+        raised.level,
+        AuditLevel::Standard,
+        "H02-02: run raise survives"
+    );
+    let mut floored = AuditConfig {
+        level: AuditLevel::Minimal,
+        ..Default::default()
+    };
+    resolve_effective_audit(&mut floored, None, AuditFloor::Standard);
+    assert_eq!(
+        floored.level,
+        AuditLevel::Standard,
+        "H02-01: deployment floor applies"
+    );
+    let mut standard = AuditConfig {
+        level: AuditLevel::Standard,
+        ..Default::default()
+    };
+    resolve_effective_audit(&mut standard, None, AuditFloor::Minimal);
+    assert_eq!(
+        standard.level,
+        AuditLevel::Standard,
+        "standard without overrides stays standard"
+    );
+    // Durable records are never filtered: policy resolution keeps them.
+    let policy = policy::AuditPolicy::from_config(&raised).expect("policy resolves");
+    assert!(
+        policy.is_full(),
+        "raised policy must persist observations fully"
+    );
+}
+
+#[tokio::test]
+async fn h02_raise_survives_rehydrate_and_spawn_resolution() {
+    // H02-02/H02-04: a journaled Standard raise is preserved by rehydrate;
+    // Minimal without a raise stays Minimal until a floor is applied at spawn.
+    let root = temp_run_dir("h02-raise");
+    let _ = std::fs::remove_dir_all(&root);
+    write_generator_package(&root.join("generators"), "h02-gen");
+    let service = test_service(vec![root.join("generators")], root.join("runs"));
+    let id = service
+        .start_run(StartRun {
+            generator_id: "h02-gen".into(),
+            inputs: BTreeMap::from([("name".into(), json!("test"))]),
+            audit_level: Some(policy::AuditLevel::Standard),
+            ..Default::default()
+        })
+        .await
+        .expect("raised run should start");
+    // Admission journaled the raise.
+    let journal_path = run_meta_dir(&service.run_dir_for(&id).await.unwrap()).join("journal.jsonl");
+    let values = crate::summaries::read_journal_events(&service.run_dir_for(&id).await.unwrap())
+        .expect("journal should read");
+    assert_eq!(
+        crate::summaries::audit_raise_from_values(&values),
+        Some(policy::AuditLevel::Standard),
+        "journaled raise must be extractable"
+    );
+    // Restart recovery preserves the raise even before the floor is applied.
+    let recovered = crate::summaries::rehydrate_runs(
+        &root.join("runs"),
+        policy::DEFAULT_MAX_TRACKED_RUNS,
+        policy::DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES,
+    )
+    .expect("rehydrate should succeed");
+    let record = recovered.get(&id).expect("run should rehydrate");
+    assert_eq!(
+        record.contract.manifest.audit.level,
+        policy::AuditLevel::Standard,
+        "H02-02: rehydrate must not drop the run raise"
+    );
+    // Spawn-time floor application keeps the raise (Minimal floor here).
+    let mut spawn_contract = record.contract.clone();
+    spawn_contract.apply_effective_audit(
+        crate::summaries::audit_raise_from_values(&values),
+        policy::AuditFloor::Minimal,
+    );
+    assert_eq!(
+        spawn_contract.manifest.audit.level,
+        policy::AuditLevel::Standard
+    );
+    // H02-04: a run without a raise rehydrates as Standard (default
+    // generator) and stays Standard; a Minimal contract without raise/floor
+    // stays Minimal by construction (covered by the matrix above).
+    let _ = journal_path;
+    drop(service);
+}
+
+#[tokio::test]
+async fn h02_floor_applies_at_spawn_and_peer_takeover() {
+    // H02-01/H02-03: a Minimal contract executed under a Standard floor
+    // runs Full, including when a second peer takes over the same journal.
+    let root = temp_run_dir("h02-floor");
+    let _ = std::fs::remove_dir_all(&root);
+    // Minimal-audit generator.
+    let gen_dir = root.join("generators").join("h02-min-gen");
+    std::fs::create_dir_all(&gen_dir).expect("gen dir");
+    std::fs::write(
+        gen_dir.join(contract::MANIFEST_FILE),
+        r#"
+[generator]
+id = "h02-min-gen"
+name = "h02-min-gen"
+version = "0.1.0"
+
+[audit]
+level = "minimal"
+
+[[inputs.stages]]
+id = "basic"
+
+[[inputs.stages.fields]]
+id = "name"
+required = true
+type = "string"
+
+[permissions]
+fs_read = []
+fs_write = []
+network = []
+commands = []
+side_effects = "none"
+side_effects_scope = "invocation"
+
+[permissions.containers]
+enabled = false"#,
+    )
+    .expect("manifest");
+    // Peer A: Minimal floor admits the run (contract stays Minimal).
+    let service_a = test_service(vec![root.join("generators")], root.join("runs"));
+    let id = service_a
+        .start_run(StartRun {
+            generator_id: "h02-min-gen".into(),
+            inputs: BTreeMap::from([("name".into(), json!("test"))]),
+            ..Default::default()
+        })
+        .await
+        .expect("minimal run should start");
+    let values = crate::summaries::read_journal_events(&service_a.run_dir_for(&id).await.unwrap())
+        .expect("journal");
+    assert_eq!(crate::summaries::audit_raise_from_values(&values), None);
+    // Spawn under a Standard floor (peer B / restarted deployment) resolves Full.
+    let mut execution = service_a
+        .inner
+        .runs
+        .read()
+        .await
+        .get(&id)
+        .unwrap()
+        .contract
+        .clone();
+    assert_eq!(execution.manifest.audit.level, policy::AuditLevel::Minimal);
+    execution.apply_effective_audit(None, policy::AuditFloor::Standard);
+    assert_eq!(execution.manifest.audit.level, policy::AuditLevel::Standard);
+    let policy_obj = policy::AuditPolicy::from_config(&execution.manifest.audit).expect("policy");
+    assert!(
+        policy_obj.is_full(),
+        "H02-01: floor-only run must persist observations fully"
+    );
+    // Peer B rehydrates the same journal (SharedFilesystem takeover shape):
+    // the raise-free journal still rehydrates, and B's spawn-time floor
+    // application converges to the same Full policy (H02-03).
+    let recovered = crate::summaries::rehydrate_runs(
+        &root.join("runs"),
+        policy::DEFAULT_MAX_TRACKED_RUNS,
+        policy::DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES,
+    )
+    .expect("peer rehydrate");
+    let peer_record = recovered.get(&id).expect("peer should see the run");
+    let mut peer_execution = peer_record.contract.clone();
+    peer_execution.apply_effective_audit(
+        crate::summaries::audit_raise_from_values(&values),
+        policy::AuditFloor::Standard,
+    );
+    assert_eq!(
+        peer_execution.manifest.audit.level,
+        policy::AuditLevel::Standard
+    );
+    drop(service_a);
 }

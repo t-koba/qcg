@@ -76,5 +76,44 @@ expect_fail "G07-03 unknown test name" bash "$check"
 cp "$work/good3.md" "$matrix"
 expect_pass "G07-03 valid matrix" bash "$check"
 
+# H06-01: a producer that emits one valid name then exits 2 must fail
+# closed instead of validating the partial prefix.
+cp "$matrix" "$work/good4.md"
+printf '| Partial read | `real_test_placeholder` |\n| Unread tail | `nonexistent_test_xyz_123` |\n' >"$matrix"
+mkdir -p "$work/fakebin"
+real_grep="$(command -v grep)"
+printf '#!/usr/bin/env bash\nif [[ "${1:-}" == "-oE" ]]; then\n  printf "`real_test_placeholder`\\n"\n  echo "grep: injected I/O failure after partial output" >&2\n  exit 2\nfi\nexec "%s" "$@"\n' "$real_grep" >"$work/fakebin/grep"
+printf '%s' "$(cat "$work/fakebin/grep" | sed "s/printf \"\`real_test_placeholder\`\\\\n\"/printf '\`real_test_placeholder\`\\\\n'/")" >"$work/fakebin/grep"
+chmod 755 "$work/fakebin/grep"
+# Seed a live test name matching the partial output so the gate would pass
+# if it validated the prefix.
+if ! grep -rq "real_test_placeholder" "$repo_root" 2>/dev/null; then
+  # Use a known-live test name instead: rewrite the matrix and wrapper to
+  # use an actually existing test discovered from the tree.
+  live_name="$(grep -rhoE 'fn[[:space:]]+[a-z0-9_]+[[:space:]]*(\(|<)' "$repo_root" --exclude-dir=.git --exclude-dir=target --exclude-dir=node_modules 2>/dev/null | head -n 1 | grep -oE '[a-z0-9_]+' | head -n 1)"
+  if [[ -n "${live_name:-}" ]]; then
+    printf '| Partial read | `%s` |\n| Unread tail | `nonexistent_test_xyz_123` |\n' "$live_name" >"$matrix"
+    printf '#!/usr/bin/env bash\nif [[ "${1:-}" == "-oE" ]]; then\n  printf '\''`%s`\\n'\''\n  echo "grep: injected I/O failure after partial output" >&2\n  exit 2\nfi\nexec "%s" "$@"\n' "$live_name" "$real_grep" >"$work/fakebin/grep"
+    chmod 755 "$work/fakebin/grep"
+  fi
+fi
+PATH="$work/fakebin:$PATH" expect_fail "H06-01 partial producer exit 2" bash "$check"
+cp "$work/good4.md" "$matrix"
+rm -rf "$work/fakebin"
+
+# H06-03: consumer failures fail closed too.
+cp "$matrix" "$work/good5.md"
+mkdir -p "$work/fakebin2"
+printf '#!/usr/bin/env bash\necho "tr: injected failure" >&2\nexit 1\n' >"$work/fakebin2/tr"
+chmod 755 "$work/fakebin2/tr"
+PATH="$work/fakebin2:$PATH" expect_fail "H06-03 tr failure" bash "$check"
+rm -rf "$work/fakebin2"
+mkdir -p "$work/fakebin3"
+printf '#!/usr/bin/env bash\ncat > /dev/null\necho "sort: injected failure" >&2\nexit 1\n' >"$work/fakebin3/sort"
+chmod 755 "$work/fakebin3/sort"
+PATH="$work/fakebin3:$PATH" expect_fail "H06-03 sort failure" bash "$check"
+rm -rf "$work/fakebin3"
+cp "$work/good5.md" "$matrix"
+
 echo "capability gate self-test: $pass passed, $fail failed"
 [[ "$fail" -eq 0 ]]

@@ -630,16 +630,24 @@ impl LocalService {
             return Err(api_bad_request(format!("run id `{run_id}` is not allowed")));
         }
         let run_dir = self.inner.runs_dir.join(&run_id);
-        // Only one admission may prepare, wipe, or adopt this run id at a
-        // time; a concurrent caller fails closed and retries instead of
-        // wiping a live prepare or writing a second admission event (E03).
+        // H01: shard contention is physical, not a same-run conflict.
+        // Distinct ids sharing one of the 64 shards wait cancellably for
+        // the shard; the semantic same-run duplicate is decided after
+        // acquisition via the adoption/identity checks below. Shutdown
+        // during the wait refuses without starting any work (H01-03).
         // The live-hit fast path is re-checked under this lock so a drain
         // racing the check cannot be missed (E05).
-        let _admission = crate::run_dirs::try_lock_run_admission(&run_dir)
+        let _admission = match crate::run_dirs::lock_run_admission(&run_dir, &self.inner.shutdown)
+            .await
             .map_err(api_internal)?
-            .ok_or_else(|| ApiError::Conflict {
-                detail: format!("run `{run_id}` admission is already in progress; retry"),
-            })?;
+        {
+            Some(lock) => lock,
+            None => {
+                return Err(ApiError::Unavailable {
+                    detail: "server is shutting down".into(),
+                });
+            }
+        };
         // Adoption snapshot first: one journal read serves the live-hit
         // verification, the seed, and the queue instant below. The live
         // check reuses this snapshot instead of rescanning, so each
@@ -968,11 +976,18 @@ impl LocalService {
             return Err(api_bad_request(format!("run id `{run_id}` is not allowed")));
         }
         let run_dir = self.inner.runs_dir.join(&run_id);
-        let _admission = crate::run_dirs::try_lock_run_admission(&run_dir)
+        // H01: same cancellable shard wait as start admissions (see above).
+        let _admission = match crate::run_dirs::lock_run_admission(&run_dir, &self.inner.shutdown)
+            .await
             .map_err(api_internal)?
-            .ok_or_else(|| ApiError::Conflict {
-                detail: format!("run `{run_id}` admission is already in progress; retry"),
-            })?;
+        {
+            Some(lock) => lock,
+            None => {
+                return Err(ApiError::Unavailable {
+                    detail: "server is shutting down".into(),
+                });
+            }
+        };
         // Re-checked under the admission lock so a drain racing the first
         // probe cannot be missed (E05).
         // Filesystem preparation happens outside the run-map lock so concurrent
