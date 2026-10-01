@@ -836,6 +836,9 @@ fn spec_with_base_url(id: &str, base_url: &str) -> ProviderSpec {
         retry_backoff_exponent_cap: None,
         chat_token_limit_field: None,
         prompt_cache_field: None,
+        decision_input_wrapper: DecisionInputWrapper::None,
+        decision_model_in_body: true,
+        decision_response_wrapper: DecisionResponseWrapper::Auto,
         response_body_limit_bytes: None,
         max_concurrency: None,
         requests_per_minute: None,
@@ -879,18 +882,34 @@ fn endpoint_supports_path_template_and_query_interpolation() {
 }
 
 #[test]
-fn endpoint_encodes_model_as_a_path_segment() {
+fn endpoint_expands_model_as_path_segments() {
     let mut spec = spec_with_base_url("x", "https://resource.example/v1");
     spec.path_template = Some("deployments/{model}/chat".into());
     let provider = HttpProvider::from_spec(spec);
 
+    // `{model}` expands as segments so namespaced models such as
+    // `typesafe/jev` address `.../run/typesafe/jev`. Delimiters that would
+    // escape the path (`?`) stay encoded; empty, `.`, and `..` pieces fail.
     assert_eq!(
         provider
             .endpoint_for("deployment/with?delimiters")
             .expect("endpoint should be valid")
             .as_str(),
-        "https://resource.example/v1/deployments/deployment%2Fwith%3Fdelimiters/chat"
+        "https://resource.example/v1/deployments/deployment/with%3Fdelimiters/chat"
     );
+    assert_eq!(
+        provider
+            .endpoint_for("typesafe/jev")
+            .expect("endpoint should be valid")
+            .as_str(),
+        "https://resource.example/v1/deployments/typesafe/jev/chat"
+    );
+    for unsafe_model in ["", "a//b", "a/./b", "a/../b", "/leading", "trailing/"] {
+        assert!(
+            provider.endpoint_for(unsafe_model).is_err(),
+            "unsafe model `{unsafe_model}` must fail"
+        );
+    }
 }
 
 #[test]
@@ -1350,10 +1369,66 @@ fn providers_file_rejects_invalid_capability_and_transport_combinations() {
             ),
             "Responses API",
         ),
+        (
+            test_provider_row(
+                "chat-decision",
+                "chat_completions",
+                "https://example.invalid",
+                "decision_input_wrapper = \"input\"\n",
+            ),
+            "system_one",
+        ),
+        (
+            test_provider_row(
+                "chat-decision-model",
+                "responses",
+                "https://example.invalid",
+                "decision_model_in_body = false\npath_template = \"run/{model}\"\n",
+            ),
+            "system_one",
+        ),
+        (
+            test_provider_row(
+                "chat-decision-response",
+                "chat_completions",
+                "https://example.invalid",
+                "decision_response_wrapper = \"result\"\n",
+            ),
+            "system_one",
+        ),
+        (
+            test_provider_row(
+                "decision-no-path-model",
+                "system_one",
+                "https://example.invalid",
+                "decision_model_in_body = false\n",
+            ),
+            "{model}",
+        ),
     ] {
         let error = ProvidersFile::parse(&source)
             .expect_err("invalid provider combinations must fail validation");
         assert!(error.contains(expected), "{error}");
+    }
+}
+
+#[test]
+fn system_one_decision_transports_validate_without_network() {
+    // Direct (default), Cloudflare body-style (`/ai/run`), and Cloudflare
+    // path-style (`/ai/run/{model}`) are all pure registry mechanism.
+    for extra in [
+        "",
+        "decision_input_wrapper = \"input\"\npath_template = \"run\"\n",
+        "path_template = \"run/{model}\"\ndecision_model_in_body = false\n",
+        "decision_input_wrapper = \"input\"\npath_template = \"run/{model}\"\ndecision_model_in_body = false\ndecision_response_wrapper = \"result\"\n",
+    ] {
+        let source = test_provider_row(
+            "decisions",
+            "system_one",
+            "https://example.invalid/v1",
+            extra,
+        );
+        ProvidersFile::parse(&source).expect("decision transports must validate");
     }
 }
 
@@ -1948,4 +2023,169 @@ fn retryability_is_structural_not_string_based() {
         message: "malformed response".into(),
         kind: LlmErrorKind::InvalidResponse,
     }));
+}
+
+/// Captured decision HTTP request: path plus raw JSON body.
+type CapturedDecisionRequest = Arc<std::sync::Mutex<Option<(String, Vec<u8>)>>>;
+
+fn spawn_decision_server(
+    response_body: String,
+) -> (String, CapturedDecisionRequest, JoinHandle<()>) {
+    use std::sync::{Arc, Mutex};
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
+    let address = listener.local_addr().expect("address");
+    let captured: CapturedDecisionRequest = Arc::new(Mutex::new(None));
+    let captured_server = Arc::clone(&captured);
+    let handle = std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        // Read headers then exactly Content-Length bytes so the JSON body is
+        // complete even when it arrives in multiple TCP segments.
+        let mut raw = Vec::new();
+        let mut buf = [0_u8; 4096];
+        let header_end = loop {
+            let n = stream.read(&mut buf).expect("request should arrive");
+            if n == 0 {
+                break None;
+            }
+            raw.extend_from_slice(&buf[..n]);
+            if let Some(pos) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+                break Some(pos + 4);
+            }
+        };
+        let Some(header_end) = header_end else {
+            return;
+        };
+        let headers = String::from_utf8_lossy(&raw[..header_end]).into_owned();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                (name.trim().eq_ignore_ascii_case("content-length"))
+                    .then(|| value.trim().parse::<usize>().ok())?
+            })
+            .unwrap_or(0);
+        while raw.len() < header_end + content_length {
+            let n = stream.read(&mut buf).expect("body should arrive");
+            if n == 0 {
+                break;
+            }
+            raw.extend_from_slice(&buf[..n]);
+        }
+        let request_line = headers.lines().next().unwrap_or_default().to_string();
+        let body = raw[header_end..].to_vec();
+        *captured_server.lock().unwrap() = Some((request_line, body));
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        let _ = stream.write_all(response.as_bytes());
+    });
+    (format!("http://{address}"), captured, handle)
+}
+
+fn decision_fixture_request(provider: &str, model: &str) -> DecisionRequest {
+    serde_json::from_value(json!({
+        "provider": provider, "model": model,
+        "state": "Help! My payouts have been failing for three days.",
+        "questions": {"urgent": {"type": "noul", "instructions": "Does this convey urgency?"}}
+    }))
+    .unwrap()
+}
+
+fn decision_fixture_answer(model: &str) -> serde_json::Value {
+    json!({"model": model, "usage": {"input_tokens": 10, "output_tokens": 2}, "answers": {
+        "urgent": {"type": "noul", "noul": 0.95}
+    }})
+}
+
+#[tokio::test]
+async fn decide_supports_cloudflare_body_style_envelope() {
+    // Cloudflare `POST .../ai/run`: `{"model","input":{...}}` request and a
+    // `{"result":{...}}` response envelope. Pure registry mechanism: the
+    // contract still sends logical `{provider, model, state, questions}`.
+    let answer = decision_fixture_answer("jev-1.13.0");
+    let response_body = serde_json::to_string(&json!({
+        "result": answer, "success": true, "errors": [], "messages": []
+    }))
+    .unwrap();
+    let (base_url, captured, server) = spawn_decision_server(response_body);
+    let router = LlmRouter::parse_text(&format!(
+        r#"
+[[provider]]
+id = "cf-body"
+api = "system_one"
+base_url = "{base_url}"
+path_template = "run"
+decision_input_wrapper = "input"
+"#
+    ))
+    .expect("registry should parse");
+    let provider = router
+        .providers
+        .get("cf-body")
+        .expect("provider should register");
+    let request = decision_fixture_request("cf-body", "typesafe/jev");
+    let response = provider
+        .decide(request.clone())
+        .await
+        .expect("enveloped decision should succeed");
+    response.validate(&request).expect("answer should validate");
+    assert_eq!(response.model, "jev-1.13.0");
+    let (request_line, body) = captured.lock().unwrap().take().expect("request");
+    assert!(request_line.contains("POST /run"), "{request_line}");
+    let sent: serde_json::Value = serde_json::from_slice(&body).expect("body");
+    assert_eq!(sent["model"], json!("typesafe/jev"));
+    assert_eq!(
+        sent["input"]["state"],
+        json!("Help! My payouts have been failing for three days.")
+    );
+    assert!(sent["input"]["questions"]["urgent"].is_object());
+    assert!(sent.get("state").is_none());
+    server.join().expect("server should stop");
+}
+
+#[tokio::test]
+async fn decide_supports_cloudflare_path_style_envelope() {
+    // Cloudflare `POST .../ai/run/{model}`: model in the path only,
+    // bare `{"state","questions"}` body, `result` envelope response.
+    let answer = decision_fixture_answer("jev-1.13.0");
+    let response_body = serde_json::to_string(&json!({
+        "result": answer, "success": true, "errors": [], "messages": []
+    }))
+    .unwrap();
+    let (base_url, captured, server) = spawn_decision_server(response_body);
+    let router = LlmRouter::parse_text(&format!(
+        r#"
+[[provider]]
+id = "cf-path"
+api = "system_one"
+base_url = "{base_url}"
+path_template = "run/{{model}}"
+decision_model_in_body = false
+"#
+    ))
+    .expect("registry should parse");
+    let provider = router
+        .providers
+        .get("cf-path")
+        .expect("provider should register");
+    let request = decision_fixture_request("cf-path", "typesafe/jev");
+    let response = provider
+        .decide(request.clone())
+        .await
+        .expect("path-style decision should succeed");
+    assert_eq!(response.model, "jev-1.13.0");
+    let (request_line, body) = captured.lock().unwrap().take().expect("request");
+    assert!(
+        request_line.contains("POST /run/typesafe/jev"),
+        "{request_line}"
+    );
+    let sent: serde_json::Value = serde_json::from_slice(&body).expect("body");
+    assert!(sent.get("model").is_none());
+    assert!(sent["state"].is_string());
+    assert!(sent["questions"]["urgent"].is_object());
+    server.join().expect("server should stop");
 }

@@ -75,10 +75,12 @@ Fields:
 
 - `id`: unique identifier referenced by contracts.
 - `api`: request protocol: `chat_completions`, `responses`,
-  `anthropic_messages`, or `system_one`. The value selects the payload format
-  and endpoint path (`chat/completions`, `responses`, `messages`, or
-  `systemone`). System One uses typed decisions through `llm.decide`, not chat;
-  its provider rows must not advertise chat capabilities.
+  `anthropic_messages`, or `system_one`. The value selects the payload family
+  and default endpoint path (`chat/completions`, `responses`, `messages`, or
+  `systemone`); `path_template` and the `decision_*` fields specialize the
+  System One transport without code changes. System One uses typed decisions
+  through `llm.decide`, not chat; its provider rows must not advertise chat
+  capabilities.
 - `base_url`: literal endpoint root. `{ENV_VAR}` placeholders are resolved
   from the environment before use. The configured `api_key_env` placeholder,
   other credential-like placeholders, URL userinfo, queries, and fragments are
@@ -93,10 +95,30 @@ Fields:
 - `auth_header`: header name carrying the credential. Omit to use standard
   Bearer authorization.
 - `path_template`: optional request path where `{model}` expands to the model
-  name from the contract.
+  name from the contract. `{model}` expands as path segments so namespaced
+  models such as `typesafe/jev` address `.../ai/run/typesafe/jev`; `?`, `#`,
+  and `%` stay encoded, while empty, `.`, and `..` pieces fail closed.
 - `query`: optional query parameters appended to the URL; values may contain
   non-credential `{ENV_VAR}` placeholders. The configured `api_key_env`,
   credential-like query names, and credential placeholders are rejected.
+- `decision_input_wrapper`: System One request envelope mechanism
+  (`none` or `input`, default `none`). `none` sends the direct TypeSafe
+  shape `{"model","state","questions"}`; `input` sends the Cloudflare
+  `POST .../ai/run` shape `{"model","input":{"state","questions"}}`.
+  Rejected for other APIs.
+- `decision_model_in_body`: System One model-placement mechanism (default
+  `true`). `true` keeps `model` in the JSON body; `false` omits it so the
+  model travels only via `path_template` `{model}` (Cloudflare
+  `POST .../ai/run/{model}` style) and requires that placeholder.
+  Rejected for other APIs.
+- `decision_response_wrapper`: System One response-envelope mechanism
+  (`auto`, `direct`, or `result`, default `auto`). `direct` accepts only the
+  top-level TypeSafe shape; `result` requires the Cloudflare
+  `{"result":{...},"success":...}` envelope (a `"success": false` envelope
+  fails without echoing the body); `auto` accepts both. Rejected for other
+  APIs. Together the three `decision_*` fields are the transport mechanism;
+  the contract's `llm.decide` params stay pure policy
+  (`provider`, `model`, `state`, `questions`, budgets).
 - `timeout_seconds`: timeout for each completion attempt. The default is 120
   seconds; retryable failures may start another independently timed attempt.
 - `retry_attempts`: attempts per completion call including the first, 1 to 10.
@@ -515,14 +537,21 @@ model-specific combinations.
 
 ## System One decisions
 
-`llm.decide` sends `model`, `state`, and a map of typed `questions` to the
-System One endpoint, `POST /v1/systemone`. It requires an explicit
-`params.model` selecting a `system_one` provider. It is independent of `[llm]`:
+`llm.decide` sends the logical decision (`model`, `state`, typed `questions`)
+through the provider row's declared System One transport. The bundled
+`typesafe` row targets the direct endpoint, `POST /v1/systemone`. It requires
+an explicit `params.model` selecting a `system_one` provider. It is independent of `[llm]`:
 no `[llm]` or registry default model, chat controls, or chat output ceiling is
 inherited, and there is no model or provider fallback. Run-wide budgets still
 apply. Chat parameters (including `prompt`, `request`, tools, and streaming),
 templates, and node `context` are rejected rather than ignored. A System One
 profile cannot serve chat requests.
+
+Mechanism lives in `providers.toml`; policy lives in the contract. The
+contract never names paths or envelopes: it selects `provider`/`model` and
+declares `state`/`questions`/budgets, while the row declares `base_url`,
+`path_template`, and the three `decision_*` envelope fields. Adding a new
+System One gateway is a registry edit with no rebuild.
 
 This flow fragment uses the active `typesafe` profile:
 
@@ -603,6 +632,58 @@ is a moving alias. See the official [API reference](https://docs.typesafe.ai/api
 for request and response details. No live API validation was performed for
 this integration; documentation review is not an end-to-end provider test.
 
+### Cloudflare Workers AI Jev
+
+Cloudflare hosts the same Jev model as `typesafe/jev` with a different wire
+envelope ([model page](https://developers.cloudflare.com/ai/models/typesafe/jev/)).
+The contract fragment above stays unchanged except for the route; only the
+registry row changes. Two registry styles are supported, both pure mechanism:
+
+```toml
+# Generic `POST .../ai/run`: model in the body, inputs under `input`.
+[[provider]]
+id = "cloudflare-jev"
+api = "system_one"
+base_url = "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai"
+api_key_env = "CLOUDFLARE_API_KEY"
+path_template = "run"
+decision_input_wrapper = "input"
+decision_response_wrapper = "auto"
+```
+
+```toml
+# Classic `POST .../ai/run/{model}`: model in the path only, bare inputs.
+[[provider]]
+id = "cloudflare-jev-path"
+api = "system_one"
+base_url = "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai"
+api_key_env = "CLOUDFLARE_API_KEY"
+path_template = "run/{model}"
+decision_model_in_body = false
+decision_response_wrapper = "auto"
+```
+
+```toml
+[[flow]]
+id = "classify"
+type = "llm.decide"
+[flow.params]
+model = { provider = "cloudflare-jev", model = "typesafe/jev" }
+state = "Help! My payouts have been failing for three days."
+max_tokens = 4096
+[flow.params.questions.urgent]
+type = "noul"
+instructions = "Does this convey urgency?"
+```
+
+`{model}` expands as path segments, so `typesafe/jev` addresses
+`.../ai/run/typesafe/jev`; `decision_response_wrapper = "auto"` (the default)
+accepts both the direct `{model,answers,usage}` shape and the Cloudflare
+`{"result":{...},"success":...}` envelope. A `"success": false` envelope fails
+without echoing the upstream body. Set `CLOUDFLARE_API_KEY` (Workers AI Read +
+Write) and `CLOUDFLARE_ACCOUNT_ID` before running; the shipped
+`providers.toml` carries both rows as commented templates.
+
 ## Bundled providers
 
 The shipped registry follows an opt-in execution model. Local LLM endpoints
@@ -625,7 +706,8 @@ Bundled MCP profile: `tinyfish` (Streamable HTTP + OAuth; no
 credentials use the OS keyring).
 
 Commented templates: `anthropic`, `openai`, `openai_responses`, `openrouter`,
-`gemini`, `sakura`, `cloudflare`, `opencode-go`, `opencode-zen`,
+`gemini`, `sakura`, `cloudflare`, `cloudflare-jev`, `cloudflare-jev-path`,
+`opencode-go`, `opencode-zen`,
 `opencode-go-responses`, `opencode-zen-responses`, `groq`, `deepseek`,
 `mistral`, `xai`, `together`, `fireworks`, `azure-openai`.
 
@@ -642,6 +724,8 @@ Commented templates: `anthropic`, `openai`, `openai_responses`, `openrouter`,
 | `gemini` | `chat_completions` | `GEMINI_API_KEY` | none |
 | `sakura` | `chat_completions` | `SAKURA_API_KEY` | none |
 | `cloudflare` | `chat_completions` | `CLOUDFLARE_API_KEY` | `CLOUDFLARE_ACCOUNT_ID` |
+| `cloudflare-jev` | `system_one` | `CLOUDFLARE_API_KEY` | `CLOUDFLARE_ACCOUNT_ID` |
+| `cloudflare-jev-path` | `system_one` | `CLOUDFLARE_API_KEY` | `CLOUDFLARE_ACCOUNT_ID` |
 | `opencode-go` | `chat_completions` | `OPENCODE_API_KEY` | none |
 | `opencode-zen` | `chat_completions` | `OPENCODE_API_KEY` | none |
 | `opencode-go-responses` | `responses` | `OPENCODE_API_KEY` | none |

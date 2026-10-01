@@ -23,8 +23,8 @@ use crate::parse::{
 use crate::payload::{anthropic_payload, chat_completions_payload, responses_payload};
 use crate::provider::{
     ApiFlavor, ChatTokenLimitField, DEFAULT_RETRY_BACKOFF_EXPONENT_CAP,
-    DEFAULT_RETRY_RATE_LIMIT_FLOOR_MS, LlmProvider, ModelPricing, ModelSpec, PromptCacheField,
-    ProviderSpec,
+    DEFAULT_RETRY_RATE_LIMIT_FLOOR_MS, DecisionInputWrapper, DecisionResponseWrapper, LlmProvider,
+    ModelPricing, ModelSpec, PromptCacheField, ProviderSpec,
 };
 use crate::stream::{HttpStreamAccumulator, json_contains_string_fragment};
 use crate::types::{
@@ -56,6 +56,9 @@ pub struct HttpProvider {
     retry_backoff_exponent_cap: u32,
     chat_token_limit_field: ChatTokenLimitField,
     prompt_cache_field: Option<PromptCacheField>,
+    decision_input_wrapper: DecisionInputWrapper,
+    decision_model_in_body: bool,
+    decision_response_wrapper: DecisionResponseWrapper,
     response_body_limit_bytes: usize,
     config_errors: Vec<String>,
     client: Option<Client>,
@@ -191,6 +194,9 @@ impl HttpProvider {
                 .chat_token_limit_field
                 .unwrap_or(ChatTokenLimitField::MaxTokens),
             prompt_cache_field: spec.prompt_cache_field,
+            decision_input_wrapper: spec.decision_input_wrapper,
+            decision_model_in_body: spec.decision_model_in_body,
+            decision_response_wrapper: spec.decision_response_wrapper,
             response_body_limit_bytes: spec
                 .response_body_limit_bytes
                 .unwrap_or(DEFAULT_RESPONSE_BODY_LIMIT_BYTES),
@@ -274,7 +280,38 @@ impl HttpProvider {
                 .split('/')
                 .filter(|segment| !segment.is_empty())
             {
-                segments.push(&segment.replace("{model}", model));
+                if segment.contains("{model}") {
+                    // `{model}` expands as path segments so namespaced models
+                    // such as `typesafe/jev` reach
+                    // `.../ai/run/typesafe/jev` instead of a single
+                    // percent-encoded `typesafe%2Fjev` segment. Each piece is
+                    // still pushed as a segment, so `?`, `#`, and `%` stay
+                    // encoded and cannot escape into query or fragment.
+                    // Empty, `.`, and `..` pieces are rejected fail-closed so
+                    // a model name can never traverse the path.
+                    if model.trim().is_empty() || model.chars().any(char::is_control) {
+                        return Err(
+                            "provider model contains an empty or invalid path segment".to_owned()
+                        );
+                    }
+                    let replaced = segment.replace("{model}", model);
+                    let mut pushed = false;
+                    for piece in replaced.split('/') {
+                        if piece.is_empty() || matches!(piece, "." | "..") {
+                            return Err("provider model contains an empty or unsafe path segment"
+                                .to_owned());
+                        }
+                        segments.push(piece);
+                        pushed = true;
+                    }
+                    if !pushed {
+                        return Err(
+                            "provider model contains an empty or unsafe path segment".to_owned()
+                        );
+                    }
+                } else {
+                    segments.push(segment);
+                }
             }
         }
         if !self.query.is_empty() {
@@ -784,9 +821,9 @@ impl LlmProvider for HttpProvider {
         req.validate()?;
         let _slot = self.acquire_request_slot().await?;
         let result = async {
-            let value = self.send_json(req.payload(), &req.model).await?;
-            let response: crate::DecisionResponse = serde_json::from_value(value)
-                .map_err(|_| LlmError::invalid_response("invalid System One response shape"))?;
+            let payload = req.payload_for(self.decision_model_in_body, self.decision_input_wrapper);
+            let value = self.send_json(payload, &req.model).await?;
+            let response = crate::parse_decision_response(value, self.decision_response_wrapper)?;
             response.validate(&req)?;
             Ok(response)
         }

@@ -198,6 +198,44 @@ pub enum PromptCacheField {
     PromptCacheKey,
 }
 
+/// Decision request wire format. Mechanism only: how the logical
+/// `{model, state, questions}` decision maps onto the HTTP JSON body.
+/// Direct TypeSafe/OpenRouter/Vercel gateways send state and questions at the
+/// top level; Cloudflare Workers AI wraps them under `input`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionInputWrapper {
+    /// `{"model","state","questions"}` (or without `model` when
+    /// `decision_model_in_body = false`). Default.
+    #[default]
+    None,
+    /// `{"model","input":{"state","questions"}}` (or `{"input":{...}}` when
+    /// the model travels in the path). Cloudflare `POST .../ai/run` style.
+    Input,
+}
+
+/// Decision response wire format. Mechanism only: where the typed
+/// `{model, answers, usage}` object lives in the HTTP JSON body.
+/// Cloudflare's classic `POST .../ai/run/{model}` style nests it under
+/// `result` alongside `success`/`errors`; direct endpoints return it at the
+/// top level. `auto` (the default) accepts both without policy input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionResponseWrapper {
+    /// Try `result` when the top level does not parse, else top level.
+    /// Default: accepts both direct and Cloudflare envelopes.
+    #[default]
+    Auto,
+    /// Top level only. Rejects Cloudflare `result` envelopes.
+    Direct,
+    /// Require the `result` field. Rejects direct responses.
+    Result,
+}
+
+fn default_decision_model_in_body() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelsDiscovery {
@@ -373,6 +411,22 @@ pub struct ProviderSpec {
     /// the `prompt_cache` capability is enabled and invalid otherwise.
     #[serde(default)]
     pub prompt_cache_field: Option<PromptCacheField>,
+    /// Decision wire-format mechanism for `api = "system_one"` rows.
+    /// `decision_input_wrapper` selects the request envelope (`none` for
+    /// direct TypeSafe shape, `input` for Cloudflare `{"input":{...}}`).
+    /// `decision_model_in_body` selects whether `model` travels in the JSON
+    /// body (direct and Cloudflare `POST .../ai/run` styles) or only in
+    /// `path_template` via `{model}` (Cloudflare
+    /// `POST .../ai/run/{model}` style). `decision_response_wrapper`
+    /// selects where the typed answer lives (`auto` accepts both direct
+    /// and Cloudflare `result` envelopes). Rejected for other APIs so chat
+    /// rows cannot declare decision transport.
+    #[serde(default)]
+    pub decision_input_wrapper: DecisionInputWrapper,
+    #[serde(default = "default_decision_model_in_body")]
+    pub decision_model_in_body: bool,
+    #[serde(default)]
+    pub decision_response_wrapper: DecisionResponseWrapper,
     #[serde(default)]
     pub response_body_limit_bytes: Option<usize>,
     #[serde(default)]
@@ -571,6 +625,28 @@ impl ProviderSpec {
                 "provider `{}` may only set `chat_token_limit_field` for chat_completions",
                 self.id
             ));
+        }
+        let decision_transport_is_default = self.decision_input_wrapper
+            == DecisionInputWrapper::None
+            && self.decision_model_in_body
+            && self.decision_response_wrapper == DecisionResponseWrapper::Auto;
+        if self.api != ApiFlavor::SystemOne && !decision_transport_is_default {
+            return Err(format!(
+                "provider `{}` may only set `decision_input_wrapper`, `decision_model_in_body`, or `decision_response_wrapper` for system_one",
+                self.id
+            ));
+        }
+        if self.api == ApiFlavor::SystemOne && !self.decision_model_in_body {
+            let carries_model = self
+                .path_template
+                .as_deref()
+                .is_some_and(|template| template.contains("{model}"));
+            if !carries_model {
+                return Err(format!(
+                    "provider `{}` with `decision_model_in_body = false` must set `path_template` containing `{{model}}`",
+                    self.id
+                ));
+            }
         }
         match (self.capabilities.prompt_cache, self.prompt_cache_field) {
             (true, None) => {

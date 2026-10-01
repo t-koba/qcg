@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::provider::{DecisionInputWrapper, DecisionResponseWrapper};
 use crate::{LlmError, TokenUsage};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,7 +35,33 @@ pub enum DecisionQuestion {
 
 impl DecisionRequest {
     pub fn payload(&self) -> Value {
-        json!({"model": self.model, "state": self.state, "questions": self.questions})
+        self.payload_for(true, DecisionInputWrapper::None)
+    }
+
+    /// Mechanism mapping from the logical decision onto the provider's HTTP
+    /// JSON body. `model_in_body` and `input_wrapper` come from the provider
+    /// registry row, never from the generator contract: direct TypeSafe
+    /// gateways use `(true, None)`, Cloudflare `POST .../ai/run` uses
+    /// `(true, Input)`, and Cloudflare `POST .../ai/run/{model}` uses
+    /// `(false, None)`.
+    pub fn payload_for(&self, model_in_body: bool, input_wrapper: DecisionInputWrapper) -> Value {
+        let inner = json!({"state": self.state, "questions": self.questions});
+        match input_wrapper {
+            DecisionInputWrapper::None => {
+                let mut body = json!({"state": self.state, "questions": self.questions});
+                if model_in_body {
+                    body["model"] = json!(self.model);
+                }
+                body
+            }
+            DecisionInputWrapper::Input => {
+                let mut body = json!({"input": inner});
+                if model_in_body {
+                    body["model"] = json!(self.model);
+                }
+                body
+            }
+        }
     }
 
     pub fn validate(&self) -> Result<(), LlmError> {
@@ -101,6 +128,73 @@ impl DecisionRequest {
 
 fn valid_content(value: &Value) -> bool {
     matches!(value, Value::String(_) | Value::Object(_) | Value::Array(_))
+}
+
+/// Mechanism mapping from the provider's HTTP JSON body back onto the typed
+/// decision. `wrapper` comes from the registry row: `Direct` accepts only
+/// the top-level TypeSafe shape, `Result` requires the Cloudflare
+/// `{"result":{...}}` envelope (honoring `"success": false` as an upstream
+/// failure without echoing the body), and `Auto` accepts both so one row
+/// works against direct and Cloudflare-compatible gateways.
+pub fn parse_decision_response(
+    value: Value,
+    wrapper: DecisionResponseWrapper,
+) -> Result<DecisionResponse, LlmError> {
+    match wrapper {
+        DecisionResponseWrapper::Direct => serde_json::from_value(value)
+            .map_err(|_| LlmError::invalid_response("invalid System One response shape")),
+        DecisionResponseWrapper::Result => parse_result_envelope(value),
+        DecisionResponseWrapper::Auto => {
+            // Prefer the direct shape so a top-level answer never hides
+            // behind a coincidental `result` field; fall back to the
+            // Cloudflare envelope when direct parsing fails.
+            match serde_json::from_value::<DecisionResponse>(value.clone()) {
+                Ok(response) => Ok(response),
+                Err(_) => parse_result_envelope(value),
+            }
+        }
+    }
+}
+
+fn parse_result_envelope(value: Value) -> Result<DecisionResponse, LlmError> {
+    let result = value
+        .get("result")
+        .cloned()
+        .ok_or_else(|| LlmError::invalid_response("invalid System One response shape"))?;
+    if value.get("success").and_then(Value::as_bool) == Some(false) {
+        let detail = value
+            .get("errors")
+            .and_then(Value::as_array)
+            .map(|errors| {
+                errors
+                    .iter()
+                    .take(3)
+                    .filter_map(|error| {
+                        error
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .or_else(|| error.as_str())
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+            .filter(|detail| !detail.is_empty())
+            .map(|detail| {
+                const LIMIT: usize = 500;
+                if detail.len() > LIMIT {
+                    format!("{}…", &detail[..LIMIT])
+                } else {
+                    detail
+                }
+            })
+            .map(|detail| format!(": {detail}"))
+            .unwrap_or_default();
+        return Err(LlmError::new(format!(
+            "decision provider reported failure{detail}"
+        )));
+    }
+    serde_json::from_value(result)
+        .map_err(|_| LlmError::invalid_response("invalid System One response shape"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -270,6 +364,71 @@ mod tests {
         assert_eq!(serde_json::to_value(&response).unwrap(), value);
         assert_eq!(response.token_usage().input, 312);
         assert_eq!(response.token_usage().output, 48);
+    }
+
+    #[test]
+    fn payload_envelopes_cover_direct_and_workers_ai_transports() {
+        use crate::provider::{DecisionInputWrapper, DecisionResponseWrapper};
+        let request = request();
+        // Direct TypeSafe shape (default).
+        let direct = request.payload_for(true, DecisionInputWrapper::None);
+        assert_eq!(direct["model"], json!("jev-latest"));
+        assert_eq!(direct["state"], json!({"text": "Help"}));
+        assert!(direct["questions"].is_object());
+        assert!(direct.get("input").is_none());
+        // Cloudflare `POST .../ai/run`: model in body, inputs under `input`.
+        let wrapped = request.payload_for(true, DecisionInputWrapper::Input);
+        assert_eq!(wrapped["model"], json!("jev-latest"));
+        assert_eq!(wrapped["input"]["state"], json!({"text": "Help"}));
+        assert!(wrapped["input"]["questions"].is_object());
+        assert!(wrapped.get("state").is_none());
+        // Cloudflare `POST .../ai/run/{model}`: model in path only.
+        let bare = request.payload_for(false, DecisionInputWrapper::None);
+        assert!(bare.get("model").is_none());
+        assert!(bare["state"].is_object());
+        let bare_wrapped = request.payload_for(false, DecisionInputWrapper::Input);
+        assert!(bare_wrapped.get("model").is_none());
+        assert!(bare_wrapped["input"]["state"].is_object());
+        // Response envelopes: direct, Cloudflare `result`, and auto.
+        let direct_response = response();
+        let parsed =
+            parse_decision_response(direct_response.clone(), DecisionResponseWrapper::Direct)
+                .expect("direct response should parse");
+        assert_eq!(parsed.model, "jev-1.13.0");
+        let enveloped =
+            json!({"result": direct_response, "success": true, "errors": [], "messages": []});
+        let parsed = parse_decision_response(enveloped, DecisionResponseWrapper::Result)
+            .expect("result envelope should parse");
+        assert_eq!(parsed.model, "jev-1.13.0");
+        // Auto accepts both shapes.
+        let parsed = parse_decision_response(direct_response, DecisionResponseWrapper::Auto)
+            .expect("auto should accept direct");
+        assert_eq!(parsed.model, "jev-1.13.0");
+        let enveloped =
+            json!({"result": response(), "success": true, "errors": [], "messages": []});
+        let parsed = parse_decision_response(enveloped, DecisionResponseWrapper::Auto)
+            .expect("auto should accept result envelope");
+        assert_eq!(parsed.model, "jev-1.13.0");
+        // Strict wrappers reject the other shape.
+        assert!(
+            parse_decision_response(response(), DecisionResponseWrapper::Result).is_err(),
+            "result wrapper must reject a direct response"
+        );
+        assert!(
+            parse_decision_response(
+                json!({"result": response(), "success": true}),
+                DecisionResponseWrapper::Direct
+            )
+            .is_err(),
+            "direct wrapper must reject a result envelope"
+        );
+        // `success: false` fails without echoing the upstream body.
+        let failed = parse_decision_response(
+            json!({"result": response(), "success": false, "errors": [{"message": "overloaded"}]}),
+            DecisionResponseWrapper::Auto,
+        )
+        .expect_err("failed envelope must not parse");
+        assert!(failed.to_string().contains("reported failure"));
     }
 
     #[test]
