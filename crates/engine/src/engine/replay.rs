@@ -433,6 +433,9 @@ impl BudgetTracker {
     }
 
     pub(crate) fn consume(&self, node_id: &str) -> Result<(), StepError> {
+        // `fetch_update` is renamed `try_update` in Rust 1.99; the old name
+        // is kept so the 1.98 MSRV build still compiles.
+        #[allow(deprecated)]
         let result =
             self.executed_steps
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |executed| {

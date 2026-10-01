@@ -416,7 +416,8 @@ impl Engine {
         // Fork blob staging uses the same `.part-` atomic-write prefix
         // as workspace writes (E06/E13); the blob sweep above only covers
         // `.tmp-`, so also reap `.part-` orphans here.
-        for fragment in [".part-"] {
+        {
+            let fragment = ".part-";
             if let Err(error) = crate::FsGateway::sweep_orphaned_staging_files(
                 &metadata_dir.join("checkpoint-blobs"),
                 fragment,

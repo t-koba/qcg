@@ -31,6 +31,9 @@ where
             return Ok(bytes);
         }
         if let Some(limit) = limit {
+            // `fetch_update` is renamed `try_update` in Rust 1.99; the old
+            // name is kept so the 1.98 MSRV build still compiles.
+            #[allow(deprecated)]
             let reserved = used.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_add(read).filter(|next| *next <= limit)
             });
