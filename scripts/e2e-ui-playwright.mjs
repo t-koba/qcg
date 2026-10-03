@@ -85,6 +85,8 @@ async function runMode(mode) {
     await assertSuccessfulRun(page);
     if (mode.frontend === "vite") await assertCrossOriginApi(page, apiBase);
     await assertCancelRun(page);
+    await assertApprovalApprove(page);
+    await assertApprovalDeny(page);
     await assertQuestionForm(page);
     await assertListMultiselectForm(page);
     await assertSchemaDrivenForm(page);
@@ -360,6 +362,33 @@ async function assertFileInput(page) {
     .locator("#artifact-preview")
     .filter({ hasText: "files/config_file/config.json" })
     .waitFor({ timeout: 5000 });
+}
+
+async function assertApprovalApprove(page) {
+  // Real-click approval E2E: Side Effect Confirm reaches
+  // confirming against the real server, a real Approve click resumes the
+  // run, and the terminal state plus the post-confirm artifact are asserted.
+  await selectGenerator(page, /Side Effect Confirm/);
+  await page.getByRole("button", { name: /^Start generation$/ }).click();
+  await page.locator("#run-state.confirming").waitFor({ timeout: 15000 });
+  await page.getByRole("button", { name: /^Approve and continue$/ }).click();
+  await page.locator("#run-state.succeeded").waitFor({ timeout: 15000 });
+  const row = page.locator("#artifact-list .artifact").filter({ hasText: "after.txt" });
+  await row.waitFor({ timeout: 5000 });
+  await page.getByRole("button", { name: /^Start again$/ }).click();
+  await page.getByRole("button", { name: /^Start generation$/ }).waitFor({ timeout: 5000 });
+}
+
+async function assertApprovalDeny(page) {
+  // Real-click denial E2E: a second confirming run is denied
+  // with a real Deny click and must settle as failed, not resume.
+  await selectGenerator(page, /Side Effect Confirm/);
+  await page.getByRole("button", { name: /^Start generation$/ }).click();
+  await page.locator("#run-state.confirming").waitFor({ timeout: 15000 });
+  await page.getByRole("button", { name: /^Deny$/ }).click();
+  await page.locator("#run-state.failed").waitFor({ timeout: 15000 });
+  await page.getByRole("button", { name: /^Start again$/ }).click();
+  await page.getByRole("button", { name: /^Start generation$/ }).waitFor({ timeout: 5000 });
 }
 
 async function selectGenerator(page, name) {
