@@ -712,7 +712,7 @@ credentials use the OS keyring).
 
 Commented templates: `anthropic`, `openai`, `openai_responses`, `openrouter`,
 `gemini`, `sakura`, `cloudflare`, `cloudflare-jev`, `cloudflare-jev-path`,
-`opencode-go`, `opencode-zen`,
+`opencode-go`, `opencode-zen`, `opencode-zen-free`,
 `opencode-go-responses`, `opencode-zen-responses`, `groq`, `deepseek`,
 `mistral`, `xai`, `together`, `fireworks`, `azure-openai`.
 
@@ -733,6 +733,7 @@ Commented templates: `anthropic`, `openai`, `openai_responses`, `openrouter`,
 | `cloudflare-jev-path` | `system_one` | `CLOUDFLARE_API_KEY` | `CLOUDFLARE_ACCOUNT_ID` |
 | `opencode-go` | `chat_completions` | `OPENCODE_API_KEY` | none |
 | `opencode-zen` | `chat_completions` | `OPENCODE_API_KEY` | none |
+| `opencode-zen-free` (anonymous example) | `chat_completions` | none | none |
 | `opencode-go-responses` | `responses` | `OPENCODE_API_KEY` | none |
 | `opencode-zen-responses` | `responses` | `OPENCODE_API_KEY` | none |
 | `groq` | `chat_completions` | `GROQ_API_KEY` | none |
@@ -991,3 +992,54 @@ the [TinyFish Search API](https://docs.tinyfish.ai/search-api/reference),
 `[llm].retry_prompt` is rendered with minijinja and has access to `{{ error }}`
 and `{{ attempt }}`. Invalid retry templates fail the step; qcg does not fall
 back to a hidden prompt.
+
+## Anonymous free-model endpoints
+
+Any compatible endpoint can use the ordinary provider configuration without
+`api_key_env` or `api_key_file_env`. qcg then sends no authorization header and
+reads no implicit provider credential. A zero token price is accounting metadata,
+not evidence that the endpoint permits anonymous inference.
+
+The bundled `opencode-zen-free` example uses this mechanism. Uncomment its
+`[[provider]]` block and nested `[[provider.models]]` block together in
+`providers.toml`, then select it in the contract:
+
+```toml
+[llm]
+model = { provider = "opencode-zen-free", model = "big-pickle" }
+
+[permissions]
+network = ["opencode.ai"]
+```
+
+Merge the network host into existing permissions rather than replacing them.
+The profile does not become the default model. Even if `OPENCODE_API_KEY` is
+set, this anonymous profile does not read it; the separate `opencode-zen`
+profile continues to require that credential.
+
+**Availability checked on 2026-10-03:** a direct anonymous `big-pickle`
+inference request returned HTTP 403 with `FreeTierError`, stating that the
+free tier can only be used within OpenCode. This example documents the wire
+configuration; it is not a verified working inference service. qcg surfaces
+HTTP failures without switching to a paid provider. Its existing error handling
+does not expose arbitrary upstream response bodies.
+
+The [OpenCode server source](https://github.com/anomalyco/opencode/blob/dev/packages/console/app/src/routes/zen/util/handler.ts)
+treats the public token `public` as absent authentication and checks
+`allowAnonymous` per model. Omitting authentication uses that anonymous path;
+no dummy credential or OpenCode client impersonation is needed in qcg's config.
+The provider can still reject a request under its current access policy.
+
+To add another model, add an explicit `[[provider.models]]` entry under the
+chosen provider with its exact model ID and verified input/output prices.
+For a different service, declare its own provider ID, compatible API format,
+and base URL, and grant its host in the contract. Advertise only confirmed
+capabilities; the example leaves tools, structured output, sampling controls,
+and streaming disabled until verified for the selected model.
+
+The example intentionally omits `models_discovery` and `catalog_id`. The public
+`/models` response also includes paid models and does not certify anonymous
+inference access. Explicit model entries curate the picker, not an access
+allowlist: contracts may still name other models. Do not infer free access
+from a name suffix, zero price, or successful model discovery. Availability
+and prices must be rechecked when changing the configuration.

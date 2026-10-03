@@ -2215,3 +2215,157 @@ mod env_process {
         "/../../scripts/test-support/environment.rs"
     ));
 }
+
+#[tokio::test]
+async fn anonymous_registry_supports_http_streaming_and_preserves_forbidden() {
+    if env_process::isolated() {
+        return;
+    }
+    let _guard = super::ENV_LOCK.lock().await;
+    // SAFETY: this test runs in an isolated process and holds ENV_LOCK.
+    unsafe {
+        std::env::set_var("OPENCODE_API_KEY", "unused-test-credential");
+        std::env::remove_var("QCG_ANONYMOUS_TEST_MISSING_KEY");
+    }
+    for (streaming, status) in [(false, 200), (true, 200), (false, 403), (true, 403)] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut raw = Vec::new();
+            while !raw.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).unwrap();
+                raw.push(byte[0]);
+            }
+            let headers = String::from_utf8(raw).unwrap();
+            assert!(headers.starts_with("POST /v1/chat/completions HTTP/1.1"));
+            assert!(!headers.to_ascii_lowercase().contains("authorization:"));
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            let mut body = vec![0; length];
+            socket.read_exact(&mut body).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["model"], "example-free");
+            if streaming {
+                assert_eq!(body["stream"], true);
+            }
+            let (content_type, response) = if status == 403 {
+                (
+                    "application/json",
+                    r#"{"error":{"type":"FreeTierError","message":"restricted"}}"#.to_owned(),
+                )
+            } else if streaming {
+                ("text/event-stream", "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n".to_owned())
+            } else {
+                ("application/json", r#"{"choices":[{"message":{"content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#.to_owned())
+            };
+            write!(socket, "HTTP/1.1 {status} Test\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+        });
+        let router = LlmRouter::parse_text(&format!(
+            r#"
+[[provider]]
+id = "anonymous"
+api = "chat_completions"
+base_url = "http://{address}/v1"
+capabilities = {{ streaming = true }}
+[[provider.models]]
+id = "example-free"
+input_cost_per_million_usd = 0.0
+output_cost_per_million_usd = 0.0
+[[provider]]
+id = "paid"
+api = "chat_completions"
+base_url = "http://127.0.0.1:1/v1"
+api_key_env = "QCG_ANONYMOUS_TEST_MISSING_KEY"
+"#
+        ))
+        .unwrap();
+        let view = router.catalog.view(false).await;
+        let profile = view.providers.iter().find(|p| p.id == "anonymous").unwrap();
+        assert!(profile.available);
+        assert!(!profile.discovery);
+        assert_eq!(profile.models.len(), 1);
+        assert_eq!(profile.models[0].input_cost_per_million_usd, Some(0.0));
+        assert_eq!(profile.models[0].output_cost_per_million_usd, Some(0.0));
+        let mut request = sample_request();
+        request.provider = "anonymous".into();
+        request.model = "example-free".into();
+        request.temperature = None;
+        request.seed = None;
+        request.stream = streaming;
+        let mut paid_request = request.clone();
+        paid_request.provider = "paid".into();
+        paid_request.stream = false;
+        let error = router.complete(paid_request).await.unwrap_err();
+        assert!(error.message.contains("QCG_ANONYMOUS_TEST_MISSING_KEY"));
+        let result = if streaming {
+            let (events, mut receiver) = mpsc::channel(8);
+            let result = router.stream(request, events).await;
+            if status == 200 {
+                assert!(result.is_ok(), "{result:?}");
+                assert!(
+                    matches!(receiver.try_recv(), Ok(ChatStreamEvent::TextDelta { text }) if text == "OK")
+                );
+                let mut completed = false;
+                while let Ok(event) = receiver.try_recv() {
+                    if let ChatStreamEvent::Completed { response } = event {
+                        assert!(
+                            matches!(&response.content[0], ChatContent::Text(text) if text == "OK")
+                        );
+                        completed = true;
+                    }
+                }
+                assert!(completed);
+            }
+            result
+        } else {
+            router.complete(request).await.map(|response| {
+                assert!(matches!(&response.content[0], ChatContent::Text(text) if text == "OK"));
+            })
+        };
+        if status == 403 {
+            let error = result.unwrap_err();
+            assert_eq!(error.kind, LlmErrorKind::HttpStatus(403));
+            assert!(!is_retryable_llm_error(&error));
+        } else {
+            result.unwrap();
+        }
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn bundled_anonymous_example_parses_without_credentials_or_discovery() {
+    let bundled = include_str!("../../../providers.toml");
+    let start = bundled
+        .find("# [[provider]]\n# id = \"opencode-zen-free\"")
+        .unwrap();
+    let block = bundled[start..].split("\n\n").next().unwrap();
+    let text = block
+        .lines()
+        .map(|line| line.strip_prefix("# ").unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let file = ProvidersFile::parse(&text).unwrap();
+    let spec = &file.provider[0];
+    assert!(spec.api_key_env.is_none());
+    assert!(spec.api_key_file_env.is_none());
+    assert!(spec.models_discovery.is_none());
+    assert!(spec.catalog_id.is_none());
+    assert_eq!(spec.models[0].id, "big-pickle");
+    assert_eq!(
+        spec.models[0].pricing().unwrap().input_cost_per_million_usd,
+        Some(0.0)
+    );
+    assert!(!spec.capabilities.json_schema);
+}
