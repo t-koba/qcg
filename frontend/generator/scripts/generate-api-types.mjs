@@ -18,5 +18,7 @@ writeFileSync(openapiPath, openapi);
 execFileSync("npx", ["openapi-typescript", openapiPath, "-o", typesPath], {
   cwd: uiRoot,
   stdio: "inherit",
+  // Windows spawns .cmd shims only through a shell (same as generate-sdk.mjs).
+  shell: process.platform === "win32",
 });
 console.log(`generated ${outDir}`);

@@ -274,7 +274,7 @@ if __name__ == "__main__":
     test_frame_limit()
     print("Python SSE behavior: all G04 checks passed")
 
-for fixture in json.loads((Path(__file__).resolve().parents[1] / "fixtures/sse.json").read_text()):
+for fixture in json.loads((Path(__file__).resolve().parents[1] / "fixtures/sse.json").read_text(encoding="utf-8")):
     wire = bytes.fromhex(fixture["wire_hex"]) if "wire_hex" in fixture else fixture["wire"].encode("utf-8")
     for size in range(1, len(wire) + 1):
         assert collect_with_fake(wire, [size]) == fixture["payloads"], fixture["name"]

@@ -399,7 +399,14 @@ mod tests {
             .event("run_started", serde_json::json!({"generator":"test","generator_path":"test","contract_sha256":"abc","inputs":{},"resource_hashes":[],"schema_version":1}))
             .unwrap();
         assert_eq!(store.read(&directory).unwrap().state.last_seq, 2);
+        // Non-Unix rebuilds the view on any change instead of guessing
+        // appends (see `ReadStore::read`): the first read applied 1 event
+        // and this rebuild applies 2, while Unix reuses the view and
+        // applies only the 1 new event.
+        #[cfg(unix)]
         assert_eq!(store.applied.load(Ordering::Relaxed), 2);
+        #[cfg(not(unix))]
+        assert_eq!(store.applied.load(Ordering::Relaxed), 3);
         std::fs::remove_dir_all(directory).unwrap();
     }
     #[test]
