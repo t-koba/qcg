@@ -392,8 +392,11 @@ async function assertApprovalDeny(page) {
 }
 
 async function selectGenerator(page, name) {
+  // Scope to the generator list: open-run tabs (button.run-tab-open) also
+  // expose the generator name, so an unscoped role query goes strict-mode
+  // ambiguous once an earlier run left a tab behind.
   try {
-    await page.getByRole("button", { name }).click();
+    await page.locator(".generator-nav").getByRole("button", { name }).click();
   } catch (error) {
     const body = await page.locator("body").innerText().catch(() => "");
     throw new Error(`generator ${name} was not selectable; body:\n${body}\nlog:\n${Buffer.concat(logChunks).toString()}\n${error}`);
