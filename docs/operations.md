@@ -632,3 +632,14 @@ For deployments retaining 10,000 runs, the measured synthetic views need about
 budget evicts views and correctly requires rereading them. Capacity accounting
 is incremental and LRU selection uses an index. This budget excludes transient
 request/parser buffers and is not a total process RSS limit.
+
+## Install backup maintenance
+
+Install recovery and stale-backup deletion hold the same per-generator lock as
+commits. Maintenance skips a live commit; lock failures refuse deletion. Only
+regular backup directories with a regular, bounded marker naming a safe target
+id are eligible. Unmarked, corrupt, oversized, or unsafe markers retain the
+backup for operator inspection; the old unmarked age-based deletion path is
+removed. Successful uninstall removes owned recovery copies under the lock so
+later maintenance cannot resurrect the generator. Unknown ownership is always
+retained.

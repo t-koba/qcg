@@ -4,6 +4,7 @@ set -euo pipefail
 tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/qcg-dist-smoke.XXXXXX")"
 server_pid=""
 archive=""
+frontend_args=()
 cleanup() {
   if [ -n "$server_pid" ]; then
     kill "$server_pid" 2>/dev/null || true
@@ -15,6 +16,9 @@ trap cleanup EXIT
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --frontend-built|--dependencies-installed)
+      frontend_args+=("$1")
+      ;;
     --archive)
       shift
       archive="${1:?missing --archive value}"
@@ -28,7 +32,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 if [ -z "$archive" ]; then
-  archive="$(bash scripts/package-dist.sh --debug --out-dir "$tmp_root/dist" | tail -n 1)"
+  archive="$(bash scripts/package-dist.sh --debug --out-dir "$tmp_root/dist" "${frontend_args[@]}" | tail -n 1)"
 elif [ ! -f "$archive" ]; then
   echo "archive not found: $archive" >&2
   exit 1

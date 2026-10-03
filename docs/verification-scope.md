@@ -43,3 +43,33 @@ runtime and compiled application/WASM ship in the SPA; the build tools and
 Node modules do not ship as server endpoints. `npm audit --audit-level=moderate`
 is a required gate, with the lockfile reviewed instead of force-upgrading
 outside parent compatibility constraints.
+
+## Test maintenance policy
+
+Every continuing test should name the behavior it protects and exercise the
+production code responsible for it. Prefer structured events, observable state
+transitions, effects, and read counts over incidental error text or source-code
+spelling. Keep separate tests where OS, feature selection, transport, or failure
+mode changes the guarantee. Generated freshness checks remain separate from
+runtime behavior checks.
+
+Confirmation UI tests render the actual panel and check scope messaging,
+binding display, and enabled actions. MCP continuation identity and rejection
+are checked against the real Rust continuation store, rather than a fixed key
+and a separate regular expression. Fork execution probes count actual snapshot
+uses and disk fallbacks; the pure snapshot derivation test also removes the
+journal. Broadcast overflow uses a small real channel and a question as a
+synchronization point, requiring lag and cursor-based replay rather than
+accepting either lag or a direct terminal event. Secret sentinel tests and real agent execution checks protect emitted
+values; lexical bans on Debug formatting are not treated as security evidence.
+
+The local full pipeline installs frontend dependencies once and reuses the
+frontend just built by browser verification for distribution verification.
+`check-demo-local.sh --dependencies-installed` requires an existing dependency
+installation. `check-dist-bundle.sh --frontend-built` (forwarded to packaging)
+requires freshly generated API/WASM and a freshly built frontend. Standalone
+packaging builds these inputs by default. Rust OS CI forwards
+`--dependencies-installed` to distribution verification after its dependency
+installation; API/WASM generation and frontend building still run there.
+End-to-end CI builds the frontend
+inside its browser runner once, after generating API/WASM inputs.

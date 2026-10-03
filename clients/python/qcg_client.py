@@ -258,17 +258,6 @@ class QcgClient:
         self._request_bytes_raw(method, path, query, body, headers)
         return None
 
-    # Back-compat JSON reader used by older call sites.
-    def _request(
-        self,
-        method: str,
-        path: str,
-        query: dict[str, Any] | None = None,
-        body: Any = None,
-        headers: dict[str, str] | None = None,
-    ) -> Any:
-        return self._request_json(method, path, query, body, headers)
-
     def stream_run_events(self, run_id: str, last_event_id: int | None = None) -> Iterator[Any]:
         """Yields parsed SSE event payloads until the stream ends."""
         headers = self._headers()

@@ -64,7 +64,7 @@ content = "unexpected"
         })
         .await
         .expect("cancelable run should start");
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    wait_for_snapshot(&service, &id, RunStatus::Running).await;
     service
         .cancel(id.clone())
         .await
@@ -361,13 +361,33 @@ enabled = false"#,
     );
     cancel_result.expect("cancel should succeed");
     if let Err(error) = answer_result {
-        assert!(error.to_string().contains("not waiting for user input"));
+        assert!(
+            matches!(
+                error,
+                api::ApiError::Invalid { .. } | api::ApiError::Conflict { .. }
+            ),
+            "a canceled or terminal question must reject the answer: {error}"
+        );
     }
     let snapshot = wait_for_snapshot(&service, &id, RunStatus::Canceled).await;
     assert_eq!(snapshot.state, RunStatus::Canceled);
     let journal = read_journal_string(&service, id).await;
-    assert_eq!(journal.matches("\"t\":\"run_canceled\"").count(), 1);
-    assert!(!journal.contains("\"status\":\"success\",\"t\":\"run_finished\""));
+    let events: Vec<Value> = journal
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("journal event"))
+        .collect();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["t"] == "run_canceled")
+            .count(),
+        1
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["t"] == "run_finished" && event["status"] == "success")
+    );
 }
 
 #[tokio::test]

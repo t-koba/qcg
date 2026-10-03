@@ -288,6 +288,11 @@ sha256 = "..."                            # optional pin
 The cache is loaded at process start so validation stays deterministic
 offline. `qcg serve` refreshes stale sources in the background (failures are
 logged and retried, never fatal), and `qcg models --refresh` or
+Local catalog source files and the catalog cache have the same 64 MiB byte
+limit as remote catalog sources. Oversized or non-regular files report an
+error; an unreadable cache is ignored with a visible error. Cache writes that
+exceed this limit are refused before publication.
+
 `GET /api/llm/catalog?refresh=true` re-fetch on demand. The view marks stale
 metadata and reports fetch errors.
 

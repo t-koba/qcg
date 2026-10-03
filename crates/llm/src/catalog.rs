@@ -461,7 +461,7 @@ impl CatalogService {
     async fn fetch_source(&self, source: &CatalogSourceSpec) -> Result<ExternalCatalog, String> {
         let bytes = match (&source.url, &source.file) {
             (Some(url), None) => self.fetch_url(url).await?,
-            (None, Some(file)) => std::fs::read(expand_home(file))
+            (None, Some(file)) => read_catalog_file(Path::new(&expand_home(file)))
                 .map_err(|error| format!("catalog file `{file}` could not be read: {error}"))?,
             _ => return Err("[catalog.source] must declare exactly one of url or file".into()),
         };
@@ -947,11 +947,38 @@ fn expand_home(path: &str) -> String {
     path.to_string()
 }
 
+/// Local sources and cache files obey the same cap as remote catalogs.
+/// Ordinary file sources may be symlinks; the opened handle must be regular
+/// and Unix opens nonblocking so FIFOs cannot stall the request/runtime.
+fn read_catalog_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("catalog must be a regular file"));
+    }
+    let mut bytes = Vec::new();
+    file.take(MODELS_DEV_BODY_LIMIT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MODELS_DEV_BODY_LIMIT_BYTES {
+        return Err(std::io::Error::other(format!(
+            "catalog exceeds {MODELS_DEV_BODY_LIMIT_BYTES} bytes"
+        )));
+    }
+    Ok(bytes)
+}
+
 fn load_cached_external(config: &CatalogConfig) -> (ExternalCatalog, Option<String>) {
     let Some(path) = cache_path(config) else {
         return (ExternalCatalog::default(), None);
     };
-    let bytes = match std::fs::read(&path) {
+    let bytes = match read_catalog_file(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return (ExternalCatalog::default(), None);
@@ -1026,6 +1053,11 @@ fn write_cache(config: &CatalogConfig, catalog: &ExternalCatalog) -> Result<(), 
     };
     let bytes = serde_json::to_vec_pretty(&cached)
         .map_err(|error| format!("catalog cache is not serializable: {error}"))?;
+    if bytes.len() > MODELS_DEV_BODY_LIMIT_BYTES {
+        return Err(format!(
+            "catalog cache exceeds {MODELS_DEV_BODY_LIMIT_BYTES} bytes"
+        ));
+    }
     // Unique temp name (F09-03): concurrent refreshes must not share one
     // fixed `.tmp` path and clobber each other's publish.
     let tmp = parent.join(format!(
@@ -1640,6 +1672,39 @@ label = "Explicit label"
             format!(r#"{{"openai": {{"models": {{"{model}": {{"tool_call": true}}}}}}}}"#),
         )
         .expect("fixture should write");
+    }
+
+    #[tokio::test]
+    async fn oversized_local_catalog_and_cache_fail_with_visible_errors() {
+        let dir = temp_catalog_dir("bounded");
+        let path = dir.join("catalog.json");
+        let file = std::fs::File::create(&path).expect("catalog file");
+        file.set_len(MODELS_DEV_BODY_LIMIT_BYTES as u64 + 1)
+            .expect("oversized sparse file");
+        let config = CatalogConfig {
+            cache: Some(path.to_string_lossy().into_owned()),
+            source: vec![CatalogSourceSpec {
+                kind: CatalogSourceKind::ModelsDev,
+                url: None,
+                file: Some(path.to_string_lossy().into_owned()),
+                sha256: None,
+            }],
+            ..Default::default()
+        };
+        let service = CatalogService::new(vec![], Some(config.clone())).expect("catalog service");
+        let error = service
+            .fetch_source(&config.source[0])
+            .await
+            .expect_err("oversized source must fail");
+        assert!(error.contains("exceeds"), "{error}");
+        let (cached, error) = load_cached_external(&config);
+        assert!(cached.providers.is_empty());
+        assert!(
+            error
+                .expect("cache error must be visible")
+                .contains("exceeds")
+        );
+        std::fs::remove_dir_all(dir).expect("cleanup");
     }
 
     fn temp_catalog_dir(name: &str) -> std::path::PathBuf {

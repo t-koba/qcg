@@ -165,7 +165,6 @@ async function assertCancelRun(page) {
   await selectGenerator(page, /Cancelable UI/);
   await page.getByRole("button", { name: /^Start generation$/ }).click();
   await page.locator("#run-state.running").waitFor({ timeout: 15000 });
-  await page.waitForTimeout(200);
   await page.getByRole("button", { name: /^Cancel run$/ }).click();
   await page.locator("#run-state.canceled").waitFor({ timeout: 5000 });
   await page.getByRole("button", { name: /^Start again$/ }).click();

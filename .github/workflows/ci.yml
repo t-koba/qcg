@@ -56,7 +56,7 @@ jobs:
 
       - name: Verify extracted distribution
         shell: bash
-        run: bash scripts/check-dist-bundle.sh
+        run: bash scripts/check-dist-bundle.sh --dependencies-installed
 
   demo-frontend:
     name: Demo frontend
@@ -130,8 +130,8 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/generator/package-lock.json
 
-      - name: Install demo dependencies and build
-        run: npm ci && npm run generate:api && npm run generate:wasm && npm run build
+      - name: Install demo dependencies and generate inputs
+        run: npm ci && npm run generate:api && npm run generate:wasm
         working-directory: frontend/generator
 
       - name: Install Playwright

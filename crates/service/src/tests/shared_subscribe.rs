@@ -361,8 +361,12 @@ async fn shared_subscribers_follow_the_durable_journal() {
     let question = waiting.question.expect("run should have a question");
     let peer = make_service();
     let mut stream = peer.subscribe(id.clone()).await.expect("subscription");
-    // Let the peer's journal poller attach before the answer lands.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // Observe durable history through the actual subscription before the
+    // answer lands, rather than guessing when the poller attached.
+    tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("subscription must deliver history")
+        .expect("subscription must stay open");
     owner
         .answer(
             id.clone(),

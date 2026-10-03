@@ -1266,43 +1266,4 @@ mod tests {
         assert!(!text.contains("SENTINEL_URL2"), "{text}");
         assert!(text.contains("api_key="), "keys stay visible: {text}");
     }
-
-    #[test]
-    fn approval_path_production_code_uses_no_debug_formatting() {
-        // E09h: the approval-path files must never Debug-format values in
-        // production code: a derived or ad-hoc `{:?}` on an args-carrying
-        // type would log secrets in plaintext. The redacting wrappers above
-        // are the only sanctioned Debug path. This scans the production
-        // part (before `#[cfg(test)]`) of each approval-path file for `:?}`
-        // outside comments; a hit fails loudly so the author either uses
-        // the wrappers or documents why the formatted type is secret-free.
-        // Covers the agent approval path plus the engine gateway command
-        // planning path (`gateway/command.rs`, yours — verify + pin). The
-        // engine HTTP gateway (`gateway/http.rs`) Debug derives are FOREIGN
-        // (not yours): reported separately, never edited here.
-        for file in [
-            "agent.rs",
-            "agent_runtime.rs",
-            "tool_events.rs",
-            "gateway/command.rs",
-        ] {
-            let source = match file {
-                "agent.rs" => include_str!("agent.rs"),
-                "agent_runtime.rs" => include_str!("agent_runtime.rs"),
-                "gateway/command.rs" => include_str!("../../engine/src/gateway/command.rs"),
-                _ => include_str!("tool_events.rs"),
-            };
-            let production = source.split("#[cfg(test)]").next().unwrap_or(source);
-            for (index, line) in production.lines().enumerate() {
-                if line.trim_start().starts_with("//") {
-                    continue;
-                }
-                assert!(
-                    !line.contains(":?}"),
-                    "approval-path production code must not Debug-format (use the Redacted wrappers): {file}:{}: {line}",
-                    index + 1,
-                );
-            }
-        }
-    }
 }

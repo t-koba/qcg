@@ -172,17 +172,16 @@ fn recover_generators_backups(generators_dir: &Utf8Path) {
         let Ok(backup) = Utf8PathBuf::from_path_buf(entry.path()) else {
             continue;
         };
-        let marker = backup.join(install_commit::BACKUP_MARKER_FILE);
-        if let Ok(bytes) = std::fs::read(&marker)
-            && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
-            && let Some(id) = value.get("id").and_then(|v| v.as_str())
-        {
-            ids.insert(id.to_string());
+        if let Some(id) = install_commit::backup_marker_id(&backup) {
+            ids.insert(id);
         }
     }
     for id in ids {
         let target = generators_dir.join(&id);
-        install_commit::recover_interrupted_backup(&target);
+        let lock_path = generators_dir.join(install_commit::per_id_lock_name(&id));
+        if let Ok(Some(_guard)) = install_commit::try_acquire_file_lock(&lock_path) {
+            install_commit::recover_interrupted_backup(&target);
+        }
     }
 }
 
@@ -191,7 +190,7 @@ fn recover_generators_backups(generators_dir: &Utf8Path) {
 /// - a backup whose target is missing is never deleted (recover first);
 /// - freshness uses the marker mtime, not the renamed directory mtime;
 /// - a contended per-id lock (concurrent commit) skips deletion;
-/// - unmarked directories fall back to the scratch age gate.
+/// - unmarked directories are retained because ownership is unknown.
 ///
 /// The freshness gate applies to every entry: the pid only proves which
 /// process created a backup, never that its commit finished, so a
@@ -214,57 +213,25 @@ fn reap_install_backup_siblings(
         let Ok(backup) = Utf8PathBuf::from_path_buf(entry.path()) else {
             continue;
         };
-        // Resolve the target id from the marker when present. A present
-        // but unreadable marker fails closed: the entry may be the sole
-        // surviving copy of an interrupted commit, so it is never swept
-        // as scratch (the recovery pass above already restored whatever
-        // it could parse; the rest stays for the operator).
-        let marker_path = backup.join(install_commit::BACKUP_MARKER_FILE);
-        let marker_present = std::fs::symlink_metadata(&marker_path).is_ok();
-        let target_id: Option<String> = std::fs::read(&marker_path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-            .and_then(|value| value.get("id").and_then(|v| v.as_str()).map(str::to_string));
-        if marker_present && target_id.is_none() {
+        // Missing, corrupt, oversized, or unsafe markers prove no ownership.
+        let Some(id) = install_commit::backup_marker_id(&backup) else {
+            continue;
+        };
+        let lock_path = generators_dir.join(install_commit::per_id_lock_name(&id));
+        let _guard = match install_commit::try_acquire_file_lock(&lock_path) {
+            Ok(Some(guard)) => guard,
+            Ok(None) => continue,
+            Err(error) => {
+                failures.push(format!("failed to lock backup `{backup}`: {error}"));
+                continue;
+            }
+        };
+        // Inspect target and freshness under the same lock as commit/recovery.
+        if std::fs::symlink_metadata(generators_dir.join(&id)).is_err() {
             continue;
         }
-        if let Some(id) = &target_id {
-            let target = generators_dir.join(id);
-            // Sole remaining old version with a missing target: keep for
-            // recovery, never sweep (F14-02/F14-04).
-            if std::fs::symlink_metadata(&target).is_err() {
-                continue;
-            }
-            // Live commit guard (F14-03): a concurrent commit holds the
-            // per-id file lock. Try non-blocking; contention means live.
-            let lock_path = generators_dir.join(install_commit::per_id_lock_name(id));
-            if let Ok(lock_file) = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(&lock_path)
-                && lock_file.try_lock().is_err()
-            {
-                continue;
-            }
-            // Freshness from the marker (F14-01): the renamed directory
-            // keeps its old mtime, so the directory mtime alone would mark
-            // a just-made backup as stale.
-            let fresh = install_commit::backup_freshness(&backup);
-            let old_enough = fresh.map(|mtime| mtime <= cutoff).unwrap_or(false);
-            if !old_enough {
-                continue;
-            }
-        } else {
-            // Unmarked: legacy scratch path with the age gate.
-            let old_enough = entry
-                .metadata()
-                .and_then(|meta| meta.modified())
-                .map(|mtime| mtime <= cutoff)
-                .unwrap_or(false);
-            if !old_enough {
-                continue;
-            }
+        if !install_commit::backup_freshness(&backup).is_some_and(|mtime| mtime <= cutoff) {
+            continue;
         }
         if let Err(error) = install_commit::remove_owned_path(&backup) {
             failures.push(format!(
@@ -857,6 +824,119 @@ version = "1.0.0"
             !backup.exists(),
             "the restored backup must be consumed, not left behind"
         );
+    }
+
+    #[test]
+    fn backup_maintenance_excludes_live_commits_and_retains_unknown_ownership() {
+        let root = test_root("backup-maintenance");
+        let _guard = TempGuard(root.clone());
+        std::fs::create_dir_all(&root).expect("root");
+        let target = root.join("mygen");
+        std::fs::create_dir_all(&target).expect("target");
+        let backup = root.join(".install-backup-marked");
+        std::fs::create_dir_all(&backup).expect("backup");
+        std::fs::write(
+            backup.join(install_commit::BACKUP_MARKER_FILE),
+            r#"{"id":"mygen"}"#,
+        )
+        .expect("marker");
+        let lock_path = root.join(install_commit::per_id_lock_name("mygen"));
+        let commit_guard =
+            install_commit::acquire_file_lock(&lock_path, &target).expect("commit lock");
+        reap_install_backup_siblings(&root, std::time::SystemTime::now()).expect("contended sweep");
+        assert!(backup.exists(), "a live commit's backup must survive");
+        std::fs::remove_dir_all(&target).expect("simulate commit rename window");
+        recover_generators_backups(&root);
+        assert!(
+            !target.exists(),
+            "maintenance must not restore into a live commit's rename window"
+        );
+        assert!(backup.exists());
+        drop(commit_guard);
+        recover_generators_backups(&root);
+        assert!(
+            target.exists(),
+            "an abandoned commit must recover after the lock is released"
+        );
+        assert!(!backup.exists());
+
+        std::fs::create_dir_all(&backup).expect("obsolete backup");
+        std::fs::write(
+            backup.join(install_commit::BACKUP_MARKER_FILE),
+            r#"{"id":"mygen"}"#,
+        )
+        .expect("marker");
+        reap_install_backup_siblings(&root, std::time::SystemTime::now())
+            .expect("uncontended sweep");
+        assert!(
+            !backup.exists(),
+            "an owned obsolete backup should be removed"
+        );
+        for (name, marker) in [
+            ("unmarked", None),
+            ("corrupt", Some("{".to_string())),
+            ("unsafe", Some(r#"{"id":"../outside"}"#.to_string())),
+            (
+                "oversized",
+                Some(format!(
+                    r#"{{"id":"mygen","extra":"{}"}}"#,
+                    "x".repeat(16 * 1024)
+                )),
+            ),
+        ] {
+            let path = root.join(format!(".install-backup-{name}"));
+            std::fs::create_dir_all(&path).expect("unknown backup");
+            if let Some(marker) = marker {
+                std::fs::write(path.join(install_commit::BACKUP_MARKER_FILE), marker)
+                    .expect("unknown marker");
+            }
+            reap_install_backup_siblings(&root, std::time::SystemTime::now())
+                .expect("unknown sweep");
+            assert!(path.exists(), "{name} backup must be retained");
+        }
+    }
+
+    #[test]
+    fn uninstall_removes_owned_backups_without_resurrecting_the_generator() {
+        let root = test_root("uninstall-backup");
+        let _guard = TempGuard(root.clone());
+        write_installed(&root.join("mygen"), "mygen", "");
+        let backup = root.join(".install-backup-owned");
+        std::fs::create_dir_all(&backup).expect("backup");
+        std::fs::write(
+            backup.join(install_commit::BACKUP_MARKER_FILE),
+            r#"{"id":"mygen"}"#,
+        )
+        .expect("marker");
+        let unknown = root.join(".install-backup-unknown");
+        std::fs::create_dir_all(&unknown).expect("unknown backup");
+        uninstall("mygen", &root, true).expect("uninstall");
+        recover_generators_backups(&root);
+        assert!(
+            !root.join("mygen").exists(),
+            "successful uninstall must not be undone by recovery"
+        );
+        assert!(!backup.exists());
+        assert!(unknown.exists(), "uninstall must retain unowned data");
+    }
+
+    #[test]
+    fn backup_sweep_refuses_unavailable_lock() {
+        let root = test_root("backup-lock-error");
+        let _guard = TempGuard(root.clone());
+        std::fs::create_dir_all(root.join("mygen")).expect("target");
+        let backup = root.join(".install-backup-owned");
+        std::fs::create_dir_all(&backup).expect("backup");
+        std::fs::write(
+            backup.join(install_commit::BACKUP_MARKER_FILE),
+            r#"{"id":"mygen"}"#,
+        )
+        .expect("marker");
+        std::fs::create_dir_all(root.join(install_commit::per_id_lock_name("mygen")))
+            .expect("unopenable lock");
+        reap_install_backup_siblings(&root, std::time::SystemTime::now())
+            .expect_err("lock failure must refuse deletion");
+        assert!(backup.exists());
     }
 
     #[test]

@@ -27,6 +27,12 @@ behind (ADR 0001: no inert promises).
 | F14b | Fresh marked backup survives foreign sweep | `fresh_marked_backup_survives_foreign_sweep` |
 | F14c | Corrupt marked backup is never swept | `corrupt_marked_backup_is_never_swept` |
 | F14d | Failed commit restores old version and converges on rerun | `failed_commit_restores_old_version_and_converges_on_rerun` |
+| F14e | Backup recovery and sweeping exclude live commits; unknown ownership is retained | `backup_maintenance_excludes_live_commits_and_retains_unknown_ownership` |
+| F14f | Lock-open failure refuses backup deletion | `backup_sweep_refuses_unavailable_lock` |
+| F14g | Uninstall cannot be undone by backup recovery | `uninstall_removes_owned_backups_without_resurrecting_the_generator` |
+| F15 | No-follow reads reject FIFOs without waiting for a writer (Unix) | `nofollow_read_refuses_fifo_without_waiting_for_a_writer` |
+| F16 | Local catalog and cache reads reject oversized files with visible errors | `oversized_local_catalog_and_cache_fail_with_visible_errors` |
+| F17 | Fork execution uses its admission snapshot; ordinary start/resume read once | `fork_snapshot_derivations_work_after_journal_removal` |
 | F06a | Concurrent same-file patches fail closed on base drift | `concurrent_same_file_patches_fail_closed_on_base_drift` |
 | F06b | Commit-time recheck refuses a foreign writer | `commit_time_recheck_refuses_a_foreign_writer` |
 | G01-01 | Forced cancel settles without self-conflict (no 409 without a peer) | `g01_forced_cancel_settles_without_self_conflict` |

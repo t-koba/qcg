@@ -8,8 +8,13 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 scratch_root="$(mktemp -d "${TMPDIR:-/tmp}/qcg-example-smoke.XXXXXX")"
 trap 'rm -rf "$scratch_root"' EXIT
 
+# Build once; every fixture exercises the same resulting CLI binary.
+# Repeated cargo run would re-check the workspace for every invocation.
+CARGO_TARGET_DIR="$repo_root/target" cargo build --manifest-path "$repo_root/Cargo.toml" -p cli --locked
+binary="$repo_root/target/debug/$(node "$repo_root/scripts/product.mjs" binary)"
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) binary="${binary}.exe" ;; esac
 run_qcg() {
-  (cd "$scratch_root" && CARGO_TARGET_DIR="$repo_root/target" cargo run --manifest-path "$repo_root/Cargo.toml" -p cli --locked -- "$@")
+  (cd "$scratch_root" && "$binary" "$@")
 }
 
 for dir in generators/* fixtures/generators/*; do

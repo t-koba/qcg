@@ -609,28 +609,22 @@ async fn hitl_two_streams_continue_to_terminal_through_subscribe() {
 
 #[tokio::test]
 async fn broadcast_overflow_continues_through_resubscribe() {
-    // E12: a broadcast overflow through the real subscribe path ends with a
-    // `lagged` marker carrying the last delivered seq (never delivered +
-    // skipped), and a resubscribe from that seq continues through the
-    // journal replay to the terminal event.
+    // A small real live channel makes lag deterministic with eight writes.
+    // The question is the synchronization point: subscribe before releasing
+    // execution, leave the receiver unread, then resume from its lag cursor.
     let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
         .unwrap()
         .join(format!("subscribe-overflow-{}", uuid::Uuid::now_v7()));
-    let _temp_guard = TempGuard(root.clone());
-    let generators_dir = root.join("generators");
-    let generator_dir = generators_dir.join("flood");
-    let runs_dir = root.join("runs");
-    std::fs::create_dir_all(&generator_dir).unwrap();
-    // A real generator flooding >512 live events: 600 foreach writes emit
-    // well over the live channel capacity, so a non-reading subscriber
-    // deterministically lags through the real broadcast (no raw channel).
+    let _guard = TempGuard(root.clone());
+    let generators = root.join("generators");
+    let generator = generators.join("flood");
+    std::fs::create_dir_all(&generator).unwrap();
     std::fs::write(
-        generator_dir.join(contract::MANIFEST_FILE),
+        generator.join(contract::MANIFEST_FILE),
         r#"[generator]
 id = "flood"
 name = "Flood"
 version = "0.1.0"
-
 [permissions]
 fs_read = []
 network = []
@@ -638,126 +632,136 @@ commands = []
 side_effects = "none"
 side_effects_scope = "invocation"
 fs_write = ["workspace"]
-
-
 [permissions.containers]
 enabled = false
 [[inputs.stages]]
-id = "basic"
-
+id = "main"
 [[inputs.stages.fields]]
 id = "items"
 required = true
 type = "list"
 item_type = "integer"
-
 [[blocks.item]]
 id = "write_item"
 type = "write"
-
 [blocks.item.params]
 content = "item={{ item }}"
 output_file = "items/{{ item }}.txt"
-
+[[flow]]
+id = "ready"
+type = "ask_user"
+[flow.params]
+content = "Release the flood?"
+options = ["yes"]
 [[flow]]
 id = "flood"
 type = "foreach"
-
+needs = ["ready"]
 [flow.params]
 items = "inputs.items"
-max_iterations = 700
-parallel = 8
+max_iterations = 8
+parallel = 2
 subflow = "item"
-
 [[flow]]
 id = "done"
 type = "write"
 needs = ["flood"]
 artifact = { label = "Done", required = true }
-
 [flow.params]
 content = "done"
-output_file = "done.txt""#,
+output_file = "done.txt"
+"#,
     )
     .unwrap();
-    let service = test_service(generators_dir, runs_dir, None).expect("service should initialize");
-    let items: Vec<serde_json::Value> = (0..600).map(|index| serde_json::json!(index)).collect();
-    let run_id = service
+    let service = LocalService::with_generator_roots_policy_and_store_mode(
+        vec![generators],
+        root.join("runs"),
+        None,
+        policy::DEFAULT_MAX_ACTIVE_RUNS,
+        policy::DEFAULT_MAX_TRACKED_RUNS,
+        service::RunStoreMode::Exclusive,
+        service::ServiceDeploymentPolicy {
+            live_event_channel_capacity: 8,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let id = service
         .start_run(api::StartRun {
             generator_id: "flood".into(),
             inputs: std::collections::BTreeMap::from([(
                 "items".into(),
-                serde_json::Value::Array(items),
+                json!([0, 1, 2, 3, 4, 5, 6, 7]),
             )]),
             ..Default::default()
         })
         .await
-        .expect("flooding run should start");
-    // Subscribe early, then do not read while the engine floods: the live
-    // broadcast must lag.
-    let mut lagging = service
-        .subscribe(run_id.clone())
-        .await
-        .expect("subscribe should succeed");
-    // Wait for terminal through snapshots (not through the lagging stream),
-    // so the stream's receiver stays unread while 600+ events flood it.
-    for _ in 0..400 {
-        if service
-            .snapshot(run_id.clone())
-            .await
-            .is_ok_and(|snapshot| snapshot.state.is_terminal())
-        {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-    // Drain the lagging stream through the real path: it must end with a
-    // `lagged` marker (not a fabricated skip) or already hold the terminal
-    // via history on resubscribe. Either way the client continues to the
-    // terminal event.
-    let mut saw_lagged = false;
-    let mut saw_terminal = false;
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while let Some(event) = lagging.next().await {
-            if event.kind.as_str() == "lagged" {
-                saw_lagged = true;
-                break;
-            }
-            if api::is_terminal_event_kind(event.kind.as_str()) {
-                saw_terminal = true;
-                break;
-            }
-        }
-    })
-    .await;
-    if saw_lagged {
-        // The marker itself was delivered above carrying the last delivered
-        // seq; resubscribe through the real path and require the terminal
-        // event via journal replay.
-        let mut resumed = service
-            .subscribe(run_id.clone())
-            .await
-            .expect("resubscribe should succeed");
-        let terminal = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        .unwrap();
+    async fn at_state(service: &LocalService, id: &str, state: RunStatus) -> api::RunSnapshot {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
-                let event = resumed.next().await.expect("resumed stream must continue");
-                if api::is_terminal_event_kind(event.kind.as_str()) {
-                    break event;
+                let snapshot = service.snapshot(id.to_string()).await.unwrap();
+                if snapshot.state == state {
+                    return snapshot;
                 }
+                assert!(
+                    !snapshot.state.is_terminal(),
+                    "unexpected terminal state: {:?}",
+                    snapshot.state
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("resumed subscribe should reach a terminal event");
-        assert!(
-            api::is_terminal_event_kind(terminal.kind.as_str()),
-            "resumed stream must end terminally"
-        );
-    } else {
-        assert!(
-            saw_terminal,
-            "a flooding subscribe must end with lagged-then-terminal or direct terminal"
-        );
+        .expect("run must reach its synchronization state")
     }
+    let waiting = at_state(&service, &id, RunStatus::Waiting).await;
+    let mut stream = service
+        .subscribe_with_cursor(id.clone(), waiting.seq)
+        .await
+        .unwrap();
+    service
+        .answer(
+            id.clone(),
+            waiting.question.unwrap().id,
+            api::AnswerPayload {
+                values: std::collections::BTreeMap::from([("answer".into(), json!("yes"))]),
+            },
+        )
+        .await
+        .unwrap();
+    let terminal = at_state(&service, &id, RunStatus::Succeeded).await;
+    let lag = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("lag marker must be prompt")
+        .expect("lag marker must be emitted");
+    assert_eq!(lag.kind, "lagged", "overflow must exercise the lag path");
+    assert_eq!(
+        lag.seq, waiting.seq,
+        "lag cannot advance past the last delivered event"
+    );
+    assert!(
+        stream.next().await.is_none(),
+        "lag marker ends the old tail"
+    );
+    let mut resumed = service.subscribe_with_cursor(id, lag.seq).await.unwrap();
+    let replay = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut events = Vec::new();
+        while let Some(event) = resumed.next().await {
+            events.push(event);
+        }
+        events
+    })
+    .await
+    .expect("settled replay must close");
+    assert!(!replay.is_empty());
+    assert!(replay.iter().all(|event| event.seq > lag.seq));
+    assert!(
+        replay.windows(2).all(|pair| pair[0].seq < pair[1].seq),
+        "replay cannot duplicate or reorder events"
+    );
+    assert_eq!(replay.last().unwrap().kind, "run_finished");
+    assert_eq!(replay.last().unwrap().seq, terminal.seq);
 }
 
 #[tokio::test]

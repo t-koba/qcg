@@ -1497,17 +1497,16 @@ fn fork_policy_prefers_own_admission_over_source() {
 
 #[tokio::test]
 async fn fork_snapshot_derivations_work_after_journal_removal() {
-    // E03: a fresh fork threads its single admission snapshot through to
-    // the spawn, so the fork pays exactly one journal read. Proof by
-    // deletion (same shape as the adopt single-read test): the single
-    // read serves fork inputs, the seed, and the spawn snapshot, and
-    // every downstream derivation is pure over the snapshot with zero
-    // further journal I/O.
+    // Exercise real start, answer resume, and fork execution. The scoped
+    // probe counts execution's snapshot and disk paths, including spawned
+    // tasks. Then remove the journal and prove snapshot derivations need
+    // no further I/O.
     let root = temp_run_dir("fork-single-read");
     let _guard = TempGuard(root.clone());
     let generators =
         Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
     let runs = root.join("runs");
+    let probe = super::support::SpawnJournalProbe::new(runs.clone());
     let service = LocalService::with_generator_roots_policy_and_store_mode(
         vec![generators],
         runs.clone(),
@@ -1522,6 +1521,11 @@ async fn fork_snapshot_derivations_work_after_journal_removal() {
     assert_eq!(
         wait_for_terminal_snapshot(&service, &source).await.state,
         RunStatus::Succeeded
+    );
+    assert_eq!(
+        probe.counts(&runs.join(&source)),
+        (0, 2),
+        "each start/resume should read once and reuse that read for policy"
     );
     let checkpoint = read_journal_events(&service.run_dir_for(&source).await.expect("source dir"))
         .expect("source journal")
@@ -1547,6 +1551,15 @@ async fn fork_snapshot_derivations_work_after_journal_removal() {
         .run_dir_for(&fork)
         .await
         .expect("fork directory should resolve");
+    assert_eq!(
+        wait_for_terminal_snapshot(&service, &fork).await.state,
+        RunStatus::Succeeded
+    );
+    assert_eq!(
+        probe.counts(&fork_dir),
+        (1, 0),
+        "fork execution must load its admission snapshot without a disk fallback"
+    );
     // The single admission read: fork inputs, the seed, and the spawn
     // snapshot all derive from this one snapshot with no second scan.
     let snapshot = crate::run_dirs::try_adopt_run_dir_with_snapshot(&fork_dir, &fork)
@@ -1591,13 +1604,6 @@ async fn fork_snapshot_derivations_work_after_journal_removal() {
     assert_eq!(
         snapshot.events, events_before,
         "derivations must not mutate the snapshot"
-    );
-    // Structural pin: the fresh-fork spawn must carry a snapshot
-    // (`Some`), never `None` (which would force a second disk read).
-    let admission = include_str!("../runs_api/admission.rs");
-    assert!(
-        admission.contains("journal_snapshot: Some(spawn_snapshot)"),
-        "fresh forks must thread the single snapshot to the spawn"
     );
 }
 

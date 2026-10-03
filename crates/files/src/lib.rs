@@ -124,7 +124,7 @@ pub fn open_read_nofollow(path: &Utf8Path) -> std::io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt as _;
         let file = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)?;
         if !file.metadata()?.file_type().is_file() {
             return Err(std::io::Error::new(
@@ -847,6 +847,50 @@ fn cleanup_staging(staging: &Utf8Path, error: std::io::Error) -> std::io::Error 
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn nofollow_read_refuses_fifo_without_waiting_for_a_writer() {
+        const CHILD: &str = "QCG_FIFO_READ_TEST_CHILD";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let path = Utf8PathBuf::from_path_buf(path.into()).expect("FIFO path");
+            let error =
+                super::read_nofollow_bounded(&path, Some(1024)).expect_err("FIFO must be refused");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            return;
+        }
+        let path = std::env::temp_dir().join(format!("qcg-fifo-{}", uuid::Uuid::now_v7()));
+        use std::os::unix::ffi::OsStrExt as _;
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("FIFO name");
+        // SAFETY: name is valid and NUL terminated; creates only our unique temp FIFO.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let mut child =
+            std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "--exact",
+                    "tests::nofollow_read_refuses_fifo_without_waiting_for_a_writer",
+                ])
+                .env(CHILD, &path)
+                .spawn()
+                .expect("FIFO reader child");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let outcome = loop {
+            if let Some(status) = child.try_wait().expect("child status") {
+                break Some(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().expect("stop blocked reader");
+                child.wait().expect("reap reader");
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        std::fs::remove_file(path).expect("FIFO cleanup");
+        assert!(
+            outcome.is_some_and(|status| status.success()),
+            "FIFO read blocked or failed instead of rejecting the non-regular file"
+        );
+    }
+
     use super::*;
     use camino::Utf8PathBuf;
 

@@ -1328,7 +1328,7 @@ impl LocalService {
                         _ = notified => continue,
                     }
                 };
-                {
+                let journaled = {
                     let mut runs = service.inner.runs.write().await;
                     let Some(record) = runs.get_mut(&run_id) else {
                         return;
@@ -1368,22 +1368,35 @@ impl LocalService {
                     // one (adopted retries, fresh forks): the pre-execution
                     // fold then costs no second journal read or re-fold of
                     // the same events (E03).
-                    let pre_state: Result<engine::RunState, crate::types::ServiceError> =
-                        match &journal_snapshot {
-                            Some(values) => {
-                                engine::RunState::fold_values(values).map_err(|error| {
-                                    crate::types::ServiceError::Invalid(error.to_string())
+                    #[cfg(test)]
+                    crate::tests::support::record_spawn_journal_use(
+                        &run_dir,
+                        journal_snapshot.is_some(),
+                    );
+                    let pre_state = match journal_snapshot {
+                        Some(values) => engine::RunState::fold_values(&values)
+                            .map(|state| (state, values))
+                            .map_err(|error| {
+                                crate::types::ServiceError::Invalid(error.to_string())
+                            }),
+                        None => {
+                            let directory = run_dir.clone();
+                            service
+                                .blocking_work(move || {
+                                    crate::summaries::read_journal_events(&directory)
                                 })
-                            }
-                            None => {
-                                let directory = run_dir.clone();
-                                service
-                                    .blocking_work(move || fold_run_state(&directory))
-                                    .await
-                            }
-                        };
-                    match pre_state {
-                        Ok(state) if state.terminal.is_some() => {
+                                .await
+                                .and_then(|values| {
+                                    engine::RunState::fold_values(&values)
+                                        .map(|state| (state, values))
+                                        .map_err(|error| {
+                                            crate::types::ServiceError::Invalid(error.to_string())
+                                        })
+                                })
+                        }
+                    };
+                    let journaled = match pre_state {
+                        Ok((state, _)) if state.terminal.is_some() => {
                             record.state = match state.terminal {
                                 Some(terminal) => terminal_status(&terminal),
                                 None => RunStatus::Canceled,
@@ -1393,7 +1406,7 @@ impl LocalService {
                             record.confirm = None;
                             return;
                         }
-                        Ok(_) => {}
+                        Ok((_, values)) => values,
                         Err(error) => {
                             // Fail closed with an explicit error instead of
                             // leaving the run Queued for the 5s/10s resumer
@@ -1411,46 +1424,16 @@ impl LocalService {
                             service.inner.queue_notify.notify_waiters();
                             return;
                         }
-                    }
+                    };
                     record.state = RunStatus::Running;
                     // Claim shared-store ownership while holding the execution
                     // lease so peers observe the active owner.
                     record.owner_id = service.inner.owner_id.clone();
-                }
-                // Prefer the journaled admission instant over re-resolving:
-                // a ceiling change between admission and execution must not
-                // diverge the two (E04). An unreadable journal fails closed:
-                // defaulting to an empty event list would silently run under
-                // the current ceiling instead of the admitted one (E04).
-                // The admission snapshot is reused when the spawn carries
-                // one, so adopted retries and fresh forks pay no second
-                // journal read here (E03).
-                let journaled: Vec<Value> = match journal_snapshot {
-                    Some(values) => values,
-                    None => match crate::summaries::read_journal_events(&run_dir) {
-                        Ok(events) => events,
-                        Err(error) => {
-                            // Fail closed with an explicit error instead of
-                            // leaving a Running memory record with no driver
-                            // for the resumer timers (E03): mark the run
-                            // failed in memory, wake the queue, and return.
-                            // The journal stays the truth on restart.
-                            tracing::error!(%error, run_id = %run_id, "admission journal unreadable; marking the run failed instead of starting execution");
-                            let mut runs = service.inner.runs.write().await;
-                            if let Some(record) = runs.get_mut(&run_id)
-                                && !record.state.is_terminal()
-                            {
-                                record.state = RunStatus::Failed;
-                                record.preempted = false;
-                                record.question = None;
-                                record.confirm = None;
-                            }
-                            drop(runs);
-                            service.inner.queue_notify.notify_waiters();
-                            return;
-                        }
-                    },
+                    journaled
                 };
+                // State validation and policy resolution share these exact
+                // events: one disk read without an admission snapshot, zero
+                // with one. Errors already settled before marking Running.
                 // H02: single effective-audit enforcement for every execution
                 // path (fresh, restart recovery, resumer, peer takeover).
                 // The journaled `audit_raise` plus the current deployment

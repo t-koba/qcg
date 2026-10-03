@@ -369,3 +369,55 @@ pub(crate) fn temp_root(name: &str) -> Utf8PathBuf {
     let dir = std::env::temp_dir().join(format!("accept-{name}-{}", uuid::Uuid::now_v7()));
     Utf8PathBuf::from_path_buf(dir).expect("temp path must be UTF-8")
 }
+
+/// Counts actual pre-execution snapshot uses and disk fallbacks in one store.
+/// Registration is scoped; production builds contain no probe or registry.
+pub(crate) struct SpawnJournalProbe {
+    root: Utf8PathBuf,
+    counts: Arc<Mutex<BTreeMap<Utf8PathBuf, (usize, usize)>>>,
+}
+
+type SpawnProbeRegistry =
+    BTreeMap<Utf8PathBuf, std::sync::Weak<Mutex<BTreeMap<Utf8PathBuf, (usize, usize)>>>>;
+fn spawn_probe_registry() -> &'static Mutex<SpawnProbeRegistry> {
+    static REGISTRY: std::sync::OnceLock<Mutex<SpawnProbeRegistry>> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(Mutex::default)
+}
+impl SpawnJournalProbe {
+    pub(crate) fn new(root: Utf8PathBuf) -> Self {
+        let counts = Arc::new(Mutex::new(BTreeMap::new()));
+        spawn_probe_registry()
+            .lock()
+            .unwrap()
+            .insert(root.clone(), Arc::downgrade(&counts));
+        Self { root, counts }
+    }
+    pub(crate) fn counts(&self, path: &Utf8Path) -> (usize, usize) {
+        self.counts
+            .lock()
+            .unwrap()
+            .get(path)
+            .copied()
+            .unwrap_or_default()
+    }
+}
+impl Drop for SpawnJournalProbe {
+    fn drop(&mut self) {
+        spawn_probe_registry().lock().unwrap().remove(&self.root);
+    }
+}
+pub(crate) fn record_spawn_journal_use(path: &Utf8Path, snapshot: bool) {
+    for (root, probe) in spawn_probe_registry().lock().unwrap().iter() {
+        if path.starts_with(root)
+            && let Some(counts) = probe.upgrade()
+        {
+            let mut counts = counts.lock().unwrap();
+            let entry = counts.entry(path.to_path_buf()).or_default();
+            if snapshot {
+                entry.0 += 1;
+            } else {
+                entry.1 += 1;
+            }
+        }
+    }
+}

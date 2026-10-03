@@ -4,10 +4,18 @@ set -euo pipefail
 profile="release"
 target_profile="release"
 dry_run="false"
+frontend_built="false"
+dependencies_installed="false"
 out_dir="dist"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --dependencies-installed)
+      dependencies_installed="true"
+      ;;
+    --frontend-built)
+      frontend_built="true"
+      ;;
     --debug)
       profile="dev"
       target_profile="debug"
@@ -69,10 +77,16 @@ if [ "$dry_run" = "true" ]; then
   exit 0
 fi
 
-npm --prefix frontend/generator ci
-npm --prefix frontend/generator run generate:api
-npm --prefix frontend/generator run generate:wasm
-npm --prefix frontend/generator run build
+# Verified local pipelines can reuse the frontend they just built and tested.
+# Standalone packaging and releases always build unless explicitly requested.
+if [ "$frontend_built" != "true" ]; then
+  if [ "$dependencies_installed" != "true" ]; then
+    npm --prefix frontend/generator ci
+  fi
+  npm --prefix frontend/generator run generate:api
+  npm --prefix frontend/generator run generate:wasm
+  npm --prefix frontend/generator run build
+fi
 require_path "generators/generator/ui/index.html"
 
 build_root="$(pwd -P)"

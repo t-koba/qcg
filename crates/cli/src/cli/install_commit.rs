@@ -390,174 +390,56 @@ pub(crate) fn global_commit_rwlock() -> &'static std::sync::RwLock<()> {
     GLOBAL_RWLOCK.get_or_init(|| std::sync::RwLock::new(()))
 }
 
-pub(crate) fn acquire_file_lock(lock_path: &Utf8Path, target: &Utf8Path) -> Result<std::fs::File> {
-    // Open with no-follow semantics so check and use cannot diverge (E14f
-    // SENSITIVE): Unix opens with O_NOFOLLOW at use time; a planted symlink
-    // fails the open instead of redirecting the lock outside the install
-    // tree. Non-Unix does a pre-check plus a post-open re-check (no
-    // O_NOFOLLOW exists there). Inspection failures other than absence
-    // propagate fail-closed instead of proceeding to open.
+fn open_install_lock(lock_path: &Utf8Path) -> Result<std::fs::File> {
+    match std::fs::symlink_metadata(lock_path) {
+        Ok(meta) if !meta.file_type().is_file() => {
+            anyhow::bail!("refusing to lock through non-regular file `{lock_path}`")
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("failed to inspect install lock"),
+    }
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(false).write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        // Pre-check for a clear symlink refusal message; the O_NOFOLLOW
-        // open below is authoritative (a swap between check and open fails
-        // the open, never follows).
-        match std::fs::symlink_metadata(lock_path) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                anyhow::bail!("refusing to lock through symbolic link `{lock_path}`")
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to inspect install lock `{lock_path}`"));
-            }
-        }
-        let lock_file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(lock_path)
-            .with_context(|| format!("failed to open install lock `{lock_path}`"))?;
-        // Post-open verification: the opened handle must not be a symlink
-        // (O_NOFOLLOW already guarantees this; the re-check closes any
-        // platform gap best-effort).
-        // Fail closed on inspection errors (E14/G-1): an unscannable
-        // lock path proves nothing about symlinks, so proceeding would be
-        // fail-open. Only NotFound is impossible here (the path was just
-        // opened/created above) and still refuses like any other error.
-        if std::fs::symlink_metadata(lock_path)
-            .map(|meta| meta.file_type().is_symlink())
-            .with_context(|| format!("failed to inspect install lock `{lock_path}`"))?
-        {
-            anyhow::bail!("refusing to lock through symbolic link `{lock_path}`");
-        }
-        // Blocking exclusive lock: holders of the same lock file serialize (E14).
-        lock_file
-            .lock()
-            .with_context(|| format!("failed to lock install `{target}`"))?;
-        Ok(lock_file)
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    #[cfg(not(unix))]
-    {
-        match std::fs::symlink_metadata(lock_path) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                anyhow::bail!("refusing to lock through symbolic link `{lock_path}`")
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to inspect install lock `{lock_path}`"));
-            }
-        }
-        let lock_file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(lock_path)
-            .with_context(|| format!("failed to open install lock `{lock_path}`"))?;
-        // Post-open re-check (no O_NOFOLLOW on this platform): a symlink
-        // swapped in between pre-check and open fails closed here instead of
-        // locking through it.
-        // Fail closed on inspection errors (E14/G-1): an unscannable
-        // lock path proves nothing about symlinks, so proceeding would be
-        // fail-open. Only NotFound is impossible here (the path was just
-        // opened/created above) and still refuses like any other error.
-        if std::fs::symlink_metadata(lock_path)
-            .map(|meta| meta.file_type().is_symlink())
-            .with_context(|| format!("failed to inspect install lock `{lock_path}`"))?
-        {
-            anyhow::bail!("refusing to lock through symbolic link `{lock_path}`");
-        }
-        // Blocking exclusive lock: holders of the same lock file serialize (E14).
-        lock_file
-            .lock()
-            .with_context(|| format!("failed to lock install `{target}`"))?;
-        Ok(lock_file)
+    let file = options
+        .open(lock_path)
+        .with_context(|| format!("failed to open install lock `{lock_path}`"))?;
+    if !file.metadata()?.is_file() || !std::fs::symlink_metadata(lock_path)?.file_type().is_file() {
+        anyhow::bail!("refusing to lock through non-regular file `{lock_path}`");
     }
+    Ok(file)
+}
+
+pub(crate) fn acquire_file_lock(lock_path: &Utf8Path, target: &Utf8Path) -> Result<std::fs::File> {
+    let file = open_install_lock(lock_path)?;
+    file.lock()
+        .with_context(|| format!("failed to lock install `{target}`"))?;
+    Ok(file)
 }
 
 pub(crate) fn acquire_file_lock_shared(
     lock_path: &Utf8Path,
     target: &Utf8Path,
 ) -> Result<std::fs::File> {
-    // Shared variant of the lock above for commits holding the global lock
-    // as readers: many installs may share it, one uninstall excludes all.
-    // Same no-follow semantics as the exclusive variant (E14f SENSITIVE).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        match std::fs::symlink_metadata(lock_path) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                anyhow::bail!("refusing to lock through symbolic link `{lock_path}`")
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to inspect install lock `{lock_path}`"));
-            }
-        }
-        let lock_file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(lock_path)
-            .with_context(|| format!("failed to open install lock `{lock_path}`"))?;
-        // Fail closed on inspection errors (E14/G-1): an unscannable
-        // lock path proves nothing about symlinks, so proceeding would be
-        // fail-open. Only NotFound is impossible here (the path was just
-        // opened/created above) and still refuses like any other error.
-        if std::fs::symlink_metadata(lock_path)
-            .map(|meta| meta.file_type().is_symlink())
-            .with_context(|| format!("failed to inspect install lock `{lock_path}`"))?
-        {
-            anyhow::bail!("refusing to lock through symbolic link `{lock_path}`");
-        }
-        // Blocking shared lock: parallel installs proceed together (E14).
-        lock_file
-            .lock_shared()
-            .with_context(|| format!("failed to lock install `{target}`"))?;
-        Ok(lock_file)
-    }
-    #[cfg(not(unix))]
-    {
-        match std::fs::symlink_metadata(lock_path) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                anyhow::bail!("refusing to lock through symbolic link `{lock_path}`")
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to inspect install lock `{lock_path}`"));
-            }
-        }
-        let lock_file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(lock_path)
-            .with_context(|| format!("failed to open install lock `{lock_path}`"))?;
-        // Fail closed on inspection errors (E14/G-1): an unscannable
-        // lock path proves nothing about symlinks, so proceeding would be
-        // fail-open. Only NotFound is impossible here (the path was just
-        // opened/created above) and still refuses like any other error.
-        if std::fs::symlink_metadata(lock_path)
-            .map(|meta| meta.file_type().is_symlink())
-            .with_context(|| format!("failed to inspect install lock `{lock_path}`"))?
-        {
-            anyhow::bail!("refusing to lock through symbolic link `{lock_path}`");
-        }
-        // Blocking shared lock: parallel installs proceed together (E14).
-        lock_file
-            .lock_shared()
-            .with_context(|| format!("failed to lock install `{target}`"))?;
-        Ok(lock_file)
+    let file = open_install_lock(lock_path)?;
+    file.lock_shared()
+        .with_context(|| format!("failed to lock install `{target}`"))?;
+    Ok(file)
+}
+
+/// Maintenance never waits for an active commit and retains the returned
+/// handle through recovery or deletion. Opening or locking errors propagate.
+pub(crate) fn try_acquire_file_lock(lock_path: &Utf8Path) -> Result<Option<std::fs::File>> {
+    let file = open_install_lock(lock_path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
     }
 }
 
@@ -566,11 +448,6 @@ pub(crate) fn commit_install(
     target: &Utf8Path,
     replace_existing: bool,
 ) -> Result<()> {
-    // Recovery before locking (F14): if a previous commit died between
-    // target->backup and new-target publish, `target` is missing with a
-    // backup sibling intact. Restore the newest backup for this id before
-    // any sweep or commit can delete the sole old version.
-    recover_interrupted_backup(target);
     // Per-id serialization in-process plus per-id file lock across
     // processes, held for the whole backup+rename window. Fresh installs
     // race too (two NotFound observers both renaming): without the lock
@@ -600,6 +477,7 @@ pub(crate) fn commit_install(
     let _global_file_guard = acquire_file_lock_shared(&global_path, target)?;
     let lock_path = parent.join(per_id_lock_name(id));
     let _file_guard = acquire_file_lock(&lock_path, target)?;
+    recover_interrupted_backup(target);
     let backup = if replace_existing {
         let backup = loop {
             let candidate = unique_nonexistent_path(parent, "install-backup")?;
@@ -757,6 +635,13 @@ pub(crate) fn uninstall(id: &str, generators_dir: &Utf8Path, yes: bool) -> Resul
     if !yes {
         confirm_stdin(&format!("Uninstall generator `{id}`?"))?;
     }
+    // Remove owned recovery copies while holding the same per-id lock.
+    // Otherwise later maintenance could resurrect a successfully uninstalled id.
+    // Do this before removing the target so cleanup failure leaves it installed.
+    for backup in backup_candidates_for(generators_dir, id) {
+        remove_owned_path(&backup)
+            .with_context(|| format!("failed to remove backup `{backup}` before uninstall"))?;
+    }
     std::fs::remove_dir_all(&target)
         .with_context(|| format!("failed to remove generator `{target}`"))?;
     Ok(())
@@ -900,8 +785,7 @@ pub(crate) fn recover_interrupted_backup(target: &Utf8Path) {
 }
 
 /// Lists backup siblings whose marker names this target id (F14). Marker
-/// parsing is best-effort: unmarked directories are scratch, not recovery
-/// backups, and are left to the age-gated scratch path.
+/// parsing is best-effort: unmarked directories have unknown ownership and are retained.
 pub(crate) fn backup_candidates_for(parent: &Utf8Path, id: &str) -> Vec<Utf8PathBuf> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(parent) else {
@@ -925,13 +809,22 @@ pub(crate) fn backup_candidates_for(parent: &Utf8Path, id: &str) -> Vec<Utf8Path
     out
 }
 
-fn backup_marker_id(backup: &Utf8Path) -> Option<String> {
-    let bytes = std::fs::read(backup.join(BACKUP_MARKER_FILE)).ok()?;
+pub(crate) fn backup_marker_id(backup: &Utf8Path) -> Option<String> {
+    if !std::fs::symlink_metadata(backup).ok()?.file_type().is_dir() {
+        return None;
+    }
+    let marker = backup.join(BACKUP_MARKER_FILE);
+    if !std::fs::symlink_metadata(&marker)
+        .ok()?
+        .file_type()
+        .is_file()
+    {
+        return None;
+    }
+    let bytes = files::read_nofollow_bounded(&marker, Some(16 * 1024)).ok()?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    value
-        .get("id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
+    let id = value.get("id")?.as_str()?;
+    policy::is_safe_path_component(id).then(|| id.to_string())
 }
 
 /// Freshness of a backup (F14-01): the max of the directory mtime and the

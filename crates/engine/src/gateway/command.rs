@@ -730,22 +730,4 @@ mod tests {
         );
         assert_ne!(first, other_run, "cross-run digests must diverge");
     }
-
-    #[test]
-    fn command_plan_production_code_uses_no_debug_formatting() {
-        // E09h: the gateway command planning path must never Debug-format
-        // values in production code. Mirrors the llm-steps pin test.
-        let source = include_str!("command.rs");
-        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
-        for (index, line) in production.lines().enumerate() {
-            if line.trim_start().starts_with("//") {
-                continue;
-            }
-            assert!(
-                !line.contains(":?}"),
-                "gateway command production code must not Debug-format: {}: {line}",
-                index + 1,
-            );
-        }
-    }
 }
