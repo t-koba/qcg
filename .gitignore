@@ -67,3 +67,5 @@ docs/*benchmark*.json
 docs/comparison-results.json
 docs/dify-comparison-results.json
 docs/performance-environment.json
+
+/.mizu/
