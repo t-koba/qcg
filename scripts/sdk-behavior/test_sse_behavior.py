@@ -13,7 +13,7 @@ from pathlib import Path
 
 CLIENT = Path(__file__).resolve().parents[2] / "clients" / "python"
 sys.path.insert(0, str(CLIENT))
-from qcg_client import QcgClient  # noqa: E402
+from qcg_client import QcgClient, QcgError, RunSnapshot, QueuePositionQuality  # noqa: E402
 
 
 class FakeRaw:
@@ -231,6 +231,11 @@ class FakeHttpResponse:
 
 def test_typed_readers() -> None:
     """G07-04: JSON/text/bytes/NDJSON/empty/304 readers over mocked transport."""
+    from typing import get_args, get_type_hints
+    assert get_type_hints(RunSnapshot)["queue_position_quality"] == QueuePositionQuality
+    assert set(get_args(QueuePositionQuality)) == {"exact", "estimated", "unavailable"}
+    assert "running" in get_args(get_type_hints(RunSnapshot)["state"])
+    assert {"run_id", "generator_id", "state"} <= RunSnapshot.__required_keys__
     client = QcgClient(base_url="http://127.0.0.1:9")
 
     def serve(status: int, payload: bytes):
@@ -251,10 +256,25 @@ def test_typed_readers() -> None:
     print("typed readers passed")
 
 
+def test_frame_limit() -> None:
+    try:
+        collect_with_fake(b"data:" + b"x" * (16 * 1024 * 1024 + 1), [65536])
+    except QcgError as error:
+        assert "SSE frame exceeds" in str(error)
+    else:
+        raise AssertionError("unterminated oversized SSE frame was accepted")
+
+
 if __name__ == "__main__":
     test_g04_02_split_positions_match_unsplit()
     test_g04_03_multi_data_and_eof()
     test_g04_04_release_on_break_and_error()
     test_g04_01_immediate_delivery_over_real_http()
     test_typed_readers()
+    test_frame_limit()
     print("Python SSE behavior: all G04 checks passed")
+
+for fixture in json.loads((Path(__file__).resolve().parents[1] / "fixtures/sse.json").read_text()):
+    wire = bytes.fromhex(fixture["wire_hex"]) if "wire_hex" in fixture else fixture["wire"].encode("utf-8")
+    for size in range(1, len(wire) + 1):
+        assert collect_with_fake(wire, [size]) == fixture["payloads"], fixture["name"]

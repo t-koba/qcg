@@ -2101,6 +2101,14 @@
         ],
         "type": "object"
       },
+      "QueuePositionQuality": {
+        "enum": [
+          "exact",
+          "estimated",
+          "unavailable"
+        ],
+        "type": "string"
+      },
       "ReasonEventData": {
         "additionalProperties": false,
         "properties": {
@@ -3026,6 +3034,10 @@
               "integer",
               "null"
             ]
+          },
+          "queue_position_quality": {
+            "$ref": "#/components/schemas/QueuePositionQuality",
+            "default": "unavailable"
           },
           "queued_at": {
             "default": null,
@@ -4824,6 +4836,33 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Return 304 when the artifact digest matches.",
+            "in": "header",
+            "name": "If-None-Match",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "One bytes=start-end, bytes=start- or bytes=-suffix range.",
+            "in": "header",
+            "name": "Range",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Apply Range only when this strong ETag matches.",
+            "in": "header",
+            "name": "If-Range",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -4836,7 +4875,69 @@
                 }
               }
             },
-            "description": "Artifact bytes"
+            "description": "Artifact bytes",
+            "headers": {
+              "Accept-Ranges": {
+                "description": "Supported range unit: bytes.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Content-Disposition": {
+                "description": "Attachment filename.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "ETag": {
+                "description": "Strong validator naming the verified artifact SHA-256.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "206": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Requested byte range",
+            "headers": {
+              "Accept-Ranges": {
+                "description": "Supported range unit: bytes.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Content-Disposition": {
+                "description": "Attachment filename.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "ETag": {
+                "description": "Strong validator naming the verified artifact SHA-256.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "Not modified",
+            "headers": {
+              "ETag": {
+                "description": "Weak validator for conditional GET requests.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "content": {
@@ -4860,6 +4961,19 @@
               }
             },
             "description": "Resource not found"
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Payload too large"
+          },
+          "416": {
+            "description": "Unsatisfiable byte range; Content-Range gives the artifact length"
           },
           "429": {
             "$ref": "#/components/responses/TooManyRequests"

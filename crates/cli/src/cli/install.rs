@@ -603,6 +603,9 @@ version = "1.0.0"
 
     #[tokio::test]
     async fn installed_parent_repairs_a_missing_dependency_closure() {
+        if env_process::isolated() {
+            return;
+        }
         // E14: re-running an installed parent must verify (and attempt to
         // repair) its dependency closure instead of returning success.
         let root = test_root("closure");
@@ -635,6 +638,9 @@ version = "1.0.0"
 
     #[tokio::test]
     async fn installed_package_tamper_fails_inventory_verification() {
+        if env_process::isolated() {
+            return;
+        }
         // E14: a modified installed package must fail inventory
         // verification instead of being silently reused.
         let root = test_root("tamper");
@@ -666,6 +672,9 @@ version = "1.0.0"
 
     #[tokio::test]
     async fn installed_parent_fails_closed_when_registry_fetch_fails() {
+        if env_process::isolated() {
+            return;
+        }
         // E14: a configured but unreachable registry must fail the repair
         // instead of being skipped as if the closure were complete.
         let root = test_root("fetch");
@@ -695,6 +704,9 @@ version = "1.0.0"
 
     #[tokio::test]
     async fn installed_cycle_is_rejected() {
+        if env_process::isolated() {
+            return;
+        }
         // E14: a true A -> B -> A dependency cycle fails closed instead of
         // recursing forever or being silently accepted.
         let root = test_root("cycle");
@@ -719,6 +731,9 @@ version = "1.0.0"
 
     #[tokio::test]
     async fn installed_closure_accepts_a_diamond_without_a_registry() {
+        if env_process::isolated() {
+            return;
+        }
         // E14: a diamond (A -> {B, C} -> D) must resolve without false
         // cycle detection and without consulting a registry once every
         // package in the closure is installed.
@@ -972,6 +987,9 @@ version = "1.0.0"
 
     #[tokio::test]
     async fn direct_install_verifies_inventory_and_reports_partial_closure() {
+        if env_process::isolated() {
+            return;
+        }
         // E14: a direct (local directory) install resolves and stages the
         // FULL closure before any commit. With an unsatisfiable dependency
         // the install refuses pre-commit and never leaves a committed
@@ -1087,6 +1105,9 @@ version = "1.0.0"
 
     #[tokio::test]
     async fn version_mismatch_diamond_fails_closed() {
+        if env_process::isolated() {
+            return;
+        }
         // E14-3: a diamond requiring two different versions of D cannot
         // converge on one install dir; the second branch fails closed
         // instead of silently last-winning.
@@ -1127,6 +1148,9 @@ version = "1.0.0"
 
     #[tokio::test]
     async fn direct_self_dependency_fails_closed() {
+        if env_process::isolated() {
+            return;
+        }
         // E14-3: a generator depending on itself is a cycle and fails
         // closed, never recursing forever.
         let root = test_root("selfdep");
@@ -1154,6 +1178,9 @@ version = "1.0.0"
 
     #[tokio::test]
     async fn first_failure_then_rerun_converges_via_real_install() {
+        if env_process::isolated() {
+            return;
+        }
         // E14 TRUE first-failure e2e (not manual fill): a direct parent
         // install with a missing dependency fails pre-commit with no parent
         // left behind; the dependency is then installed via the REAL
@@ -1245,6 +1272,9 @@ version = "1.0.0"
 
     #[tokio::test]
     async fn post_cycle_state_converges_without_residue() {
+        if env_process::isolated() {
+            return;
+        }
         // E14-10: after a cycle failure, retrying fails the same way without
         // wedging on residue; no backup or temp dirs linger.
         let root = test_root("postcycle");
@@ -1384,6 +1414,9 @@ version = "1.0.0"
 
     #[tokio::test]
     async fn staged_dir_source_is_a_private_copy_never_live() {
+        if env_process::isolated() {
+            return;
+        }
         // Gap 9: a directory source must be copied into private staging;
         // the staged path is never the live path, so later live mutations
         // cannot redirect the commit.
@@ -1432,6 +1465,9 @@ version = "1.0.0"
 
     #[tokio::test]
     async fn registry_fetch_failure_then_rerun_repairs_via_registry() {
+        if env_process::isolated() {
+            return;
+        }
         // E14: a dependency whose archive fetch fails first leaves no parent
         // behind; once the recording file:// registry serves the archive, a
         // rerun repairs the closure through the real registry path (no manual
@@ -1520,6 +1556,9 @@ version = "1.0.0"
 
     #[tokio::test]
     async fn dependency_commit_failure_keeps_prior_deps_and_rerun_converges() {
+        if env_process::isolated() {
+            return;
+        }
         // E14: a dependency commit failure leaves already-committed earlier
         // dependencies behind (documented, not rolled back); removing the
         // blocker and rerunning converges the full closure.
@@ -1607,6 +1646,9 @@ version = "1.0.0"
 
     #[tokio::test]
     async fn registry_missing_package_leaves_no_parent_behind() {
+        if env_process::isolated() {
+            return;
+        }
         // Gap 7: resolution happens before any commit, so an unresolvable
         // fresh package never leaves a parent directory behind.
         let root = test_root("noparent");
@@ -1764,4 +1806,12 @@ version = "1.0.0"
         }
         HomeGuard { _lock: lock }
     }
+}
+
+#[cfg(test)]
+mod env_process {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../scripts/test-support/environment.rs"
+    ));
 }

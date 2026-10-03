@@ -227,7 +227,11 @@ pub(crate) async fn wait_for_snapshot(
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    panic!("run did not reach state `{state}`");
+    panic!(
+        "run {id} did not reach state `{state}`; snapshot={:?}; journal={}",
+        service.snapshot(id.to_string()).await,
+        read_journal_string(service, id.to_string()).await
+    );
 }
 
 /// Waits until the exclusive runs-directory lock is free again.

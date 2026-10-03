@@ -213,15 +213,28 @@ keeps network delivery explicit and journaled.
 ## CORS and events
 
 CORS is disabled unless one or more exact `--cors-origin` values are supplied.
-Allowed request headers are `authorization`, `content-type`, and
-`idempotency-key`; credentialed CORS is not enabled. Builds without the
+Allowed request headers are `Authorization`, `Content-Type`, `idempotency-key`,
+`Last-Event-ID`, `If-None-Match`, `If-Range` and `Range`. Browsers can read
+`ETag`, `Location`, `Retry-After`, `Content-Disposition`, `Content-Range` and
+`Accept-Ranges`; credentialed CORS is not enabled. Builds without the
 `server-cors` cargo feature refuse configured origins with an explicit error
-instead of serving without CORS. Run events use SSE and support `Last-Event-ID` replay.
+instead of serving without CORS. Run events use SSE and support `Last-Event-ID`
+replay. A completed run returns only unread history and closes, including when
+the terminal cursor has no unread events. Future cursors replay all history.
+The `lagged`, `stream_error` and `shutdown` control frames do not advance the
+durable cursor; reconnect using the last real event's seq.
+
+Single-artifact downloads support a single `bytes` range, returning `206`,
+`Content-Range` and `Accept-Ranges`. A matching strong `If-Range` validator
+permits the range; a mismatch returns the complete `200` representation.
+Unsatisfiable ranges return `416` with `Content-Range: bytes */size`.
+Unsupported units and multipart ranges fall back to the complete representation.
+The complete file is verified before delivering a successful range response.
 
 ## Shutdown behavior
 
 On `SIGINT`/`SIGTERM` the server stops accepting mutating requests with
-`503` (JSON problem shape), closes event streams with an explicit
+`503` (JSON problem shape), closes active event streams with an explicit
 `shutdown` marker (distinguishing shutdown from truncation), stops resident
 tasks, and
 settles tracked runs as `Interrupted` under a 150 s outer deadline exceeded

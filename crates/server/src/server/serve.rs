@@ -90,6 +90,7 @@ pub async fn serve_with_resolved_policy(
 /// no occupied port, no lock, and no recovery behind (E04).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedServerPolicy {
+    pub read_cache_max_bytes: usize,
     pub idempotency_ttl: std::time::Duration,
     pub idempotency_max_entries: usize,
     pub max_total_steps: Option<usize>,
@@ -222,6 +223,8 @@ pub fn resolve_server_policy(config: &ServerConfig) -> Result<ResolvedServerPoli
             }
         },
     };
+    let read_cache_max_bytes =
+        parse_positive_env("READ_CACHE_MAX_BYTES", policy::DEFAULT_READ_CACHE_BYTES)?;
     let gc_keep = parse_positive_env("GC_KEEP", policy::DEFAULT_GC_KEEP)?;
     let gc_keep_failed = parse_positive_env("GC_KEEP_FAILED", policy::DEFAULT_GC_KEEP_FAILED)?;
     let gc_interval_secs = match std::env::var("GC_INTERVAL_SECS") {
@@ -317,6 +320,7 @@ pub fn resolve_server_policy(config: &ServerConfig) -> Result<ResolvedServerPoli
         return Err("api_token must not be empty when set".into());
     }
     Ok(ResolvedServerPolicy {
+        read_cache_max_bytes,
         idempotency_ttl,
         idempotency_max_entries,
         max_total_steps,
@@ -391,6 +395,7 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
     // explicit environment overrides (3.2). Invalid knobs refuse to boot
     // instead of degrading silently.
     let ResolvedServerPolicy {
+        read_cache_max_bytes,
         idempotency_ttl,
         idempotency_max_entries,
         max_total_steps,
@@ -440,6 +445,7 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
         config.max_tracked_runs,
         config.run_store_mode,
         service::ServiceDeploymentPolicy {
+            read_cache_max_bytes,
             max_total_steps,
             preemption_enabled,
             audit_floor,
@@ -1061,6 +1067,18 @@ fn apply_cors_layer(app: Router, validated_cors: &[HeaderValue]) -> Result<Route
                 header::AUTHORIZATION,
                 header::CONTENT_TYPE,
                 header::HeaderName::from_static(IDEMPOTENCY_HEADER),
+                header::HeaderName::from_static("last-event-id"),
+                header::IF_NONE_MATCH,
+                header::IF_RANGE,
+                header::RANGE,
+            ])
+            .expose_headers([
+                header::ETAG,
+                header::LOCATION,
+                header::RETRY_AFTER,
+                header::CONTENT_DISPOSITION,
+                header::CONTENT_RANGE,
+                header::ACCEPT_RANGES,
             ])
             .allow_methods([
                 Method::GET,
@@ -1970,6 +1988,11 @@ command = ["sh", "-c", "sleep 30"]"#,
 
     #[tokio::test]
     async fn rate_limit_env_knobs_are_resolved_strictly() {
+        if crate::tests::isolate_environment_test(
+            "server::serve::tests::rate_limit_env_knobs_are_resolved_strictly",
+        ) {
+            return;
+        }
         // E04: rate limit knobs are fail-closed. Zero, garbage, fractional,
         // negative, and empty values refuse boot, and so does a burst without
         // an rps; valid values freeze into the resolved policy.
@@ -2059,6 +2082,11 @@ command = ["sh", "-c", "sleep 30"]"#,
 
     #[test]
     fn bounded_policy_envs_refuse_out_of_range_values() {
+        if crate::tests::isolate_environment_test(
+            "server::serve::tests::bounded_policy_envs_refuse_out_of_range_values",
+        ) {
+            return;
+        }
         let root = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir())
             .expect("temporary directory path should be UTF-8")
             .join(format!("env-bounds-{}", uuid::Uuid::now_v7()));
@@ -2077,6 +2105,7 @@ command = ["sh", "-c", "sleep 30"]"#,
         };
         // Defaults resolve to the documented values.
         for variable in [
+            "READ_CACHE_MAX_BYTES",
             "LIVE_EVENT_CHANNEL_CAPACITY",
             "JOURNAL_POLL_INTERVAL_MS",
             "MAX_DIRECTORY_SCAN_ENTRIES",
@@ -2098,6 +2127,24 @@ command = ["sh", "-c", "sleep 30"]"#,
         );
         assert_eq!(policy.shutdown_drain.as_secs(), 30);
         assert_eq!(policy.shutdown_settle.as_secs(), 150);
+
+        unset("READ_CACHE_MAX_BYTES");
+        assert_eq!(
+            resolve_server_policy(&config).unwrap().read_cache_max_bytes,
+            policy::DEFAULT_READ_CACHE_BYTES
+        );
+        set("READ_CACHE_MAX_BYTES", "0");
+        assert!(
+            resolve_server_policy(&config)
+                .unwrap_err()
+                .contains("READ_CACHE_MAX_BYTES")
+        );
+        set("READ_CACHE_MAX_BYTES", "268435456");
+        assert_eq!(
+            resolve_server_policy(&config).unwrap().read_cache_max_bytes,
+            256 * 1024 * 1024
+        );
+        unset("READ_CACHE_MAX_BYTES");
 
         // Out-of-range values refuse boot with the variable named.
         set("LIVE_EVENT_CHANNEL_CAPACITY", "1");
@@ -2191,6 +2238,11 @@ command = ["sh", "-c", "sleep 30"]"#,
 
     #[tokio::test]
     async fn invalid_boot_policy_refuses_serve_with_listener() {
+        if crate::tests::isolate_environment_test(
+            "server::serve::tests::invalid_boot_policy_refuses_serve_with_listener",
+        ) {
+            return;
+        }
         // E04: every deployment knob refuses boot before the run-store lock
         // or recovery, with zero side effects and a released lock.
         // Covers env knobs, total-step ceiling, and capacity bounds. Provider
@@ -2469,6 +2521,11 @@ command = ["sh", "-c", "sleep 30"]"#,
 
     #[tokio::test]
     async fn resolved_policy_freeze_survives_mid_boot_env_change() {
+        if crate::tests::isolate_environment_test(
+            "server::serve::tests::resolved_policy_freeze_survives_mid_boot_env_change",
+        ) {
+            return;
+        }
         // E04 single freeze: the main path resolves once before bind and
         // serves with the frozen policy. A mid-boot environment change must
         // not move the served values: the resolved path proceeds past policy

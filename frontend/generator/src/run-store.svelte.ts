@@ -1,5 +1,5 @@
 import { ApiClient, type ConfirmSpec, type FormSpec, type GeneratorDetail, type GeneratorSummary, type InputField, type OutputArtifact, type RunEvent, type RunListResponse, type RunSnapshot, type RunStatus } from "./api/client";
-import { parseSseFrames } from "./api/sse";
+import { SseParser } from "./api/sse";
 import { evalWhen } from "./expr/loader";
 import { encodeBase64, validateFileInput } from "./field";
 import {
@@ -59,6 +59,7 @@ export interface RunTab {
   /** `question:*` answer values owned by this run. */
   answers: Record<string, unknown>;
   queuePosition: number | null;
+  queuePositionQuality: "exact" | "estimated" | "unavailable";
   queuedAt: string | null;
   pendingAction: PendingAction | null;
   lastSnapshotSeq: number;
@@ -92,6 +93,7 @@ function emptyTab(runId: string, generatorId: string, generatorName: string): Ru
     confirm: null,
     answers: {},
     queuePosition: null,
+    queuePositionQuality: "unavailable",
     queuedAt: null,
     pendingAction: null,
     lastSnapshotSeq: 0,
@@ -128,6 +130,7 @@ export class RunStore {
   question = $state<FormSpec | null>(null);
   confirm = $state<ConfirmSpec | null>(null);
   queuePosition = $state<number | null>(null);
+  queuePositionQuality = $state<"exact" | "estimated" | "unavailable">("unavailable");
   queuedAt = $state<string | null>(null);
   errorText = $state("");
   pendingAction = $state<PendingAction | null>(null);
@@ -138,7 +141,8 @@ export class RunStore {
     ),
   );
 
-  #sources: Record<string, { close(): void }> = {};
+  #sources: Record<string, { close(): void; controller: AbortController }> = {};
+  #refreshes = new Map<string, { promise: Promise<void>; again: boolean }>();
   #selectionController: AbortController | null = null;
   #cancelController: AbortController | null = null;
   #selectionVersion = 0;
@@ -373,7 +377,7 @@ export class RunStore {
   }
 
   async openRun(runId: string): Promise<void> {
-    const snapshot = await this.api.get<RunSnapshot>(`/api/runs/${encodeURIComponent(runId)}`);
+    const snapshot = await this.api.get<RunSnapshot>(`/api/runs/${encodeURIComponent(runId)}`, AbortSignal.timeout(15000));
     this.applySnapshot(snapshot);
     this.selectTab(runId);
   }
@@ -426,6 +430,7 @@ export class RunStore {
     this.question = null;
     this.confirm = null;
     this.queuePosition = null;
+    this.queuePositionQuality = "unavailable";
     this.queuedAt = null;
     this.pendingAction = null;
     // During initial restore the URL deep link owns the hash; clearing it
@@ -654,15 +659,26 @@ export class RunStore {
     this.errorText = "";
   }
 
-  async refreshRun(runId: string): Promise<void> {
-    const tab = this.tabs[runId];
-    if (!tab) return;
-    const version = ++tab.snapshotVersion;
-    this.tabs = { ...this.tabs };
-    const snapshot = await this.api.get<RunSnapshot>(`/api/runs/${encodeURIComponent(runId)}`);
-    const current = this.tabs[runId];
-    if (!current || version !== current.snapshotVersion) return;
-    this.applySnapshot(snapshot);
+  refreshRun(runId: string): Promise<void> {
+    if (!this.tabs[runId]) return Promise.resolve();
+    const pending = this.#refreshes.get(runId);
+    if (pending) { pending.again = true; return pending.promise; }
+    const entry = { again: false, promise: Promise.resolve() };
+    entry.promise = Promise.resolve().then(async () => {
+      try {
+        do {
+          entry.again = false;
+          const tab = this.tabs[runId];
+          if (!tab) return;
+          const version = ++tab.snapshotVersion;
+          const snapshot = await this.api.get<RunSnapshot>(`/api/runs/${encodeURIComponent(runId)}`, AbortSignal.timeout(15000));
+          const current = this.tabs[runId];
+          if (current && version === current.snapshotVersion) this.applySnapshot(snapshot);
+        } while (entry.again);
+      } finally { this.#refreshes.delete(runId); }
+    });
+    this.#refreshes.set(runId, entry);
+    return entry.promise;
   }
 
   applySnapshot(snapshot: RunSnapshot): void {
@@ -689,6 +705,7 @@ export class RunStore {
     tab.question = snapshot.question || null;
     tab.confirm = snapshot.confirm || null;
     tab.queuePosition = snapshot.queue_position ?? null;
+    tab.queuePositionQuality = snapshot.queue_position_quality ?? "unavailable";
     tab.queuedAt = snapshot.queued_at ?? null;
     this.tabs = { ...this.tabs };
     if (snapshot.run_id === this.currentRun) {
@@ -712,56 +729,72 @@ export class RunStore {
     // authenticated instance requires, so the stream is read from the
     // response body and resumes with Last-Event-ID after a reconnect.
     const controller = new AbortController();
-    this.#sources[runId] = { close: () => controller.abort() };
+    this.#sources[runId] = { close: () => controller.abort(), controller };
     void this.#readRunEvents(runId, controller);
   }
 
   async #readRunEvents(runId: string, controller: AbortController): Promise<void> {
-    while (!controller.signal.aborted) {
-      const tab = this.tabs[runId];
-      if (!tab || !isActive(tab.runState)) break;
-      // Resume from the last stream position, not the last retained event:
-      // the window is trimmed for display and its tail is not the cursor.
-      const last = tab.lastStreamSeq;
-      try {
-        const response = await this.api.events(runId, last || undefined, controller.signal);
-        const reader = response.body?.getReader();
-        if (!reader) throw new Error("The run event stream is not readable.");
-        const decoder = new TextDecoder();
-        let buffer = "";
-        while (!controller.signal.aborted) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          const { frames, rest } = parseSseFrames(buffer);
-          buffer = rest;
-          for (const frame of frames) {
-            try {
-              this.#applyEvent(runId, JSON.parse(frame.data) as RunEvent);
-            } catch {
-              if (runId === this.currentRun) this.errorText = "The server sent an invalid run event.";
+    try {
+      while (!controller.signal.aborted) {
+        const tab = this.tabs[runId];
+        if (!tab || !isActive(tab.runState)) break;
+        // Resume from the last stream position, not the last retained event:
+        // the window is trimmed for display and its tail is not the cursor.
+        const last = tab.lastStreamSeq;
+        try {
+          const response = await this.api.events(runId, last || undefined, controller.signal);
+          const reader = response.body?.getReader();
+          if (!reader) throw new Error("The run event stream is not readable.");
+          // Start snapshot synchronization immediately without holding the
+          // event reader behind a slow snapshot response.
+          void this.withError(() => this.refreshRun(runId));
+          const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
+          const parser = new SseParser();
+          try {
+            while (!controller.signal.aborted) {
+              const { done, value } = await reader.read();
+              if (done || controller.signal.aborted) break;
+              const frames = parser.push(decoder.decode(value, { stream: true }));
+              for (const frame of frames) {
+                try {
+                  this.#applyEvent(runId, JSON.parse(frame.data) as RunEvent);
+                } catch {
+                  if (runId === this.currentRun) this.errorText = "The server sent an invalid run event.";
+                }
+              }
             }
+          } finally {
+            try { await reader.cancel(); } catch { /* Already closed. */ }
+            reader.releaseLock();
+          }
+          if (controller.signal.aborted) return;
+          await this.withError(() => this.refreshRun(runId));
+        } catch (error) {
+          if (controller.signal.aborted) return;
+          // A refusal the server keeps returning stops the loop and says why; a
+          // dropped connection reconnects silently from the last stream position.
+          const status = (error as { status?: number }).status;
+          if (status === 401) {
+            if (runId === this.currentRun) this.errorText = this.tokenRequiredMessage();
+            return;
+          }
+          if (status !== undefined && !RETRYABLE_STREAM_STATUSES.has(status)) {
+            if (runId === this.currentRun) {
+              this.errorText = `The event stream was refused (${status}) and will not reconnect.`;
+            }
+            return;
           }
         }
-      } catch (error) {
-        if (controller.signal.aborted) return;
-        // A refusal the server keeps returning stops the loop and says why; a
-        // dropped connection reconnects silently from the last stream position.
-        const status = (error as { status?: number }).status;
-        if (status === 401) {
-          if (runId === this.currentRun) this.errorText = this.tokenRequiredMessage();
-          return;
-        }
-        if (status !== undefined && !RETRYABLE_STREAM_STATUSES.has(status)) {
-          if (runId === this.currentRun) {
-            this.errorText = `The event stream was refused (${status}) and will not reconnect.`;
-          }
-          return;
-        }
+        const current = this.tabs[runId];
+        if (!current || !isActive(current.runState) || controller.signal.aborted) break;
+        await new Promise<void>((resolve) => {
+          const finish = (): void => { clearTimeout(timer); controller.signal.removeEventListener("abort", finish); resolve(); };
+          const timer = setTimeout(finish, 1500);
+          controller.signal.addEventListener("abort", finish, { once: true });
+        });
       }
-      const current = this.tabs[runId];
-      if (!current || !isActive(current.runState) || controller.signal.aborted) break;
-      await new Promise((resolve) => setTimeout(resolve, 1500));
+    } finally {
+      if (this.#sources[runId]?.controller === controller) delete this.#sources[runId];
     }
   }
 
@@ -784,11 +817,12 @@ export class RunStore {
   #applyEvent(runId: string, event: RunEvent): void {
     const tab = this.tabs[runId];
     if (!tab) return;
-    if (event.kind === "lagged") {
+    if (["lagged", "stream_error", "shutdown"].includes(event.kind)) {
+      if (event.kind === "stream_error" && runId === this.currentRun) this.errorText = "The run event stream failed; synchronizing state.";
       void this.withError(() => this.refreshRun(runId));
       return;
     }
-    if (tab.events.some((candidate) => candidate.seq === event.seq)) return;
+    if (event.seq <= tab.lastStreamSeq || tab.events.some((candidate) => candidate.seq === event.seq)) return;
     // Progress folds from every event, including the ones the display window
     // later drops, so the aggregate and the window are updated separately.
     applyNodeProgress(tab.nodeProgressState, event);
@@ -803,8 +837,23 @@ export class RunStore {
         this.errorText = typeof data.error === "string" ? data.error : JSON.stringify(data);
       }
     }
-    if (SNAPSHOT_REFRESH_EVENT_KINDS.has(event.kind)) {
+    if (["run_finished", "run_error", "run_canceled", "run_interrupted"].includes(event.kind)) {
+      const data = record(event.data);
+      tab.runState = event.kind === "run_canceled" ? "canceled" : event.kind === "run_interrupted" ? "interrupted" : event.kind === "run_error" ? "failed" : data.status === "success" ? "succeeded" : "failed";
+      if (runId === this.currentRun) this.restoreView(tab);
+      void this.#syncTerminalSnapshot(runId);
+    } else if (SNAPSHOT_REFRESH_EVENT_KINDS.has(event.kind)) {
       void this.withError(() => this.refreshRun(runId));
+    }
+  }
+
+  async #syncTerminalSnapshot(runId: string): Promise<void> {
+    // A durable terminal event updates status immediately; recover the other
+    // snapshot fields after transient HTTP failures without reopening SSE.
+    for (let attempt = 0; attempt < 5 && this.tabs[runId]; attempt++) {
+      try { await this.refreshRun(runId); return; }
+      catch (error) { if (runId === this.currentRun) this.errorText = error instanceof Error ? error.message : String(error); }
+      await new Promise(resolve => setTimeout(resolve, Math.min(500 * 2 ** attempt, 4000)));
     }
   }
 
@@ -887,6 +936,7 @@ export class RunStore {
     tab.question = this.question;
     tab.confirm = this.confirm;
     tab.queuePosition = this.queuePosition;
+    tab.queuePositionQuality = this.queuePositionQuality;
     tab.queuedAt = this.queuedAt;
     tab.pendingAction = this.pendingAction;
     tab.answers = Object.fromEntries(
@@ -903,6 +953,7 @@ export class RunStore {
     this.question = tab.question;
     this.confirm = tab.confirm;
     this.queuePosition = tab.queuePosition;
+    this.queuePositionQuality = tab.queuePositionQuality;
     this.queuedAt = tab.queuedAt;
     this.pendingAction = tab.pendingAction;
     const formValues = Object.fromEntries(

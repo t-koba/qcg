@@ -1,0 +1,70 @@
+[
+  {
+    "name": "LF",
+    "wire": "id: 1\ndata: {\"text\":\"質問🎉\"}\n\n",
+    "payloads": [
+      {
+        "text": "質問🎉"
+      }
+    ]
+  },
+  {
+    "name": "CRLF",
+    "wire": "data: {\"text\":\"CRLF\"}\r\n\r\n",
+    "payloads": [
+      {
+        "text": "CRLF"
+      }
+    ]
+  },
+  {
+    "name": "CR and BOM",
+    "wire": "﻿data: {\"text\":\"CR\"}\r\r",
+    "payloads": [
+      {
+        "text": "CR"
+      }
+    ]
+  },
+  {
+    "name": "multiline",
+    "wire": ": comment\ndata: {\ndata:   \"text\": \"value\"\ndata: }\n\n",
+    "payloads": [
+      {
+        "text": "value"
+      }
+    ]
+  },
+  {
+    "name": "empty and EOF",
+    "wire": "data:\n\n: comment\n\ndata: {\"discard\":true}",
+    "payloads": []
+  },
+  {
+    "name": "leading spaces retained",
+    "wire": "data:  {\"text\":\"  value\"}\n\n",
+    "payloads": [
+      {
+        "text": "  value"
+      }
+    ]
+  },
+  {
+    "name": "only one leading BOM",
+    "wire": "﻿﻿data: {\"seq\":1}\n\ndata: {\"seq\":2}\n\n",
+    "payloads": [
+      {
+        "seq": 2
+      }
+    ]
+  },
+  {
+    "name": "invalid UTF-8 replaced",
+    "wire_hex": "646174613a207b2274657874223a22ff227d0a0a",
+    "payloads": [
+      {
+        "text": "�"
+      }
+    ]
+  }
+]

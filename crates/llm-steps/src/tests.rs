@@ -1358,6 +1358,9 @@ auth_header = "Authorization"
 
 #[test]
 fn web_search_requires_credential_and_network_permission() {
+    if env_process::isolated() {
+        return;
+    }
     let root = std::env::temp_dir().join(format!(
         "web-search-permission-{}-{}",
         std::process::id(),
@@ -1458,6 +1461,9 @@ fn web_search_rejects_inline_transport_configuration() {
 
 #[tokio::test]
 async fn web_search_uses_real_http_with_bounded_query_and_header_auth() {
+    if env_process::isolated() {
+        return;
+    }
     let listener =
         std::net::TcpListener::bind("127.0.0.1:0").expect("loopback listener should bind");
     let address = listener
@@ -1799,4 +1805,12 @@ fn tool_source_scan_is_depth_node_and_result_bounded() {
         deep = json!({ "nested": deep });
     }
     assert!(tool_call_sources(&deep).is_empty());
+}
+
+#[cfg(test)]
+mod env_process {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../scripts/test-support/environment.rs"
+    ));
 }

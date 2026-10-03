@@ -1,20 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-run_step() {
-  echo "==> $*"
-  "$@"
-}
-
-run_step cargo fmt --all -- --check
-run_step cargo check --workspace --locked
-run_step cargo check -p expr-wasm --target wasm32-unknown-unknown --locked
-run_step bash scripts/check-generated-docs.sh
-run_step bash scripts/check-third-party-notices.sh
-run_step cargo clippy --workspace --all-targets --locked -- -D warnings
-run_step cargo test --workspace --locked -- --test-threads=1
-run_step bash scripts/check-fixtures.sh
-run_step bash scripts/e2e-server-smoke.sh
-run_step bash scripts/package-dist.sh --dry-run
-
-echo "local core CI audit ok"
+cd "$(dirname "$0")/.."
+verification_venv="$(mktemp -d "${TMPDIR:-/tmp}/qcg-verification-python.XXXXXX")"
+trap 'rm -rf "$verification_venv"' EXIT
+python3 -m venv --without-pip "$verification_venv"
+python3 -m pip --python "$verification_venv/bin/python3" install -r scripts/requirements-spdx.txt
+export PATH="$verification_venv/bin:$PATH"
+npm --prefix frontend/generator ci
+npm --prefix frontend/generator audit --audit-level=moderate
+bash scripts/check-core.sh
+bash scripts/check-demo-local.sh

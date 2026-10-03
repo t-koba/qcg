@@ -8,6 +8,9 @@
 //! boot (ADR 0001); requests never re-read the environment.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+pub(crate) static EXPORT_FAILURES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static REJECTED_SPANS: AtomicU64 = AtomicU64::new(0);
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,9 +35,19 @@ impl OtlpConfig {
 /// disables export; a lone interval or an invalid value refuses boot instead
 /// of silently degrading.
 pub(crate) fn resolve_otlp_config() -> Result<Option<OtlpConfig>, String> {
-    let endpoint = match std::env::var("OTLP_ENDPOINT") {
-        Err(_) => {
-            if std::env::var("OTLP_INTERVAL_MS").is_ok() {
+    resolve_otlp_config_values(
+        std::env::var("OTLP_ENDPOINT").ok(),
+        std::env::var("OTLP_INTERVAL_MS").ok(),
+    )
+}
+
+fn resolve_otlp_config_values(
+    endpoint: Option<String>,
+    interval: Option<String>,
+) -> Result<Option<OtlpConfig>, String> {
+    let endpoint = match endpoint {
+        None => {
+            if interval.is_some() {
                 return Err(
                     "OTLP_INTERVAL_MS is set without OTLP_ENDPOINT; set both or neither"
                         .to_string(),
@@ -42,7 +55,7 @@ pub(crate) fn resolve_otlp_config() -> Result<Option<OtlpConfig>, String> {
             }
             return Ok(None);
         }
-        Ok(value) => {
+        Some(value) => {
             let parsed = url::Url::parse(&value)
                 .map_err(|error| format!("invalid OTLP_ENDPOINT `{value}`: {error}"))?;
             if !matches!(parsed.scheme(), "http" | "https") {
@@ -58,9 +71,9 @@ pub(crate) fn resolve_otlp_config() -> Result<Option<OtlpConfig>, String> {
             value
         }
     };
-    let interval = match std::env::var("OTLP_INTERVAL_MS") {
-        Err(_) => Duration::from_secs(5),
-        Ok(value) => match value.parse::<u64>() {
+    let interval = match interval {
+        None => Duration::from_secs(5),
+        Some(value) => match value.parse::<u64>() {
             Ok(millis) if millis >= 100 => Duration::from_millis(millis),
             _ => {
                 return Err(format!(
@@ -266,8 +279,7 @@ pub(crate) async fn run_exporter(state: Arc<AppState>, config: OtlpConfig) {
             return;
         }
     };
-    let mut cursors: BTreeMap<String, u64> = BTreeMap::new();
-    let mut completed: BTreeSet<String> = BTreeSet::new();
+    let mut cursors: BTreeMap<String, service::EventCursor> = BTreeMap::new();
     let mut interval = tokio::time::interval(config.interval);
     tracing::info!(
         endpoint = %config.redacted_endpoint(),
@@ -279,95 +291,83 @@ pub(crate) async fn run_exporter(state: Arc<AppState>, config: OtlpConfig) {
             _ = state.shutdown.cancelled() => return,
             _ = interval.tick() => {}
         }
-        let runs = match state.service.list_run_items().await {
-            Ok(runs) => runs,
-            Err(error) => {
-                tracing::warn!(%error, "OTLP exporter could not list runs");
-                continue;
-            }
-        };
-        for run in runs {
-            // Cooperative shutdown inside the scan (F01): a slow collector
-            // must not pin service state past the shutdown deadline. Check
-            // between runs so aborting the task is a fallback, not the plan.
-            if state.shutdown.is_cancelled() {
-                return;
-            }
-            if completed.contains(&run.run_id) {
-                continue;
-            }
-            let terminal = matches!(
-                run.state,
-                api::RunStatus::Succeeded
-                    | api::RunStatus::Failed
-                    | api::RunStatus::Canceled
-                    | api::RunStatus::Interrupted
-            );
-            let run_dir = match state.service.run_dir_for(&run.run_id).await {
-                Ok(run_dir) => run_dir,
-                Err(error) => {
-                    tracing::debug!(run_id = %run.run_id, %error, "OTLP exporter skipped an unreadable run");
-                    continue;
-                }
-            };
-            let events = match service::read_events_with_audit(&run_dir) {
-                Ok(events) => events,
-                Err(error) => {
-                    tracing::warn!(run_id = %run.run_id, %error, "OTLP exporter could not read run records");
-                    continue;
-                }
-            };
-            let cursor = cursors.get(&run.run_id).copied().unwrap_or(0);
-            let batch: Vec<Value> = events
-                .into_iter()
-                .filter(|event| event.get("seq").and_then(Value::as_u64).unwrap_or(0) > cursor)
-                .collect();
-            if batch.is_empty() {
-                if terminal {
-                    completed.insert(run.run_id.clone());
-                }
-                continue;
-            }
-            let max_seq = batch
-                .iter()
-                .filter_map(|event| event.get("seq").and_then(Value::as_u64))
-                .max()
-                .unwrap_or(cursor);
-            match export_batch(&client, &config.endpoint, &run.run_id, &batch).await {
-                Ok(outcome) => {
-                    if outcome.rejected_spans > 0 || outcome.rejected_log_records > 0 {
-                        // Partial success is not full success (F11-03): the
-                        // accepted spans stay accepted (no blind full resend),
-                        // but the rejection is observed instead of silently
-                        // advancing as success.
-                        tracing::warn!(
-                            run_id = %run.run_id,
-                            endpoint = %config.redacted_endpoint(),
-                            rejected_spans = outcome.rejected_spans,
-                            rejected_logs = outcome.rejected_log_records,
-                            error_message = %outcome.error_message,
-                            "OTLP collector partially rejected the batch; accepted spans advance, rejections are recorded"
-                        );
-                    }
-                    cursors.insert(run.run_id.clone(), max_seq);
-                    if terminal {
-                        completed.insert(run.run_id.clone());
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        run_id = %run.run_id,
-                        endpoint = %config.redacted_endpoint(),
-                        %error,
-                        "OTLP export failed; the batch will retry"
-                    );
-                }
-            }
+        export_cycle(
+            &state.service,
+            &client,
+            &config,
+            &mut cursors,
+            &state.shutdown,
+        )
+        .await;
+    }
+}
+
+// One independently testable observation cycle. Execution never depends on it.
+async fn export_cycle(
+    service: &service::LocalService,
+    client: &reqwest::Client,
+    config: &OtlpConfig,
+    cursors: &mut BTreeMap<String, service::EventCursor>,
+    shutdown: &tokio_util::sync::CancellationToken,
+) {
+    let runs = match service.observable_run_ids().await {
+        Ok(runs) => runs,
+        Err(error) => {
+            tracing::warn!(%error, "OTLP exporter could not list runs");
+            return;
         }
-        // Bound the completion marker set: dropping it only re-reads runs
-        // whose cursor already covers every record, so no duplicate spans.
-        if completed.len() > 4_096 {
-            completed.clear();
+    };
+    let present: BTreeSet<_> = runs.iter().cloned().collect();
+    cursors.retain(|id, _| present.contains(id));
+    use futures_util::StreamExt;
+    let jobs = runs
+        .into_iter()
+        .map(|run| {
+            let cursor = cursors.get(&run).cloned().unwrap_or_default();
+            (run, cursor)
+        })
+        .collect::<Vec<_>>();
+    let mut exports = futures_util::stream::iter(jobs)
+        .map(|(run, cursor)| {
+            let service = service.clone();
+            let endpoint = &config.endpoint;
+            async move {
+                let result = async {
+                    let batch = service
+                        .read_event_batch(&run, cursor)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let outcome = if batch.events.is_empty() {
+                        None
+                    } else {
+                        Some(export_batch(client, endpoint, &run, &batch.events).await?)
+                    };
+                    Ok::<_, String>((batch.cursor, outcome))
+                }
+                .await;
+                (run, result)
+            }
+        })
+        .buffer_unordered(8);
+    loop {
+        let next = tokio::select! {_=shutdown.cancelled()=>return, next=exports.next()=>next};
+        let Some((run, result)) = next else {
+            break;
+        };
+        match result {
+            Ok((cursor, outcome)) => {
+                if let Some(outcome) = outcome {
+                    REJECTED_SPANS.fetch_add(outcome.rejected_spans as u64, Ordering::Relaxed);
+                    if outcome.rejected_spans > 0 || !outcome.error_message.is_empty() {
+                        tracing::warn!(run_id=%run,rejected_spans=outcome.rejected_spans,error_message=%outcome.error_message,"OTLP partial success advances accepted spans without full resend");
+                    }
+                }
+                cursors.insert(run, cursor);
+            }
+            Err(error) => {
+                EXPORT_FAILURES.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(run_id=%run,%error,"OTLP export failed; batch will retry");
+            }
         }
     }
 }
@@ -379,7 +379,6 @@ pub(crate) async fn run_exporter(state: Arc<AppState>, config: OtlpConfig) {
 #[derive(Debug)]
 struct ExportOutcome {
     rejected_spans: i64,
-    rejected_log_records: i64,
     error_message: String,
 }
 
@@ -409,7 +408,7 @@ async fn export_batch(
         ));
     }
     let body = read_bounded_body(response, 64 * 1024).await?;
-    Ok(parse_partial_success(&body))
+    parse_partial_success(&body)
 }
 
 /// Reads a collector response body with an explicit bound (F11) so a
@@ -427,78 +426,61 @@ async fn read_bounded_body(response: reqwest::Response, limit: usize) -> Result<
 }
 
 /// Parses OTLP/HTTP `partial_success` from a 2xx body. Empty bodies mean
-/// full success. Unparseable bodies are treated as full success with no
-/// rejections (the transport already succeeded); only well-formed
-/// rejection counts are reported.
-fn parse_partial_success(body: &[u8]) -> ExportOutcome {
-    let trimmed: Vec<u8> = body
-        .iter()
-        .copied()
-        .filter(|b| !b.is_ascii_whitespace())
-        .collect();
-    if trimmed.is_empty() {
-        return ExportOutcome {
-            rejected_spans: 0,
-            rejected_log_records: 0,
-            error_message: String::new(),
-        };
-    }
-    let value: Value = match serde_json::from_slice(body) {
-        Ok(value) => value,
-        Err(_) => {
-            return ExportOutcome {
-                rejected_spans: 0,
-                rejected_log_records: 0,
-                error_message: String::new(),
-            };
-        }
+/// full success. Malformed nonempty bodies fail as protocol errors; rejection counts
+/// must be nonnegative integers.
+fn parse_partial_success(body: &[u8]) -> Result<ExportOutcome, String> {
+    let value: Value = if body.iter().all(u8::is_ascii_whitespace) {
+        json!({})
+    } else {
+        serde_json::from_slice(body).map_err(|e| format!("invalid OTLP response: {e}"))?
     };
-    let mut rejected_spans = 0_i64;
-    let mut rejected_logs = 0_i64;
-    let mut message = String::new();
-    // Traces response shape: { partialSuccess: { rejectedSpans, errorMessage } }
+    let fields = value.as_object().ok_or("OTLP response must be an object")?;
+    if fields
+        .keys()
+        .any(|key| !matches!(key.as_str(), "partialSuccess" | "partial_success"))
+    {
+        return Err("unrecognized OTLP response field".into());
+    }
+    let mut outcome = ExportOutcome {
+        rejected_spans: 0,
+        error_message: String::new(),
+    };
     if let Some(partial) = value
         .get("partialSuccess")
         .or_else(|| value.get("partial_success"))
     {
-        rejected_spans = partial
+        let fields = partial
+            .as_object()
+            .ok_or("OTLP partialSuccess must be an object")?;
+        if fields.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "rejectedSpans" | "rejected_spans" | "errorMessage" | "error_message"
+            )
+        }) {
+            return Err("unrecognized OTLP partialSuccess field".into());
+        }
+        if let Some(count) = partial
             .get("rejectedSpans")
             .or_else(|| partial.get("rejected_spans"))
-            .and_then(Value::as_i64)
-            .or_else(|| {
-                partial
-                    .get("rejectedSpans")
-                    .or_else(|| partial.get("rejected_spans"))
-                    .and_then(Value::as_str)
-                    .and_then(|s| s.parse::<i64>().ok())
-            })
-            .unwrap_or(0)
-            .max(0);
-        if let Some(text) = partial
+        {
+            outcome.rejected_spans = count
+                .as_i64()
+                .or_else(|| count.as_str().and_then(|s| s.parse().ok()))
+                .filter(|count| *count >= 0)
+                .ok_or("invalid OTLP rejectedSpans")?;
+        }
+        if let Some(message) = partial
             .get("errorMessage")
             .or_else(|| partial.get("error_message"))
-            .and_then(Value::as_str)
         {
-            message = text.to_string();
+            outcome.error_message = message
+                .as_str()
+                .ok_or("invalid OTLP errorMessage")?
+                .to_owned();
         }
     }
-    // Logs response shape nests under similar keys; check top-level too.
-    if let Some(logs_partial) = value
-        .get("logsPartialSuccess")
-        .or_else(|| value.get("logs_partial_success"))
-    {
-        rejected_logs = logs_partial
-            .get("rejectedLogRecords")
-            .or_else(|| logs_partial.get("rejected_log_records"))
-            .and_then(Value::as_i64)
-            .unwrap_or(0)
-            .max(0);
-    }
-    ExportOutcome {
-        rejected_spans,
-        rejected_log_records: rejected_logs,
-        error_message: message,
-    }
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -507,48 +489,28 @@ mod tests {
 
     #[test]
     fn endpoint_and_interval_are_resolved_strictly() {
-        // SAFETY: the test binary serializes nothing else that reads these
-        // variables; each case sets or clears them before resolving.
-        unsafe {
-            std::env::remove_var("OTLP_ENDPOINT");
-            std::env::remove_var("OTLP_INTERVAL_MS");
-        }
-        assert_eq!(
-            resolve_otlp_config().expect("unset endpoint must resolve"),
-            None
-        );
-        unsafe {
-            std::env::set_var("OTLP_INTERVAL_MS", "1000");
-        }
-        let error = resolve_otlp_config().expect_err("a lone interval must refuse boot");
-        assert!(error.contains("OTLP_INTERVAL_MS"), "{error}");
-        unsafe {
-            std::env::remove_var("OTLP_INTERVAL_MS");
-            std::env::set_var("OTLP_ENDPOINT", "ftp://collector");
-        }
-        let error = resolve_otlp_config().expect_err("non-http schemes must refuse boot");
-        assert!(error.contains("scheme"), "{error}");
-        unsafe {
-            std::env::set_var("OTLP_ENDPOINT", "https://collector.example/v1/traces");
-        }
-        assert_eq!(
-            resolve_otlp_config().expect("valid endpoint must resolve"),
-            Some(OtlpConfig {
-                endpoint: "https://collector.example/v1/traces".into(),
-                interval: Duration::from_secs(5),
-            })
-        );
-        unsafe {
-            std::env::set_var("OTLP_INTERVAL_MS", "99");
-        }
+        let resolve = |endpoint: Option<&str>, interval: Option<&str>| {
+            resolve_otlp_config_values(endpoint.map(str::to_owned), interval.map(str::to_owned))
+        };
+        assert_eq!(resolve(None, None).unwrap(), None);
         assert!(
-            resolve_otlp_config().is_err(),
-            "sub-100ms cadence must refuse"
+            resolve(None, Some("1000"))
+                .unwrap_err()
+                .contains("OTLP_INTERVAL_MS")
         );
-        unsafe {
-            std::env::remove_var("OTLP_ENDPOINT");
-            std::env::remove_var("OTLP_INTERVAL_MS");
-        }
+        assert!(
+            resolve(Some("ftp://collector"), None)
+                .unwrap_err()
+                .contains("scheme")
+        );
+        assert_eq!(
+            resolve(Some("https://collector.example/v1/traces"), None)
+                .unwrap()
+                .unwrap()
+                .interval,
+            Duration::from_secs(5)
+        );
+        assert!(resolve(Some("https://collector.example/v1/traces"), Some("99")).is_err());
     }
 
     #[test]
@@ -666,13 +628,22 @@ mod tests {
         // treated as full success.
         let outcome = parse_partial_success(
             br#"{"partialSuccess":{"rejectedSpans":"3","errorMessage":"quota"}}"#,
-        );
+        )
+        .unwrap();
         assert_eq!(outcome.rejected_spans, 3);
         assert_eq!(outcome.error_message, "quota");
-        let full = parse_partial_success(b"");
+        let full = parse_partial_success(b"").unwrap();
         assert_eq!(full.rejected_spans, 0);
-        let snake = parse_partial_success(br#"{"partial_success":{"rejected_spans":2}}"#);
+        let snake = parse_partial_success(br#"{"partial_success":{"rejected_spans":2}}"#).unwrap();
         assert_eq!(snake.rejected_spans, 2);
+        for body in [
+            b"not json".as_slice(),
+            b"[]",
+            br#"{"partialSuccess":true}"#,
+            br#"{"partialSuccess":{"rejectedSpans":-1}}"#,
+        ] {
+            assert!(parse_partial_success(body).is_err());
+        }
     }
 
     /// Minimal collector double: serves one scripted response per test.
@@ -682,14 +653,27 @@ mod tests {
     ) -> (String, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback should bind");
+        listener.set_nonblocking(true).unwrap();
         let endpoint = format!(
             "http://{}/v1/traces",
             listener.local_addr().expect("address")
         );
         let handle = std::thread::spawn(move || {
-            let Ok((mut stream, _)) = listener.accept() else {
-                return;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "collector received no request before deadline"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("collector accept: {error}"),
+                }
             };
+            stream.set_nonblocking(false).unwrap();
             let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
             let mut head = Vec::new();
             let mut byte = [0u8; 1];
@@ -733,6 +717,67 @@ mod tests {
             "node": "build",
             "status": "success",
         })]
+    }
+
+    #[tokio::test]
+    async fn observation_cycles_isolate_corruption_advance_partial_success_and_prune_gc() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let root = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir())
+                .unwrap()
+                .join(format!("qcg-otlp-cycle-{}", uuid::Uuid::now_v7()));
+            let service =
+                crate::tests::single_run_service(root.join("generators"), root.join("runs"));
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap();
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let mut cursors = BTreeMap::new();
+            let bad = root.join("runs/bad/meta");
+            std::fs::create_dir_all(&bad).unwrap();
+            std::fs::write(bad.join("journal.jsonl"), "{bad json\n").unwrap();
+            for iteration in 0..8 {
+                let id = format!("good-{iteration}");
+                let meta = root.join("runs").join(&id).join("meta");
+                std::fs::create_dir_all(&meta).unwrap();
+                let mut event = sample_events().remove(0);
+                event["run_id"] = json!(id);
+                // Use an internal envelope without a public payload schema;
+                // the observation path must not fold execution state.
+                event["t"] = json!("budget_charged");
+                event["amount"] = json!(0);
+                std::fs::write(meta.join("journal.jsonl"), format!("{event}\n")).unwrap();
+                let (endpoint, collector) =
+                    serve_collector_once(200, br#"{"partialSuccess":{"rejectedSpans":1}}"#);
+                let config = OtlpConfig {
+                    endpoint,
+                    interval: Duration::from_millis(100),
+                };
+                export_cycle(&service, &client, &config, &mut cursors, &shutdown).await;
+                collector.join().unwrap();
+                assert_eq!(
+                    cursors.len(),
+                    1,
+                    "bad run must not block or retain a cursor"
+                );
+                assert!(cursors.contains_key(&id));
+                // The collector is now closed. A blind resend would fail,
+                // while the advanced cursor reads no events and stays put.
+                export_cycle(&service, &client, &config, &mut cursors, &shutdown).await;
+                let empty = service
+                    .read_event_batch(&id, cursors[&id].clone())
+                    .await
+                    .unwrap();
+                assert!(empty.events.is_empty());
+                std::fs::remove_dir_all(meta.parent().unwrap()).unwrap();
+                export_cycle(&service, &client, &config, &mut cursors, &shutdown).await;
+                assert!(cursors.is_empty(), "GC must prune cursors on every cycle");
+            }
+            drop(service);
+            std::fs::remove_dir_all(root).unwrap();
+        })
+        .await
+        .expect("OTLP observation cycles exceeded the whole-test deadline");
     }
 
     #[tokio::test]

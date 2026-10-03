@@ -312,76 +312,13 @@ export class QcgClient {
     }
     const reader = response.body!.getReader();
     try {
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let pendingCr = false;
-      // H05: SSE ignores one leading BOM. TextDecoder already strips a
-      // complete BOM, but a split BOM or a decoder that preserves it must
-      // not drop the first event; only the stream-start U+FEFF is removed.
-      let bomChecked = false;
+      const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
+      const parser = new SseParser();
       while (true) {
         const { done, value } = await reader.read();
-        if (done) {
-          // H05: the trailing CR was already emitted immediately, so EOF
-          // only clears the split-CRLF guard, then dispatches frames
-          // already terminated by a blank line and discards only the truly
-          // unterminated tail (SSE spec). The decoder flush only completes
-          // a split multibyte character, which can never create the ASCII
-          // blank line that frames an event.
-          try {
-            decoder.decode();
-          } catch {
-            // Best-effort flush: a malformed tail is still discarded.
-          }
-          pendingCr = false;
-          let tail = buffer.indexOf("\n\n");
-          while (tail >= 0) {
-            const frame = buffer.slice(0, tail);
-            buffer = buffer.slice(tail + 2);
-            const payload = parseSseFrame(frame);
-            if (payload !== undefined) yield payload;
-            tail = buffer.indexOf("\n\n");
-          }
-          return;
-        }
-        let piece = decoder.decode(value, { stream: true });
-        if (!bomChecked && piece) {
-          if (piece.charCodeAt(0) === 0xfeff) piece = piece.slice(1);
-          bomChecked = true;
-        }
-        // H05: CR is a complete line break immediately; pendingCr only
-        // swallows one LF of a CRLF pair split across chunks. Holding the
-        // CR would delay a CRLF/CR-terminated event past its flush.
-        if (pendingCr) {
-          if (piece.startsWith("\n")) {
-            piece = piece.slice(1);
-          }
-          pendingCr = false;
-        }
-        let trailingCr = false;
-        if (piece.endsWith("\r")) {
-          piece = piece.slice(0, -1);
-          pendingCr = true;
-          trailingCr = true;
-        }
-        if (piece) {
-          piece = piece.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-          buffer += piece;
-        }
-        if (trailingCr) {
-          buffer += "\n";
-        }
-        if (!bomChecked && buffer.charCodeAt(0) === 0xfeff) {
-          buffer = buffer.slice(1);
-          bomChecked = true;
-        }
-        let boundary = buffer.indexOf("\n\n");
-        while (boundary >= 0) {
-          const frame = buffer.slice(0, boundary);
-          buffer = buffer.slice(boundary + 2);
-          const payload = parseSseFrame(frame);
-          if (payload !== undefined) yield payload;
-          boundary = buffer.indexOf("\n\n");
+        if (done) return;
+        for (const frame of parser.push(decoder.decode(value, { stream: true }))) {
+          if (frame.data) yield JSON.parse(frame.data);
         }
       }
     } finally {
@@ -458,8 +395,8 @@ export class QcgClient {
     return this.requestBytes("GET", `/api/runs/${encodeURIComponent(id)}/artifacts.zip`);
   }
 
-  async readArtifact(id: string, path: string): Promise<Uint8Array | null> {
-    return this.requestBytes("GET", `/api/runs/${encodeURIComponent(id)}/artifacts/${encodePathParam(path)}`);
+  async readArtifact(id: string, path: string, options?: { headers?: Record<string, string> }): Promise<Uint8Array | null> {
+    return this.requestBytes("GET", `/api/runs/${encodeURIComponent(id)}/artifacts/${encodePathParam(path)}`, { headers: options?.headers });
   }
 
   async downloadRunBundle(id: string): Promise<Uint8Array | null> {
@@ -503,22 +440,69 @@ export class QcgClient {
   }
 }
 
-function parseSseFrame(frame: string): unknown | undefined {
-  const data: string[] = [];
-  for (const line of frame.split("\n")) {
-    if (line.startsWith(":")) continue;
-    if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
+/** Shared SSE decoder. The SDK generator embeds this source verbatim. */
+export type SseFrame = { data: string; id?: string; event?: string };
+
+export class SseParser {
+  #line = "";
+  #data: string[] = [];
+  #id: string | undefined;
+  #event: string | undefined;
+  #skipLf = false;
+  #started = false;
+  readonly maxFrameChars = 16 * 1024 * 1024;
+  #size = 0;
+
+  push(piece: string): SseFrame[] {
+    const frames: SseFrame[] = [];
+    for (const char of piece) {
+      if (!this.#started) {
+        this.#started = true;
+        if (char === "\uFEFF") continue;
+      }
+      if (this.#skipLf) {
+        this.#skipLf = false;
+        if (char === "\n") continue;
+      }
+      if (char === "\r" || char === "\n") {
+        this.#skipLf = char === "\r";
+        const line = this.#line;
+        this.#line = "";
+        if (line === "") {
+          if (this.#data.length) frames.push({ data: this.#data.join("\n"), id: this.#id, event: this.#event });
+          this.#data = [];
+          this.#event = undefined;
+          this.#size = 0;
+        } else if (!line.startsWith(":")) {
+          const colon = line.indexOf(":");
+          const field = colon < 0 ? line : line.slice(0, colon);
+          let value = colon < 0 ? "" : line.slice(colon + 1);
+          if (value.startsWith(" ")) value = value.slice(1);
+          if (field === "data") this.#data.push(value);
+          else if (field === "id" && !value.includes("\0")) this.#id = value;
+          else if (field === "event") this.#event = value;
+        }
+      } else {
+        this.#line += char;
+        if (++this.#size > this.maxFrameChars) throw new Error("SSE frame exceeds the size limit");
+      }
+    }
+    return frames;
   }
-  if (data.length === 0) return undefined;
-  const text = data.join("\n");
-  if (!text) return undefined;
-  return JSON.parse(text) as unknown;
 }
 
-function problemMessage(problem: unknown): string {
-  if (problem && typeof problem === "object" && "detail" in problem) {
-    const detail = (problem as { detail?: unknown }).detail;
-    if (typeof detail === "string") return detail;
+/** Convenience parser for complete buffers; streaming callers retain SseParser. */
+export function parseSseFrames(buffer: string): { frames: SseFrame[]; rest: string } {
+  const parser = new SseParser();
+  const frames = parser.push(buffer);
+  let end = 0;
+  let previousBreak = false;
+  for (let index = 0; index < buffer.length; index++) {
+    if (buffer[index] === "\r" || buffer[index] === "\n") {
+      if (buffer[index] === "\r" && buffer[index + 1] === "\n") index++;
+      if (previousBreak) end = index + 1;
+      previousBreak = true;
+    } else previousBreak = false;
   }
-  return "";
+  return { frames, rest: buffer.slice(end) };
 }

@@ -190,6 +190,23 @@ impl AuditPolicy {
     /// Validates class keys and resolves the preset. Durable kinds are
     /// rejected: accepting them would claim a filter that cannot exist.
     pub fn from_config(config: &AuditConfig) -> Result<Self, String> {
+        if config
+            .max_bytes
+            .is_some_and(|value| value == 0 || value > DEFAULT_MAX_AUDIT_TOTAL_BYTES)
+        {
+            return Err(format!(
+                "audit max_bytes must be between 1 and {DEFAULT_MAX_AUDIT_TOTAL_BYTES}"
+            ));
+        }
+        if config
+            .max_events
+            .is_some_and(|value| value == 0 || value > crate::DEFAULT_MAX_JOURNAL_EVENT_COUNT)
+        {
+            return Err(format!(
+                "audit max_events must be between 1 and {}",
+                crate::DEFAULT_MAX_JOURNAL_EVENT_COUNT
+            ));
+        }
         for kind in config.classes.keys() {
             if event_class(kind) == EventClass::Durable {
                 return Err(format!(
@@ -234,9 +251,19 @@ impl AuditLimits {
     /// writer and every reader share one hard cap.
     pub fn from_config(config: &AuditConfig) -> Self {
         Self {
-            max_event_bytes: None,
-            max_total_bytes: Some(config.max_bytes.unwrap_or(DEFAULT_MAX_AUDIT_TOTAL_BYTES)),
-            max_event_count: config.max_events,
+            max_event_bytes: Some(crate::DEFAULT_MAX_JOURNAL_EVENT_BYTES),
+            max_total_bytes: Some(
+                config
+                    .max_bytes
+                    .unwrap_or(DEFAULT_MAX_AUDIT_TOTAL_BYTES)
+                    .min(DEFAULT_MAX_AUDIT_TOTAL_BYTES),
+            ),
+            max_event_count: Some(
+                config
+                    .max_events
+                    .unwrap_or(crate::DEFAULT_MAX_JOURNAL_EVENT_COUNT)
+                    .min(crate::DEFAULT_MAX_JOURNAL_EVENT_COUNT),
+            ),
         }
     }
 

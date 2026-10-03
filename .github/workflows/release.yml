@@ -10,6 +10,7 @@ jobs:
   bundle:
     name: Bundle (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -35,13 +36,18 @@ jobs:
       - name: Verify tag version
         if: startsWith(github.ref, 'refs/tags/')
         shell: bash
-        run: |
-          tag_version="${GITHUB_REF_NAME#v}"
-          cargo_version="$(cargo metadata --no-deps --format-version 1 --locked | node -e 'let s=""; process.stdin.on("data", c => s += c); process.stdin.on("end", () => { const p = JSON.parse(s).packages.find(p => p.name === "qcg"); process.stdout.write(p.version); });')"
-          test "$tag_version" = "$cargo_version" || {
-            echo "tag version $tag_version does not match Cargo version $cargo_version" >&2
-            exit 1
-          }
+        run: node scripts/product.mjs verify-version "$GITHUB_REF_NAME"
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --version 0.15.0 --locked
+
+      - name: Setup SPDX validator Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned SPDX validator
+        run: python -m pip install -r scripts/requirements-spdx.txt
 
       - name: Build bundle
         shell: bash

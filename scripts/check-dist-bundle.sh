@@ -47,7 +47,7 @@ case "$archive" in
     ;;
 esac
 
-bundle_dir="$(find "$tmp_root" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+bundle_dir="$(find "$tmp_root" -mindepth 1 -maxdepth 1 -type d ! -name dist | head -n 1)"
 if [ -z "$bundle_dir" ]; then
   echo "bundle directory was not extracted" >&2
   exit 1
@@ -74,6 +74,8 @@ test ! -e "$share_dir/docs/internal"
 test -f "$share_dir/THIRD-PARTY-NOTICES"
 test -f "$share_dir/SBOM.spdx.json"
 test ! -e "$share_dir/web"
+node scripts/verify-bundle.mjs "$share_dir"
+python3 scripts/validate-spdx.py "$share_dir/SBOM.spdx.json"
 archive_dir="$(dirname "$archive")"
 checksum_count="$(find "$archive_dir" -maxdepth 1 -type f -name 'SHA256SUMS-*' | wc -l | tr -d ' ')"
 test "$checksum_count" = "1"
@@ -86,10 +88,10 @@ mkdir -p "$tmp_root/sample-run"
 (
   cd "$tmp_root/sample-run"
   "$bin" run "$share_dir/generators/generator" \
-    --answer 'ask_purpose={"description":"Bundle smoke generated package"}' \
-    --answer 'ask_design_mode=manual' \
-    --answer 'ask_manual_form={"package":{"manifest":{"generator":{"id":"sample-gen","name":"Sample Gen","version":"0.1.0","description":"Generate a sample artifact","authors":[]},"inputs":{"stages":[{"id":"main","fields":[{"id":"request","type":"natural_language","required":true}]}]},"flow":[{"id":"emit","type":"render","artifact":{"label":"Sample artifact","preview":"text","required":true},"params":{"template":"templates/artifact.txt.j2","output_file":"README.md"}}]},"sources":{"templates/artifact.txt.j2":{"encoding":"utf8","content":"# Sample"}}}}' \
-    --answer 'ask_authority={"permissions":{"fs_read":[],"fs_write":["workspace"],"network":[],"commands":[],"containers":{"enabled":false,"images":[],"on_missing":"error"},"side_effects":"none"},"secrets":{}}' \
+    --answer 'ask_purpose:ask_user:d334a65de4f45a9aa0ef33a23d19020d6f579dfd647c1180018c5cc9225e4527={"description":"Bundle smoke generated package"}' \
+    --answer 'ask_design_mode:ask_user:c56e2588ba87dccdb2a232dbd3a3536e6bdca3fba6bbf2ee3a8ad5c5767de5cc=manual' \
+    --answer 'ask_manual_form:ask_user:cfb35af7507ce1c535b14dc0a5b605073cf27e420192ef2b6c4d074c510e3eb6={"package":{"manifest":{"generator":{"id":"sample-gen","name":"Sample Gen","version":"0.1.0","description":"Generate a sample artifact","authors":[]},"inputs":{"stages":[{"id":"main","fields":[{"id":"request","type":"natural_language","required":true}]}]},"flow":[{"id":"emit","type":"render","artifact":{"label":"Sample artifact","preview":"text","required":true},"params":{"template":"templates/artifact.txt.j2","output_file":"README.md"}}]},"sources":{"templates/artifact.txt.j2":{"encoding":"utf8","content":"# Sample"}}}}' \
+    --answer 'ask_authority:ask_user:85bcc546274c9fde9ed86f57701f8d9afac56baf0c630e430a5fc85ec1258da6={"permissions":{"fs_read":[],"fs_write":["workspace"],"network":[],"commands":[],"containers":{"enabled":false,"images":[],"on_missing":"error"},"side_effects":"none","side_effects_scope":"invocation"},"secrets":{}}' \
     --output "$tmp_root/sample-run" \
     --yes >/dev/null
 )

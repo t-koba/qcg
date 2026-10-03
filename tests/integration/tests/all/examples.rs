@@ -1832,6 +1832,9 @@ async fn llm_context_denied_rejects_non_visible_resource() {
 
 #[tokio::test]
 async fn secret_leak_rejects_secret_and_keeps_journal_redacted() {
+    if env_process::isolated() {
+        return;
+    }
     let _guard = ENV_LOCK.lock().await;
     let _secret = TestSecretEnv::set("super-secret-token");
     let result = run_fixture("secret-leak", inputs([]), answers([])).await;
@@ -1846,6 +1849,9 @@ async fn secret_leak_rejects_secret_and_keeps_journal_redacted() {
 
 #[tokio::test]
 async fn agent_secret_tool_result_is_not_cached_before_the_output_scan() {
+    if env_process::isolated() {
+        return;
+    }
     // D03: the command tool produces a declared secret on stdout without
     // any secret in its arguments. The result must be rejected by the
     // output scan without first entering the journal, state, or resend
@@ -1893,6 +1899,9 @@ async fn agent_secret_tool_result_is_not_cached_before_the_output_scan() {
 
 #[tokio::test]
 async fn agent_secret_tool_result_never_reaches_sse() {
+    if env_process::isolated() {
+        return;
+    }
     // D03: SSE replays the journal; the rejected result must not appear in
     // any streamed frame.
     let _guard = ENV_LOCK.lock().await;
@@ -1952,6 +1961,9 @@ async fn agent_secret_tool_result_never_reaches_sse() {
 
 #[tokio::test]
 async fn resumed_agent_secret_result_refuses_replay_without_reexecuting() {
+    if env_process::isolated() {
+        return;
+    }
     // D03: after the secret-rejected run, a resume must not repeat the
     // external effect. The run is restarted into the same output directory
     // so the engine folds the previous journal and recovers the state.
@@ -3622,4 +3634,12 @@ output_file = "draft.txt""#,
     .expect_err("a library child without a description must fail validation");
     assert!(error.contains("description"), "unexpected error: {error}");
     let _ = std::fs::remove_dir_all(&fixture_root);
+}
+
+#[cfg(test)]
+mod env_process {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../scripts/test-support/environment.rs"
+    ));
 }

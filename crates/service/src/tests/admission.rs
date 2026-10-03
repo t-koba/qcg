@@ -80,6 +80,10 @@ async fn queued_snapshots_expose_admission_order() {
         .expect("first snapshot should load");
     assert_eq!(first.state, RunStatus::Queued);
     assert_eq!(first.queue_position, Some(1));
+    assert_eq!(
+        first.queue_position_quality,
+        api::QueuePositionQuality::Exact
+    );
     // Display follows the durable journal instant, not the memory value,
     // so every process reports identical admission order.
     let first_journal_at =
@@ -102,7 +106,21 @@ async fn queued_snapshots_expose_admission_order() {
         .await
         .expect("running snapshot should load");
     assert_eq!(running.queue_position, None);
+    assert_eq!(
+        running.queue_position_quality,
+        api::QueuePositionQuality::Unavailable
+    );
     assert_eq!(running.queued_at, None);
+    let corrupt = root.join("runs").join("corrupt-peer");
+    prepare_api_run_directory(&corrupt).unwrap();
+    std::fs::write(run_meta_dir(&corrupt).join("journal.jsonl"), "{bad json\n").unwrap();
+    *service.inner.queue_cache.lock().await = None;
+    let estimated = service.snapshot("q-first".into()).await.unwrap();
+    assert_eq!(estimated.queue_position, Some(1));
+    assert_eq!(
+        estimated.queue_position_quality,
+        api::QueuePositionQuality::Estimated
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1041,6 +1059,10 @@ async fn unknown_admission_time_sorts_last() {
         .await
         .expect("first snapshot should load");
     assert_eq!(first.queue_position, Some(1));
+    assert_eq!(
+        first.queue_position_quality,
+        api::QueuePositionQuality::Exact
+    );
     let unknown = service
         .snapshot("q-unknown".into())
         .await

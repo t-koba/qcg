@@ -538,6 +538,9 @@ mod tests {
 
     #[test]
     fn registry_resolves_default_and_keeps_credentials_out_of_debug() {
+        if env_process::isolated() {
+            return;
+        }
         let env_name = format!("SEARCH_TEST_KEY_{}", std::process::id());
         // SAFETY: environment mutation is serialized with the crate ENV_LOCK.
         let _guard = crate::ENV_LOCK.blocking_lock();
@@ -650,4 +653,12 @@ results_pointer = "/results"
         assert!(error.contains("--providers"));
         assert!(error.contains("PROVIDERS"));
     }
+}
+
+#[cfg(test)]
+mod env_process {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../scripts/test-support/environment.rs"
+    ));
 }

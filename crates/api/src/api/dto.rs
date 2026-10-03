@@ -151,6 +151,15 @@ pub struct ConfirmSpec {
     pub scope: contract::SideEffectScope,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum QueuePositionQuality {
+    Exact,
+    Estimated,
+    #[default]
+    Unavailable,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RunSnapshot {
     pub run_id: String,
@@ -172,6 +181,8 @@ pub struct RunSnapshot {
     /// 1-based position among queued runs, present only while `Queued`.
     #[serde(default)]
     pub queue_position: Option<usize>,
+    #[serde(default)]
+    pub queue_position_quality: QueuePositionQuality,
     /// Scheduling priority, higher runs first.
     #[serde(default)]
     pub priority: i32,

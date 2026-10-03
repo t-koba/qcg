@@ -132,6 +132,62 @@ const NOT_MODIFIED_RESPONSES: &[ApiResponse] = &[ApiResponse {
     headers: ETAG_HEADERS,
 }];
 
+const ARTIFACT_REQUEST_HEADERS: &[ApiHeader] = &[
+    ApiHeader {
+        name: "If-None-Match",
+        description: "Return 304 when the artifact digest matches.",
+        required: false,
+    },
+    ApiHeader {
+        name: "Range",
+        description: "One bytes=start-end, bytes=start- or bytes=-suffix range.",
+        required: false,
+    },
+    ApiHeader {
+        name: "If-Range",
+        description: "Apply Range only when this strong ETag matches.",
+        required: false,
+    },
+];
+const ARTIFACT_RESPONSE_HEADERS: &[ApiHeader] = &[
+    ApiHeader {
+        name: "ETag",
+        description: "Strong validator naming the verified artifact SHA-256.",
+        required: true,
+    },
+    ApiHeader {
+        name: "Accept-Ranges",
+        description: "Supported range unit: bytes.",
+        required: true,
+    },
+    ApiHeader {
+        name: "Content-Disposition",
+        description: "Attachment filename.",
+        required: true,
+    },
+];
+const ARTIFACT_RESPONSES: &[ApiResponse] = &[
+    ApiResponse {
+        status: 304,
+        description: "Not modified",
+        body: ResponseBody::Empty,
+        headers: ETAG_HEADERS,
+    },
+    ApiResponse {
+        status: 206,
+        description: "Requested byte range",
+        body: ResponseBody::Binary("application/octet-stream"),
+        headers: ARTIFACT_RESPONSE_HEADERS,
+    },
+    ApiResponse {
+        status: 416,
+        description: "Unsatisfiable byte range; Content-Range gives the artifact length",
+        body: ResponseBody::Empty,
+        headers: NO_HEADERS,
+    },
+];
+const ERR_ARTIFACT: &[u16] = &[400, 404, 413, 416, 500];
+
 pub const API_ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "get",
@@ -481,13 +537,13 @@ pub const API_ROUTES: &[ApiRoute] = &[
             status: 200,
             description: "Artifact bytes",
             body: ResponseBody::Binary("application/octet-stream"),
-            headers: NO_HEADERS,
+            headers: ARTIFACT_RESPONSE_HEADERS,
         },
-        additional_responses: NO_ADDITIONAL_RESPONSES,
+        additional_responses: ARTIFACT_RESPONSES,
         request_schema: None,
-        request_headers: NO_HEADERS,
+        request_headers: ARTIFACT_REQUEST_HEADERS,
         query_parameters: NO_QUERY_PARAMETERS,
-        errors: ERR_RESOURCE,
+        errors: ERR_ARTIFACT,
     },
     ApiRoute {
         method: "delete",

@@ -102,6 +102,16 @@ pub(crate) async fn metrics(State(state): State<Arc<AppState>>) -> Result<Respon
     let mut body = String::from(
         "# HELP runs_total Number of durable runs by state.\n# TYPE runs_total gauge\n",
     );
+    body.push_str("# TYPE otlp_export_failures_total counter\n");
+    body.push_str(&format!(
+        "otlp_export_failures_total {}\n",
+        super::otlp::EXPORT_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
+    ));
+    body.push_str("# TYPE otlp_rejected_spans_total counter\n");
+    body.push_str(&format!(
+        "otlp_rejected_spans_total {}\n",
+        super::otlp::REJECTED_SPANS.load(std::sync::atomic::Ordering::Relaxed)
+    ));
     for (status, count) in states {
         body.push_str(&format!("runs_total{{state=\"{status}\"}} {count}\n"));
     }

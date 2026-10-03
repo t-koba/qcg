@@ -55,3 +55,15 @@ Desktop.ini
 
 __pycache__/
 *.pyc
+
+# Regenerable measurement evidence (benchmark/comparison outputs).
+# Reproduce locally via scripts/benchmark-http.mjs,
+# scripts/benchmark-live-sse.mjs, scripts/comparison/run.py, and the
+# read-view matrix (`cargo test read_view_performance_matrix --ignored`).
+# Host-specific snapshots, never sources: keep them out of version control.
+# `scripts/package-dist.sh` still requires them at pack time — generate
+# first, then pack.
+docs/*benchmark*.json
+docs/comparison-results.json
+docs/dify-comparison-results.json
+docs/performance-environment.json

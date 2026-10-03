@@ -10,7 +10,6 @@ use crate::run_dirs::{
 use crate::summaries::{
     fold_run_state, gc_run_directories, has_remote_cancel_request, read_merged_events_from_meta,
     read_optional_output_manifest, rehydrate_runs, run_meta_dir, run_workspace_dir,
-    status_from_journal,
 };
 use crate::types::{
     DirectRun, DirectRunEvents, FinishTransition, LocalService, LocalServiceInner, RunRecord,
@@ -160,6 +159,11 @@ impl LocalService {
         let llm_runtime = crate::run_dirs::load_llm_runtime(providers_path.as_deref())?;
         Ok(Self {
             inner: Arc::new(LocalServiceInner {
+                read_store: Arc::new(crate::read_store::ReadStore::new(
+                    max_tracked_runs,
+                    policy.read_cache_max_bytes,
+                )),
+                queue_cache: tokio::sync::Mutex::new(None),
                 generator_roots: roots,
                 runs_dir,
                 runs: RwLock::new(runs),
@@ -451,7 +455,10 @@ impl LocalService {
                 };
                 // Filesystem observations without any run-map lock.
                 let cancel_probe = has_remote_cancel_request(&run_dir)?;
-                let state = fold_run_state(&run_dir)?;
+                let directory = run_dir.clone();
+                let state = self
+                    .blocking_work(move || fold_run_state(&directory))
+                    .await?;
                 let hitl = (state.answers.clone(), state.confirmations.clone());
                 let journal_queued_at = state.queued_at.as_deref().and_then(|at| {
                     chrono::DateTime::parse_from_rfc3339(at)
@@ -622,7 +629,7 @@ impl LocalService {
         if let Err(error) = self.drain_cancel_controls(run_id, run_dir).await {
             tracing::warn!(run_id = %run_id, %error, "cancel drain failed during queued settlement; mailbox retained");
         }
-        let terminal = match crate::summaries::fold_run_state(run_dir) {
+        let terminal = match self.authoritative_state(run_dir).await {
             Ok(state) => state.terminal.clone(),
             Err(error) => {
                 tracing::error!(run_id = %run_id, %error, "state fold failed during queued settlement");
@@ -1035,17 +1042,26 @@ impl LocalService {
     /// Err so the GC task retries boundedly and then ends visibly instead
     /// of looping silently as Ok (E05).
     async fn collect_retained_runs(&self) -> Result<(), ServiceError> {
-        let maintenance_lock = match try_lock_store_maintenance(&self.inner.runs_dir)? {
-            Some(lock) => lock,
-            None => return Ok(()),
+        let directory = self.inner.runs_dir.clone();
+        let policy = self.inner.deployment_policy;
+        let maintenance_lock = self
+            .blocking_work(move || {
+                let Some(lock) = try_lock_store_maintenance(&directory)? else {
+                    return Ok(None);
+                };
+                gc_run_directories(
+                    &directory,
+                    policy.gc_keep,
+                    policy.gc_keep_failed,
+                    true,
+                    policy.max_directory_scan_entries,
+                )?;
+                Ok(Some(lock))
+            })
+            .await?;
+        let Some(maintenance_lock) = maintenance_lock else {
+            return Ok(());
         };
-        gc_run_directories(
-            &self.inner.runs_dir,
-            self.inner.deployment_policy.gc_keep,
-            self.inner.deployment_policy.gc_keep_failed,
-            true,
-            self.inner.deployment_policy.max_directory_scan_entries,
-        )?;
         let mut runs = self.inner.runs.write().await;
         let mut removed = Vec::new();
         for (id, record) in runs.iter() {
@@ -1097,30 +1113,13 @@ impl LocalService {
     }
 
     pub async fn list_run_items(&self) -> Result<Vec<RunListItem>, ApiError> {
-        // Single directory scan lives in `list_run_summaries`, which folds
-        // each run exactly once and returns its `last_seq` alongside: this
-        // layer only projects into list items so scan, filter, fold, and
-        // sort never drift apart and no second fold per run exists.
-        let summaries = crate::summaries::list_run_summaries(
-            &self.inner.runs_dir,
-            self.inner.deployment_policy.max_directory_scan_entries,
-        )
-        .map_err(api_internal)?;
-        let mut items = Vec::with_capacity(summaries.len());
-        for (summary, seq) in summaries {
-            items.push(RunListItem {
-                run_id: summary.run_id,
-                state: status_from_journal(&summary.status).map_err(api_internal)?,
-                generator_id: summary
-                    .generator
-                    .split_once('@')
-                    .map(|(id, _)| id.to_string())
-                    .unwrap_or(summary.generator),
-                started_at: summary.started_at,
-                seq,
-            });
-        }
-        Ok(items)
+        // A bounded blocking scan projects cached read views. Unchanged
+        // journals are not folded again for each list request.
+        let directory = self.inner.runs_dir.clone();
+        let cap = self.inner.deployment_policy.max_directory_scan_entries;
+        let store = self.inner.read_store.clone();
+        self.blocking_read(move || crate::summaries::list_items_cached(&directory, cap, &store))
+            .await
     }
 
     /// In-flight preemption fact for observability only: counts in-memory
@@ -1376,7 +1375,12 @@ impl LocalService {
                                     crate::types::ServiceError::Invalid(error.to_string())
                                 })
                             }
-                            None => crate::summaries::fold_run_state(&run_dir),
+                            None => {
+                                let directory = run_dir.clone();
+                                service
+                                    .blocking_work(move || fold_run_state(&directory))
+                                    .await
+                            }
                         };
                     match pre_state {
                         Ok(state) if state.terminal.is_some() => {
@@ -1795,8 +1799,10 @@ impl LocalService {
                         Err(broadcast::error::TryRecvError::Closed) => break,
                     }
                 }
-                let journal_events = read_merged_events_from_meta(&metadata_dir)
-                    .map_err(api_internal)?
+                let directory = metadata_dir.clone();
+                let journal_events = self
+                    .blocking_read(move || read_merged_events_from_meta(&directory))
+                    .await?
                     .into_iter()
                     .map(|event| RunEvent::from_flat(&event))
                     .collect::<Result<Vec<_>, _>>()
@@ -1844,7 +1850,7 @@ impl LocalService {
         // An unreadable journal fails closed toward suspension: without
         // evidence of an answer the run parks as waiting instead of
         // requeueing on a guess (E03).
-        let answered = match crate::summaries::fold_run_state(run_dir) {
+        let answered = match self.authoritative_state(run_dir).await {
             Ok(state) => state.answers.contains_key(&question.id),
             Err(error) => {
                 tracing::warn!(run_id = %run_id, %error, "suspend race check failed; keeping suspension");
@@ -1864,7 +1870,7 @@ impl LocalService {
         run_dir: &Utf8Path,
         confirm: &api::ConfirmSpec,
     ) -> bool {
-        let decided = match crate::summaries::fold_run_state(run_dir) {
+        let decided = match self.authoritative_state(run_dir).await {
             Ok(state) => state.confirmations.contains_key(&confirm.id),
             Err(error) => {
                 tracing::warn!(run_id = %run_id, %error, "suspend race check failed; keeping suspension");
@@ -1890,7 +1896,7 @@ impl LocalService {
         if service.is_shutting_down() {
             return false;
         }
-        let (answers, confirmations) = match crate::summaries::fold_run_state(run_dir) {
+        let (answers, confirmations) = match self.authoritative_state(run_dir).await {
             Ok(state) => (state.answers, state.confirmations),
             Err(error) => {
                 tracing::error!(run_id = %run_id, %error, "early answer requeue failed to fold HITL maps");
@@ -2082,7 +2088,7 @@ impl LocalService {
                 "cancel drain failed during cancellation settlement; mailbox retained"
             );
         }
-        let terminal = match fold_run_state(&record.run_dir) {
+        let terminal = match self.authoritative_state(&record.run_dir).await {
             Ok(state) => state.terminal,
             Err(error) => {
                 tracing::error!(

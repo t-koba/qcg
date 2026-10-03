@@ -15,8 +15,8 @@ python3 "$repo_root/scripts/sdk-behavior/test_sse_behavior.py"
 echo "--- TypeScript SDK behavior (G04/G05 via bundled client) ---"
 bundle_dir="$(mktemp -d "${TMPDIR:-/tmp}/qcg-ts-behavior.XXXXXX")"
 trap 'rm -rf "$bundle_dir"' EXIT
-npx -y esbuild "$repo_root/clients/ts/client.ts" \
-  --format=esm --outfile="$bundle_dir/client.mjs" --log-level=error
+(cd "$repo_root/frontend/generator" && npx --no-install esbuild "$repo_root/clients/ts/client.ts" \
+  --format=esm --outfile="$bundle_dir/client.mjs" --log-level=error)
 QCG_TS_CLIENT="$bundle_dir/client.mjs" node "$repo_root/scripts/sdk-behavior/test_sse_redirect.mjs"
 
 echo "SDK behavior check passed"

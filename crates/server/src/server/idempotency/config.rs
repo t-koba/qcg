@@ -104,6 +104,11 @@ mod tests {
 
     #[test]
     fn invalid_idempotency_policy_names_its_variable() {
+        if crate::tests::isolate_environment_test(
+            "server::idempotency::config::tests::invalid_idempotency_policy_names_its_variable",
+        ) {
+            return;
+        }
         // E04: unknown, zero, or non-numeric deployment knobs refuse at
         // startup instead of degrading silently; each error names the
         // offending variable.

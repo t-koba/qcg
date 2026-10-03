@@ -315,32 +315,17 @@ pub(crate) async fn run_events(
     // drain. Cursor filtering and future-cursor clamping mirror the live
     // path so resume semantics stay identical.
     if shutdown.is_cancelled() {
-        let run_dir = state
+        let (history, terminal_seen, last_delivered) = state
             .service
-            .run_dir_for(&id)
+            .history_events(&id, after_seq)
             .await
             .map_err(ApiHttpError::from_api)?;
-        let history = tokio::task::spawn_blocking(move || service::read_run_events(&run_dir))
-            .await
-            .map_err(|error| ApiHttpError::internal(format!("event history task failed: {error}")))?
-            .map_err(ApiHttpError::internal)?;
-        let history_last_seq = history.last().map_or(0, |event| event.seq);
-        let clamped_after = if after_seq > history_last_seq {
-            0
-        } else {
-            after_seq
-        };
-        let tail: Vec<api::RunEvent> = history
-            .into_iter()
-            .filter(|event| event.seq > clamped_after)
-            .collect();
-        let terminal_seen = tail.last().is_some_and(|event| {
-            api::is_terminal_event_kind(event.kind.as_str())
-                || api::TRANSPORT_RUN_EVENT_KINDS.contains(&event.kind.as_str())
-        });
-        let last_delivered = tail.last().map_or(clamped_after, |event| event.seq);
-        let history_stream = futures_util::stream::iter(tail.into_iter().map(|event| {
+        let terminal_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(terminal_seen));
+        let terminal_for_history = terminal_flag.clone();
+        let history_stream = history.map(move |event| {
             let seq = event.seq;
+            if api::is_terminal_event_kind(&event.kind) || event.kind==api::STREAM_ERROR_KIND {terminal_for_history.store(true,std::sync::atomic::Ordering::Relaxed);}
+            else if matches!(event.kind.as_str(),"run_queued" | "run_started" | "run_resumed") {terminal_for_history.store(false,std::sync::atomic::Ordering::Relaxed);}
             match serde_json::to_string(&event) {
                 Ok(data) => Ok(Event::default().id(seq.to_string()).data(data)),
                 Err(error) => {
@@ -360,8 +345,7 @@ pub(crate) async fn run_events(
                         .data(data))
                 }
             }
-        }));
-        let terminal_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(terminal_seen));
+        });
         let marker = shutdown_marker_stream_with_seq(
             shutdown.clone(),
             last_delivered.saturating_add(1),
@@ -394,8 +378,8 @@ pub(crate) async fn run_events(
         // A long-lived SSE connection must not hold graceful drain open:
         // closing the token ends every stream at shutdown (E05).
         .take_until(async move { shutdown_for_stream.cancelled().await })
-        // End the stream after the terminal event, so clients observe the
-        // outcome and the connection closes instead of living until GC.
+        // The service closes terminal streams after unread history, including
+        // any observation records following the terminal event.
         // An unserializable event is a bug, not a gap to paper over: close
         // the stream instead of silently continuing without it.
         .scan(false, move |done, event| {
@@ -407,7 +391,13 @@ pub(crate) async fn run_events(
             // outcome: consumers distinguish it by kind (E05).
             let is_failure = event.kind == api::STREAM_ERROR_KIND;
             let is_terminal = api::is_terminal_event_kind(event.kind.as_str()) || is_failure;
-            *done = is_terminal;
+            *done = is_failure;
+            if matches!(
+                event.kind.as_str(),
+                "run_queued" | "run_started" | "run_resumed"
+            ) {
+                terminal_for_scan.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
             if is_terminal {
                 terminal_for_scan.store(true, std::sync::atomic::Ordering::SeqCst);
             }
@@ -704,6 +694,49 @@ pub(crate) fn json_response_with_etag(
         .map_err(ApiHttpError::internal)
 }
 
+/// Single byte ranges; unsupported units/multipart ranges are ignored.
+/// If-Range only enables partial delivery for the exact strong validator.
+fn artifact_range(headers: &HeaderMap, etag: &str, size: u64) -> Result<Option<(u64, u64)>, ()> {
+    if headers
+        .get(header::IF_RANGE)
+        .is_some_and(|value| value.to_str().ok() != Some(etag))
+    {
+        return Ok(None);
+    }
+    let Some(value) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) else {
+        return Ok(None);
+    };
+    let Some(value) = value.strip_prefix("bytes=") else {
+        return Ok(None);
+    };
+    if value.contains(',') {
+        return Ok(None);
+    }
+    let Some((start, end)) = value.split_once('-') else {
+        return Ok(None);
+    };
+    if size == 0 {
+        return Err(());
+    }
+    if start.is_empty() {
+        let suffix = end.parse::<u64>().map_err(|_| ())?;
+        if suffix == 0 {
+            return Err(());
+        }
+        return Ok(Some((size.saturating_sub(suffix), size - 1)));
+    }
+    let start = start.parse::<u64>().map_err(|_| ())?;
+    let end = if end.is_empty() {
+        size - 1
+    } else {
+        end.parse::<u64>().map_err(|_| ())?.min(size - 1)
+    };
+    if start >= size || end < start {
+        return Err(());
+    }
+    Ok(Some((start, end)))
+}
+
 pub(crate) async fn read_artifact(
     State(state): State<Arc<AppState>>,
     Path((id, path)): Path<(String, String)>,
@@ -800,9 +833,24 @@ pub(crate) async fn read_artifact(
         verify_artifact_measurement(&artifact, seen, &hex::encode(hasher.finalize()))
             .map_err(ApiHttpError::internal)?;
     }
+    let range = artifact_range(&headers, &strong_etag, artifact.bytes);
+    let (start, length, partial) = match range {
+        Ok(Some((start, end))) => (start, end - start + 1, true),
+        Ok(None) => (0, artifact.bytes, false),
+        Err(()) => {
+            return Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(header::CONTENT_RANGE, format!("bytes */{}", artifact.bytes))
+                .header(header::ACCEPT_RANGES, "bytes")
+                .body(Body::empty())
+                .map_err(ApiHttpError::internal);
+        }
+    };
     {
         use tokio::io::AsyncSeekExt as _;
-        file.rewind().await.map_err(ApiHttpError::internal)?;
+        file.seek(std::io::SeekFrom::Start(start))
+            .await
+            .map_err(ApiHttpError::internal)?;
     }
     let content_type = artifact
         .mime
@@ -812,7 +860,7 @@ pub(crate) async fn read_artifact(
     let shutdown = state.shutdown.clone();
     let logged_path = artifact.path.clone();
     let logged_bytes = artifact.bytes;
-    let stream = tokio_util::io::ReaderStream::new(file)
+    let stream = tokio_util::io::ReaderStream::new(tokio::io::AsyncReadExt::take(file, length))
         .take_until(async move {
             shutdown.cancelled().await;
         })
@@ -836,13 +884,25 @@ pub(crate) async fn read_artifact(
                 })
             }
         });
-    Response::builder()
-        .status(StatusCode::OK)
+    let mut response = Response::builder()
+        .status(if partial {
+            StatusCode::PARTIAL_CONTENT
+        } else {
+            StatusCode::OK
+        })
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CONTENT_DISPOSITION, content_disposition)
-        .header(header::CONTENT_LENGTH, artifact.bytes)
+        .header(header::CONTENT_LENGTH, length)
+        .header(header::ACCEPT_RANGES, "bytes")
         .header(header::ETAG, strong_etag)
-        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::CACHE_CONTROL, "no-store");
+    if partial {
+        response = response.header(
+            header::CONTENT_RANGE,
+            format!("bytes {start}-{}/{}", start + length - 1, artifact.bytes),
+        );
+    }
+    response
         .body(Body::from_stream(stream))
         .map_err(ApiHttpError::internal)
 }
@@ -1239,6 +1299,7 @@ mod tests {
             confirm: None,
             queued_at: None,
             queue_position,
+            queue_position_quality: api::QueuePositionQuality::Unavailable,
             priority: 0,
             parent_run_id: None,
             metrics: None,
@@ -1306,31 +1367,6 @@ mod tests {
             response.status(),
             StatusCode::NOT_MODIFIED,
             "an unchanged snapshot must reuse the conditional response"
-        );
-    }
-
-    #[test]
-    fn streaming_bodies_carry_no_validator_and_pin_the_snapshot_alternative() {
-        // E16: streaming archives (bundle/zip) cannot validate without
-        // hashing the full body upfront, defeating streaming. They carry no
-        // ETag; clients condition on the snapshot or artifact-list ETag
-        // instead. This pins the alternative so a future refactor cannot
-        // silently add a diverging validator or drop the documented path.
-        let snapshot = snapshot_for_etag(Some(1), 7);
-        let snapshot_bytes = serde_json::to_vec(&snapshot).expect("snapshot should serialize");
-        let snapshot_etag = body_etag(&snapshot_bytes);
-        assert!(
-            snapshot_etag.starts_with("W/\""),
-            "the snapshot alternative must carry a validator"
-        );
-        // Bundle/zip builders in this module set content-type/disposition
-        // without an ETag header by construction; the snapshot ETag above
-        // is the pinned queue-revision alternative.
-        let bundle_has_etag = false;
-        let zip_has_etag = false;
-        assert!(
-            !bundle_has_etag && !zip_has_etag,
-            "streaming bundle/zip must carry no validator; use the snapshot ETag"
         );
     }
 
@@ -1728,6 +1764,26 @@ mod tests {
         .await
         .expect("conditional artifact read should respond");
         assert_eq!(not_modified.status(), axum::http::StatusCode::NOT_MODIFIED);
+        for response in [
+            read_run_bundle(State(state.clone()), Path(run_id.clone()))
+                .await
+                .unwrap(),
+            read_artifacts_zip(State(state.clone()), Path(run_id.clone()))
+                .await
+                .unwrap(),
+        ] {
+            assert!(
+                !response.headers().contains_key(header::ETAG),
+                "streaming archives do not expose a validator"
+            );
+            assert!(response.headers().contains_key(header::CONTENT_DISPOSITION));
+            assert!(
+                !axum::body::to_bytes(response.into_body(), 16 * 1024 * 1024)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
         // A same-size content swap fails delivery: the verifier reads the
         // open description, so the swap cannot pass the sha256 check.
         let original = std::fs::read(&resolved).expect("artifact bytes should read");

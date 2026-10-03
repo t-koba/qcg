@@ -1,30 +1,66 @@
-//! Server-sent event frame parsing for fetch-based streams.
-//!
-//! The bundled UI reads SSE from a fetch body so it can send an
-//! `Authorization` header, which EventSource cannot. Only `data` and `id`
-//! fields are used by the runtime; comments and other fields are ignored.
+/** Shared SSE decoder. The SDK generator embeds this source verbatim. */
+export type SseFrame = { data: string; id?: string; event?: string };
 
-export type SseFrame = { data: string; id?: string };
+export class SseParser {
+  #line = "";
+  #data: string[] = [];
+  #id: string | undefined;
+  #event: string | undefined;
+  #skipLf = false;
+  #started = false;
+  readonly maxFrameChars = 16 * 1024 * 1024;
+  #size = 0;
 
-/**
- * Splits complete SSE frames out of a decoded buffer and returns the
- * trailing partial frame. A frame without a `data` field is not an event.
- */
-export function parseSseFrames(buffer: string): { frames: SseFrame[]; rest: string } {
-  const frames: SseFrame[] = [];
-  let rest = buffer;
-  while (true) {
-    const boundary = rest.indexOf("\n\n");
-    if (boundary < 0) break;
-    const raw = rest.slice(0, boundary);
-    rest = rest.slice(boundary + 2);
-    let data = "";
-    let id: string | undefined;
-    for (const line of raw.split("\n")) {
-      if (line.startsWith("data:")) data += line.slice(5).trimStart();
-      else if (line.startsWith("id:")) id = line.slice(3).trim();
+  push(piece: string): SseFrame[] {
+    const frames: SseFrame[] = [];
+    for (const char of piece) {
+      if (!this.#started) {
+        this.#started = true;
+        if (char === "\uFEFF") continue;
+      }
+      if (this.#skipLf) {
+        this.#skipLf = false;
+        if (char === "\n") continue;
+      }
+      if (char === "\r" || char === "\n") {
+        this.#skipLf = char === "\r";
+        const line = this.#line;
+        this.#line = "";
+        if (line === "") {
+          if (this.#data.length) frames.push({ data: this.#data.join("\n"), id: this.#id, event: this.#event });
+          this.#data = [];
+          this.#event = undefined;
+          this.#size = 0;
+        } else if (!line.startsWith(":")) {
+          const colon = line.indexOf(":");
+          const field = colon < 0 ? line : line.slice(0, colon);
+          let value = colon < 0 ? "" : line.slice(colon + 1);
+          if (value.startsWith(" ")) value = value.slice(1);
+          if (field === "data") this.#data.push(value);
+          else if (field === "id" && !value.includes("\0")) this.#id = value;
+          else if (field === "event") this.#event = value;
+        }
+      } else {
+        this.#line += char;
+        if (++this.#size > this.maxFrameChars) throw new Error("SSE frame exceeds the size limit");
+      }
     }
-    if (data) frames.push({ data, id });
+    return frames;
   }
-  return { frames, rest };
+}
+
+/** Convenience parser for complete buffers; streaming callers retain SseParser. */
+export function parseSseFrames(buffer: string): { frames: SseFrame[]; rest: string } {
+  const parser = new SseParser();
+  const frames = parser.push(buffer);
+  let end = 0;
+  let previousBreak = false;
+  for (let index = 0; index < buffer.length; index++) {
+    if (buffer[index] === "\r" || buffer[index] === "\n") {
+      if (buffer[index] === "\r" && buffer[index + 1] === "\n") index++;
+      if (previousBreak) end = index + 1;
+      previousBreak = true;
+    } else previousBreak = false;
+  }
+  return { frames, rest: buffer.slice(end) };
 }

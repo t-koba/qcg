@@ -1,0 +1,33 @@
+{
+  "temporal_cli": {
+    "version": "1.9.1",
+    "server_version": "1.32.0",
+    "linux_amd64_archive_sha256": "09a0326a51db84d02735e53542b9ebd8c4758daf47482a9ab0abce15844e60d5"
+  },
+  "dify": {
+    "version": "1.17.1",
+    "revision": "8387590ace4a094de812b7847fc6a4c3a27cd52b",
+    "dsl_version": "0.7.0",
+    "disable_telemetry": true,
+    "container_network_internal": true,
+    "images": [
+      "langgenius/dify-api@sha256:ceede5b903afaa20348f7ad80ebf847379dc56d886a99b9ec6a08913dacd7732",
+      "langgenius/dify-plugin-daemon@sha256:34412a22d1e1d1a6c73727fef88cffbcdd9be7a21bf9ad3076b4bf5c1b88fd9b",
+      "langgenius/dify-sandbox@sha256:750e1111426ef31a9217b81c98cccfb750f17b182af3221102e420afa9f0928e",
+      "redis@sha256:b362b5dff9d14d961dc3352db4776aba6a8c53ca2661d7c74ad2c121f82cdaea",
+      "postgres@sha256:f7d23353e1b15400d22ebe31189f4d314b87a4c129cc400c8c2d8d4ca127bf81",
+      "busybox@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e",
+      "ubuntu/squid@sha256:6a097f68bae708cedbabd6188d68c7e2e7a38cedd05a176e1cc0ba29e3bbe029",
+      "nginx@sha256:540858b3a92eed95cbcae475698c12f619b4a6afa122485f439e4d7227cbeb38"
+    ]
+  },
+  "docker": {
+    "version": "29.8.2",
+    "linux_amd64_archive_sha256": "995d1ef289677f74fd58d8d2c35727b6a4ee389c69db8638a3e42d0487aa5b0f",
+    "linux_amd64_rootless_archive_sha256": "707ebf6a5afd88104086e7b6749997b2366e816aeaf2c3ef2305b08fde9ee007"
+  },
+  "compose": {
+    "version": "5.6.0",
+    "linux_amd64_binary_sha256": "40343e21ca777173e69cff5dbafeb37c6f81f3b0d57d9e597f036e95eb63e76a"
+  }
+}

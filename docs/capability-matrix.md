@@ -2,7 +2,7 @@
 
 Each row maps a user-visible guarantee to the live test that covers it.
 `scripts/check-capability-matrix.sh` fails when a named test no longer
-exists, so a guarantee cannot be silently dropped while its claim stays
+is registered in Cargo’s test listing for the current build, so a guarantee cannot be silently dropped while its claim stays
 behind (ADR 0001: no inert promises).
 
 | ID | Guarantee | Test |
@@ -47,3 +47,9 @@ behind (ADR 0001: no inert promises).
 | G04 | SSE immediate delivery and chunk-split framing | See `scripts/check-sdk-behavior.sh` (Python/Node live-server behavior tests) |
 | G05 | TypeScript redirect is finite and consistent per runtime | See `scripts/check-sdk-behavior.sh` (loop/cycle/limit/auth/release tests) |
 | G07 | Capability gate and SDK freshness/behavior separation | See `scripts/check-capability-matrix.sh` and `scripts/check-sdk-behavior.sh` |
+
+The gate reads `cargo test --workspace -- --list`, and CI separately runs the
+listed suites. Unix mode tests G06 are constrained to Unix and are excluded on
+Windows. Script guarantees are exercised by the named CI gates, rather than
+inferred from Rust function names. See [verification scope](verification-scope.md)
+for API, CLI, SDK, UI, distribution and feature/OS coverage.

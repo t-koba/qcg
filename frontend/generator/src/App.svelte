@@ -180,7 +180,7 @@
             <p class="generator-description">{store.detail.generator.description}</p>
           {/if}
           {#if store.runState === "queued" && store.queuePosition !== null}
-            <p class="queue-note">{messages.queuedPosition.replace("{position}", String(store.queuePosition))}</p>
+            <p class="queue-note">{store.queuePositionQuality === "estimated" ? "≈ " : ""}{messages.queuedPosition.replace("{position}", String(store.queuePosition))}</p>
           {/if}
         </div>
       </header>

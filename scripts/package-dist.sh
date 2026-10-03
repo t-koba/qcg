@@ -35,6 +35,11 @@ require_path() {
 }
 
 public_docs=(
+  "agent-mcp-verification.md"
+  "capability-matrix.md"
+  "verification-scope.md"
+  "performance-validation.md"
+  "comparison-protocol.md"
   "built-in-generators.md"
   "cli-reference.md"
   "contract-reference.md"
@@ -76,7 +81,7 @@ if [ -n "${HOME:-}" ]; then
   remap_flags="${remap_flags} --remap-path-prefix=${HOME}=/build"
 fi
 RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }${remap_flags}" \
-  cargo build -p cli --locked --profile "$profile"
+  cargo build -p "$(node scripts/product.mjs package)" --locked --profile "$profile"
 
 case "$(uname -s)" in
   Darwin) os="macos" ;;
@@ -87,17 +92,19 @@ esac
 arch="$(uname -m)"
 # Single rename place for distribution product id. Binary name and share dir
 # follow this value; pass a different id to rebrand without code changes.
-product_id="${PRODUCT_ID:-qcg}"
+product_id="$(node scripts/product.mjs name)"
+source_binary="$(node scripts/product.mjs binary)"
 name="${product_id}-${os}-${arch}"
 staging="${out_dir}/${name}"
 bin_name="${product_id}"
 if [ "$os" = "windows" ]; then
   bin_name="${product_id}.exe"
+  source_binary="${source_binary}.exe"
 fi
 
 rm -rf "$staging"
 mkdir -p "$staging/bin" "$staging/share/${product_id}"
-cp "target/${target_profile}/${bin_name}" "$staging/bin/"
+cp "target/${target_profile}/${source_binary}" "$staging/bin/${bin_name}"
 cp README.md "$staging/share/${product_id}/"
 cp providers.toml "$staging/share/${product_id}/providers.toml"
 cp THIRD-PARTY-NOTICES "$staging/share/${product_id}/"

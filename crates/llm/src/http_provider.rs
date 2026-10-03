@@ -1050,6 +1050,9 @@ mod loopback_stream_tests {
 
     #[tokio::test]
     async fn split_credential_across_chunks_never_publishes() {
+        if env_process::isolated() {
+            return;
+        }
         // B04: the audit counterexample shape — canary split across text
         // deltas with per-chunk metadata that defeats metadata-mixed
         // windows. The published stream must never complete the canary,
@@ -1117,6 +1120,9 @@ mod loopback_stream_tests {
 
     #[tokio::test]
     async fn clean_stream_publishes_in_full() {
+        if env_process::isolated() {
+            return;
+        }
         // The gate must not disturb honest streams: every byte publishes
         // and the stream completes.
         // SAFETY: environment mutation is serialized with ENV_LOCK; unique variable name.
@@ -1169,4 +1175,12 @@ mod stream_credential_tests {
         .unwrap();
         assert!(json_contains_string_fragment(&escaped, key));
     }
+}
+
+#[cfg(test)]
+mod env_process {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../scripts/test-support/environment.rs"
+    ));
 }

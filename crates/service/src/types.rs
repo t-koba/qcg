@@ -25,6 +25,8 @@ pub enum RunStoreMode {
 /// never be half-applied by a racing setter during recovery.
 #[derive(Debug, Clone, Copy)]
 pub struct ServiceDeploymentPolicy {
+    /// Maximum retained read-view memory charge. Zero disables retention.
+    pub read_cache_max_bytes: usize,
     pub max_total_steps: Option<usize>,
     pub preemption_enabled: bool,
     /// Deployment audit floor. It can only raise observation persistence:
@@ -54,6 +56,7 @@ pub struct ServiceDeploymentPolicy {
 impl Default for ServiceDeploymentPolicy {
     fn default() -> Self {
         Self {
+            read_cache_max_bytes: policy::DEFAULT_READ_CACHE_BYTES,
             max_total_steps: None,
             preemption_enabled: true,
             audit_floor: policy::AuditFloor::Minimal,
@@ -118,6 +121,8 @@ pub struct DirectRunEvents {
 
 #[derive(Debug)]
 pub(crate) struct LocalServiceInner {
+    pub(crate) read_store: Arc<crate::read_store::ReadStore>,
+    pub(crate) queue_cache: tokio::sync::Mutex<Option<crate::runs_api::QueueCache>>,
     /// All generator roots in precedence order; the first root containing an
     /// id wins and is also the writable install target. Later roots (for
     /// example the bundled `share/<product>/generators`) are read-only catalogs.

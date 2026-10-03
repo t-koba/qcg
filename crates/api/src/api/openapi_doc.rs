@@ -58,6 +58,9 @@ fn route_operation(route: &ApiRoute) -> Value {
         .copied()
         .chain(crate::api::routes::middleware_error_statuses(route.path))
     {
+        if responses.contains_key(&status.to_string()) {
+            continue;
+        }
         // The two failures every route inherits are referenced, not inlined, so
         // the document defines each response body once.
         if let Some(name) = middleware_response_name(status) {

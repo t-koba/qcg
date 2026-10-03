@@ -8,8 +8,33 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Iterator
+from typing import Any, Iterator, Literal, TypedDict
 from urllib.parse import quote, urlencode
+
+
+QueuePositionQuality = Literal["exact", "estimated", "unavailable"]
+RunStatus = Literal["queued", "running", "waiting", "confirming", "succeeded", "failed", "canceled", "interrupted", "cancel_requested"]
+
+
+class _RunSnapshotRequired(TypedDict):
+    generator_id: str
+    run_id: str
+    state: RunStatus
+
+
+class RunSnapshot(_RunSnapshotRequired, total=False):
+    artifacts: dict[str, Any] | None
+    confirm: dict[str, Any] | None
+    contract_sha256: str | None
+    labels: dict[str, str]
+    metrics: dict[str, Any] | None
+    parent_run_id: str | None
+    priority: int
+    question: dict[str, Any] | None
+    queue_position: int | None
+    queue_position_quality: QueuePositionQuality
+    queued_at: str | None
+    seq: int
 
 
 class QcgError(Exception):
@@ -258,7 +283,7 @@ class QcgClient:
             problem, detail = self._problem_from_error(error)
             raise QcgError(error.code, problem, detail) from error
         with contextlib.closing(raw):
-            decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
             text_buffer = ""
             pending_cr = False
             # H05: SSE ignores one leading BOM at the stream start. The
@@ -310,8 +335,10 @@ class QcgClient:
                         bom_checked = True
                     while "\n\n" in text_buffer:
                         frame, text_buffer = text_buffer.split("\n\n", 1)
+                        if len(frame) > 16 * 1024 * 1024:
+                            raise QcgError(0, None, "SSE frame exceeds 16 MiB character limit")
                         data_lines = [
-                            line[5:].lstrip() if line[5:6] == " " else line[5:]
+                            line[6:] if line[5:6] == " " else line[5:]
                             for line in frame.split("\n")
                             if line.startswith("data:")
                         ]
@@ -321,6 +348,8 @@ class QcgClient:
                         data = "\n".join(data_lines)
                         if data:
                             yield json.loads(data)
+                    if len(text_buffer) > 16 * 1024 * 1024:
+                        raise QcgError(0, None, "SSE frame exceeds 16 MiB character limit")
                 # H05: the trailing CR was already emitted immediately,
                 # so EOF only swallows a dangling split-CRLF LF, then
                 # dispatches frames already terminated by a blank line and
@@ -345,7 +374,7 @@ class QcgClient:
                 while "\n\n" in text_buffer:
                     frame, text_buffer = text_buffer.split("\n\n", 1)
                     data_lines = [
-                        line[5:].lstrip() if line[5:6] == " " else line[5:]
+                        line[6:] if line[5:6] == " " else line[5:]
                         for line in frame.split("\n")
                         if line.startswith("data:")
                     ]
@@ -393,10 +422,10 @@ class QcgClient:
     def list_runs(self, query=None):
         return self._request_json("GET", "/api/runs", query=query)
 
-    def start_run(self, body=None, headers=None, idempotency_key=None):
+    def start_run(self, body=None, headers=None, idempotency_key=None) -> RunSnapshot | None:
         return self._request_json("POST", "/api/runs", body=body, headers=headers, idempotency_key=idempotency_key)
 
-    def get_run(self, id, headers=None):
+    def get_run(self, id, headers=None) -> RunSnapshot | None:
         return self._request_json("GET", f"/api/runs/{_encode_segment(id)}", headers=headers)
 
     def delete_run(self, id):
@@ -408,19 +437,19 @@ class QcgClient:
     def download_artifacts_zip(self, id):
         return self._request_bytes("GET", f"/api/runs/{_encode_segment(id)}/artifacts.zip")
 
-    def read_artifact(self, id, path):
-        return self._request_bytes("GET", f"/api/runs/{_encode_segment(id)}/artifacts/{_encode_path(path)}")
+    def read_artifact(self, id, path, headers=None):
+        return self._request_bytes("GET", f"/api/runs/{_encode_segment(id)}/artifacts/{_encode_path(path)}", headers=headers)
 
     def download_run_bundle(self, id):
         return self._request_bytes("GET", f"/api/runs/{_encode_segment(id)}/bundle")
 
-    def confirm_run(self, id, cid, body=None, headers=None, idempotency_key=None):
+    def confirm_run(self, id, cid, body=None, headers=None, idempotency_key=None) -> RunSnapshot | None:
         return self._request_json("PUT", f"/api/runs/{_encode_segment(id)}/confirmations/{_encode_segment(cid)}", body=body, headers=headers, idempotency_key=idempotency_key)
 
     def run_events(self, id, headers=None):
         return self._request_text("GET", f"/api/runs/{_encode_segment(id)}/events", headers=headers)
 
-    def fork_run(self, id, body=None, headers=None, idempotency_key=None):
+    def fork_run(self, id, body=None, headers=None, idempotency_key=None) -> RunSnapshot | None:
         return self._request_json("POST", f"/api/runs/{_encode_segment(id)}/fork", body=body, headers=headers, idempotency_key=idempotency_key)
 
     def read_run_journal(self, id):
@@ -429,10 +458,10 @@ class QcgClient:
     def read_run_metrics(self, id):
         return self._request_json("GET", f"/api/runs/{_encode_segment(id)}/metrics")
 
-    def answer_question(self, id, qid, body=None, headers=None, idempotency_key=None):
+    def answer_question(self, id, qid, body=None, headers=None, idempotency_key=None) -> RunSnapshot | None:
         return self._request_json("PUT", f"/api/runs/{_encode_segment(id)}/questions/{_encode_segment(qid)}", body=body, headers=headers, idempotency_key=idempotency_key)
 
-    def cancel_run(self, id, headers=None, idempotency_key=None):
+    def cancel_run(self, id, headers=None, idempotency_key=None) -> RunSnapshot | None:
         return self._request_json("POST", f"/api/runs/{_encode_segment(id)}:cancel", headers=headers, idempotency_key=idempotency_key)
 
     def health(self):

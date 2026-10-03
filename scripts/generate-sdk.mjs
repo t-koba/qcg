@@ -231,6 +231,44 @@ function pyResponseKind(entry) {
   return responseKind(entry);
 }
 
+function pySnapshotTypes() {
+  const schema = spec.components.schemas.RunSnapshot;
+  const enums = new Set();
+  const enumValues = (schema) => {
+    if (schema.enum) return schema.enum;
+    if (Object.hasOwn(schema, "const")) return [schema.const];
+    if (schema.oneOf) {
+      const values = schema.oneOf.map(enumValues);
+      if (values.every(Boolean)) return values.flat();
+    }
+    return null;
+  };
+  const type = (field) => {
+    if (field.$ref) {
+      const name = field.$ref.split('/').at(-1);
+      if (enumValues(spec.components.schemas[name] ?? {})) { enums.add(name); return name; }
+      return "dict[str, Any]";
+    }
+    if (field.anyOf) return [...new Set(field.anyOf.map(type))].join(" | ");
+    if (Array.isArray(field.type)) return field.type.map(value => type({type:value})).join(" | ");
+    switch (field.type) {
+      case "string": return "str";
+      case "integer": return "int";
+      case "number": return "float";
+      case "boolean": return "bool";
+      case "null": return "None";
+      case "array": return `list[${type(field.items ?? {})}]`;
+      case "object": return `dict[str, ${type(field.additionalProperties ?? {})}]`;
+      default: return "Any";
+    }
+  };
+  const fields = Object.entries(schema.properties).map(([name, field]) => [name, type(field)]);
+  const required = new Set(schema.required);
+  const aliases = [...enums].sort().map(name => `${name} = Literal[${enumValues(spec.components.schemas[name]).map(value => JSON.stringify(value)).join(", ")}]`).join("\n");
+  const members = (needed) => fields.filter(([name]) => required.has(name) === needed).map(([name, value]) => `    ${name}: ${value}`).join("\n");
+  return `${aliases}\n\n\nclass _RunSnapshotRequired(TypedDict):\n${members(true)}\n\n\nclass RunSnapshot(_RunSnapshotRequired, total=False):\n${members(false)}`;
+}
+
 function pyOperation(entry) {
   const params = pathParams(entry.path);
   const args = params.map((name) => snakeCase(name));
@@ -264,7 +302,8 @@ function pyOperation(entry) {
   if (headers.length > 0) call.push("headers=headers");
   if (headers.includes("Idempotency-Key")) call.push("idempotency_key=idempotency_key");
   const signature = ["self", ...args].join(", ");
-  return `    def ${snakeCase(entry.name)}(${signature}):
+  const snapshotResponse = Object.entries(entry.operation.responses ?? {}).some(([code, response]) => /^2\d\d$/.test(code) && response.content?.["application/json"]?.schema?.$ref === "#/components/schemas/RunSnapshot");
+  return `    def ${snakeCase(entry.name)}(${signature})${snapshotResponse ? " -> RunSnapshot | None" : ""}:
         return ${reader}("${entry.method.toUpperCase()}", ${path}${call.length ? ", " + call.join(", ") : ""})`;
 }
 
@@ -584,76 +623,13 @@ export class QcgClient {
     }
     const reader = response.body!.getReader();
     try {
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let pendingCr = false;
-      // H05: SSE ignores one leading BOM. TextDecoder already strips a
-      // complete BOM, but a split BOM or a decoder that preserves it must
-      // not drop the first event; only the stream-start U+FEFF is removed.
-      let bomChecked = false;
+      const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
+      const parser = new SseParser();
       while (true) {
         const { done, value } = await reader.read();
-        if (done) {
-          // H05: the trailing CR was already emitted immediately, so EOF
-          // only clears the split-CRLF guard, then dispatches frames
-          // already terminated by a blank line and discards only the truly
-          // unterminated tail (SSE spec). The decoder flush only completes
-          // a split multibyte character, which can never create the ASCII
-          // blank line that frames an event.
-          try {
-            decoder.decode();
-          } catch {
-            // Best-effort flush: a malformed tail is still discarded.
-          }
-          pendingCr = false;
-          let tail = buffer.indexOf("\\n\\n");
-          while (tail >= 0) {
-            const frame = buffer.slice(0, tail);
-            buffer = buffer.slice(tail + 2);
-            const payload = parseSseFrame(frame);
-            if (payload !== undefined) yield payload;
-            tail = buffer.indexOf("\\n\\n");
-          }
-          return;
-        }
-        let piece = decoder.decode(value, { stream: true });
-        if (!bomChecked && piece) {
-          if (piece.charCodeAt(0) === 0xfeff) piece = piece.slice(1);
-          bomChecked = true;
-        }
-        // H05: CR is a complete line break immediately; pendingCr only
-        // swallows one LF of a CRLF pair split across chunks. Holding the
-        // CR would delay a CRLF/CR-terminated event past its flush.
-        if (pendingCr) {
-          if (piece.startsWith("\\n")) {
-            piece = piece.slice(1);
-          }
-          pendingCr = false;
-        }
-        let trailingCr = false;
-        if (piece.endsWith("\\r")) {
-          piece = piece.slice(0, -1);
-          pendingCr = true;
-          trailingCr = true;
-        }
-        if (piece) {
-          piece = piece.replace(/\\r\\n/g, "\\n").replace(/\\r/g, "\\n");
-          buffer += piece;
-        }
-        if (trailingCr) {
-          buffer += "\\n";
-        }
-        if (!bomChecked && buffer.charCodeAt(0) === 0xfeff) {
-          buffer = buffer.slice(1);
-          bomChecked = true;
-        }
-        let boundary = buffer.indexOf("\\n\\n");
-        while (boundary >= 0) {
-          const frame = buffer.slice(0, boundary);
-          buffer = buffer.slice(boundary + 2);
-          const payload = parseSseFrame(frame);
-          if (payload !== undefined) yield payload;
-          boundary = buffer.indexOf("\\n\\n");
+        if (done) return;
+        for (const frame of parser.push(decoder.decode(value, { stream: true }))) {
+          if (frame.data) yield JSON.parse(frame.data);
         }
       }
     } finally {
@@ -669,25 +645,7 @@ export class QcgClient {
 ${pinned.map(tsOperation).join("\n\n")}
 }
 
-function parseSseFrame(frame: string): unknown | undefined {
-  const data: string[] = [];
-  for (const line of frame.split("\\n")) {
-    if (line.startsWith(":")) continue;
-    if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
-  }
-  if (data.length === 0) return undefined;
-  const text = data.join("\\n");
-  if (!text) return undefined;
-  return JSON.parse(text) as unknown;
-}
-
-function problemMessage(problem: unknown): string {
-  if (problem && typeof problem === "object" && "detail" in problem) {
-    const detail = (problem as { detail?: unknown }).detail;
-    if (typeof detail === "string") return detail;
-  }
-  return "";
-}
+${readFileSync(resolve(root, "frontend/generator/src/api/sse.ts"), "utf8")}
 `;
 
 const py = `"""Generated by scripts/generate-sdk.mjs from docs/openapi.json; do not edit."""
@@ -700,8 +658,11 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Iterator
+from typing import Any, Iterator, Literal, TypedDict
 from urllib.parse import quote, urlencode
+
+
+${pySnapshotTypes()}
 
 
 class QcgError(Exception):
@@ -950,7 +911,7 @@ class QcgClient:
             problem, detail = self._problem_from_error(error)
             raise QcgError(error.code, problem, detail) from error
         with contextlib.closing(raw):
-            decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
             text_buffer = ""
             pending_cr = False
             # H05: SSE ignores one leading BOM at the stream start. The
@@ -1002,8 +963,10 @@ class QcgClient:
                         bom_checked = True
                     while "\\n\\n" in text_buffer:
                         frame, text_buffer = text_buffer.split("\\n\\n", 1)
+                        if len(frame) > 16 * 1024 * 1024:
+                            raise QcgError(0, None, "SSE frame exceeds 16 MiB character limit")
                         data_lines = [
-                            line[5:].lstrip() if line[5:6] == " " else line[5:]
+                            line[6:] if line[5:6] == " " else line[5:]
                             for line in frame.split("\\n")
                             if line.startswith("data:")
                         ]
@@ -1013,6 +976,8 @@ class QcgClient:
                         data = "\\n".join(data_lines)
                         if data:
                             yield json.loads(data)
+                    if len(text_buffer) > 16 * 1024 * 1024:
+                        raise QcgError(0, None, "SSE frame exceeds 16 MiB character limit")
                 # H05: the trailing CR was already emitted immediately,
                 # so EOF only swallows a dangling split-CRLF LF, then
                 # dispatches frames already terminated by a blank line and
@@ -1037,7 +1002,7 @@ class QcgClient:
                 while "\\n\\n" in text_buffer:
                     frame, text_buffer = text_buffer.split("\\n\\n", 1)
                     data_lines = [
-                        line[5:].lstrip() if line[5:6] == " " else line[5:]
+                        line[6:] if line[5:6] == " " else line[5:]
                         for line in frame.split("\\n")
                         if line.startswith("data:")
                     ]
@@ -1067,7 +1032,7 @@ execFileSync(
     shell: process.platform === "win32",
   },
 );
-writeFileSync(resolve(outRoot, "ts/client.ts"), ts);
+writeFileSync(resolve(outRoot, "ts/client.ts"), ts.trimEnd() + "\n");
 writeFileSync(resolve(outRoot, "python/qcg_client.py"), py);
 writeFileSync(
   resolve(outRoot, "README.md"),
@@ -1097,11 +1062,16 @@ surface as HTTP errors rather than silent follows.
 
 SSE (both clients): utilizable bytes are consumed incrementally (Python
 uses read1 so flushed tens-of-bytes events arrive while the stream stays
-open). CR/CRLF/LF framing holds a trailing CR across chunk boundaries so a
-split CRLF frames as one break, never two. Multi-data lines join with LF;
+open). CR immediately ends a line; one following LF is swallowed across
+chunk boundaries, so split CRLF is one break. Multi-data lines join with LF;
 an EOF without a terminating blank line dispatches only already-terminated
 frames and never fabricates an event from the tail. Breaking the consumer
 or a parse failure releases the connection/reader.
+
+Run snapshots expose \`queue_position_quality\`: \`exact\`, \`estimated\`, or
+\`unavailable\`. Python returns the same fields in dictionaries. Transport
+markers \`lagged\`, \`stream_error\`, and \`shutdown\` do not advance a
+reconnection cursor; use the last actual run-event sequence.
 `,
 );
 console.log(`generated ${pinned.length} SDK operations`);

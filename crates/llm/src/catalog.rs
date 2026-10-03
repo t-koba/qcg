@@ -1382,6 +1382,9 @@ models_discovery = "openai"
 
     #[tokio::test]
     async fn discovery_normal_rotation_and_limits_share_one_path() {
+        if env_process::isolated() {
+            return;
+        }
         // F03-03: normal listings, credential rotation, and the body limit
         // all flow through the same credentialed discovery path.
         use std::io::{Read, Write};
@@ -1741,4 +1744,12 @@ label = "Explicit label"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+#[cfg(test)]
+mod env_process {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../scripts/test-support/environment.rs"
+    ));
 }

@@ -34,7 +34,10 @@ async fn bind_loopback() -> Option<tokio::net::TcpListener> {
 /// instead of racing the default. Exclusive store mode, no explicit
 /// providers file, and the default deployment policy match
 /// `crate::test_service`; only the active-run slot differs.
-fn single_run_service(generators_dir: Utf8PathBuf, runs_dir: Utf8PathBuf) -> LocalService {
+pub(crate) fn single_run_service(
+    generators_dir: Utf8PathBuf,
+    runs_dir: Utf8PathBuf,
+) -> LocalService {
     LocalService::with_generator_roots_policy_and_store_mode(
         vec![generators_dir],
         runs_dir,
@@ -67,6 +70,7 @@ fn conditional_json_star_matches_any_existing_snapshot() {
         confirm: None,
         queued_at: None,
         queue_position: Some(2),
+        queue_position_quality: api::QueuePositionQuality::Unavailable,
         priority: 0,
         parent_run_id: None,
         metrics: None,
@@ -1848,4 +1852,30 @@ async fn ready_persist_failure_then_retry_reuses_the_original_run() {
         1,
         "retry must not create a duplicate run"
     );
+}
+
+/// Process environment behavior runs alone so parallel server tests cannot
+/// observe an invalid transient deployment policy.
+pub(crate) fn isolate_environment_test(name: &str) -> bool {
+    if std::env::var("QCG_ENV_TEST_CHILD").as_deref() == Ok(name) {
+        return false;
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env("QCG_ENV_TEST_CHILD", name)
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "isolated environment test {name} failed");
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("isolated environment test {name} exceeded 60 seconds");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }

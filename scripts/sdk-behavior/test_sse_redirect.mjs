@@ -385,3 +385,13 @@ function redirectResponse(location) {
 }
 
 console.log(`TS SSE/redirect behavior: all G04/G05 checks passed (${results.length} assertions)`);
+
+// The SPA, TypeScript SDK and Python SDK consume the same wire fixtures.
+const fixtures = JSON.parse(await (await import('node:fs/promises')).readFile(new URL('../fixtures/sse.json', import.meta.url), 'utf8'));
+for (const fixture of fixtures) {
+  const wire = fixture.wire_hex ? Buffer.from(fixture.wire_hex, "hex") : enc.encode(fixture.wire);
+  for (let split = 1; split < wire.length; split++) {
+    const client = new QcgClient({ baseUrl: 'http://127.0.0.1:9', fetch: async () => sseResponse([wire.slice(0,split), wire.slice(split)]).response });
+    check(`shared fixture ${fixture.name}/${split}`, JSON.stringify(await collect(client,'r1')) === JSON.stringify(fixture.payloads));
+  }
+}

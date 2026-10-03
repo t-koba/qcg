@@ -39,17 +39,9 @@ pub fn run_summary_with_seq(run_dir: &Utf8Path) -> Result<(RunSummary, u64), Ser
     Ok((summary, state.last_seq))
 }
 
-/// Status and settled time come from the folded state, not from a second scan
-/// of lifecycle events: one journal read, one projection, no second source of
-/// truth for what a run is doing.
-fn run_summary_from_state(
-    run_dir: &Utf8Path,
-    events: &[RunEvent],
-    state: &engine::RunState,
-) -> Result<RunSummary, ServiceError> {
-    let (started_event, started) = run_identity_event(run_dir, events)?;
+pub(crate) fn status_name_from_state(state: &engine::RunState) -> &'static str {
     use engine::{Interaction, TerminalState};
-    let status = match (&state.terminal, &state.pending) {
+    match (&state.terminal, &state.pending) {
         (Some(TerminalState::Succeeded), _) => "success",
         (Some(TerminalState::Failed), _) => "failed",
         (Some(TerminalState::Canceled), _) => "canceled",
@@ -60,7 +52,19 @@ fn run_summary_from_state(
         (None, Some(Interaction::Confirmation { .. })) => "confirming",
         (None, None) if state.execution_started => "running",
         (None, None) => "queued",
-    };
+    }
+}
+
+/// Status and settled time come from the folded state, not from a second scan
+/// of lifecycle events: one journal read, one projection, no second source of
+/// truth for what a run is doing.
+pub(crate) fn run_summary_from_state(
+    run_dir: &Utf8Path,
+    events: &[RunEvent],
+    state: &engine::RunState,
+) -> Result<RunSummary, ServiceError> {
+    let (started_event, started) = run_identity_event(run_dir, events)?;
+    let status = status_name_from_state(state);
     let artifacts = read_optional_output_manifest(run_dir)?
         .map(|manifest| manifest.artifacts)
         .unwrap_or_default();

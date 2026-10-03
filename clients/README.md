@@ -24,8 +24,13 @@ surface as HTTP errors rather than silent follows.
 
 SSE (both clients): utilizable bytes are consumed incrementally (Python
 uses read1 so flushed tens-of-bytes events arrive while the stream stays
-open). CR/CRLF/LF framing holds a trailing CR across chunk boundaries so a
-split CRLF frames as one break, never two. Multi-data lines join with LF;
+open). CR immediately ends a line; one following LF is swallowed across
+chunk boundaries, so split CRLF is one break. Multi-data lines join with LF;
 an EOF without a terminating blank line dispatches only already-terminated
 frames and never fabricates an event from the tail. Breaking the consumer
 or a parse failure releases the connection/reader.
+
+Run snapshots expose `queue_position_quality`: `exact`, `estimated`, or
+`unavailable`. Python returns the same fields in dictionaries. Transport
+markers `lagged`, `stream_error`, and `shutdown` do not advance a
+reconnection cursor; use the last actual run-event sequence.

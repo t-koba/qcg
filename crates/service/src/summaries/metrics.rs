@@ -5,13 +5,11 @@ use engine::JournalLimits;
 use futures_util::StreamExt as _;
 use futures_util::stream::BoxStream;
 use model::RunMetrics;
-use serde_json::Value;
-use std::io::SeekFrom;
-use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::reads::read_durable_run_events;
 use super::state::fold_run_state;
+#[cfg(test)]
 use super::summary::run_meta_dir;
 use policy::JOURNAL_POLL_CHANNEL_CAPACITY;
 
@@ -156,206 +154,72 @@ pub(crate) fn poll_journal_events_with_limits(
 ) -> BoxStream<'static, RunEvent> {
     let (sender, receiver) = tokio::sync::mpsc::channel(JOURNAL_POLL_CHANNEL_CAPACITY);
     tokio::spawn(async move {
-        let meta_dir = run_meta_dir(&run_dir);
-        let durable_path = meta_dir.join("journal.jsonl");
-        let audit_path = meta_dir.join("audit.jsonl");
-        let mut durable_offset = 0_u64;
-        let mut audit_offset = 0_u64;
-        let mut event_count = 0_usize;
-        let mut interval =
-            tokio::time::interval(std::time::Duration::from_millis(poll_interval_millis));
-        /// Sends the failure marker best-effort before closing: a dropped
-        /// receiver means no consumer remains, so the send failure is
-        /// intentionally ignored (documented best-effort, not a silent drop).
-        async fn fail_closed(
-            sender: &tokio::sync::mpsc::Sender<RunEvent>,
-            run_id: &str,
-            seq: u64,
-            detail: String,
-        ) {
-            let _ = sender.send(stream_error_event(run_id, seq, detail)).await;
-        }
-        /// Reads complete newline-terminated records appended after
-        /// `offset`. A partial tail stays for the next tick, and a shrunken
-        /// file resets the cursor (delivered-seq filtering prevents
-        /// duplicates). Lines without a seq are corruption.
-        async fn drain(
-            path: &Utf8Path,
-            offset: &mut u64,
-            max_event_bytes: Option<usize>,
-            label: &str,
-        ) -> Result<Vec<(u64, Vec<u8>)>, String> {
-            use tokio::io::AsyncBufReadExt as _;
-            let metadata = match tokio::fs::metadata(path).await {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(Vec::new());
-                }
-                Err(error) => return Err(format!("failed to inspect {label}: {error}")),
-            };
-            if metadata.len() < *offset {
-                tracing::warn!(
-                    offset,
-                    len = metadata.len(),
-                    "shared {label} shrank; resetting poll cursor"
-                );
-                *offset = 0;
-            }
-            let mut file = tokio::fs::File::open(path)
-                .await
-                .map_err(|error| format!("failed to open {label}: {error}"))?;
-            file.seek(SeekFrom::Start(*offset))
-                .await
-                .map_err(|error| format!("failed to seek {label}: {error}"))?;
-            let mut reader = tokio::io::BufReader::new(file);
-            let mut lines = Vec::new();
-            loop {
-                let mut line = Vec::new();
-                let line_limit = max_event_bytes.map(|limit| limit.saturating_add(2));
-                let read = match line_limit {
-                    Some(line_limit) => {
-                        (&mut reader)
-                            .take(line_limit as u64)
-                            .read_until(b'\n', &mut line)
-                            .await
-                    }
-                    None => reader.read_until(b'\n', &mut line).await,
-                }
-                .map_err(|error| format!("failed to read {label}: {error}"))?;
-                if read == 0 {
-                    break;
-                }
-                if line.last() != Some(&b'\n') {
-                    if line_limit.is_some_and(|limit| read == limit) {
-                        return Err(format!("{label} event exceeds byte limit"));
-                    }
-                    break;
-                }
-                *offset = offset
-                    .checked_add(read as u64)
-                    .ok_or_else(|| format!("{label} offset overflowed"))?;
-                line.pop();
-                if max_event_bytes.is_some_and(|limit| line.len() > limit) {
-                    return Err(format!("{label} event exceeds byte limit"));
-                }
-                if line.iter().all(u8::is_ascii_whitespace) {
-                    continue;
-                }
-                let seq = serde_json::from_slice::<Value>(&line)
-                    .ok()
-                    .and_then(|value| value.get("seq").and_then(Value::as_u64))
-                    .ok_or_else(|| format!("{label} contains an event without seq"))?;
-                lines.push((seq, line));
-            }
-            Ok(lines)
-        }
+        let mut cursor = crate::EventCursor::default();
+        let mut terminal = false;
         loop {
-            // Shutdown must end every poll task even when the run never
-            // emits another event; the SSE wrapper cannot reach this task
-            // (E05). A terminal event also ends the task; both paths close
-            // the stream and the client reconnects from its last seq.
-            // Only failure paths emit the error marker above: shutdown and
-            // terminal closes carry no marker, so the three endings stay
-            // distinguishable (E05).
-            tokio::select! {
-                _ = shutdown.cancelled() => return,
-                _ = interval.tick() => {}
-            }
-            // Durable byte bound: enforced against the file size before any
-            // content is read, exactly as the single-stream poller did.
-            if let Some(limit) = limits.max_total_bytes
-                && let Ok(metadata) = tokio::fs::metadata(&durable_path).await
-                && metadata.len() > limit as u64
-            {
-                tracing::error!(%run_id, actual = metadata.len(), "shared run journal exceeds byte limit");
-                fail_closed(
-                    &sender,
-                    &run_id,
-                    delivered_seq,
-                    "shared run journal exceeds byte limit".to_string(),
-                )
-                .await;
+            if shutdown.is_cancelled() {
                 return;
             }
-            let mut pending = match drain(
-                &durable_path,
-                &mut durable_offset,
-                limits.max_event_bytes,
-                "run journal",
-            )
-            .await
-            {
-                Ok(lines) => lines,
-                Err(detail) => {
-                    tracing::error!(%run_id, %detail, "shared run journal poll failed");
-                    fail_closed(&sender, &run_id, delivered_seq, detail).await;
+            let directory = run_dir.clone();
+            let current = cursor.clone();
+            static PERMITS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+                std::sync::OnceLock::new();
+            let permits = PERMITS
+                .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(8)))
+                .clone();
+            let permit = tokio::select! {_=shutdown.cancelled()=>return, permit=permits.acquire_owned()=>permit.expect("poll permits are never closed")};
+            let result = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                current.read_with_limits(&directory, limits)
+            })
+            .await;
+            let batch = match result {
+                Ok(Ok(batch)) => batch,
+                result => {
+                    let detail = match result {
+                        Ok(Err(e)) => e.to_string(),
+                        Err(e) => e.to_string(),
+                        _ => unreachable!(),
+                    };
+                    let event = stream_error_event(&run_id, delivered_seq, detail);
+                    tokio::select! { _ = shutdown.cancelled() => {}, _ = sender.send(event) => {} }
                     return;
                 }
             };
-            // Observation records share the seq space and are merged by seq
-            // so consumers see the same single order as the durable path
-            // (ADR 0001). An audit read failure never fails the durable
-            // stream: it is logged and retried on the next tick.
-            match drain(&audit_path, &mut audit_offset, None, "audit stream").await {
-                Ok(mut observed) => pending.append(&mut observed),
-                Err(detail) => {
-                    tracing::warn!(%run_id, %detail, "shared audit stream poll failed; retrying");
-                }
-            }
-            pending.sort_by_key(|(seq, _)| *seq);
-            for (_, line) in pending {
-                event_count = event_count.saturating_add(1);
-                if limits
-                    .max_event_count
-                    .is_some_and(|limit| event_count > limit)
-                {
-                    tracing::error!(%run_id, limit = ?limits.max_event_count, "shared run journal event count exceeds limit");
-                    fail_closed(
-                        &sender,
-                        &run_id,
-                        delivered_seq,
-                        "shared run journal event count exceeds limit".to_string(),
-                    )
-                    .await;
-                    return;
-                }
-                let value = match serde_json::from_slice::<Value>(&line) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        tracing::error!(%error, %run_id, "shared run journal contains invalid JSON");
-                        fail_closed(
-                            &sender,
-                            &run_id,
-                            delivered_seq,
-                            format!("shared run journal contains invalid JSON: {error}"),
-                        )
-                        .await;
-                        return;
-                    }
-                };
+            cursor = batch.cursor;
+            for value in batch.events {
                 let event = match RunEvent::from_flat(&value) {
                     Ok(event) => event,
-                    Err(error) => {
-                        tracing::error!(%error, %run_id, "shared run journal contains an invalid event");
-                        fail_closed(
-                            &sender,
-                            &run_id,
-                            delivered_seq,
-                            format!("shared run journal contains an invalid event: {error}"),
-                        )
-                        .await;
+                    Err(detail) => {
+                        let _ = sender
+                            .send(stream_error_event(&run_id, delivered_seq, detail))
+                            .await;
                         return;
                     }
                 };
-                let terminal = api::is_terminal_event_kind(event.kind.as_str());
+                if api::is_terminal_event_kind(&event.kind) {
+                    terminal = true;
+                } else if matches!(
+                    event.kind.as_str(),
+                    "run_queued" | "run_started" | "run_resumed"
+                ) {
+                    terminal = false;
+                }
                 if event.seq > delivered_seq {
                     delivered_seq = event.seq;
-                    if sender.send(event).await.is_err() {
-                        return;
+                    tokio::select! {
+                        _ = shutdown.cancelled() => return,
+                        result = sender.send(event) => { if result.is_err() { return; } }
                     }
                 }
-                if terminal {
-                    return;
+            }
+            if terminal && batch.exhausted {
+                return;
+            }
+            if batch.exhausted {
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(poll_interval_millis)) => {}
                 }
             }
         }
@@ -394,6 +258,67 @@ mod tests {
             "a cancelled poll must close its stream"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn resumed_history_does_not_end_a_live_poll() {
+        use std::io::Write;
+        let directory = Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("poll-resumed-{}", uuid::Uuid::now_v7())),
+        )
+        .unwrap();
+        std::fs::create_dir_all(run_meta_dir(&directory)).unwrap();
+        let path = run_meta_dir(&directory).join("journal.jsonl");
+        let record = |seq, kind| {
+            let mut value = serde_json::json!({
+                "seq": seq, "run_id": "resumed", "t": kind,
+                "ts": "2026-01-01T00:00:00Z",
+                "trace_id": api::trace_id_for_run("resumed"), "span_id": api::span_id_for_seq(seq)
+            });
+            if kind == "run_interrupted" {
+                value["reason"] = serde_json::json!({"code":"interrupted", "message":"test"});
+            } else if kind == "run_finished" {
+                value["status"] = serde_json::json!("success");
+                value["metrics"] = serde_json::to_value(model::RunMetrics::default()).unwrap();
+            }
+            format!("{}\n", value)
+        };
+        std::fs::write(
+            &path,
+            format!(
+                "{}{}",
+                record(1, "run_interrupted"),
+                record(2, "run_resumed")
+            ),
+        )
+        .unwrap();
+        let token = tokio_util::sync::CancellationToken::new();
+        let mut stream =
+            poll_journal_events(directory.clone(), "resumed".into(), 2, 10, token.clone());
+        // Let the initial batch be consumed, then append a new durable event.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), stream.next())
+                .await
+                .is_err()
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        write!(file, "{}", record(3, "run_finished")).unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.seq, 3);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        token.cancel();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]

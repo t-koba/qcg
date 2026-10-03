@@ -2,7 +2,8 @@ import { execFileSync, spawn } from "node:child_process";
 import { mkdtemp, mkdir, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { chromium } from "playwright";
+import { createRequire } from "node:module";
+const { chromium } = createRequire(new URL("../frontend/generator/package.json", import.meta.url))("playwright");
 
 const apiPort = Number(process.env.UI_SMOKE_PORT || 58018);
 const uiPort = Number(process.env.UI_VITE_SMOKE_PORT || 58019);
@@ -49,6 +50,8 @@ async function runMode(mode) {
     generatorsDir,
     "--runs-dir",
     runsDir,
+    "--cors-origin",
+    `http://127.0.0.1:${uiPort}`,
   ];
   const qcg = spawn(qcgBinary, qcgArgs, { stdio: ["ignore", "pipe", "pipe"] });
   captureOutput(qcg, `${mode.name} qcg`);
@@ -80,6 +83,7 @@ async function runMode(mode) {
     await page.getByRole("button", { name: /Hello Template/ }).waitFor({ timeout: 10000 });
     await assertMcpConnections(page);
     await assertSuccessfulRun(page);
+    if (mode.frontend === "vite") await assertCrossOriginApi(page, apiBase);
     await assertCancelRun(page);
     await assertQuestionForm(page);
     await assertListMultiselectForm(page);
@@ -449,4 +453,30 @@ try {
     await browser.close();
   }
   await rm(root, { recursive: true, force: true });
+}
+
+async function assertCrossOriginApi(page, apiBase) {
+  const result = await page.evaluate(async base => {
+    const list = await (await fetch(`${base}/api/runs`)).json();
+    const run = (Array.isArray(list) ? list : list.items ?? list.runs)[0];
+    if (!run) throw new Error("CORS test requires a completed run");
+    const endpoint = `${base}/api/runs/${run.run_id}`;
+    const snapshot = await fetch(endpoint);
+    const etag = snapshot.headers.get("etag");
+    if (!etag) throw new Error("ETag must be visible across origins");
+    const value = await snapshot.json();
+    const conditional = await fetch(endpoint, {headers:{"If-None-Match":etag}});
+    const events = await fetch(`${endpoint}/events`, {headers:{"Last-Event-ID":String(value.seq)},signal:AbortSignal.timeout(5000)});
+    await events.text(); // Terminal cursor closes after any unread audit records.
+    const artifacts = (await (await fetch(`${endpoint}/artifacts`)).json()).artifacts;
+    const artifact = artifacts?.[0];
+    if (!artifact) throw new Error("CORS test requires an artifact");
+    const download = await fetch(`${endpoint}/artifacts/${artifact.path.split('/').map(encodeURIComponent).join('/')}`, {headers:{Range:'bytes=0-3'}});
+    const etagArtifact=download.headers.get('etag');
+    const matched=await fetch(`${endpoint}/artifacts/${artifact.path.split('/').map(encodeURIComponent).join('/')}`, {headers:{Range:'bytes=0-3','If-Range':etagArtifact}});
+    const unsatisfiable=await fetch(`${endpoint}/artifacts/${artifact.path.split('/').map(encodeURIComponent).join('/')}`, {headers:{Range:'bytes=999999999999-'}});
+    if (matched.status!==206 || unsatisfiable.status!==416 || !unsatisfiable.headers.get('content-range')) throw new Error('If-Range/416 CORS failed');
+    return {status:conditional.status, download:download.status, ranges:download.headers.get('accept-ranges'),range:download.headers.get('content-range'), disposition:download.headers.get('content-disposition')};
+  }, apiBase);
+  if (result.status !== 304 || result.download !== 206 || !result.range || !result.ranges || !result.disposition) throw new Error(`CORS response contract failed: ${JSON.stringify(result)}`);
 }

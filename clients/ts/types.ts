@@ -1004,7 +1004,14 @@ export interface paths {
         get: {
             parameters: {
                 query?: never;
-                header?: never;
+                header?: {
+                    /** @description Return 304 when the artifact digest matches. */
+                    "If-None-Match"?: string;
+                    /** @description One bytes=start-end, bytes=start- or bytes=-suffix range. */
+                    Range?: string;
+                    /** @description Apply Range only when this strong ETag matches. */
+                    "If-Range"?: string;
+                };
                 path: {
                     id: string;
                     path: string;
@@ -1016,11 +1023,41 @@ export interface paths {
                 /** @description Artifact bytes */
                 200: {
                     headers: {
+                        /** @description Supported range unit: bytes. */
+                        "Accept-Ranges"?: string;
+                        /** @description Attachment filename. */
+                        "Content-Disposition"?: string;
+                        /** @description Strong validator naming the verified artifact SHA-256. */
+                        ETag?: string;
                         [name: string]: unknown;
                     };
                     content: {
                         "application/octet-stream": string;
                     };
+                };
+                /** @description Requested byte range */
+                206: {
+                    headers: {
+                        /** @description Supported range unit: bytes. */
+                        "Accept-Ranges"?: string;
+                        /** @description Attachment filename. */
+                        "Content-Disposition"?: string;
+                        /** @description Strong validator naming the verified artifact SHA-256. */
+                        ETag?: string;
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/octet-stream": string;
+                    };
+                };
+                /** @description Not modified */
+                304: {
+                    headers: {
+                        /** @description Weak validator for conditional GET requests. */
+                        ETag?: string;
+                        [name: string]: unknown;
+                    };
+                    content?: never;
                 };
                 /** @description Invalid request */
                 400: {
@@ -1040,6 +1077,22 @@ export interface paths {
                     content: {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
+                };
+                /** @description Payload too large */
+                413: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/problem+json": components["schemas"]["ProblemDetails"];
+                    };
+                };
+                /** @description Unsatisfiable byte range; Content-Range gives the artifact length */
+                416: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
                 };
                 429: components["responses"]["TooManyRequests"];
                 /** @description Internal server error */
@@ -2472,6 +2525,8 @@ export interface components {
             field: string;
             reason: string;
         };
+        /** @enum {string} */
+        QueuePositionQuality: "exact" | "estimated" | "unavailable";
         ReasonEventData: {
             /**
              * @description Accumulated cost metrics, present when the writer attached them.
@@ -2800,6 +2855,8 @@ export interface components {
              * @default null
              */
             queue_position: number | null;
+            /** @default unavailable */
+            queue_position_quality: components["schemas"]["QueuePositionQuality"];
             /**
              * @description RFC 3339 timestamp of the last transition to `Queued`, if any.
              * @default null

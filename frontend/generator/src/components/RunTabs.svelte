@@ -30,7 +30,7 @@
           <span class="run-tab-name">{tab.generatorName}</span>
           <small class="run-tab-id">{shortId(tab.runId)}</small>
           {#if tab.runState === "queued" && tab.queuePosition !== null}
-            <small class="run-tab-queue">#{tab.queuePosition}</small>
+            <small class="run-tab-queue">{tab.queuePositionQuality === "estimated" ? "≈ " : ""}#{tab.queuePosition}</small>
           {/if}
           {#if tab.pendingAction}<span class="spinner tiny" aria-hidden="true"></span>{/if}
         </button>

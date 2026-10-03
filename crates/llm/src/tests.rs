@@ -796,6 +796,9 @@ async fn streams_anthropic_schema_tool_as_a_completed_structured_response() {
 
 #[test]
 fn interpolates_environment_placeholders() {
+    if env_process::isolated() {
+        return;
+    }
     // SAFETY: environment mutation is serialized with ENV_LOCK.
     let _guard = super::ENV_LOCK.blocking_lock();
     // SAFETY: lock held; unique variable name.
@@ -861,6 +864,9 @@ fn endpoint_uses_flavor_default_path() {
 
 #[test]
 fn endpoint_supports_path_template_and_query_interpolation() {
+    if env_process::isolated() {
+        return;
+    }
     let mut spec = spec_with_base_url("azure", "https://resource.example");
     spec.path_template = Some("openai/deployments/{model}/chat/completions".into());
     spec.query
@@ -1029,6 +1035,9 @@ fn base_url_rejects_userinfo_query_and_fragment() {
 
 #[test]
 fn credentialed_http_requires_https_except_for_loopback() {
+    if env_process::isolated() {
+        return;
+    }
     let mut remote = spec_with_base_url("remote", "http://example.test/v1");
     remote.api_key_env = Some("LLM_HTTP_REMOTE_KEY_XYZ".into());
     let provider = HttpProvider::from_spec(remote);
@@ -1054,6 +1063,9 @@ fn credentialed_http_requires_https_except_for_loopback() {
 
 #[test]
 fn credential_env_names_expose_names_without_values() {
+    if env_process::isolated() {
+        return;
+    }
     // SAFETY: environment mutation is serialized with ENV_LOCK.
     let _guard = super::ENV_LOCK.blocking_lock();
     // SAFETY: lock held; unique variable name.
@@ -1108,6 +1120,9 @@ async fn non_success_body_is_not_returned_in_error() {
 
 #[tokio::test]
 async fn reflected_credential_is_never_returned() {
+    if env_process::isolated() {
+        return;
+    }
     let key = "test<reflected-credential-unique";
     // SAFETY: environment mutation is serialized with ENV_LOCK.
     let _guard = super::ENV_LOCK.lock().await;
@@ -1694,6 +1709,9 @@ base_url = "http://127.0.0.1:9/v1"
 
 #[test]
 fn load_optional_honors_the_environment_override() {
+    if env_process::isolated() {
+        return;
+    }
     let dir = std::env::temp_dir().join(format!(
         "llm-load-optional-env-{}-{}",
         std::process::id(),
@@ -2188,4 +2206,12 @@ decision_model_in_body = false
     assert!(sent["state"].is_string());
     assert!(sent["questions"]["urgent"].is_object());
     server.join().expect("server should stop");
+}
+
+#[cfg(test)]
+mod env_process {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../scripts/test-support/environment.rs"
+    ));
 }

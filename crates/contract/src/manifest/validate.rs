@@ -139,6 +139,11 @@ impl Manifest {
                 errors.push(stripped_error_message(error));
             }
         };
+        check(
+            policy::AuditPolicy::from_config(&self.audit)
+                .map(|_| ())
+                .map_err(ContractError::Invalid),
+        );
         check(GeneratorMetadataRule.validate(self));
         check(InputRule.validate(self));
         check(ResourceRule.validate(self));

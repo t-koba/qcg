@@ -612,3 +612,23 @@ position display without misordering execution (the scheduler never consults
 this cache). A lagging position still serves the exact-body validator for
 the lagging body, so the ETag stays exact for what is served — display
 staleness by design, never a mismatched validator (E12/E16).
+
+### Queue position quality and preemption
+
+`queue_position_quality` is `exact` for a complete local observation,
+`estimated` for shared-store/peer observations or an incomplete directory scan,
+and `unavailable` when no queued position can be derived. The SPA prefixes
+estimated positions with `≈`. Display caches never drive scheduling.
+Priority descends first, then equal-priority runs use their durable queued time
+(FIFO). Higher priorities may preempt lower ones. Finished steps replay from
+the journal; interrupted external operations with indeterminate outcomes
+refuse automatic replay. Preemption is therefore not a promise that every
+external command or side effect can safely restart.
+
+The observation cache retains at most `MAX_TRACKED_RUNS` entries and
+`READ_CACHE_MAX_BYTES` bytes of conservative memory charge (64 MiB by default).
+For deployments retaining 10,000 runs, the measured synthetic views need about
+240 MiB of charge; the benchmark explicitly sets a 256 MiB budget. A smaller
+budget evicts views and correctly requires rereading them. Capacity accounting
+is incremental and LRU selection uses an index. This budget excludes transient
+request/parser buffers and is not a total process RSS limit.

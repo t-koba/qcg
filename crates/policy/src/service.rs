@@ -42,6 +42,9 @@ mod tests {
 
     #[test]
     fn service_name_resolution_order() {
+        if env_process::isolated() {
+            return;
+        }
         // Single test owns SERVICE_NAME end to end: parallel tests in one
         // process share the environment, so split tests racing on the same
         // variable would flake. Follows the limits.rs set/restore pattern.
@@ -73,4 +76,12 @@ mod tests {
             .to_string();
         assert_eq!(binary_stem(), Some(expected));
     }
+}
+
+#[cfg(test)]
+mod env_process {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../scripts/test-support/environment.rs"
+    ));
 }

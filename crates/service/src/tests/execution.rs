@@ -478,7 +478,7 @@ done
 
 #[cfg(unix)]
 #[tokio::test]
-async fn priority_preempts_and_resumes_in_order() {
+async fn priority_preempts_in_order_and_refuses_indeterminate_command_replay() {
     let root = temp_run_dir("priority-preemption");
     let _ = std::fs::remove_dir_all(&root);
     let generator = root.join("generator");
@@ -556,6 +556,16 @@ command_timeout_seconds = 300"#,
     );
     // A higher-priority arrival preempts the running run instead of
     // waiting behind it.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !read_journal_string(&service, running.clone())
+            .await
+            .contains("operation_started")
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("command must have started before preemption");
     let urgent = start_prioritized(&service, 5).await;
     assert_eq!(
         wait_for_snapshot(&service, &urgent, RunStatus::Running)
@@ -621,15 +631,17 @@ command_timeout_seconds = 300"#,
         .await
         .expect("queued run should cancel");
     assert_eq!(
-        wait_for_snapshot(&service, &running, RunStatus::Running)
+        wait_for_snapshot(&service, &running, RunStatus::Failed)
             .await
             .state,
-        RunStatus::Running
+        RunStatus::Failed
     );
-    service
-        .cancel(running.clone())
-        .await
-        .expect("preempted run should cancel");
+    assert!(
+        read_journal_string(&service, running.clone())
+            .await
+            .contains("indeterminate result after interruption"),
+        "an external command must never be blindly replayed after preemption"
+    );
     drop(service);
     let _ = std::fs::remove_dir_all(&root);
 }

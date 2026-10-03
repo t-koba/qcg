@@ -496,6 +496,7 @@ content = "done""#,
     writer
         .event("run_finished", json!({"status": "success"}))
         .unwrap();
+    writer.event("graph_resolved", json!({"nodes":[]})).unwrap();
     drop(writer);
 
     let service = test_service(generators_dir, runs_dir, None).expect("service should initialize");
@@ -513,6 +514,24 @@ content = "done""#,
         kinds.iter().any(|kind| kind == "run_finished"),
         "history must include the terminal event: {kinds:?}"
     );
+    for (cursor, expected) in [
+        (1, vec![2, 3]),
+        (2, vec![3]),
+        (3, vec![]),
+        (99, vec![1, 2, 3]),
+    ] {
+        let stream = service
+            .subscribe_with_cursor(run_id.clone(), cursor)
+            .await
+            .unwrap();
+        let seqs = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.map(|e| e.seq).collect::<Vec<_>>(),
+        )
+        .await
+        .expect("settled cursor must close");
+        assert_eq!(seqs, expected);
+    }
 }
 
 #[tokio::test]

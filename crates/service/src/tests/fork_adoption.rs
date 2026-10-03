@@ -1496,7 +1496,7 @@ fn fork_policy_prefers_own_admission_over_source() {
 }
 
 #[tokio::test]
-async fn fork_pays_exactly_one_journal_read() {
+async fn fork_snapshot_derivations_work_after_journal_removal() {
     // E03: a fresh fork threads its single admission snapshot through to
     // the spawn, so the fork pays exactly one journal read. Proof by
     // deletion (same shape as the adopt single-read test): the single
@@ -1572,9 +1572,15 @@ async fn fork_pays_exactly_one_journal_read() {
         .expect("fork record should exist");
     let inputs = crate::runs_api::fork_checkpoint_inputs(&snapshot, &contract, &source, checkpoint)
         .expect("fork inputs should derive without the journal");
-    assert!(
-        !inputs.is_empty() || inputs.is_empty(),
-        "inputs derive purely"
+    assert_eq!(
+        inputs,
+        snapshot
+            .state
+            .as_ref()
+            .unwrap()
+            .inputs
+            .clone()
+            .unwrap_or_default()
     );
     let policy = crate::types::ResolvedExecutionPolicy::for_execution(&snapshot.events, None)
         .expect("policy should resolve without the journal");
@@ -1588,9 +1594,9 @@ async fn fork_pays_exactly_one_journal_read() {
     );
     // Structural pin: the fresh-fork spawn must carry a snapshot
     // (`Some`), never `None` (which would force a second disk read).
-    let runs_api = include_str!("../runs_api.rs");
+    let admission = include_str!("../runs_api/admission.rs");
     assert!(
-        runs_api.contains("journal_snapshot: Some(spawn_snapshot)"),
+        admission.contains("journal_snapshot: Some(spawn_snapshot)"),
         "fresh forks must thread the single snapshot to the spawn"
     );
 }

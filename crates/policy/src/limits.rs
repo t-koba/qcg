@@ -40,6 +40,9 @@ pub const DEFAULT_MAX_JOURNAL_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_MAX_JOURNAL_EVENT_COUNT: usize = 1_000_000;
 pub const DEFAULT_MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
 
+/// Retained service read-view charge, separately from in-flight parser buffers.
+pub const DEFAULT_READ_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Hard cap for one run's observation stream when `[audit].max_bytes` is
 /// unset. The writer degrades instead of exceeding it, and every reader
 /// refuses a stream that already did, so an audit trail can never become the
@@ -205,10 +208,14 @@ pub fn parse_bool_env(name: &str, default: bool) -> Result<bool, String> {
 
 #[cfg(test)]
 mod bool_env_tests {
+    use super::env_process;
     use super::parse_bool_env;
 
     #[test]
     fn bool_knobs_reject_garbage_instead_of_folding() {
+        if env_process::isolated() {
+            return;
+        }
         for (value, expected) in [
             ("1", true),
             ("true", true),
@@ -252,4 +259,12 @@ mod bool_env_tests {
         assert_eq!(parse_bool_env("POLICY_BOOL_TEST", true), Ok(true));
         assert_eq!(parse_bool_env("POLICY_BOOL_TEST", false), Ok(false));
     }
+}
+
+#[cfg(test)]
+mod env_process {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../scripts/test-support/environment.rs"
+    ));
 }
