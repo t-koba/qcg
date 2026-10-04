@@ -384,6 +384,7 @@ impl LocalService {
                             "run_finished",
                             json!({
                                 "status": "failed",
+                                "metrics": {},
                                 "reason": FailureDetail::new(
                                     FailureCode::ExecutionFailed,
                                     "side effect denied by user",

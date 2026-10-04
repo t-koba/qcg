@@ -1742,3 +1742,66 @@ enabled = false
     drop(service);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn denied_confirmation_settles_failed_without_executing_side_effect() {
+    // Denial is the fail-closed side-effect boundary: the journal must
+    // carry `denied_by_user` plus a terminal `run_finished/failed` record
+    // (with the required metrics object), the snapshot must settle Failed,
+    // and the denied command must never execute. Removing the settlement
+    // writes or the metrics object makes this test fail (confirm errors
+    // with `missing field \`metrics\`` or the snapshot never settles).
+    let service = test_service(
+        vec![Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators")],
+        temp_run_dir("denied-confirmation"),
+    );
+    let id = service
+        .start_run(StartRun {
+            generator_id: "side-effect-confirm".into(),
+            inputs: BTreeMap::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("run should start");
+    let snapshot = wait_for_snapshot(&service, &id, RunStatus::Confirming).await;
+    let confirm = snapshot.confirm.expect("run should request confirmation");
+    service
+        .confirm(
+            id.clone(),
+            confirm.id.clone(),
+            ConfirmDecision {
+                decision: ConfirmationDecision::Deny,
+            },
+        )
+        .await
+        .expect("denial should settle the run");
+    let snapshot = wait_for_terminal_snapshot(&service, &id).await;
+    assert_eq!(snapshot.state, RunStatus::Failed);
+    assert!(
+        snapshot.confirm.is_none(),
+        "a denied run must not keep its confirmation prompt"
+    );
+    let journal = read_journal_string(&service, id.clone()).await;
+    assert!(
+        journal
+            .lines()
+            .any(|line| line.contains("\"t\":\"side_effect\"")
+                && line.contains("\"decision\":\"denied_by_user\"")),
+        "denial bookkeeping must journal denied_by_user"
+    );
+    assert!(
+        journal
+            .lines()
+            .any(|line| line.contains("\"t\":\"run_finished\"")
+                && line.contains("\"status\":\"failed\"")
+                && line.contains("side effect denied by user")),
+        "denial must journal a failed terminal outcome"
+    );
+    assert!(
+        !journal
+            .lines()
+            .any(|line| line.contains("\"decision\":\"approved_by_user\"")),
+        "a denied side effect must never execute"
+    );
+}
