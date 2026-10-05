@@ -51,6 +51,7 @@ pub(crate) fn test_state(
         artifact_limits: service::ArtifactZipLimits::default(),
         asset_limit: None,
         max_request_bytes: None,
+        metrics_policy: crate::server::MetricsPolicy::default(),
         shutdown,
     }
 }

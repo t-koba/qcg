@@ -80,6 +80,9 @@ pub(crate) struct AppState {
     /// Effective request body limit surfaced by /healthz. None means no
     /// mechanistic limit.
     pub(crate) max_request_bytes: Option<usize>,
+    /// Frozen metrics cardinality policy resolved once at boot. Every
+    /// scrape uses these values, never re-reads the environment (E04).
+    pub(crate) metrics_policy: super::middleware::MetricsPolicy,
     /// Set when graceful shutdown starts: new mutating requests are
     /// rejected, resident tasks stop, and SSE streams close (E05).
     pub(crate) shutdown: CancellationToken,

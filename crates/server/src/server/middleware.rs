@@ -64,10 +64,94 @@ pub(crate) async fn require_api_auth(
     }
 }
 
-/// Cardinality bound on `generator_runs_total` series: only this many
-/// generators (highest run counts first) are exported with a label, so a
-/// chaotic generator id space cannot blow up scrape size.
-const METRICS_GENERATOR_LIMIT: usize = 20;
+/// Deployment policy for `/metrics` generator-series cardinality.
+/// Mechanism renders the series; this policy chooses the budget and which
+/// generators survive truncation. The scrape stays bounded in every case:
+/// at most `generator_limit` series are ever emitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricsPolicy {
+    /// Maximum `generator_runs_total` series per scrape.
+    pub generator_limit: usize,
+    /// Generator ids that survive truncation when present in the inventory.
+    /// Sorted ascending and deduplicated at resolve time so selection is
+    /// deterministic. Pinned ids present in the inventory are emitted first
+    /// (up to the budget); the remainder of the budget is filled top by
+    /// run count.
+    pub pinned_generators: Vec<String>,
+}
+
+impl Default for MetricsPolicy {
+    fn default() -> Self {
+        Self {
+            generator_limit: policy::DEFAULT_METRICS_GENERATOR_LIMIT,
+            pinned_generators: Vec::new(),
+        }
+    }
+}
+
+/// Resolves the metrics cardinality policy from the environment, once per
+/// boot. `METRICS_GENERATOR_LIMIT` sets the budget (default 20, bounded
+/// 1..=256 so the scrape cannot grow without bound); `METRICS_PINNED_GENERATORS`
+/// is an optional comma-separated list of generator ids that survive
+/// truncation when present (at most 64 ids, each 1..=256 bytes, no empty
+/// entries). Every invalid value refuses boot instead of degrading
+/// silently (E04).
+pub(crate) fn resolve_metrics_policy() -> Result<MetricsPolicy, String> {
+    let generator_limit = match std::env::var("METRICS_GENERATOR_LIMIT") {
+        Err(_) => policy::DEFAULT_METRICS_GENERATOR_LIMIT,
+        Ok(value) => match value.parse::<usize>() {
+            Ok(parsed)
+                if (policy::MIN_METRICS_GENERATOR_LIMIT..=policy::MAX_METRICS_GENERATOR_LIMIT)
+                    .contains(&parsed) =>
+            {
+                parsed
+            }
+            _ => {
+                return Err(format!(
+                    "invalid METRICS_GENERATOR_LIMIT `{value}`: must be an integer between {} and {}",
+                    policy::MIN_METRICS_GENERATOR_LIMIT,
+                    policy::MAX_METRICS_GENERATOR_LIMIT
+                ));
+            }
+        },
+    };
+    let pinned_generators = match std::env::var("METRICS_PINNED_GENERATORS") {
+        Err(_) => Vec::new(),
+        Ok(value) if value.trim().is_empty() => Vec::new(),
+        Ok(value) => {
+            let mut pinned = Vec::new();
+            for entry in value.split(',') {
+                let id = entry.trim().to_string();
+                if id.is_empty() {
+                    return Err(format!(
+                        "invalid METRICS_PINNED_GENERATORS `{value}`: must be a comma-separated list with no empty entries"
+                    ));
+                }
+                if id.len() > policy::MAX_METRICS_PINNED_ID_BYTES {
+                    return Err(format!(
+                        "invalid METRICS_PINNED_GENERATORS `{id}`: pinned id must be at most {} bytes",
+                        policy::MAX_METRICS_PINNED_ID_BYTES
+                    ));
+                }
+                if !pinned.contains(&id) {
+                    pinned.push(id);
+                }
+            }
+            if pinned.len() > policy::MAX_METRICS_PINNED_GENERATORS {
+                return Err(format!(
+                    "invalid METRICS_PINNED_GENERATORS `{value}`: must list at most {} generators",
+                    policy::MAX_METRICS_PINNED_GENERATORS
+                ));
+            }
+            pinned.sort();
+            pinned
+        }
+    };
+    Ok(MetricsPolicy {
+        generator_limit,
+        pinned_generators,
+    })
+}
 
 pub(crate) async fn metrics(State(state): State<Arc<AppState>>) -> Result<Response, ApiHttpError> {
     let runs = state
@@ -98,7 +182,8 @@ pub(crate) async fn metrics(State(state): State<Arc<AppState>>) -> Result<Respon
         }
     }
     let generator_count = generators.len();
-    let generator_runs = top_generator_runs(generators.into_iter().collect());
+    let generator_runs =
+        select_generator_runs(generators.into_iter().collect(), &state.metrics_policy);
     let mut body = String::from(
         "# HELP runs_total Number of durable runs by state.\n# TYPE runs_total gauge\n",
     );
@@ -139,7 +224,7 @@ pub(crate) async fn metrics(State(state): State<Arc<AppState>>) -> Result<Respon
     body.push_str("# TYPE generators gauge\n");
     body.push_str(&format!("generators {generator_count}\n"));
     body.push_str(
-        "# HELP generator_runs_total Number of durable runs per generator (top 20 by run count).\n",
+        "# HELP generator_runs_total Number of durable runs per generator (bounded selection).\n",
     );
     body.push_str("# TYPE generator_runs_total gauge\n");
     for (generator, count) in generator_runs {
@@ -158,12 +243,38 @@ pub(crate) async fn metrics(State(state): State<Arc<AppState>>) -> Result<Respon
         .into_response())
 }
 
-/// Orders generator run counts by count descending (ties by generator id
-/// ascending, so the output is deterministic) and keeps the top series.
-fn top_generator_runs(mut runs: Vec<(String, usize)>) -> Vec<(String, usize)> {
-    runs.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-    runs.truncate(METRICS_GENERATOR_LIMIT);
-    runs
+/// Selects the generator series for one scrape under `policy`.
+/// Pinned generators present in the inventory are emitted first (id
+/// ascending, so the output is deterministic), up to the budget; the
+/// remainder of the budget is filled top by run count (count descending,
+/// ties by id ascending). The output never exceeds the budget, so the
+/// scrape stays bounded no matter how large the generator id space grows.
+fn select_generator_runs(
+    runs: Vec<(String, usize)>,
+    policy: &MetricsPolicy,
+) -> Vec<(String, usize)> {
+    use std::collections::BTreeMap;
+    let counts: BTreeMap<String, usize> = runs.into_iter().collect();
+    let mut selected = Vec::new();
+    for pinned in &policy.pinned_generators {
+        if selected.len() >= policy.generator_limit {
+            break;
+        }
+        if let Some(count) = counts.get(pinned) {
+            selected.push((pinned.clone(), *count));
+        }
+    }
+    let mut rest: Vec<(String, usize)> = counts
+        .into_iter()
+        .filter(|(id, _)| !selected.iter().any(|(kept, _)| kept == id))
+        .collect();
+    rest.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    let remaining = policy.generator_limit.saturating_sub(selected.len());
+    rest.truncate(remaining);
+    // Keep pinned-first ordering deterministic: pinned stay id-ascending at
+    // the head, the filled remainder stays count-descending after them.
+    selected.extend(rest);
+    selected
 }
 
 /// Escapes a Prometheus label value per the text exposition format: only
@@ -341,6 +452,7 @@ command = ["sh", "-c", "sleep 30"]"#;
             artifact_limits: service::ArtifactZipLimits::default(),
             asset_limit: None,
             max_request_bytes: None,
+            metrics_policy: MetricsPolicy::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
         });
         let run_id = state
@@ -420,6 +532,7 @@ command = ["sh", "-c", "sleep 30"]"#;
             artifact_limits: service::ArtifactZipLimits::default(),
             asset_limit: None,
             max_request_bytes: None,
+            metrics_policy: MetricsPolicy::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
         });
         let app = Router::new()
@@ -467,20 +580,89 @@ command = ["sh", "-c", "sleep 30"]"#;
     }
 
     #[test]
-    fn generator_series_are_bounded_and_labels_escaped() {
+    fn generator_series_respect_nondefault_budget_and_deterministic_order() {
+        // Nondefault budget: only the top two survive, ordered by count
+        // descending with id tie-breaks.
+        let policy = MetricsPolicy {
+            generator_limit: 2,
+            pinned_generators: Vec::new(),
+        };
         let mut runs = Vec::new();
-        for index in 0..25 {
+        for index in 0..5 {
             runs.push((format!("gen-{index:02}"), index));
         }
-        let top = top_generator_runs(runs);
-        assert_eq!(top.len(), METRICS_GENERATOR_LIMIT);
-        assert_eq!(top[0], ("gen-24".to_string(), 24));
-        assert_eq!(top[19], ("gen-05".to_string(), 5));
+        let selected = select_generator_runs(runs, &policy);
+        assert_eq!(
+            selected,
+            vec![("gen-04".to_string(), 4), ("gen-03".to_string(), 3),],
+            "a nondefault budget must truncate top by count"
+        );
         // Ties order deterministically by generator id.
         assert_eq!(
-            top_generator_runs(vec![("b".to_string(), 1), ("a".to_string(), 1)]),
+            select_generator_runs(
+                vec![("b".to_string(), 1), ("a".to_string(), 1)],
+                &MetricsPolicy::default(),
+            ),
             vec![("a".to_string(), 1), ("b".to_string(), 1)]
         );
+        // Default budget still bounds a chaotic id space.
+        let mut many = Vec::new();
+        for index in 0..25 {
+            many.push((format!("gen-{index:02}"), index));
+        }
+        let top = select_generator_runs(many, &MetricsPolicy::default());
+        assert_eq!(top.len(), policy::DEFAULT_METRICS_GENERATOR_LIMIT);
+        assert_eq!(top[0], ("gen-24".to_string(), 24));
+    }
+
+    #[test]
+    fn pinned_generators_survive_truncation_deterministically() {
+        // A low-volume pinned generator survives even when outside the
+        // top-by-count budget; pinned ids lead id-ascending.
+        let policy = MetricsPolicy {
+            generator_limit: 2,
+            pinned_generators: vec!["pinned-low".to_string()],
+        };
+        let runs = vec![
+            ("gen-high-a".to_string(), 10),
+            ("gen-high-b".to_string(), 9),
+            ("pinned-low".to_string(), 1),
+        ];
+        assert_eq!(
+            select_generator_runs(runs, &policy),
+            vec![
+                ("pinned-low".to_string(), 1),
+                ("gen-high-a".to_string(), 10),
+            ],
+            "the pinned low-volume series must survive truncation"
+        );
+        // Absent pinned ids never fabricate series, and the budget is
+        // never exceeded even when pinned plus inventory overflow it.
+        let overflow = MetricsPolicy {
+            generator_limit: 1,
+            pinned_generators: vec!["a".to_string(), "b".to_string()],
+        };
+        let runs = vec![
+            ("a".to_string(), 1),
+            ("b".to_string(), 2),
+            ("c".to_string(), 99),
+        ];
+        let selected = select_generator_runs(runs, &overflow);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].0, "a");
+        let missing = MetricsPolicy {
+            generator_limit: 1,
+            pinned_generators: vec!["absent".to_string()],
+        };
+        assert_eq!(
+            select_generator_runs(vec![("c".to_string(), 5)], &missing),
+            vec![("c".to_string(), 5)],
+            "an absent pin must not fabricate a series"
+        );
+    }
+
+    #[test]
+    fn generator_labels_are_escaped() {
         assert_eq!(escape_prometheus_label("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
     }
 }

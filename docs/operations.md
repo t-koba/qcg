@@ -569,7 +569,11 @@ Unattended limits:
   queue depth, lease, and GC state are not reported there.
 - `GET /metrics` exposes gauges only: durable runs by state, active, queued,
   waiting, confirming, in-flight preempted (`qcg_runs_preempted`), distinct
-  generators, and per-generator top-20 counts.
+  generators, and per-generator counts under a bounded selection
+  (`METRICS_GENERATOR_LIMIT`, default 20, 1-256; `METRICS_PINNED_GENERATORS`,
+  optional comma-separated generator ids that survive truncation when present).
+  Pinned ids lead id-ascending, the remainder fills top by run count, and the
+  scrape never exceeds the budget.
   Latency histograms, error rates, queue dwell, preemption totals, and GC
   deletion or failure counts are not exported; alert thresholds live outside.
 - OTLP export exists in implementation (`OTLP_ENDPOINT`,

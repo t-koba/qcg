@@ -12,6 +12,7 @@ mod serve;
 pub use config::*;
 #[cfg(test)]
 pub(crate) use idempotency::*;
+pub use middleware::MetricsPolicy;
 #[cfg(test)]
 pub(crate) use middleware::*;
 pub use otlp::OtlpConfig;

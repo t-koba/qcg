@@ -183,6 +183,23 @@ pub const IDEMPOTENCY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Maximum idempotency records retained per server.
 pub const IDEMPOTENCY_MAX_ENTRIES: usize = 1024;
 
+/// Default bound on `generator_runs_total` series exported by `/metrics`.
+/// Deployment policy may set any value within the mechanism bounds; the
+/// scrape stays bounded in every case (never unbounded).
+pub const DEFAULT_METRICS_GENERATOR_LIMIT: usize = 20;
+
+/// Inclusive mechanism bounds for the metrics generator-series budget.
+/// The upper bound keeps one scrape to tens of kilobytes worst case.
+pub const MIN_METRICS_GENERATOR_LIMIT: usize = 1;
+pub const MAX_METRICS_GENERATOR_LIMIT: usize = 256;
+
+/// Inclusive mechanism bound for pinned generator selections carried in
+/// `METRICS_PINNED_GENERATORS`. Keeps the parsed env value bounded.
+pub const MAX_METRICS_PINNED_GENERATORS: usize = 64;
+
+/// Inclusive mechanism bound for one pinned generator id, in bytes.
+pub const MAX_METRICS_PINNED_ID_BYTES: usize = 256;
+
 /// Maximum bytes kept per tool-call event value before truncation.
 pub const TOOL_EVENT_VALUE_LIMIT_BYTES: usize = 32 * 1024;
 

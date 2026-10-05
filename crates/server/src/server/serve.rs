@@ -113,6 +113,8 @@ pub struct ResolvedServerPolicy {
     pub gc_interval_secs: u64,
     /// Deployment cap on parallel wave scheduling; `None` uses the CPU count.
     pub max_parallel_steps: Option<usize>,
+    /// Metrics cardinality policy resolved at boot (E04 freeze).
+    pub metrics_policy: super::middleware::MetricsPolicy,
     /// Per-run live broadcast channel capacity.
     pub live_event_channel_capacity: usize,
     /// Shared-mode journal follow cadence, in milliseconds.
@@ -163,6 +165,8 @@ pub fn resolve_server_policy(config: &ServerConfig) -> Result<ResolvedServerPoli
     // refuses boot (E04).
     let rate_limit = super::rate_limit::resolve_rate_limit_policy()
         .map_err(|detail| format!("invalid rate limit configuration: {detail}"))?;
+    let metrics_policy = super::middleware::resolve_metrics_policy()
+        .map_err(|detail| format!("invalid metrics configuration: {detail}"))?;
     let otlp = super::otlp::resolve_otlp_config()?;
     // Retention sweep policy: strict positive integers, resolved once.
     let live_event_channel_capacity = usize::try_from(parse_bounded_env(
@@ -320,6 +324,7 @@ pub fn resolve_server_policy(config: &ServerConfig) -> Result<ResolvedServerPoli
         return Err("api_token must not be empty when set".into());
     }
     Ok(ResolvedServerPolicy {
+        metrics_policy,
         read_cache_max_bytes,
         idempotency_ttl,
         idempotency_max_entries,
@@ -395,6 +400,7 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
     // explicit environment overrides (3.2). Invalid knobs refuse to boot
     // instead of degrading silently.
     let ResolvedServerPolicy {
+        metrics_policy,
         read_cache_max_bytes,
         idempotency_ttl,
         idempotency_max_entries,
@@ -426,6 +432,8 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
         preemption_enabled,
         rate_limit_rps = rate_limit.as_ref().map(|policy| policy.rps),
         rate_limit_burst = rate_limit.as_ref().map(|policy| policy.burst),
+        metrics_generator_limit = metrics_policy.generator_limit,
+        metrics_pinned_generators = metrics_policy.pinned_generators.len(),
         validated_cors_origins = validated_cors.len(),
         otlp = otlp
             .as_ref()
@@ -491,6 +499,9 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
         },
         asset_limit: config.max_asset_bytes,
         max_request_bytes: config.max_request_bytes,
+        // Freeze the already-resolved metrics policy: scrapes never
+        // re-read the environment (E04).
+        metrics_policy,
         shutdown: shutdown.clone(),
     });
     // Router construction is the last fallible initialization step. It must
@@ -2078,6 +2089,100 @@ command = ["sh", "-c", "sleep 30"]"#,
         );
         unset("RATE_LIMIT_RPS");
         unset("RATE_LIMIT_BURST");
+    }
+
+    #[tokio::test]
+    async fn metrics_cardinality_env_knobs_are_resolved_strictly() {
+        if crate::tests::isolate_environment_test(
+            "server::serve::tests::metrics_cardinality_env_knobs_are_resolved_strictly",
+        ) {
+            return;
+        }
+        // E04: metrics cardinality knobs are fail-closed. Zero, garbage,
+        // out-of-range, and malformed pin lists refuse boot; valid values
+        // freeze into the resolved policy with deterministic pin order.
+        let _env_guard = BOOT_ENV_GUARD.lock().await;
+        let root = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .expect("temporary directory path should be UTF-8")
+            .join(format!("e04-metrics-{}", uuid::Uuid::now_v7()));
+        let _temp_guard = TempGuard(root.clone());
+        let generators = root.join("generators");
+        let runs = root.join("runs");
+        std::fs::create_dir_all(&generators).expect("generators dir should create");
+        let config = boot_config(&generators, &runs);
+        let unset = |variable: &str| {
+            // SAFETY: the guard serializes environment mutation across tests.
+            unsafe {
+                std::env::remove_var(variable);
+            }
+        };
+        let set = |variable: &str, value: &str| {
+            // SAFETY: the guard serializes environment mutation across tests.
+            unsafe {
+                std::env::set_var(variable, value);
+            }
+        };
+        unset("METRICS_GENERATOR_LIMIT");
+        unset("METRICS_PINNED_GENERATORS");
+        let resolved = resolve_server_policy(&config).expect("unset metrics knobs should resolve");
+        assert_eq!(
+            resolved.metrics_policy.generator_limit,
+            policy::DEFAULT_METRICS_GENERATOR_LIMIT
+        );
+        assert!(resolved.metrics_policy.pinned_generators.is_empty());
+        for bad in ["0", "fast", "", "-1", "1.5", "257", "99999999999999999999"] {
+            set("METRICS_GENERATOR_LIMIT", bad);
+            let error = resolve_server_policy(&config)
+                .expect_err("invalid metrics budget must refuse boot");
+            assert!(
+                error.contains("METRICS_GENERATOR_LIMIT"),
+                "refusal must name the budget: {error}"
+            );
+        }
+        unset("METRICS_GENERATOR_LIMIT");
+        for bad in ["a,,b", ",", "a, ,b", " "] {
+            // " " trims to empty and means unset, so it resolves; the rest
+            // must refuse. Handle the whitespace-only case explicitly.
+            if bad.trim().is_empty() {
+                set("METRICS_PINNED_GENERATORS", bad);
+                assert!(
+                    resolve_server_policy(&config)
+                        .expect("whitespace-only pins should resolve empty")
+                        .metrics_policy
+                        .pinned_generators
+                        .is_empty()
+                );
+                continue;
+            }
+            set("METRICS_PINNED_GENERATORS", bad);
+            let error =
+                resolve_server_policy(&config).expect_err("malformed pin list must refuse boot");
+            assert!(
+                error.contains("METRICS_PINNED_GENERATORS"),
+                "refusal must name the pin list: {error}"
+            );
+        }
+        // Too many pins refuse boot.
+        let many = (0..65)
+            .map(|i| format!("gen-{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        set("METRICS_PINNED_GENERATORS", &many);
+        let error =
+            resolve_server_policy(&config).expect_err("oversized pin list must refuse boot");
+        assert!(error.contains("METRICS_PINNED_GENERATORS"), "{error}");
+        // A nondefault budget with pins resolves and pins sort
+        // deterministically.
+        set("METRICS_GENERATOR_LIMIT", "2");
+        set("METRICS_PINNED_GENERATORS", "b,a,b");
+        let resolved = resolve_server_policy(&config).expect("valid metrics knobs should resolve");
+        assert_eq!(resolved.metrics_policy.generator_limit, 2);
+        assert_eq!(
+            resolved.metrics_policy.pinned_generators,
+            vec!["a".to_string(), "b".to_string()]
+        );
+        unset("METRICS_GENERATOR_LIMIT");
+        unset("METRICS_PINNED_GENERATORS");
     }
 
     #[test]
