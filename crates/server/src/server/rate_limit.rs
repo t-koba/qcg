@@ -19,13 +19,23 @@ use std::time::{Duration, Instant};
 use super::error::ApiHttpError;
 use super::middleware::sha256_bytes;
 
-/// Upper bound on tracked credential buckets. A fully refilled bucket is
-/// indistinguishable from an absent one, so the least recently used entry is
-/// evicted when a new credential arrives at capacity; without this bound an
-/// attacker rotating `Authorization` headers would grow the map forever.
-const MAX_TRACKED_BUCKETS: usize = 4_096;
+/// Deployment overflow choice for new identities arriving at capacity.
+/// The mechanism never evicts an exhausted bucket into a full one (that
+/// would hand out fresh bursts on rotation); the deployment chooses what a
+/// new identity observes instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RateLimitOverflow {
+    /// New identities share the anonymous bucket instead of minting fresh
+    /// budget. Preserves the previous behavior.
+    #[default]
+    FoldAnonymous,
+    /// New identities are rejected with `429` while established identities
+    /// keep their own buckets, so capacity pressure is visible as an
+    /// explicit denial instead of shared quota.
+    RejectNew,
+}
 
-/// Boot-frozen rate limit policy. Both values are validated in
+/// Boot-frozen rate limit policy. Every value is validated in
 /// [`resolve_rate_limit_policy`]: a rejected knob refuses boot instead of
 /// silently degrading to an unthrottled or mis-throttled server.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +49,11 @@ pub struct RateLimitPolicy {
     /// bucket key. Must only be configured when the outer layer strips or
     /// overwrites it; otherwise callers could self-assert identity (F10).
     pub trusted_identity_header: Option<String>,
+    /// Maximum tracked identity buckets (deployment budget, default 4096).
+    /// Bounds the bucket map no matter how large the identity space grows.
+    pub max_identities: usize,
+    /// What a new identity observes at capacity (deployment choice).
+    pub overflow: RateLimitOverflow,
 }
 
 /// Resolves the deployment rate limit from the environment. Unset
@@ -79,10 +94,43 @@ pub(crate) fn resolve_rate_limit_policy() -> Result<Option<RateLimitPolicy>, Str
             Some(name)
         }
     };
+    let max_identities = match std::env::var("RATE_LIMIT_MAX_IDENTITIES") {
+        Err(_) => policy::DEFAULT_RATE_LIMIT_MAX_IDENTITIES,
+        Ok(value) => match value.parse::<usize>() {
+            Ok(parsed)
+                if (policy::MIN_RATE_LIMIT_MAX_IDENTITIES
+                    ..=policy::MAX_RATE_LIMIT_MAX_IDENTITIES)
+                    .contains(&parsed) =>
+            {
+                parsed
+            }
+            _ => {
+                return Err(format!(
+                    "invalid RATE_LIMIT_MAX_IDENTITIES `{value}`: must be an integer between {} and {}",
+                    policy::MIN_RATE_LIMIT_MAX_IDENTITIES,
+                    policy::MAX_RATE_LIMIT_MAX_IDENTITIES
+                ));
+            }
+        },
+    };
+    let overflow = match std::env::var("RATE_LIMIT_OVERFLOW") {
+        Err(_) => RateLimitOverflow::FoldAnonymous,
+        Ok(value) => match value.to_ascii_lowercase().as_str() {
+            "fold" => RateLimitOverflow::FoldAnonymous,
+            "reject" => RateLimitOverflow::RejectNew,
+            _ => {
+                return Err(format!(
+                    "invalid RATE_LIMIT_OVERFLOW `{value}`: must be `fold` or `reject`"
+                ));
+            }
+        },
+    };
     Ok(Some(RateLimitPolicy {
         rps,
         burst,
         trusted_identity_header,
+        max_identities,
+        overflow,
     }))
 }
 
@@ -168,27 +216,51 @@ impl RateLimiter {
             .buckets
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // At capacity, fold new identities into the shared anonymous bucket
-        // instead of evicting (F10-03): evicting an exhausted bucket and
-        // recreating it full would hand out fresh bursts on rotation.
+        // At capacity no exhausted bucket is evicted into a full one
+        // (F10-03): evicting an exhausted bucket and recreating it full
+        // would hand out fresh bursts on rotation. The deployment overflow
+        // policy chooses what a new identity observes instead.
         let mut key = key;
-        if !buckets.contains_key(&key) && buckets.len() >= MAX_TRACKED_BUCKETS {
-            if key.is_some() {
-                key = None;
-            } else {
-                // Even the anonymous bucket is at capacity pressure: evict
-                // the fullest bucket so an exhausted bucket never refills
-                // via eviction.
-                let fullest = buckets
-                    .iter()
-                    .max_by(|a, b| {
-                        a.1.tokens
-                            .partial_cmp(&b.1.tokens)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .map(|(key, _)| *key);
-                if let Some(fullest) = fullest {
-                    buckets.remove(&fullest);
+        if !buckets.contains_key(&key) && buckets.len() >= self.policy.max_identities {
+            match self.policy.overflow {
+                RateLimitOverflow::RejectNew => {
+                    // Explicit pressure signal: the newcomer is denied
+                    // without minting a bucket and without touching
+                    // established buckets. The wait covers one token so the
+                    // 429 carries a meaningful `Retry-After`.
+                    let rps = f64::from(self.policy.rps);
+                    tracing::warn!(
+                        capacity = self.policy.max_identities,
+                        tracked = buckets.len(),
+                        "rate limit identity budget exhausted; rejecting new identity"
+                    );
+                    return Err(Duration::from_secs_f64((1.0 / rps).max(0.001)));
+                }
+                RateLimitOverflow::FoldAnonymous => {
+                    if key.is_some() {
+                        tracing::warn!(
+                            capacity = self.policy.max_identities,
+                            tracked = buckets.len(),
+                            "rate limit identity budget exhausted; folding new identity into the anonymous bucket"
+                        );
+                        key = None;
+                    }
+                    // The folded (or originally anonymous) key may still be
+                    // new at capacity: evict the fullest bucket so an
+                    // exhausted bucket never refills via eviction.
+                    if !buckets.contains_key(&key) && buckets.len() >= self.policy.max_identities {
+                        let fullest = buckets
+                            .iter()
+                            .max_by(|a, b| {
+                                a.1.tokens
+                                    .partial_cmp(&b.1.tokens)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                            .map(|(key, _)| *key);
+                        if let Some(fullest) = fullest {
+                            buckets.remove(&fullest);
+                        }
+                    }
                 }
             }
         }
@@ -281,6 +353,8 @@ mod tests {
                 rps: 2,
                 burst: 3,
                 trusted_identity_header: None,
+                max_identities: policy::DEFAULT_RATE_LIMIT_MAX_IDENTITIES,
+                overflow: RateLimitOverflow::FoldAnonymous,
             },
             None,
         );
@@ -318,6 +392,8 @@ mod tests {
                 rps: 1,
                 burst: 1,
                 trusted_identity_header: None,
+                max_identities: policy::DEFAULT_RATE_LIMIT_MAX_IDENTITIES,
+                overflow: RateLimitOverflow::FoldAnonymous,
             },
             Some(expected),
         );
@@ -343,6 +419,8 @@ mod tests {
                 rps: 1,
                 burst: 1,
                 trusted_identity_header: None,
+                max_identities: policy::DEFAULT_RATE_LIMIT_MAX_IDENTITIES,
+                overflow: RateLimitOverflow::FoldAnonymous,
             },
             None,
         );
@@ -394,6 +472,8 @@ mod tests {
                 rps: 1,
                 burst: 1,
                 trusted_identity_header: None,
+                max_identities: policy::DEFAULT_RATE_LIMIT_MAX_IDENTITIES,
+                overflow: RateLimitOverflow::FoldAnonymous,
             },
             None,
         )));
@@ -447,6 +527,8 @@ mod tests {
                 rps: 1,
                 burst: 1,
                 trusted_identity_header: None,
+                max_identities: policy::DEFAULT_RATE_LIMIT_MAX_IDENTITIES,
+                overflow: RateLimitOverflow::FoldAnonymous,
             },
             None,
         )));
@@ -488,6 +570,8 @@ mod tests {
                 rps: 1,
                 burst: 1,
                 trusted_identity_header: None,
+                max_identities: policy::DEFAULT_RATE_LIMIT_MAX_IDENTITIES,
+                overflow: RateLimitOverflow::FoldAnonymous,
             },
             Some(expected),
         )));
@@ -536,22 +620,37 @@ mod tests {
         );
     }
 
+    fn small_policy(max: usize, overflow: RateLimitOverflow) -> RateLimitPolicy {
+        RateLimitPolicy {
+            rps: 1,
+            burst: 1,
+            trusted_identity_header: None,
+            max_identities: max,
+            overflow,
+        }
+    }
+
+    fn tracked_len(limiter: &RateLimiter) -> usize {
+        limiter
+            .buckets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
     #[test]
     fn overflow_identities_fold_into_anonymous_without_refill() {
-        // F10-03: at capacity no exhausted bucket is evicted into a full
-        // one; memory stays bounded by MAX_TRACKED_BUCKETS plus the shared
-        // overflow bucket.
+        // F10-03 (fold): at capacity no exhausted bucket is evicted into a
+        // full one; memory stays bounded by the deployment budget plus the
+        // shared overflow bucket.
+        let max = policy::DEFAULT_RATE_LIMIT_MAX_IDENTITIES;
         let limiter = RateLimiter::with_expected_digest(
-            RateLimitPolicy {
-                rps: 1,
-                burst: 1,
-                trusted_identity_header: None,
-            },
+            small_policy(max, RateLimitOverflow::FoldAnonymous),
             None,
         );
         let now = Instant::now();
         // Fill every slot with an exhausted bucket via distinct keys.
-        for i in 0..MAX_TRACKED_BUCKETS {
+        for i in 0..max {
             let key = Some(sha256_bytes(&format!("user-{i}")));
             limiter.try_acquire(key, now).expect("fresh bucket admits");
             assert!(
@@ -559,15 +658,7 @@ mod tests {
                 "each bucket must be exhausted"
             );
         }
-        assert_eq!(
-            limiter
-                .buckets
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .len(),
-            MAX_TRACKED_BUCKETS,
-            "memory must stay bounded"
-        );
+        assert_eq!(tracked_len(&limiter), max, "memory must stay bounded");
         // A new identity folds into anonymous instead of evicting an
         // exhausted bucket back to full.
         let first = Some(sha256_bytes("user-0"));
@@ -577,14 +668,94 @@ mod tests {
             limiter.try_acquire(first, now).is_err(),
             "no exhausted bucket may be evicted into a refill"
         );
+        assert!(tracked_len(&limiter) <= max + 1, "memory must stay bounded");
+    }
+
+    #[test]
+    fn small_cap_fold_keeps_established_independent_without_churn_refill() {
+        // Focused small-cap fixture (fold): two established identities stay
+        // independent at capacity, the newcomer shares the anonymous budget,
+        // and rotating newcomers never refill an exhausted bucket.
+        let limiter = RateLimiter::with_expected_digest(
+            small_policy(2, RateLimitOverflow::FoldAnonymous),
+            None,
+        );
+        let now = Instant::now();
+        let alice = Some(sha256_bytes("alice"));
+        let bob = Some(sha256_bytes("bob"));
+        limiter.try_acquire(alice, now).expect("alice admitted");
+        limiter
+            .try_acquire(bob, now)
+            .expect("bob admitted independently");
+        assert_eq!(tracked_len(&limiter), 2);
+        // Both established buckets are exhausted; the newcomer folds into
+        // the anonymous bucket (one fresh token), not into a refill.
+        let mallory = Some(sha256_bytes("mallory"));
+        limiter
+            .try_acquire(mallory, now)
+            .expect("folded newcomer shares the anonymous budget once");
         assert!(
-            limiter
-                .buckets
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .len()
-                <= MAX_TRACKED_BUCKETS + 1,
-            "memory must stay bounded"
+            limiter.try_acquire(alice, now).is_err(),
+            "alice must stay exhausted"
+        );
+        assert!(
+            limiter.try_acquire(bob, now).is_err(),
+            "bob must stay exhausted"
+        );
+        // Identity churn never replenishes: every further newcomer shares
+        // the now-exhausted anonymous bucket.
+        for i in 0..4 {
+            let churn = Some(sha256_bytes(&format!("churn-{i}")));
+            assert!(
+                limiter.try_acquire(churn, now).is_err(),
+                "churn identity {i} must not mint fresh budget"
+            );
+        }
+        assert!(
+            tracked_len(&limiter) <= 3,
+            "memory must stay bounded by the budget plus overflow"
+        );
+    }
+
+    #[test]
+    fn small_cap_reject_denies_newcomers_without_touching_established() {
+        // Focused small-cap fixture (reject): established identities keep
+        // their budgets at capacity while newcomers are denied outright,
+        // and churn never refills an exhausted bucket.
+        let limiter =
+            RateLimiter::with_expected_digest(small_policy(2, RateLimitOverflow::RejectNew), None);
+        let now = Instant::now();
+        let alice = Some(sha256_bytes("alice"));
+        limiter.try_acquire(alice, now).expect("alice admitted");
+        assert!(
+            limiter.try_acquire(alice, now).is_err(),
+            "alice must be exhausted"
+        );
+        let bob = Some(sha256_bytes("bob"));
+        limiter
+            .try_acquire(bob, now)
+            .expect("bob admitted independently");
+        assert_eq!(tracked_len(&limiter), 2);
+        // At capacity: newcomers are rejected without minting buckets.
+        for fresh in ["mallory", "churn-1", "churn-2"] {
+            let key = Some(sha256_bytes(fresh));
+            let wait = limiter
+                .try_acquire(key, now)
+                .expect_err("newcomer must be rejected at capacity");
+            assert!(wait > Duration::ZERO, "rejection must report a retry delay");
+        }
+        assert_eq!(
+            tracked_len(&limiter),
+            2,
+            "rejected newcomers must not grow the map"
+        );
+        assert!(
+            limiter.try_acquire(alice, now).is_err(),
+            "no exhausted bucket may be evicted into a refill"
+        );
+        assert!(
+            limiter.try_acquire(bob, now).is_err(),
+            "bob must stay exhausted"
         );
     }
 }

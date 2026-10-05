@@ -27,7 +27,7 @@ use super::middleware::{
     loopback_oauth_origins, metrics, reject_unsafe_generator_asset_path, require_api_auth,
     security_headers_middleware, sha256_bytes,
 };
-use super::rate_limit::{RateLimitPolicy, RateLimiter, enforce_rate_limit};
+use super::rate_limit::{RateLimitOverflow, RateLimitPolicy, RateLimiter, enforce_rate_limit};
 use super::run_detail::{
     answer_run, cancel_run_from_path, confirm_run, delete_run, dispatch_fallback, read_artifact,
     read_artifacts_zip, read_cost_metrics, read_journal, read_run_bundle, run_artifacts,
@@ -432,6 +432,14 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
         preemption_enabled,
         rate_limit_rps = rate_limit.as_ref().map(|policy| policy.rps),
         rate_limit_burst = rate_limit.as_ref().map(|policy| policy.burst),
+        rate_limit_max_identities = rate_limit.as_ref().map(|policy| policy.max_identities),
+        rate_limit_overflow = rate_limit
+            .as_ref()
+            .map(|policy| match policy.overflow {
+                RateLimitOverflow::FoldAnonymous => "fold",
+                RateLimitOverflow::RejectNew => "reject",
+            })
+            .unwrap_or("off"),
         metrics_generator_limit = metrics_policy.generator_limit,
         metrics_pinned_generators = metrics_policy.pinned_generators.len(),
         validated_cors_origins = validated_cors.len(),
@@ -2072,7 +2080,9 @@ command = ["sh", "-c", "sleep 30"]"#,
             Some(RateLimitPolicy {
                 rps: 10,
                 burst: 10,
-                trusted_identity_header: None
+                trusted_identity_header: None,
+                max_identities: policy::DEFAULT_RATE_LIMIT_MAX_IDENTITIES,
+                overflow: RateLimitOverflow::FoldAnonymous,
             }),
             "an unset burst must default to the rps value"
         );
@@ -2084,11 +2094,54 @@ command = ["sh", "-c", "sleep 30"]"#,
             Some(RateLimitPolicy {
                 rps: 10,
                 burst: 25,
-                trusted_identity_header: None
+                trusted_identity_header: None,
+                max_identities: policy::DEFAULT_RATE_LIMIT_MAX_IDENTITIES,
+                overflow: RateLimitOverflow::FoldAnonymous,
             })
         );
+        // Identity capacity and overflow default to the bounded fold policy.
+        unset("RATE_LIMIT_MAX_IDENTITIES");
+        unset("RATE_LIMIT_OVERFLOW");
+        let resolved = resolve_server_policy(&config).expect("defaults should resolve");
+        let limited = resolved.rate_limit.expect("rate limit should resolve");
+        assert_eq!(
+            limited.max_identities,
+            policy::DEFAULT_RATE_LIMIT_MAX_IDENTITIES
+        );
+        assert_eq!(limited.overflow, RateLimitOverflow::FoldAnonymous);
+        // Out-of-range budgets and unknown overflow modes refuse boot.
+        for bad in [
+            "0",
+            "fast",
+            "",
+            "-1",
+            "1.5",
+            "65537",
+            "99999999999999999999",
+        ] {
+            set("RATE_LIMIT_MAX_IDENTITIES", bad);
+            let error = resolve_server_policy(&config)
+                .expect_err("invalid identity budget must refuse boot");
+            assert!(
+                error.contains("RATE_LIMIT_MAX_IDENTITIES"),
+                "refusal must name the budget: {error}"
+            );
+        }
+        unset("RATE_LIMIT_MAX_IDENTITIES");
+        set("RATE_LIMIT_OVERFLOW", "evict");
+        let error = resolve_server_policy(&config).expect_err("unknown overflow must refuse boot");
+        assert!(error.contains("RATE_LIMIT_OVERFLOW"), "{error}");
+        // A nondefault budget with explicit reject resolves.
+        set("RATE_LIMIT_MAX_IDENTITIES", "2");
+        set("RATE_LIMIT_OVERFLOW", "reject");
+        let resolved = resolve_server_policy(&config).expect("valid capacity knobs should resolve");
+        let limited = resolved.rate_limit.expect("rate limit should resolve");
+        assert_eq!(limited.max_identities, 2);
+        assert_eq!(limited.overflow, RateLimitOverflow::RejectNew);
         unset("RATE_LIMIT_RPS");
         unset("RATE_LIMIT_BURST");
+        unset("RATE_LIMIT_MAX_IDENTITIES");
+        unset("RATE_LIMIT_OVERFLOW");
     }
 
     #[tokio::test]
@@ -2299,6 +2352,8 @@ command = ["sh", "-c", "sleep 30"]"#,
             rps: 1,
             burst: 1,
             trusted_identity_header: None,
+            max_identities: policy::DEFAULT_RATE_LIMIT_MAX_IDENTITIES,
+            overflow: RateLimitOverflow::FoldAnonymous,
         };
         let app = build_router(&state, &config, &validated_cors, Some(policy))
             .expect("router should build");

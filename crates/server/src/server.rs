@@ -16,7 +16,7 @@ pub use middleware::MetricsPolicy;
 #[cfg(test)]
 pub(crate) use middleware::*;
 pub use otlp::OtlpConfig;
-pub use rate_limit::RateLimitPolicy;
+pub use rate_limit::{RateLimitOverflow, RateLimitPolicy};
 #[cfg(test)]
 pub(crate) use run_detail::*;
 #[cfg(test)]

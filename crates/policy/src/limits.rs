@@ -200,6 +200,17 @@ pub const MAX_METRICS_PINNED_GENERATORS: usize = 64;
 /// Inclusive mechanism bound for one pinned generator id, in bytes.
 pub const MAX_METRICS_PINNED_ID_BYTES: usize = 256;
 
+/// Default bound on tracked rate-limit identity buckets. The bucket
+/// mechanism stays bounded in every case; deployments may set any value
+/// within the mechanism bounds.
+pub const DEFAULT_RATE_LIMIT_MAX_IDENTITIES: usize = 4_096;
+
+/// Inclusive mechanism bounds for the rate-limit identity budget. The upper
+/// bound keeps the bucket map to a few megabytes worst case (one small
+/// bucket per identity) instead of unbounded growth.
+pub const MIN_RATE_LIMIT_MAX_IDENTITIES: usize = 1;
+pub const MAX_RATE_LIMIT_MAX_IDENTITIES: usize = 65_536;
+
 /// Maximum bytes kept per tool-call event value before truncation.
 pub const TOOL_EVENT_VALUE_LIMIT_BYTES: usize = 32 * 1024;
 
