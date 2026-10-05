@@ -389,12 +389,23 @@ pub(crate) fn checkpoint_scope(
 /// instead of being trusted back into a continuation.
 const PENDING_PAYLOAD_MAX_BYTES: usize = policy::TOOL_EVENT_VALUE_LIMIT_BYTES + 4096;
 
-/// Ceiling for one spilled operation result. The sidecar indexes into the same
-/// run state, so it inherits the state ceiling instead of inventing a second
-/// limit that write and read could disagree about.
-const OPERATION_RESULT_SIDECAR_MAX_BYTES: usize = policy::DEFAULT_MAX_STATE_BYTES;
-
+// Resolved ceiling for one spilled operation result: the sidecar indexes
+// into the same run state, so write and read share the resolver below,
+// which inherits the resolved state ceiling (`runtime.state_limit_bytes`,
+// defaulting exactly like `JournalLimits::from`).
 impl RunContext {
+    /// Operation-result sidecar bound for this run. Mirrors the journal
+    /// state ceiling resolution (`None` means the default, never
+    /// unlimited), so raising or lowering `state_limit_bytes` reaches the
+    /// persistence path that indexes into that state.
+    fn operation_result_sidecar_max_bytes(&self) -> usize {
+        self.contract
+            .manifest
+            .runtime
+            .state_limit_bytes
+            .unwrap_or(policy::DEFAULT_MAX_STATE_BYTES)
+    }
+
     /// Test-only context builder for downstream approval/resume tests
     /// (F02). Mirrors production construction (same gateways, same secret
     /// loading) with fresh cancellation and empty replay state. Only
@@ -738,9 +749,10 @@ impl RunContext {
         // ceiling as the state that indexes them. Refusing here keeps write and
         // read symmetric: a sidecar that could never be read back is refused at
         // the moment the external effect is recorded, not at resend time.
-        if bytes.len() > OPERATION_RESULT_SIDECAR_MAX_BYTES {
+        let sidecar_max_bytes = self.operation_result_sidecar_max_bytes();
+        if bytes.len() > sidecar_max_bytes {
             return Err(fail(format!(
-                "operation `{operation_id}` result is {} bytes, exceeding the {OPERATION_RESULT_SIDECAR_MAX_BYTES}-byte sidecar bound",
+                "operation `{operation_id}` result is {} bytes, exceeding the {sidecar_max_bytes}-byte sidecar bound",
                 bytes.len()
             )));
         }
@@ -777,8 +789,8 @@ impl RunContext {
         let path = self.metadata.join("operation-results").join(name);
         // The same ceiling the write enforces, so a swapped oversized file
         // fails as tampering instead of allocating.
-        let bytes =
-            files::read_nofollow_bounded(&path, Some(OPERATION_RESULT_SIDECAR_MAX_BYTES))
+        let sidecar_max_bytes = self.operation_result_sidecar_max_bytes();
+        let bytes = files::read_nofollow_bounded(&path, Some(sidecar_max_bytes))
                 .map_err(|error| {
             fail(format!(
                 "operation `{operation_id}` spilled result `{name}` is unavailable: {error}; manual recovery required"
@@ -2218,6 +2230,62 @@ mod tests {
         match ctx.guard_external_operation(&journal, &node, "command", "big", &details, "call-1") {
             Err(crate::StepError::Refused { .. }) => {}
             other => panic!("a damaged sidecar must refuse resend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn operation_result_sidecar_inherits_smaller_state_limit() {
+        // E07: lowering `runtime.state_limit_bytes` lowers the sidecar
+        // ceiling too, so a result the build default would spill is
+        // refused at record time under the tightened run policy.
+        let (_dir, metadata, mut ctx, node) = guard_harness("spill-tight");
+        ctx.contract.manifest.runtime.state_limit_bytes = Some(80 * 1024);
+        assert_eq!(ctx.operation_result_sidecar_max_bytes(), 80 * 1024);
+        let journal = test_guard_journal(&metadata, "spill-tight");
+        let big = Value::String("x".repeat(100 * 1024));
+        let details = Some(json!({"argv": ["big"]}));
+        let GuardDecision::Proceed { operation_id } = ctx
+            .guard_external_operation(&journal, &node, "command", "big", &details, "call-1")
+            .expect("first guard should proceed")
+        else {
+            panic!("first guard must proceed");
+        };
+        let error = ctx
+            .finish_external_operation(&journal, &node, &operation_id, Some(big))
+            .expect_err("a result above the tightened state ceiling must refuse");
+        assert!(
+            error.to_string().contains("sidecar bound"),
+            "refusal must name the sidecar bound: {error}"
+        );
+    }
+
+    #[test]
+    fn operation_result_sidecar_inherits_larger_state_limit() {
+        // E07: raising `runtime.state_limit_bytes` raises the sidecar
+        // ceiling too, so a result the build default would refuse spills
+        // and resends under the loosened run policy. Write and read share
+        // the resolver, so the resend observes the same raised bound.
+        let (_dir, metadata, mut ctx, node) = guard_harness("spill-loose");
+        let raised = policy::DEFAULT_MAX_STATE_BYTES + 4 * 1024 * 1024;
+        ctx.contract.manifest.runtime.state_limit_bytes = Some(raised);
+        assert_eq!(ctx.operation_result_sidecar_max_bytes(), raised);
+        let journal = test_guard_journal(&metadata, "spill-loose");
+        let big = Value::String("x".repeat(policy::DEFAULT_MAX_STATE_BYTES + 1024 * 1024));
+        let details = Some(json!({"argv": ["big"]}));
+        let GuardDecision::Proceed { operation_id } = ctx
+            .guard_external_operation(&journal, &node, "command", "big", &details, "call-1")
+            .expect("first guard should proceed")
+        else {
+            panic!("first guard must proceed");
+        };
+        ctx.finish_external_operation(&journal, &node, &operation_id, Some(big.clone()))
+            .expect("spilling under the raised ceiling should journal");
+        match ctx
+            .guard_external_operation(&journal, &node, "command", "big", &details, "call-1")
+            .expect("resend should converge")
+        {
+            GuardDecision::Resend { result, .. } => assert_eq!(result, big),
+            GuardDecision::Proceed { .. } => panic!("resend must not re-execute"),
         }
     }
 }
