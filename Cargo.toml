@@ -24,7 +24,7 @@ edition = "2024"
 description = "Contract-driven harness for bounded, purpose-specialized generation"
 repository = "https://github.com/t-koba/qcg"
 readme = "README.md"
-rust-version = "1.98"
+rust-version = "1.99"
 version = "0.1.0"
 publish = false
 
