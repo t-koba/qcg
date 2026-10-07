@@ -2,7 +2,7 @@
 use crate::bounded_http::BoundedHttpClient;
 use crate::bounded_stdio::BoundedChildTransport;
 use rmcp::ClientHandler;
-use rmcp::model::{ClientCapabilities, ClientInfo, Implementation, TASKS_EXTENSION_ID};
+use rmcp::model::{ClientCapabilities, ClientConfig, Implementation, TASKS_EXTENSION_ID};
 use rmcp::transport::StreamableHttpClientTransport;
 #[cfg(feature = "mcp-oauth")]
 use rmcp::transport::auth::{
@@ -48,13 +48,13 @@ fn oauth_feature_error(server_id: &str) -> McpError {
 }
 
 impl ClientHandler for McpClient {
-    fn get_info(&self) -> ClientInfo {
+    fn get_info(&self) -> ClientConfig {
         let mut capabilities = ClientCapabilities::default();
         capabilities.extensions = Some(BTreeMap::from([(
             TASKS_EXTENSION_ID.to_string(),
             Default::default(),
         )]));
-        ClientInfo::new(
+        ClientConfig::new(
             capabilities,
             Implementation::new(policy::default_service_name(), env!("CARGO_PKG_VERSION")),
         )

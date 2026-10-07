@@ -7,7 +7,7 @@ use mcp::{
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ElicitRequest, ElicitRequestParams,
     InputRequest, InputRequiredResult, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
-    ServerInfo, Tool,
+    ServerConfig, Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::streamable_http_server::{
@@ -27,8 +27,8 @@ struct SessionServer {
 }
 
 impl ServerHandler for SessionServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 
     async fn list_tools(
