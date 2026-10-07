@@ -42,7 +42,7 @@ dunce = "1"
 futures-util = "0.3"
 hex = "0.4"
 http = "1"
-jsonschema = { version = "0.55", default-features = false }
+jsonschema = { version = "0.58", default-features = false }
 keyring = "4.1.6"
 libc = "0.2"
 minijinja = { version = "2", features = ["loader", "json", "fuel"] }
