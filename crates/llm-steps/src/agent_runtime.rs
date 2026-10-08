@@ -872,12 +872,7 @@ pub(crate) async fn execute_agent_tool(
                 .get("content")
                 .and_then(Value::as_str)
                 .ok_or_else(|| StepError::failed(&node.id, "fs.write tool requires content"))?;
-            if !path_is_within_prefix(path, path_prefix) {
-                return Err(StepError::failed(
-                    &node.id,
-                    format!("tool `{name}` path `{path}` is outside prefix `{path_prefix}`"),
-                ));
-            }
+            ensure_path_within_prefix(node, name, path, path_prefix)?;
             // Same side-effect and durability gate as command and HTTP tools
             // (E07): the checkpoint alone is not a durable record. Approval,
             // guard, and completion records decide resend, clean retry, and
@@ -1023,12 +1018,7 @@ pub(crate) async fn execute_agent_tool(
                 .get("path")
                 .and_then(Value::as_str)
                 .ok_or_else(|| StepError::failed(&node.id, "fs.read tool requires path"))?;
-            if !path_is_within_prefix(path, path_prefix) {
-                return Err(StepError::failed(
-                    &node.id,
-                    format!("tool `{name}` path `{path}` is outside prefix `{path_prefix}`"),
-                ));
-            }
+            ensure_path_within_prefix(node, name, path, path_prefix)?;
             let offset = args
                 .get("offset")
                 .and_then(Value::as_u64)
@@ -1083,12 +1073,7 @@ pub(crate) async fn execute_agent_tool(
                 .get("edits")
                 .and_then(Value::as_array)
                 .ok_or_else(|| StepError::failed(&node.id, "fs.patch tool requires edits"))?;
-            if !path_is_within_prefix(path, path_prefix) {
-                return Err(StepError::failed(
-                    &node.id,
-                    format!("tool `{name}` path `{path}` is outside prefix `{path_prefix}`"),
-                ));
-            }
+            ensure_path_within_prefix(node, name, path, path_prefix)?;
             let salt = ctx.run.run_id.clone();
             let canonical = canonical_patch_edits(args).ok_or_else(|| {
                 StepError::failed(&node.id, "fs.patch edits are not canonicalizable")
@@ -1454,6 +1439,21 @@ pub(crate) fn validate_agent_tool_call_args(
     } else {
         validate_agent_tool_args(node, tool, &call.args)
     }
+}
+
+fn ensure_path_within_prefix(
+    node: &NodeDef,
+    name: &str,
+    path: &str,
+    path_prefix: &str,
+) -> Result<(), StepError> {
+    if !path_is_within_prefix(path, path_prefix) {
+        return Err(StepError::failed(
+            &node.id,
+            format!("tool `{name}` path `{path}` is outside prefix `{path_prefix}`"),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn path_is_within_prefix(path: &str, prefix: &str) -> bool {
