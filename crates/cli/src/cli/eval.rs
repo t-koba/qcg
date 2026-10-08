@@ -624,6 +624,14 @@ mod tests {
         kinded(seq, "step_finished")
     }
 
+    fn metered(seq: u64, kind: &str, calls: u64) -> api::RunEvent {
+        let mut event = kinded(seq, kind);
+        event.data = api::RunEventData::Unknown(serde_json::json!({
+            "metrics": { "llm_calls": calls },
+        }));
+        event
+    }
+
     #[test]
     fn duplicate_effect_passes_uncapped_but_trips_explicit_max() {
         // Replay of the duplicate-write probe through the real eval gate:
@@ -694,6 +702,66 @@ mod tests {
         assert!(
             failures[0].contains("outside 0..0"),
             "cap failure must name the bound, got: {}",
+            failures[0]
+        );
+    }
+
+    #[test]
+    fn metric_max_reads_run_finished_only_and_fails_closed_otherwise() {
+        // Replay of a failed-run trajectory through the real eval gate:
+        // `metric_max` resolves only against `run_finished`, so a
+        // `run_error` carrying metrics still fails closed with
+        // "was not recorded" while the same payload on `run_finished`
+        // enforces the ceiling.
+        let manifest = OutputManifest { artifacts: vec![] };
+        let runtime = RuntimeLimits::default();
+        let root = Utf8PathBuf::from(".");
+        let ceiling = vec![EvalAssertion::MetricMax {
+            metric: "llm_calls".into(),
+            max: 5,
+        }];
+        let failures = evaluate_assertions(
+            &ceiling,
+            root.as_path(),
+            &manifest,
+            &runtime,
+            &[metered(0, "run_error", 3)],
+        )
+        .expect("error-trajectory eval must run");
+        assert_eq!(
+            failures.len(),
+            1,
+            "failed-run metrics must not satisfy the ceiling: {failures:?}"
+        );
+        assert!(
+            failures[0].contains("was not recorded"),
+            "missing terminal must fail closed, got: {}",
+            failures[0]
+        );
+        let failures = evaluate_assertions(
+            &ceiling,
+            root.as_path(),
+            &manifest,
+            &runtime,
+            &[metered(0, "run_finished", 3)],
+        )
+        .expect("finished-trajectory eval must run");
+        assert!(
+            failures.is_empty(),
+            "finished-run metrics within ceiling must pass: {failures:?}"
+        );
+        let failures = evaluate_assertions(
+            &ceiling,
+            root.as_path(),
+            &manifest,
+            &runtime,
+            &[metered(0, "run_finished", 7)],
+        )
+        .expect("over-ceiling eval must run");
+        assert_eq!(failures.len(), 1, "over-ceiling metrics must fail");
+        assert!(
+            failures[0].contains("exceeding maximum 5"),
+            "ceiling failure must name the bound, got: {}",
             failures[0]
         );
     }
