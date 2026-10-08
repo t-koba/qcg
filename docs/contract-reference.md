@@ -4038,7 +4038,9 @@ Tasks extension and supports multi-round-trip
 `input_required` tool results. MCP elicitation requests become runtime-generated
 forms on the ordinary durable DAG pause/resume boundary; answers and the opaque
 request state are returned to the original tool call. Unsupported input request
-methods fail explicitly. Client sampling and roots are not exposed.
+methods fail explicitly. Only form-mode elicitation is supported: URL
+(out-of-band) mode and other modes fail explicitly instead of being coerced
+into an in-band form. Client sampling and roots are not exposed.
 Side-effect journals contain only argument names and encoded size, never raw MCP
 argument values.
 

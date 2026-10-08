@@ -423,7 +423,8 @@ verified against the real service. The client advertises
 the Tasks extension and handles multi-round-trip `input_required`
 results. Form elicitation requests are projected onto qcg's durable HITL form,
 and the accepted values plus opaque request state resume the original tool call.
-Unsupported input request methods fail explicitly. Client sampling and roots are
+Unsupported input request methods fail explicitly. Only form-mode elicitation is
+supported; URL (out-of-band) mode fails explicitly. Client sampling and roots are
 not exposed.
 
 ## Declaring the model

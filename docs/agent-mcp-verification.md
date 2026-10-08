@@ -45,7 +45,7 @@ layer below must pass independently before the feature is considered working.
 | Exact binding | A contract fixes both profile ID and remote tool name; the model sees only the declared alias. | manifest validation and `McpAgentTools::prepare` |
 | Input | Model arguments are validated locally against the discovered input schema before transport. | `parallel_public_search_contract_validates_real_wire_shapes` |
 | Complete result | `content` must be an array. `isError` must be boolean when present. A successful typed result requires valid `structuredContent`; a typed tool error remains recoverable without it. | `mcp_result_requires_structured_content_only_for_successful_typed_results` |
-| Tasks and input-required | Task polling, cancellation, supported form elicitation, stable question IDs, and durable resume are bounded. Unsupported request methods fail. | `modern_mrtr_is_exposed_for_durable_hitl_and_can_resume`, MCP input-required tests |
+| Tasks and input-required | Task polling, cancellation, supported form elicitation, stable question IDs, and durable resume are bounded. Unsupported request methods and non-form (URL/out-of-band) elicitation modes fail. | `modern_mrtr_is_exposed_for_durable_hitl_and_can_resume`, MCP input-required tests |
 | Failure classification | Tool-declared errors return to the model. Transport, protocol, schema, credential-reflection, and cancellation errors fail the step explicitly. | `mcp_tool_error_is_recoverable_but_transport_error_is_not` and transport tests |
 | Secret handling | Credentials never enter model-visible schemas/events, are scanned in results/errors, and are not printed by debug formatting. | mcp credential and reflection tests |
 

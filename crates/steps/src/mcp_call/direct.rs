@@ -400,14 +400,37 @@ fn direct_mcp_form_spec(
             ));
         }
         let params = request.get("params").unwrap_or(request);
+        // Only form-mode elicitation is supported. URL (out-of-band) mode
+        // must not be coerced into an in-band form: its payload must never
+        // pass through the client, and qcg has no external-navigation
+        // approval path, so fail closed. Legacy requests without a mode are
+        // treated as form, matching rmcp's LegacyForm wire handling.
+        if let Some(mode) = params.get("mode").and_then(Value::as_str)
+            && mode != "form"
+        {
+            return Err(StepError::failed(
+                alias,
+                format!(
+                    "MCP input request `{request_id}` uses unsupported elicitation mode `{mode}`"
+                ),
+            ));
+        }
+        if params.get("url").is_some()
+            || params.get("elicitationId").is_some()
+            || params.get("elicitation_id").is_some()
+        {
+            return Err(StepError::failed(
+                alias,
+                format!(
+                    "MCP input request `{request_id}` uses unsupported URL-mode elicitation; only form mode is supported"
+                ),
+            ));
+        }
         let message = params
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("MCP tool requested structured input");
-        let label = params
-            .get("url")
-            .and_then(Value::as_str)
-            .map_or_else(|| message.to_string(), |url| format!("{message} ({url})"));
+        let label = message.to_string();
         fields.push(InputField {
             id: format!("response_{index}"),
             label: Some(label),

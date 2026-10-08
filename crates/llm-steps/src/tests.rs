@@ -922,7 +922,13 @@ fn mcp_input_required_builds_a_stable_durable_form_and_response() {
                 "method": "elicitation/create",
                 "params": {
                     "message": "Choose the authoritative source",
-                    "url": "https://example.test/source"
+                    "requestedSchema": {
+                        "type": "object",
+                        "properties": {
+                            "source": { "type": "string" }
+                        },
+                        "required": ["source"]
+                    }
                 }
             }),
         )]),
@@ -960,11 +966,9 @@ fn mcp_input_required_builds_a_stable_durable_form_and_response() {
     let form = mcp_form_spec(first, "search", &required).expect("form");
     assert_eq!(form.fields.len(), 1);
     assert_eq!(form.fields[0].id, "response_0");
-    assert!(
-        form.fields[0]
-            .label
-            .as_deref()
-            .is_some_and(|label| label.contains("example.test"))
+    assert_eq!(
+        form.fields[0].label.as_deref(),
+        Some("Choose the authoritative source")
     );
 
     let responses = mcp_input_responses(
@@ -1000,6 +1004,64 @@ fn mcp_input_required_rejects_unsupported_requests_and_missing_answers() {
         request_state: None,
     };
     assert!(mcp_input_responses(&elicitation, &json!({})).is_err());
+
+    // Explicit form mode is accepted.
+    let form_mode = McpInputRequired {
+        input_requests: BTreeMap::from([(
+            "request-1".into(),
+            json!({
+                "method": "elicitation/create",
+                "params": {
+                    "mode": "form",
+                    "message": "Provide a value",
+                    "requestedSchema": {
+                        "type": "object",
+                        "properties": { "value": { "type": "string" } }
+                    }
+                }
+            }),
+        )]),
+        request_state: None,
+    };
+    assert!(mcp_form_spec("question".into(), "search", &form_mode).is_ok());
+}
+
+#[test]
+fn mcp_input_required_rejects_url_mode_elicitation() {
+    // Spec-compliant URL (out-of-band) mode must fail closed instead of
+    // being coerced into an in-band form that returns content to the server.
+    for params in [
+        json!({
+            "mode": "url",
+            "message": "Approve externally",
+            "url": "https://example.test/approve",
+            "elicitationId": "elicit-1"
+        }),
+        json!({
+            "mode": "url",
+            "message": "Approve externally",
+            "url": "https://example.test/approve",
+            "elicitation_id": "elicit-1"
+        }),
+        // URL markers without an explicit mode are also rejected: form
+        // requests never carry them per the pinned rmcp wire types.
+        json!({
+            "message": "Choose the authoritative source",
+            "url": "https://example.test/source"
+        }),
+        json!({ "mode": "future-mode", "message": "Unknown mode" }),
+    ] {
+        let required = McpInputRequired {
+            input_requests: BTreeMap::from([(
+                "request-1".into(),
+                json!({ "method": "elicitation/create", "params": params }),
+            )]),
+            request_state: None,
+        };
+        let error = mcp_form_spec("question".into(), "search", &required)
+            .expect_err("URL-mode elicitation must fail closed");
+        assert!(error.to_string().contains("unsupported"), "{error}");
+    }
 }
 
 #[test]
