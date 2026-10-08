@@ -31,6 +31,8 @@ credentials*.json
 *.pfx
 .netrc
 .npmrc
+# Committed install-script policy (no secrets): fail closed on lifecycle scripts.
+!frontend/generator/.npmrc
 
 # Editor, operating-system, and test-run artifacts
 .DS_Store
