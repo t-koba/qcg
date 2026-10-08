@@ -2498,6 +2498,15 @@ export interface components {
             fs_read: string[];
             fs_write: string[];
             network: string[];
+            /**
+             * @description Opt-in SSRF hardening for the HTTP fetch path. When true, every
+             *     hop resolves ALL A/AAAA records and denies non-global IPs
+             *     (loopback, private, link-local, multicast, unspecified, reserved);
+             *     the connection is pinned to the validated addresses. Default
+             *     false so existing wildcard deployments keep working.
+             * @default false
+             */
+            network_deny_private_ips: boolean;
             side_effects: components["schemas"]["SideEffects"];
             /**
              * @description How far one approval reaches. `invocation` (default) authorizes a
