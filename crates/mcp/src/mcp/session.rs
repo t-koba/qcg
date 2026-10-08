@@ -47,12 +47,7 @@ impl McpSession {
                 Duration::from_secs(seconds),
                 McpClient.serve_with_lifecycle(
                     transport,
-                    match profile.spec.lifecycle {
-                        McpLifecycle::Initialize => ClientLifecycleMode::Initialize,
-                        McpLifecycle::Discover => ClientLifecycleMode::Discover {
-                            preferred_versions: vec![ProtocolVersion::V_2026_07_28],
-                        },
-                    },
+                    client_lifecycle_mode(profile.spec.lifecycle),
                 ),
             ) => {
                 result
@@ -380,6 +375,25 @@ impl McpSession {
 enum ToolCallResult {
     Complete(CallToolResult),
     InputRequired(McpInputRequired),
+}
+
+/// Maps the configured profile lifecycle to the pinned rmcp handshake.
+///
+/// `Auto` is explicit opt-in only: it probes `server/discover`, then falls
+/// back to the legacy `initialize` handshake when the peer reports legacy or
+/// does not answer within the rmcp-bounded 10 seconds. The default and the
+/// built-in public profiles never select it implicitly.
+pub(crate) fn client_lifecycle_mode(lifecycle: McpLifecycle) -> ClientLifecycleMode {
+    match lifecycle {
+        McpLifecycle::Initialize => ClientLifecycleMode::Initialize,
+        McpLifecycle::Discover => ClientLifecycleMode::Discover {
+            preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+        },
+        McpLifecycle::Auto => ClientLifecycleMode::Auto {
+            preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+            legacy_version: Some(ProtocolVersion::V_2025_11_25),
+        },
+    }
 }
 
 async fn bounded_credential_values(

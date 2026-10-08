@@ -17,6 +17,7 @@ pub(crate) fn default_transport() -> McpTransport {
 pub enum McpLifecycle {
     Initialize,
     Discover,
+    Auto,
 }
 
 pub(crate) fn default_lifecycle() -> McpLifecycle {

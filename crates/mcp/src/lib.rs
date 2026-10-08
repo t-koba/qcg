@@ -133,6 +133,42 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_auto_is_explicit_opt_in_with_pinned_versions() {
+        use rmcp::model::ProtocolVersion;
+        use rmcp::service::ClientLifecycleMode;
+        // Serde snake_case: config value is `auto`.
+        let spec: McpServerSpec = serde_json::from_value(serde_json::json!({
+            "id": "custom",
+            "transport": "streamable_http",
+            "lifecycle": "auto",
+            "url": "https://mcp.example.test/mcp",
+            "auth": "none",
+            "allowed_hosts": ["mcp.example.test"],
+        }))
+        .expect("lifecycle auto should parse");
+        assert_eq!(spec.lifecycle, McpLifecycle::Auto);
+        // Default stays discover; built-ins stay pinned to initialize.
+        assert_eq!(default_lifecycle(), McpLifecycle::Discover);
+        assert_eq!(
+            client_lifecycle_mode(McpLifecycle::Initialize),
+            ClientLifecycleMode::Initialize
+        );
+        assert_eq!(
+            client_lifecycle_mode(McpLifecycle::Discover),
+            ClientLifecycleMode::Discover {
+                preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+            }
+        );
+        assert_eq!(
+            client_lifecycle_mode(McpLifecycle::Auto),
+            ClientLifecycleMode::Auto {
+                preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+                legacy_version: Some(ProtocolVersion::V_2025_11_25),
+            }
+        );
+    }
+
+    #[test]
     fn public_default_ids_cannot_be_overridden() {
         let mut spec = remote_spec();
         spec.id = "exa-public".into();
