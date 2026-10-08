@@ -63,6 +63,12 @@ pub fn ip_is_denied_when_opted_in(ip: &IpAddr) -> bool {
                 || o[0] >= 224
         }
         IpAddr::V6(v6) => {
+            // IPv4-mapped (`::ffff:10.0.0.1`) must face the same deny set
+            // as plain IPv4: an attacker literal must not slip the V6
+            // branch on round-trip luck.
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return ip_is_denied_when_opted_in(&IpAddr::V4(mapped));
+            }
             let s = v6.segments();
             v6.is_loopback()
                 || v6.is_unspecified()
@@ -111,6 +117,7 @@ impl HttpGateway {
         let client = Client::builder()
             .redirect(Policy::none())
             .timeout(timeout)
+            .no_proxy()
             .build()?;
         Ok(Self {
             permissions,
@@ -286,6 +293,7 @@ impl HttpGateway {
                     Client::builder()
                         .redirect(Policy::none())
                         .timeout(self.timeout)
+                        .no_proxy()
                         .resolve_to_addrs(&host, &addrs)
                         .build()?,
                 );
@@ -1084,10 +1092,13 @@ mod tests {
             "172.16.0.1",
             "192.168.1.1",
             "169.254.169.254",
+            "100.100.100.200",
             "0.0.0.0",
             "::1",
             "fc00::1",
             "fe80::1",
+            "::ffff:10.0.0.5",
+            "::ffff:169.254.169.254",
         ] {
             let ip: IpAddr = denied.parse().expect("test IP should parse");
             assert!(ip_is_denied_when_opted_in(&ip), "{denied} must be denied");
