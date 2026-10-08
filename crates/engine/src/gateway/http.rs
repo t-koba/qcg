@@ -177,7 +177,12 @@ impl HttpGateway {
     /// no DNS; otherwise the stub (tests) or `lookup_host` (production).
     /// Single resolution per call: the caller pins this exact set.
     async fn resolve_all(&self, host: &str, port: u16) -> Result<Vec<IpAddr>, GatewayError> {
-        if let Ok(literal) = host.parse::<IpAddr>() {
+        // Callers pass `host_str`, which brackets IPv6 literals.
+        let bare = host
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(host);
+        if let Ok(literal) = bare.parse::<IpAddr>() {
             return Ok(vec![literal]);
         }
         if let Some(stub) = &self.stub_resolver {
@@ -218,12 +223,18 @@ impl HttpGateway {
         })?;
         let host = parsed.host_str().unwrap_or_default().to_string();
         let port = parsed.port_or_known_default().unwrap_or(443);
-        if host.parse::<IpAddr>().is_ok() {
-            let ip: IpAddr = host.parse().expect("already checked");
-            if ip_is_denied_when_opted_in(&ip) {
+        // `host_str` brackets IPv6 literals (`[::1]` never parses as
+        // `IpAddr`), so match the parsed host: literals deny-or-pin with
+        // no DNS, and only real names reach the resolver.
+        if let Some(literal) = parsed.host().and_then(|host| match host {
+            url::Host::Ipv4(v4) => Some(IpAddr::V4(v4)),
+            url::Host::Ipv6(v6) => Some(IpAddr::V6(v6)),
+            _ => None,
+        }) {
+            if ip_is_denied_when_opted_in(&literal) {
                 return Err(GatewayError::NetworkIpDenied {
                     host,
-                    ip: ip.to_string(),
+                    ip: literal.to_string(),
                 });
             }
             return Ok(None);
@@ -1414,6 +1425,37 @@ mod tests {
         assert!(
             matches!(error, GatewayError::NetworkIpDenied { .. }),
             "mapped literal must raise IP denial, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ipv6_literals_deny_without_dns() {
+        // Bracketed literals (`host_str` keeps the brackets) must take
+        // the literal branch and never consult DNS: a counting stub
+        // proves no masking.
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stub: StubDnsResolver = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_host: &str| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(vec!["93.184.216.34".parse().expect("public")])
+            })
+        };
+        let gateway = opt_in_gateway(stub);
+        for url in ["http://[::1]/", "http://[::ffff:127.0.0.1]/next"] {
+            let error = gateway
+                .resolve_then_check(url)
+                .await
+                .expect_err("IPv6 loopback literal must deny");
+            assert!(
+                matches!(error, GatewayError::NetworkIpDenied { .. }),
+                "IPv6 literal must raise IP denial, got: {error}"
+            );
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "IP literals must not consult DNS"
         );
     }
 }
