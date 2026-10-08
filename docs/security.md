@@ -287,6 +287,11 @@ Digest pinning follows the family: Docker-compatible images use
 `name@sha256:<hex>` enforced by the daemon; Incus-like images use
 `<remote>:<path>@sha256:<fingerprint>` and launch by fingerprint so
 exactly the pinned bits run (pre-pull fingerprints with `image copy`).
+Pinning fixes the bits but does not sanitize image device nodes, so prefer
+trusted images. Host runtimes are operator-owned: use `runc` >= 1.2.8
+(>= 1.3.3 on the 1.3 stream) and a `runsc` build containing both `586c38d`
+and `573a9e7`; disable CUSE on `runsc` hosts or use a default-emulated-only
+build.
 The declared
 runtime is recorded in the command plan, and cleanup (stop/delete with a
 Drop-path safety net) runs on success, error, cancel, and timeout for
