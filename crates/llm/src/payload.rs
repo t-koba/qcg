@@ -867,4 +867,101 @@ mod tests {
         );
         assert!(chat.get("prompt_cache_key").is_none());
     }
+
+    #[test]
+    fn cache_prefix_hygiene_stable_across_turns_and_diverges_on_churn() {
+        use crate::types::{ChatMessage, ChatToolCall, ToolSpec};
+        // Deterministic run id (no randomness): fixed UUID string.
+        let run_id = "8812c1cb-0000-5000-8000-000000000000";
+        let system = "You generate concise configuration patches.";
+        let tool = |name: &str| ToolSpec {
+            name: name.into(),
+            description: format!("{name} tool"),
+            input_schema: json!({"type": "object"}),
+        };
+        let tools = vec![tool("lookup"), tool("search_web")];
+        let turn1_messages = vec![ChatMessage::text("user", "hello")];
+        let mut turn1 = request(Some(system), PromptCache::Auto);
+        turn1.messages = turn1_messages.clone();
+        turn1.tools = tools.clone();
+        let mut turn2 = turn1.clone();
+        turn2.messages.push(ChatMessage::assistant_tool_calls(
+            "",
+            vec![ChatToolCall {
+                id: "call-1".into(),
+                name: "lookup".into(),
+                args: json!({}),
+            }],
+        ));
+        turn2.messages.push(ChatMessage::tool_result(
+            "call-1",
+            format!("synthetic result run {run_id}"),
+        ));
+
+        // Stable across turns: routing key ignores message history.
+        let key1 = chat_completions_payload(
+            &turn1,
+            true,
+            ChatTokenLimitField::MaxTokens,
+            Some(PromptCacheField::PromptCacheKey),
+        )["prompt_cache_key"]
+            .as_str()
+            .expect("turn1 key")
+            .to_string();
+        let key2 = chat_completions_payload(
+            &turn2,
+            true,
+            ChatTokenLimitField::MaxTokens,
+            Some(PromptCacheField::PromptCacheKey),
+        )["prompt_cache_key"]
+            .as_str()
+            .expect("turn2 key")
+            .to_string();
+        assert_eq!(key1, key2, "key must survive append-only turns");
+
+        // Anthropic breakpoint prefix (tools + system) identical; append-only.
+        let prefix1 = anthropic_payload(&turn1, Some(PromptCacheField::CacheControl));
+        let prefix2 = anthropic_payload(&turn2, Some(PromptCacheField::CacheControl));
+        assert_eq!(prefix1["tools"], prefix2["tools"]);
+        assert_eq!(prefix1["system"], prefix2["system"]);
+        assert_eq!(
+            serde_json::to_value(&turn2.messages[..turn1_messages.len()]).expect("head json"),
+            serde_json::to_value(&turn1_messages).expect("turn1 json"),
+            "turn2 must append, never rewrite head"
+        );
+
+        // Tool shuffle diverges the tools prefix (key correctly stays: system unchanged).
+        let mut shuffled = turn1.clone();
+        shuffled.tools = vec![tool("search_web"), tool("lookup")];
+        let shuffled_payload = anthropic_payload(&shuffled, Some(PromptCacheField::CacheControl));
+        assert_ne!(prefix1["tools"], shuffled_payload["tools"]);
+
+        // Volatile system suffix breaks key and system block.
+        let mut volatile = turn1.clone();
+        volatile.system = Some(format!("{system} run {run_id}"));
+        let volatile_key = chat_completions_payload(
+            &volatile,
+            true,
+            ChatTokenLimitField::MaxTokens,
+            Some(PromptCacheField::PromptCacheKey),
+        )["prompt_cache_key"]
+            .as_str()
+            .expect("volatile key")
+            .to_string();
+        assert_ne!(
+            key1, volatile_key,
+            "per-run system bytes must break the key"
+        );
+        let volatile_payload = anthropic_payload(&volatile, Some(PromptCacheField::CacheControl));
+        assert_ne!(prefix1["system"], volatile_payload["system"]);
+
+        // Head truncation diverges messages.
+        let mut truncated = turn2.clone();
+        truncated.messages.remove(0);
+        assert_ne!(
+            anthropic_messages(&turn2),
+            anthropic_messages(&truncated),
+            "head compaction must diverge the tail"
+        );
+    }
 }
