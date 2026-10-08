@@ -153,6 +153,11 @@ Fields:
   `anthropic_messages`. It is required exactly when `capabilities.prompt_cache`
   is enabled and rejected otherwise, so a contract `[llm].cache = "auto"`
   never silently degrades. Rows without prompt caching stay unchanged.
+  Prefix hygiene (author guidance, no new mechanism): caching is a prefix
+  match, so keep the contract tool declaration order stable and `[llm].system`
+  templates free of per-run values (timestamps, UUIDs, run IDs). qcg emits
+  tools in declaration order and derives `prompt_cache_key` from the system
+  text with a single system breakpoint, so churn there silently breaks the prefix.
 - `capabilities`: advertised support for `tool_use`, `json_schema`,
   `structured_output_with_tools`, `seed`, `image_input`, `audio_input`,
   `file_input`, `streaming`, `temperature`, `top_p`, `stop_sequences`,
