@@ -48,7 +48,7 @@ pub use params::{params_schema, string_array_schema, string_schema};
 pub use path::{is_safe_path_component, is_safe_relative_path, portable_relative_path};
 pub use schema::{
     MAX_JSON_SCHEMA_BYTES, MAX_JSON_SCHEMA_DEPTH, MAX_JSON_SCHEMA_NODES,
-    MAX_JSON_SCHEMA_OBJECT_MEMBERS, MAX_JSON_SCHEMA_STRING_BYTES, compile_bounded_validator,
-    validate_bounded_json_schema,
+    MAX_JSON_SCHEMA_OBJECT_MEMBERS, MAX_JSON_SCHEMA_STRING_BYTES, MAX_PATTERN_BACKTRACK_LIMIT,
+    compile_bounded_validator, validate_bounded_json_schema,
 };
 pub use service::{binary_stem, default_service_name};
