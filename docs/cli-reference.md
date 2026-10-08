@@ -75,6 +75,9 @@ JSON event output go to stdout.
   paths, manifest pointers, and capped event counts are checked, so an extra
   file, manifest artifact, or uncapped event passes unless the suite caps it
   with an explicit `event_count` `max` (or equivalent assertion).
+  `event_sequence` is a subsequence match: kinds listed in order pass with
+  interleaved noise between them, so cap the noise kind with an explicit
+  `event_count` `max` when extras must fail.
 - `qcg package <dir> [-o package.pkg] [--signing-key key.pk8]
   [--max-entries N] [--max-bytes N] [--max-metadata-bytes N]` creates a `.pkg`
   ZIP from a directory, prints its SHA-256, and optionally writes detached
