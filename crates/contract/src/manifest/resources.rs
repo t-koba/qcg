@@ -173,6 +173,13 @@ pub struct Permissions {
     pub fs_read: Vec<String>,
     pub fs_write: Vec<String>,
     pub network: Vec<String>,
+    /// Opt-in SSRF hardening for the HTTP fetch path. When true, every
+    /// hop resolves ALL A/AAAA records and denies non-global IPs
+    /// (loopback, private, link-local, multicast, unspecified, reserved);
+    /// the connection is pinned to the validated addresses. Default
+    /// false so existing wildcard deployments keep working.
+    #[serde(default)]
+    pub network_deny_private_ips: bool,
     pub commands: Vec<CommandPermission>,
     pub containers: ContainerPermission,
     pub side_effects: SideEffects,

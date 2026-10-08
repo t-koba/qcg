@@ -136,6 +136,7 @@ impl OperationOutcome {
             | GatewayError::ContainerImageMissing { .. }
             | GatewayError::CommandInputTooLarge { .. }
             | GatewayError::NetworkDenied { .. }
+            | GatewayError::NetworkIpDenied { .. }
             | GatewayError::UnsupportedUrl { .. }
             | GatewayError::HttpRequestBodyTooLarge { .. }
             | GatewayError::FsReadDenied

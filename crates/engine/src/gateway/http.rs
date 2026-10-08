@@ -2,13 +2,20 @@ use contract::Permissions;
 use policy::credential_like_name;
 use reqwest::{Client, Method, redirect::Policy};
 use std::collections::BTreeMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
+/// Stub-injectable DNS for tests. Production (`None`) uses
+/// `tokio::net::lookup_host`; tests inject a map from hostname to
+/// addresses so resolve-inward and rebinding cases run offline.
+pub type StubDnsResolver = Arc<dyn Fn(&str) -> std::io::Result<Vec<IpAddr>> + Send + Sync>;
+
 use super::error::GatewayError;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HttpGateway {
     permissions: Permissions,
     client: Client,
@@ -16,6 +23,55 @@ pub struct HttpGateway {
     body_limit_bytes: Option<usize>,
     redirect_limit: Option<usize>,
     cancellation: CancellationToken,
+    stub_resolver: Option<StubDnsResolver>,
+}
+
+impl std::fmt::Debug for HttpGateway {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpGateway")
+            .field("permissions", &self.permissions)
+            .field("timeout", &self.timeout)
+            .field("body_limit_bytes", &self.body_limit_bytes)
+            .field("redirect_limit", &self.redirect_limit)
+            .field("stub_resolver", &self.stub_resolver.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// A non-globally-reachable address is denied when the opt-in is on.
+/// Stable-only octet/segment matching (no nightly `is_global`): loopback,
+/// private, link-local, shared, documentation, benchmark, multicast,
+/// unspecified, broadcast, and reserved ranges are all denied; only
+/// public unicast passes. Fail-closed: any unrecognized special range
+/// added later should extend this list.
+pub fn ip_is_denied_when_opted_in(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 0
+                || o[0] == 10
+                || o[0] == 127
+                || (o[0] == 169 && o[1] == 254)
+                || (o[0] == 172 && (16..=31).contains(&o[1]))
+                || (o[0] == 192 && o[1] == 168)
+                || (o[0] == 192 && o[1] == 0 && o[2] == 2)
+                || (o[0] == 198 && o[1] == 51 && o[2] == 100)
+                || (o[0] == 203 && o[1] == 0 && o[2] == 113)
+                || (o[0] == 100 && (64..=127).contains(&o[1]))
+                || (o[0] == 198 && (18..=19).contains(&o[1]))
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+                || o[0] >= 224
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (s[0] & 0xffc0) == 0xfe80
+                || (s[0] & 0xfe00) == 0xfc00
+                || (s[0] == 0x2001 && s[1] == 0x0db8)
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -52,7 +108,10 @@ impl HttpGateway {
         body_limit_bytes: Option<usize>,
         redirect_limit: Option<usize>,
     ) -> Result<Self, GatewayError> {
-        let client = Client::builder().redirect(Policy::none()).build()?;
+        let client = Client::builder()
+            .redirect(Policy::none())
+            .timeout(timeout)
+            .build()?;
         Ok(Self {
             permissions,
             client,
@@ -60,7 +119,88 @@ impl HttpGateway {
             body_limit_bytes,
             redirect_limit,
             cancellation: CancellationToken::new(),
+            stub_resolver: None,
         })
+    }
+
+    /// Inject a stub DNS resolver (tests only). Production keeps `None`
+    /// and uses real `lookup_host`.
+    pub fn with_stub_resolver(mut self, resolver: StubDnsResolver) -> Self {
+        self.stub_resolver = Some(resolver);
+        self
+    }
+
+    fn deny_private_ips(&self) -> bool {
+        self.permissions.network_deny_private_ips
+    }
+
+    /// Resolve ALL addresses for `host`. IP literals short-circuit with
+    /// no DNS; otherwise the stub (tests) or `lookup_host` (production).
+    /// Single resolution per call: the caller pins this exact set.
+    async fn resolve_all(&self, host: &str, port: u16) -> Result<Vec<IpAddr>, GatewayError> {
+        if let Ok(literal) = host.parse::<IpAddr>() {
+            return Ok(vec![literal]);
+        }
+        if let Some(stub) = &self.stub_resolver {
+            let stub = Arc::clone(stub);
+            let owned = host.to_string();
+            let label = owned.clone();
+            return tokio::task::spawn_blocking(move || stub(&owned))
+                .await
+                .map_err(|_| GatewayError::UnsupportedUrl {
+                    url: format!("DNS resolver task failed for `{label}`"),
+                })?
+                .map_err(|error| GatewayError::UnsupportedUrl {
+                    url: format!("DNS lookup for `{host}` failed: {error}"),
+                });
+        }
+        let addrs = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|error| GatewayError::UnsupportedUrl {
+                url: format!("DNS lookup failed: {error}"),
+            })?;
+        let ips: Vec<IpAddr> = addrs.map(|addr| addr.ip()).collect();
+        if ips.is_empty() {
+            return Err(GatewayError::UnsupportedUrl {
+                url: format!("DNS lookup for `{host}` returned no addresses"),
+            });
+        }
+        Ok(ips)
+    }
+
+    /// Resolve-then-check for one hop. Returns pinned socket addresses
+    /// (port 0 = use the URL port) when the host is a DNS name, or `None`
+    /// when the host is an IP literal (already pinned by the URL itself).
+    /// Any non-global address denies the whole hop: an attacker set with
+    /// one good + one bad record must not pass on round-robin luck.
+    async fn resolve_then_check(&self, url: &str) -> Result<Option<Vec<SocketAddr>>, GatewayError> {
+        let parsed = Url::parse(url).map_err(|_| GatewayError::UnsupportedUrl {
+            url: error_url(url, &BTreeMap::new()),
+        })?;
+        let host = parsed.host_str().unwrap_or_default().to_string();
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        if host.parse::<IpAddr>().is_ok() {
+            let ip: IpAddr = host.parse().expect("already checked");
+            if ip_is_denied_when_opted_in(&ip) {
+                return Err(GatewayError::NetworkIpDenied {
+                    host,
+                    ip: ip.to_string(),
+                });
+            }
+            return Ok(None);
+        }
+        let ips = self.resolve_all(&host, port).await?;
+        for ip in &ips {
+            if ip_is_denied_when_opted_in(ip) {
+                return Err(GatewayError::NetworkIpDenied {
+                    host: host.clone(),
+                    ip: ip.to_string(),
+                });
+            }
+        }
+        Ok(Some(
+            ips.into_iter().map(|ip| SocketAddr::new(ip, 0)).collect(),
+        ))
     }
 
     pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
@@ -127,6 +267,29 @@ impl HttpGateway {
             }
             redirects = redirects.saturating_add(1);
             ensure_url_allowed(&self.permissions, &url)?;
+            // Opt-in SSRF hardening: resolve-then-check every hop (initial
+            // and each redirect target) and pin the connection to the
+            // validated addresses, closing the rebinding TOCTOU. One
+            // resolution per hop; the pinned client carries it.
+            let mut pinned_client: Option<Client> = None;
+            if self.deny_private_ips()
+                && let Some(addrs) = self.resolve_then_check(&url).await?
+            {
+                let host = Url::parse(&url)
+                    .map_err(|_| GatewayError::UnsupportedUrl {
+                        url: error_url(&url, &request.sensitive_query),
+                    })?
+                    .host_str()
+                    .unwrap_or_default()
+                    .to_string();
+                pinned_client = Some(
+                    Client::builder()
+                        .redirect(Policy::none())
+                        .timeout(self.timeout)
+                        .resolve_to_addrs(&host, &addrs)
+                        .build()?,
+                );
+            }
             let parsed_method =
                 method
                     .parse::<Method>()
@@ -153,8 +316,8 @@ impl HttpGateway {
                     }
                 }
             }
-            let mut builder = self
-                .client
+            let active_client = pinned_client.as_ref().unwrap_or(&self.client);
+            let mut builder = active_client
                 .request(parsed_method, request_url)
                 .timeout(self.timeout);
             for (key, value) in &request.headers {
@@ -210,6 +373,11 @@ impl HttpGateway {
             }
             let final_url = response.url().to_string();
             ensure_url_allowed(&self.permissions, &final_url)?;
+            if self.deny_private_ips() && final_url != url {
+                // Different final URL (e.g. server-reported): re-validate
+                // its addresses; the dispatched hop itself stays pinned.
+                self.resolve_then_check(&final_url).await?;
+            }
             let public_final_url = redact_query_parameters(&final_url, &request.sensitive_query)?;
             let headers = response
                 .headers()
@@ -882,6 +1050,254 @@ mod tests {
         assert!(
             !matches!(error, GatewayError::AfterSend(_)),
             "safe requests have no side-effect history, got: {error}"
+        );
+    }
+
+    // --- Opt-in resolve-then-check + per-hop + pinning (SSRF) ---
+
+    fn opt_in_gateway(stub: StubDnsResolver) -> HttpGateway {
+        HttpGateway::new(
+            Permissions {
+                network: vec!["allowed.example".into()],
+                network_deny_private_ips: true,
+                ..Permissions::default()
+            },
+            Duration::from_secs(2),
+            None,
+            Some(4),
+        )
+        .expect("opt-in gateway should build")
+        .with_stub_resolver(stub)
+    }
+
+    fn stub_for(ip: &str) -> StubDnsResolver {
+        let ip: IpAddr = ip.parse().expect("test IP should parse");
+        Arc::new(move |_host: &str| Ok(vec![ip]))
+    }
+
+    #[test]
+    fn non_global_addresses_are_denied_when_opted_in() {
+        // (a) shape: loopback, private, link-local denied; public passes.
+        for denied in [
+            "127.0.0.1",
+            "10.0.0.5",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "0.0.0.0",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+        ] {
+            let ip: IpAddr = denied.parse().expect("test IP should parse");
+            assert!(ip_is_denied_when_opted_in(&ip), "{denied} must be denied");
+        }
+        for allowed in ["93.184.216.34", "8.8.8.8", "1.1.1.1"] {
+            let ip: IpAddr = allowed.parse().expect("test IP should parse");
+            assert!(!ip_is_denied_when_opted_in(&ip), "{allowed} must pass");
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_inward_is_blocked_before_connect() {
+        // (a) allowlisted name stub-resolves inward x3: the string
+        // allowlist passes but the IP check blocks before any connect.
+        for inward in ["169.254.169.254", "127.0.0.1", "10.0.0.5"] {
+            let gateway = opt_in_gateway(stub_for(inward));
+            let error = gateway
+                .request(request("GET", "http://allowed.example/".into(), None))
+                .await
+                .expect_err("resolve-inward must block");
+            assert!(
+                matches!(error, GatewayError::NetworkIpDenied { ref ip, .. } if ip == inward),
+                "expected NetworkIpDenied({inward}), got: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn any_bad_address_in_the_set_denies_the_hop() {
+        // One good + one bad record must not pass on round-robin luck.
+        let stub: StubDnsResolver = Arc::new(|_host: &str| {
+            Ok(vec![
+                "93.184.216.34".parse().expect("public"),
+                "10.0.0.5".parse().expect("private"),
+            ])
+        });
+        let gateway = opt_in_gateway(stub);
+        let error = gateway
+            .request(request("GET", "http://allowed.example/".into(), None))
+            .await
+            .expect_err("mixed set must block");
+        assert!(
+            matches!(error, GatewayError::NetworkIpDenied { .. }),
+            "mixed A/AAAA must deny the hop, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn opt_out_keeps_the_string_allowlist_only() {
+        // Default off: no DNS is consulted (stub never called) so existing
+        // wildcard/loopback deployments keep working.
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stub: StubDnsResolver = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_host: &str| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(vec!["10.0.0.5".parse().expect("private")])
+            })
+        };
+        let gateway = HttpGateway::new(
+            Permissions {
+                network: vec!["allowed.example".into()],
+                ..Permissions::default()
+            },
+            Duration::from_secs(2),
+            None,
+            Some(0),
+        )
+        .expect("gateway should build")
+        .with_stub_resolver(stub);
+        // String allowlist passes; the (skipped) IP check would have
+        // blocked. The request then fails at DNS/connect, never with an
+        // IP denial, and the stub was never consulted.
+        let error = gateway
+            .request(request("GET", "http://allowed.example/".into(), None))
+            .await
+            .expect_err("unroutable name must fail without IP denial");
+        assert!(
+            !matches!(error, GatewayError::NetworkIpDenied { .. }),
+            "opt-out must not raise IP denial, got: {error}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "opt-out must not consult DNS"
+        );
+    }
+
+    async fn serve_once_on(
+        addr: &str,
+        response: String,
+    ) -> (u16, tokio::task::JoinHandle<(String, Vec<u8>)>) {
+        let listener = tokio::net::TcpListener::bind(format!("{addr}:0"))
+            .await
+            .expect("loopback listener should bind");
+        let port = listener
+            .local_addr()
+            .expect("listener should have an address")
+            .port();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("client should connect");
+            let (head, body) = read_request(&mut stream).await;
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("response should write");
+            let _ = stream.shutdown().await;
+            (head, body)
+        });
+        (port, handle)
+    }
+
+    #[tokio::test]
+    async fn redirect_to_unlisted_host_is_blocked_per_hop() {
+        // (b) per-hop string recheck is load-bearing: 127.0.0.1 allows the
+        // first hop, 127.0.0.2 is unlisted and must block live.
+        let (target_port, target_task) = serve_once_on(
+            "127.0.0.2",
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".into(),
+        )
+        .await;
+        let (redirect_port, redirect_task) = serve_once_on(
+            "127.0.0.1",
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.2:{target_port}/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        let gateway = HttpGateway::new(
+            Permissions {
+                network: vec!["127.0.0.1".into()],
+                ..Permissions::default()
+            },
+            Duration::from_secs(10),
+            None,
+            Some(4),
+        )
+        .expect("test gateway should build");
+        let error = gateway
+            .request(request(
+                "GET",
+                format!("http://127.0.0.1:{redirect_port}/start"),
+                None,
+            ))
+            .await
+            .expect_err("redirect to unlisted host must block");
+        assert!(
+            matches!(error, GatewayError::NetworkDenied { ref host } if host == "127.0.0.2"),
+            "expected NetworkDenied(127.0.0.2), got: {error}"
+        );
+        redirect_task.await.expect("redirect server should finish");
+        assert!(
+            !target_task.is_finished(),
+            "the blocked target must never be contacted"
+        );
+        target_task.abort();
+    }
+
+    #[tokio::test]
+    async fn rebinding_window_is_single_resolution_pinned() {
+        // (c) the DNS layer itself rebinds (public then private across two
+        // independent resolutions), so the hop must resolve exactly once
+        // and pin that set: the request below resolves once (public) and
+        // never consults DNS again for the same hop.
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stub: StubDnsResolver = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_host: &str| {
+                let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    Ok(vec!["93.184.216.34".parse().expect("public")])
+                } else {
+                    Ok(vec!["127.0.0.1".parse().expect("private")])
+                }
+            })
+        };
+        let gateway = opt_in_gateway(stub);
+        // Direct primitive proof: two independent resolutions disagree,
+        // which is exactly the TOCTOU window pinning removes.
+        let first = gateway
+            .resolve_then_check("http://allowed.example/")
+            .await
+            .expect("first resolution is public");
+        assert!(first.is_some(), "public hop returns pinned addresses");
+        let second = gateway.resolve_then_check("http://allowed.example/").await;
+        assert!(
+            matches!(second, Err(GatewayError::NetworkIpDenied { .. })),
+            "second resolution rebinds private: {second:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "two independent resolutions show the window"
+        );
+        // Hop proof: one request resolves exactly once (public at check
+        // time) and the failure afterwards is a connect error, never an
+        // IP denial from a rebound second lookup.
+        calls.store(0, std::sync::atomic::Ordering::SeqCst);
+        let error = gateway
+            .request(request("GET", "http://allowed.example:81/".into(), None))
+            .await
+            .expect_err("unroutable public IP must fail at connect");
+        assert!(
+            !matches!(error, GatewayError::NetworkIpDenied { .. }),
+            "pinned public hop must not rebound-deny, got: {error}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one hop must resolve exactly once and pin"
         );
     }
 }

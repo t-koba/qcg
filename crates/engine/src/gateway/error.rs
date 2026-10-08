@@ -48,6 +48,10 @@ pub enum GatewayError {
     CommandInputTooLarge { bin: String },
     #[error("network access to host `{host}` is not allowed by permissions.network")]
     NetworkDenied { host: String },
+    #[error(
+        "network access to host `{host}` is denied: resolved IP `{ip}` is not globally reachable (permissions.network_deny_private_ips)"
+    )]
+    NetworkIpDenied { host: String, ip: String },
     #[error("unsupported URL `{url}`")]
     UnsupportedUrl { url: String },
     #[error("HTTP response body exceeded limit for `{url}`")]

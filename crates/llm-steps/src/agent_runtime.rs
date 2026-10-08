@@ -2460,6 +2460,7 @@ mod approval_e2e {
                     fs_read: vec![],
                     fs_write: vec!["workspace".into()],
                     network: vec!["127.0.0.1".into()],
+                    network_deny_private_ips: false,
                     commands: vec![],
                     containers: Default::default(),
                     side_effects: SideEffects::Confirm,
