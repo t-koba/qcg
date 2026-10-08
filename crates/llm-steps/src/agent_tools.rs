@@ -36,110 +36,41 @@ pub(crate) fn validate_agent_tool(
         ToolDecl::FsWrite {
             name, path_prefix, ..
         } => {
-            if path_prefix.is_empty() {
-                return Err(StepError::failed(
-                    &node.id,
-                    format!("tool `{name}` requires path_prefix"),
-                ));
-            }
-            if normalize_path_prefix(path_prefix).is_none() {
-                return Err(StepError::failed(
-                    &node.id,
-                    format!("tool `{name}` path_prefix must be a safe relative path"),
-                ));
-            }
-            if !contract
-                .manifest
-                .permissions
-                .fs_write
-                .iter()
-                .any(|scope| scope == "workspace")
-            {
-                return Err(StepError::failed(
-                    &node.id,
-                    format!(
-                        "tool `{}` requires permissions.fs_write to include workspace",
-                        name
-                    ),
-                ));
-            }
+            validate_fs_path_prefix(node, name, path_prefix)?;
+            require_fs_scope(
+                node,
+                name,
+                &contract.manifest.permissions.fs_write,
+                "fs_write",
+            )?;
         }
         ToolDecl::FsRead {
             name, path_prefix, ..
         } => {
-            if path_prefix.is_empty() {
-                return Err(StepError::failed(
-                    &node.id,
-                    format!("tool `{name}` requires path_prefix"),
-                ));
-            }
-            if normalize_path_prefix(path_prefix).is_none() {
-                return Err(StepError::failed(
-                    &node.id,
-                    format!("tool `{name}` path_prefix must be a safe relative path"),
-                ));
-            }
-            if !contract
-                .manifest
-                .permissions
-                .fs_read
-                .iter()
-                .any(|scope| scope == "workspace")
-            {
-                return Err(StepError::failed(
-                    &node.id,
-                    format!(
-                        "tool `{}` requires permissions.fs_read to include workspace",
-                        name
-                    ),
-                ));
-            }
+            validate_fs_path_prefix(node, name, path_prefix)?;
+            require_fs_scope(
+                node,
+                name,
+                &contract.manifest.permissions.fs_read,
+                "fs_read",
+            )?;
         }
         ToolDecl::FsPatch {
             name, path_prefix, ..
         } => {
-            if path_prefix.is_empty() {
-                return Err(StepError::failed(
-                    &node.id,
-                    format!("tool `{name}` requires path_prefix"),
-                ));
-            }
-            if normalize_path_prefix(path_prefix).is_none() {
-                return Err(StepError::failed(
-                    &node.id,
-                    format!("tool `{name}` path_prefix must be a safe relative path"),
-                ));
-            }
-            if !contract
-                .manifest
-                .permissions
-                .fs_read
-                .iter()
-                .any(|scope| scope == "workspace")
-            {
-                return Err(StepError::failed(
-                    &node.id,
-                    format!(
-                        "tool `{}` requires permissions.fs_read to include workspace",
-                        name
-                    ),
-                ));
-            }
-            if !contract
-                .manifest
-                .permissions
-                .fs_write
-                .iter()
-                .any(|scope| scope == "workspace")
-            {
-                return Err(StepError::failed(
-                    &node.id,
-                    format!(
-                        "tool `{}` requires permissions.fs_write to include workspace",
-                        name
-                    ),
-                ));
-            }
+            validate_fs_path_prefix(node, name, path_prefix)?;
+            require_fs_scope(
+                node,
+                name,
+                &contract.manifest.permissions.fs_read,
+                "fs_read",
+            )?;
+            require_fs_scope(
+                node,
+                name,
+                &contract.manifest.permissions.fs_write,
+                "fs_write",
+            )?;
         }
         ToolDecl::Command { name, command, .. } => {
             if command.is_empty() {
@@ -428,6 +359,37 @@ pub(crate) fn validate_agent_tool(
         ToolDecl::Skill { .. } => {
             crate::skill_tool::validate_skill_tool(node, contract, tool)?;
         }
+    }
+    Ok(())
+}
+
+fn validate_fs_path_prefix(node: &NodeDef, name: &str, path_prefix: &str) -> Result<(), StepError> {
+    if path_prefix.is_empty() {
+        return Err(StepError::failed(
+            &node.id,
+            format!("tool `{name}` requires path_prefix"),
+        ));
+    }
+    if normalize_path_prefix(path_prefix).is_none() {
+        return Err(StepError::failed(
+            &node.id,
+            format!("tool `{name}` path_prefix must be a safe relative path"),
+        ));
+    }
+    Ok(())
+}
+
+fn require_fs_scope(
+    node: &NodeDef,
+    name: &str,
+    scopes: &[String],
+    scope: &str,
+) -> Result<(), StepError> {
+    if !scopes.iter().any(|allowed| allowed == "workspace") {
+        return Err(StepError::failed(
+            &node.id,
+            format!("tool `{name}` requires permissions.{scope} to include workspace"),
+        ));
     }
     Ok(())
 }
