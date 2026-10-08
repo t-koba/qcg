@@ -41,6 +41,7 @@ jobs:
       - name: Install pinned wasm-bindgen CLI
         # The CLI rejects a library version it does not match, so derive the
         # version from Cargo.lock instead of hard-coding a second copy.
+        shell: bash
         run: |
           VERSION="$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p')"
           cargo install wasm-bindgen-cli --version "$VERSION" --locked
