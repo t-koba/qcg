@@ -71,6 +71,10 @@ JSON event output go to stdout.
   `fixtures/generators/hello-template/suite.json` for a minimal example.
   Semantic judges are out of mechanism: use an external `command` step or
   guardrail when meaning must be judged, with explicit timeout and byte limits.
+  Assertions stay declared-only evaluator policy: only asserted artifact
+  paths, manifest pointers, and capped event counts are checked, so an extra
+  file, manifest artifact, or uncapped event passes unless the suite caps it
+  with an explicit `event_count` `max` (or equivalent assertion).
 - `qcg package <dir> [-o package.pkg] [--signing-key key.pk8]
   [--max-entries N] [--max-bytes N] [--max-metadata-bytes N]` creates a `.pkg`
   ZIP from a directory, prints its SHA-256, and optionally writes detached
