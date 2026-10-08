@@ -38,8 +38,12 @@ jobs:
         shell: bash
         run: node scripts/product.mjs verify-version "$GITHUB_REF_NAME"
 
-      - name: Install wasm-pack
-        run: cargo install wasm-pack --version 0.15.0 --locked
+      - name: Install pinned wasm-bindgen CLI
+        # The CLI rejects a library version it does not match, so derive the
+        # version from Cargo.lock instead of hard-coding a second copy.
+        run: |
+          VERSION="$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p')"
+          cargo install wasm-bindgen-cli --version "$VERSION" --locked
 
       - name: Setup SPDX validator Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0

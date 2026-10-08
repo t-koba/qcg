@@ -15,24 +15,41 @@ const rustflags = [
   `--remap-path-prefix=${cargoHome}=/cargo`,
 ].join(separator);
 
-const result = spawnSync(
-  "wasm-pack",
+// wasm-bindgen reads the release artifact directly; honor CARGO_TARGET_DIR
+// the same way cargo does so custom target directories keep working.
+const cargoTargetDir = process.env.CARGO_TARGET_DIR || join(root, "target");
+const wasmFile = join(
+  cargoTargetDir,
+  "wasm32-unknown-unknown/release/expr_wasm.wasm",
+);
+const outDir = join(root, "frontend/generator/src/expr/pkg");
+
+function run(command, args, env) {
+  const result = spawnSync(command, args, {
+    cwd: root,
+    env,
+    stdio: "inherit",
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) process.exit(result.status ?? 1);
+}
+
+run(
+  "cargo",
   [
     "build",
-    "crates/expr-wasm",
+    "-p",
+    "expr-wasm",
+    "--release",
     "--target",
-    "web",
-    "--out-dir",
-    "../../frontend/generator/src/expr/pkg",
-    "--out-name",
-    "expr_wasm",
+    "wasm32-unknown-unknown",
+    "--locked",
   ],
-  {
-    cwd: root,
-    env: { ...process.env, CARGO_ENCODED_RUSTFLAGS: rustflags, RUSTFLAGS: "" },
-    stdio: "inherit",
-  },
+  { ...process.env, CARGO_ENCODED_RUSTFLAGS: rustflags, RUSTFLAGS: "" },
 );
 
-if (result.error) throw result.error;
-if (result.status !== 0) process.exit(result.status ?? 1);
+run(
+  "wasm-bindgen",
+  ["--target", "web", "--out-dir", outDir, "--out-name", "expr_wasm", wasmFile],
+  process.env,
+);
