@@ -3219,7 +3219,10 @@ fn assert_journal_has_none(run: &Utf8Path, predicate: impl Fn(&Value) -> bool) {
 }
 
 async fn wait_for_success(client: &reqwest::Client, base: &str, run_id: &str) {
-    for _ in 0..50 {
+    // Concurrent runs take ~0.7s isolated on Linux and exceed the old 1s
+    // bound under loaded/slower Windows CI; poll up to 10s without changing
+    // the success condition.
+    for _ in 0..500 {
         let snapshot: Value = client
             .get(format!("{base}/api/runs/{run_id}"))
             .send()
