@@ -3904,8 +3904,10 @@ and secrecy, not correctness: a plausible-but-wrong tool value that satisfies
 its schema passes undetected. Correctness verification stays generator policy:
 add a mandatory check only where its cost is justified — a same-context
 re-check, a bounded specialist verifier (`handoff = false`), or a `check.*`
-step after side-effect-free tool calls. Note that `on_failure = "return_error"`
-continues on such values, while `fail`/`tripwire` stops.
+step after side-effect-free tool calls. Once such a check flags a suspect
+value, `on_failure = "return_error"` returns it as a tool error for the parent
+to handle, while `fail`/`tripwire` stops the node; without such a check, a
+schema-valid wrong value continues under either setting.
 Executors return typed configuration/evaluation errors and typed violations.
 `on_error = "fail"` propagates an executor error; `on_error = "block"` converts
 it into a policy violation. Both paths emit structured events with stable code,
