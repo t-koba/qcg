@@ -5276,3 +5276,207 @@ async fn duplicate_write_and_extra_effect_pass_shape_validation_with_wrong_readb
     let _ = std::fs::remove_dir_all(&duplicate_root);
     let _ = std::fs::remove_dir_all(&extra_root);
 }
+
+#[tokio::test]
+async fn acrfence_crash_after_commit_and_token_resurrection_replay_gap() {
+    use llm::{ChatMessage, ChatRequest, FakeLlmProvider, LlmProvider, PromptCache};
+    use model::StructuredOutputMode;
+
+    let schema = json!({
+        "type": "object",
+        "required": ["transfer_id"],
+        "properties": { "transfer_id": { "type": "string" } },
+        "additionalProperties": false
+    });
+    let permissions = Permissions {
+        fs_write: vec!["workspace".into()],
+        ..Permissions::default()
+    };
+
+    fn bank_charge(ledger: &Utf8PathBuf, key: &str) -> bool {
+        let prior = std::fs::read_to_string(ledger).unwrap_or_default();
+        for line in prior.lines() {
+            if line.contains(key) {
+                return false;
+            }
+        }
+        use std::fmt::Write as _;
+        let mut body = prior;
+        let _ = writeln!(body, "{}", serde_json::json!({ "key": key }));
+        std::fs::write(ledger, body).expect("ledger should be writable");
+        true
+    }
+    fn ledger_len(ledger: &Utf8PathBuf) -> usize {
+        std::fs::read_to_string(ledger)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count()
+    }
+    async fn write_receipt(workspace: &Utf8PathBuf, permissions: &Permissions, transfer_id: &str) {
+        let gateway = crate::FsGateway::new(workspace.clone(), permissions);
+        let target = gateway
+            .resolve_write(&format!("transfers/{transfer_id}.json"))
+            .expect("receipt path should resolve");
+        std::fs::create_dir_all(target.parent().expect("receipt must have a parent"))
+            .expect("receipt parent should be creatable");
+        let body = serde_json::json!({ "transfer_id": transfer_id }).to_string();
+        gateway
+            .write_file_atomic(&target, body.as_bytes())
+            .await
+            .expect("receipt write should succeed");
+    }
+    async fn script_tool_call(name: &str, args: serde_json::Value) -> (String, serde_json::Value) {
+        let sequence = serde_json::to_string(&[serde_json::json!({
+            "name": name,
+            "args": args,
+        })])
+        .expect("tool sequence should serialize");
+        let prompt = format!("do it\nFAKE_TOOL_SEQUENCE:{sequence}");
+        let request = ChatRequest {
+            provider: "fake".into(),
+            model: "fake".into(),
+            system: None,
+            messages: vec![ChatMessage::text("user", &prompt)],
+            tools: vec![],
+            response_schema: None,
+            structured_output: StructuredOutputMode::Auto,
+            temperature: None,
+            top_p: None,
+            max_tokens: 128,
+            stop_sequences: vec![],
+            seed: None,
+            reasoning_effort: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            verbosity: None,
+            stream: false,
+            prompt_cache: PromptCache::Off,
+        };
+        let response = FakeLlmProvider
+            .complete(request)
+            .await
+            .expect("fake provider should script the call");
+        use llm::ChatContent;
+        let [ChatContent::ToolCall { name, args, .. }] = response.content.as_slice() else {
+            panic!("fake provider should script a tool call");
+        };
+        (name.clone(), args.clone())
+    }
+
+    // Baseline: single committed transfer, validator PASSes, ledger holds 1.
+    let baseline_id = uuid::Uuid::now_v7().as_simple().to_string();
+    let baseline_root = Utf8PathBuf::from_path_buf(
+        std::env::temp_dir().join(format!("engine-acrfence-{baseline_id}")),
+    )
+    .expect("temporary path must be UTF-8");
+    let baseline_workspace = baseline_root.join("workspace");
+    std::fs::create_dir_all(&baseline_workspace).expect("workspace should be created");
+    let baseline_ledger = baseline_root.join("bank-ledger.jsonl");
+    let (name, args) = script_tool_call(
+        "bank_transfer",
+        serde_json::json!({ "transfer_id": baseline_id }),
+    )
+    .await;
+    assert_eq!(name, "bank_transfer");
+    assert_eq!(args, serde_json::json!({ "transfer_id": baseline_id }));
+    assert!(bank_charge(&baseline_ledger, &baseline_id));
+    write_receipt(&baseline_workspace, &permissions, &baseline_id).await;
+    assert!(
+        crate::validate_json_schema_step(
+            "node",
+            &schema,
+            &json!({ "transfer_id": baseline_id }),
+            "response"
+        )
+        .is_ok(),
+        "baseline must PASS shape validation"
+    );
+    assert_eq!(ledger_len(&baseline_ledger), 1);
+
+    // Crash-after-commit restore: commit K1, crash before checkpoint, restore
+    // re-synthesizes a fresh key K2 (no idempotency-key binding on the
+    // re-entry path) and the bank accepts it as new. Same-key retry would
+    // have been deduped, so the fresh UUID is what bypasses dedup.
+    let restore_id = uuid::Uuid::now_v7().as_simple().to_string();
+    let restore_root = Utf8PathBuf::from_path_buf(
+        std::env::temp_dir().join(format!("engine-acrfence-{restore_id}")),
+    )
+    .expect("temporary path must be UTF-8");
+    let restore_workspace = restore_root.join("workspace");
+    std::fs::create_dir_all(&restore_workspace).expect("workspace should be created");
+    let restore_ledger = restore_root.join("bank-ledger.jsonl");
+    let committed_key = uuid::Uuid::now_v7().as_simple().to_string();
+    assert!(bank_charge(&restore_ledger, &committed_key));
+    write_receipt(&restore_workspace, &permissions, &committed_key).await;
+    assert!(
+        !bank_charge(&restore_ledger, &committed_key),
+        "same key must dedup"
+    );
+    assert_eq!(ledger_len(&restore_ledger), 1);
+    let retried_key = uuid::Uuid::now_v7().as_simple().to_string();
+    assert_ne!(
+        committed_key, retried_key,
+        "restore re-synthesis mints a fresh key"
+    );
+    let (rename, reargs) = script_tool_call(
+        "bank_transfer",
+        serde_json::json!({ "transfer_id": retried_key }),
+    )
+    .await;
+    assert_eq!(
+        (rename, reargs),
+        (
+            "bank_transfer".into(),
+            serde_json::json!({ "transfer_id": retried_key })
+        )
+    );
+    assert!(
+        bank_charge(&restore_ledger, &retried_key),
+        "fresh key bypasses bank dedup"
+    );
+    write_receipt(&restore_workspace, &permissions, &retried_key).await;
+    assert!(
+        crate::validate_json_schema_step(
+            "node",
+            &schema,
+            &json!({ "transfer_id": retried_key }),
+            "response"
+        )
+        .is_ok(),
+        "restored final response must PASS shape validation"
+    );
+    assert_eq!(
+        ledger_len(&restore_ledger),
+        2,
+        "crash-after-commit restore duplicates the external effect"
+    );
+
+    // Authority resurrection: single-use token consumed once, then a rewind
+    // reuses it on a different target. Stateless validation accepts the
+    // reuse; a stateful revocation list rejects it.
+    let token = uuid::Uuid::now_v7().as_simple().to_string();
+    let mut consumed = std::collections::HashSet::new();
+    let stateless = |_: &str| true;
+    let mut stateful = |key: &str| {
+        if consumed.contains(key) {
+            false
+        } else {
+            consumed.insert(key.to_string());
+            true
+        }
+    };
+    assert!(stateless(&token));
+    assert!(
+        stateless(&token),
+        "stateless check resurrects the consumed token"
+    );
+    assert!(stateful(&token));
+    assert!(
+        !stateful(&token),
+        "stateful revocation list must reject reuse"
+    );
+
+    let _ = std::fs::remove_dir_all(&baseline_root);
+    let _ = std::fs::remove_dir_all(&restore_root);
+}
