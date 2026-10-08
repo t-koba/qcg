@@ -2024,6 +2024,11 @@
             },
             "type": "array"
           },
+          "network_deny_private_ips": {
+            "default": false,
+            "description": "Opt-in SSRF hardening for the HTTP fetch path. When true, every\nhop resolves ALL A/AAAA records and denies non-global IPs\n(loopback, private, link-local, multicast, unspecified, reserved);\nthe connection is pinned to the validated addresses. Default\nfalse so existing wildcard deployments keep working.",
+            "type": "boolean"
+          },
           "side_effects": {
             "$ref": "#/components/schemas/SideEffects"
           },
