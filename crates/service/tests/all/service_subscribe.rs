@@ -698,9 +698,15 @@ output_file = "done.txt"
         .await
         .unwrap();
     async fn at_state(service: &LocalService, id: &str, state: RunStatus) -> api::RunSnapshot {
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        // Locally this flood finishes in ~0.3s; loaded Windows CI exceeded
+        // the old 10s bound without reaching a terminal state, so poll up
+        // to 60s without changing the success condition. Report the last
+        // state so a failed run is not mistaken for a slow one.
+        let mut last_state = RunStatus::Queued;
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
             loop {
                 let snapshot = service.snapshot(id.to_string()).await.unwrap();
+                last_state = snapshot.state;
                 if snapshot.state == state {
                     return snapshot;
                 }
@@ -709,11 +715,11 @@ output_file = "done.txt"
                     "unexpected terminal state: {:?}",
                     snapshot.state
                 );
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
         })
         .await
-        .expect("run must reach its synchronization state")
+        .unwrap_or_else(|_| panic!("run {id} did not reach {state:?} (last state: {last_state:?})"))
     }
     let waiting = at_state(&service, &id, RunStatus::Waiting).await;
     let mut stream = service
