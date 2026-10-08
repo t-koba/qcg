@@ -158,6 +158,11 @@ Fields:
   templates free of per-run values (timestamps, UUIDs, run IDs). qcg emits
   tools in declaration order and derives `prompt_cache_key` from the system
   text with a single system breakpoint, so churn there silently breaks the prefix.
+  Keep dynamic queries and tool outputs at the message tail and prefer system-only
+  routing over full-context caching: compaction rewrites only message bodies and
+  preserves the system/tools prefix, while any full-transcript cache necessarily
+  diverges after compaction; per-turn tool-discovery reorder likewise breaks the
+  tools prefix.
 - `capabilities`: advertised support for `tool_use`, `json_schema`,
   `structured_output_with_tools`, `seed`, `image_input`, `audio_input`,
   `file_input`, `streaming`, `temperature`, `top_p`, `stop_sequences`,
