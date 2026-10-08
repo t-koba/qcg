@@ -313,6 +313,47 @@ pub(crate) fn loopback_oauth_origins(address: SocketAddr) -> BTreeSet<String> {
     ])
 }
 
+/// Derives the allowed `Host` values (`host[:port]`) from loopback origins
+/// (`scheme://host[:port]`). The server already freezes the origins at boot
+/// from the bound address, so no new configuration enters here (E04).
+pub(crate) fn allowed_hosts_from_origins(origins: &BTreeSet<String>) -> BTreeSet<String> {
+    origins
+        .iter()
+        .filter_map(|origin| {
+            origin
+                .strip_prefix("http://")
+                .or_else(|| origin.strip_prefix("https://"))
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// Rejects DNS-rebinding probes on a loopback listener: the `Host` header
+/// must be one of the loopback hosts for the bound port, else 403.
+/// Non-loopback binds pass through: the operator's reverse proxy owns the
+/// `Host` check there. Runs before authentication so a spoofed host never
+/// reaches credential timing (E04 fail closed, no new config).
+pub(crate) async fn require_loopback_host(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiHttpError> {
+    if state.oauth_origin.is_none() {
+        return Ok(next.run(request).await);
+    }
+    let allowed = allowed_hosts_from_origins(&state.oauth_allowed_origins);
+    let host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok());
+    match host {
+        Some(host) if allowed.contains(host) => Ok(next.run(request).await),
+        _ => Err(ApiHttpError::forbidden(
+            "request Host is not a loopback address for this server",
+        )),
+    }
+}
+
 pub(crate) async fn reject_unsafe_generator_asset_path(
     request: Request,
     next: Next,
@@ -664,5 +705,111 @@ command = ["sh", "-c", "sleep 30"]"#;
     #[test]
     fn generator_labels_are_escaped() {
         assert_eq!(escape_prometheus_label("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
+    }
+
+    #[test]
+    fn allowed_hosts_derive_from_loopback_origins() {
+        let addr: SocketAddr = "127.0.0.1:8080"
+            .parse()
+            .expect("loopback addr should parse");
+        let origins = loopback_oauth_origins(addr);
+        let hosts = allowed_hosts_from_origins(&origins);
+        assert!(
+            hosts.contains("127.0.0.1:8080"),
+            "bound host must be allowed: {hosts:?}"
+        );
+        assert!(
+            hosts.contains("localhost:8080"),
+            "localhost alias must be allowed: {hosts:?}"
+        );
+        assert!(
+            !hosts.iter().any(|host| host.contains("://")),
+            "scheme must be stripped: {hosts:?}"
+        );
+        assert!(allowed_hosts_from_origins(&BTreeSet::new()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn loopback_host_rejects_spoofed_host() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::routing::get;
+        use tower::ServiceExt as _;
+
+        let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .expect("temporary directory path should be UTF-8")
+            .join(format!("loopback-host-{}", uuid::Uuid::now_v7()));
+        let _temp_guard = TempGuard(root.clone());
+        let generators = root.join("generators");
+        let runs = root.join("runs");
+        std::fs::create_dir_all(&generators).expect("generator dir should create");
+        let addr: SocketAddr = "127.0.0.1:8080"
+            .parse()
+            .expect("loopback addr should parse");
+        let state = Arc::new(AppState {
+            service: LocalService::with_generator_roots_policy_and_store_mode(
+                vec![generators.clone()],
+                runs.clone(),
+                None,
+                1,
+                policy::DEFAULT_MAX_TRACKED_RUNS,
+                RunStoreMode::Exclusive,
+                service::ServiceDeploymentPolicy::default(),
+            )
+            .expect("service should initialize"),
+            runs_dir: runs.clone(),
+            oauth_origin: Some(format!("http://{addr}")),
+            oauth_allowed_origins: loopback_oauth_origins(addr),
+            oauth_callback_url: None,
+            idempotency: tokio::sync::Mutex::new(BTreeMap::new()),
+            idempotency_ttl: policy::IDEMPOTENCY_TTL,
+            idempotency_max_entries: policy::IDEMPOTENCY_MAX_ENTRIES,
+            api_token_digest: None,
+            artifact_limits: service::ArtifactZipLimits::default(),
+            asset_limit: None,
+            max_request_bytes: None,
+            metrics_policy: MetricsPolicy::default(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        });
+        let app = Router::new()
+            .route("/healthz", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                require_loopback_host,
+            ));
+        let request = |host: Option<&str>| {
+            let mut builder = axum::http::Request::builder().uri("/healthz");
+            if let Some(host) = host {
+                builder = builder.header(axum::http::header::HOST, host);
+            }
+            builder.body(Body::empty()).expect("request should build")
+        };
+        let ok = app
+            .clone()
+            .oneshot(request(Some("127.0.0.1:8080")))
+            .await
+            .expect("allowed host should respond");
+        assert_eq!(ok.status(), axum::http::StatusCode::OK);
+        let alias = app
+            .clone()
+            .oneshot(request(Some("localhost:8080")))
+            .await
+            .expect("localhost alias should respond");
+        assert_eq!(alias.status(), axum::http::StatusCode::OK);
+        let spoofed = app
+            .clone()
+            .oneshot(request(Some("evil.com")))
+            .await
+            .expect("spoofed host should respond");
+        assert_eq!(
+            spoofed.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "DNS-rebinding Host must fail closed"
+        );
+        let missing = app
+            .oneshot(request(None))
+            .await
+            .expect("missing host should respond");
+        assert_eq!(missing.status(), axum::http::StatusCode::FORBIDDEN);
     }
 }

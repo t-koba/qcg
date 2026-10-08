@@ -25,7 +25,7 @@ use super::mcp::{
 };
 use super::middleware::{
     loopback_oauth_origins, metrics, reject_unsafe_generator_asset_path, require_api_auth,
-    security_headers_middleware, sha256_bytes,
+    require_loopback_host, security_headers_middleware, sha256_bytes,
 };
 use super::rate_limit::{RateLimitOverflow, RateLimitPolicy, RateLimiter, enforce_rate_limit};
 use super::run_detail::{
@@ -943,12 +943,17 @@ pub(crate) fn build_router(
         // inside the shutdown gate: draining still answers 503 before the
         // limiter can answer 429, while the limiter covers unauthenticated
         // floods with a shared anonymous bucket and splits only verified
-        // identity (F10).
+        // identity (F10). The loopback Host check is layered outside auth so
+        // a spoofed Host is rejected before credential timing.
         .layer(axum_middleware::from_fn(reject_unsafe_generator_asset_path))
         .layer(axum_middleware::from_fn(security_headers_middleware))
         .layer(axum_middleware::from_fn_with_state(
             Arc::clone(state),
             require_api_auth,
+        ))
+        .layer(axum_middleware::from_fn_with_state(
+            Arc::clone(state),
+            require_loopback_host,
         ));
     let app = match rate_limit {
         Some(policy) => {

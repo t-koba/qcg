@@ -212,6 +212,12 @@ keeps network delivery explicit and journaled.
 
 ## CORS and events
 
+On a loopback listener every request must carry a loopback `Host` for the
+bound port (`127.0.0.1`, `localhost`, `::1`, or the bound address); any other
+`Host` is rejected with `403` before authentication, which blocks
+DNS-rebinding pages from driving the local API. Non-loopback binds leave
+`Host` validation to the reverse proxy.
+
 CORS is disabled unless one or more exact `--cors-origin` values are supplied.
 Allowed request headers are `Authorization`, `Content-Type`, `idempotency-key`,
 `Last-Event-ID`, `If-None-Match`, `If-Range` and `Range`. Browsers can read

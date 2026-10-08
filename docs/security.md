@@ -512,7 +512,13 @@ with an explicit error instead of silently serving without CORS
 API calls, event streams, and artifact downloads; the token never enters a
 URL, a cookie, or `localStorage` (see `docs/http-server-guide.md`). Static
 generator assets stay readable without a token so the UI shell can load;
-every JSON API route requires the credential when one is configured.
+every JSON API route requires the credential when one is configured. On a
+loopback listener the server additionally rejects any request whose `Host`
+is not a loopback host for the bound port (`require_loopback_host` in
+`crates/server/src/server/middleware.rs`, derived from the frozen
+`loopback_oauth_origins` with no new configuration), so a DNS-rebinding page
+cannot drive the API through a foreign `Host`. Non-loopback binds pass the
+`Host` through: put a reverse proxy with its own `Host` check in front.
 Browser access that must be authenticated at a different boundary goes
 through qpx, which injects the header after validating the caller.
 
