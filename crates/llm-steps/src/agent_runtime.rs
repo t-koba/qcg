@@ -9,7 +9,7 @@ use contract::{AgentFailureAction, NodeDef, ToolDecl, validate_form_values};
 use contract::{AgentFailureCode, FieldType, InputField};
 use engine::{HttpRequest, ResultExt, StepContext, StepError};
 use llm::{ChatMessage, ChatToolCall, LlmRuntime};
-use policy::is_safe_relative_path;
+use policy::path_is_within_prefix;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -1454,22 +1454,6 @@ fn ensure_path_within_prefix(
         ));
     }
     Ok(())
-}
-
-pub(crate) fn path_is_within_prefix(path: &str, prefix: &str) -> bool {
-    let Some(prefix) = normalize_path_prefix(prefix) else {
-        return false;
-    };
-    is_safe_relative_path(path)
-        && (path == prefix
-            || path
-                .strip_prefix(prefix)
-                .is_some_and(|suffix| suffix.starts_with('/')))
-}
-
-pub(crate) fn normalize_path_prefix(prefix: &str) -> Option<&str> {
-    let normalized = prefix.strip_suffix('/').unwrap_or(prefix);
-    is_safe_relative_path(normalized).then_some(normalized)
 }
 
 pub(crate) fn agent_failure_code(error: &StepError) -> AgentFailureCode {

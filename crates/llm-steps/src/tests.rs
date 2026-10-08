@@ -12,7 +12,7 @@ use engine::{TOOL_EVENT_SOURCE_LIMIT, TOOL_EVENT_SOURCE_SCAN_DEPTH, TOOL_EVENT_S
 use llm::{ChatMessage, ChatToolCall, LlmRuntime, SearchRuntime, StopReason};
 use mcp::{McpCallOutcome, McpError, McpInputRequired};
 use model::StructuredOutputMode;
-use policy::TOOL_EVENT_VALUE_LIMIT_BYTES;
+use policy::{TOOL_EVENT_VALUE_LIMIT_BYTES, path_is_within_prefix};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};

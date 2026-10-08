@@ -7,7 +7,6 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
 use crate::agent::agent_command_allowed;
-use crate::agent_runtime::normalize_path_prefix;
 use crate::prompting::read_path_bounded;
 use crate::request_policy::{effective_request_policy, llm_params};
 use crate::routes::validate_route_sequence;
@@ -16,6 +15,7 @@ use crate::validation::{
     request_required_capabilities, resolve_model_static, validate_effective_tool_policy,
     validate_provider_requirements,
 };
+use policy::normalize_path_prefix;
 
 pub(crate) fn validate_agent_tool(
     node: &NodeDef,

@@ -31,6 +31,28 @@ pub fn portable_relative_path(path: &Utf8Path) -> String {
         .join("/")
 }
 
+/// Normalizes an fs tool `path_prefix` to its slash-trimmed safe form.
+/// Returns `None` when the prefix is not a safe relative path.
+pub fn normalize_path_prefix(prefix: &str) -> Option<&str> {
+    let normalized = prefix.strip_suffix('/').unwrap_or(prefix);
+    is_safe_relative_path(normalized).then_some(normalized)
+}
+
+/// Returns whether `path` stays within `prefix` on component boundaries.
+/// Both sides must be safe relative paths; `path == prefix` counts as
+/// within. String-prefix matches that split a component (e.g.
+/// `outcome.txt` under `out`) are rejected, as is any unsafe path.
+pub fn path_is_within_prefix(path: &str, prefix: &str) -> bool {
+    let Some(prefix) = normalize_path_prefix(prefix) else {
+        return false;
+    };
+    is_safe_relative_path(path)
+        && (path == prefix
+            || path
+                .strip_prefix(prefix)
+                .is_some_and(|suffix| suffix.starts_with('/')))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,6 +81,19 @@ mod tests {
             }
             assert!(is_safe_relative_path(good), "{good:?}");
         }
+    }
+
+    #[test]
+    fn prefix_matches_components_not_string_prefixes() {
+        assert!(path_is_within_prefix("out/result.txt", "out/"));
+        assert!(path_is_within_prefix("out/result.txt", "out"));
+        assert!(path_is_within_prefix("out", "out/"));
+        assert!(!path_is_within_prefix("outcome.txt", "out/"));
+        assert!(!path_is_within_prefix("outcome/result.txt", "out"));
+        assert!(!path_is_within_prefix("other/result.txt", "out/"));
+        assert!(!path_is_within_prefix("out/../escape.txt", "out/"));
+        assert!(normalize_path_prefix("out/") == Some("out"));
+        assert!(normalize_path_prefix("../escape").is_none());
     }
 
     #[test]
