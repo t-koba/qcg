@@ -601,3 +601,58 @@ fn evaluate_assertions(
     }
     Ok(failures)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn finished(seq: u64) -> api::RunEvent {
+        api::RunEvent {
+            seq,
+            ts: "2026-10-08T00:00:00Z".into(),
+            run_id: "run-dup".into(),
+            trace_id: "trace-dup".into(),
+            span_id: format!("span-{seq}"),
+            parent_span_id: None,
+            path: None,
+            kind: "step_finished".into(),
+            data: api::RunEventData::Unknown(serde_json::json!({})),
+        }
+    }
+
+    #[test]
+    fn duplicate_effect_passes_uncapped_but_trips_explicit_max() {
+        // Replay of the duplicate-write probe through the real eval gate:
+        // two `step_finished` events with identical checked artifact content
+        // pass a declared-only uncapped suite (false accept) and fail only
+        // when the suite caps the count with an explicit `max`.
+        let events = vec![finished(0), finished(1)];
+        let manifest = OutputManifest { artifacts: vec![] };
+        let runtime = RuntimeLimits::default();
+        let root = Utf8PathBuf::from(".");
+        let uncapped = vec![EvalAssertion::EventCount {
+            kind: "step_finished".into(),
+            min: Some(1),
+            max: None,
+        }];
+        let failures = evaluate_assertions(&uncapped, root.as_path(), &manifest, &runtime, &events)
+            .expect("uncapped eval must run");
+        assert!(
+            failures.is_empty(),
+            "uncapped suite false-accepts the duplicate effect: {failures:?}"
+        );
+        let capped = vec![EvalAssertion::EventCount {
+            kind: "step_finished".into(),
+            min: Some(1),
+            max: Some(1),
+        }];
+        let failures = evaluate_assertions(&capped, root.as_path(), &manifest, &runtime, &events)
+            .expect("capped eval must run");
+        assert_eq!(failures.len(), 1, "explicit max must catch the duplicate");
+        assert!(
+            failures[0].contains("outside 1..1"),
+            "cap failure must name the bound, got: {}",
+            failures[0]
+        );
+    }
+}
