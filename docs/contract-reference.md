@@ -284,7 +284,7 @@ effects are denied unless explicitly declared.
   files. Paths are normalized and symlink escapes are rejected.
 - `fs_write`: include `workspace` to allow workspace writes.
 - `network`: allowed host names, matched as strings against the request URL host (`ensure_url_allowed` in `crates/engine/src/gateway/http.rs`). `"*"` allows every host including loopback, link-local, and cloud metadata endpoints; an explicit hostname does not pin DNS, so a name that resolves inward at connect time still connects. Prefer explicit hosts and avoid `"*"` on cloud or loopback-adjacent deployments.
-- `network_deny_private_ips`: opt-in SSRF hardening for the HTTP fetch path (default `false`). When `true`, every hop resolve-then-checks ALL A/AAAA records, denies non-global IPs, and pins the connection to the validated addresses (single resolution per hop).
+- `network_deny_private_ips`: opt-in SSRF hardening for the HTTP fetch path (default `false`). When `true`, every hop resolve-then-checks ALL A/AAAA records, denies non-global IPs, and pins the connection to the validated addresses (single resolution per hop). Wildcard-DNS names such as `<169.254.169.254>.nip.io` (and `sslip.io`/`xip.io`/`traefik.me` equivalents) stay DNS names and pass the string allowlist when listed: only `true` denies them at resolve time — prefer `true` on cloud or loopback-adjacent deployments.
 - `commands`: allowlisted `{ bin, args, purpose, isolation, image? }` shapes.
   `isolation` is mandatory. `container` requires an `image` pinned with
   `@sha256:` and present in `permissions.containers.images`; `trusted_host`
