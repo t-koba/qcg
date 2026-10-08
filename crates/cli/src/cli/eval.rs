@@ -606,7 +606,7 @@ fn evaluate_assertions(
 mod tests {
     use super::*;
 
-    fn finished(seq: u64) -> api::RunEvent {
+    fn kinded(seq: u64, kind: &str) -> api::RunEvent {
         api::RunEvent {
             seq,
             ts: "2026-10-08T00:00:00Z".into(),
@@ -615,9 +615,13 @@ mod tests {
             span_id: format!("span-{seq}"),
             parent_span_id: None,
             path: None,
-            kind: "step_finished".into(),
+            kind: kind.into(),
             data: api::RunEventData::Unknown(serde_json::json!({})),
         }
+    }
+
+    fn finished(seq: u64) -> api::RunEvent {
+        kinded(seq, "step_finished")
     }
 
     #[test]
@@ -651,6 +655,44 @@ mod tests {
         assert_eq!(failures.len(), 1, "explicit max must catch the duplicate");
         assert!(
             failures[0].contains("outside 1..1"),
+            "cap failure must name the bound, got: {}",
+            failures[0]
+        );
+    }
+
+    #[test]
+    fn event_sequence_tolerates_noise_but_count_cap_catches_extra() {
+        // Replay of a noise-interleaved trajectory through the real eval
+        // gate: `event_sequence` is a subsequence match, so an interleaved
+        // `llm_delta` passes declared-only and only an explicit
+        // `event_count` max on the noise kind catches the extra event.
+        let events = vec![
+            kinded(0, "step_started"),
+            kinded(1, "llm_delta"),
+            kinded(2, "step_finished"),
+        ];
+        let manifest = OutputManifest { artifacts: vec![] };
+        let runtime = RuntimeLimits::default();
+        let root = Utf8PathBuf::from(".");
+        let sequence = vec![EvalAssertion::EventSequence {
+            kinds: vec!["step_started".into(), "step_finished".into()],
+        }];
+        let failures = evaluate_assertions(&sequence, root.as_path(), &manifest, &runtime, &events)
+            .expect("sequence eval must run");
+        assert!(
+            failures.is_empty(),
+            "sequence false-accepts interleaved noise by design: {failures:?}"
+        );
+        let capped = vec![EvalAssertion::EventCount {
+            kind: "llm_delta".into(),
+            min: None,
+            max: Some(0),
+        }];
+        let failures = evaluate_assertions(&capped, root.as_path(), &manifest, &runtime, &events)
+            .expect("capped eval must run");
+        assert_eq!(failures.len(), 1, "explicit max must catch the extra event");
+        assert!(
+            failures[0].contains("outside 0..0"),
             "cap failure must name the bound, got: {}",
             failures[0]
         );
