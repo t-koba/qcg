@@ -424,7 +424,7 @@ pub(crate) fn percentile_u64(values: &[u64]) -> u64 {
     sorted[sorted.len() / 2]
 }
 
-/// Terminal metrics from run events when the run finished.
+/// Terminal metrics from the terminal run event (finished or error).
 fn eval_terminal_metrics(events: &[api::RunEvent]) -> (u64, u64, u64, u64) {
     use api::RunEventData;
     for event in events.iter().rev() {
