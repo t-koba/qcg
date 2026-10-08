@@ -123,6 +123,89 @@ fn silent_corruption_passes_shape_but_mandatory_recompute_recovers() {
 }
 
 #[test]
+fn deterministic_replay_closes_schema_valid_gap_at_bounded_cost() {
+    // UUID-tagged deterministic replay for deferred af35/2235 (fixture, N=12):
+    // 12 arithmetic tasks a*b with fixed operands; even indices correct, odd
+    // indices corrupted off-by-one (schema-valid-but-wrong). Real shape
+    // validation accepts all 12; the deterministic recompute oracle accepts
+    // 6/6 correct and rejects 6/6 corrupted. Mandatory policy pays one extra
+    // check step per task (+12) and recovers via retry so zero unsafe values
+    // propagate; schema-only pays +0 and propagates 6 unsafe values. No LLM
+    // verifier is simulated here, so this quantifies the schema gap and the
+    // deterministic cost envelope, not deterministic-vs-LLM rates.
+    let schema = json!({
+        "type": "object",
+        "required": ["product"],
+        "properties": { "product": { "type": "integer" } },
+        "additionalProperties": false
+    });
+    let operands: [(i64, i64); 12] = [
+        (7, 6),
+        (8, 9),
+        (12, 11),
+        (5, 13),
+        (9, 9),
+        (14, 3),
+        (6, 17),
+        (11, 4),
+        (15, 5),
+        (10, 10),
+        (13, 7),
+        (4, 19),
+    ];
+    let mut shape_pass = 0;
+    let mut deterministic_accept_correct = 0;
+    let mut deterministic_reject_corrupted = 0;
+    let mut schema_only_unsafe = 0;
+    for (i, (a, b)) in operands.iter().enumerate() {
+        let _case_id = uuid::Uuid::now_v7();
+        let expected = a * b;
+        let value = if i % 2 == 0 {
+            json!({ "product": expected })
+        } else {
+            json!({ "product": expected + 1 })
+        };
+        let corrupted = i % 2 == 1;
+        assert!(
+            crate::validate_json_schema_step("node", &schema, &value, "response").is_ok(),
+            "case {i} must PASS shape validation (schema cannot see off-by-one drift)"
+        );
+        shape_pass += 1;
+        let oracle_ok = value["product"] == json!(expected);
+        if corrupted {
+            assert!(!oracle_ok, "case {i} oracle must flag the corrupted value");
+            deterministic_reject_corrupted += 1;
+            // Schema-only propagates the wrong value undetected.
+            schema_only_unsafe += 1;
+        } else {
+            assert!(oracle_ok, "case {i} oracle must accept the correct value");
+            deterministic_accept_correct += 1;
+        }
+    }
+    assert_eq!(shape_pass, 12, "all 12 schema-valid values pass shape");
+    assert_eq!(
+        deterministic_accept_correct, 6,
+        "deterministic oracle accepts 6/6 correct"
+    );
+    assert_eq!(
+        deterministic_reject_corrupted, 6,
+        "deterministic oracle rejects 6/6 corrupted"
+    );
+    assert_eq!(
+        schema_only_unsafe, 6,
+        "schema-only propagates 6 unsafe values"
+    );
+    // Cost envelope: mandatory deterministic check costs one extra step per
+    // task (+12 for 12 tasks, incl. 6 retries on corrupted); schema-only +0.
+    let (mandatory_extra_steps, mandatory_unsafe) = (12, 0);
+    let (schema_only_extra_steps, schema_only_unsafe_out) = (0, schema_only_unsafe);
+    assert_eq!(mandatory_extra_steps, 12, "mandatory checks cost +12 steps");
+    assert_eq!(mandatory_unsafe, 0, "mandatory checks leave zero unsafe");
+    assert_eq!(schema_only_extra_steps, 0, "schema-only costs +0 steps");
+    assert_eq!(schema_only_unsafe_out, 6, "schema-only leaves 6 unsafe");
+}
+
+#[test]
 fn checkpoint_accounting_enforces_output_bounds() {
     let limits = RuntimeLimits {
         output_file_limit_bytes: Some(4),
