@@ -295,6 +295,30 @@ fn provider_boundary_rejects_reserved_and_invalid_tool_schemas() {
 }
 
 #[test]
+fn anthropic_rejects_top_level_union_tool_schemas() {
+    for keyword in ["anyOf", "oneOf", "allOf"] {
+        let mut request = sample_request();
+        request.tools = vec![ToolSpec {
+            name: "union_tool".into(),
+            description: "union".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "value": { "type": "string" } },
+                keyword: [{ "type": "string" }]
+            }),
+        }];
+        let error = validate_chat_request(&request, ApiFlavor::AnthropicMessages)
+            .expect_err("Anthropic must reject top-level unions fail-closed");
+        assert!(
+            error.to_string().contains(keyword),
+            "{error} missing {keyword}"
+        );
+        validate_chat_request(&request, ApiFlavor::ChatCompletions)
+            .expect("other APIs still accept the same schema");
+    }
+}
+
+#[test]
 fn native_schema_compatibility_rejects_unsupported_keywords_and_external_refs() {
     let supported = json!({
         "type": "object",

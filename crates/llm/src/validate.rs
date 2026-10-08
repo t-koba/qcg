@@ -113,7 +113,7 @@ pub(crate) fn validate_chat_request(req: &ChatRequest, api: ApiFlavor) -> Result
                 tool.name
             )));
         }
-        validate_tool_input_schema(&tool.name, &tool.input_schema)?;
+        validate_tool_input_schema(&tool.name, &tool.input_schema, api)?;
     }
     for message in &req.messages {
         if message.provider_state.is_some() && api != ApiFlavor::Responses {
@@ -178,10 +178,20 @@ pub(crate) fn validate_chat_request(req: &ChatRequest, api: ApiFlavor) -> Result
     Ok(())
 }
 
-fn validate_tool_input_schema(name: &str, schema: &Value) -> Result<(), LlmError> {
+fn validate_tool_input_schema(name: &str, schema: &Value, api: ApiFlavor) -> Result<(), LlmError> {
     if schema.get("type").and_then(Value::as_str) != Some("object") {
         return Err(LlmError::new(format!(
             "tool `{name}` input_schema root must have type `object`"
+        )));
+    }
+    if api == ApiFlavor::AnthropicMessages
+        && let Some(object) = schema.as_object()
+        && let Some(keyword) = ["oneOf", "anyOf", "allOf"]
+            .iter()
+            .find(|keyword| object.contains_key(**keyword))
+    {
+        return Err(LlmError::new(format!(
+            "tool `{name}` input_schema uses top-level `{keyword}` which Anthropic input_schema rejects"
         )));
     }
     let size = serde_json::to_vec(schema)
