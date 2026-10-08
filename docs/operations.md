@@ -174,9 +174,11 @@ server-hosted generators.
 
 `skill` and `skill_library` resources follow the agentskills.io format.
 Names, descriptions, and unparseable frontmatter are hard errors at contract
-load; soft violations (name length, character set, or a name that differs from
-the directory name) are recorded as diagnostics on the run's resource snapshot
-and logged with `tracing` instead of failing the run. Validate a skill or a
+load; unknown top-level keys (ecosystem extensions) are ignored with a warning
+diagnostic, while a misspelled required field still fails through the missing
+name/description check. Soft violations (name length, character set, or a name
+that differs from the directory name) are recorded as diagnostics on the run's
+resource snapshot and logged with `tracing` instead of failing the run. Validate a skill or a
 library before packaging with:
 
 ```bash

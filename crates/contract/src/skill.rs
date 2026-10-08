@@ -77,8 +77,10 @@ pub enum SkillValidationError {
 /// (`>`) block scalars with chomping, and a flat `metadata` string map.
 /// Anchors, aliases, flow collections, and multi-document files are rejected
 /// as invalid lines instead of being silently misread. Unknown top-level keys
-/// are rejected (fail-closed): silently ignoring them would accept
-/// misspelled required fields as valid skills.
+/// (ecosystem extensions) are ignored with a warning diagnostic: a misspelled
+/// required field still fails closed through the missing `name`/`description`
+/// check below, so strict rejection would be stricter than needed for
+/// cross-platform skill reuse.
 pub fn parse_skill_doc(source: &str) -> Result<SkillDoc, SkillParseError> {
     let source = match source.strip_prefix('\u{feff}') {
         Some(rest) => rest,
@@ -338,7 +340,7 @@ fn parse_front_matter(
         {
             let (scalar, next) =
                 read_block_scalar(front, index + 1, style, chomping, indent, line_number)?;
-            assign_field(&mut fields, key, scalar, line_number)?;
+            assign_field(&mut fields, key, scalar, line_number, diagnostics)?;
             index = next;
             continue;
         }
@@ -354,17 +356,17 @@ fn parse_front_matter(
             message,
         })?;
         if value.trim().is_empty() {
-            assign_field(&mut fields, key, scalar, line_number)?;
+            assign_field(&mut fields, key, scalar, line_number, diagnostics)?;
             index = skip_indented_block(front, index + 1);
             continue;
         }
         if quoted {
-            assign_field(&mut fields, key, scalar, line_number)?;
+            assign_field(&mut fields, key, scalar, line_number, diagnostics)?;
             index = skip_indented_block(front, index + 1);
             continue;
         }
         let (scalar, next) = read_plain_continuation(front, index + 1, scalar);
-        assign_field(&mut fields, key, scalar, line_number)?;
+        assign_field(&mut fields, key, scalar, line_number, diagnostics)?;
         index = next;
     }
     Ok(fields)
@@ -432,6 +434,7 @@ fn assign_field(
     key: &str,
     value: String,
     line_number: usize,
+    diagnostics: &mut Vec<SkillDiagnostic>,
 ) -> Result<(), SkillParseError> {
     match key {
         "name" => fields.name = Some(value),
@@ -439,13 +442,15 @@ fn assign_field(
         "license" => fields.license = Some(value),
         "compatibility" => fields.compatibility = Some(value),
         "allowed-tools" => fields.allowed_tools = Some(value),
-        // Fail-closed on unknown keys: a misspelled required field must not
-        // read as a missing field with a default.
+        // Cross-platform fallback: ecosystem extensions are ignored with a
+        // warning so reviewed contracts can consume skills authored for
+        // other harnesses without forking them. Typo safety stays
+        // fail-closed through the missing `name`/`description` check in
+        // `parse_skill_doc`, which rejects a misspelled required field.
         _ => {
-            return Err(SkillParseError::InvalidLine {
-                line: line_number,
-                message: format!("unknown frontmatter key `{key}`"),
-            });
+            diagnostics.push(SkillDiagnostic::warning(format!(
+                "unknown frontmatter key `{key}` on line {line_number}; the entry is ignored"
+            )));
         }
     }
     Ok(())
@@ -796,16 +801,33 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_front_matter_keys() {
-        // Fail-closed: unknown keys are rejected, never silently ignored.
-        let source = "---\nname: demo\ndescription: Demo\nunknown-key: value\n---\nBody.\n";
-        let error = parse_skill_doc(source).expect_err("unknown keys must be rejected");
+    fn warns_and_ignores_unknown_front_matter_keys() {
+        // Cross-platform fallback: ecosystem extensions load with a warning.
+        // Typo safety stays fail-closed via the missing name/description check.
+        let source = "---\nname: demo\ndescription: Demo\nuser-invocable: false\npaths: \"**/*.md\"\n---\nBody.\n";
+        let skill = parse_skill_doc(source).expect("extension keys must warn, not fail");
+        assert_eq!(skill.name, "demo");
+        assert_eq!(skill.description, "Demo");
+        assert_eq!(skill.instructions, "Body.");
         assert!(
-            matches!(error, SkillParseError::InvalidLine { .. }),
-            "unknown keys must fail as invalid lines: {error:?}"
+            skill
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("unknown frontmatter key")),
+            "extension keys must surface a warning diagnostic"
         );
         let nested = "---\nname: demo\ndescription: Demo\nnested:\n  child: value\n---\nBody.\n";
-        parse_skill_doc(nested).expect_err("nested unknown keys must be rejected");
+        let skill = parse_skill_doc(nested).expect("nested unknown keys must warn, not fail");
+        assert_eq!(skill.name, "demo");
+        assert!(
+            skill
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("unknown frontmatter key")),
+        );
+        // A misspelled required field still fails through the missing check.
+        let typo = "---\nnme: demo\ndescription: Demo\n---\nBody.\n";
+        parse_skill_doc(typo).expect_err("misspelled name must still fail as missing");
     }
 
     #[test]

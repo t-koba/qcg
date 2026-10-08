@@ -219,7 +219,10 @@ frontmatter follows the agentskills.io specification: required `name` and
 and `allowed-tools`. `allowed-tools` is informational and never grants
 permissions. Conformant YAML is parsed for plain, quoted, folded (`>`), and
 literal (`|`) scalars; missing `name` or `description`, unparseable
-frontmatter, and a missing `SKILL.md` fail explicitly. Soft violations such as
+frontmatter, and a missing `SKILL.md` fail explicitly. Unknown top-level keys
+(ecosystem extensions) are ignored with a warning diagnostic so skills authored
+for other harnesses load without forking; a misspelled required field still
+fails through the missing `name`/`description` check. Soft violations such as
 a name that differs from the directory name are recorded as diagnostics in the
 resource snapshot and logged instead of failing the run.
 
