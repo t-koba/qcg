@@ -241,6 +241,131 @@ fn structured_output_mode_selects_strict_compatible_or_prompt_transport() {
 }
 
 #[test]
+fn auto_matches_explicit_native_transport_or_fail_closed() {
+    let strict_closed = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": { "answer": { "type": "string" } },
+        "required": ["answer"]
+    });
+    let mut auto_req = sample_request();
+    auto_req.temperature = None;
+    auto_req.seed = None;
+    auto_req.response_schema = Some(strict_closed.clone());
+    auto_req.structured_output = StructuredOutputMode::Auto;
+    let mut strict_req = auto_req.clone();
+    strict_req.structured_output = StructuredOutputMode::NativeStrict;
+
+    for api in [
+        ApiFlavor::ChatCompletions,
+        ApiFlavor::Responses,
+        ApiFlavor::AnthropicMessages,
+    ] {
+        validate_chat_request(&auto_req, api).expect("auto strict-closed should validate");
+        validate_chat_request(&strict_req, api).expect("explicit strict-closed should validate");
+    }
+    assert_eq!(
+        native_response_schema(&auto_req),
+        native_response_schema(&strict_req),
+        "auto must select the same native transport as explicit"
+    );
+    assert_eq!(
+        native_response_schema(&auto_req),
+        Some((&strict_closed, true))
+    );
+    assert_eq!(
+        chat_completions_payload(
+            &auto_req,
+            false,
+            ChatTokenLimitField::MaxCompletionTokens,
+            None
+        )["response_format"],
+        chat_completions_payload(
+            &strict_req,
+            false,
+            ChatTokenLimitField::MaxCompletionTokens,
+            None
+        )["response_format"]
+    );
+    assert_eq!(
+        responses_payload(&auto_req, None)["text"],
+        responses_payload(&strict_req, None)["text"]
+    );
+    let auto_anthropic = anthropic_payload(&auto_req, None);
+    let strict_anthropic = anthropic_payload(&strict_req, None);
+    assert_eq!(auto_anthropic["tools"], strict_anthropic["tools"]);
+    assert_eq!(
+        auto_anthropic["tool_choice"],
+        strict_anthropic["tool_choice"]
+    );
+    assert_eq!(auto_anthropic["tool_choice"]["name"], "response");
+
+    // Native-incompatible schema: auto falls back to prompt while explicit
+    // fails closed before transport.
+    let open_schema = json!({
+        "type": "object",
+        "anyOf": [{ "type": "object", "additionalProperties": false }]
+    });
+    let mut auto_open = sample_request();
+    auto_open.temperature = None;
+    auto_open.seed = None;
+    auto_open.response_schema = Some(open_schema.clone());
+    auto_open.structured_output = StructuredOutputMode::Auto;
+    let mut strict_open = auto_open.clone();
+    strict_open.structured_output = StructuredOutputMode::NativeStrict;
+
+    validate_chat_request(&auto_open, ApiFlavor::ChatCompletions)
+        .expect("auto must fall back to prompt validation for incompatible schema");
+    assert!(
+        native_response_schema(&auto_open).is_none(),
+        "auto must not select native transport for incompatible schema"
+    );
+    assert!(
+        chat_completions_payload(
+            &auto_open,
+            false,
+            ChatTokenLimitField::MaxCompletionTokens,
+            None
+        )
+        .get("response_format")
+        .is_none()
+    );
+    assert!(
+        anthropic_payload(&auto_open, None)["tools"]
+            .as_array()
+            .is_none_or(|tools| tools.iter().all(|tool| tool["name"] != "response"))
+    );
+    let error = validate_chat_request(&strict_open, ApiFlavor::ChatCompletions)
+        .expect_err("explicit native_strict must reject incompatible schema");
+    assert!(
+        error.to_string().contains("unsupported keywords")
+            || error.to_string().contains("fully closed"),
+        "{error}"
+    );
+
+    // Anthropic owns tool_choice on both paths.
+    for mode in [
+        StructuredOutputMode::Auto,
+        StructuredOutputMode::NativeStrict,
+    ] {
+        let mut owned = sample_request();
+        owned.temperature = None;
+        owned.seed = None;
+        owned.response_schema = Some(strict_closed.clone());
+        owned.structured_output = mode;
+        owned.tools = vec![ToolSpec {
+            name: "lookup".into(),
+            description: "lookup".into(),
+            input_schema: json!({ "type": "object" }),
+        }];
+        owned.tool_choice = Some(ToolChoice::required());
+        let error = validate_chat_request(&owned, ApiFlavor::AnthropicMessages)
+            .expect_err("Anthropic must own tool_choice on every native path");
+        assert!(error.to_string().contains("owns tool_choice"), "{error}");
+    }
+}
+
+#[test]
 fn provider_boundary_rejects_native_schema_without_capability() {
     let mut request = sample_request();
     request.response_schema = Some(json!({
