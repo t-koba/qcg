@@ -3221,7 +3221,9 @@ fn assert_journal_has_none(run: &Utf8Path, predicate: impl Fn(&Value) -> bool) {
 async fn wait_for_success(client: &reqwest::Client, base: &str, run_id: &str) {
     // Concurrent runs take ~0.7s isolated on Linux and exceed the old 1s
     // bound under loaded/slower Windows CI; poll up to 10s without changing
-    // the success condition.
+    // the success condition. Report the terminal state so a failed run is
+    // not mistaken for a slow one.
+    let mut last_state = String::from("<unknown>");
     for _ in 0..500 {
         let snapshot: Value = client
             .get(format!("{base}/api/runs/{run_id}"))
@@ -3233,12 +3235,17 @@ async fn wait_for_success(client: &reqwest::Client, base: &str, run_id: &str) {
             .json()
             .await
             .expect("snapshot should be JSON");
-        if snapshot["state"].as_str() == Some("succeeded") {
+        let state = snapshot["state"].as_str().unwrap_or("<unknown>");
+        last_state = state.to_string();
+        if state == "succeeded" {
             return;
+        }
+        if matches!(state, "failed" | "canceled" | "interrupted") {
+            panic!("run ended as {state}: {snapshot}");
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    panic!("run did not finish");
+    panic!("run did not finish (last state: {last_state}, run_id: {run_id})");
 }
 
 async fn read_sse_until_finished(client: &reqwest::Client, base: &str, run_id: &str) -> Vec<Value> {
