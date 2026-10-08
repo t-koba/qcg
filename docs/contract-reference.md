@@ -283,7 +283,7 @@ effects are denied unless explicitly declared.
 - `fs_read`: include `workspace` to allow steps to read generated workspace
   files. Paths are normalized and symlink escapes are rejected.
 - `fs_write`: include `workspace` to allow workspace writes.
-- `network`: allowed host names.
+- `network`: allowed host names, matched as strings against the request URL host (`ensure_url_allowed` in `crates/engine/src/gateway/http.rs`). `"*"` allows every host including loopback, link-local, and cloud metadata endpoints; an explicit hostname does not pin DNS, so a name that resolves inward at connect time still connects. Prefer explicit hosts and avoid `"*"` on cloud or loopback-adjacent deployments.
 - `commands`: allowlisted `{ bin, args, purpose, isolation, image? }` shapes.
   `isolation` is mandatory. `container` requires an `image` pinned with
   `@sha256:` and present in `permissions.containers.images`; `trusted_host`

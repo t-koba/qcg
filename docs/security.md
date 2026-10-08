@@ -360,6 +360,8 @@ declared `allowed_hosts`, require every one of those hosts in
 allow only their exact command vector through `permissions.commands`; the child
 does not receive the qcg process environment.
 
+Network allowlist scope: `permissions.network` (and MCP `allowed_hosts`) match the URL hostname as a string only, with no DNS lookup or resolved-IP filtering (`ensure_url_allowed` in `crates/engine/src/gateway/http.rs`). `"*"` therefore includes loopback, link-local, and cloud metadata endpoints, and an explicit hostname does not pin DNS against rebinding. Prefer explicit hosts and avoid `"*"` on cloud or loopback-adjacent deployments; every redirect hop is re-checked against the same string allowlist.
+
 MCP `tools/list` metadata is untrusted. qcg strips descriptive schema
 annotations before putting a server schema into an LLM tool definition, then
 validates each model argument against the original schema. When a server
