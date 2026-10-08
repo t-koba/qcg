@@ -37,7 +37,7 @@ jobs:
           cache-dependency-path: frontend/generator/package-lock.json
 
       - name: Install verification dependencies
-        run: npm --prefix frontend/generator ci
+        run: npm --prefix frontend/generator ci --ignore-scripts
 
       - name: Shared core verification
         shell: bash
@@ -88,7 +88,7 @@ jobs:
           cache-dependency-path: frontend/generator/package-lock.json
 
       - name: Install demo dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
         working-directory: frontend/generator
 
       - name: Install pinned wasm-bindgen CLI
@@ -146,7 +146,7 @@ jobs:
           cache-dependency-path: frontend/generator/package-lock.json
 
       - name: Install demo dependencies and generate inputs
-        run: npm ci && npm run generate:api && npm run generate:wasm
+        run: npm ci --ignore-scripts && npm run generate:api && npm run generate:wasm
         working-directory: frontend/generator
 
       - name: Install Playwright

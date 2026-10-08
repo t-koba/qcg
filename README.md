@@ -30,7 +30,10 @@ provider's MCP search tool, and must grant the corresponding hosts in
 When running from the source tree, build the generated SPA assets first:
 
 ```bash
-npm --prefix frontend/generator ci
+# --ignore-scripts: dependency install scripts never execute (install-time
+# execution is a supply-chain exfiltration vector; neither locked script is
+# needed — the esbuild binary ships via optionalDependencies).
+npm --prefix frontend/generator ci --ignore-scripts
 npm --prefix frontend/generator run generate:api
 npm --prefix frontend/generator run generate:wasm
 npm --prefix frontend/generator run build
@@ -56,7 +59,7 @@ http://127.0.0.1:8080/api/generators/generator/assets/ui/index.html
 For frontend development, run the source SPA through Vite's API proxy:
 
 ```bash
-npm --prefix frontend/generator ci
+npm --prefix frontend/generator ci --ignore-scripts
 npm --prefix frontend/generator run generate:api
 npm --prefix frontend/generator run generate:wasm
 API_TARGET=http://127.0.0.1:8080 \
