@@ -337,13 +337,8 @@ permission by itself.
 `lifecycle` selects MCP session negotiation explicitly: `initialize` uses the
 widely deployed initialize handshake, while `discover` requires the modern
 `server/discover` lifecycle and is the default for custom profiles. Use
-`initialize` for a server that documents only the initialize handshake.
-`auto` is explicit opt-in to a bounded fallback: it probes `server/discover`
-(preferring `2026-07-28`), then falls back to `initialize` (`2025-11-25`)
-only when the peer reports legacy or does not answer within 10 seconds.
-qcg never silently retries a different lifecycle: `initialize` and `discover`
-never fall back, and `auto` falls back only when the profile selects it.
-The built-in Exa and
+`initialize` for a server that documents only the initialize handshake. qcg
+never silently retries a different lifecycle. The built-in Exa and
 Parallel profiles are pinned to `initialize` and are exercised by live
 contract tests.
 

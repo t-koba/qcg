@@ -38,7 +38,7 @@ layer below must pass independently before the feature is considered working.
 
 | Area | Required behavior | Verification |
 |---|---|---|
-| Lifecycle | Profiles choose `initialize`, `discover`, or explicit opt-in `auto` (bounded `discover`-then-`initialize` fallback); no implicit protocol fallback exists. Known public profiles are pinned to the lifecycle they actually implement. | `public_defaults_are_anonymous_and_pinned_to_exact_hosts`, `lifecycle_auto_is_explicit_opt_in_with_pinned_versions` |
+| Lifecycle | Profiles choose `initialize` or `discover`; no implicit protocol fallback exists. Known public profiles are pinned to the lifecycle they actually implement. | `public_defaults_are_anonymous_and_pinned_to_exact_hosts` |
 | Transport | Streamable HTTP and stdio perform real initialization, listing, calls, isolation, cancellation, timeout, and close/reap behavior. A malformed successful HTTP JSON body fails immediately instead of entering asynchronous task polling. | `mcp` HTTP and stdio integration tests, including `malformed_success_json_fails_immediately_instead_of_timing_out` |
 | Discovery bounds | Pagination, response size, schema size, depth, node count, object width, and string length are bounded. | MCP schema and transport bound tests |
 | Schema trust | Descriptions and annotations are sanitized, internal references/composition work, and external references are rejected. | `mcp_schema_removes_untrusted_annotations_without_dropping_property_names`, reference and complexity tests |

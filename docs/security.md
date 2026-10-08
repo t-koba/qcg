@@ -409,12 +409,9 @@ string-size bounds before schema compilation. A contract's
 `permissions.side_effects = "none"`, or pauses for the normal HITL
 confirmation under `confirm` / `dry_run_first`; only a reviewed `allowed`
 policy executes it without confirmation. Confirmation journals summarize only
-argument names and encoded size. Each MCP profile selects `initialize`, `discover`, or explicit opt-in `auto`
-(`discover` probing `2026-07-28` with a bounded 10-second fallback to
-`initialize` at `2025-11-25`). Known servers are pinned to their verified lifecycle, and qcg never
-silently retries a different protocol lifecycle after a negotiation failure:
-`initialize` and `discover` never fall back, and `auto` falls back only when
-the profile selects it.
+argument names and encoded size. Each MCP profile selects `initialize` or
+`discover`. Known servers are pinned to their verified lifecycle, and qcg never
+silently retries a different protocol lifecycle after a negotiation failure.
 qcg advertises MCP Tasks, polls task completion
 within the bounded profile timeout, and sends task cancellation when the run is
 canceled. Multi-round-trip `input_required` responses are converted into the

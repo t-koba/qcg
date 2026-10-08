@@ -4040,9 +4040,8 @@ cancellation token, and close the protocol session when the run ends. A run
 cancelled through the API therefore cancels in-flight MCP discovery or calls as
 well as the LLM loop.
 
-Each MCP profile explicitly selects the `initialize` lifecycle, the 2026-07-28
-`server/discover` lifecycle, or explicit opt-in `auto` (bounded
-`discover`-then-`initialize` fallback). Custom profiles default to `discover`, while known
+Each MCP profile explicitly selects the `initialize` lifecycle or the 2026-07-28
+`server/discover` lifecycle. Custom profiles default to `discover`, while known
 public profiles are pinned to their verified lifecycle. The client advertises the
 Tasks extension and supports multi-round-trip
 `input_required` tool results. MCP elicitation requests become runtime-generated
