@@ -6,7 +6,6 @@ use crate::payload::{
 };
 use crate::provider::ApiFlavor;
 use crate::types::{Capabilities, ChatContentPart, ChatRequest, LlmError};
-use policy::{MAX_JSON_SCHEMA_BYTES, MAX_JSON_SCHEMA_DEPTH, MAX_JSON_SCHEMA_NODES};
 
 pub(crate) fn validate_chat_request(req: &ChatRequest, api: ApiFlavor) -> Result<(), LlmError> {
     if api == ApiFlavor::SystemOne {
@@ -194,43 +193,9 @@ fn validate_tool_input_schema(name: &str, schema: &Value, api: ApiFlavor) -> Res
             "tool `{name}` input_schema uses top-level `{keyword}` which Anthropic input_schema rejects"
         )));
     }
-    let size = serde_json::to_vec(schema)
-        .map_err(|error| LlmError::new(format!("tool `{name}` input_schema is invalid: {error}")))?
-        .len();
-    if size > MAX_JSON_SCHEMA_BYTES {
-        return Err(LlmError::new(format!(
-            "tool `{name}` input_schema exceeds {MAX_JSON_SCHEMA_BYTES} bytes"
-        )));
-    }
-    let mut stack = vec![(schema, 1_usize)];
-    let mut nodes = 0_usize;
-    while let Some((value, depth)) = stack.pop() {
-        nodes = nodes.saturating_add(1);
-        if nodes > MAX_JSON_SCHEMA_NODES || depth > MAX_JSON_SCHEMA_DEPTH {
-            return Err(LlmError::new(format!(
-                "tool `{name}` input_schema exceeds complexity limits"
-            )));
-        }
-        match value {
-            Value::Object(object) => {
-                if object.iter().any(|(key, value)| {
-                    matches!(key.as_str(), "$ref" | "$dynamicRef" | "$recursiveRef")
-                        && value
-                            .as_str()
-                            .is_some_and(|reference| !reference.starts_with('#'))
-                }) {
-                    return Err(LlmError::new(format!(
-                        "tool `{name}` input_schema contains an external reference"
-                    )));
-                }
-                stack.extend(object.values().map(|value| (value, depth + 1)));
-            }
-            Value::Array(array) => {
-                stack.extend(array.iter().map(|value| (value, depth + 1)));
-            }
-            _ => {}
-        }
-    }
+    // Bounds, external-reference ban, and compilation all run through the
+    // shared policy choke point; this keeps tool schemas under the same
+    // limits as every other untrusted schema.
     policy::compile_bounded_validator(schema).map_err(|error| {
         LlmError::new(format!("tool `{name}` input_schema is invalid: {error}"))
     })?;
