@@ -3911,7 +3911,7 @@ re-check, a bounded specialist verifier (`handoff = false`), or a `check.*`
 step after side-effect-free tool calls. Once such a check flags a suspect
 value, `on_failure = "return_error"` returns it as a tool error for the parent
 to handle, while `fail`/`tripwire` stops the node; without such a check, a
-schema-valid wrong value continues under either setting.
+schema-valid wrong value continues under either setting. Effect checks need state, not just shape: a duplicated non-idempotent write and an extra persisted file both pass closed-schema shape checks, a crash-after-commit restore that mints a fresh key duplicates the ledger while the same key dedups, and a reused single-use token passes stateless validation while a stateful revocation list rejects it. Where effect correctness matters, assert cardinality and consumption state (ledger count, revocation/consumption check) alongside field shape and bind retries to the same idempotency key.
 Executors return typed configuration/evaluation errors and typed violations.
 `on_error = "fail"` propagates an executor error; `on_error = "block"` converts
 it into a policy violation. Both paths emit structured events with stable code,
