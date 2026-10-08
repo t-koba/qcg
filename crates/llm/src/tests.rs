@@ -444,6 +444,52 @@ fn anthropic_rejects_top_level_union_tool_schemas() {
 }
 
 #[test]
+fn documents_nested_anyof_with_siblings_forwarded_openai_compatible() {
+    // Minimal opencode/Gemini shape: a nested array carrying `anyOf` alongside
+    // `description`/`items` siblings. This pins the current fail-open forwarding
+    // on the OpenAI-compatible path; a Gemini-backed endpoint rejects it
+    // (`any_of` must be the only field). No silent rewrite: the payload must
+    // forward the schema verbatim until a networked probe decides fail-closed
+    // vs provider-scoped guidance.
+    let input_schema = json!({
+        "type": "object",
+        "properties": {
+            "comments": {
+                "type": "array",
+                "description": "review comments",
+                "items": { "type": "string" },
+                "anyOf": [
+                    { "type": "string" },
+                    { "type": "array", "items": { "type": "string" } }
+                ]
+            }
+        }
+    });
+    assert!(
+        native_schema_syntax_compatible(&input_schema),
+        "nested anyOf-with-siblings still passes the native syntax gate"
+    );
+    for api in [ApiFlavor::ChatCompletions, ApiFlavor::Responses] {
+        let mut request = sample_request();
+        request.temperature = None;
+        request.seed = None;
+        request.tools = vec![ToolSpec {
+            name: "review".into(),
+            description: "review".into(),
+            input_schema: input_schema.clone(),
+        }];
+        validate_chat_request(&request, api)
+            .expect("nested anyOf-with-siblings is currently forwarded fail-open");
+        let forwarded = openai_tool(&request.tools[0]);
+        assert_eq!(
+            forwarded["function"]["parameters"]["properties"]["comments"]["anyOf"],
+            input_schema["properties"]["comments"]["anyOf"],
+            "forwarding must stay verbatim, never silently strip siblings"
+        );
+    }
+}
+
+#[test]
 fn native_schema_compatibility_rejects_unsupported_keywords_and_external_refs() {
     let supported = json!({
         "type": "object",
