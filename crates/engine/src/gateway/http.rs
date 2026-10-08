@@ -72,6 +72,36 @@ pub fn ip_is_denied_when_opted_in(ip: &IpAddr) -> bool {
                 return ip_is_denied_when_opted_in(&IpAddr::V4(mapped));
             }
             let s = v6.segments();
+            // Transition mechanisms embed an IPv4 address outside
+            // `to_ipv4` (6to4 `2002:V4::/48`, Teredo `2001::/32` with
+            // bit-flipped client, well-known NAT64 `64:ff9b::/96`).
+            // Unwrap-then-V4-table keeps public embeddings usable while
+            // a private embedding faces the same deny set as plain IPv4.
+            // Only the well-known NAT64 /96 is unwrapped; RFC 6052
+            // network-specific prefixes need explicit configuration.
+            if s[0] == 0x2002 {
+                let embedded = std::net::Ipv4Addr::new(
+                    (s[1] >> 8) as u8,
+                    (s[1] & 0xff) as u8,
+                    (s[2] >> 8) as u8,
+                    (s[2] & 0xff) as u8,
+                );
+                return ip_is_denied_when_opted_in(&IpAddr::V4(embedded));
+            }
+            if s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0
+            {
+                let o = v6.octets();
+                let embedded = std::net::Ipv4Addr::new(o[12], o[13], o[14], o[15]);
+                return ip_is_denied_when_opted_in(&IpAddr::V4(embedded));
+            }
+            if s[0] == 0x2001 && s[1] == 0x0000 {
+                let o = v6.octets();
+                let server = std::net::Ipv4Addr::new(o[4], o[5], o[6], o[7]);
+                let client =
+                    std::net::Ipv4Addr::new(o[12] ^ 0xff, o[13] ^ 0xff, o[14] ^ 0xff, o[15] ^ 0xff);
+                return ip_is_denied_when_opted_in(&IpAddr::V4(server))
+                    || ip_is_denied_when_opted_in(&IpAddr::V4(client));
+            }
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
@@ -1103,6 +1133,14 @@ mod tests {
             "::ffff:169.254.169.254",
             "::10.0.0.5",
             "::127.0.0.1",
+            "2002:a00:1::",
+            "2002:7f00:1::",
+            "2002:a9fe:a9fe::",
+            "64:ff9b::a00:1",
+            "64:ff9b::7f00:1",
+            "64:ff9b::a9fe:a9fe",
+            "2001:0:5db8:d822:0000:1234:f5ff:fffe",
+            "2001:0:a00:1:0000:1234:a247:27dd",
         ] {
             let ip: IpAddr = denied.parse().expect("test IP should parse");
             assert!(ip_is_denied_when_opted_in(&ip), "{denied} must be denied");
@@ -1113,6 +1151,9 @@ mod tests {
             "1.1.1.1",
             "::ffff:8.8.8.8",
             "2606:4700:4700::1111",
+            "2002:5db8:d822::",
+            "64:ff9b::5db8:d822",
+            "2001:0:5db8:d822:0000:1234:a247:27dd",
         ] {
             let ip: IpAddr = allowed.parse().expect("test IP should parse");
             assert!(!ip_is_denied_when_opted_in(&ip), "{allowed} must pass");
