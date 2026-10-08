@@ -63,10 +63,12 @@ pub fn ip_is_denied_when_opted_in(ip: &IpAddr) -> bool {
                 || o[0] >= 224
         }
         IpAddr::V6(v6) => {
-            // IPv4-mapped (`::ffff:10.0.0.1`) must face the same deny set
-            // as plain IPv4: an attacker literal must not slip the V6
-            // branch on round-trip luck.
-            if let Some(mapped) = v6.to_ipv4_mapped() {
+            // IPv4-embedded (`::ffff:10.0.0.1` mapped and `::10.0.0.5`
+            // compat) must face the same deny set as plain IPv4: an
+            // attacker literal or AAAA must not slip the V6 branch.
+            // `to_ipv4` covers both forms; `::1 -> 0.0.0.1` and
+            // `:: -> 0.0.0.0` stay denied via the V4 table.
+            if let Some(mapped) = v6.to_ipv4() {
                 return ip_is_denied_when_opted_in(&IpAddr::V4(mapped));
             }
             let s = v6.segments();
@@ -1099,11 +1101,19 @@ mod tests {
             "fe80::1",
             "::ffff:10.0.0.5",
             "::ffff:169.254.169.254",
+            "::10.0.0.5",
+            "::127.0.0.1",
         ] {
             let ip: IpAddr = denied.parse().expect("test IP should parse");
             assert!(ip_is_denied_when_opted_in(&ip), "{denied} must be denied");
         }
-        for allowed in ["93.184.216.34", "8.8.8.8", "1.1.1.1"] {
+        for allowed in [
+            "93.184.216.34",
+            "8.8.8.8",
+            "1.1.1.1",
+            "::ffff:8.8.8.8",
+            "2606:4700:4700::1111",
+        ] {
             let ip: IpAddr = allowed.parse().expect("test IP should parse");
             assert!(!ip_is_denied_when_opted_in(&ip), "{allowed} must pass");
         }
@@ -1309,6 +1319,58 @@ mod tests {
             calls.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "one hop must resolve exactly once and pin"
+        );
+    }
+
+    #[tokio::test]
+    async fn opt_in_redirect_target_is_rechecked_per_hop() {
+        // (b) opt-in leg: same stub keyed by hostname — hop1 resolves
+        // public (passes), hop2 resolves compat-private (denies). Live
+        // loopback cannot serve the first hop under opt-in (127.0.0.1
+        // is itself denied), so the per-hop enforcement layer is
+        // exercised directly: `request()` calls this on every hop.
+        let stub: StubDnsResolver = Arc::new(|host: &str| {
+            if host == "hop1.example" {
+                Ok(vec!["93.184.216.34".parse().expect("public")])
+            } else {
+                Ok(vec!["::10.0.0.5".parse().expect("compat-private")])
+            }
+        });
+        let gateway = HttpGateway::new(
+            Permissions {
+                network: vec!["hop1.example".into(), "hop2.example".into()],
+                network_deny_private_ips: true,
+                ..Permissions::default()
+            },
+            Duration::from_secs(2),
+            None,
+            Some(4),
+        )
+        .expect("opt-in gateway should build")
+        .with_stub_resolver(stub);
+        let first = gateway
+            .resolve_then_check("http://hop1.example/start")
+            .await;
+        assert!(
+            first.is_ok(),
+            "initial public hop must pass, got: {first:?}"
+        );
+        let error = gateway
+            .resolve_then_check("http://hop2.example/next")
+            .await
+            .expect_err("redirect to compat-private must deny per hop");
+        assert!(
+            matches!(error, GatewayError::NetworkIpDenied { .. }),
+            "redirect hop must raise IP denial, got: {error}"
+        );
+        // IP-literal redirect target (no DNS): mapped loopback denies.
+        let error = gateway
+            .resolve_then_check("http://[::ffff:127.0.0.1]/next")
+            .await
+            .expect_err("mapped-literal redirect must deny");
+        assert!(
+            matches!(error, GatewayError::NetworkIpDenied { .. }),
+            "mapped literal must raise IP denial, got: {error}"
         );
     }
 }
