@@ -5091,3 +5091,188 @@ async fn queue_interrupt_resume_keeps_elapsed_budget_end_to_end() {
     );
     let _ = std::fs::remove_dir_all(&run_dir);
 }
+
+#[tokio::test]
+async fn duplicate_write_and_extra_effect_pass_shape_validation_with_wrong_readback() {
+    use llm::{ChatMessage, ChatRequest, FakeLlmProvider, LlmProvider, PromptCache};
+    use model::StructuredOutputMode;
+
+    let schema = json!({
+        "type": "object",
+        "required": ["order_id"],
+        "properties": { "order_id": { "type": "string" } },
+        "additionalProperties": false
+    });
+    let permissions = Permissions {
+        fs_write: vec!["workspace".into()],
+        ..Permissions::default()
+    };
+
+    async fn write_order(
+        workspace: &Utf8PathBuf,
+        permissions: &Permissions,
+        order_id: &str,
+    ) -> Utf8PathBuf {
+        let gateway = crate::FsGateway::new(workspace.clone(), permissions);
+        let target = gateway
+            .resolve_write(&format!("orders/{order_id}.json"))
+            .expect("order path should resolve");
+        std::fs::create_dir_all(target.parent().expect("order file must have a parent"))
+            .expect("order parent should be creatable");
+        let body = serde_json::json!({ "order_id": order_id }).to_string();
+        gateway
+            .write_file_atomic(&target, body.as_bytes())
+            .await
+            .expect("order write should succeed");
+        target
+    }
+
+    let baseline_id = uuid::Uuid::now_v7().as_simple().to_string();
+    let baseline_root = Utf8PathBuf::from_path_buf(
+        std::env::temp_dir().join(format!("engine-duplicate-replay-{baseline_id}")),
+    )
+    .expect("temporary path must be UTF-8");
+    let baseline_workspace = baseline_root.join("workspace");
+    std::fs::create_dir_all(&baseline_workspace).expect("workspace should be created");
+    let baseline_target = write_order(&baseline_workspace, &permissions, &baseline_id).await;
+    let baseline_value = json!({ "order_id": baseline_id });
+    assert!(
+        crate::validate_json_schema_step("node", &schema, &baseline_value, "response").is_ok(),
+        "baseline must PASS shape validation"
+    );
+    let baseline_bytes =
+        std::fs::read_to_string(&baseline_target).expect("baseline order should be readable");
+    assert!(baseline_bytes.contains(&baseline_id));
+
+    let duplicate_id = uuid::Uuid::now_v7().as_simple().to_string();
+    let duplicate_root = Utf8PathBuf::from_path_buf(
+        std::env::temp_dir().join(format!("engine-duplicate-replay-{duplicate_id}")),
+    )
+    .expect("temporary path must be UTF-8");
+    let duplicate_workspace = duplicate_root.join("workspace");
+    std::fs::create_dir_all(&duplicate_workspace).expect("workspace should be created");
+    let sequence = serde_json::to_string(&[
+        json!({ "name": "write_order", "args": { "order_id": duplicate_id } }),
+        json!({ "name": "write_order", "args": { "order_id": duplicate_id } }),
+    ])
+    .expect("tool sequence should serialize");
+    let first_prompt = format!("place the order\nFAKE_TOOL_SEQUENCE:{sequence}");
+    let first_request = ChatRequest {
+        provider: "fake".into(),
+        model: "fake".into(),
+        system: None,
+        messages: vec![ChatMessage::text("user", &first_prompt)],
+        tools: vec![],
+        response_schema: None,
+        structured_output: StructuredOutputMode::Auto,
+        temperature: None,
+        top_p: None,
+        max_tokens: 128,
+        stop_sequences: vec![],
+        seed: None,
+        reasoning_effort: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        verbosity: None,
+        stream: false,
+        prompt_cache: PromptCache::Off,
+    };
+    let first = FakeLlmProvider
+        .complete(first_request)
+        .await
+        .expect("fake provider should script the first write");
+    let second_request = ChatRequest {
+        provider: "fake".into(),
+        model: "fake".into(),
+        system: None,
+        messages: vec![
+            ChatMessage::text("user", &first_prompt),
+            ChatMessage {
+                role: "tool".into(),
+                content: "write ok".into(),
+                parts: vec![],
+                tool_calls: vec![],
+                tool_call_id: Some("fake-tool-1".into()),
+                provider_state: None,
+            },
+        ],
+        tools: vec![],
+        response_schema: None,
+        structured_output: StructuredOutputMode::Auto,
+        temperature: None,
+        top_p: None,
+        max_tokens: 128,
+        stop_sequences: vec![],
+        seed: None,
+        reasoning_effort: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        verbosity: None,
+        stream: false,
+        prompt_cache: PromptCache::Off,
+    };
+    let second = FakeLlmProvider
+        .complete(second_request)
+        .await
+        .expect("fake provider should script the second write");
+    use llm::ChatContent;
+    let scripted = [&first, &second]
+        .iter()
+        .map(|response| {
+            let [ChatContent::ToolCall { name, args, .. }] = response.content.as_slice() else {
+                panic!("fake provider should script a tool call");
+            };
+            (name.clone(), args.clone())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        scripted[0], scripted[1],
+        "duplicate tool calls preserve every checked field"
+    );
+    write_order(&duplicate_workspace, &permissions, &duplicate_id).await;
+    write_order(&duplicate_workspace, &permissions, &duplicate_id).await;
+    let duplicate_writes = 2;
+    let duplicate_value = json!({ "order_id": duplicate_id });
+    assert!(
+        crate::validate_json_schema_step("node", &schema, &duplicate_value, "response").is_ok(),
+        "duplicate-write final response must PASS shape validation"
+    );
+    assert_eq!(duplicate_writes, 2);
+    let duplicate_target = duplicate_workspace.join(format!("orders/{duplicate_id}.json"));
+    let duplicate_bytes =
+        std::fs::read_to_string(&duplicate_target).expect("duplicate order should be readable");
+    assert!(duplicate_bytes.contains(&duplicate_id));
+
+    let extra_id = uuid::Uuid::now_v7().as_simple().to_string();
+    let extra_root = Utf8PathBuf::from_path_buf(
+        std::env::temp_dir().join(format!("engine-duplicate-replay-{extra_id}")),
+    )
+    .expect("temporary path must be UTF-8");
+    let extra_workspace = extra_root.join("workspace");
+    std::fs::create_dir_all(&extra_workspace).expect("workspace should be created");
+    write_order(&extra_workspace, &permissions, &extra_id).await;
+    let gateway = crate::FsGateway::new(extra_workspace.clone(), &permissions);
+    let extra_target = gateway
+        .resolve_write(&format!("orders/{extra_id}-extra.json"))
+        .expect("extra path should resolve");
+    gateway
+        .write_file_atomic(&extra_target, b"extra persisted state")
+        .await
+        .expect("extra write should succeed");
+    let extra_value = json!({ "order_id": extra_id });
+    assert!(
+        crate::validate_json_schema_step("node", &schema, &extra_value, "response").is_ok(),
+        "extra-effect final response must PASS shape validation"
+    );
+    assert!(extra_target.exists());
+
+    let inside_extra = json!({ "order_id": extra_id, "label": "extra" });
+    assert!(
+        crate::validate_json_schema_step("node", &schema, &inside_extra, "response").is_err(),
+        "in-JSON extras under a closed schema must FAIL"
+    );
+
+    let _ = std::fs::remove_dir_all(&baseline_root);
+    let _ = std::fs::remove_dir_all(&duplicate_root);
+    let _ = std::fs::remove_dir_all(&extra_root);
+}
