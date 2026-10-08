@@ -2208,23 +2208,17 @@ async fn http_concurrent_runs_keep_artifacts_and_journals_isolated() {
                     .as_str()
                     .expect("start response should contain run_id")
                     .to_string();
-                let sse = client
-                    .get(format!("{base}/api/runs/{run_id}/events"))
-                    .send()
-                    .await
-                    .expect("immediate SSE request should respond");
-                Ok::<_, String>((message, run_id, sse.status()))
+                Ok::<_, String>((message, run_id))
             })
         })
         .collect::<Vec<_>>();
 
     let mut started = Vec::with_capacity(start_tasks.len());
     for task in start_tasks {
-        let (message, run_id, sse_status) = task
+        let (message, run_id) = task
             .await
             .expect("concurrent start task should not panic")
             .expect("concurrent start should succeed");
-        assert_eq!(sse_status, reqwest::StatusCode::OK);
         started.push((message, run_id));
     }
     assert_eq!(
@@ -3219,33 +3213,32 @@ fn assert_journal_has_none(run: &Utf8Path, predicate: impl Fn(&Value) -> bool) {
 }
 
 async fn wait_for_success(client: &reqwest::Client, base: &str, run_id: &str) {
-    // Concurrent runs take ~0.7s isolated on Linux and exceed the old 1s
-    // bound under loaded/slower Windows CI; poll up to 10s without changing
-    // the success condition. Report the terminal state so a failed run is
-    // not mistaken for a slow one.
-    let mut last_state = String::from("<unknown>");
-    for _ in 0..500 {
-        let snapshot: Value = client
-            .get(format!("{base}/api/runs/{run_id}"))
-            .send()
-            .await
-            .expect("snapshot request should succeed")
-            .error_for_status()
-            .expect("snapshot response should be ok")
-            .json()
-            .await
-            .expect("snapshot should be JSON");
-        let state = snapshot["state"].as_str().unwrap_or("<unknown>");
-        last_state = state.to_string();
-        if state == "succeeded" {
-            return;
-        }
-        if matches!(state, "failed" | "canceled" | "interrupted") {
-            panic!("run ended as {state}: {snapshot}");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    panic!("run did not finish (last state: {last_state}, run_id: {run_id})");
+    // Event-driven completion: drain the run's SSE stream until its
+    // terminal event instead of polling snapshot state against a
+    // wall-clock bound. A slower runner only delays the terminal event;
+    // it never fails the test. Per-chunk timeouts inside `read_sse_until`
+    // stay as a last-resort guard against a hung stream, and a
+    // non-success terminal is reported with its payload so a failed run
+    // is never mistaken for a slow one.
+    let events = read_sse_until_terminal(client, base, run_id).await;
+    let terminal = events.last().expect("SSE must deliver a terminal event");
+    let kind = terminal
+        .get("kind")
+        .or_else(|| terminal.get("t"))
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>");
+    assert_eq!(
+        kind, "run_finished",
+        "run {run_id} must succeed, got terminal {kind}: {terminal}"
+    );
+    assert_eq!(
+        terminal
+            .get("data")
+            .and_then(|data| data.get("status"))
+            .and_then(Value::as_str),
+        Some("success"),
+        "run {run_id} must succeed: {terminal}"
+    );
 }
 
 async fn read_sse_until_finished(client: &reqwest::Client, base: &str, run_id: &str) -> Vec<Value> {

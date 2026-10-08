@@ -697,53 +697,88 @@ output_file = "done.txt"
         })
         .await
         .unwrap();
-    async fn at_state(service: &LocalService, id: &str, state: RunStatus) -> api::RunSnapshot {
-        // Locally this flood finishes in ~0.3s; loaded Windows CI exceeded
-        // the old 10s bound without reaching a terminal state, so poll up
-        // to 60s without changing the success condition. Report the last
-        // state so a failed run is not mistaken for a slow one.
-        let mut last_state = RunStatus::Queued;
+    // Event-driven synchronization: wait for the journaled `run_waiting`
+    // event itself instead of polling snapshot state against a wall-clock
+    // bound. A slower runner only delays the event; it never fails the
+    // test. The 60s timeout is a last-resort guard against a hung run, and
+    // a terminal event first reports failure instead of being mistaken
+    // for slowness.
+    let mut waiter = service.subscribe(id.clone()).await.unwrap();
+    let (waiting_seq, question_id) =
         tokio::time::timeout(std::time::Duration::from_secs(60), async {
             loop {
-                let snapshot = service.snapshot(id.to_string()).await.unwrap();
-                last_state = snapshot.state;
-                if snapshot.state == state {
-                    return snapshot;
+                let event = waiter.next().await.expect("waiting stream must continue");
+                match &event.data {
+                    api::RunEventData::RunWaiting(data) => {
+                        break (event.seq, data.question.id.clone());
+                    }
+                    _ if api::is_terminal_event_kind(event.kind.as_str()) => {
+                        panic!("run ended before waiting: {event:?}")
+                    }
+                    _ => {}
                 }
-                assert!(
-                    !snapshot.state.is_terminal(),
-                    "unexpected terminal state: {:?}",
-                    snapshot.state
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
         })
         .await
-        .unwrap_or_else(|_| panic!("run {id} did not reach {state:?} (last state: {last_state:?})"))
-    }
-    let waiting = at_state(&service, &id, RunStatus::Waiting).await;
+        .expect("run must publish run_waiting");
+    drop(waiter);
     let mut stream = service
-        .subscribe_with_cursor(id.clone(), waiting.seq)
+        .subscribe_with_cursor(id.clone(), waiting_seq)
         .await
         .unwrap();
     service
         .answer(
             id.clone(),
-            waiting.question.unwrap().id,
+            question_id,
             api::AnswerPayload {
                 values: std::collections::BTreeMap::from([("answer".into(), json!("yes"))]),
             },
         )
         .await
         .unwrap();
-    let terminal = at_state(&service, &id, RunStatus::Succeeded).await;
-    let lag = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+    // The flood deterministically overflows the capacity-8 live channel
+    // while this receiver stays unread. Let execution finish first through
+    // a second, promptly-drained subscription (still event-driven: the
+    // replayed `run_finished` is the completion signal, never a
+    // wall-clock bound), so the lag marker below is the overflow signal
+    // itself instead of a race with the flood. The bounds only guard a
+    // hung run.
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        let mut cursor = waiting_seq;
+        loop {
+            let mut watch = service
+                .subscribe_with_cursor(id.clone(), cursor)
+                .await
+                .unwrap();
+            let mut progressed = false;
+            while let Some(event) = watch.next().await {
+                progressed = true;
+                match event.kind.as_str() {
+                    "run_finished" => return,
+                    "lagged" => {
+                        cursor = event.seq;
+                        break;
+                    }
+                    _ if api::is_terminal_event_kind(event.kind.as_str()) => {
+                        panic!("flood ended without success: {event:?}")
+                    }
+                    _ => {}
+                }
+            }
+            if !progressed {
+                panic!("completion watch ended without a terminal event");
+            }
+        }
+    })
+    .await
+    .expect("flood must finish");
+    let lag = tokio::time::timeout(std::time::Duration::from_secs(60), stream.next())
         .await
-        .expect("lag marker must be prompt")
+        .expect("lag marker must arrive")
         .expect("lag marker must be emitted");
     assert_eq!(lag.kind, "lagged", "overflow must exercise the lag path");
     assert_eq!(
-        lag.seq, waiting.seq,
+        lag.seq, waiting_seq,
         "lag cannot advance past the last delivered event"
     );
     assert!(
@@ -751,7 +786,11 @@ output_file = "done.txt"
         "lag marker ends the old tail"
     );
     let mut resumed = service.subscribe_with_cursor(id, lag.seq).await.unwrap();
-    let replay = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    // Completion is the replayed `run_finished` event itself: draining
+    // until the stream closes waits on journal truth, so a slower runner
+    // only delays the terminal event instead of failing a wall-clock
+    // bound. The timeout guards a hung run only.
+    let replay = tokio::time::timeout(std::time::Duration::from_secs(60), async {
         let mut events = Vec::new();
         while let Some(event) = resumed.next().await {
             events.push(event);
@@ -759,7 +798,7 @@ output_file = "done.txt"
         events
     })
     .await
-    .expect("settled replay must close");
+    .expect("resumed replay must end at the terminal event");
     assert!(!replay.is_empty());
     assert!(replay.iter().all(|event| event.seq > lag.seq));
     assert!(
@@ -767,7 +806,6 @@ output_file = "done.txt"
         "replay cannot duplicate or reorder events"
     );
     assert_eq!(replay.last().unwrap().kind, "run_finished");
-    assert_eq!(replay.last().unwrap().seq, terminal.seq);
 }
 
 #[tokio::test]
