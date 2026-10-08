@@ -3899,6 +3899,13 @@ external extension boundary: it sends the inspected value as JSON on stdin and
 accepts a typed pass, violation, or error JSON object on stdout. Every
 evaluation is journaled without the inspected value. A
 violating guardrail with `tripwire = true` terminates the node immediately.
+Shape validation, secret scanning, and `tool_output` guardrails check shape
+and secrecy, not correctness: a plausible-but-wrong tool value that satisfies
+its schema passes undetected. Correctness verification stays generator policy:
+add a mandatory check only where its cost is justified — a same-context
+re-check, a bounded specialist verifier (`handoff = false`), or a `check.*`
+step after side-effect-free tool calls. Note that `on_failure = "return_error"`
+continues on such values, while `fail`/`tripwire` stops.
 Executors return typed configuration/evaluation errors and typed violations.
 `on_error = "fail"` propagates an executor error; `on_error = "block"` converts
 it into a policy violation. Both paths emit structured events with stable code,
