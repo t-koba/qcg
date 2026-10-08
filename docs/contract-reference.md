@@ -650,7 +650,10 @@ are explicit errors.
 
 `llm.fill`
 : Produce JSON and validate it against `schema`. Invalid JSON/schema responses
-  retry up to `max_iterations` attempts.
+  retry up to `max_iterations` attempts. Close object schemas with
+  `additionalProperties: false`: an open schema accepts undeclared extra
+  fields, so a passing validation proves field values only, not the absence
+  of extras.
 
 `llm.choose`
 : Choose from the closed `options` list. Out-of-set responses retry up to
