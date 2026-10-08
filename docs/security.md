@@ -368,7 +368,19 @@ result enters the next LLM turn. External schema references are rejected, so
 schema validation cannot initiate undeclared network or filesystem access.
 Tool results remain untrusted data (the agent
 guardrail tells the model not to treat them as instructions) and are scanned
-for declared secret values before they enter the next LLM turn. The resend
+for declared secret values before they enter the next LLM turn. The primary boundary is native tool-role isolation: results enter as `tool` messages, never as instructions. Flows that expose high-volume untrusted tools (`mcp`, web search) can opt in to a `tool_output` `regex_deny` scoped to that tool; there is deliberately no delimiter/datamark encoding on tool results (fixture replay showed no instruction-following or guardrail-trip delta from wrapping, so wrapping would add bytes without adding signal).
+
+```toml
+[[flow.params.guardrails]]
+name = "untrusted_output"
+stage = "tool_output"
+kind = "regex_deny"
+tool = "mcp"
+tripwire = true
+on_error = "fail"
+params = { pattern = "(?i)ignore\\s+previous\\s+instructions|exfiltrate|<IMPORTANT>" }
+```
+ The resend
 cache for external operations is written only after the tool-output
 guardrails and that scan pass: a rejected result is journaled as a
 successful operation without a reusable result, so a resume refuses
