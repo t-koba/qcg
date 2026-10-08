@@ -19,11 +19,11 @@ pub(crate) struct CatalogQuery {
 }
 
 pub(crate) async fn healthz(State(state): State<Arc<AppState>>) -> Json<Value> {
-    // Effective request body limit: null means no mechanistic limit
-    // (Axum's default is disabled); a number is the enforced bound.
+    // Effective request body limit: the explicit flag when set, otherwise
+    // the documented default. Never null/unlimited.
     Json(json!({
         "ok": true,
-        "max_request_bytes": state.max_request_bytes,
+        "max_request_bytes": super::config::effective_max_request_bytes(state.max_request_bytes),
     }))
 }
 

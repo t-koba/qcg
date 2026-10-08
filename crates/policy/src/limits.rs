@@ -43,6 +43,13 @@ pub const DEFAULT_MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
 /// Retained service read-view charge, separately from in-flight parser buffers.
 pub const DEFAULT_READ_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Default cap, in bytes, for the whole HTTP request body when
+/// `--max-request-bytes` (`MAX_REQUEST_BYTES`) is omitted. Restores Axum's
+/// 2 MiB secure default: omitted means this default, never unlimited, so
+/// unauthenticated buffering and durable journal/idempotency growth stay
+/// bounded before any contract or FileValue check.
+pub const DEFAULT_MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
+
 /// Hard cap for one run's observation stream when `[audit].max_bytes` is
 /// unset. The writer degrades instead of exceeding it, and every reader
 /// refuses a stream that already did, so an audit trail can never become the

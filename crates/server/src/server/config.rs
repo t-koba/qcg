@@ -22,7 +22,8 @@ pub struct ServerConfig {
     pub cors_origins: Vec<String>,
     /// Optional bearer token. When omitted, the selected listener is unauthenticated.
     pub api_token: Option<String>,
-    /// Explicit max only. Omitted means no mechanistic limit.
+    /// Explicit override. Omitted means `policy::DEFAULT_MAX_REQUEST_BYTES`
+    /// (Axum's 2 MiB secure default), never unlimited.
     pub max_request_bytes: Option<usize>,
     /// Explicit max only. Omitted means no mechanistic limit.
     pub max_artifact_bytes: Option<u64>,
@@ -33,6 +34,13 @@ pub struct ServerConfig {
     /// Deployment ceiling for per-run total steps. Omitted means the
     /// engine default. Set to cap every run below its contract budget.
     pub max_total_steps: Option<usize>,
+}
+
+/// Effective HTTP request body limit: the explicit flag when set,
+/// otherwise `policy::DEFAULT_MAX_REQUEST_BYTES`. Omitted never means
+/// unlimited: the default restores Axum's 2 MiB secure default.
+pub(crate) fn effective_max_request_bytes(flag: Option<usize>) -> usize {
+    flag.unwrap_or(policy::DEFAULT_MAX_REQUEST_BYTES)
 }
 
 /// Effective service step ceiling: `MAX_TOTAL_STEPS` overrides nothing
@@ -48,6 +56,15 @@ pub(crate) fn effective_max_total_steps(flag: Option<usize>) -> Result<Option<us
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn max_request_bytes_flag_falls_back_to_default() {
+        assert_eq!(
+            effective_max_request_bytes(None),
+            policy::DEFAULT_MAX_REQUEST_BYTES
+        );
+        assert_eq!(effective_max_request_bytes(Some(1024)), 1024);
+    }
 
     #[test]
     fn max_total_steps_flag_rejects_zero() {
@@ -77,8 +94,9 @@ pub(crate) struct AppState {
     pub(crate) api_token_digest: Option<[u8; 32]>,
     pub(crate) artifact_limits: service::ArtifactZipLimits,
     pub(crate) asset_limit: Option<usize>,
-    /// Effective request body limit surfaced by /healthz. None means no
-    /// mechanistic limit.
+    /// Configured request body override surfaced by /healthz. `None`
+    /// means the documented default (`policy::DEFAULT_MAX_REQUEST_BYTES`);
+    /// the effective bound is never unlimited.
     pub(crate) max_request_bytes: Option<usize>,
     /// Frozen metrics cardinality policy resolved once at boot. Every
     /// scrape uses these values, never re-reads the environment (E04).

@@ -222,7 +222,7 @@ pub(crate) enum Command {
         cors_origins: Vec<String>,
         #[arg(long, env = "API_TOKEN", hide_env_values = true)]
         api_token: Option<String>,
-        /// Explicit max only. Omitted means no mechanistic limit.
+        /// Explicit override. Omitted means the 2 MiB documented default, never unlimited.
         #[arg(long = "max-request-bytes", env = "MAX_REQUEST_BYTES")]
         max_request_bytes: Option<usize>,
         /// Explicit max only. Omitted means no mechanistic limit.

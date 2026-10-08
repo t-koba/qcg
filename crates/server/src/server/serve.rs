@@ -283,8 +283,10 @@ pub fn resolve_server_policy(config: &ServerConfig) -> Result<ResolvedServerPoli
     if config.max_tracked_runs > 1_000_000 {
         return Err("max_tracked_runs must be at most 1000000".into());
     }
-    // Explicit-max-only byte/count knobs: None means no mechanistic limit;
-    // Some(0) would block every request, so it refuses boot (E04).
+    // Explicit-max byte/count knobs: `max_request_bytes` falls back to the
+    // documented default when omitted (never unlimited); the remaining
+    // `None` knobs mean no mechanistic limit. Some(0) would block every
+    // request, so it refuses boot (E04).
     reject_zero_explicit_max(config)?;
     // Run-store mode is an exhaustive enum: every variant is explicitly
     // accepted here so adding a variant forces a boot decision (E04).
@@ -426,7 +428,7 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
     tracing::info!(
         idempotency_ttl_secs = idempotency_ttl.as_secs(),
         idempotency_max_entries,
-        max_request_bytes = config.max_request_bytes,
+        max_request_bytes = super::config::effective_max_request_bytes(config.max_request_bytes),
         max_total_steps = max_total_steps,
         auto_gc,
         preemption_enabled,
@@ -971,17 +973,12 @@ pub(crate) fn build_router(
             reject_mutating_requests_during_shutdown,
         ))
         .with_state(Arc::clone(state));
-    // None means no mechanistic limit: disable Axum's 2 MiB default so the
-    // documented `Explicit max only. Omitted means no mechanistic limit.`
-    // holds for the JSON extractor as well as FileValue limits (A12).
-    match config.max_request_bytes {
-        Some(max_request_bytes) => {
-            app = app.layer(DefaultBodyLimit::max(max_request_bytes));
-        }
-        None => {
-            app = app.layer(DefaultBodyLimit::disable());
-        }
-    }
+    // Fail-closed default: omitted means `policy::DEFAULT_MAX_REQUEST_BYTES`
+    // (Axum's 2 MiB secure default), never unlimited. The explicit flag
+    // overrides the default, including larger values.
+    let effective_max_request_bytes =
+        super::config::effective_max_request_bytes(config.max_request_bytes);
+    app = app.layer(DefaultBodyLimit::max(effective_max_request_bytes));
     // The validated origins from the single parse above flow in; an empty
     // list means no layer. The router never parses strings itself (E04).
     let app = if !validated_cors.is_empty() {
@@ -2674,7 +2671,8 @@ command = ["sh", "-c", "sleep 30"]"#,
                     .contains("api_token")
             );
         }
-        // Non-zero explicit maxima resolve (None stays unlimited).
+        // Non-zero explicit maxima resolve (omitted request bytes fall
+        // back to the documented default, never unlimited).
         config.max_request_bytes = Some(1024);
         config.max_artifact_bytes = Some(1024);
         config.max_artifact_entries = Some(10);
@@ -2809,5 +2807,75 @@ command = ["sh", "-c", "sleep 30"]"#,
         // Lock released: dropping the refused state frees the store.
         drop(state);
         acquire_store_after_release(&generators, &runs).await;
+    }
+
+    #[tokio::test]
+    async fn omitted_request_body_limit_enforces_documented_default() {
+        // Fail-closed: omitted `max_request_bytes` enforces
+        // `policy::DEFAULT_MAX_REQUEST_BYTES` (never unlimited), and an
+        // explicit flag overrides it.
+        use tower::ServiceExt as _;
+        let root = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .expect("temporary directory path should be UTF-8")
+            .join(format!("e04-body-default-{}", uuid::Uuid::now_v7()));
+        let _temp_guard = TempGuard(root.clone());
+        let generators = root.join("generators");
+        let runs = root.join("runs");
+        std::fs::create_dir_all(&generators).expect("generators dir should create");
+        let service = single_run_service(&generators, &runs);
+        let state = Arc::new(test_state(
+            service,
+            runs.clone(),
+            None,
+            CancellationToken::new(),
+        ));
+        let validated: Vec<HeaderValue> = Vec::new();
+        // Explicit small bound rejects an oversized JSON body with 413.
+        let mut explicit = boot_config(&generators, &runs);
+        explicit.max_request_bytes = Some(32);
+        let app = build_router(&state, &explicit, &validated, None).expect("router should build");
+        let big = "x".repeat(1024);
+        let body = format!(r#"{{"generator_id":"g","inputs":{{"f":"{big}"}}}}"#);
+        let request = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/api/runs")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .expect("request should build");
+        let response = app.oneshot(request).await.expect("request should respond");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            "explicit max_request_bytes must reject oversized bodies"
+        );
+        // Omitted flag enforces the documented default: a body just over
+        // the default is rejected even though no explicit bound was set.
+        let default_config = boot_config(&generators, &runs);
+        assert_eq!(default_config.max_request_bytes, None);
+        let app =
+            build_router(&state, &default_config, &validated, None).expect("router should build");
+        let over = "x".repeat(policy::DEFAULT_MAX_REQUEST_BYTES + 1024);
+        let request = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/api/runs")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(over))
+            .expect("request should build");
+        let response = app.oneshot(request).await.expect("request should respond");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            "omitted max_request_bytes must enforce the documented default"
+        );
+        // /healthz reports the effective bound: the default when omitted,
+        // never null/unlimited.
+        let health =
+            crate::server::generators::healthz(axum::extract::State(Arc::clone(&state))).await;
+        let value = serde_json::to_value(health.0).expect("healthz should serialize");
+        assert_eq!(
+            value["max_request_bytes"],
+            serde_json::json!(policy::DEFAULT_MAX_REQUEST_BYTES),
+            "/healthz must report the default when omitted"
+        );
     }
 }
