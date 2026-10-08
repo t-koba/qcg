@@ -1265,16 +1265,18 @@ mod tests {
     #[tokio::test]
     async fn redirect_to_unlisted_host_is_blocked_per_hop() {
         // (b) per-hop string recheck is load-bearing: 127.0.0.1 allows the
-        // first hop, 127.0.0.2 is unlisted and must block live.
+        // first hop, localhost is unlisted and must block live. Both
+        // listeners bind 127.0.0.1: macOS loopback lacks 127.0.0.2, so a
+        // distinct-IP target fails to bind there (EADDRNOTAVAIL).
         let (target_port, target_task) = serve_once_on(
-            "127.0.0.2",
+            "127.0.0.1",
             "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".into(),
         )
         .await;
         let (redirect_port, redirect_task) = serve_once_on(
             "127.0.0.1",
             format!(
-                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.2:{target_port}/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                "HTTP/1.1 302 Found\r\nLocation: http://localhost:{target_port}/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             ),
         )
         .await;
@@ -1297,8 +1299,8 @@ mod tests {
             .await
             .expect_err("redirect to unlisted host must block");
         assert!(
-            matches!(error, GatewayError::NetworkDenied { ref host } if host == "127.0.0.2"),
-            "expected NetworkDenied(127.0.0.2), got: {error}"
+            matches!(error, GatewayError::NetworkDenied { ref host } if host == "localhost"),
+            "expected NetworkDenied(localhost), got: {error}"
         );
         redirect_task.await.expect("redirect server should finish");
         assert!(
