@@ -78,6 +78,8 @@ JSON event output go to stdout.
   `event_sequence` is a subsequence match: kinds listed in order pass with
   interleaved noise between them, so cap the noise kind with an explicit
   `event_count` `max` when extras must fail.
+  `metric_max` reads only `run_finished` metrics, so a failed run fails the
+  assertion as not recorded.
 - `qcg package <dir> [-o package.pkg] [--signing-key key.pk8]
   [--max-entries N] [--max-bytes N] [--max-metadata-bytes N]` creates a `.pkg`
   ZIP from a directory, prints its SHA-256, and optionally writes detached
