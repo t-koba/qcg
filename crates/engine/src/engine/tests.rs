@@ -63,6 +63,66 @@ fn budget_tracker_rejects_after_global_limit() {
 }
 
 #[test]
+fn silent_corruption_passes_shape_but_mandatory_recompute_recovers() {
+    // Verification-policy probe for deferred ce95 (fixture, N=1): deterministic
+    // tool-value task 7*6=42 with a hidden-interceptor corruption to 43.
+    // Shape availability (JSON-schema validation) cannot see the drift;
+    // a mandatory semantic recompute (stand-in for a command guardrail /
+    // specialist verifier / check step) flags it at +1 step. Optional policy
+    // matches mandatory only when invoked, so its outcome depends on
+    // invocation frequency rather than verifier quality.
+    let schema = json!({
+        "type": "object",
+        "required": ["product"],
+        "properties": { "product": { "type": "integer" } },
+        "additionalProperties": false
+    });
+    let correct = json!({ "product": 7 * 6 });
+    let corrupted = json!({ "product": 43 });
+    assert!(
+        crate::validate_json_schema_step("node", &schema, &correct, "response").is_ok(),
+        "correct value must PASS shape validation"
+    );
+    assert!(
+        crate::validate_json_schema_step("node", &schema, &corrupted, "response").is_ok(),
+        "schema-valid-but-wrong value must also PASS shape validation"
+    );
+    let recompute_ok = |value: &Value| value["product"] == json!(7 * 6);
+    assert!(
+        recompute_ok(&correct),
+        "recompute accepts the correct value"
+    );
+    assert!(
+        !recompute_ok(&corrupted),
+        "recompute flags the corrupted value"
+    );
+    // Policies: (invoked, extra_steps, task_success). None skips the verifier
+    // and silently propagates the wrong value; mandatory always pays +1 and
+    // recovers via retry/correction; optional splits on invocation.
+    let cases = [
+        ("none", false, 0, false),
+        ("mandatory", true, 1, true),
+        ("optional-invoked", true, 1, true),
+        ("optional-skipped", false, 0, false),
+    ];
+    for (policy, invoked, extra_steps, success) in cases {
+        let (steps, ok) = if invoked {
+            (1, !recompute_ok(&corrupted))
+        } else {
+            (0, corrupted["product"] == json!(7 * 6))
+        };
+        assert_eq!(
+            steps, extra_steps,
+            "{policy} must cost the expected extra steps"
+        );
+        assert_eq!(
+            ok, success,
+            "{policy} must report the expected task success"
+        );
+    }
+}
+
+#[test]
 fn checkpoint_accounting_enforces_output_bounds() {
     let limits = RuntimeLimits {
         output_file_limit_bytes: Some(4),
