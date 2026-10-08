@@ -94,9 +94,9 @@ Streamable HTTP profiles require each `allowed_hosts` entry in the contract's
 `permissions.network`. Stdio profiles require the exact `command` vector in
 `permissions.commands`; their child environment is cleared and receives only
 `PATH`, configured non-sensitive `env`, and explicitly mapped `env_from` values.
-OAuth credentials use the OS keyring by default. The SPA Connections panel
+OAuth credentials use the OS keyring by default. Keyring entries live in the session's unlocked login collection (the Linux Secret Service default collection), not in a backable file, and do not survive container restart by themselves; WSL has no default collection. The SPA Connections panel
 starts authorization on a loopback server, while the process-level token
-manager is shared by profile across runs. Each run has its own bounded MCP
+manager is shared by profile across runs. A headless host without an unlocked provider fails closed with an actionable OS-keyring-unavailable error; either run an unlocked provider or accept `oauth_store = "memory"` plus loopback re-authorization after every restart. Each run has its own bounded MCP
 connection, timeout, cancellation token, and close operation. The client
 prefers the 2026-07-28 `server/discover` lifecycle and explicitly supports the
 2025-11-25 lifecycle for older servers.
@@ -549,10 +549,14 @@ start: it is refused with `503` during drain, never half-copied.
 Unattended limits:
 
 - MCP OAuth authorization needs a browser on loopback and cannot run
-  unattended. Authorize once from the loopback Connections panel, then persist
-  the OS keyring entry per deployment policy (backup and rotation are operator
-  policy; qcg never exports tokens). Headless or container renewal without a
-  prior authorized keyring fails closed.
+  unattended. Authorize once from the loopback Connections panel on a host
+  with an unlocked OS keyring. Entries live in the unlocked login collection
+  and are not file-backable, so they do not survive container restart or
+  redeploy by themselves (rotation and re-authorization are operator policy;
+  qcg never exports tokens). Headless or container renewal without an
+  unlocked provider fails closed; either run an unlocked Secret Service
+  provider or set `oauth_store = "memory"` and re-authorize from loopback
+  after every restart.
 - A denied confirmation ends the run as `Failed`; retries, backoff, and
   notifications are the orchestrator's job, not qcg's.
 - `qcg serve` retains the newest 50 terminal run directories plus 10 failed

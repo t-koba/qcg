@@ -168,19 +168,29 @@ impl KeyringCredentialStore {
 }
 
 #[cfg(feature = "mcp-oauth")]
+pub(crate) fn keyring_store_error(context: &'static str, error: keyring::Error) -> AuthError {
+    // Keyring errors carry OS/store diagnostics only, never OAuth tokens, so
+    // the underlying message is safe to surface next to stable operator
+    // guidance. Keep the prefix stable: `auth_error` surfaces it verbatim.
+    AuthError::CredentialStoreError(format!(
+        "OS keyring unavailable ({context}): {error}; authorize from the loopback Connections panel on a host with an unlocked OS keyring, or set oauth_store=\"memory\" for ephemeral process-local credentials"
+    ))
+}
+
+#[cfg(feature = "mcp-oauth")]
 #[async_trait]
 impl CredentialStore for KeyringCredentialStore {
     async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
         let account = self.account.clone();
         tokio::task::spawn_blocking(move || {
             let entry = Entry::new(KEYRING_SERVICE, &account)
-                .map_err(|error| AuthError::InternalError(error.to_string()))?;
+                .map_err(|error| keyring_store_error("open", error))?;
             match entry.get_secret() {
                 Ok(secret) => serde_json::from_slice(&secret)
                     .map(Some)
                     .map_err(|error| AuthError::InternalError(error.to_string())),
                 Err(keyring::Error::NoEntry) => Ok(None),
-                Err(error) => Err(AuthError::InternalError(error.to_string())),
+                Err(error) => Err(keyring_store_error("load", error)),
             }
         })
         .await
@@ -194,7 +204,7 @@ impl CredentialStore for KeyringCredentialStore {
         tokio::task::spawn_blocking(move || {
             Entry::new(KEYRING_SERVICE, &account)
                 .and_then(|entry| entry.set_secret(&secret))
-                .map_err(|error| AuthError::InternalError(error.to_string()))
+                .map_err(|error| keyring_store_error("save", error))
         })
         .await
         .map_err(|error| AuthError::InternalError(error.to_string()))?
@@ -204,10 +214,10 @@ impl CredentialStore for KeyringCredentialStore {
         let account = self.account.clone();
         tokio::task::spawn_blocking(move || {
             let entry = Entry::new(KEYRING_SERVICE, &account)
-                .map_err(|error| AuthError::InternalError(error.to_string()))?;
+                .map_err(|error| keyring_store_error("open", error))?;
             match entry.delete_credential() {
                 Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-                Err(error) => Err(AuthError::InternalError(error.to_string())),
+                Err(error) => Err(keyring_store_error("clear", error)),
             }
         })
         .await

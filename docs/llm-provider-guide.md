@@ -385,7 +385,7 @@ and bounded shutdown also terminate descendants.
   dynamic registration where supported.
 
 `oauth_store` defaults to `keyring`. `keyring` stores OAuth credentials in the
-operating-system credential store under a profile-specific account. `memory`
+operating-system credential store under a profile-specific account, in the session's unlocked login collection (not a backable file; headless Linux without an unlocked Secret Service provider fails closed, and WSL has no default collection). `memory`
 is an explicit process-local option for isolated ephemeral use and is lost on
 restart. Neither mode writes access tokens or refresh tokens to the registry,
 generator packages, prompts, journals, or artifacts. Values for `credential_env`

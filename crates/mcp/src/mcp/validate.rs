@@ -18,11 +18,17 @@ pub(crate) fn required_env(name: &str) -> Result<String, McpError> {
 }
 
 #[cfg(feature = "mcp-oauth")]
-pub(crate) fn auth_error(_error: AuthError) -> McpError {
-    // OAuth and credential-store errors may contain token response bodies or
-    // platform-specific secret-store details. Keep the public error stable and
-    // deliberately omit the provider-supplied message.
-    McpError::Authorization("authorization protocol operation failed".into())
+pub(crate) fn auth_error(error: AuthError) -> McpError {
+    // OAuth protocol errors may contain token response bodies, so keep the
+    // public error stable and omit the provider-supplied message. Credential
+    // store errors are built by `keyring_store_error` from OS/store
+    // diagnostics plus stable operator guidance and never carry tokens, so
+    // surface them verbatim to stay fail-closed but actionable on headless
+    // hosts without an unlocked OS keyring.
+    match error {
+        AuthError::CredentialStoreError(message) => McpError::Authorization(message),
+        _ => McpError::Authorization("authorization protocol operation failed".into()),
+    }
 }
 
 pub(crate) fn guarded_transport_error(

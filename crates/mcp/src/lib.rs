@@ -289,6 +289,41 @@ mod tests {
     }
 
     #[cfg(feature = "mcp-oauth")]
+    #[test]
+    fn keyring_unavailable_stays_actionable_while_protocol_errors_stay_opaque() {
+        // NoDefaultStore is the headless failure: no unlocked default
+        // collection exists, so the store is unavailable (not a clean miss).
+        let store_error = keyring_store_error("open", keyring::Error::NoDefaultStore);
+        let message = match store_error {
+            rmcp::transport::auth::AuthError::CredentialStoreError(message) => message,
+            other => panic!("keyring unavailable must use CredentialStoreError: {other:?}"),
+        };
+        assert!(message.contains("OS keyring unavailable"), "{message}");
+        assert!(message.contains("oauth_store"), "{message}");
+        let surfaced = auth_error(rmcp::transport::auth::AuthError::CredentialStoreError(
+            message.clone(),
+        ));
+        assert!(
+            surfaced.to_string().contains("OS keyring unavailable"),
+            "{surfaced:?}"
+        );
+        assert!(surfaced.to_string().contains("oauth_store"), "{surfaced:?}");
+        let opaque = auth_error(rmcp::transport::auth::AuthError::InternalError(
+            "token response body".into(),
+        ));
+        assert!(
+            !opaque.to_string().contains("token response body"),
+            "{opaque:?}"
+        );
+        assert!(
+            opaque
+                .to_string()
+                .contains("authorization protocol operation failed"),
+            "{opaque:?}"
+        );
+    }
+
+    #[cfg(feature = "mcp-oauth")]
     #[tokio::test]
     async fn authorization_cannot_be_cleared_while_sessions_are_active() {
         let runtime = McpRuntime::from_specs(vec![remote_spec()]).expect("runtime should load");
