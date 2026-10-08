@@ -288,10 +288,10 @@ Digest pinning follows the family: Docker-compatible images use
 `<remote>:<path>@sha256:<fingerprint>` and launch by fingerprint so
 exactly the pinned bits run (pre-pull fingerprints with `image copy`).
 Pinning fixes the bits but does not sanitize image device nodes, so prefer
-trusted images. Host runtimes are operator-owned: use `runc` >= 1.2.8
-(>= 1.3.3 on the 1.3 stream) and a `runsc` build containing both `586c38d`
+trusted images. Host runtimes are operator-owned: use `runc` >= 1.3.6
+(>= 1.4.3 on the 1.4 stream, >= 1.5.0 final on the 1.5 stream) and a `runsc` build containing both `586c38d`
 and `573a9e7`; disable CUSE on `runsc` hosts or use a default-emulated-only
-build.
+build. `runc` below 1.3.6 lets a malicious-image `/dev` symlink violate host filesystem integrity (CVE-2026-41579); Docker masks it but podman hosts do not, so patch podman hosts first.
 The declared
 runtime is recorded in the command plan, and cleanup (stop/delete with a
 Drop-path safety net) runs on success, error, cancel, and timeout for
