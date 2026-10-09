@@ -149,10 +149,16 @@ Fields:
   any delta was delivered, so two model responses can never interleave;
   `0` surfaces the provider error immediately.
 - `prompt_cache_field`: prompt-cache mechanism for this row. `prompt_cache_key`
-  is valid for `chat_completions` and `responses`; `cache_control` is valid for
-  `anthropic_messages`. It is required exactly when `capabilities.prompt_cache`
-  is enabled and rejected otherwise, so a contract `[llm].cache = "auto"`
-  never silently degrades. Rows without prompt caching stay unchanged.
+  is valid for `chat_completions` and `responses`; `cache_control` and
+  `cache_control_auto` are valid for `anthropic_messages`. It is required
+  exactly when `capabilities.prompt_cache` is enabled and rejected otherwise,
+  so a contract `[llm].cache = "auto"` never silently degrades. Rows without
+  prompt caching stay unchanged. `cache_control` marks only the stable system
+  prefix and is the safe default; `cache_control_auto` adds the top-level
+  automatic tail marker (explicit system plus automatic tail, 5-minute default,
+  2 of 4 slots) for multi-turn agent loops. Opt in to `cache_control_auto`
+  only on routes that accept the top-level field; routes without automatic
+  caching reject it, so they keep `cache_control`.
   Prefix hygiene (author guidance, no new mechanism): caching is a prefix
   match, so keep the contract tool declaration order stable and `[llm].system`
   templates free of per-run values (timestamps, UUIDs, run IDs). qcg emits
@@ -162,7 +168,8 @@ Fields:
   routing over full-context caching: compaction rewrites only message bodies and
   preserves the system/tools prefix, while any full-transcript cache necessarily
   diverges after compaction; per-turn tool-discovery reorder likewise breaks the
-  tools prefix.
+  tools prefix. Minimum cacheable prefixes and TTL pricing are model-dependent;
+  verify with `cache_read_input_tokens` after any prompt-assembly change.
 - `capabilities`: advertised support for `tool_use`, `json_schema`,
   `structured_output_with_tools`, `seed`, `image_input`, `audio_input`,
   `file_input`, `streaming`, `temperature`, `top_p`, `stop_sequences`,

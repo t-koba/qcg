@@ -192,8 +192,13 @@ pub enum ChatTokenLimitField {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptCacheField {
-    /// Anthropic Messages `cache_control` content blocks.
+    /// Anthropic Messages explicit `cache_control` block on the stable
+    /// system prefix. Safe default for routes without automatic caching.
     CacheControl,
+    /// Anthropic robust combination: explicit system marker plus top-level
+    /// automatic caching for the growing conversation tail. Opt in only on
+    /// routes that accept the top-level field; others keep `cache_control`.
+    CacheControlAuto,
     /// OpenAI-compatible `prompt_cache_key` request field.
     PromptCacheKey,
 }
@@ -667,7 +672,10 @@ impl ProviderSpec {
                     (
                         ApiFlavor::ChatCompletions | ApiFlavor::Responses,
                         PromptCacheField::PromptCacheKey
-                    ) | (ApiFlavor::AnthropicMessages, PromptCacheField::CacheControl)
+                    ) | (
+                        ApiFlavor::AnthropicMessages,
+                        PromptCacheField::CacheControl | PromptCacheField::CacheControlAuto
+                    )
                 );
                 if !supported {
                     return Err(format!(

@@ -124,7 +124,7 @@ pub(crate) fn anthropic_payload(
         "messages": anthropic_messages(req),
     });
     if let Some(system) = &req.system {
-        if wants_prompt_cache(req, prompt_cache, PromptCacheField::CacheControl) {
+        if wants_anthropic_cache(req, prompt_cache) {
             // Anthropic caches explicit content blocks; the system block is
             // the stable prefix, so the marker goes on its text block.
             payload["system"] = json!([{
@@ -135,6 +135,12 @@ pub(crate) fn anthropic_payload(
         } else {
             payload["system"] = Value::String(system.clone());
         }
+    }
+    if wants_prompt_cache(req, prompt_cache, PromptCacheField::CacheControlAuto) {
+        // Top-level automatic caching covers the growing conversation tail;
+        // the explicit system marker above keeps the stable prefix readable.
+        // Both default to the 5-minute TTL and consume 2 of 4 slots.
+        payload["cache_control"] = json!({ "type": "ephemeral" });
     }
     if let Some(temperature) = req.temperature {
         payload["temperature"] = json!(temperature);
@@ -181,6 +187,16 @@ fn responses_tool_choice(choice: Option<&ToolChoice>) -> Value {
         ToolChoice::Mode(mode) => json!(mode),
         ToolChoice::Tool { tool } => json!({ "type": "function", "name": tool }),
     }
+}
+
+/// Anthropic explicit system marker is shared by `cache_control` and
+/// `cache_control_auto`; the latter adds the top-level tail marker below.
+fn wants_anthropic_cache(req: &ChatRequest, prompt_cache: Option<PromptCacheField>) -> bool {
+    req.prompt_cache == PromptCache::Auto
+        && matches!(
+            prompt_cache,
+            Some(PromptCacheField::CacheControl | PromptCacheField::CacheControlAuto)
+        )
 }
 
 /// A builder only emits cache instructions when the request asks for them
@@ -840,6 +856,31 @@ mod tests {
         // Without a declared mechanism the builder must not guess.
         let payload = anthropic_payload(&req, None);
         assert_eq!(payload["system"], json!("stable system"));
+    }
+
+    #[test]
+    fn auto_tail_uses_top_level_marker_only_on_opt_in() {
+        let req = request(Some("stable system"), PromptCache::Auto);
+        // Explicit-only stays the safe default: system marker, no top level.
+        let explicit = anthropic_payload(&req, Some(PromptCacheField::CacheControl));
+        assert_eq!(
+            explicit["system"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        assert!(explicit.get("cache_control").is_none());
+        // Opt-in robust combination: same system marker plus top-level tail.
+        let auto = anthropic_payload(&req, Some(PromptCacheField::CacheControlAuto));
+        assert_eq!(
+            auto["system"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        assert_eq!(auto["cache_control"], json!({"type": "ephemeral"}));
+        assert_eq!(explicit["system"], auto["system"]);
+        // Off sends neither marker.
+        let off = request(Some("stable system"), PromptCache::Off);
+        let off_payload = anthropic_payload(&off, Some(PromptCacheField::CacheControlAuto));
+        assert_eq!(off_payload["system"], json!("stable system"));
+        assert!(off_payload.get("cache_control").is_none());
     }
 
     #[test]
