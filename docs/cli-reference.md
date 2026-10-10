@@ -85,10 +85,10 @@ JSON event output go to stdout.
   ZIP from a directory, prints its SHA-256, and optionally writes detached
   Ed25519 `.sig` and `.pub` files. Archives are deterministic and include an
   SPDX 2.3 file inventory plus in-toto/SLSA provenance. Symlinks and output
-  paths inside the source tree are rejected. There is no mechanistic size
-  limit: `--max-entries`, `--max-bytes`, and `--max-metadata-bytes`
-  (`PACKAGE_MAX_ENTRIES`, `PACKAGE_MAX_BYTES`,
-  `PACKAGE_MAX_METADATA_BYTES`) enforce an explicit max only when set.
+  paths inside the source tree are rejected. Entry count defaults to 1000
+  and expanded bytes to 10 MiB (`PACKAGE_MAX_ENTRIES`, `PACKAGE_MAX_BYTES`
+  override); `--max-metadata-bytes` (`PACKAGE_MAX_METADATA_BYTES`)
+  enforces an explicit max only when set.
 - `qcg install <path-or-url> [--sha256 HEX] [--signature HEX --public-key HEX]
   [--generators-dir dir] [--yes] [--force]
   [--max-entries N] [--max-bytes N] [--max-archive-bytes N]
@@ -96,15 +96,16 @@ JSON event output go to stdout.
   summarizes permissions, and installs a package. Remote packages must be
   pinned by SHA-256 or verified by an Ed25519 signature. A bare
   `<id>[@version-requirement]` instead installs from configured registries
-  (see below), including `[dependencies]` recursively. Archive and inventory
-  bounds are explicit-only
-   (`PACKAGE_MAX_ENTRIES`, `PACKAGE_MAX_BYTES`,
-   `PACKAGE_MAX_ARCHIVE_BYTES`, `PACKAGE_MAX_METADATA_BYTES`).
-  For untrusted packages bound all three dimensions, e.g.
-  `qcg install pkg.pkg --max-entries 1000 --max-bytes 5242880
-  --max-archive-bytes 5242880` (1000 entries, 5 MiB expanded, 5 MiB
+  (see below), including `[dependencies]` recursively. Entry count defaults
+  to 1000 and expanded bytes to 10 MiB (`PACKAGE_MAX_ENTRIES`,
+  `PACKAGE_MAX_BYTES` override); archive and metadata bounds stay
+  explicit-only (`PACKAGE_MAX_ARCHIVE_BYTES`,
+  `PACKAGE_MAX_METADATA_BYTES`).
+  For untrusted packages the entry/expanded defaults already apply; bound
+  the archive dimension explicitly as well, e.g.
+  `qcg install pkg.pkg --max-archive-bytes 5242880` (5 MiB
   archive: wide headroom over the in-repo fixtures at ~30 KiB and 13
-  entries, while rejecting entry-flood and zip-bomb shapes).
+  entries, while the defaults reject entry-flood and zip-bomb shapes).
 - `qcg registry add <name> <url>`, `qcg registry remove <name>`,
   `qcg registry list`: manage registry index URLs (`file://` or `https://`)
   under `$DATA_HOME` (default `~/.data`). Everything is user-owned files; no
@@ -274,9 +275,11 @@ use of the same output directory.
   API requests. CORS is disabled when it is unset. Allowed request headers are
   `authorization`, `content-type`, and `idempotency-key`; builds without the
   `server-cors` cargo feature refuse configured origins with an explicit error.
-- `PACKAGE_MAX_ENTRIES`, `PACKAGE_MAX_BYTES`,
-  `PACKAGE_MAX_ARCHIVE_BYTES`, `PACKAGE_MAX_METADATA_BYTES`: explicit
-  max for `qcg package` and `qcg install`. Unset means no mechanistic limit.
+- `PACKAGE_MAX_ENTRIES` (default `1000`), `PACKAGE_MAX_BYTES`
+  (default `10485760`): entry and expanded-byte bounds for `qcg package`
+  and `qcg install`. `PACKAGE_MAX_ARCHIVE_BYTES`,
+  `PACKAGE_MAX_METADATA_BYTES`: explicit max for archive and metadata
+  bytes. Unset means no mechanistic limit for those two only.
 - `MAX_INPUTS_FILE_BYTES`: explicit max for `qcg run --inputs-file`.
   Unset means no mechanistic limit.
 - `MAX_REQUEST_BYTES`, `MAX_ARTIFACT_BYTES`,

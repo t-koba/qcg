@@ -143,9 +143,11 @@ SHA-256 instead of printing base64.
 
 ## Required limits for production
 
-Every byte/count limit is explicit-only: `None` (omitted) means no mechanistic
-limit. Defaults favor local development; production operators must set bounds
-or a single oversized input, package, artifact, or LLM context can exhaust
+Runtime, LLM, and resource byte/count limits are explicit-only: `None`
+(omitted) means no mechanistic limit. Package entry count and expanded
+bytes are the exception: they default to 1000 entries and 10 MiB.
+Defaults favor local development; production operators must set bounds
+or a single oversized input, artifact, or LLM context can exhaust
 memory or disk. Minimum set:
 
 - `[runtime]` in `qcg.toml`: `file_input_limit_bytes`, `file_count_limit`,
@@ -162,16 +164,18 @@ memory or disk. Minimum set:
   `openapi`, and `exec`; `max_files`, `max_bytes`, `max_depth`,
   `max_entries`, `max_selected_bytes` for `dir`, `skill`, and
   `skill_library`).
-- `qcg package`: `--max-entries`, `--max-bytes`, `--max-metadata-bytes`.
-  Unbounded packaging trusts the source tree; never package untrusted trees
-  without bounds.
-- `qcg install`: `--max-entries`, `--max-bytes`, `--max-archive-bytes`
-  (plus `--max-metadata-bytes`). Unset means no mechanistic limit, so bound
-  untrusted installs on all three dimensions, e.g.
-  `qcg install pkg.pkg --max-entries 1000 --max-bytes 5242880
-  --max-archive-bytes 5242880` (1000 entries, 5 MiB expanded, 5 MiB
+- `qcg package`: `--max-entries` (default 1000), `--max-bytes`
+  (default 10 MiB), `--max-metadata-bytes` (explicit-only).
+  The defaults already bound untrusted trees; raise them only for
+  reviewed large generators.
+- `qcg install`: `--max-entries` (default 1000), `--max-bytes`
+  (default 10 MiB), `--max-archive-bytes` plus `--max-metadata-bytes`
+  (both explicit-only). The entry/expanded defaults already reject
+  entry-flood and zip-bomb shapes; bound the archive dimension explicitly
+  for untrusted installs, e.g.
+  `qcg install pkg.pkg --max-archive-bytes 5242880` (5 MiB
   archive: wide headroom over the in-repo fixtures at ~30 KiB and 13
-  entries, while rejecting entry-flood and zip-bomb shapes).
+  entries).
 
 `[budget]` (`max_steps`, `max_tokens`, `max_cost_usd`,
 `max_elapsed_seconds`) is the run-wide backstop and should always be set for
