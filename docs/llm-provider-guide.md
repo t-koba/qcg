@@ -354,7 +354,7 @@ permission by itself.
 
 `allowed_destinations` is the separate operator ceiling for server-side fetch:
 every whole-value `http(s)` URL string in the tool arguments contributes its
-host, and each host must be listed here (exact match or `"*"`, hosts only).
+host, and each host must be listed here (exact match or `"*"`, hosts only; IPv6 literals use the bracketed form `"[2001:db8::1]"`).
 It defaults to empty — host-free calls such as pure-query search pass, while
 any fetch URL is refused until its host is listed. The endpoint host above
 never implies destination rights. To migrate a fetch tool (for example an

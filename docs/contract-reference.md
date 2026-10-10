@@ -4032,7 +4032,7 @@ state are shared by the process-level profile runtime.
 Server-side fetch destinations are a second, independent ceiling: every
 whole-value `http(s)` URL string anywhere in the tool arguments contributes
 its lowercased host, and each host must be listed in the profile's operator-owned
-`allowed_destinations` (exact match or `"*"`, hosts only, never full URLs).
+`allowed_destinations` (exact match or `"*"`, hosts only with IPv6 literals in bracketed form `"[2001:db8::1]"`, never full URLs).
 The default is empty, so calls with no extracted host (for example pure-query
 search) pass while any fetch URL is refused until the operator allows its host
 in `providers.toml`. The server endpoint host never implies destination rights:

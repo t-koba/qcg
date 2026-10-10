@@ -149,6 +149,8 @@ mod tests {
             Vec::new(),
             vec!["example.com".to_string()],
             vec!["*".to_string()],
+            vec!["[2001:db8::1]".to_string()],
+            vec!["[::1]".to_string()],
         ] {
             let mut spec = remote_spec();
             spec.allowed_destinations = destinations;
@@ -159,8 +161,20 @@ mod tests {
                 .validate()
                 .expect("stdio servers fetch remotely too, so destinations stay allowed");
         }
-        // Full URLs, ports, and empty entries are never canonical hosts.
-        for bad in ["https://example.com", "example.com:443", "", "exa mple.com"] {
+        // Full URLs, ports, unbracketed IPv6, and empty entries are never
+        // canonical hosts.
+        for bad in [
+            "https://example.com",
+            "example.com:443",
+            "",
+            "exa mple.com",
+            "2001:db8::1",
+            "::1",
+            "[2001:db8::1]:443",
+            "https://[2001:db8::1]",
+            "[]",
+            "[not-ipv6]",
+        ] {
             let mut spec = remote_spec();
             spec.allowed_destinations = vec![bad.to_string()];
             let error = spec

@@ -745,6 +745,17 @@ mod tests {
             extract_mcp_destinations(&json!({"url": "  HTTPS://Example.COM:8443/x  "})),
             BTreeSet::from(["example.com".to_string()])
         );
+        // IPv6 fetch extracts the canonical bracketed literal (`Url`
+        // normalizes case/zeros), so an explicit allow entry can cover it
+        // without falling back to `"*"`.
+        assert_eq!(
+            extract_mcp_destinations(&json!({"url": "https://[2001:DB8::1]/x"})),
+            BTreeSet::from(["[2001:db8::1]".to_string()])
+        );
+        assert_eq!(
+            extract_mcp_destinations(&json!({"url": "https://[::1]:8443/x"})),
+            BTreeSet::from(["[::1]".to_string()])
+        );
         // Allow matching is exact-or-wildcard, fail-closed otherwise.
         assert!(mcp_destination_is_allowed(
             &["example.com".to_string()],
@@ -761,6 +772,20 @@ mod tests {
         assert!(mcp_destination_is_allowed(
             &["*".to_string()],
             "anything.test"
+        ));
+        // Explicit IPv6 allow matches only its own literal, fail-closed
+        // otherwise.
+        assert!(mcp_destination_is_allowed(
+            &["[2001:db8::1]".to_string()],
+            "[2001:db8::1]"
+        ));
+        assert!(!mcp_destination_is_allowed(
+            &["[2001:db8::1]".to_string()],
+            "[::1]"
+        ));
+        assert!(!mcp_destination_is_allowed(
+            &Vec::<String>::new(),
+            "[2001:db8::1]"
         ));
     }
 }

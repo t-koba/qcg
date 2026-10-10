@@ -159,9 +159,10 @@ pub(crate) fn validate_redirect_uri(raw: &str) -> Result<Url, McpError> {
     Ok(url)
 }
 
-/// Validates one `allowed_destinations` entry: the `"*"` wildcard or a
-/// canonical host name (same shape as [`validate_host`], ports and URLs
-/// never allowed).
+/// Validates one `allowed_destinations` entry: the `"*"` wildcard, a
+/// canonical host name, or a bracketed IPv6 literal (for example
+/// `"[2001:db8::1]"`, same canonical form as [`validate_host`]); ports and
+/// URLs are never allowed.
 pub(crate) fn validate_destination(destination: &str) -> Result<(), String> {
     if destination == "*" {
         return Ok(());
@@ -170,6 +171,25 @@ pub(crate) fn validate_destination(destination: &str) -> Result<(), String> {
 }
 
 pub(crate) fn validate_host(host: &str) -> Result<(), String> {
+    if let Some(inner) = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        // Bracketed IPv6 literal only: the inner text must parse as an IPv6
+        // address and the bracketed form must round-trip through `Url`
+        // unchanged (canonical lowercase, no port or zone suffix).
+        let valid = !inner.is_empty()
+            && inner.parse::<std::net::Ipv6Addr>().is_ok()
+            && Url::parse(&format!("https://{host}"))
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_string))
+                .as_deref()
+                == Some(host);
+        if valid {
+            return Ok(());
+        }
+        return Err(format!("`{host}` is not a canonical host name"));
+    }
     if host.is_empty()
         || host.contains(['/', ':', '@', '?', '#'])
         || Url::parse(&format!("https://{host}"))
@@ -184,8 +204,15 @@ pub(crate) fn validate_host(host: &str) -> Result<(), String> {
 }
 
 fn is_loopback(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    // `Url::host_str` keeps IPv6 brackets (`[::1]`); strip one bracket pair
+    // so loopback detection covers IPv6 loopback too.
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
 }
