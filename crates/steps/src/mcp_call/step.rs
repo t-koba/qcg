@@ -101,6 +101,13 @@ impl StepExecutor for McpCallStep {
             ));
         }
         validate_mcp_call_arguments(node, params.input_schema.as_ref(), &arguments)?;
+        check_direct_destinations(
+            node,
+            &params.server,
+            &params.tool,
+            profile.allowed_destinations(),
+            &arguments,
+        )?;
         let access = mcp_access(ctx, profile.command());
         let confirm_details = Some(json!({
             "server": params.server,
@@ -272,5 +279,118 @@ impl StepExecutor for McpCallStep {
             })),
             files: vec![],
         })
+    }
+}
+
+/// Fail-closed destination-policy gate for the direct `mcp.call` path:
+/// every host extracted from the rendered arguments must sit within the
+/// operator's per-profile `allowed_destinations` (exact match or `"*"`).
+/// Calls with no extracted host pass, so pure-query search keeps working
+/// while fetch requires an explicit operator allow. Denials are `Refused`,
+/// never silent — mirroring the `llm.agent` MCP tool gate.
+fn check_direct_destinations(
+    node: &NodeDef,
+    server: &str,
+    tool: &str,
+    allowed: &[String],
+    args: &Value,
+) -> Result<(), engine::StepError> {
+    let extracted: Vec<String> = policy::extract_mcp_destinations(args).into_iter().collect();
+    let denied: Vec<&String> = extracted
+        .iter()
+        .filter(|host| !policy::mcp_destination_is_allowed(allowed, host))
+        .collect();
+    if !denied.is_empty() {
+        let denied = denied
+            .into_iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(engine::StepError::Refused {
+            node: node.id.clone(),
+            message: format!(
+                "MCP tool `{server}/{tool}` destination `{denied}` is not in server `{server}` allowed_destinations; ask the operator to allow it in providers.toml"
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use contract::{NodeDef, OnDeps, StepType};
+    use serde_json::json;
+
+    fn node() -> NodeDef {
+        NodeDef {
+            id: "mcp-call".into(),
+            kind: StepType::literal("mcp.call"),
+            needs: vec![],
+            when: None,
+            on_deps: OnDeps::AllSucceeded,
+            context: vec![],
+            output: None,
+            artifact: None,
+            on_fail: None,
+            failure: None,
+            retry: None,
+            params: Default::default(),
+        }
+    }
+
+    #[test]
+    fn direct_destination_policy_denies_unlisted_fetch_but_passes_query() {
+        let node = node();
+        // Empty default denies every extracted host; host-only calls pass.
+        let error = check_direct_destinations(
+            &node,
+            "exa-public",
+            "web_fetch_exa",
+            &[],
+            &json!({"url": "https://example.test/x"}),
+        )
+        .expect_err("unlisted fetch destination must be refused");
+        assert!(
+            matches!(error, engine::StepError::Refused { .. }),
+            "denials are Refused, never silent: {error}"
+        );
+        check_direct_destinations(
+            &node,
+            "exa-public",
+            "web_search_exa",
+            &[],
+            &json!({"query": "rust", "numResults": 5}),
+        )
+        .expect("pure-query search must pass the empty default");
+        // An explicit operator allow passes fetch; other hosts still fail.
+        check_direct_destinations(
+            &node,
+            "exa-public",
+            "web_fetch_exa",
+            &["example.test".to_string()],
+            &json!({"url": "https://example.test/x"}),
+        )
+        .expect("listed destination must pass");
+        assert!(
+            check_direct_destinations(
+                &node,
+                "exa-public",
+                "web_fetch_exa",
+                &["example.test".to_string()],
+                &json!({"url": "https://other.test/x"}),
+            )
+            .is_err(),
+            "unlisted hosts stay denied under a non-empty list"
+        );
+        // The wildcard covers every host.
+        check_direct_destinations(
+            &node,
+            "exa-public",
+            "web_fetch_exa",
+            &["*".to_string()],
+            &json!({"url": "https://other.test/x"}),
+        )
+        .expect("wildcard must allow any destination");
     }
 }
