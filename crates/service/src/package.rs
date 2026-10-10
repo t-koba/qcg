@@ -1748,6 +1748,125 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn unpack_streaming_take_bounds_a_lying_declared_size() {
+        // The declared-size gate trusts the header, so the entry stream
+        // itself is bounded with `take`: a deflated entry whose central and
+        // local uncompressed sizes are patched small still decompresses to
+        // its real body. Under `max_bytes` the copy must fail mid-stream
+        // with the expanded-size refusal (not the post-copy size-changed
+        // error), and no committed output may be left behind.
+        use std::io::Write as _;
+
+        let root = temp_dir("unpack-lying-size");
+        let _temp_guard = TempGuard(root.clone());
+        std::fs::create_dir_all(&root).expect("root should be created");
+        let archive = root.join("pkg.pkg");
+        let body = vec![b'A'; 100];
+        let sha256 = hex::encode(Sha256::digest(&body));
+        {
+            let file = File::create(&archive).expect("archive should be created");
+            let mut writer = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default();
+            writer
+                .start_file("evil.txt", options.unix_permissions(0o644))
+                .expect("evil entry");
+            writer.write_all(&body).expect("evil body");
+            let sbom = test_sbom(vec![test_sbom_file("evil.txt", &sha256, 0o644)]);
+            finish_archive(writer, options, &sbom);
+        }
+        // Patch only the uncompressed-size fields of evil.txt (central
+        // header +24, local header +22) down to 1 byte, keeping the
+        // compressed sizes intact so the deflate stream still yields the
+        // full 100-byte body.
+        {
+            let mut bytes = std::fs::read(&archive).expect("archive should be readable");
+            let eocd_sig = [0x50u8, 0x4b, 0x05, 0x06];
+            let eocd_pos = bytes
+                .windows(4)
+                .rposition(|window| window == eocd_sig)
+                .expect("archive should have an End of Central Directory");
+            let central_size = u32::from_le_bytes(
+                bytes[eocd_pos + 12..eocd_pos + 16]
+                    .try_into()
+                    .expect("size"),
+            ) as usize;
+            let central_offset = u32::from_le_bytes(
+                bytes[eocd_pos + 16..eocd_pos + 20]
+                    .try_into()
+                    .expect("offset"),
+            ) as usize;
+            let central_end = central_offset + central_size;
+            let mut offset = central_offset;
+            let mut local_offset = None;
+            let mut patched = false;
+            while offset + 46 <= central_end && offset + 46 <= bytes.len() {
+                let is_central = bytes[offset] == 0x50
+                    && bytes[offset + 1] == 0x4b
+                    && bytes[offset + 2] == 0x01
+                    && bytes[offset + 3] == 0x02;
+                if !is_central {
+                    break;
+                }
+                let name_len = u16::from_le_bytes(
+                    bytes[offset + 28..offset + 30]
+                        .try_into()
+                        .expect("name len"),
+                ) as usize;
+                let extra_len = u16::from_le_bytes(
+                    bytes[offset + 30..offset + 32]
+                        .try_into()
+                        .expect("extra len"),
+                ) as usize;
+                let comment_len = u16::from_le_bytes(
+                    bytes[offset + 32..offset + 34]
+                        .try_into()
+                        .expect("comment len"),
+                ) as usize;
+                let name_start = offset + 46;
+                let name_end = name_start + name_len;
+                if name_end <= bytes.len() && &bytes[name_start..name_end] == b"evil.txt" {
+                    bytes[offset + 24..offset + 28].copy_from_slice(&[1, 0, 0, 0]);
+                    local_offset = Some(u32::from_le_bytes(
+                        bytes[offset + 42..offset + 46]
+                            .try_into()
+                            .expect("local offset"),
+                    ) as usize);
+                    patched = true;
+                }
+                offset = name_end + extra_len + comment_len;
+            }
+            assert!(patched, "evil.txt central header should be found");
+            let local = local_offset.expect("evil.txt local header should be found");
+            assert!(
+                bytes[local] == 0x50
+                    && bytes[local + 1] == 0x4b
+                    && bytes[local + 2] == 0x03
+                    && bytes[local + 3] == 0x04,
+                "evil.txt local header should be present"
+            );
+            bytes[local + 22..local + 26].copy_from_slice(&[1, 0, 0, 0]);
+            std::fs::write(&archive, &bytes).expect("patched archive should be writable");
+        }
+        let target = root.join("out");
+        std::fs::create_dir_all(&target).expect("target");
+        let limits = PackageLimits {
+            max_bytes: Some(10),
+            ..PackageLimits::default()
+        };
+        let error = unpack_package(&archive, &target, &limits)
+            .expect_err("a lying declared size must fail on the stream bound");
+        assert!(
+            error.to_string().contains("archive expanded size exceeds"),
+            "the refusal must name the expanded-size bound: {error}"
+        );
+        assert!(
+            !target.join("evil.txt").exists(),
+            "the bounded stream must leave no committed output behind"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn unpack_masks_the_full_special_bit_matrix() {
         // E15: setuid, setgid, sticky, and world-writable bits are all
         // masked; only the sanitized permission bits survive.
