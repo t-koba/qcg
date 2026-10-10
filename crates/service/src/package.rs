@@ -518,6 +518,7 @@ pub fn unpack_package(
                 "archive contains a symbolic link `{rel}`"
             )));
         }
+        let prior_bytes = unpacked_bytes;
         unpacked_bytes = unpacked_bytes
             .checked_add(entry.size())
             .ok_or_else(|| ServiceError::Invalid("archive expanded size overflowed".into()))?;
@@ -559,10 +560,34 @@ pub fn unpack_package(
             // File leaves are staged with the final mode applied BEFORE the
             // rename; no post-rename chmod ever runs (E15).
             let expected = entry.size();
+            // Budget left for this entry's actual bytes: the declared-size
+            // gate above trusts the header, so bound the stream itself with
+            // `take` so a lying header (small declared, large actual) fails
+            // mid-stream instead of writing unbounded bytes before the
+            // post-copy size check.
+            let remaining = limits
+                .max_bytes
+                .map(|limit| limit.saturating_sub(prior_bytes));
             #[cfg(unix)]
             with_parent_fd(&pinned_target, &rel, |parent, leaf| {
                 stage_file_fd(parent, leaf, archived_mode, |output| {
-                    let copied = std::io::copy(&mut entry, output)?;
+                    use std::io::Read as _;
+                    let copied = match remaining {
+                        Some(budget) => {
+                            let mut bounded = entry.take(budget.saturating_add(1));
+                            let copied = std::io::copy(&mut bounded, output)?;
+                            if copied > budget {
+                                return Err(std::io::Error::other(format!(
+                                    "archive expanded size exceeds {} bytes",
+                                    limits.max_bytes.unwrap_or(u64::MAX)
+                                )));
+                            }
+                            // Restore the wrapped entry for the borrow checker:
+                            // `take` holds `&mut entry`, dropped here.
+                            copied
+                        }
+                        None => std::io::copy(&mut entry, output)?,
+                    };
                     if copied != expected {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -593,7 +618,21 @@ pub fn unpack_package(
                     Err(error) => return Err(ServiceError::Io(error)),
                 }
                 stage_file_path(&out, archived_mode, |output| {
-                    let copied = std::io::copy(&mut entry, output)?;
+                    use std::io::Read as _;
+                    let copied = match remaining {
+                        Some(budget) => {
+                            let mut bounded = entry.take(budget.saturating_add(1));
+                            let copied = std::io::copy(&mut bounded, output)?;
+                            if copied > budget {
+                                return Err(std::io::Error::other(format!(
+                                    "archive expanded size exceeds {} bytes",
+                                    limits.max_bytes.unwrap_or(u64::MAX)
+                                )));
+                            }
+                            copied
+                        }
+                        None => std::io::copy(&mut entry, output)?,
+                    };
                     if copied != expected {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
