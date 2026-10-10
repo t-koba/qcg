@@ -165,6 +165,13 @@ memory or disk. Minimum set:
 - `qcg package`: `--max-entries`, `--max-bytes`, `--max-metadata-bytes`.
   Unbounded packaging trusts the source tree; never package untrusted trees
   without bounds.
+- `qcg install`: `--max-entries`, `--max-bytes`, `--max-archive-bytes`
+  (plus `--max-metadata-bytes`). Unset means no mechanistic limit, so bound
+  untrusted installs on all three dimensions, e.g.
+  `qcg install pkg.pkg --max-entries 1000 --max-bytes 5242880
+  --max-archive-bytes 5242880` (1000 entries, 5 MiB expanded, 5 MiB
+  archive: wide headroom over the in-repo fixtures at ~30 KiB and 13
+  entries, while rejecting entry-flood and zip-bomb shapes).
 
 `[budget]` (`max_steps`, `max_tokens`, `max_cost_usd`,
 `max_elapsed_seconds`) is the run-wide backstop and should always be set for

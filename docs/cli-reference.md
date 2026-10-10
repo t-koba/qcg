@@ -100,6 +100,11 @@ JSON event output go to stdout.
   bounds are explicit-only
    (`PACKAGE_MAX_ENTRIES`, `PACKAGE_MAX_BYTES`,
    `PACKAGE_MAX_ARCHIVE_BYTES`, `PACKAGE_MAX_METADATA_BYTES`).
+  For untrusted packages bound all three dimensions, e.g.
+  `qcg install pkg.pkg --max-entries 1000 --max-bytes 5242880
+  --max-archive-bytes 5242880` (1000 entries, 5 MiB expanded, 5 MiB
+  archive: wide headroom over the in-repo fixtures at ~30 KiB and 13
+  entries, while rejecting entry-flood and zip-bomb shapes).
 - `qcg registry add <name> <url>`, `qcg registry remove <name>`,
   `qcg registry list`: manage registry index URLs (`file://` or `https://`)
   under `$DATA_HOME` (default `~/.data`). Everything is user-owned files; no
