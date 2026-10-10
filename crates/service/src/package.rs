@@ -1937,4 +1937,53 @@ mod tests {
             assert_eq!(mode, expected, "dangerous bits must be masked for `{name}`");
         }
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_package_limits_pin_bounded_entry_and_byte_gates() {
+        // Pin the bounded defaults: entry count (1000) and expanded bytes
+        // (10 MiB) fail closed without configuration, while archive and
+        // metadata bounds stay explicit-only. A regression to all-`None`
+        // would silently reopen the bomb/flood shapes, so the default must
+        // also reject a flood archive through the real unpack path.
+        use std::io::Write as _;
+
+        let limits = PackageLimits::default();
+        assert_eq!(limits.max_entries, Some(DEFAULT_PACKAGE_MAX_ENTRIES));
+        assert_eq!(limits.max_entries, Some(1000));
+        assert_eq!(limits.max_bytes, Some(DEFAULT_PACKAGE_MAX_BYTES));
+        assert_eq!(limits.max_bytes, Some(10 * 1024 * 1024));
+        assert_eq!(limits.max_metadata_bytes, None);
+        assert_eq!(limits.max_archive_bytes, None);
+
+        let root = temp_dir("default-limits-flood");
+        let _temp_guard = TempGuard(root.clone());
+        std::fs::create_dir_all(&root).expect("root should be created");
+        let archive = root.join("pkg.pkg");
+        let body = b"x";
+        let sha256 = hex::encode(Sha256::digest(body));
+        let mut sbom_files = Vec::new();
+        {
+            let file = File::create(&archive).expect("archive should be created");
+            let mut writer = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default();
+            for index in 0..=DEFAULT_PACKAGE_MAX_ENTRIES {
+                let name = format!("flood-{index}.txt");
+                writer
+                    .start_file(name.as_str(), options.unix_permissions(0o644))
+                    .expect("flood entry");
+                writer.write_all(body).expect("flood body");
+                sbom_files.push(test_sbom_file(name.as_str(), &sha256, 0o644));
+            }
+            finish_archive(writer, options, &test_sbom(sbom_files));
+        }
+        let target = root.join("out");
+        std::fs::create_dir_all(&target).expect("target should be created");
+        let error = unpack_package(&archive, &target, &PackageLimits::default())
+            .expect_err("the default entry bound must reject the flood");
+        assert!(
+            error.to_string().contains("too many entries"),
+            "the refusal must name the entry bound: {error}"
+        );
+    }
 }
