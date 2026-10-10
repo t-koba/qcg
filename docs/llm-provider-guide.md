@@ -362,6 +362,12 @@ Exa/Parallel fetch behind a custom `[[mcp_server]]` row), add each host the
 model may ask the server to fetch; the built-in `exa-public` and
 `parallel-public` profiles ship with the empty default, so their fetch tools
 stay refused until the operator fronts the endpoint with an explicit row.
+The ceiling covers only the initial whole-value host: qcg cannot re-check
+server-side redirect targets or pin server-side DNS. The `HttpGateway`
+per-hop re-check and `network_deny_private_ips` pinning apply only to
+qcg-originated fetches. Prefer `web.search`/pure-query tools over server-side
+fetch and list explicit per-host destinations (avoid `"*"` on
+cloud/loopback-adjacent deployments).
 
 `lifecycle` selects MCP session negotiation explicitly: `initialize` uses the
 widely deployed initialize handshake, while `discover` requires the modern
