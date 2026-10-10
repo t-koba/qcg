@@ -4029,6 +4029,20 @@ vector must be listed in `permissions.commands`. qcg opens a separate MCP
 protocol session for each run, even though OAuth credentials and token refresh
 state are shared by the process-level profile runtime.
 
+Server-side fetch destinations are a second, independent ceiling: every
+whole-value `http(s)` URL string anywhere in the tool arguments contributes
+its lowercased host, and each host must be listed in the profile's operator-owned
+`allowed_destinations` (exact match or `"*"`, hosts only, never full URLs).
+The default is empty, so calls with no extracted host (for example pure-query
+search) pass while any fetch URL is refused until the operator allows its host
+in `providers.toml`. The server endpoint host never implies destination rights:
+listing `mcp.exa.ai` does not authorize fetching `example.com`. The check runs
+both at argument validation and at execution before any guard or remote touch,
+applies to stdio servers too, and is `Refused` (fail-closed) with the extracted
+hosts journaled in plaintext alongside the existing argument summary; resume
+recomputes the extraction and refuses on mismatch, and tightening the policy
+applies retroactively to resumed calls.
+
 Before the first model request, qcg connects to each declared MCP server and
 discovers its `tools/list` schema. That input schema is authoritative for
 argument validation; untrusted descriptions, titles, defaults, examples, and
@@ -4057,8 +4071,8 @@ request state are returned to the original tool call. Unsupported input request
 methods fail explicitly. Only form-mode elicitation is supported: URL
 (out-of-band) mode and other modes fail explicitly instead of being coerced
 into an in-band form. Client sampling and roots are not exposed.
-Side-effect journals contain only argument names and encoded size, never raw MCP
-argument values.
+Side-effect journals contain only argument names, encoded size, the argument
+digest, and the extracted destination hosts — never raw MCP argument values.
 
 ## `[outputs]`
 

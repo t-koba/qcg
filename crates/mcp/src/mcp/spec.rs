@@ -21,8 +21,8 @@ use super::transport::{
     default_transport,
 };
 use super::validate::{
-    dangerous_process_env_name, reserved_transport_header, valid_env_name, valid_id, validate_host,
-    validate_remote_url,
+    dangerous_process_env_name, reserved_transport_header, valid_env_name, valid_id,
+    validate_destination, validate_host, validate_remote_url,
 };
 
 #[derive(Clone, Deserialize)]
@@ -61,6 +61,12 @@ pub struct McpServerSpec {
     pub oauth_store: OAuthCredentialStore,
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+    /// Operator ceiling for server-side fetch destinations extracted from
+    /// tool arguments. Empty (default) denies every extracted host; calls
+    /// with no extracted host pass. Applies to both transports: a stdio
+    /// server fetches remotely too.
+    #[serde(default)]
+    pub allowed_destinations: Vec<String>,
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
     #[serde(default = "default_max_response_bytes")]
@@ -98,6 +104,7 @@ impl std::fmt::Debug for McpServerSpec {
             .field("oauth_client_secret_env", &self.oauth_client_secret_env)
             .field("oauth_store", &self.oauth_store)
             .field("allowed_hosts", &self.allowed_hosts)
+            .field("allowed_destinations", &self.allowed_destinations)
             .field("timeout_seconds", &self.timeout_seconds)
             .field("max_response_bytes", &self.max_response_bytes)
             .field("tools_list_page_limit", &self.tools_list_page_limit)
@@ -232,6 +239,14 @@ impl McpServerSpec {
                         format!("MCP server `{}` has invalid allowed host: {error}", self.id)
                     })?;
                 }
+                for destination in &self.allowed_destinations {
+                    validate_destination(destination).map_err(|error| {
+                        format!(
+                            "MCP server `{}` has invalid allowed destination: {error}",
+                            self.id
+                        )
+                    })?;
+                }
             }
             McpTransport::Stdio => {
                 if self.url.is_some() || !self.headers.is_empty() || !self.allowed_hosts.is_empty()
@@ -240,6 +255,14 @@ impl McpServerSpec {
                         "MCP server `{}` stdio transport must not declare HTTP fields",
                         self.id
                     ));
+                }
+                for destination in &self.allowed_destinations {
+                    validate_destination(destination).map_err(|error| {
+                        format!(
+                            "MCP server `{}` has invalid allowed destination: {error}",
+                            self.id
+                        )
+                    })?;
                 }
                 if self
                     .command

@@ -17,8 +17,9 @@ pub use audit::{
 };
 pub use cost::{LlmCostBudget, PricingRow, select_pricing};
 pub use credential::{
-    credential_like_name, redact_all_query_values, redact_credential_assignments_in_text,
-    redact_header_values, redact_urls_in_text,
+    credential_like_name, extract_mcp_destinations, mcp_destination_is_allowed,
+    redact_all_query_values, redact_credential_assignments_in_text, redact_header_values,
+    redact_urls_in_text,
 };
 pub use limits::{
     DEFAULT_GC_INTERVAL_SECS, DEFAULT_GC_KEEP, DEFAULT_GC_KEEP_FAILED,

@@ -278,6 +278,12 @@ pub(crate) async fn execute_mcp_tool(
     let server = mcp
         .server_for(alias)
         .ok_or_else(|| StepError::failed(&node.id, format!("unknown MCP tool alias `{alias}`")))?;
+    // Destination-policy gate (server->destination reach): model-chosen
+    // URL args must stay within the operator's per-server
+    // `allowed_destinations`. This runs on every execution — fresh and
+    // resumed — before any guard or remote touch, so tightening the policy
+    // applies retroactively and no resend path can bypass it.
+    mcp.check_destinations(node, alias, &args)?;
     match resume_agent_mcp_continuation(ctx, node, server, alias, &args, call_id)? {
         ContinuationDecision::Fresh => {}
         ContinuationDecision::Resume {
@@ -309,6 +315,8 @@ pub(crate) async fn execute_mcp_tool(
                     ),
                 ));
             }
+            check_resumed_mcp_destinations(&pending_key, pending, &args)
+                .map_err(|message| StepError::failed(&node.id, message))?;
             request_state = resumed_state;
             input_responses = resumed_responses;
         }
@@ -441,6 +449,16 @@ pub(crate) async fn execute_mcp_tool(
                     // (E07-5/E08-3). The live `args` keeps raw values for
                     // execution.
                     let journal_args = canonical_mcp_key_args(&args);
+                    // Journaled destinations bind this suspension for
+                    // replay: resume recomputes the extraction from live
+                    // args and refuses on mismatch. Hosts are not secrets,
+                    // mirroring HTTP targets journaled in plaintext.
+                    let journal_destinations = Value::Array(
+                        policy::extract_mcp_destinations(&journal_args)
+                            .into_iter()
+                            .map(Value::String)
+                            .collect(),
+                    );
                     ctx.journal
                         .event(
                             "mcp_input_pending",
@@ -452,6 +470,7 @@ pub(crate) async fn execute_mcp_tool(
                                 "alias": alias,
                                 "call_id": call_id,
                                 "arguments": journal_args,
+                                "destinations": journal_destinations,
                                 "request_state": required.request_state,
                                 "input_requests": required.input_requests,
                             }),
@@ -485,6 +504,35 @@ pub(crate) async fn execute_mcp_tool(
 /// `record_agent_checkpoint`, which must stay byte-identical.
 pub(crate) fn canonical_mcp_key_args(args: &Value) -> Value {
     engine::redact_mcp_args_for_journal(args)
+}
+
+/// Recomputes the journaled destination list from live args and refuses
+/// on mismatch (replay binding for the destination policy). The comparison
+/// runs over the canonical (redacted) form, matching what the suspend site
+/// journals, so a checkpointed copy recomputes identically. Descriptors
+/// written before this policy carry no `destinations` field and skip the
+/// comparison; the execution-time gate still applies the current
+/// `allowed_destinations` to those resumes.
+pub(crate) fn check_resumed_mcp_destinations(
+    pending_key: &str,
+    pending: &Value,
+    args: &Value,
+) -> Result<(), String> {
+    let Some(journaled) = pending.get("destinations") else {
+        return Ok(());
+    };
+    let live = Value::Array(
+        policy::extract_mcp_destinations(&canonical_mcp_key_args(args))
+            .into_iter()
+            .map(Value::String)
+            .collect(),
+    );
+    if journaled != &live {
+        return Err(format!(
+            "MCP continuation `{pending_key}` holds different destinations; refusing resume"
+        ));
+    }
+    Ok(())
 }
 
 /// Invocation-scoped continuation key binding run node, resolved server,
@@ -673,6 +721,7 @@ fn decide_agent_mcp_continuation(
             "MCP continuation `{pending_key}` holds different arguments; refusing resume"
         ));
     }
+    check_resumed_mcp_destinations(&pending_key, pending, args)?;
     // Every writer records the suspending question: a pending continuation
     // without one is corrupt, and starting fresh would duplicate the remote
     // call while orphaning this state. (An unanswered question below is the
@@ -1034,6 +1083,29 @@ mod tests {
         let other = pending_key_for_agent_mcp("node", "server-2", "alias", "call-1", &args)
             .expect("pending key serialization is infallible in tests");
         assert_ne!(agent_key, other, "server must separate continuations");
+    }
+
+    #[test]
+    fn resumed_destinations_recompute_and_compare() {
+        // The suspend site journals the canonical-form extraction; resume
+        // recomputes from live args and refuses on mismatch.
+        let args = json!({"url": "https://example.test/x"});
+        let journaled = json!({
+            "destinations": ["example.test"],
+        });
+        check_resumed_mcp_destinations("key", &journaled, &args)
+            .expect("identical destinations must resume");
+        let tampered = json!({
+            "destinations": ["other.test"],
+        });
+        let error = check_resumed_mcp_destinations("key", &tampered, &args)
+            .expect_err("changed destinations must refuse");
+        assert!(error.contains("different destinations"), "{error}");
+        // Descriptors written before this policy carry no field and skip
+        // the comparison; the execution-time gate still applies current
+        // policy to those resumes.
+        check_resumed_mcp_destinations("key", &json!({}), &args)
+            .expect("absent field must not block pre-policy journals");
     }
 
     #[test]

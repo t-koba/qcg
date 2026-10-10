@@ -94,6 +94,14 @@ Streamable HTTP profiles require each `allowed_hosts` entry in the contract's
 `permissions.network`. Stdio profiles require the exact `command` vector in
 `permissions.commands`; their child environment is cleared and receives only
 `PATH`, configured non-sensitive `env`, and explicitly mapped `env_from` values.
+Each profile also carries an operator-owned `allowed_destinations` ceiling for
+server-side fetch (hosts extracted from whole-value `http(s)` URL arguments,
+empty by default which denies every extracted host). To allow a fetch
+destination, add its host to the server's row in `providers.toml` and restart
+qcg; tightening the list applies retroactively to resumed calls. Denials are
+`Refused` `tool_call` failures naming the offending host, and the extracted
+hosts ride the `operation_started` details alongside the argument summary for
+audit.
 OAuth credentials use the OS keyring by default. Keyring entries live in the session's unlocked login collection (the Linux Secret Service default collection), not in a backable file, and do not survive container restart by themselves; WSL has no default collection. The SPA Connections panel
 starts authorization on a loopback server, while the process-level token
 manager is shared by profile across runs. A headless host without an unlocked provider fails closed with an actionable OS-keyring-unavailable error; either run an unlocked provider or accept `oauth_store = "memory"` plus loopback re-authorization after every restart. Each run has its own bounded MCP

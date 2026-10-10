@@ -430,6 +430,60 @@ pub fn canonical_http_url(url: &str) -> String {
     canonical
 }
 
+/// Extracts server-side fetch destinations from MCP tool arguments: every
+/// **whole-value** string that parses as an `http(s)` URL contributes its
+/// lowercased host. The walk is recursive over objects and arrays with
+/// deduplication via the returned set. Non-strings, relative URLs, other
+/// schemes, and URLs mentioned inside longer prose are ignored on purpose:
+/// substring scanning would gate file content that merely mentions a URL
+/// and would need secret-aware redaction; a server shown to interpret
+/// substrings as fetch targets needs its own observed-behavior experiment
+/// before this rule grows.
+/// Host comparison is string-only with no DNS pinning: remote resolution
+/// stays outside qcg (documented residual, same as the existing
+/// `network_deny_private_ips` scope, which covers qcg-originated fetches).
+pub fn extract_mcp_destinations(args: &serde_json::Value) -> std::collections::BTreeSet<String> {
+    fn walk(value: &serde_json::Value, hosts: &mut std::collections::BTreeSet<String>) {
+        match value {
+            serde_json::Value::String(text) => {
+                let Ok(url) = url::Url::parse(text.trim()) else {
+                    return;
+                };
+                if !matches!(url.scheme(), "http" | "https") {
+                    return;
+                }
+                if let Some(host) = url.host_str() {
+                    hosts.insert(host.to_lowercase());
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, hosts);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for value in map.values() {
+                    walk(value, hosts);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut hosts = std::collections::BTreeSet::new();
+    walk(args, &mut hosts);
+    hosts
+}
+
+/// Reports whether a lowercased destination host is covered by an operator
+/// `allowed_destinations` list: exact match or the `"*"` wildcard. Ports
+/// are never part of the comparison (extraction keeps hosts only), and
+/// anything else fails closed.
+pub fn mcp_destination_is_allowed(allowed: &[String], host: &str) -> bool {
+    allowed
+        .iter()
+        .any(|entry| entry == "*" || entry.to_lowercase() == host)
+}
+
 /// Returns whether a configuration name conventionally denotes credential material.
 ///
 /// Token boundaries avoid false positives such as `AUTHORITY` and `TOKENIZER`, while
@@ -646,5 +700,67 @@ mod tests {
             canonical_http_url("https://example.test/plain"),
             "https://example.test/plain"
         );
+    }
+
+    #[test]
+    fn mcp_destination_extraction_gates_whole_value_urls_only() {
+        use serde_json::json;
+        use std::collections::BTreeSet;
+        // Pure-query search extracts nothing and keeps passing.
+        assert_eq!(
+            extract_mcp_destinations(&json!({"query": "rust", "numResults": 5})),
+            BTreeSet::new()
+        );
+        // A fetch URL extracts its lowercased host.
+        assert_eq!(
+            extract_mcp_destinations(&json!({"url": "https://Example.COM/path?q=1"})),
+            BTreeSet::from(["example.com".to_string()])
+        );
+        // Nested arrays extract every host, deduplicated and sorted.
+        assert_eq!(
+            extract_mcp_destinations(&json!({
+                "urls": ["https://b.test/x", "https://a.test/y", "https://a.test/z"],
+                "nested": {"deep": ["https://b.test/other"]},
+            })),
+            BTreeSet::from(["a.test".to_string(), "b.test".to_string()])
+        );
+        // Non-http schemes, relative URLs, bare hosts, and prose
+        // mentioning a URL extract nothing (no false positives on file
+        // content that merely mentions a URL).
+        assert_eq!(
+            extract_mcp_destinations(&json!({
+                "command": "fetch file:///etc/passwd",
+                "path": "/relative/path",
+                "host": "example.com",
+                "notes": "see https://example.test/docs for details",
+                "count": 3,
+                "flag": true,
+                "nothing": null,
+            })),
+            BTreeSet::new()
+        );
+        // Surrounding whitespace and case do not smuggle a host past the
+        // allow check: extraction still yields the canonical host.
+        assert_eq!(
+            extract_mcp_destinations(&json!({"url": "  HTTPS://Example.COM:8443/x  "})),
+            BTreeSet::from(["example.com".to_string()])
+        );
+        // Allow matching is exact-or-wildcard, fail-closed otherwise.
+        assert!(mcp_destination_is_allowed(
+            &["example.com".to_string()],
+            "example.com"
+        ));
+        assert!(!mcp_destination_is_allowed(
+            &["example.com".to_string()],
+            "sub.example.com"
+        ));
+        assert!(!mcp_destination_is_allowed(
+            &Vec::<String>::new(),
+            "example.com"
+        ));
+        assert!(mcp_destination_is_allowed(
+            &["*".to_string()],
+            "anything.test"
+        ));
     }
 }

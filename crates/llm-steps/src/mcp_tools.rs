@@ -40,11 +40,59 @@ pub(crate) struct McpResolvedTool {
 pub(crate) struct McpAgentTools {
     sessions: BTreeMap<String, McpSession>,
     tools: BTreeMap<String, McpResolvedTool>,
+    /// Operator `allowed_destinations` ceiling per resolved server id.
+    /// Missing entries fail closed (deny everything extracted).
+    destinations: BTreeMap<String, Vec<String>>,
 }
 
 impl McpAgentTools {
     pub(crate) fn server_for(&self, alias: &str) -> Option<&str> {
         self.tools.get(alias).map(|tool| tool.server.as_str())
+    }
+
+    /// Fail-closed destination-policy gate for server->destination reach:
+    /// every host extracted from the tool arguments must sit within the
+    /// operator's per-server `allowed_destinations` (exact match or `"*"`).
+    /// Calls with no extracted host pass, so pure-query search keeps
+    /// working while fetch requires an explicit operator allow. Denials
+    /// are `Refused`, never silent.
+    pub(crate) fn check_destinations(
+        &self,
+        node: &NodeDef,
+        alias: &str,
+        args: &Value,
+    ) -> Result<Vec<String>, StepError> {
+        let tool = self.tools.get(alias).ok_or_else(|| {
+            StepError::failed(
+                &node.id,
+                format!("MCP tool alias `{alias}` was not resolved"),
+            )
+        })?;
+        let allowed = self
+            .destinations
+            .get(&tool.server)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let extracted: Vec<String> = policy::extract_mcp_destinations(args).into_iter().collect();
+        let denied: Vec<&String> = extracted
+            .iter()
+            .filter(|host| !policy::mcp_destination_is_allowed(allowed, host))
+            .collect();
+        if !denied.is_empty() {
+            let denied = denied
+                .into_iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(StepError::Refused {
+                node: node.id.clone(),
+                message: format!(
+                    "MCP tool `{alias}` destination `{denied}` is not in server `{}` allowed_destinations; ask the operator to allow it in providers.toml",
+                    tool.server
+                ),
+            });
+        }
+        Ok(extracted)
     }
 
     pub(crate) async fn prepare(
@@ -75,11 +123,13 @@ impl McpAgentTools {
         }
 
         let mut permitted_commands = Vec::new();
+        let mut destinations = BTreeMap::new();
         for server in requested.keys() {
             let profile = runtime
                 .mcp
                 .resolve(server)
                 .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
+            destinations.insert(server.clone(), profile.allowed_destinations().to_vec());
             if profile.transport() == mcp::McpTransport::Stdio
                 && let Some(permission) = agent_command_permission(
                     &ctx.run.contract.manifest.permissions.commands,
@@ -217,6 +267,7 @@ impl McpAgentTools {
         Ok(Self {
             sessions,
             tools: resolved,
+            destinations,
         })
     }
 
@@ -243,7 +294,9 @@ impl McpAgentTools {
                 format!("MCP tool alias `{alias}` was not resolved"),
             )
         })?;
-        validate_mcp_value(&node.id, alias, &tool.input_validator, args, "arguments")
+        validate_mcp_value(&node.id, alias, &tool.input_validator, args, "arguments")?;
+        self.check_destinations(node, alias, args)?;
+        Ok(())
     }
 
     pub(crate) async fn call(
@@ -407,5 +460,83 @@ pub(crate) fn sanitize_untrusted_schema(value: &Value) -> Value {
             Value::Object(sanitized)
         }
         _ => value.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use contract::{NodeDef, OnDeps, StepType};
+    use serde_json::json;
+
+    fn node() -> NodeDef {
+        NodeDef {
+            id: "agent".into(),
+            kind: StepType::literal("llm.agent"),
+            needs: vec![],
+            when: None,
+            on_deps: OnDeps::AllSucceeded,
+            context: vec![],
+            output: None,
+            artifact: None,
+            on_fail: None,
+            failure: None,
+            retry: None,
+            params: Default::default(),
+        }
+    }
+
+    fn harness(allowed: Vec<String>) -> McpAgentTools {
+        let schema = json!({"type": "object"});
+        let input_validator =
+            policy::compile_bounded_validator(&schema).expect("test schema must compile");
+        McpAgentTools {
+            sessions: BTreeMap::new(),
+            tools: BTreeMap::from([(
+                "fetch".to_string(),
+                McpResolvedTool {
+                    server: "exa-public".to_string(),
+                    remote_name: "web_fetch_exa".to_string(),
+                    description: "test".to_string(),
+                    model_input_schema: schema,
+                    input_validator,
+                    output_validator: None,
+                },
+            )]),
+            destinations: BTreeMap::from([("exa-public".to_string(), allowed)]),
+        }
+    }
+
+    #[test]
+    fn destination_policy_denies_unlisted_fetch_but_passes_query() {
+        let node = node();
+        // Empty default denies every extracted host; host-only calls pass.
+        let tools = harness(Vec::new());
+        let error = tools
+            .validate_args(&node, "fetch", &json!({"url": "https://example.test/x"}))
+            .expect_err("unlisted fetch destination must be refused");
+        assert!(
+            matches!(error, StepError::Refused { .. }),
+            "denials are Refused, never silent: {error}"
+        );
+        tools
+            .validate_args(&node, "fetch", &json!({"query": "rust", "numResults": 5}))
+            .expect("pure-query search must pass the empty default");
+        // An explicit operator allow passes fetch; other hosts still fail.
+        let tools = harness(vec!["example.test".to_string()]);
+        tools
+            .validate_args(&node, "fetch", &json!({"url": "https://example.test/x"}))
+            .expect("listed destination must pass");
+        assert!(
+            tools
+                .validate_args(&node, "fetch", &json!({"url": "https://other.test/x"}))
+                .is_err(),
+            "unlisted hosts stay denied under a non-empty list"
+        );
+        // The wildcard covers every host.
+        let tools = harness(vec!["*".to_string()]);
+        tools
+            .validate_args(&node, "fetch", &json!({"url": "https://other.test/x"}))
+            .expect("wildcard must allow any destination");
     }
 }

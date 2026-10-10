@@ -192,9 +192,16 @@ pub(crate) fn mcp_argument_summary(arguments: &Value) -> Value {
     // continuation (E07). Identity paths fail closed via `Result` instead.
     let bytes = serde_json::to_vec(arguments)
         .unwrap_or_else(|_| Vec::from(b"{\"serialization_failed\":true}"));
+    // Journaled fetch destinations for the operator allowlist audit and
+    // the approval digest below: hosts are not secrets, mirroring HTTP
+    // targets journaled in plaintext.
+    let destinations: Vec<String> = policy::extract_mcp_destinations(arguments)
+        .into_iter()
+        .collect();
     json!({
         "argument_names": names,
         "encoded_bytes": bytes.len(),
         "arguments_sha256": hex::encode(Sha256::digest(&bytes)),
+        "destinations": destinations,
     })
 }

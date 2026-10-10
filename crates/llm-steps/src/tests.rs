@@ -892,6 +892,16 @@ fn mcp_confirmation_summary_never_contains_argument_values() {
 }
 
 #[test]
+fn mcp_confirmation_summary_journals_fetch_destinations() {
+    // The approval digest and the operation_started audit bind the
+    // extracted hosts; pure-query calls journal an empty list.
+    let fetch = mcp_argument_summary(&json!({"url": "https://Example.TEST/x?q=1"}));
+    assert_eq!(fetch["destinations"], json!(["example.test"]));
+    let query = mcp_argument_summary(&json!({"query": "rust"}));
+    assert_eq!(query["destinations"], json!([]));
+}
+
+#[test]
 fn mcp_tool_error_is_recoverable_but_transport_error_is_not() {
     let reported = json!({
         "isError": true,

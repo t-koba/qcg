@@ -30,6 +30,7 @@ mod tests {
             oauth_client_secret_env: None,
             oauth_store: OAuthCredentialStore::Memory,
             allowed_hosts: vec!["agent.tinyfish.ai".into()],
+            allowed_destinations: vec![],
             timeout_seconds: 30,
             max_response_bytes: 1024,
             tools_list_page_limit: default_tools_list_page_limit(),
@@ -139,6 +140,34 @@ mod tests {
         let error = McpRuntime::from_specs_with_public_defaults(vec![spec])
             .expect_err("built-in public profile ids must be reserved");
         assert!(error.contains("reserved"), "{error}");
+    }
+
+    #[test]
+    fn destination_allowlist_accepts_hosts_and_wildcard_only() {
+        // Operator ceiling: hosts and "*" validate on both transports.
+        for destinations in [
+            Vec::new(),
+            vec!["example.com".to_string()],
+            vec!["*".to_string()],
+        ] {
+            let mut spec = remote_spec();
+            spec.allowed_destinations = destinations;
+            spec.validate().expect("hosts and wildcard must validate");
+            let mut stdio = stdio_spec();
+            stdio.allowed_destinations = spec.allowed_destinations.clone();
+            stdio
+                .validate()
+                .expect("stdio servers fetch remotely too, so destinations stay allowed");
+        }
+        // Full URLs, ports, and empty entries are never canonical hosts.
+        for bad in ["https://example.com", "example.com:443", "", "exa mple.com"] {
+            let mut spec = remote_spec();
+            spec.allowed_destinations = vec![bad.to_string()];
+            let error = spec
+                .validate()
+                .expect_err("non-host destinations must be rejected");
+            assert!(error.contains("allowed destination"), "{error}");
+        }
     }
 
     #[test]
@@ -371,6 +400,7 @@ mod tests {
             oauth_client_secret_env: None,
             oauth_store: OAuthCredentialStore::Memory,
             allowed_hosts: vec![],
+            allowed_destinations: vec![],
             timeout_seconds: 30,
             max_response_bytes: 1024,
             tools_list_page_limit: default_tools_list_page_limit(),

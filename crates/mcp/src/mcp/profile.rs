@@ -63,6 +63,10 @@ impl McpProfile {
         &self.spec.allowed_hosts
     }
 
+    pub fn allowed_destinations(&self) -> &[String] {
+        &self.spec.allowed_destinations
+    }
+
     pub fn command(&self) -> &[String] {
         &self.spec.command
     }

@@ -159,6 +159,16 @@ pub(crate) fn validate_redirect_uri(raw: &str) -> Result<Url, McpError> {
     Ok(url)
 }
 
+/// Validates one `allowed_destinations` entry: the `"*"` wildcard or a
+/// canonical host name (same shape as [`validate_host`], ports and URLs
+/// never allowed).
+pub(crate) fn validate_destination(destination: &str) -> Result<(), String> {
+    if destination == "*" {
+        return Ok(());
+    }
+    validate_host(destination)
+}
+
 pub(crate) fn validate_host(host: &str) -> Result<(), String> {
     if host.is_empty()
         || host.contains(['/', ':', '@', '?', '#'])

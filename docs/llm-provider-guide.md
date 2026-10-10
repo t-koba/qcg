@@ -336,6 +336,7 @@ url = "https://agent.tinyfish.ai/mcp"
 auth = "oauth"
 oauth_store = "keyring"
 allowed_hosts = ["agent.tinyfish.ai", "clerk.tinyfish.ai"]
+allowed_destinations = ["example.com"]
 timeout_seconds = 120
 max_response_bytes = 4194304
 tools_list_page_limit = 100
@@ -350,6 +351,17 @@ OAuth discovery, authorization, token, or registration requests. It is also
 the redirect allowlist for the OAuth HTTP client. The contract must list every
 one of these hosts in `[permissions].network`; the registry never grants that
 permission by itself.
+
+`allowed_destinations` is the separate operator ceiling for server-side fetch:
+every whole-value `http(s)` URL string in the tool arguments contributes its
+host, and each host must be listed here (exact match or `"*"`, hosts only).
+It defaults to empty — host-free calls such as pure-query search pass, while
+any fetch URL is refused until its host is listed. The endpoint host above
+never implies destination rights. To migrate a fetch tool (for example an
+Exa/Parallel fetch behind a custom `[[mcp_server]]` row), add each host the
+model may ask the server to fetch; the built-in `exa-public` and
+`parallel-public` profiles ship with the empty default, so their fetch tools
+stay refused until the operator fronts the endpoint with an explicit row.
 
 `lifecycle` selects MCP session negotiation explicitly: `initialize` uses the
 widely deployed initialize handshake, while `discover` requires the modern
@@ -376,7 +388,8 @@ auth = "none"
 ```
 
 `stdio` requires a non-empty command and cannot declare `url`, `headers`, or
-`allowed_hosts`. The child process receives a cleared environment containing
+`allowed_hosts`. It can declare `allowed_destinations`, with the same
+whole-value extraction and empty-default-deny semantics as above. The child process receives a cleared environment containing
 only `PATH`, the non-sensitive `env` entries, and `env_from` values copied from
 the qcg process. Sensitive environment names must use `env_from`; provider
 credentials are never inherited implicitly. The complete command vector must

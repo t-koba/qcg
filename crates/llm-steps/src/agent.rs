@@ -285,6 +285,8 @@ fn verify_resumed_mcp_call(
             format!("MCP continuation `{pending_key}` holds different arguments; refusing resume"),
         ));
     }
+    crate::tool_events::check_resumed_mcp_destinations(&pending_key, pending, &suspended.args)
+        .map_err(|message| StepError::failed(&node.id, message))?;
     let descriptor_question = pending
         .get("question_id")
         .and_then(Value::as_str)

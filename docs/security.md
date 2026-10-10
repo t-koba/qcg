@@ -358,7 +358,17 @@ is expected to have side effects. Streamable HTTP profiles allow only their
 declared `allowed_hosts`, require every one of those hosts in
 `permissions.network`, and use HTTPS for non-loopback endpoints. Stdio profiles
 allow only their exact command vector through `permissions.commands`; the child
-does not receive the qcg process environment.
+does not receive the qcg process environment. The argument schema gate and the
+qcg-to-server reach check above do not govern server-to-destination reach, so
+model-chosen URL arguments pass a second operator-owned ceiling first:
+`allowed_destinations` per `[[mcp_server]]` row (both transports; stdio servers
+fetch remotely too). Extraction is whole-value strings only — prose that merely
+mentions a URL never gates — and the empty default denies every extracted host
+while host-free calls pass. Residual: comparison is string-only with no DNS
+pinning for the remotely fetched host (remote resolution stays outside qcg,
+same scope note as `network_deny_private_ips` above, which covers only
+qcg-originated fetches). Extracted hosts are journaled in plaintext for audit;
+query values stay redacted by the existing MCP journal redaction.
 
 Network allowlist scope: `permissions.network` (and MCP `allowed_hosts`) match the URL hostname as a string only, with no DNS lookup or resolved-IP filtering by default (`ensure_url_allowed` in `crates/engine/src/gateway/http.rs`). `"*"` therefore includes loopback, link-local, and cloud metadata endpoints, and an explicit hostname does not pin DNS against rebinding. Prefer explicit hosts and avoid `"*"` on cloud or loopback-adjacent deployments; every redirect hop is re-checked against the same string allowlist. Opt-in hardening for the HTTP fetch path: `permissions.network_deny_private_ips = true` resolve-then-checks ALL A/AAAA records on every hop, denies non-global IPs (loopback, private, link-local, multicast, unspecified, reserved, documentation), and pins the connection to the validated addresses (single resolution per hop; Host/TLS SNI stay the original hostname). Default off so existing wildcard deployments keep working; MCP `allowed_hosts` keeps string matching. Wildcard-DNS names such as `<169.254.169.254>.nip.io` (and `sslip.io`/`xip.io`/`traefik.me` equivalents) stay DNS names: the string allowlist passes them when `"*"` or the name is listed, and only `network_deny_private_ips = true` denies them at resolve time — prefer `= true` on cloud or loopback-adjacent deployments.
 
