@@ -435,9 +435,10 @@ async fn run_async() -> Result<std::process::ExitCode> {
             let output = output.unwrap_or_else(|| {
                 Utf8PathBuf::from(format!("{}.pkg", dir.file_name().unwrap_or("generator")))
             });
+            let defaults = service::PackageLimits::default();
             let limits = service::PackageLimits {
-                max_entries,
-                max_bytes,
+                max_entries: max_entries.or(defaults.max_entries),
+                max_bytes: max_bytes.or(defaults.max_bytes),
                 max_metadata_bytes,
                 max_archive_bytes: None,
             };
@@ -486,8 +487,8 @@ async fn run_async() -> Result<std::process::ExitCode> {
                     public_key: public_key.as_deref(),
                 },
                 &service::PackageLimits {
-                    max_entries,
-                    max_bytes,
+                    max_entries: max_entries.or(service::PackageLimits::default().max_entries),
+                    max_bytes: max_bytes.or(service::PackageLimits::default().max_bytes),
                     max_metadata_bytes,
                     max_archive_bytes,
                 },

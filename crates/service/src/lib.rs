@@ -1,5 +1,7 @@
 pub mod package;
-pub use package::{ArtifactZipLimits, PackageLimits};
+pub use package::{
+    ArtifactZipLimits, DEFAULT_PACKAGE_MAX_BYTES, DEFAULT_PACKAGE_MAX_ENTRIES, PackageLimits,
+};
 
 mod artifacts;
 mod event_reader;

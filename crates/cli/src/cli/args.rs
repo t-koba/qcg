@@ -119,10 +119,10 @@ pub(crate) enum Command {
         output: Option<Utf8PathBuf>,
         #[arg(long = "signing-key", value_name = "PKCS8_PATH")]
         signing_key: Option<Utf8PathBuf>,
-        /// Explicit max only. Omitted means no mechanistic limit.
+        /// Bounds entry count. Omitted means the 1000-entry default, never unlimited.
         #[arg(long = "max-entries", env = "PACKAGE_MAX_ENTRIES")]
         max_entries: Option<usize>,
-        /// Explicit max only. Omitted means no mechanistic limit.
+        /// Bounds expanded bytes. Omitted means the 10 MiB default, never unlimited.
         #[arg(long = "max-bytes", env = "PACKAGE_MAX_BYTES")]
         max_bytes: Option<u64>,
         /// Explicit max only. Omitted means no mechanistic limit.
@@ -147,10 +147,10 @@ pub(crate) enum Command {
         signature: Option<String>,
         #[arg(long = "public-key", value_name = "HEX")]
         public_key: Option<String>,
-        /// Explicit max only. Omitted means no mechanistic limit.
+        /// Bounds entry count. Omitted means the 1000-entry default, never unlimited.
         #[arg(long = "max-entries", env = "PACKAGE_MAX_ENTRIES")]
         max_entries: Option<usize>,
-        /// Explicit max only. Omitted means no mechanistic limit.
+        /// Bounds expanded bytes. Omitted means the 10 MiB default, never unlimited.
         #[arg(long = "max-bytes", env = "PACKAGE_MAX_BYTES")]
         max_bytes: Option<u64>,
         /// Explicit max only. Omitted means no mechanistic limit.

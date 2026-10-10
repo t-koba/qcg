@@ -19,13 +19,32 @@ const UNIX_MODE_SYMLINK: u32 = 0o120000;
 #[cfg(unix)]
 const UNIX_MODE_DIR: u32 = 0o040000;
 
-/// Explicit max only. `None` means no mechanistic limit.
-#[derive(Debug, Clone, Copy, Default)]
+/// Default entry-count bound for package archives (flood gate).
+pub const DEFAULT_PACKAGE_MAX_ENTRIES: usize = 1000;
+/// Default expanded-bytes bound for package archives (bomb gate, 10 MiB).
+pub const DEFAULT_PACKAGE_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Bounded by default: `max_entries` (1000 entries) and `max_bytes` (10 MiB
+/// expanded) fail closed without configuration. `max_archive_bytes` stays
+/// explicit-only (an archive-byte cap cannot stop a bomb) and
+/// `max_metadata_bytes` stays explicit-only (uncalibrated).
+#[derive(Debug, Clone, Copy)]
 pub struct PackageLimits {
     pub max_entries: Option<usize>,
     pub max_bytes: Option<u64>,
     pub max_metadata_bytes: Option<usize>,
     pub max_archive_bytes: Option<u64>,
+}
+
+impl Default for PackageLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: Some(DEFAULT_PACKAGE_MAX_ENTRIES),
+            max_bytes: Some(DEFAULT_PACKAGE_MAX_BYTES),
+            max_metadata_bytes: None,
+            max_archive_bytes: None,
+        }
+    }
 }
 
 /// Explicit max only. `None` means no mechanistic limit.
