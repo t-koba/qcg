@@ -477,11 +477,11 @@ pub fn extract_mcp_destinations(args: &serde_json::Value) -> std::collections::B
 /// Reports whether a lowercased destination host is covered by an operator
 /// `allowed_destinations` list: exact match or the `"*"` wildcard. Ports
 /// are never part of the comparison (extraction keeps hosts only), and
-/// anything else fails closed.
+/// anything else fails closed. Entries are canonical (spec validation
+/// rejects non-lowercase hosts), so the comparison is exact: a
+/// non-canonical entry never matches.
 pub fn mcp_destination_is_allowed(allowed: &[String], host: &str) -> bool {
-    allowed
-        .iter()
-        .any(|entry| entry == "*" || entry.to_lowercase() == host)
+    allowed.iter().any(|entry| entry == "*" || entry == host)
 }
 
 /// Returns whether a configuration name conventionally denotes credential material.
@@ -785,6 +785,16 @@ mod tests {
         ));
         assert!(!mcp_destination_is_allowed(
             &Vec::<String>::new(),
+            "[2001:db8::1]"
+        ));
+        // Non-canonical entries never match: spec validation rejects
+        // uppercase hosts, so matching stays exact and fail-closed.
+        assert!(!mcp_destination_is_allowed(
+            &["Example.COM".to_string()],
+            "example.com"
+        ));
+        assert!(!mcp_destination_is_allowed(
+            &["[2001:DB8::1]".to_string()],
             "[2001:db8::1]"
         ));
     }
