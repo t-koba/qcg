@@ -185,6 +185,30 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_endpoint_requires_bracketed_allowed_host() {
+        // Endpoint host matching uses `Url::host_str`, which keeps IPv6
+        // brackets, so the allow entry must use the same bracketed form.
+        let mut spec = remote_spec();
+        spec.url = Some("https://[2001:db8::1]/mcp".into());
+        spec.allowed_hosts = vec!["[2001:db8::1]".into()];
+        spec.validate()
+            .expect("bracketed IPv6 endpoint host must validate");
+        let mut bare = remote_spec();
+        bare.url = Some("https://[2001:db8::1]/mcp".into());
+        bare.allowed_hosts = vec!["2001:db8::1".into()];
+        let error = bare
+            .validate()
+            .expect_err("unbracketed IPv6 must not cover a bracketed endpoint host");
+        assert!(error.contains("allowed_hosts"), "{error}");
+        let mut loopback = remote_spec();
+        loopback.url = Some("http://[::1]/mcp".into());
+        loopback.allowed_hosts = vec!["[::1]".into()];
+        loopback
+            .validate()
+            .expect("loopback IPv6 over HTTP must validate");
+    }
+
+    #[test]
     fn remote_profile_requires_all_endpoint_hosts() {
         let mut spec = remote_spec();
         spec.allowed_hosts.clear();

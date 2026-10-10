@@ -4023,7 +4023,7 @@ A never authorizes a regenerated target B. Node-wide
 bulk approvals do not exist: every approval authorizes exactly one
 operation digest (plus one invocation under `invocation` scope).
 
-For Streamable HTTP, every host in the profile's `allowed_hosts` must also be
+For Streamable HTTP, every host in the profile's `allowed_hosts` (hosts only; IPv6 literals in bracketed form `"[2001:db8::1]"`) must also be
 listed in `permissions.network`. For stdio, the complete profile `command`
 vector must be listed in `permissions.commands`. qcg opens a separate MCP
 protocol session for each run, even though OAuth credentials and token refresh

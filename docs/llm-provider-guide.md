@@ -347,7 +347,7 @@ task_poll_interval_ms = 250
 `transport` defaults to `streamable_http`. The URL must be an HTTP(S) URL
 without userinfo, query, or fragment; a non-loopback remote URL must use
 HTTPS. `allowed_hosts` must include the endpoint host and every host needed by
-OAuth discovery, authorization, token, or registration requests. It is also
+OAuth discovery, authorization, token, or registration requests (hosts only; IPv6 literals use the bracketed form `"[2001:db8::1]"`). It is also
 the redirect allowlist for the OAuth HTTP client. The contract must list every
 one of these hosts in `[permissions].network`; the registry never grants that
 permission by itself.
