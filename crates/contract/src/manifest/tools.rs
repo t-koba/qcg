@@ -87,6 +87,13 @@ pub enum ToolDecl {
         max_calls: usize,
         #[serde(default = "default_true")]
         side_effects: bool,
+        /// Optional per-tool fetch narrowing delegated from the operator
+        /// `allowed_destinations` ceiling. `None` (default) inherits the
+        /// ceiling; `Some(list)` allows only those hosts with an empty list
+        /// meaning query-only. Entries are canonical hosts only, never `"*"`
+        /// or URLs.
+        #[serde(default)]
+        destinations: Option<Vec<String>>,
     },
     #[serde(rename = "agent")]
     Agent {

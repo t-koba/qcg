@@ -43,6 +43,10 @@ pub(crate) struct McpAgentTools {
     /// Operator `allowed_destinations` ceiling per resolved server id.
     /// Missing entries fail closed (deny everything extracted).
     destinations: BTreeMap<String, Vec<String>>,
+    /// Contract-delegated per-tool narrowing. `None` inherits the ceiling;
+    /// `Some(list)` allows only those hosts with an empty list meaning
+    /// query-only. Missing entries inherit the ceiling.
+    declared: BTreeMap<String, Option<Vec<String>>>,
 }
 
 impl McpAgentTools {
@@ -52,10 +56,11 @@ impl McpAgentTools {
 
     /// Fail-closed destination-policy gate for server->destination reach:
     /// every host extracted from the tool arguments must sit within the
-    /// operator's per-server `allowed_destinations` (exact match or `"*"`).
-    /// Calls with no extracted host pass, so pure-query search keeps
-    /// working while fetch requires an explicit operator allow. Denials
-    /// are `Refused`, never silent.
+    /// operator's per-server `allowed_destinations` (exact match or `"*"`)
+    /// and, when the contract declares per-tool `destinations`, within that
+    /// narrowing too (exact match, empty means query-only). Calls with no
+    /// extracted host pass, so pure-query search keeps working while fetch
+    /// requires an explicit allow. Denials are `Refused`, never silent.
     pub(crate) fn check_destinations(
         &self,
         node: &NodeDef,
@@ -92,6 +97,25 @@ impl McpAgentTools {
                 ),
             });
         }
+        if let Some(Some(narrow)) = self.declared.get(alias) {
+            let denied: Vec<&String> = extracted
+                .iter()
+                .filter(|host| !narrow.iter().any(|allowed| allowed == *host))
+                .collect();
+            if !denied.is_empty() {
+                let denied = denied
+                    .into_iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(StepError::Refused {
+                    node: node.id.clone(),
+                    message: format!(
+                        "MCP tool `{alias}` destination `{denied}` is not in tool `{alias}` destinations"
+                    ),
+                });
+            }
+        }
         Ok(extracted)
     }
 
@@ -102,12 +126,14 @@ impl McpAgentTools {
         declarations: &[ToolDecl],
     ) -> Result<Self, StepError> {
         let mut requested = BTreeMap::<String, Vec<(String, String, Option<String>)>>::new();
+        let mut declared: BTreeMap<String, Option<Vec<String>>> = BTreeMap::new();
         for declaration in declarations {
             if let ToolDecl::Mcp {
                 name,
                 description,
                 server,
                 tool,
+                destinations,
                 ..
             } = declaration
             {
@@ -116,6 +142,7 @@ impl McpAgentTools {
                     tool.clone(),
                     description.clone(),
                 ));
+                declared.insert(name.clone(), destinations.clone());
             }
         }
         if requested.is_empty() {
@@ -268,6 +295,7 @@ impl McpAgentTools {
             sessions,
             tools: resolved,
             destinations,
+            declared,
         })
     }
 
@@ -487,6 +515,10 @@ mod tests {
     }
 
     fn harness(allowed: Vec<String>) -> McpAgentTools {
+        harness_with_declared(allowed, None)
+    }
+
+    fn harness_with_declared(allowed: Vec<String>, declared: Option<Vec<String>>) -> McpAgentTools {
         let schema = json!({"type": "object"});
         let input_validator =
             policy::compile_bounded_validator(&schema).expect("test schema must compile");
@@ -504,6 +536,7 @@ mod tests {
                 },
             )]),
             destinations: BTreeMap::from([("exa-public".to_string(), allowed)]),
+            declared: BTreeMap::from([("fetch".to_string(), declared)]),
         }
     }
 
@@ -538,5 +571,53 @@ mod tests {
         tools
             .validate_args(&node, "fetch", &json!({"url": "https://other.test/x"}))
             .expect("wildcard must allow any destination");
+    }
+
+    #[test]
+    fn delegated_destinations_narrow_the_operator_ceiling() {
+        let node = node();
+        // Absent narrowing inherits the ceiling: both hosts pass.
+        let tools = harness_with_declared(
+            vec!["example.test".to_string(), "other.test".to_string()],
+            None,
+        );
+        tools
+            .validate_args(&node, "fetch", &json!({"url": "https://other.test/x"}))
+            .expect("absent destinations must inherit the ceiling");
+        // Explicit narrowing allows its hosts while denying the rest, even
+        // though the ceiling allows them. Query-only passes.
+        let tools = harness_with_declared(
+            vec!["example.test".to_string(), "other.test".to_string()],
+            Some(vec!["example.test".to_string()]),
+        );
+        tools
+            .validate_args(&node, "fetch", &json!({"url": "https://example.test/x"}))
+            .expect("declared host must pass");
+        tools
+            .validate_args(&node, "fetch", &json!({"query": "rust"}))
+            .expect("query-only must pass narrowing");
+        let error = tools
+            .validate_args(&node, "fetch", &json!({"url": "https://other.test/x"}))
+            .expect_err("narrowed host must be refused");
+        assert!(
+            matches!(error, StepError::Refused { .. }),
+            "narrowing denials are Refused, never silent: {error}"
+        );
+        assert!(
+            error.to_string().contains("tool `fetch` destinations"),
+            "narrowing denial must name the tool destinations: {error}"
+        );
+        // Empty narrowing is query-only: any fetch is refused.
+        let tools = harness_with_declared(vec!["example.test".to_string()], Some(Vec::new()));
+        let error = tools
+            .validate_args(&node, "fetch", &json!({"url": "https://example.test/x"}))
+            .expect_err("empty destinations must deny fetch");
+        assert!(
+            matches!(error, StepError::Refused { .. }),
+            "empty narrowing must refuse: {error}"
+        );
+        tools
+            .validate_args(&node, "fetch", &json!({"query": "rust"}))
+            .expect("empty narrowing must pass query-only");
     }
 }

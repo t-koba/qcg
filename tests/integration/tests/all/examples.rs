@@ -2906,6 +2906,7 @@ fn assert_mcp_tool(
         tool,
         max_calls,
         side_effects,
+        ..
     } = tool
     else {
         panic!("expected MCP tool `{expected_name}`, got {tool:?}");

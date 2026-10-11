@@ -646,6 +646,7 @@ fn agent_tool_budgets_apply_total_and_per_tool_limits() {
         tool: "web_search".into(),
         max_calls: 1,
         side_effects: false,
+        destinations: None,
     }];
     let mut total = 0;
     let mut counts = BTreeMap::new();

@@ -163,14 +163,14 @@ pub(crate) fn validate_redirect_uri(raw: &str) -> Result<Url, McpError> {
 /// canonical host name, or a bracketed IPv6 literal (for example
 /// `"[2001:db8::1]"`, same canonical form as [`validate_host`]); ports and
 /// URLs are never allowed.
-pub(crate) fn validate_destination(destination: &str) -> Result<(), String> {
+pub fn validate_destination(destination: &str) -> Result<(), String> {
     if destination == "*" {
         return Ok(());
     }
     validate_host(destination)
 }
 
-pub(crate) fn validate_host(host: &str) -> Result<(), String> {
+pub fn validate_host(host: &str) -> Result<(), String> {
     if let Some(inner) = host
         .strip_prefix('[')
         .and_then(|rest| rest.strip_suffix(']'))

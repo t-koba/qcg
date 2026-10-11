@@ -404,7 +404,8 @@ impl StepExecutor for LlmAgentStep {
                                     "server": string_schema(),
                                     "tool": string_schema(),
                                     "max_calls": { "type": "integer", "minimum": 1, "maximum": policy::MAX_AGENT_TOOL_CALLS },
-                                    "side_effects": { "type": "boolean" }
+                                    "side_effects": { "type": "boolean" },
+                                    "destinations": string_array_schema()
                                 })
                             ),
                             agent_tool_params_schema(

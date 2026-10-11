@@ -1659,6 +1659,12 @@ metadata. Update it with `qcg docs step-schemas`.
               "description": {
                 "type": "string"
               },
+              "destinations": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
               "kind": {
                 "const": "mcp"
               },
@@ -3857,7 +3863,8 @@ against the current file contents.
 - `web.search`: an opt-in search profile selected from the unified
   `providers.toml` registry. Its model-visible input is always the closed
   `{query, limit?}` schema and cannot be replaced.
-- `mcp`: a fixed tool binding into one generic `[[mcp_server]]` profile. Its
+- `mcp`: a fixed tool binding into one generic `[[mcp_server]]` profile, plus an
+  optional `destinations` narrowing list. Its
   model-visible input schema is discovered from the MCP server at run time.
 - `agent`: a bounded specialist with `instructions`, an allowlist of sibling
   `tools`, invocation bound `max_calls`, `max_iterations`, `max_tokens_total`, required
@@ -4042,6 +4049,16 @@ applies to stdio servers too, and is `Refused` (fail-closed) with the extracted
 hosts journaled in plaintext alongside the existing argument summary; resume
 recomputes the extraction and refuses on mismatch, and tightening the policy
 applies retroactively to resumed calls.
+
+An `mcp` tool may also declare `destinations = ["example.com"]` to narrow the
+operator ceiling per tool. Absent (default) inherits the ceiling; an explicit
+list allows only those hosts with an empty list meaning query-only (any
+extracted host is refused). Entries are canonical hosts only, never `"*"` or
+URLs, and each entry must sit within the server's `allowed_destinations`. The
+narrowing is checked both at validation and at execution alongside the ceiling
+with `Refused` denials naming the tool destinations; it is pinned to the run's
+contract version while ceiling tightening still applies retroactively. The
+deterministic `mcp.call` step keeps the operator ceiling only.
 
 Before the first model request, qcg connects to each declared MCP server and
 discovers its `tools/list` schema. That input schema is authoritative for

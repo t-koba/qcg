@@ -134,6 +134,7 @@ pub(crate) fn validate_agent_tool(
             server,
             tool,
             max_calls,
+            destinations,
             ..
         } => {
             if server.trim().is_empty() || tool.trim().is_empty() {
@@ -148,10 +149,26 @@ pub(crate) fn validate_agent_tool(
                     format!("tool `{name}` max_calls must be greater than zero"),
                 ));
             }
+            if let Some(destinations) = destinations {
+                validate_mcp_tool_destinations(node, name, destinations)?;
+            }
             let profile = runtime
                 .mcp
                 .resolve(server)
                 .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
+            if let Some(destinations) = destinations {
+                let allowed = profile.allowed_destinations();
+                for host in destinations {
+                    if !policy::mcp_destination_is_allowed(allowed, host) {
+                        return Err(StepError::failed(
+                            &node.id,
+                            format!(
+                                "tool `{name}` destination `{host}` is not in server `{server}` allowed_destinations"
+                            ),
+                        ));
+                    }
+                }
+            }
             match profile.transport() {
                 mcp::McpTransport::StreamableHttp => {
                     for host in profile.allowed_hosts() {
@@ -358,6 +375,36 @@ pub(crate) fn validate_agent_tool(
         }
         ToolDecl::Skill { .. } => {
             crate::skill_tool::validate_skill_tool(node, contract, tool)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_mcp_tool_destinations(
+    node: &NodeDef,
+    name: &str,
+    destinations: &[String],
+) -> Result<(), StepError> {
+    use std::collections::BTreeSet;
+    let mut seen = BTreeSet::new();
+    for host in destinations {
+        if host == "*" {
+            return Err(StepError::failed(
+                &node.id,
+                format!("tool `{name}` destinations must list explicit hosts, never `*`"),
+            ));
+        }
+        if !seen.insert(host) {
+            return Err(StepError::failed(
+                &node.id,
+                format!("tool `{name}` declares duplicate destination `{host}`"),
+            ));
+        }
+        if let Err(reason) = mcp::validate::validate_host(host) {
+            return Err(StepError::failed(
+                &node.id,
+                format!("tool `{name}` destination `{host}` is not valid: {reason}"),
+            ));
         }
     }
     Ok(())
@@ -810,6 +857,41 @@ mod tests {
             validate_agent_tool_args(&node, &tool, &json!({"question": "city?", "notes": 42}))
                 .is_err(),
             "non-string notes must fail schema validation"
+        );
+    }
+
+    #[test]
+    fn mcp_tool_destinations_reject_wildcard_duplicates_and_noncanonical() {
+        let node = agent_node();
+        validate_mcp_tool_destinations(&node, "fetch", &["example.test".to_string()])
+            .expect("canonical host must validate");
+        validate_mcp_tool_destinations(&node, "fetch", &[])
+            .expect("empty narrowing means query-only and must validate");
+        validate_mcp_tool_destinations(&node, "fetch", &["[2001:db8::1]".to_string()])
+            .expect("bracketed IPv6 must validate");
+        let error = validate_mcp_tool_destinations(&node, "fetch", &["*".to_string()])
+            .expect_err("`*` must be rejected in contract destinations");
+        assert!(
+            error.to_string().contains("fetch"),
+            "error must name the tool: {error}"
+        );
+        assert!(
+            validate_mcp_tool_destinations(
+                &node,
+                "fetch",
+                &["example.test".to_string(), "example.test".to_string()]
+            )
+            .is_err(),
+            "duplicate destinations must be rejected"
+        );
+        assert!(
+            validate_mcp_tool_destinations(&node, "fetch", &["Example.TEST".to_string()]).is_err(),
+            "non-canonical case must be rejected"
+        );
+        assert!(
+            validate_mcp_tool_destinations(&node, "fetch", &["https://example.test/x".to_string()])
+                .is_err(),
+            "URLs must be rejected in contract destinations"
         );
     }
 
