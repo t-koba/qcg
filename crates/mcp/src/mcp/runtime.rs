@@ -968,6 +968,8 @@ fn public_default_specs() -> Vec<McpServerSpec> {
         oauth_store: OAuthCredentialStore::Memory,
         allowed_hosts: vec![host.to_string()],
         allowed_destinations: Vec::new(),
+        destination_decider: Vec::new(),
+        destination_decider_timeout_seconds: None,
         timeout_seconds: DEFAULT_MCP_TIMEOUT_SECONDS,
         max_response_bytes: DEFAULT_MCP_MAX_RESPONSE_BYTES,
         tools_list_page_limit: default_tools_list_page_limit(),

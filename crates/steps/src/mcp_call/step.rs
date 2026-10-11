@@ -101,13 +101,8 @@ impl StepExecutor for McpCallStep {
             ));
         }
         validate_mcp_call_arguments(node, params.input_schema.as_ref(), &arguments)?;
-        check_direct_destinations(
-            node,
-            &params.server,
-            &params.tool,
-            profile.allowed_destinations(),
-            &arguments,
-        )?;
+        authorize_direct_destinations(ctx, node, profile, &params.server, &params.tool, &arguments)
+            .await?;
         let access = mcp_access(ctx, profile.command());
         let confirm_details = Some(json!({
             "server": params.server,
@@ -280,6 +275,106 @@ impl StepExecutor for McpCallStep {
             files: vec![],
         })
     }
+}
+
+/// Execution-time destination gate for the direct `mcp.call` path:
+/// re-extracts hosts, enforces the static `allowed_destinations` ceiling,
+/// then delegates a remaining miss to the operator `destination_decider`
+/// when one is configured. Static hits never consult the decider. The
+/// verdict is journaled (`mcp_destination_decision`, hosts only) for audit;
+/// resumes re-invoke fresh so tightening denies retroactively, and
+/// cancellation propagates instead of denying.
+async fn authorize_direct_destinations(
+    ctx: &StepContext<'_>,
+    node: &NodeDef,
+    profile: &mcp::McpProfile,
+    server: &str,
+    tool: &str,
+    args: &Value,
+) -> Result<(), engine::StepError> {
+    // Static verdict first (host-free passes, misses refuse): the decider
+    // below only widens a miss, so this reuse keeps one matcher.
+    if check_direct_destinations(node, server, tool, profile.allowed_destinations(), args).is_ok() {
+        return Ok(());
+    }
+    let extracted: Vec<String> = policy::extract_mcp_destinations(args).into_iter().collect();
+    if extracted.is_empty() {
+        return Ok(());
+    }
+    let Some(argv) = profile.destination_decider() else {
+        let denied = extracted.join(", ");
+        return Err(engine::StepError::Refused {
+            node: node.id.clone(),
+            message: format!(
+                "MCP tool `{server}/{tool}` destination `{denied}` is not in server `{server}` allowed_destinations; ask the operator to allow it in providers.toml"
+            ),
+        });
+    };
+    let timeout = profile.destination_decider_timeout_seconds();
+    let gateway = engine::CmdGateway::new(
+        ctx.run.contract.manifest.permissions.clone(),
+        ctx.run.fs.workspace().to_owned(),
+    )
+    .with_cancellation(ctx.run.cancellation.clone());
+    let verdict =
+        engine::decide_destination(&gateway, server, tool, &extracted, argv, timeout).await;
+    match verdict {
+        Err(engine::GatewayError::Canceled) => Err(engine::StepError::Cancelled),
+        Err(error) => {
+            record_direct_destination_decision(
+                ctx, node, server, tool, &extracted, timeout, false,
+            )?;
+            Err(engine::StepError::Refused {
+                node: node.id.clone(),
+                message: format!(
+                    "MCP tool `{server}/{tool}` destination decider for server `{server}` failed ({error}); refusing the fetch"
+                ),
+            })
+        }
+        Ok(allow) => {
+            record_direct_destination_decision(
+                ctx, node, server, tool, &extracted, timeout, allow,
+            )?;
+            if allow {
+                Ok(())
+            } else {
+                let denied = extracted.join(", ");
+                Err(engine::StepError::Refused {
+                    node: node.id.clone(),
+                    message: format!(
+                        "MCP tool `{server}/{tool}` destination `{denied}` was denied by the destination decider for server `{server}`"
+                    ),
+                })
+            }
+        }
+    }
+}
+
+/// Journals one delegated destination verdict for audit (hosts only, never
+/// URLs, query values, or arguments).
+fn record_direct_destination_decision(
+    ctx: &StepContext<'_>,
+    node: &NodeDef,
+    server: &str,
+    tool: &str,
+    hosts: &[String],
+    timeout_seconds: u64,
+    allow: bool,
+) -> Result<(), engine::StepError> {
+    ctx.journal
+        .event(
+            "mcp_destination_decision",
+            json!({
+                "node": node.id,
+                "server": server,
+                "tool": tool,
+                "hosts": hosts,
+                "verdict_source": "decider",
+                "allow": allow,
+                "timeout_seconds": timeout_seconds,
+            }),
+        )
+        .map_err(|error| engine::StepError::failed(&node.id, error.to_string()))
 }
 
 /// Fail-closed destination-policy gate for the direct `mcp.call` path:

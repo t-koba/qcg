@@ -280,10 +280,13 @@ pub(crate) async fn execute_mcp_tool(
         .ok_or_else(|| StepError::failed(&node.id, format!("unknown MCP tool alias `{alias}`")))?;
     // Destination-policy gate (server->destination reach): model-chosen
     // URL args must stay within the operator's per-server
-    // `allowed_destinations`. This runs on every execution — fresh and
-    // resumed — before any guard or remote touch, so tightening the policy
-    // applies retroactively and no resend path can bypass it.
-    mcp.check_destinations(node, alias, &args)?;
+    // `allowed_destinations`, with a configured `destination_decider`
+    // consulted as fallback on a static miss. This runs on every execution —
+    // fresh and resumed — before any guard or remote touch, so tightening
+    // the ceiling, the narrowing, or the decider applies retroactively and
+    // no resend path can bypass it. Resume re-invokes the decider fresh; a
+    // journaled allow never grants future execution.
+    mcp.authorize_destinations(ctx, node, alias, &args).await?;
     match resume_agent_mcp_continuation(ctx, node, server, alias, &args, call_id)? {
         ContinuationDecision::Fresh => {}
         ContinuationDecision::Resume {

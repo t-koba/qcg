@@ -1,4 +1,5 @@
 mod command;
+mod decider;
 mod error;
 mod fs;
 #[cfg(unix)]
@@ -9,6 +10,7 @@ mod process;
 mod staging;
 
 pub use command::*;
+pub use decider::*;
 pub use error::*;
 pub use fs::*;
 pub use http::*;

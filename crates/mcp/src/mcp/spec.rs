@@ -1,4 +1,4 @@
-use policy::credential_like_name;
+use policy::{MAX_DECIDER_TIMEOUT_SECONDS, MIN_DECIDER_TIMEOUT_SECONDS, credential_like_name};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
@@ -67,6 +67,18 @@ pub struct McpServerSpec {
     /// server fetches remotely too.
     #[serde(default)]
     pub allowed_destinations: Vec<String>,
+    /// Optional fail-closed destination decider: an operator-configured
+    /// command consulted only when the static `allowed_destinations` ceiling
+    /// misses. Empty (default) keeps current behavior exactly. The command
+    /// receives `{v,server,tool,hosts}` on stdin and must answer
+    /// `{v,allow}` on stdout; anything else denies. The contract must still
+    /// allow the binary through `permissions.commands`.
+    #[serde(default)]
+    pub destination_decider: Vec<String>,
+    /// Bound for one decider invocation. `None` (default) means 5 seconds;
+    /// when set must sit within 1..=10.
+    #[serde(default)]
+    pub destination_decider_timeout_seconds: Option<u64>,
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
     #[serde(default = "default_max_response_bytes")]
@@ -105,6 +117,15 @@ impl std::fmt::Debug for McpServerSpec {
             .field("oauth_store", &self.oauth_store)
             .field("allowed_hosts", &self.allowed_hosts)
             .field("allowed_destinations", &self.allowed_destinations)
+            .field("destination_decider_bin", &self.destination_decider.first())
+            .field(
+                "destination_decider_arg_count",
+                &self.destination_decider.len().saturating_sub(1),
+            )
+            .field(
+                "destination_decider_timeout_seconds",
+                &self.destination_decider_timeout_seconds,
+            )
             .field("timeout_seconds", &self.timeout_seconds)
             .field("max_response_bytes", &self.max_response_bytes)
             .field("tools_list_page_limit", &self.tools_list_page_limit)
@@ -247,6 +268,7 @@ impl McpServerSpec {
                         )
                     })?;
                 }
+                self.validate_destination_decider()?;
             }
             McpTransport::Stdio => {
                 if self.url.is_some() || !self.headers.is_empty() || !self.allowed_hosts.is_empty()
@@ -264,6 +286,7 @@ impl McpServerSpec {
                         )
                     })?;
                 }
+                self.validate_destination_decider()?;
                 if self
                     .command
                     .first()
@@ -371,6 +394,37 @@ impl McpServerSpec {
                     ));
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn validate_destination_decider(&self) -> Result<(), String> {
+        if self.destination_decider.is_empty() {
+            if self.destination_decider_timeout_seconds.is_some() {
+                return Err(format!(
+                    "MCP server `{}` destination_decider_timeout_seconds requires destination_decider",
+                    self.id
+                ));
+            }
+            return Ok(());
+        }
+        if self
+            .destination_decider
+            .first()
+            .is_none_or(|bin| bin.trim().is_empty())
+        {
+            return Err(format!(
+                "MCP server `{}` destination_decider requires a non-empty command",
+                self.id
+            ));
+        }
+        if let Some(timeout) = self.destination_decider_timeout_seconds
+            && !(MIN_DECIDER_TIMEOUT_SECONDS..=MAX_DECIDER_TIMEOUT_SECONDS).contains(&timeout)
+        {
+            return Err(format!(
+                "MCP server `{}` destination_decider_timeout_seconds must be in {MIN_DECIDER_TIMEOUT_SECONDS}..={MAX_DECIDER_TIMEOUT_SECONDS} (got {timeout})",
+                self.id
+            ));
         }
         Ok(())
     }

@@ -5,6 +5,7 @@
 pub mod audit;
 pub mod cost;
 pub mod credential;
+pub mod destination_decider;
 pub mod limits;
 pub mod params;
 pub mod path;
@@ -20,6 +21,11 @@ pub use credential::{
     credential_like_name, extract_mcp_destinations, mcp_destination_is_allowed,
     redact_all_query_values, redact_credential_assignments_in_text, redact_header_values,
     redact_urls_in_text,
+};
+pub use destination_decider::{
+    DECIDER_INPUT_LIMIT_BYTES, DECIDER_OUTPUT_LIMIT_BYTES, DECIDER_PROTOCOL_VERSION,
+    DEFAULT_DECIDER_TIMEOUT_SECONDS, MAX_DECIDER_TIMEOUT_SECONDS, MIN_DECIDER_TIMEOUT_SECONDS,
+    decider_request_json, decider_verdict_allows, effective_decider_timeout_seconds,
 };
 pub use limits::{
     DEFAULT_GC_INTERVAL_SECS, DEFAULT_GC_KEEP, DEFAULT_GC_KEEP_FAILED,

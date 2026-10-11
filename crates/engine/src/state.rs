@@ -20,6 +20,7 @@ const STATE_FREE_JOURNAL_EVENT_KINDS: &[&str] = &[
     "elapsed_exceeded",
     "foreach_sibling_ignored",
     "hook_replayed",
+    "mcp_destination_decision",
     "operation_repeated",
     "step_interrupted",
     "step_timeout",

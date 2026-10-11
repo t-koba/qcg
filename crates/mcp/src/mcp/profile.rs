@@ -67,6 +67,18 @@ impl McpProfile {
         &self.spec.allowed_destinations
     }
 
+    /// Operator destination decider argv for this server, if configured.
+    /// `None` (default) keeps the static ceiling exactly.
+    pub fn destination_decider(&self) -> Option<&[String]> {
+        (!self.spec.destination_decider.is_empty())
+            .then_some(self.spec.destination_decider.as_slice())
+    }
+
+    /// Bound for one decider invocation (documented default when unset).
+    pub fn destination_decider_timeout_seconds(&self) -> u64 {
+        policy::effective_decider_timeout_seconds(self.spec.destination_decider_timeout_seconds)
+    }
+
     pub fn command(&self) -> &[String] {
         &self.spec.command
     }

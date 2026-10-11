@@ -6,7 +6,7 @@ use mcp::{
     McpAccess, McpCallOutcome, McpCommandAccess, McpCommandIsolation, McpContainerRuntime,
     McpError, McpSession,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 use crate::agent::agent_command_permission;
@@ -47,6 +47,10 @@ pub(crate) struct McpAgentTools {
     /// `Some(list)` allows only those hosts with an empty list meaning
     /// query-only. Missing entries inherit the ceiling.
     declared: BTreeMap<String, Option<Vec<String>>>,
+    /// Operator destination decider per resolved server id: `(argv, timeout)`.
+    /// Missing entries keep the static ceiling exactly; present entries only
+    /// widen a static miss at execution time, never a narrowing denial.
+    deciders: BTreeMap<String, (Vec<String>, u64)>,
 }
 
 impl McpAgentTools {
@@ -61,6 +65,12 @@ impl McpAgentTools {
     /// narrowing too (exact match, empty means query-only). Calls with no
     /// extracted host pass, so pure-query search keeps working while fetch
     /// requires an explicit allow. Denials are `Refused`, never silent.
+    ///
+    /// When a static miss meets a configured `destination_decider` that the
+    /// narrowing would still admit, sync validation defers: it passes so the
+    /// non-suspending execution gate ([`Self::authorize_destinations`]) can
+    /// consult operator policy. A denied execution surfaces there as
+    /// `Refused`; narrowing denials never defer.
     pub(crate) fn check_destinations(
         &self,
         node: &NodeDef,
@@ -84,6 +94,17 @@ impl McpAgentTools {
             .filter(|host| !policy::mcp_destination_is_allowed(allowed, host))
             .collect();
         if !denied.is_empty() {
+            let narrow_blocks = match self.declared.get(alias) {
+                Some(Some(narrow)) => extracted
+                    .iter()
+                    .any(|host| !narrow.iter().any(|allowed| allowed == host)),
+                _ => false,
+            };
+            if !narrow_blocks && self.deciders.contains_key(&tool.server) {
+                // Deferred: the execution gate re-checks narrowing and the
+                // ceiling, then delegates this miss to the decider.
+                return Ok(extracted);
+            }
             let denied = denied
                 .into_iter()
                 .map(String::as_str)
@@ -151,12 +172,19 @@ impl McpAgentTools {
 
         let mut permitted_commands = Vec::new();
         let mut destinations = BTreeMap::new();
+        let mut deciders = BTreeMap::new();
         for server in requested.keys() {
             let profile = runtime
                 .mcp
                 .resolve(server)
                 .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
             destinations.insert(server.clone(), profile.allowed_destinations().to_vec());
+            if let Some(argv) = profile.destination_decider() {
+                deciders.insert(
+                    server.clone(),
+                    (argv.to_vec(), profile.destination_decider_timeout_seconds()),
+                );
+            }
             if profile.transport() == mcp::McpTransport::Stdio
                 && let Some(permission) = agent_command_permission(
                     &ctx.run.contract.manifest.permissions.commands,
@@ -296,6 +324,7 @@ impl McpAgentTools {
             tools: resolved,
             destinations,
             declared,
+            deciders,
         })
     }
 
@@ -325,6 +354,116 @@ impl McpAgentTools {
         validate_mcp_value(&node.id, alias, &tool.input_validator, args, "arguments")?;
         self.check_destinations(node, alias, args)?;
         Ok(())
+    }
+
+    /// Execution-time destination gate: re-extracts hosts, enforces the
+    /// narrowing and the static ceiling, then delegates a remaining miss to
+    /// the operator decider when one is configured. Static hits never consult
+    /// the decider and narrowing denials never defer to it. Resumes re-invoke
+    /// fresh, so tightening the ceiling, the narrowing, or the decider
+    /// denies retroactively; a journaled allow never grants future execution.
+    /// The verdict is journaled (`mcp_destination_decision`, hosts only) for
+    /// audit. Cancellation propagates instead of denying.
+    pub(crate) async fn authorize_destinations(
+        &self,
+        ctx: &StepContext<'_>,
+        node: &NodeDef,
+        alias: &str,
+        args: &Value,
+    ) -> Result<(), StepError> {
+        let tool = self.tools.get(alias).ok_or_else(|| {
+            StepError::failed(
+                &node.id,
+                format!("MCP tool alias `{alias}` was not resolved"),
+            )
+        })?;
+        let server = tool.server.as_str();
+        let extracted: Vec<String> = policy::extract_mcp_destinations(args).into_iter().collect();
+        if extracted.is_empty() {
+            return Ok(());
+        }
+        // Same order as sync validation: the static ceiling first, then the
+        // narrowing, so both gates refuse identically and delegation only
+        // ever widens a miss the narrowing would still admit.
+        let allowed = self
+            .destinations
+            .get(&tool.server)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let static_miss = extracted
+            .iter()
+            .any(|host| !policy::mcp_destination_is_allowed(allowed, host));
+        if !static_miss {
+            if let Some(Some(narrow)) = self.declared.get(alias) {
+                let denied: Vec<&String> = extracted
+                    .iter()
+                    .filter(|host| !narrow.iter().any(|allowed| allowed == *host))
+                    .collect();
+                if !denied.is_empty() {
+                    let denied = denied
+                        .into_iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(StepError::Refused {
+                        node: node.id.clone(),
+                        message: format!(
+                            "MCP tool `{alias}` destination `{denied}` is not in tool `{alias}` destinations"
+                        ),
+                    });
+                }
+            }
+            return Ok(());
+        }
+        let narrow_blocks = match self.declared.get(alias) {
+            Some(Some(narrow)) => extracted
+                .iter()
+                .any(|host| !narrow.iter().any(|allowed| allowed == host)),
+            _ => false,
+        };
+        let Some((argv, timeout)) = self.deciders.get(&tool.server).filter(|_| !narrow_blocks)
+        else {
+            let denied = extracted.join(", ");
+            return Err(StepError::Refused {
+                node: node.id.clone(),
+                message: format!(
+                    "MCP tool `{alias}` destination `{denied}` is not in server `{server}` allowed_destinations; ask the operator to allow it in providers.toml"
+                ),
+            });
+        };
+        let gateway = engine::CmdGateway::new(
+            ctx.run.contract.manifest.permissions.clone(),
+            ctx.run.fs.workspace().to_owned(),
+        )
+        .with_cancellation(ctx.run.cancellation.clone());
+        let verdict =
+            engine::decide_destination(&gateway, server, alias, &extracted, argv, *timeout).await;
+        match verdict {
+            Err(engine::GatewayError::Canceled) => Err(StepError::Cancelled),
+            Err(error) => {
+                record_destination_decision(ctx, node, server, alias, &extracted, *timeout, false)?;
+                Err(StepError::Refused {
+                    node: node.id.clone(),
+                    message: format!(
+                        "MCP tool `{alias}` destination decider for server `{server}` failed ({error}); refusing the fetch"
+                    ),
+                })
+            }
+            Ok(allow) => {
+                record_destination_decision(ctx, node, server, alias, &extracted, *timeout, allow)?;
+                if allow {
+                    Ok(())
+                } else {
+                    let denied = extracted.join(", ");
+                    Err(StepError::Refused {
+                        node: node.id.clone(),
+                        message: format!(
+                            "MCP tool `{alias}` destination `{denied}` was denied by the destination decider for server `{server}`"
+                        ),
+                    })
+                }
+            }
+        }
     }
 
     pub(crate) async fn call(
@@ -371,6 +510,34 @@ impl McpAgentTools {
         validate_mcp_complete_result(&node.id, alias, tool.output_validator.as_ref(), value)?;
         Ok(result)
     }
+}
+
+/// Journals one delegated destination verdict for audit. Hosts are
+/// plaintext (matching existing destination journaling); no URLs, query
+/// values, or arguments are recorded, so no secret reaches the journal.
+fn record_destination_decision(
+    ctx: &StepContext<'_>,
+    node: &NodeDef,
+    server: &str,
+    alias: &str,
+    hosts: &[String],
+    timeout_seconds: u64,
+    allow: bool,
+) -> Result<(), StepError> {
+    ctx.journal
+        .event(
+            "mcp_destination_decision",
+            json!({
+                "node": node.id,
+                "server": server,
+                "tool": alias,
+                "hosts": hosts,
+                "verdict_source": "decider",
+                "allow": allow,
+                "timeout_seconds": timeout_seconds,
+            }),
+        )
+        .map_err(|error| StepError::failed(&node.id, error.to_string()))
 }
 
 pub(crate) fn validate_mcp_complete_result(
@@ -537,6 +704,7 @@ mod tests {
             )]),
             destinations: BTreeMap::from([("exa-public".to_string(), allowed)]),
             declared: BTreeMap::from([("fetch".to_string(), declared)]),
+            deciders: BTreeMap::new(),
         }
     }
 
@@ -571,6 +739,54 @@ mod tests {
         tools
             .validate_args(&node, "fetch", &json!({"url": "https://other.test/x"}))
             .expect("wildcard must allow any destination");
+    }
+
+    fn harness_with_decider(
+        allowed: Vec<String>,
+        declared: Option<Vec<String>>,
+        decider: (Vec<String>, u64),
+    ) -> McpAgentTools {
+        let mut tools = harness_with_declared(allowed, declared);
+        tools.deciders.insert("exa-public".to_string(), decider);
+        tools
+    }
+
+    #[test]
+    fn decider_defers_static_miss_but_never_widens_narrowing() {
+        let node = node();
+        let decider = (vec!["decider".to_string()], 5);
+        // A static miss the narrowing would admit defers to execution:
+        // sync validation passes instead of refusing.
+        let tools = harness_with_decider(Vec::new(), None, decider.clone());
+        tools
+            .validate_args(&node, "fetch", &json!({"url": "https://example.test/x"}))
+            .expect("decider-configured miss must defer, not refuse");
+        tools
+            .validate_args(&node, "fetch", &json!({"query": "rust"}))
+            .expect("query-only still passes");
+        // Narrowing still denies without consulting the decider: a miss the
+        // narrowing would also block is refused (static-first, same order as
+        // execution), never deferred.
+        let tools = harness_with_decider(
+            vec!["example.test".to_string()],
+            Some(vec!["example.test".to_string()]),
+            decider,
+        );
+        let error = tools
+            .validate_args(&node, "fetch", &json!({"url": "https://other.test/x"}))
+            .expect_err("narrowing-blocked miss must not defer to the decider");
+        assert!(
+            matches!(error, StepError::Refused { .. }),
+            "narrowing-blocked misses are Refused: {error}"
+        );
+        // Without a decider the same miss refuses as before.
+        let tools = harness(Vec::new());
+        assert!(
+            tools
+                .validate_args(&node, "fetch", &json!({"url": "https://example.test/x"}))
+                .is_err(),
+            "unset decider keeps the static ceiling exactly"
+        );
     }
 
     #[test]

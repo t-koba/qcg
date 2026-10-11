@@ -31,6 +31,8 @@ mod tests {
             oauth_store: OAuthCredentialStore::Memory,
             allowed_hosts: vec!["agent.tinyfish.ai".into()],
             allowed_destinations: vec![],
+            destination_decider: vec![],
+            destination_decider_timeout_seconds: None,
             timeout_seconds: 30,
             max_response_bytes: 1024,
             tools_list_page_limit: default_tools_list_page_limit(),
@@ -181,6 +183,44 @@ mod tests {
                 .validate()
                 .expect_err("non-host destinations must be rejected");
             assert!(error.contains("allowed destination"), "{error}");
+        }
+    }
+
+    #[test]
+    fn destination_decider_is_optional_and_bounded() {
+        // Unset keeps the static ceiling exactly.
+        let mut spec = remote_spec();
+        spec.validate().expect("unset decider must validate");
+        // A decider command with a bounded timeout validates.
+        spec.destination_decider = vec!["decider".into(), "--policy".into()];
+        spec.destination_decider_timeout_seconds = Some(7);
+        spec.validate().expect("bounded decider must validate");
+        // An empty binary never validates.
+        let mut empty = remote_spec();
+        empty.destination_decider = vec!["  ".into()];
+        let error = empty
+            .validate()
+            .expect_err("empty decider command must be rejected");
+        assert!(error.contains("destination_decider"), "{error}");
+        // A timeout without a decider never validates.
+        let mut orphan = remote_spec();
+        orphan.destination_decider_timeout_seconds = Some(5);
+        let error = orphan
+            .validate()
+            .expect_err("orphan decider timeout must be rejected");
+        assert!(error.contains("destination_decider"), "{error}");
+        // Out-of-range timeouts never validate.
+        for timeout in [0, 11] {
+            let mut spec = remote_spec();
+            spec.destination_decider = vec!["decider".into()];
+            spec.destination_decider_timeout_seconds = Some(timeout);
+            let error = spec
+                .validate()
+                .expect_err("out-of-range decider timeout must be rejected");
+            assert!(
+                error.contains("destination_decider_timeout_seconds"),
+                "{error}"
+            );
         }
     }
 
@@ -439,6 +479,8 @@ mod tests {
             oauth_store: OAuthCredentialStore::Memory,
             allowed_hosts: vec![],
             allowed_destinations: vec![],
+            destination_decider: vec![],
+            destination_decider_timeout_seconds: None,
             timeout_seconds: 30,
             max_response_bytes: 1024,
             tools_list_page_limit: default_tools_list_page_limit(),

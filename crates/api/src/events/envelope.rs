@@ -39,6 +39,7 @@ pub const INTERNAL_RUN_EVENT_KINDS: &[&str] = &[
     "hook_skipped",
     "mcp_continuation_consumed",
     "mcp_continuation_resumed",
+    "mcp_destination_decision",
     "mcp_input_pending",
     "operation_finished",
     "operation_repeated",
