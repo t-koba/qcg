@@ -40,7 +40,7 @@ pub async fn decide_destination(
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use camino::Utf8PathBuf;
@@ -69,7 +69,6 @@ mod tests {
         vec!["example.test".to_string()]
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn allow_verdict_permits_the_fetch() {
         let allowed = decide_destination(
@@ -89,7 +88,6 @@ mod tests {
         assert!(allowed);
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn deny_verdict_and_failures_refuse() {
         let gateway = gateway_with_sh(test_workspace());
@@ -150,7 +148,6 @@ mod tests {
         assert!(denied.is_err(), "undeclared decider must fail closed");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn timeout_denies_without_hanging_the_gate() {
         let denied = decide_destination(
