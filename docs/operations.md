@@ -327,6 +327,22 @@ is disabled for unknown scopes in the UI.
 
 ### systemd timer
 
+Compute the calendar date outside the unit file: `%Y`, `%m`, and `%d`
+are systemd unit specifiers (fragment directory, machine id, credentials
+directory), not strftime, so `--input date=%Y-%m-%d` would pass host
+metadata instead of a date. Keep the date policy in a small wrapper and
+call it from the unit, mirroring the cron example above:
+
+```sh
+# /usr/local/bin/qcg-report
+#!/bin/sh
+exec /usr/local/bin/qcg run /srv/qcg/generators/report \
+  --input "date=$(date +%F)" \
+  --answer scope=brief \
+  --confirm publish:http:<64hex>=true \
+  --output /srv/qcg/out --yes
+```
+
 ```ini
 # /etc/systemd/system/report.service
 [Unit]
@@ -337,11 +353,7 @@ After=network-online.target
 Type=oneshot
 User=qcg
 Environment=API_TOKEN_FILE=/etc/qcg/api-token
-ExecStart=/usr/local/bin/qcg run /srv/qcg/generators/report \
-  --input date=%Y-%m-%d \
-  --answer scope=brief \
-  --confirm publish:http:<64hex>=true \
-  --output /srv/qcg/out --yes
+ExecStart=/usr/local/bin/qcg-report
 ```
 
 ```ini
