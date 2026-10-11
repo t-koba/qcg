@@ -10,10 +10,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tokio_util::sync::CancellationToken;
 
 /// Per-run pending LLM reservations shared across parallel tasks in this
-/// process. Each entry tracks conservatively reserved tokens and cost that
-/// have not yet settled into the journal budget. Reservations prevent
-/// parallel calls from each passing a post-hoc check and jointly overspending
-/// a hard cap (strongest budget guarantee).
+/// process. Each entry tracks estimated tokens and cost that have not yet
+/// settled into the journal budget. Reservations are estimated preflight
+/// admission: they reduce (but do not bound) joint parallel overspend.
+/// Enforcement is post-hoc from reported usage, not a hard upstream
+/// spending cap.
 #[derive(Debug, Default, Clone)]
 struct PendingReservation {
     tokens: u64,
@@ -198,10 +199,11 @@ impl<'a> LlmGateway<'a> {
         F: FnOnce(&TokenUsage) -> Value,
     {
         self.scan_request(node, &request)?;
-        // Hard-cap reservation before spending: estimate worst-case tokens
-        // and cost, then hold them so parallel calls cannot jointly exceed
-        // the cap. Soft post-hoc enforcement alone lets N parallel calls
-        // each pass and overspend N-fold.
+        // Estimated preflight admission before spending: hold estimated
+        // tokens and cost so parallel calls are less likely to jointly
+        // exceed the budget. Post-hoc enforcement alone lets N parallel
+        // calls each pass and overspend N-fold; the estimate itself is not
+        // a bound on real spend.
         let reservation = self.estimate_reservation(node, &request)?;
         self.try_reserve(reservation.clone())?;
         let complete_result = self
@@ -211,10 +213,14 @@ impl<'a> LlmGateway<'a> {
         complete_result
     }
 
-    /// Conservative worst-case estimate for one call: prompt bytes/4 input
-    /// tokens plus the full requested max output, priced when known.
+    /// Estimated admission for one call: prompt bytes/4 input tokens plus
+    /// the full requested max output, priced on the initial request model
+    /// when known. Bytes/4 is an average heuristic, not a worst-case bound:
+    /// token-dense input can exceed it, a pricier fallback route can exceed
+    /// the initial-route price, and retries can incur unreported usage.
     /// Unknown pricing with an enforced cost cap fails closed here instead
-    /// of spending blindly.
+    /// of spending blindly. Do not treat the reservation as an upstream
+    /// spending guarantee; caps are enforced post-hoc from reported usage.
     fn estimate_reservation(
         &self,
         node: &NodeDef,

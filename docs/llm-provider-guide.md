@@ -541,7 +541,13 @@ Mechanism enforces, policy chooses. qcg enforces run-wide `[budget]`
 ordered `fallback_models` (at most 8, retryable route failures only), and the
 streaming rule that route fallback is refused once the first delta is emitted
 (partial billing is then unavoidable). Unpriced routes account as zero and are
-flagged, since totals may understate spend.
+flagged, since totals may understate spend. Chat token and cost ceilings use
+estimated preflight admission (prompt bytes/4 plus the requested max output,
+priced on the initial route) plus post-hoc accounting from reported usage:
+local admission and accounting cannot guarantee that the provider never
+exceeds the ceiling, since token-dense input, a pricier fallback route, and
+retry attempts with unreported usage can all exceed the estimate. Do not
+treat the local ceiling as an upstream spending guarantee.
 
 Policy guidance for authors:
 

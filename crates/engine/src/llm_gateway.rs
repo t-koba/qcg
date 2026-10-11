@@ -299,6 +299,37 @@ mod tests {
         }
     }
 
+    struct TokenDenseProvider {
+        called: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        input_usage: u64,
+    }
+
+    #[async_trait]
+    impl LlmProvider for TokenDenseProvider {
+        fn id(&self) -> &str {
+            "dense"
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+
+        async fn complete(&self, _req: ChatRequest) -> Result<ChatResponse, LlmError> {
+            self.called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(ChatResponse {
+                content: vec![ChatContent::Text("dense response".into())],
+                usage: TokenUsage {
+                    input: self.input_usage,
+                    output: 0,
+                    reasoning: 0,
+                    cached_input: 0,
+                },
+                stop: StopReason::EndTurn,
+                provider_state: None,
+            })
+        }
+    }
+
     #[tokio::test]
     async fn gateway_routes_retryable_failures_to_declared_fallback_model() {
         let dir = test_dir("route-test");
@@ -600,6 +631,65 @@ mod tests {
             }
         ));
         assert_eq!(journal.state().budget.cost_microusd, 1_000_001);
+    }
+
+    #[tokio::test]
+    async fn gateway_dispatches_before_posthoc_when_usage_exceeds_estimate() {
+        // Bytes/4 is an average, not a bound: a token-dense report above the
+        // admission estimate must still dispatch, then fail post-hoc.
+        let dir = test_dir("dense-estimate");
+        let journal = test_journal(&dir, "dense-estimate-test");
+        let secrets = SecretStore::default();
+        let mut request = test_request();
+        request.provider = "dense".into();
+        let prompt_bytes = serde_json::to_vec(&request)
+            .expect("request should serialize")
+            .len() as u64;
+        let estimate = prompt_bytes
+            .div_ceil(4)
+            .saturating_add(u64::from(request.max_tokens));
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gateway = LlmGateway::new(
+            Arc::new(TokenDenseProvider {
+                called: std::sync::Arc::clone(&called),
+                input_usage: estimate.saturating_add(10),
+            }),
+            &secrets,
+            &journal,
+            CancellationToken::new(),
+            LlmCostBudget {
+                max_tokens: Some(estimate),
+                max_cost_microusd: None,
+                require_pricing: false,
+            },
+            Vec::new(),
+        );
+        let error = gateway
+            .complete(
+                &test_node(),
+                request,
+                &test_routes(&[("dense", "test")]),
+                |_| json!({}),
+            )
+            .await
+            .expect_err("token-dense usage above the estimate must fail post-hoc");
+        assert!(
+            called.load(std::sync::atomic::Ordering::SeqCst),
+            "admission must dispatch before post-hoc enforcement"
+        );
+        assert!(matches!(
+            error,
+            StepError::BudgetExceeded {
+                resource: "tokens",
+                ..
+            }
+        ));
+        assert_eq!(
+            journal.state().budget.tokens_input,
+            estimate.saturating_add(10)
+        );
+        assert!(persisted_text(&dir).contains("llm_call"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn test_request() -> ChatRequest {
