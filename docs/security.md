@@ -353,8 +353,8 @@ never be treated as instructions. Result URLs are citations, not an implicit
 permission to fetch those pages.
 
 The generic `mcp` agent tool is also explicit opt-in. Its contract fixes the
-profile `server`, remote `tool`, per-tool call budget, and whether the operation
-is expected to have side effects. Streamable HTTP profiles allow only their
+profile `server`, remote `tool`, per-tool call budget, whether the operation
+is expected to have side effects, and optional per-tool `destinations` narrowing. Streamable HTTP profiles allow only their
 declared `allowed_hosts`, require every one of those hosts in
 `permissions.network`, and use HTTPS for non-loopback endpoints. Stdio profiles
 allow only their exact command vector through `permissions.commands`; the child
@@ -365,7 +365,7 @@ model-chosen URL arguments pass a second operator-owned ceiling first:
 fetch remotely too). Extraction is whole-value strings only — prose that merely
 mentions a URL never gates — and the empty default denies every extracted host
 while host-free calls pass. Residual: the ceiling covers only the initial whole-value host; qcg cannot re-check where the MCP server fetches next (server-side redirect targets) and has no DNS pinning for the remotely fetched host (remote resolution stays outside qcg, same scope note as `network_deny_private_ips` above, which covers only qcg-originated fetches). The per-hop re-check and resolve-then-check pinning in the next paragraph apply only to qcg-originated `permissions.network` fetches via `HttpGateway`, not to server-side destinations. Prefer `web.search`/pure-query tools over server-side fetch, list explicit per-host destinations (avoid `"*"` on cloud/loopback-adjacent deployments), and keep fetch tools default-deny until each fetch host is fronted by an explicit row. Extracted hosts are journaled in plaintext for audit;
-query values stay redacted by the existing MCP journal redaction.
+query values stay redacted by the existing MCP journal redaction. A contract may narrow the ceiling per `mcp` tool with `destinations` (absent inherits the ceiling; an explicit list allows only those hosts, empty means query-only). Entries are canonical hosts only, never `"*"` or URLs, and each entry must sit within the profile `allowed_destinations` at declaration validation. The narrowing is enforced alongside the ceiling at every execution with `Refused` denials; it is pinned to the run contract version while ceiling tightening applies retroactively to resumed calls, and resume recomputes the extraction and refuses on mismatch.
 
 Network allowlist scope: `permissions.network` (and MCP `allowed_hosts`) match the URL hostname as a string only, with no DNS lookup or resolved-IP filtering by default (`ensure_url_allowed` in `crates/engine/src/gateway/http.rs`). `"*"` therefore includes loopback, link-local, and cloud metadata endpoints, and an explicit hostname does not pin DNS against rebinding. Prefer explicit hosts and avoid `"*"` on cloud or loopback-adjacent deployments; every redirect hop is re-checked against the same string allowlist. Opt-in hardening for the HTTP fetch path: `permissions.network_deny_private_ips = true` resolve-then-checks ALL A/AAAA records on every hop, denies non-global IPs (loopback, private, link-local, multicast, unspecified, reserved, documentation), and pins the connection to the validated addresses (single resolution per hop; Host/TLS SNI stay the original hostname). Default off so existing wildcard deployments keep working; MCP `allowed_hosts` keeps string matching. Wildcard-DNS names such as `<169.254.169.254>.nip.io` (and `sslip.io`/`xip.io`/`traefik.me` equivalents) stay DNS names: the string allowlist passes them when `"*"` or the name is listed, and only `network_deny_private_ips = true` denies them at resolve time — prefer `= true` on cloud or loopback-adjacent deployments.
 
