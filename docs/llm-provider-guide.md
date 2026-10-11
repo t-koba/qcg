@@ -367,7 +367,16 @@ server-side redirect targets or pin server-side DNS. The `HttpGateway`
 per-hop re-check and `network_deny_private_ips` pinning apply only to
 qcg-originated fetches. Prefer `web.search`/pure-query tools over server-side
 fetch and list explicit per-host destinations (avoid `"*"` on
-cloud/loopback-adjacent deployments).
+cloud/loopback-adjacent deployments). When enumeration cannot cover the reach,
+a row may configure a fallback-only `destination_decider = ["bin", "arg"]`
+plus `destination_decider_timeout_seconds` (default 5, bounded 1..=10): on a
+static miss the per-tool narrowing would still admit, the execution gate hands
+hosts-only `{v,server,tool,hosts}` on stdin to operator policy and requires
+strict `{v,allow}` on stdout, denying on unset, failure, timeout, non-zero
+exit, oversize, or malformed output. The binary must itself be allowed through
+the contract's `[permissions].commands`; verdicts are journaled as
+`mcp_destination_decision` (hosts only) and resumes re-invoke fresh. Unset
+keeps the static ceiling exactly.
 
 `lifecycle` selects MCP session negotiation explicitly: `initialize` uses the
 widely deployed initialize handshake, while `discover` requires the modern
@@ -395,7 +404,9 @@ auth = "none"
 
 `stdio` requires a non-empty command and cannot declare `url`, `headers`, or
 `allowed_hosts`. It can declare `allowed_destinations`, with the same
-whole-value extraction and empty-default-deny semantics as above. The child process receives a cleared environment containing
+whole-value extraction and empty-default-deny semantics as above, plus the
+same optional fallback-only `destination_decider` and bounded
+`destination_decider_timeout_seconds`. The child process receives a cleared environment containing
 only `PATH`, the non-sensitive `env` entries, and `env_from` values copied from
 the qcg process. Sensitive environment names must use `env_from`; provider
 credentials are never inherited implicitly. The complete command vector must

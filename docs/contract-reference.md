@@ -4057,8 +4057,17 @@ extracted host is refused). Entries are canonical hosts only, never `"*"` or
 URLs, and each entry must sit within the server's `allowed_destinations`. The
 narrowing is checked both at validation and at execution alongside the ceiling
 with `Refused` denials naming the tool destinations; it is pinned to the run's
-contract version while ceiling tightening still applies retroactively. The
-deterministic `mcp.call` step keeps the operator ceiling only.
+contract version while ceiling tightening still applies retroactively. When
+enumeration cannot cover the reach, the row may configure a fallback-only
+`destination_decider` command plus `destination_decider_timeout_seconds`
+(default 5, bounded 1..=10): on a static miss the narrowing would still admit,
+the execution gate hands hosts-only `{v,server,tool,hosts}` to operator policy
+and requires strict `{v,allow}` on stdout, denying on unset, failure, timeout,
+non-zero exit, or malformed output. The binary must itself be allowed through
+`permissions.commands`; verdicts are journaled as `mcp_destination_decision`
+and resumes re-invoke fresh. Both the agent `mcp` tool path and the
+deterministic `mcp.call` step share this fallback; unset keeps the static
+ceiling exactly.
 
 Before the first model request, qcg connects to each declared MCP server and
 discovers its `tools/list` schema. That input schema is authoritative for

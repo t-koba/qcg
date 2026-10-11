@@ -98,7 +98,12 @@ Each profile also carries an operator-owned `allowed_destinations` ceiling for
 server-side fetch (hosts extracted from whole-value `http(s)` URL arguments,
 empty by default which denies every extracted host). To allow a fetch
 destination, add its host to the server's row in `providers.toml` and restart
-qcg; tightening the list applies retroactively to resumed calls. Denials are
+qcg; tightening the list applies retroactively to resumed calls. A row may
+additionally configure a fallback-only `destination_decider` command plus
+bounded `destination_decider_timeout_seconds` for a static miss the per-tool
+narrowing admits; the decider takes hosts-only input, must answer strict
+`{v,allow}`, denies fail-closed, and its verdict is journaled as
+`mcp_destination_decision` with fresh re-invocation on resume. Denials are
 `Refused` `tool_call` failures naming the offending host, and the extracted
 hosts ride the `operation_started` details alongside the argument summary for
 audit.
