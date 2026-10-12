@@ -468,8 +468,10 @@ Each profile chooses the `initialize` lifecycle or the 2026-07-28
 `server/discover` lifecycle. Known public profiles are pinned to the lifecycle
 verified against the real service. The client advertises
 the Tasks extension and handles multi-round-trip `input_required`
-results. Form elicitation requests are projected onto qcg's durable HITL form,
+results. Direct form elicitation requests are projected onto qcg's durable HITL form,
 and the accepted values plus opaque request state resume the original tool call.
+A task that requests input while polling fails explicitly; only direct
+elicitation suspends for input.
 Unsupported input request methods fail explicitly. Only form-mode elicitation is
 supported; URL (out-of-band) mode fails explicitly. Client sampling and roots are
 not exposed.

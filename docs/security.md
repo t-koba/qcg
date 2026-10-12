@@ -435,9 +435,11 @@ argument names and encoded size. Each MCP profile selects `initialize` or
 silently retries a different protocol lifecycle after a negotiation failure.
 qcg advertises MCP Tasks, polls task completion
 within the bounded profile timeout, and sends task cancellation when the run is
-canceled. Multi-round-trip `input_required` responses are converted into the
-same durable, journaled HITL boundary as contract questions, then resumed with
-the server-provided request state. Deprecated client sampling is not exposed.
+canceled. Direct (synchronous) multi-round-trip `input_required` responses are
+converted into the same durable, journaled HITL boundary as contract questions,
+then resumed with the server-provided request state. A polled task that asks
+for interactive input fails explicitly instead: task handles stay in memory
+and never enter the HITL boundary. Deprecated client sampling is not exposed.
 
 Header authentication is preferred. When an upstream API requires query
 authentication, qcg appends the secret only after checking the public endpoint

@@ -4091,9 +4091,10 @@ Each MCP profile explicitly selects the `initialize` lifecycle or the 2026-07-28
 `server/discover` lifecycle. Custom profiles default to `discover`, while known
 public profiles are pinned to their verified lifecycle. The client advertises the
 Tasks extension and supports multi-round-trip
-`input_required` tool results. MCP elicitation requests become runtime-generated
+`input_required` tool results. Direct MCP elicitation requests become runtime-generated
 forms on the ordinary durable DAG pause/resume boundary; answers and the opaque
-request state are returned to the original tool call. Unsupported input request
+request state are returned to the original tool call. Task-based input requests
+fail explicitly instead: a polled task never suspends for input. Unsupported input request
 methods fail explicitly. Only form-mode elicitation is supported: URL
 (out-of-band) mode and other modes fail explicitly instead of being coerced
 into an in-band form. Client sampling and roots are not exposed.

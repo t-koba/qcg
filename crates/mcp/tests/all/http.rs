@@ -726,6 +726,341 @@ async fn streamable_http_task_poll_honors_cancellation_near_deadline() {
     let _ = server.await;
 }
 
+#[derive(Debug, Clone, Default)]
+struct TaskInputServer;
+
+impl ServerHandler for TaskInputServer {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tasks()
+                .build(),
+        )
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        Ok(ListToolsResult {
+            tools: vec![Tool::new(
+                "task-ask",
+                "Task that wants input.",
+                object(json!({
+                    "type": "object",
+                    "additionalProperties": false
+                }))?,
+            )],
+            ..Default::default()
+        })
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        if request.name != "task-ask" {
+            return Err(ErrorData::invalid_params("unknown tool", None));
+        }
+        Ok(CreateTaskResult::new(Task::new(
+            "task-1",
+            TaskStatus::Working,
+            "2025-11-25T10:30:00Z",
+            "2025-11-25T10:40:00Z",
+        ))
+        .into())
+    }
+
+    async fn get_task(
+        &self,
+        _request: GetTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, ErrorData> {
+        Ok(GetTaskResult::new(DetailedTask::new(
+            Task::new(
+                "task-1",
+                TaskStatus::InputRequired,
+                "2025-11-25T10:30:00Z",
+                "2025-11-25T10:40:00Z",
+            ),
+            TaskPayload::InputRequired {
+                input_requests: BTreeMap::new(),
+            },
+        )))
+    }
+
+    async fn cancel_task(
+        &self,
+        _request: CancelTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn streamable_http_task_input_required_fails_at_hitl_boundary() {
+    // Only direct (synchronous) elicitation rides the durable journaled
+    // HITL path: a polled task that asks for interactive input must fail
+    // explicitly instead of suspending on an in-memory handle.
+    let server_cancellation = CancellationToken::new();
+    let service: StreamableHttpService<TaskInputServer, LocalSessionManager> =
+        StreamableHttpService::new(
+            || Ok(TaskInputServer),
+            Arc::new(LocalSessionManager::default()),
+            StreamableHttpServerConfig::default()
+                .with_cancellation_token(server_cancellation.child_token()),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("loopback listener should bind");
+    let address = listener.local_addr().expect("listener has an address");
+    let shutdown = server_cancellation.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, axum::Router::new().nest_service("/mcp", service))
+            .with_graceful_shutdown(shutdown.cancelled_owned())
+            .await
+            .expect("MCP test server should run");
+    });
+
+    let mut profile = spec("task-input", &format!("http://{address}/mcp"));
+    profile.timeout_seconds = 15;
+    profile.task_poll_interval_ms = 50;
+    let runtime = McpRuntime::from_specs(vec![profile]).expect("HTTP profile should load");
+    let access = McpAccess {
+        network_hosts: BTreeSet::from(["127.0.0.1".into()]),
+        commands: vec![],
+        workspace: std::env::current_dir().expect("workspace should exist"),
+    };
+    let session = runtime
+        .connect("task-input", &access, CancellationToken::new())
+        .await
+        .expect("MCP session should initialize");
+    let error = session
+        .call_tool("task-ask", json!({}))
+        .await
+        .expect_err("task input must fail, never suspend");
+    assert!(
+        matches!(&error, mcp::McpError::Transport(message) if message.contains("outside the HITL boundary")),
+        "task input must fail at the HITL boundary, got: {error}"
+    );
+
+    drop(session);
+    server_cancellation.cancel();
+    server.await.expect("server task should stop");
+}
+
+#[derive(Debug, Clone, Default)]
+struct TaskRestartServer {
+    calls: Arc<AtomicU64>,
+    latest: Arc<std::sync::Mutex<String>>,
+    polls: Arc<AtomicU64>,
+}
+
+impl ServerHandler for TaskRestartServer {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tasks()
+                .build(),
+        )
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        Ok(ListToolsResult {
+            tools: vec![Tool::new(
+                "task-again",
+                "Task that completes once re-issued.",
+                object(json!({
+                    "type": "object",
+                    "additionalProperties": false
+                }))?,
+            )],
+            ..Default::default()
+        })
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        if request.name != "task-again" {
+            return Err(ErrorData::invalid_params("unknown tool", None));
+        }
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let task_id = format!("task-{call}");
+        *self.latest.lock().expect("task ledger should unlock") = task_id.clone();
+        Ok(CreateTaskResult::new(Task::new(
+            task_id,
+            TaskStatus::Working,
+            "2025-11-25T10:30:00Z",
+            "2025-11-25T10:40:00Z",
+        ))
+        .into())
+    }
+
+    async fn get_task(
+        &self,
+        _request: GetTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, ErrorData> {
+        // The orphaned generation never completes for its lost client:
+        // only a re-issued call (a second task) observes completion, with
+        // its own fresh task id echoed in the result.
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        let latest = self
+            .latest
+            .lock()
+            .expect("task ledger should unlock")
+            .clone();
+        if self.calls.load(Ordering::SeqCst) < 2 {
+            return Ok(GetTaskResult::new(DetailedTask::new(
+                Task::new(
+                    latest,
+                    TaskStatus::Working,
+                    "2025-11-25T10:30:00Z",
+                    "2025-11-25T10:40:00Z",
+                ),
+                TaskPayload::Working,
+            )));
+        }
+        let result = json!({
+            "content": [],
+            "structuredContent": { "task": latest },
+        })
+        .as_object()
+        .cloned()
+        .expect("task result should be an object");
+        Ok(GetTaskResult::new(DetailedTask::new(
+            Task::new(
+                latest,
+                TaskStatus::Completed,
+                "2025-11-25T10:30:00Z",
+                "2025-11-25T10:40:00Z",
+            ),
+            TaskPayload::Completed { result },
+        )))
+    }
+
+    async fn cancel_task(
+        &self,
+        _request: CancelTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn streamable_http_task_poll_restarts_with_a_fresh_task() {
+    // Task handles live in memory: losing the session mid-poll (a restart)
+    // cannot resume the orphaned server task. The next call starts over
+    // with a new task instead of hanging on the dead handle.
+    let calls = Arc::new(AtomicU64::new(0));
+    let polls = Arc::new(AtomicU64::new(0));
+    let state = TaskRestartServer {
+        calls: Arc::clone(&calls),
+        latest: Arc::new(std::sync::Mutex::new(String::new())),
+        polls: Arc::clone(&polls),
+    };
+    let server_cancellation = CancellationToken::new();
+    let service: StreamableHttpService<TaskRestartServer, LocalSessionManager> =
+        StreamableHttpService::new(
+            move || Ok(state.clone()),
+            Arc::new(LocalSessionManager::default()),
+            StreamableHttpServerConfig::default()
+                .with_cancellation_token(server_cancellation.child_token()),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("loopback listener should bind");
+    let address = listener.local_addr().expect("listener has an address");
+    let shutdown = server_cancellation.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, axum::Router::new().nest_service("/mcp", service))
+            .with_graceful_shutdown(shutdown.cancelled_owned())
+            .await
+            .expect("MCP test server should run");
+    });
+
+    let mut profile = spec("task-restart", &format!("http://{address}/mcp"));
+    profile.timeout_seconds = 15;
+    profile.task_poll_interval_ms = 50;
+    let runtime = McpRuntime::from_specs(vec![profile]).expect("HTTP profile should load");
+    let access = McpAccess {
+        network_hosts: BTreeSet::from(["127.0.0.1".into()]),
+        commands: vec![],
+        workspace: std::env::current_dir().expect("workspace should exist"),
+    };
+    // First generation, scoped so the restart drops it whole: the pinned
+    // (never spawned) future models the process dying mid-poll with the
+    // task handle still in memory.
+    {
+        let session = runtime
+            .connect("task-restart", &access, CancellationToken::new())
+            .await
+            .expect("MCP session should initialize");
+        let call = session.call_tool("task-again", json!({}));
+        tokio::pin!(call);
+        let waited = std::time::Instant::now();
+        while polls.load(Ordering::SeqCst) == 0 {
+            if waited.elapsed() > std::time::Duration::from_secs(5) {
+                panic!("restart fixture never began polling");
+            }
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {},
+                _ = &mut call => panic!("orphan generation must stay in flight"),
+            }
+        }
+        // Still pending while its task reports Working: genuinely mid-poll.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut call)
+                .await
+                .is_err(),
+            "the doomed call must still be polling"
+        );
+    }
+    // Restart: the in-flight future and its session are gone; task-1 is
+    // orphaned with no client handle left to resume it.
+    drop(runtime);
+    // Next generation: a fresh runtime and session re-issue the call.
+    let mut profile = spec("task-restart", &format!("http://{address}/mcp"));
+    profile.timeout_seconds = 15;
+    profile.task_poll_interval_ms = 50;
+    let runtime = McpRuntime::from_specs(vec![profile]).expect("HTTP profile should load");
+    let session = runtime
+        .connect("task-restart", &access, CancellationToken::new())
+        .await
+        .expect("MCP session should initialize");
+    let completed = session
+        .call_tool("task-again", json!({}))
+        .await
+        .expect("re-issued call must complete");
+    assert_eq!(
+        completed["structuredContent"]["task"],
+        json!("task-2"),
+        "restart must complete the fresh task, got: {completed}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "restart must re-issue, never resume the orphan"
+    );
+
+    drop(session);
+    server_cancellation.cancel();
+    server.await.expect("server task should stop");
+}
+
 #[tokio::test]
 async fn streamable_http_timeout_closes_the_session() {
     let server_cancellation = CancellationToken::new();
