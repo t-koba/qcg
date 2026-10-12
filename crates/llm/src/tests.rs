@@ -646,6 +646,40 @@ fn provider_payloads_map_explicit_invocation_policy() {
 }
 
 #[test]
+fn responses_payload_keeps_verbosity_alongside_native_schema_format() {
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": { "answer": { "type": "string" } },
+        "required": ["answer"]
+    });
+
+    // Verbosity-only keeps the text object without a format key.
+    let mut verbose_only = sample_request();
+    verbose_only.verbosity = Some(ResponseVerbosity::Low);
+    let payload = responses_payload(&verbose_only, None);
+    assert_eq!(payload["text"]["verbosity"], "low");
+    assert!(payload["text"].get("format").is_none());
+
+    // Schema-only keeps the format object without a verbosity key.
+    let mut schema_only = sample_request();
+    schema_only.response_schema = Some(schema.clone());
+    schema_only.structured_output = StructuredOutputMode::NativeStrict;
+    let payload = responses_payload(&schema_only, None);
+    assert_eq!(payload["text"]["format"]["type"], "json_schema");
+    assert!(payload["text"]["format"]["strict"].as_bool().unwrap());
+    assert!(payload["text"].get("verbosity").is_none());
+
+    // The combination keeps both: verbosity must survive the format branch.
+    let mut combined = schema_only.clone();
+    combined.verbosity = Some(ResponseVerbosity::Low);
+    let payload = responses_payload(&combined, None);
+    assert_eq!(payload["text"]["verbosity"], "low");
+    assert_eq!(payload["text"]["format"]["type"], "json_schema");
+    assert_eq!(payload["text"]["format"]["schema"], schema);
+}
+
+#[test]
 fn invocation_policy_rejects_conflicts_and_tool_controls_without_tools() {
     let mut request = sample_request();
     request.top_p = Some(0.5);

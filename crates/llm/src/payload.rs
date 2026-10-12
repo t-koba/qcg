@@ -84,13 +84,11 @@ pub(crate) fn responses_payload(
         payload["text"]["verbosity"] = json!(verbosity);
     }
     if let Some((schema, strict)) = native_response_schema(req) {
-        payload["text"] = json!({
-            "format": {
-                "type": "json_schema",
-                "name": "response",
-                "strict": strict,
-                "schema": schema
-            }
+        payload["text"]["format"] = json!({
+            "type": "json_schema",
+            "name": "response",
+            "strict": strict,
+            "schema": schema
         });
     }
     if !req.tools.is_empty() {
