@@ -40,10 +40,11 @@ impl std::fmt::Debug for HttpGateway {
 
 /// A non-globally-reachable address is denied when the opt-in is on.
 /// Stable-only octet/segment matching (no nightly `is_global`): loopback,
-/// private, link-local, shared, documentation, benchmark, multicast,
-/// unspecified, broadcast, and reserved ranges are all denied; only
-/// public unicast passes. Fail-closed: any unrecognized special range
-/// added later should extend this list.
+/// private, link-local, shared, documentation, benchmark, discard-only,
+/// dummy, local-use translation, SRv6 SIDs, multicast, unspecified,
+/// broadcast, and reserved ranges are all denied; only public unicast
+/// passes. Fail-closed: any unrecognized special range added later
+/// should extend this list.
 pub fn ip_is_denied_when_opted_in(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -108,6 +109,17 @@ pub fn ip_is_denied_when_opted_in(ip: &IpAddr) -> bool {
                 || (s[0] & 0xffc0) == 0xfe80
                 || (s[0] & 0xfe00) == 0xfc00
                 || (s[0] == 0x2001 && s[1] == 0x0db8)
+                // IANA non-global special ranges (Globally Reachable=False):
+                // local-use translation, discard-only, dummy, benchmarking,
+                // documentation, and SRv6 SIDs. No blanket 2001::/23 deny:
+                // global exceptions like 2001:1::1 and 2001:3::/32 stay
+                // reachable below.
+                || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0x0001)
+                || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0)
+                || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0x0001)
+                || (s[0] == 0x2001 && s[1] == 0x0002)
+                || (s[0] == 0x3fff && (s[1] & 0xf000) == 0)
+                || s[0] == 0x5f00
         }
     }
 }
@@ -1152,6 +1164,21 @@ mod tests {
             "64:ff9b::a9fe:a9fe",
             "2001:0:5db8:d822:0000:1234:f5ff:fffe",
             "2001:0:a00:1:0000:1234:a247:27dd",
+            // IANA IPv6 Special-Purpose Registry (2025-10-09),
+            // Globally Reachable=False: first/last/in-prefix per range.
+            "64:ff9b:1::1",
+            "64:ff9b:1:ffff:ffff:ffff:ffff:ffff",
+            "100::1",
+            "100::ffff:ffff:ffff:ffff",
+            "100:0:0:1::1",
+            "100:0:0:1:ffff:ffff:ffff:ffff",
+            "2001:2::1",
+            "2001:2:ffff:ffff:ffff:ffff:ffff:ffff",
+            "3fff::1",
+            "3fff:fff::1",
+            "3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "5f00::1",
+            "5f00:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
         ] {
             let ip: IpAddr = denied.parse().expect("test IP should parse");
             assert!(ip_is_denied_when_opted_in(&ip), "{denied} must be denied");
@@ -1165,6 +1192,15 @@ mod tests {
             "2002:5db8:d822::",
             "64:ff9b::5db8:d822",
             "2001:0:5db8:d822:0000:1234:a247:27dd",
+            // Just outside the new deny ranges, plus IANA global
+            // exceptions inside 2001::/23 that a blanket deny would break.
+            "64:ff9b:2::1",
+            "101::1",
+            "100:0:0:2::1",
+            "2001:1::1",
+            "2001:3::1",
+            "3fff:1000::1",
+            "5e00::1",
         ] {
             let ip: IpAddr = allowed.parse().expect("test IP should parse");
             assert!(!ip_is_denied_when_opted_in(&ip), "{allowed} must pass");
