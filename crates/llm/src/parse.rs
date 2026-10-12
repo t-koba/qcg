@@ -193,7 +193,17 @@ pub(crate) fn parse_responses_response(value: Value) -> Result<ChatResponse, Llm
             _ => {}
         }
     }
-    if content.is_empty() {
+    // Reasoning-only token exhaustion is a documented terminal: incomplete
+    // with max_output_tokens may carry no visible text or calls while still
+    // reporting billed input and reasoning usage. Let that empty content
+    // through so usage and the MaxTokens classification survive; every other
+    // empty response stays rejected below.
+    let incomplete_exhaustion = value.get("status").and_then(Value::as_str) == Some("incomplete")
+        && value
+            .pointer("/incomplete_details/reason")
+            .and_then(Value::as_str)
+            == Some("max_output_tokens");
+    if content.is_empty() && !incomplete_exhaustion {
         return Err(LlmError::invalid_response(
             "Responses API response did not include text or tool calls",
         ));

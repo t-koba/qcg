@@ -1119,6 +1119,87 @@ async fn responses_stream_rejects_unknown_incomplete_and_missing_terminal() {
 }
 
 #[test]
+fn parses_responses_reasoning_only_incomplete_preserves_usage() {
+    // Documented terminal with no visible output: reasoning consumed the
+    // budget before any text or call was produced, while input and
+    // reasoning costs were still incurred.
+    for output in [
+        json!([{ "type": "reasoning", "encrypted_content": "opaque" }]),
+        json!([]),
+    ] {
+        let response = parse_responses_response(json!({
+            "status": "incomplete",
+            "incomplete_details": { "reason": "max_output_tokens" },
+            "output": output,
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "output_tokens_details": { "reasoning_tokens": 5 }
+            }
+        }))
+        .expect("reasoning-only exhaustion should parse");
+        assert!(response.content.is_empty());
+        assert_eq!(response.stop, StopReason::MaxTokens);
+        assert_eq!(response.usage.input, 10);
+        assert_eq!(response.usage.output, 5);
+        assert_eq!(response.usage.reasoning, 5);
+    }
+    // The allowance is narrow: contentless completed and unknown statuses
+    // stay rejected even with usage present.
+    for terminal in [
+        json!({
+            "status": "completed",
+            "output": [],
+            "usage": { "input_tokens": 10, "output_tokens": 5 }
+        }),
+        json!({
+            "status": "incomplete",
+            "incomplete_details": { "reason": "max_messages" },
+            "output": [],
+            "usage": { "input_tokens": 10, "output_tokens": 5 }
+        }),
+    ] {
+        assert!(
+            parse_responses_response(terminal).is_err(),
+            "contentless responses outside max_output_tokens exhaustion must fail"
+        );
+    }
+}
+
+#[tokio::test]
+async fn responses_stream_preserves_reasoning_only_incomplete_usage() {
+    let terminal = json!({
+        "status": "incomplete",
+        "incomplete_details": { "reason": "max_output_tokens" },
+        "output": [{ "type": "reasoning", "encrypted_content": "opaque" }],
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "output_tokens_details": { "reasoning_tokens": 5 }
+        }
+    });
+    let direct = parse_responses_response(terminal.clone())
+        .expect("direct reasoning-only exhaustion should parse");
+    let (events, _receiver) = mpsc::channel(4);
+    let mut accumulator = HttpStreamAccumulator::new(ApiFlavor::Responses)
+        .expect("responses accumulator should build");
+    let streamed = accumulator
+        .ingest(
+            json!({ "type": "response.incomplete", "response": terminal }),
+            &events,
+        )
+        .await
+        .expect("reasoning-only incomplete should ingest")
+        .expect("reasoning-only incomplete is a terminal response");
+    assert!(streamed.content.is_empty());
+    assert_eq!(streamed.stop, StopReason::MaxTokens);
+    assert_eq!(streamed.stop, direct.stop);
+    assert_eq!(streamed.usage.input, 10);
+    assert_eq!(streamed.usage.output, 5);
+    assert_eq!(streamed.usage.reasoning, 5);
+}
+
+#[test]
 fn interpolates_environment_placeholders() {
     if env_process::isolated() {
         return;

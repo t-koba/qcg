@@ -330,6 +330,35 @@ mod tests {
         }
     }
 
+    struct ExhaustedProvider;
+
+    #[async_trait]
+    impl LlmProvider for ExhaustedProvider {
+        fn id(&self) -> &str {
+            "exhausted"
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+
+        // Reasoning-only token exhaustion: no visible content, but the
+        // provider still reports billed usage with a MaxTokens stop.
+        async fn complete(&self, _req: ChatRequest) -> Result<ChatResponse, LlmError> {
+            Ok(ChatResponse {
+                content: vec![],
+                usage: TokenUsage {
+                    input: 10,
+                    output: 5,
+                    reasoning: 5,
+                    cached_input: 0,
+                },
+                stop: StopReason::MaxTokens,
+                provider_state: None,
+            })
+        }
+    }
+
     #[tokio::test]
     async fn gateway_routes_retryable_failures_to_declared_fallback_model() {
         let dir = test_dir("route-test");
@@ -713,6 +742,35 @@ mod tests {
             stream: false,
             prompt_cache: llm::PromptCache::Off,
         }
+    }
+
+    #[tokio::test]
+    async fn gateway_records_usage_for_contentless_token_exhaustion() {
+        // The parser lets reasoning-only incomplete exhaustion through with
+        // empty content so its usage survives; the gateway must journal that
+        // usage into the budget even though downstream MaxTokens gates will
+        // still fail the generation itself.
+        let dir = test_dir("exhausted-usage");
+        let journal = test_journal(&dir, "exhausted-usage-test");
+        let secrets = SecretStore::default();
+        let gateway = test_gateway(Arc::new(ExhaustedProvider), &secrets, &journal);
+        let mut request = test_request();
+        request.provider = "exhausted".into();
+        let response = gateway
+            .complete(
+                &test_node(),
+                request,
+                &test_routes(&[("exhausted", "test")]),
+                |_| json!({}),
+            )
+            .await
+            .expect("exhausted usage must still complete the gateway call");
+        assert!(response.content.is_empty());
+        assert_eq!(response.stop, StopReason::MaxTokens);
+        assert_eq!(journal.state().budget.tokens_input, 10);
+        assert_eq!(journal.state().budget.tokens_output, 5);
+        assert!(persisted_text(&dir).contains("llm_call"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn test_routes(routes: &[(&str, &str)]) -> Vec<ModelRef> {
