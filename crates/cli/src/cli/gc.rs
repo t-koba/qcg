@@ -37,7 +37,10 @@ pub(crate) fn gc_runs_impl(
             continue;
         }
         let summary = run_summary(&path)?;
-        if !matches!(summary.status.as_str(), "success" | "failed" | "canceled") {
+        if !matches!(
+            summary.status.as_str(),
+            "success" | "failed" | "canceled" | "interrupted"
+        ) {
             continue;
         }
         let retention_days = run_retention_days(&summary)?;

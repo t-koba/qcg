@@ -907,6 +907,110 @@ extras = []
     }
 
     #[test]
+    fn gc_includes_interrupted_in_counts_and_expiry() {
+        fn write_success(run_dir: &Utf8PathBuf, retention_days: u64) {
+            std::fs::create_dir_all(run_meta_dir(run_dir))
+                .expect("run metadata directory should be created");
+            let run_id = run_dir.file_name().expect("run should have a name");
+            let journal = engine::JournalWriter::create(
+                &run_meta_dir(run_dir).join("journal.jsonl"),
+                run_id,
+                false,
+                None,
+            )
+            .expect("journal should be created");
+            journal
+                .event(
+                    "run_started",
+                    json!({
+                        "generator": "gc-fixture",
+                        "generator_path": "gc-fixture",
+                        "contract_sha256": "fixture",
+                        "inputs": {},
+                        "resource_hashes": [],
+                        "schema_version": 1,
+                        "retention_days": retention_days,
+                    }),
+                )
+                .expect("run should start");
+            journal
+                .event("run_finished", json!({ "status": "success" }))
+                .expect("run should finish");
+        }
+
+        fn write_interrupted(run_dir: &Utf8PathBuf, retention_days: u64) {
+            std::fs::create_dir_all(run_meta_dir(run_dir))
+                .expect("run metadata directory should be created");
+            let run_id = run_dir.file_name().expect("run should have a name");
+            let journal = engine::JournalWriter::create(
+                &run_meta_dir(run_dir).join("journal.jsonl"),
+                run_id,
+                false,
+                None,
+            )
+            .expect("journal should be created");
+            journal
+                .event(
+                    "run_started",
+                    json!({
+                        "generator": "gc-fixture",
+                        "generator_path": "gc-fixture",
+                        "contract_sha256": "fixture",
+                        "inputs": {},
+                        "resource_hashes": [],
+                        "schema_version": 1,
+                        "retention_days": retention_days,
+                    }),
+                )
+                .expect("run should start");
+            journal
+                .event(
+                    "run_interrupted",
+                    json!({
+                        "reason": {"code": "interrupted", "message": "service shutdown"},
+                    }),
+                )
+                .expect("run should interrupt");
+        }
+
+        let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .expect("temporary directory should be UTF-8")
+            .join(format!("cli-gc-interrupted-test-{}", Uuid::now_v7()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Counts: with no keep budget every terminal run goes, including
+        // interrupted ones that the server GC already collects.
+        let counted = root.join("counted");
+        write_success(&counted.join("success"), 365);
+        write_interrupted(&counted.join("interrupted"), 365);
+        gc_runs_impl(&counted, 0, 0, true, false).expect("counted GC should run");
+        assert!(
+            !counted.join("interrupted").exists(),
+            "interrupted runs count against keep like any other terminal run"
+        );
+        assert!(
+            !counted.join("success").exists(),
+            "success runs are deleted when keep is zero"
+        );
+
+        // Expiry: a run past its retention window goes even inside keep.
+        let expiring = root.join("expiring");
+        write_success(&expiring.join("success-new"), 365);
+        write_interrupted(&expiring.join("interrupted-expired"), 0);
+        gc_runs_impl(&expiring, 50, 10, true, false).expect("expiring GC should run");
+        assert!(
+            !expiring.join("interrupted-expired").exists(),
+            "an expired interrupted run is deleted regardless of keep counts"
+        );
+        assert!(
+            expiring.join("success-new").is_dir(),
+            "a fresh success run stays inside keep"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn package_verification_accepts_pinned_hash_and_ed25519_signature() {
         let bytes = b"bounded generator package";
         let digest = hex::encode(Sha256::digest(bytes));
