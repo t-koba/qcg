@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use camino::Utf8PathBuf;
 use model::{ReasoningEffort, ResponseVerbosity, StructuredOutputMode, ToolChoice};
 use policy::credential_like_name;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -728,6 +728,81 @@ async fn chat_stream_accumulates_text_deltas_and_usage() {
         matches!(receiver.try_recv(), Ok(ChatStreamEvent::TextDelta { text }) if text == "hel")
     );
     assert!(matches!(receiver.try_recv(), Ok(ChatStreamEvent::TextDelta { text }) if text == "lo"));
+}
+
+#[tokio::test]
+async fn chat_stream_refusal_deltas_classify_as_refusal() {
+    // Refusal text with finish_reason="stop" must not become EndTurn: the
+    // direct parser gives nonempty refusal precedence as Refusal.
+    let direct = parse_chat_completions_response(json!({
+        "choices": [{
+            "message": { "content": null, "refusal": "Cannot comply" },
+            "finish_reason": "stop"
+        }],
+        "usage": { "prompt_tokens": 10, "completion_tokens": 3 }
+    }))
+    .expect("direct refusal should parse");
+    assert_eq!(direct.stop, StopReason::Refusal);
+
+    // Split refusal across deltas still classifies, with identical content
+    // and usage to the direct parse.
+    let (events, _receiver) = mpsc::channel(8);
+    let mut accumulator = ChatCompletionAccumulator::default();
+    for (text, refusal, finish) in [
+        (Some("Cannot "), Some(""), None),
+        (Some(""), Some("comply"), Some("stop")),
+    ] {
+        let mut delta = serde_json::Map::new();
+        if let Some(text) = text {
+            delta.insert("content".into(), json!(text));
+        }
+        if let Some(refusal) = refusal {
+            delta.insert("refusal".into(), json!(refusal));
+        }
+        let mut choice = serde_json::Map::new();
+        choice.insert("delta".into(), Value::Object(delta));
+        choice.insert(
+            "finish_reason".into(),
+            finish.map_or(Value::Null, |s: &str| json!(s)),
+        );
+        accumulator
+            .ingest(
+                &json!({
+                    "choices": [choice],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 3}
+                }),
+                &events,
+            )
+            .await
+            .unwrap();
+    }
+    let streamed = accumulator.finish().expect("refusal stream should finish");
+    assert_eq!(streamed.stop, StopReason::Refusal);
+    assert_eq!(streamed.stop, direct.stop);
+    assert_eq!(streamed.usage.input, direct.usage.input);
+    assert_eq!(streamed.usage.output, direct.usage.output);
+    assert!(matches!(&streamed.content[0], ChatContent::Text(text) if text == "Cannot comply"));
+
+    // Plain text with finish stop stays EndTurn: the flag must not leak.
+    let (events, _receiver) = mpsc::channel(4);
+    let mut accumulator = ChatCompletionAccumulator::default();
+    accumulator
+        .ingest(
+            &json!({
+                "choices": [{"delta": {"content": "hello"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 1}
+            }),
+            &events,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        accumulator
+            .finish()
+            .expect("clean stream should finish")
+            .stop,
+        StopReason::EndTurn
+    );
 }
 
 #[tokio::test]

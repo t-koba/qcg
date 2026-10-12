@@ -84,6 +84,7 @@ pub(crate) struct ChatCompletionAccumulator {
     tool_calls: BTreeMap<usize, PartialToolCall>,
     usage: Option<TokenUsage>,
     stop: Option<StopReason>,
+    refused: bool,
 }
 
 impl ChatCompletionAccumulator {
@@ -120,19 +121,22 @@ impl ChatCompletionAccumulator {
             return Ok(());
         };
         let delta = choice.get("delta").unwrap_or(&Value::Null);
-        for text in [delta.get("content"), delta.get("refusal")]
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .filter(|text| !text.is_empty())
-        {
-            self.text.push_str(text);
-            send_ingest_event(
-                events,
-                ChatStreamEvent::TextDelta {
-                    text: text.to_string(),
-                },
-            )?;
+        // Refusal deltas join the text stream but keep their classification:
+        // like the direct parser, any nonempty refusal wins as Refusal at
+        // finish regardless of finish_reason.
+        for (field, is_refusal) in [("content", false), ("refusal", true)] {
+            if let Some(text) = delta.get(field).and_then(Value::as_str)
+                && !text.is_empty()
+            {
+                self.text.push_str(text);
+                self.refused |= is_refusal;
+                send_ingest_event(
+                    events,
+                    ChatStreamEvent::TextDelta {
+                        text: text.to_string(),
+                    },
+                )?;
+            }
         }
         for call in delta
             .get("tool_calls")
@@ -190,14 +194,22 @@ impl ChatCompletionAccumulator {
                 "OpenAI-compatible stream did not include text or tool calls",
             ));
         }
+        let stop = self.stop.ok_or_else(|| {
+            LlmError::invalid_response("OpenAI-compatible stream did not include finish_reason")
+        })?;
+        // Direct-parser parity: a nonempty refusal classifies as Refusal even
+        // when finish_reason says otherwise.
+        let stop = if self.refused {
+            StopReason::Refusal
+        } else {
+            stop
+        };
         Ok(ChatResponse {
             content,
             usage: self.usage.ok_or_else(|| {
                 LlmError::invalid_response("OpenAI-compatible stream did not include usage")
             })?,
-            stop: self.stop.ok_or_else(|| {
-                LlmError::invalid_response("OpenAI-compatible stream did not include finish_reason")
-            })?,
+            stop,
             provider_state: None,
         })
     }
