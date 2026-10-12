@@ -2741,9 +2741,10 @@ async fn elapsed_budget_is_a_hard_deadline() {
         ),
         "elapsed must classify distinctly from node timeout and cancel, got: {error}"
     );
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        1,
+    // The 1s deadline may fire before the first attempt on slow runners
+    // (0 calls) or interrupt it (1 call); either way it must never retry.
+    assert!(
+        calls.load(Ordering::SeqCst) <= 1,
         "the elapsed limit must not be retried as a transient failure"
     );
     let _ = std::fs::remove_dir_all(&run_dir);
