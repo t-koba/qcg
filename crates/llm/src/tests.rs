@@ -806,6 +806,117 @@ async fn chat_stream_refusal_deltas_classify_as_refusal() {
 }
 
 #[tokio::test]
+async fn chat_stream_rejects_malformed_usage_with_direct_parity() {
+    // Malformed required counts must fail on both paths instead of the
+    // stream journaling fabricated zeros.
+    for usage in [
+        json!({}),
+        json!({"prompt_tokens": -1, "completion_tokens": "bad"}),
+        json!({"prompt_tokens": 10}),
+    ] {
+        let direct = parse_chat_completions_response(json!({
+            "choices": [{
+                "message": { "content": "hello" },
+                "finish_reason": "stop"
+            }],
+            "usage": usage.clone()
+        }));
+        assert!(
+            direct.is_err(),
+            "direct parser must reject malformed usage {usage}"
+        );
+        let (events, _receiver) = mpsc::channel(4);
+        let mut accumulator = ChatCompletionAccumulator::default();
+        accumulator
+            .ingest(
+                &json!({
+                    "choices": [{"delta": {"content": "hello"}, "finish_reason": "stop"}],
+                    "usage": usage
+                }),
+                &events,
+            )
+            .await
+            .unwrap();
+        let error = accumulator
+            .finish()
+            .expect_err("stream must reject malformed usage {usage}");
+        assert!(error.to_string().contains("usage"), "{error}");
+    }
+    // Valid zero counts stay accepted on both paths: required means
+    // present integers, not nonzero.
+    let direct = parse_chat_completions_response(json!({
+        "choices": [{
+            "message": { "content": "hello" },
+            "finish_reason": "stop"
+        }],
+        "usage": { "prompt_tokens": 0, "completion_tokens": 0 }
+    }))
+    .expect("direct parser must accept explicit zeros");
+    assert_eq!(direct.usage.input, 0);
+    let (events, _receiver) = mpsc::channel(4);
+    let mut accumulator = ChatCompletionAccumulator::default();
+    accumulator
+        .ingest(
+            &json!({
+                "choices": [{"delta": {"content": "hello"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0}
+            }),
+            &events,
+        )
+        .await
+        .unwrap();
+    let streamed = accumulator
+        .finish()
+        .expect("stream must accept explicit zeros");
+    assert_eq!(streamed.usage.input, 0);
+    assert_eq!(streamed.usage.output, 0);
+}
+
+#[tokio::test]
+async fn anthropic_stream_requires_input_usage_with_direct_parity() {
+    // No message_start: input usage is missing and must fail like the
+    // direct parser instead of journaling zero.
+    let direct = parse_anthropic_response(json!({
+        "content": [{ "type": "text", "text": "hello" }],
+        "stop_reason": "end_turn",
+        "usage": { "output_tokens": 2 }
+    }));
+    assert!(
+        direct.is_err(),
+        "direct parser must reject missing input usage"
+    );
+    let (events, _receiver) = mpsc::channel(4);
+    let mut accumulator = AnthropicAccumulator::default();
+    // Text plus stop so only the missing input usage can fail finish.
+    accumulator
+        .ingest(
+            &json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": { "type": "text_delta", "text": "hello" }
+            }),
+            &events,
+        )
+        .await
+        .unwrap();
+    accumulator
+        .ingest(
+            &json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "end_turn" },
+                "usage": { "output_tokens": 2 }
+            }),
+            &events,
+        )
+        .await
+        .unwrap();
+    let error = accumulator
+        .finish()
+        .expect_err("stream must reject missing input usage");
+    assert!(error.to_string().contains("input usage"), "{error}");
+}
+
+#[tokio::test]
 async fn circuit_breaker_opens_after_declared_failures() {
     let mut spec = spec_with_base_url("guarded", "http://127.0.0.1:1/v1/");
     spec.circuit_breaker_failures = Some(2);

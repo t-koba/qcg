@@ -83,6 +83,7 @@ pub(crate) struct ChatCompletionAccumulator {
     text: String,
     tool_calls: BTreeMap<usize, PartialToolCall>,
     usage: Option<TokenUsage>,
+    usage_invalid: bool,
     stop: Option<StopReason>,
     refused: bool,
 }
@@ -93,25 +94,33 @@ impl ChatCompletionAccumulator {
         value: &Value,
         events: &mpsc::Sender<ChatStreamEvent>,
     ) -> Result<(), LlmError> {
+        // Required usage counts are validated like the direct parser:
+        // present-but-malformed input/output marks the stream invalid
+        // instead of journaling fabricated zeros. Cached and reasoning
+        // details stay optional with zero defaults.
         if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) {
-            self.usage = Some(TokenUsage {
-                input: usage
-                    .get("prompt_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_default(),
-                output: usage
-                    .get("completion_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_default(),
-                reasoning: usage
-                    .pointer("/completion_tokens_details/reasoning_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_default(),
-                cached_input: usage
-                    .pointer("/prompt_tokens_details/cached_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_default(),
-            });
+            match (
+                usage.get("prompt_tokens").and_then(Value::as_u64),
+                usage.get("completion_tokens").and_then(Value::as_u64),
+            ) {
+                (Some(input), Some(output)) => {
+                    self.usage = Some(TokenUsage {
+                        input,
+                        output,
+                        reasoning: usage
+                            .pointer("/completion_tokens_details/reasoning_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or_default(),
+                        cached_input: usage
+                            .pointer("/prompt_tokens_details/cached_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or_default(),
+                    });
+                }
+                _ => {
+                    self.usage_invalid = true;
+                }
+            }
         }
         let Some(choice) = value
             .get("choices")
@@ -204,6 +213,11 @@ impl ChatCompletionAccumulator {
         } else {
             stop
         };
+        if self.usage_invalid {
+            return Err(LlmError::invalid_response(
+                "OpenAI-compatible stream returned invalid usage",
+            ));
+        }
         Ok(ChatResponse {
             content,
             usage: self.usage.ok_or_else(|| {
@@ -267,7 +281,7 @@ async fn ingest_responses_stream(
 pub(crate) struct AnthropicAccumulator {
     text: String,
     tool_calls: BTreeMap<usize, PartialToolCall>,
-    input_tokens: u64,
+    input_tokens: Option<u64>,
     cached_input_tokens: u64,
     output_tokens: Option<u64>,
     stop: Option<StopReason>,
@@ -281,10 +295,11 @@ impl AnthropicAccumulator {
     ) -> Result<(), LlmError> {
         match value.get("type").and_then(Value::as_str) {
             Some("message_start") => {
+                // Like the direct parser, input usage is required: its
+                // absence fails at finish instead of journaling zero.
                 self.input_tokens = value
                     .pointer("/message/usage/input_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_default();
+                    .and_then(Value::as_u64);
                 self.cached_input_tokens = value
                     .pointer("/message/usage/cache_read_input_tokens")
                     .and_then(Value::as_u64)
@@ -411,7 +426,9 @@ impl AnthropicAccumulator {
         Ok(ChatResponse {
             content,
             usage: TokenUsage {
-                input: self.input_tokens,
+                input: self.input_tokens.ok_or_else(|| {
+                    LlmError::invalid_response("Anthropic stream did not include input usage")
+                })?,
                 output: self.output_tokens.ok_or_else(|| {
                     LlmError::invalid_response("Anthropic stream did not include output usage")
                 })?,
