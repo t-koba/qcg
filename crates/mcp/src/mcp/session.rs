@@ -289,14 +289,14 @@ impl McpSession {
         loop {
             tokio::select! {
                 _ = self.cancellation.cancelled() => {
-                    self.best_effort_cancel_task(&task_id).await;
+                    self.best_effort_cancel_task(&task_id);
                     return Err(McpError::Canceled);
                 }
                 _ = tokio::time::sleep(Duration::from_millis(poll_interval)) => {}
             }
             let detailed = tokio::select! {
                 _ = self.cancellation.cancelled() => {
-                    self.best_effort_cancel_task(&task_id).await;
+                    self.best_effort_cancel_task(&task_id);
                     return Err(McpError::Canceled);
                 }
                 result = client.peer().get_task(GetTaskParams::new(task_id.clone())) => {
@@ -352,20 +352,24 @@ impl McpSession {
         }
     }
 
-    /// Best-effort remote task cleanup. `tasks/cancel` is cooperative, so
-    /// acknowledgement never proves work stopped; the local `Canceled`
-    /// classification is preserved even if cleanup fails or times out. The
-    /// 5s bound matches session close and keeps cancellation responsive
-    /// well before the profile timeout.
-    async fn best_effort_cancel_task(&self, task_id: &str) {
+    /// Best-effort remote task cleanup, detached so an observed
+    /// cancellation keeps its `Canceled` classification even against short
+    /// profile deadlines: awaiting cleanup inside the profile timeout lets
+    /// the deadline overwrite `Canceled` with `TimedOut`. `tasks/cancel` is
+    /// cooperative, so acknowledgement never proves work stopped. The
+    /// detached attempt stays bounded by its own 5s timeout, matching
+    /// session close.
+    fn best_effort_cancel_task(&self, task_id: &str) {
         if let Some(client) = self.client.as_ref() {
-            let _ = tokio::time::timeout(
-                Duration::from_secs(5),
-                client
-                    .peer()
-                    .cancel_task(CancelTaskParams::new(task_id.to_owned())),
-            )
-            .await;
+            let peer = client.peer().clone();
+            let task_id = task_id.to_owned();
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    peer.cancel_task(CancelTaskParams::new(task_id)),
+                )
+                .await;
+            });
         }
     }
 

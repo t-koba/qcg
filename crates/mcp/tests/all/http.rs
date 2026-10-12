@@ -600,20 +600,25 @@ async fn streamable_http_task_poll_honors_run_cancellation() {
         .connect("task-cancel", &access, run_cancellation.clone())
         .await
         .expect("MCP session should initialize");
-    let call = tokio::spawn(async move { session.call_tool("task-slow", json!({})).await });
+    // Pinned, not spawned: the session must outlive the call or its drop
+    // tears down the transport the detached cleanup travels on.
+    let call = session.call_tool("task-slow", json!({}));
+    tokio::pin!(call);
     let waited = std::time::Instant::now();
     while get_calls.load(Ordering::SeqCst) == 0 {
         if waited.elapsed() > std::time::Duration::from_secs(5) {
             panic!("stalled poll never began");
         }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {},
+            _ = &mut call => panic!("stalled call finished before poll began"),
+        }
     }
     let started = std::time::Instant::now();
     run_cancellation.cancel();
     let error = tokio::time::timeout(std::time::Duration::from_secs(10), call)
         .await
         .expect("stalled poll and cleanup must stay bounded")
-        .expect("call task should join")
         .expect_err("stalled task must cancel");
     assert!(
         matches!(error, mcp::McpError::Canceled),
@@ -627,10 +632,96 @@ async fn streamable_http_task_poll_honors_run_cancellation() {
         get_calls.load(Ordering::SeqCst) >= 1,
         "cancel must happen after the poll began"
     );
+    // Detached remote cleanup travels over HTTP after Canceled returns.
+    let cleanup_waited = std::time::Instant::now();
+    while cancel_calls.load(Ordering::SeqCst) == 0 {
+        if cleanup_waited.elapsed() > std::time::Duration::from_secs(2) {
+            panic!("bounded remote cleanup must be attempted");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn streamable_http_task_poll_honors_cancellation_near_deadline() {
+    // Short profiles must not turn observed cancellation into TimedOut: the
+    // 5s cleanup bound alone exceeds the whole operation budget here, so
+    // cleanup stays detached and Canceled wins.
+    let get_calls = Arc::new(AtomicU64::new(0));
+    let cancel_calls = Arc::new(AtomicU64::new(0));
+    let state = TaskStallServer {
+        get_calls: Arc::clone(&get_calls),
+        cancel_calls: Arc::clone(&cancel_calls),
+    };
+    let server_cancellation = CancellationToken::new();
+    let service: StreamableHttpService<TaskStallServer, LocalSessionManager> =
+        StreamableHttpService::new(
+            move || Ok(state.clone()),
+            Arc::new(LocalSessionManager::default()),
+            StreamableHttpServerConfig::default()
+                .with_cancellation_token(server_cancellation.child_token()),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("loopback listener should bind");
+    let address = listener.local_addr().expect("listener has an address");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, axum::Router::new().nest_service("/mcp", service))
+            .await
+            .expect("MCP test server should run");
+    });
+
+    let mut profile = spec("task-deadline", &format!("http://{address}/mcp"));
+    profile.timeout_seconds = 3;
+    profile.task_poll_interval_ms = 50;
+    let runtime = McpRuntime::from_specs(vec![profile]).expect("HTTP profile should load");
+    let access = McpAccess {
+        network_hosts: BTreeSet::from(["127.0.0.1".into()]),
+        commands: vec![],
+        workspace: std::env::current_dir().expect("workspace should exist"),
+    };
+    let run_cancellation = CancellationToken::new();
+    let session = runtime
+        .connect("task-deadline", &access, run_cancellation.clone())
+        .await
+        .expect("MCP session should initialize");
+    // Pinned, not spawned: the session must outlive the call or its drop
+    // tears down the transport the detached cleanup travels on.
+    let call = session.call_tool("task-slow", json!({}));
+    tokio::pin!(call);
+    let waited = std::time::Instant::now();
+    while get_calls.load(Ordering::SeqCst) == 0 {
+        if waited.elapsed() > std::time::Duration::from_secs(5) {
+            panic!("stalled poll never began");
+        }
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {},
+            _ = &mut call => panic!("stalled call finished before poll began"),
+        }
+    }
+    let started = std::time::Instant::now();
+    run_cancellation.cancel();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(10), call)
+        .await
+        .expect("cancellation must beat the 3s profile deadline")
+        .expect_err("stalled task must cancel");
     assert!(
-        cancel_calls.load(Ordering::SeqCst) >= 1,
-        "bounded remote cleanup must be attempted"
+        matches!(error, mcp::McpError::Canceled),
+        "cancellation near the deadline must stay Canceled, got: {error}"
     );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "cancellation must win before the 3s profile timeout"
+    );
+    let cleanup_waited = std::time::Instant::now();
+    while cancel_calls.load(Ordering::SeqCst) == 0 {
+        if cleanup_waited.elapsed() > std::time::Duration::from_secs(2) {
+            panic!("bounded remote cleanup must be attempted");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     server.abort();
     let _ = server.await;
 }
