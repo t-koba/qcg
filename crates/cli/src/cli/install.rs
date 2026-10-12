@@ -38,16 +38,17 @@ pub(crate) struct InstallVerification<'a> {
     pub(crate) public_key: Option<&'a str>,
 }
 
-/// Best-effort removal of install staging left by a killed process.
-/// Reaps this tool's prefixes (`.install-temp-*` and
-/// `.install-backup-*` under `generators_dir`; `.install-stage-*`,
-/// `.install-archive-*`, and `.install-private-*` under the OS temp
-/// dir). Entries carrying the current pid are this process's own leftovers
-/// from a killed earlier run and are reaped aggressively; foreign or
-/// unparsable names keep the 1h age gate so a concurrent install's fresh
-/// staging is never touched (E14-8). Files and directories are both reaped;
-/// symlinks are never followed and never reaped. Removal failures are
-/// collected and returned, never silently squashed (E14-11).
+/// Best-effort removal of stale install staging under `parent` matching
+/// `prefix` (`.install-temp-*` under `generators_dir`; `.install-stage-*`,
+/// `.install-archive-*`, and `.install-private-*` under the OS temp dir —
+/// backups are never reaped here, they go through the recovery-aware backup
+/// sweep). The 1h age gate applies to every entry including same-process
+/// ones: the pid only proves which process created an entry, never that it
+/// is dead, so a concurrent install's fresh staging is never touched
+/// (E14-8). Files and directories are both reaped; symlinks are never
+/// followed — a stale planted link is unlinked itself, never its target.
+/// Removal failures are collected and returned, never silently squashed
+/// (E14-11).
 pub(crate) fn reap_install_tmps_before(
     parent: &Utf8Path,
     prefix: &str,
@@ -336,11 +337,11 @@ pub(crate) async fn install(
             ));
         }
     };
-    // Single commit phase: dependencies first, parent last. No SBOM
-    // inventory demand beyond staged verification for raw directory
-    // sources: they never carried supply-chain metadata. The staged copy
-    // was already contract-validated; what must not happen is a committed
-    // parent without its closure.
+    // Single commit phase: dependencies first, parent last. Staging already
+    // verified the SBOM inventory (directory sources carry supply-chain
+    // metadata, fail-closed E14), so commit adds no second demand. The
+    // staged copy was already contract-validated; what must not happen is
+    // a committed parent without its closure.
     for dep_staged in staged_closure {
         let dep_id = dep_staged.contract.manifest.generator.id.clone();
         finish_install(
@@ -1566,9 +1567,6 @@ version = "1.0.0"
         // cannot redirect the commit.
         let root = test_root("stage-copy");
         let _temp_guard = TempGuard(root.clone());
-        // Serialize with other installs: the stale-temp sweep reaps
-        // own-pid private staging aggressively, so a concurrent install
-        // could reap this test's live staging mid-assertion.
         let home = root.join("home");
         std::fs::create_dir_all(&home).expect("home dir should be created");
         let _env = set_registry_home(&home).await;

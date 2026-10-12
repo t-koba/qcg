@@ -505,15 +505,13 @@ pub(crate) fn commit_install(
         // Durability: fsync the parent after moving the existing target to
         // backup, before replacing (E14 backup→fsync→replace→fsync). A crash
         // between backup and replace leaves `target` missing with `backup`
-        // intact; the next boot's stale sweep keeps foreign backups for 1h
-        // (never reaps fresh foreign staging), and rerunning the install
-        // converges (fresh target installed, orphan backup reaped later).
-        // Boot-time recovery: if `target` is missing but a
-        // `.install-backup-*` sibling exists, the previous commit was
-        // interrupted after backup — rerun the install (or manually rename
-        // the newest backup back to `target`); the backup is retained on
-        // replace failure below for manual restore, never auto-deleted on
-        // failure paths.
+        // intact; every install runs recovery before its sweep, so a missing
+        // target with a backup sibling restores automatically and rerunning
+        // the install converges (fresh target installed, orphan backup
+        // reaped later). Manual rename of the newest backup back to `target`
+        // is only a last resort if automatic recovery fails; the backup is
+        // retained on replace failure below for manual restore, never
+        // auto-deleted on failure paths.
         if let Err(error) = fsync_parent_dir(target) {
             // Best-effort rollback: try to restore the backup before
             // reporting; if restore also fails, retain the backup path for

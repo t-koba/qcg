@@ -507,18 +507,20 @@ cover liveness and Prometheus monitoring.
 Installing an already-installed parent re-verifies its file inventory and
 re-walks its dependency closure instead of returning success on the parent
 alone, so an interrupted install is repaired by re-running the same command;
-there is no rollback of the already-committed parent. Dependencies that
-cannot be resolved or fetched fail the repair closed: a partial closure is
-never recorded as complete. Direct path installs (a local directory or file
-instead of a registry package) also walk the dependency closure against the
-configured registries after committing the parent; a missing set fails the
-install with the partial state and the repair (rerun the same command)
-instead of lingering silently. Crash recovery is not an automatic rollback:
-a commit interrupted after the backup rename leaves the target missing with
-a `.install-backup-*` sibling intact; rerun the install to converge (or
-manually rename the newest backup back to the target). Backups are retained
-on failure paths, never auto-deleted, and only reaped by the stale sweep
-after aging out.
+repair converges forward, it never rolls back the already-committed parent.
+Dependencies that cannot be resolved or fetched fail the repair closed: a
+partial closure is never recorded as complete. The full closure is staged
+before anything commits, for registry and direct path installs alike (a
+local directory or file stages its closure against the configured registries
+first); siblings sharing a dependency select a single version for the whole
+closure, and a missing or conflicting set refuses pre-commit with nothing
+committed, so there is no partial state to repair. A commit interrupted
+after the backup rename leaves the target missing with a
+`.install-backup-*` sibling intact; every install restores a missing target
+from its backup automatically before sweeping, so rerunning the same command
+converges (manual rename of the newest backup back to the target is only a
+last resort). Backups are retained on failure paths and only reaped by the
+stale sweep after aging out.
 
 ## Shutdown and restart semantics
 
