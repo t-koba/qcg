@@ -20,7 +20,7 @@ run_step npm --prefix frontend/generator run generate:wasm
 run_step npm --prefix frontend/generator run check:api
 run_step npm --prefix frontend/generator run check
 run_step npm --prefix frontend/generator test
-run_step node scripts/e2e-ui-playwright.mjs
+run_step npm --prefix frontend/generator run build
 run_step bash scripts/check-dist-bundle.sh --frontend-built
 
 echo "local demo CI audit ok"

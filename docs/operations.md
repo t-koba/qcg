@@ -225,8 +225,8 @@ bash scripts/check-demo-local.sh
 ```
 
 The demo check generates OpenAPI and WASM bindings, validates the frontend,
-runs browser tests against both the Vite proxy and assets served by qcg, and
-checks the distribution bundle.
+builds it, and checks the distribution bundle. Browser tests against both
+the Vite proxy and assets served by qcg run only in CI (`Demo end-to-end` job).
 
 When a qpx binary is available, verify the documented deployment boundary with:
 

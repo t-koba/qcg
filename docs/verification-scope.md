@@ -9,8 +9,8 @@ are matched against Cargo's registered tests and executed in CI.
 | API and service | `cargo test --workspace --locked` | State transitions, leases, cancel/completion races, approvals, cursor replay, concurrent readers, queue ordering, artifact integrity |
 | CLI | Workspace tests, `check-fixtures.sh`, `e2e-server-smoke.sh` | Contract validation, run output, installation, HTTP smoke |
 | TypeScript/Python SDK | `check-sdk.sh`, `check-sdk-behavior.sh` | Generated freshness, common SSE wire fixtures, every byte split, redirects, response readers, cleanup |
-| SPA | API/WASM generation, `npm run check`, `npm test`, `e2e-ui-playwright.mjs` | Type safety, coalesced refresh, terminal snapshot recovery, reader release, interactive run flows, served assets and Vite proxy |
-| Browser CORS | UI Playwright cross-origin case | Actual preflight through Last-Event-ID/If-None-Match, EOF at terminal cursor, visible ETag/Content-Disposition/Content-Range/Accept-Ranges, 304, Range/If-Range 206 and unsatisfiable Range 416 |
+| SPA | API/WASM generation, `npm run check`, `npm test` (local); `e2e-ui-playwright.mjs` (CI `Demo end-to-end` only) | Type safety, coalesced refresh, terminal snapshot recovery, reader release, interactive run flows, served assets and Vite proxy |
+| Browser CORS | UI Playwright cross-origin case (CI `Demo end-to-end` only) | Actual preflight through Last-Event-ID/If-None-Match, EOF at terminal cursor, visible ETag/Content-Disposition/Content-Range/Accept-Ranges, 304, Range/If-Range 206 and unsatisfiable Range 416 |
 | Release metadata | `node --test scripts/product.test.mjs` | Correct/incorrect tags, absent/ambiguous owning binary, product rename |
 | Distribution | `check-dist-bundle.sh`, `verify-bundle.mjs`, `validate-spdx.py` | Extracted required files, Markdown links, SPA/WASM asset presence, full SPDX 2.3 validation, packaged CLI/server startup |
 | Minimal features | `cargo test -p server --no-default-features`, MCP equivalent | Unsupported configuration refuses explicitly |
@@ -64,7 +64,7 @@ accepting either lag or a direct terminal event. Secret sentinel tests and real 
 values; lexical bans on Debug formatting are not treated as security evidence.
 
 The local full pipeline installs frontend dependencies once and reuses the
-frontend just built by browser verification for distribution verification.
+frontend just built (`npm run build`) for distribution verification.
 `check-demo-local.sh --dependencies-installed` requires an existing dependency
 installation. `check-dist-bundle.sh --frontend-built` (forwarded to packaging)
 requires freshly generated API/WASM and a freshly built frontend. Standalone
