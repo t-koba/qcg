@@ -1023,6 +1023,101 @@ async fn streams_anthropic_schema_tool_as_a_completed_structured_response() {
     );
 }
 
+#[tokio::test]
+async fn responses_stream_treats_incomplete_as_terminal() {
+    for (reason, expected) in [
+        ("max_output_tokens", StopReason::MaxTokens),
+        ("content_filter", StopReason::Refusal),
+    ] {
+        let terminal = json!({
+            "status": "incomplete",
+            "incomplete_details": { "reason": reason },
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "partial" }]
+            }],
+            "usage": { "input_tokens": 10, "output_tokens": 5 }
+        });
+        let direct =
+            parse_responses_response(terminal.clone()).expect("direct incomplete should parse");
+        assert_eq!(direct.stop, expected);
+        let (events, _receiver) = mpsc::channel(4);
+        let mut accumulator = HttpStreamAccumulator::new(ApiFlavor::Responses)
+            .expect("responses accumulator should build");
+        let streamed = accumulator
+            .ingest(
+                json!({ "type": "response.incomplete", "response": terminal }),
+                &events,
+            )
+            .await
+            .expect("incomplete should ingest")
+            .expect("incomplete is a terminal response");
+        assert_eq!(streamed.stop, direct.stop);
+        assert_eq!(streamed.usage.input, 10);
+        assert_eq!(streamed.usage.output, 5);
+        assert_eq!(streamed.content.len(), direct.content.len());
+    }
+}
+
+#[tokio::test]
+async fn responses_stream_rejects_unknown_incomplete_and_missing_terminal() {
+    let terminal = |reason: &str| {
+        json!({
+            "status": "incomplete",
+            "incomplete_details": { "reason": reason },
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "partial" }]
+            }],
+            "usage": { "input_tokens": 1, "output_tokens": 1 }
+        })
+    };
+    let (events, _receiver) = mpsc::channel(4);
+    // Unknown incomplete reasons stay rejected, even on the stream path.
+    let mut accumulator = HttpStreamAccumulator::new(ApiFlavor::Responses)
+        .expect("responses accumulator should build");
+    assert!(
+        accumulator
+            .ingest(
+                json!({ "type": "response.incomplete", "response": terminal("max_messages") }),
+                &events,
+            )
+            .await
+            .is_err(),
+        "unknown incomplete reason must fail"
+    );
+    // A terminal event without its response payload stays rejected.
+    let mut accumulator = HttpStreamAccumulator::new(ApiFlavor::Responses)
+        .expect("responses accumulator should build");
+    let error = accumulator
+        .ingest(json!({ "type": "response.incomplete" }), &events)
+        .await
+        .expect_err("missing response payload must fail");
+    assert!(
+        error.to_string().contains("did not include response"),
+        "{error}"
+    );
+    // Failed events are never terminal: ignored, then finish reports the
+    // missing terminal response.
+    let mut accumulator = HttpStreamAccumulator::new(ApiFlavor::Responses)
+        .expect("responses accumulator should build");
+    assert!(
+        accumulator
+            .ingest(
+                json!({ "type": "response.failed", "response": terminal("max_output_tokens") }),
+                &events
+            )
+            .await
+            .expect("failed must not error at ingest")
+            .is_none(),
+        "failed must not complete"
+    );
+    let error = accumulator
+        .finish()
+        .expect_err("missing terminal must fail");
+    assert!(error.to_string().contains("terminal response"), "{error}");
+}
+
 #[test]
 fn interpolates_environment_placeholders() {
     if env_process::isolated() {

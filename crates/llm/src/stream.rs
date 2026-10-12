@@ -64,7 +64,7 @@ impl HttpStreamAccumulator {
         match self {
             Self::Chat(accumulator) => accumulator.finish(),
             Self::Responses => Err(LlmError::invalid_response(
-                "Responses API stream ended without response.completed",
+                "Responses API stream ended without terminal response",
             )),
             Self::Anthropic(accumulator) => accumulator.finish(),
         }
@@ -233,14 +233,20 @@ async fn ingest_responses_stream(
             }
             Ok(None)
         }
-        Some("response.completed") => value
-            .get("response")
-            .cloned()
-            .ok_or_else(|| {
-                LlmError::invalid_response("response.completed did not include response")
-            })
-            .and_then(parse_responses_response)
-            .map(Some),
+        Some("response.completed") | Some("response.incomplete") => {
+            let kind = value
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("response.completed");
+            value
+                .get("response")
+                .cloned()
+                .ok_or_else(|| {
+                    LlmError::invalid_response(format!("{kind} did not include response"))
+                })
+                .and_then(parse_responses_response)
+                .map(Some)
+        }
         _ => Ok(None),
     }
 }
