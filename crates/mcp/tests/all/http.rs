@@ -5,9 +5,10 @@ use mcp::{
     OAuthCredentialStore,
 };
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ElicitRequest, ElicitRequestParams,
-    InputRequest, InputRequiredResult, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
-    ServerConfig, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams, CreateTaskResult,
+    DetailedTask, ElicitRequest, ElicitRequestParams, GetTaskParams, GetTaskResult, InputRequest,
+    InputRequiredResult, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig,
+    Task, TaskPayload, TaskStatus, Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::streamable_http_server::{
@@ -477,6 +478,161 @@ async fn streamable_http_call_honors_run_cancellation() {
     drop(session);
     server_cancellation.cancel();
     server.await.expect("server task should stop");
+}
+
+#[derive(Debug, Clone)]
+struct TaskStallServer {
+    get_calls: Arc<AtomicU64>,
+    cancel_calls: Arc<AtomicU64>,
+}
+
+impl ServerHandler for TaskStallServer {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tasks()
+                .build(),
+        )
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        Ok(ListToolsResult {
+            tools: vec![Tool::new(
+                "task-slow",
+                "Stalled task.",
+                object(json!({
+                    "type": "object",
+                    "additionalProperties": false
+                }))?,
+            )],
+            ..Default::default()
+        })
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        if request.name != "task-slow" {
+            return Err(ErrorData::invalid_params("unknown tool", None));
+        }
+        Ok(CreateTaskResult::new(Task::new(
+            "task-1",
+            TaskStatus::Working,
+            "2025-11-25T10:30:00Z",
+            "2025-11-25T10:40:00Z",
+        ))
+        .into())
+    }
+
+    async fn get_task(
+        &self,
+        _request: GetTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, ErrorData> {
+        self.get_calls.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        Ok(GetTaskResult::new(DetailedTask::new(
+            Task::new(
+                "task-1",
+                TaskStatus::Working,
+                "2025-11-25T10:30:00Z",
+                "2025-11-25T10:40:00Z",
+            ),
+            TaskPayload::Working,
+        )))
+    }
+
+    async fn cancel_task(
+        &self,
+        _request: CancelTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn streamable_http_task_poll_honors_run_cancellation() {
+    let get_calls = Arc::new(AtomicU64::new(0));
+    let cancel_calls = Arc::new(AtomicU64::new(0));
+    let state = TaskStallServer {
+        get_calls: Arc::clone(&get_calls),
+        cancel_calls: Arc::clone(&cancel_calls),
+    };
+    let server_cancellation = CancellationToken::new();
+    let service: StreamableHttpService<TaskStallServer, LocalSessionManager> =
+        StreamableHttpService::new(
+            move || Ok(state.clone()),
+            Arc::new(LocalSessionManager::default()),
+            StreamableHttpServerConfig::default()
+                .with_cancellation_token(server_cancellation.child_token()),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("loopback listener should bind");
+    let address = listener.local_addr().expect("listener has an address");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, axum::Router::new().nest_service("/mcp", service))
+            .await
+            .expect("MCP test server should run");
+    });
+
+    let mut profile = spec("task-cancel", &format!("http://{address}/mcp"));
+    profile.timeout_seconds = 15;
+    profile.task_poll_interval_ms = 50;
+    let runtime = McpRuntime::from_specs(vec![profile]).expect("HTTP profile should load");
+    let access = McpAccess {
+        network_hosts: BTreeSet::from(["127.0.0.1".into()]),
+        commands: vec![],
+        workspace: std::env::current_dir().expect("workspace should exist"),
+    };
+    let run_cancellation = CancellationToken::new();
+    let session = runtime
+        .connect("task-cancel", &access, run_cancellation.clone())
+        .await
+        .expect("MCP session should initialize");
+    let call = tokio::spawn(async move { session.call_tool("task-slow", json!({})).await });
+    let waited = std::time::Instant::now();
+    while get_calls.load(Ordering::SeqCst) == 0 {
+        if waited.elapsed() > std::time::Duration::from_secs(5) {
+            panic!("stalled poll never began");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let started = std::time::Instant::now();
+    run_cancellation.cancel();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(10), call)
+        .await
+        .expect("stalled poll and cleanup must stay bounded")
+        .expect("call task should join")
+        .expect_err("stalled task must cancel");
+    assert!(
+        matches!(error, mcp::McpError::Canceled),
+        "stalled task must stay Canceled, got: {error}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "cancellation must win well before the 15s profile timeout"
+    );
+    assert!(
+        get_calls.load(Ordering::SeqCst) >= 1,
+        "cancel must happen after the poll began"
+    );
+    assert!(
+        cancel_calls.load(Ordering::SeqCst) >= 1,
+        "bounded remote cleanup must be attempted"
+    );
+    server.abort();
+    let _ = server.await;
 }
 
 #[tokio::test]

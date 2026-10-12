@@ -289,20 +289,22 @@ impl McpSession {
         loop {
             tokio::select! {
                 _ = self.cancellation.cancelled() => {
-                    let _ = client
-                        .peer()
-                        .cancel_task(CancelTaskParams::new(task_id.clone()))
-                        .await;
+                    self.best_effort_cancel_task(&task_id).await;
                     return Err(McpError::Canceled);
                 }
                 _ = tokio::time::sleep(Duration::from_millis(poll_interval)) => {}
             }
-            let detailed = client
-                .peer()
-                .get_task(GetTaskParams::new(task_id.clone()))
-                .await
-                .map_err(|error| guarded_transport_error(error, sensitive_values))?
-                .task;
+            let detailed = tokio::select! {
+                _ = self.cancellation.cancelled() => {
+                    self.best_effort_cancel_task(&task_id).await;
+                    return Err(McpError::Canceled);
+                }
+                result = client.peer().get_task(GetTaskParams::new(task_id.clone())) => {
+                    result
+                        .map_err(|error| guarded_transport_error(error, sensitive_values))?
+                        .task
+                }
+            };
             poll_interval = detailed
                 .task
                 .poll_interval_ms
@@ -347,6 +349,23 @@ impl McpSession {
                     ));
                 }
             }
+        }
+    }
+
+    /// Best-effort remote task cleanup. `tasks/cancel` is cooperative, so
+    /// acknowledgement never proves work stopped; the local `Canceled`
+    /// classification is preserved even if cleanup fails or times out. The
+    /// 5s bound matches session close and keeps cancellation responsive
+    /// well before the profile timeout.
+    async fn best_effort_cancel_task(&self, task_id: &str) {
+        if let Some(client) = self.client.as_ref() {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(5),
+                client
+                    .peer()
+                    .cancel_task(CancelTaskParams::new(task_id.to_owned())),
+            )
+            .await;
         }
     }
 
