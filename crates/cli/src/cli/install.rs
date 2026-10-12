@@ -26,7 +26,7 @@ pub(crate) use super::install_commit::{
 };
 pub(crate) use super::install_commit::{finish_install, remove_owned_path, uninstall};
 pub(crate) use super::install_stage::{
-    InstallConfig, install_registry_package, is_cycle_error, stage_closure_for_manifest,
+    InstallConfig, Selected, install_registry_package, is_cycle_error, stage_closure_for_manifest,
     stage_install_source,
 };
 #[cfg(test)]
@@ -273,7 +273,14 @@ pub(crate) async fn install(
             force,
             limits,
         };
-        return install_registry_package(config, &id, &requirement, &mut BTreeSet::new()).await;
+        return install_registry_package(
+            config,
+            &id,
+            &requirement,
+            &mut BTreeSet::new(),
+            &mut Selected::new(),
+        )
+        .await;
     }
     let remote = source.starts_with("http://") || source.starts_with("https://");
     if verification.signature.is_some() != verification.public_key.is_some() {
@@ -304,6 +311,7 @@ pub(crate) async fn install(
     };
     let parent_id = staged.contract.manifest.generator.id.clone();
     let mut visiting = BTreeSet::new();
+    let mut selected = Selected::new();
     visiting.insert((
         parent_id.clone(),
         staged.contract.manifest.generator.version.clone(),
@@ -312,6 +320,7 @@ pub(crate) async fn install(
         config,
         &staged.contract.manifest,
         &mut visiting,
+        &mut selected,
     )
     .await
     {
@@ -588,14 +597,26 @@ version = "1.0.0"
         let requirement = semver::VersionReq::parse("^1").expect("requirement");
         let limits = service::PackageLimits::default();
         let config = test_config(&limits, &generators);
-        install_registry_package(config, "a", &requirement, &mut BTreeSet::new())
-            .await
-            .expect("a complete closure must re-validate without a registry");
+        install_registry_package(
+            config,
+            "a",
+            &requirement,
+            &mut BTreeSet::new(),
+            &mut Selected::new(),
+        )
+        .await
+        .expect("a complete closure must re-validate without a registry");
         std::fs::remove_dir_all(generators.join("b")).expect("remove dependency");
         let config = test_config(&limits, &generators);
-        let error = install_registry_package(config, "a", &requirement, &mut BTreeSet::new())
-            .await
-            .expect_err("a missing dependency must not be silently accepted");
+        let error = install_registry_package(
+            config,
+            "a",
+            &requirement,
+            &mut BTreeSet::new(),
+            &mut Selected::new(),
+        )
+        .await
+        .expect_err("a missing dependency must not be silently accepted");
         assert!(
             error.to_string().contains("registr"),
             "the repair must reach dependency resolution, got: {error}"
@@ -627,9 +648,15 @@ version = "1.0.0"
         let requirement = semver::VersionReq::parse("^1").expect("requirement");
         let limits = service::PackageLimits::default();
         let config = test_config(&limits, &generators);
-        let error = install_registry_package(config, "a", &requirement, &mut BTreeSet::new())
-            .await
-            .expect_err("a tampered dependency must fail closed");
+        let error = install_registry_package(
+            config,
+            "a",
+            &requirement,
+            &mut BTreeSet::new(),
+            &mut Selected::new(),
+        )
+        .await
+        .expect_err("a tampered dependency must fail closed");
         assert!(
             error.to_string().contains("inventory verification"),
             "the tamper must be reported, got: {error}"
@@ -659,9 +686,15 @@ version = "1.0.0"
         let requirement = semver::VersionReq::parse("^1").expect("requirement");
         let limits = service::PackageLimits::default();
         let config = test_config(&limits, &generators);
-        let error = install_registry_package(config, "a", &requirement, &mut BTreeSet::new())
-            .await
-            .expect_err("an unreachable registry must fail the repair");
+        let error = install_registry_package(
+            config,
+            "a",
+            &requirement,
+            &mut BTreeSet::new(),
+            &mut Selected::new(),
+        )
+        .await
+        .expect_err("an unreachable registry must fail the repair");
         assert!(
             error.to_string().contains("registry index"),
             "the failure must name the registry fetch, got: {error}"
@@ -686,9 +719,15 @@ version = "1.0.0"
         let requirement = semver::VersionReq::parse("^1").expect("requirement");
         let limits = service::PackageLimits::default();
         let config = test_config(&limits, &generators);
-        let error = install_registry_package(config, "a", &requirement, &mut BTreeSet::new())
-            .await
-            .expect_err("a dependency cycle must fail closed");
+        let error = install_registry_package(
+            config,
+            "a",
+            &requirement,
+            &mut BTreeSet::new(),
+            &mut Selected::new(),
+        )
+        .await
+        .expect_err("a dependency cycle must fail closed");
         assert!(
             error.to_string().contains("dependency cycle"),
             "the cycle must be named: {error}"
@@ -721,9 +760,15 @@ version = "1.0.0"
         let limits = service::PackageLimits::default();
         for id in ["a", "b", "c"] {
             let config = test_config(&limits, &generators);
-            install_registry_package(config, id, &requirement, &mut BTreeSet::new())
-                .await
-                .unwrap_or_else(|error| panic!("diamond closure `{id}` must resolve: {error}"));
+            install_registry_package(
+                config,
+                id,
+                &requirement,
+                &mut BTreeSet::new(),
+                &mut Selected::new(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("diamond closure `{id}` must resolve: {error}"));
         }
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1216,11 +1261,18 @@ version = "1.0.0"
         let requirement = semver::VersionReq::parse("^1").expect("requirement");
         let limits = service::PackageLimits::default();
         let config = test_config(&limits, &generators);
-        let error = install_registry_package(config, "a", &requirement, &mut BTreeSet::new())
-            .await
-            .expect_err("a version-mismatch diamond must fail closed");
+        let error = install_registry_package(
+            config,
+            "a",
+            &requirement,
+            &mut BTreeSet::new(),
+            &mut Selected::new(),
+        )
+        .await
+        .expect_err("a version-mismatch diamond must fail closed");
         assert!(
             error.to_string().contains("does not satisfy")
+                || error.to_string().contains("conflicting requirements")
                 || error.to_string().contains("registry"),
             "the mismatch must be reported, got: {error}"
         );
@@ -1243,9 +1295,15 @@ version = "1.0.0"
         let requirement = semver::VersionReq::parse("^1").expect("requirement");
         let limits = service::PackageLimits::default();
         let config = test_config(&limits, &generators);
-        let error = install_registry_package(config, "s", &requirement, &mut BTreeSet::new())
-            .await
-            .expect_err("a self-dependency must fail closed");
+        let error = install_registry_package(
+            config,
+            "s",
+            &requirement,
+            &mut BTreeSet::new(),
+            &mut Selected::new(),
+        )
+        .await
+        .expect_err("a self-dependency must fail closed");
         // Both layers fail closed: manifest validation refuses the
         // self-edge directly, while the resolver reports a dependency
         // cycle. Accept either refusal, never success.
@@ -1369,9 +1427,15 @@ version = "1.0.0"
         let limits = service::PackageLimits::default();
         for _ in 0..2 {
             let config = test_config(&limits, &generators);
-            let error = install_registry_package(config, "a", &requirement, &mut BTreeSet::new())
-                .await
-                .expect_err("a cycle must keep failing closed");
+            let error = install_registry_package(
+                config,
+                "a",
+                &requirement,
+                &mut BTreeSet::new(),
+                &mut Selected::new(),
+            )
+            .await
+            .expect_err("a cycle must keep failing closed");
             assert!(
                 error.to_string().contains("dependency cycle"),
                 "the cycle must be named: {error}"
@@ -1742,13 +1806,258 @@ version = "1.0.0"
             ..test_config(&limits, &generators)
         };
         let requirement = semver::VersionReq::parse("^1").expect("requirement should parse");
-        let error =
-            install_registry_package(config, "missing-pkg", &requirement, &mut BTreeSet::new())
-                .await
-                .expect_err("missing registry package must fail");
+        let error = install_registry_package(
+            config,
+            "missing-pkg",
+            &requirement,
+            &mut BTreeSet::new(),
+            &mut Selected::new(),
+        )
+        .await
+        .expect_err("missing registry package must fail");
         assert!(
             !generators.join("missing-pkg").exists(),
             "no parent may be left behind, got error: {error}"
+        );
+    }
+
+    /// File-backed test registry: packs sources and appends index
+    /// records so registry-path installs run fully offline.
+    struct RegistryPublisher<'a> {
+        registry_dir: &'a Utf8Path,
+        index: String,
+        root: &'a Utf8Path,
+        limits: &'a service::PackageLimits,
+    }
+
+    impl RegistryPublisher<'_> {
+        /// Packs `src_name` (whose manifest states `version`) under a
+        /// unique archive name and appends its index record.
+        fn publish(&mut self, src_name: &str, id: &str, version: &str, deps: &str) {
+            let src = self.root.join(src_name);
+            let manifest = if deps.is_empty() {
+                format!("[generator]\nid = \"{id}\"\nname = \"{id}\"\nversion = \"{version}\"\n")
+            } else {
+                format!(
+                    "[generator]\nid = \"{id}\"\nname = \"{id}\"\nversion = \"{version}\"\n\n[dependencies]{deps}"
+                )
+            };
+            write_packable_source(&src, &manifest);
+            let archive = self.registry_dir.join(format!("{src_name}.pkg"));
+            crate::cli::package_cmd::package(&src, &archive, self.limits).expect("dep should pack");
+            let digest = hex::encode(Sha256::digest(
+                std::fs::read(&archive).expect("archive should read"),
+            ));
+            self.index.push_str(&format!(
+                "[[packages]]\nid = \"{id}\"\nversion = \"{version}\"\nurl = \"{url}\"\nsha256 = \"{digest}\"\n",
+                url = file_url(&archive),
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_diamond_stages_shared_dependency_once() {
+        if env_process::isolated() {
+            return;
+        }
+        // Closure-wide single selection: a satisfiable diamond (parent ->
+        // {a, b} -> shared) stages and commits shared exactly once without
+        // --force, selecting the highest satisfying version.
+        let root = test_root("diamond-once");
+        let _temp_guard = TempGuard(root.clone());
+        let home = root.join("home");
+        let generators = root.join("generators");
+        let parent_src = root.join("parent-src");
+        let registry_dir = root.join("registry");
+        std::fs::create_dir_all(&home).expect("home dir should be created");
+        std::fs::create_dir_all(&registry_dir).expect("registry dir should be created");
+        let _env = set_registry_home(&home).await;
+        let mut config = crate::registry::RegistryConfig::default();
+        config
+            .registries
+            .insert("test".into(), format!("file://{}/index.toml", registry_dir));
+        crate::registry::save_registries(&home, &config).expect("registries should save");
+        let limits = service::PackageLimits::default();
+        let mut publisher = RegistryPublisher {
+            registry_dir: &registry_dir,
+            index: String::new(),
+            root: &root,
+            limits: &limits,
+        };
+        for (src_name, id, version, deps) in [
+            ("a-src", "e2e-d-a", "1.0.0", "\ne2e-d-shared = \"^1\"\n"),
+            ("b-src", "e2e-d-b", "1.0.0", "\ne2e-d-shared = \"^1\"\n"),
+            ("shared-100-src", "e2e-d-shared", "1.0.0", ""),
+            ("shared-150-src", "e2e-d-shared", "1.5.0", ""),
+        ] {
+            publisher.publish(src_name, id, version, deps);
+        }
+        std::fs::write(registry_dir.join("index.toml"), publisher.index)
+            .expect("index should write");
+        write_source_with_sbom(
+            &parent_src,
+            "[generator]\nid = \"e2e-d-parent\"\nname = \"E2E D Parent\"\nversion = \"1.0.0\"\n\n[dependencies]\ne2e-d-a = \"^1\"\ne2e-d-b = \"^1\"\n",
+        );
+        let installed = install(
+            None,
+            parent_src.as_str(),
+            &generators,
+            true,
+            false,
+            test_verification(),
+            &limits,
+        )
+        .await
+        .expect("satisfiable diamond must install without force");
+        assert_eq!(installed, "e2e-d-parent");
+        for id in ["e2e-d-a", "e2e-d-b", "e2e-d-parent", "e2e-d-shared"] {
+            assert!(
+                generators.join(format!("{id}/qcg.toml")).exists(),
+                "diamond member `{id}` must be installed"
+            );
+        }
+        let shared = std::fs::read_to_string(generators.join("e2e-d-shared/qcg.toml"))
+            .expect("shared manifest should read");
+        assert!(
+            shared.contains("version = \"1.5.0\""),
+            "shared must resolve once to the highest satisfying version, got: {shared}"
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_conflicting_diamond_refuses_even_with_force() {
+        if env_process::isolated() {
+            return;
+        }
+        // Incompatible sibling requirements (a -> shared=1.0.0,
+        // b -> shared=2.0.0) refuse pre-commit: no stage may commit, so
+        // --force cannot paper over the conflict with a last-wins replace.
+        let root = test_root("diamond-conflict");
+        let _temp_guard = TempGuard(root.clone());
+        let home = root.join("home");
+        let generators = root.join("generators");
+        let parent_src = root.join("parent-src");
+        let registry_dir = root.join("registry");
+        std::fs::create_dir_all(&home).expect("home dir should be created");
+        std::fs::create_dir_all(&registry_dir).expect("registry dir should be created");
+        let _env = set_registry_home(&home).await;
+        let mut config = crate::registry::RegistryConfig::default();
+        config
+            .registries
+            .insert("test".into(), format!("file://{}/index.toml", registry_dir));
+        crate::registry::save_registries(&home, &config).expect("registries should save");
+        let limits = service::PackageLimits::default();
+        let mut publisher = RegistryPublisher {
+            registry_dir: &registry_dir,
+            index: String::new(),
+            root: &root,
+            limits: &limits,
+        };
+        for (src_name, id, version, deps) in [
+            ("a-src", "e2e-x-a", "1.0.0", "\ne2e-x-shared = \"=1.0.0\"\n"),
+            ("b-src", "e2e-x-b", "1.0.0", "\ne2e-x-shared = \"=2.0.0\"\n"),
+            ("shared-100-src", "e2e-x-shared", "1.0.0", ""),
+            ("shared-200-src", "e2e-x-shared", "2.0.0", ""),
+        ] {
+            publisher.publish(src_name, id, version, deps);
+        }
+        std::fs::write(registry_dir.join("index.toml"), publisher.index)
+            .expect("index should write");
+        write_source_with_sbom(
+            &parent_src,
+            "[generator]\nid = \"e2e-x-parent\"\nname = \"E2E X Parent\"\nversion = \"1.0.0\"\n\n[dependencies]\ne2e-x-a = \"^1\"\ne2e-x-b = \"^1\"\n",
+        );
+        let error = install(
+            None,
+            parent_src.as_str(),
+            &generators,
+            true,
+            true,
+            test_verification(),
+            &limits,
+        )
+        .await
+        .expect_err("conflicting diamond must refuse even with force");
+        assert!(
+            error.to_string().contains("conflicting requirements"),
+            "the conflict must be named, got: {error}"
+        );
+        for id in ["e2e-x-parent", "e2e-x-shared", "e2e-x-a", "e2e-x-b"] {
+            assert!(
+                !generators.join(format!("{id}/qcg.toml")).exists(),
+                "conflict must commit nothing, but `{id}` exists: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn installed_reuse_conflicts_with_forced_replacement() {
+        if env_process::isolated() {
+            return;
+        }
+        // A verified installed reuse recorded earlier in the plan cannot be
+        // invalidated by a later forced replacement: shared@1.0.0 satisfies
+        // a's ^1, so b's ^2 conflicts pre-commit and the installed 1.0.0
+        // stays put.
+        let root = test_root("reuse-conflict");
+        let _temp_guard = TempGuard(root.clone());
+        let home = root.join("home");
+        let generators = root.join("generators");
+        let parent_src = root.join("parent-src");
+        let registry_dir = root.join("registry");
+        std::fs::create_dir_all(&home).expect("home dir should be created");
+        std::fs::create_dir_all(&registry_dir).expect("registry dir should be created");
+        let _env = set_registry_home(&home).await;
+        let mut config = crate::registry::RegistryConfig::default();
+        config
+            .registries
+            .insert("test".into(), format!("file://{}/index.toml", registry_dir));
+        crate::registry::save_registries(&home, &config).expect("registries should save");
+        write_installed(&generators.join("e2e-r-shared"), "e2e-r-shared", "");
+        let limits = service::PackageLimits::default();
+        let mut publisher = RegistryPublisher {
+            registry_dir: &registry_dir,
+            index: String::new(),
+            root: &root,
+            limits: &limits,
+        };
+        for (src_name, id, version, deps) in [
+            ("a-src", "e2e-r-a", "1.0.0", "\ne2e-r-shared = \"^1\"\n"),
+            ("b-src", "e2e-r-b", "1.0.0", "\ne2e-r-shared = \"^2\"\n"),
+            ("shared-200-src", "e2e-r-shared", "2.0.0", ""),
+        ] {
+            publisher.publish(src_name, id, version, deps);
+        }
+        std::fs::write(registry_dir.join("index.toml"), publisher.index)
+            .expect("index should write");
+        write_source_with_sbom(
+            &parent_src,
+            "[generator]\nid = \"e2e-r-parent\"\nname = \"E2E R Parent\"\nversion = \"1.0.0\"\n\n[dependencies]\ne2e-r-a = \"^1\"\ne2e-r-b = \"^1\"\n",
+        );
+        let error = install(
+            None,
+            parent_src.as_str(),
+            &generators,
+            true,
+            true,
+            test_verification(),
+            &limits,
+        )
+        .await
+        .expect_err("forced replacement of a reused install must refuse");
+        assert!(
+            error.to_string().contains("conflicting requirements"),
+            "the conflict must be named, got: {error}"
+        );
+        let shared = std::fs::read_to_string(generators.join("e2e-r-shared/qcg.toml"))
+            .expect("reused install must stay");
+        assert!(
+            shared.contains("version = \"1.0.0\""),
+            "installed shared must stay at 1.0.0, got: {shared}"
+        );
+        assert!(
+            !generators.join("e2e-r-parent/qcg.toml").exists(),
+            "conflict must commit no parent: {error}"
         );
     }
 

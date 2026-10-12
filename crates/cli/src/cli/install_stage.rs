@@ -8,7 +8,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use contract::{Contract, Graph};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, Read as _};
 use uuid::Uuid;
@@ -35,6 +35,30 @@ pub(crate) type Visiting = BTreeSet<(String, String)>;
 
 pub(crate) fn visiting_contains(visiting: &Visiting, id: &str) -> bool {
     visiting.iter().any(|(member, _)| member == id)
+}
+
+// Closure-wide selected versions keyed by install id, distinct from the
+// recursion-stack cycle detection (`Visiting`): at most one staged version
+// per id per plan. A repeated id reuses its selection when the new
+// requirement matches and fails closed on conflict before any commit, so
+// diamonds stage once instead of once per branch.
+pub(crate) type Selected = BTreeMap<String, semver::Version>;
+
+/// Reuse check for one closure dependency: no selection yet means stage
+/// normally; a matching selection means skip (already staged); a mismatch
+/// is a plan conflict that must refuse pre-commit, even with `--force`.
+pub(crate) fn selected_compatible(
+    selected: &Selected,
+    id: &str,
+    requirement: &semver::VersionReq,
+) -> Result<Option<semver::Version>> {
+    match selected.get(id) {
+        None => Ok(None),
+        Some(version) if requirement.matches(version) => Ok(Some(version.clone())),
+        Some(version) => Err(anyhow::anyhow!(
+            "dependency `{id}` has conflicting requirements in one closure: `{requirement}` does not match already-selected `{id}@{version}`"
+        )),
+    }
 }
 
 #[derive(Debug)]
@@ -225,6 +249,7 @@ pub(crate) fn install_registry_package<'a>(
     id: &'a str,
     requirement: &'a semver::VersionReq,
     visiting: &'a mut Visiting,
+    selected: &'a mut Selected,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
     Box::pin(async move {
         let InstallConfig {
@@ -264,7 +289,7 @@ pub(crate) fn install_registry_package<'a>(
                 let key = (id.to_string(), installed.to_string());
                 visiting.insert(key.clone());
                 let staged_closure =
-                    match stage_closure_for_manifest(config, &manifest, visiting).await {
+                    match stage_closure_for_manifest(config, &manifest, visiting, selected).await {
                         Ok(staged) => staged,
                         Err(error) => {
                             visiting.remove(&key);
@@ -308,7 +333,7 @@ pub(crate) fn install_registry_package<'a>(
         }
         // Fresh installs resolve first; the version-qualified key is pushed
         // by the inner step once the exact version is known.
-        install_registry_package_inner(config, id, requirement, visiting).await
+        install_registry_package_inner(config, id, requirement, visiting, selected).await
     })
 }
 
@@ -317,6 +342,7 @@ pub(crate) async fn install_registry_package_inner<'a>(
     id: &'a str,
     requirement: &'a semver::VersionReq,
     visiting: &'a mut Visiting,
+    selected: &'a mut Selected,
 ) -> Result<String> {
     let InstallConfig {
         providers_path,
@@ -383,6 +409,7 @@ pub(crate) async fn install_registry_package_inner<'a>(
         config,
         &staged.contract.manifest,
         visiting,
+        selected,
     )
     .await
     {
@@ -451,6 +478,7 @@ pub(crate) fn stage_closure_for_manifest<'a>(
     config: InstallConfig<'a>,
     manifest: &'a contract::Manifest,
     visiting: &'a mut Visiting,
+    selected: &'a mut Selected,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<StagedInstall>>> + Send + 'a>> {
     Box::pin(async move {
         // Single validation pass (E14): parse every requirement once and
@@ -473,6 +501,13 @@ pub(crate) fn stage_closure_for_manifest<'a>(
         }
         let mut staged = Vec::new();
         for (dependency, requirement) in validated {
+            // Closure-wide single selection (distinct from cycle
+            // detection): an already-selected id is reused without
+            // re-staging when it satisfies the new requirement, and
+            // refuses pre-commit on conflict even with `--force`.
+            if selected_compatible(selected, dependency, &requirement)?.is_some() {
+                continue;
+            }
             // E14-1 single verified load: version + manifest from the SAME
             // pinned bytes, never two opens.
             if let Some((installed, installed_manifest)) = load_installed_version_and_manifest(
@@ -483,10 +518,15 @@ pub(crate) fn stage_closure_for_manifest<'a>(
                 if requirement.matches(&installed) {
                     // Verified reuse, then walk its own closure for transitive
                     // missing sets without staging the already-installed node.
+                    // The reuse is recorded so a later forced replacement of
+                    // the same id within this plan conflicts instead of
+                    // invalidating this verified reuse.
+                    selected.insert(dependency.clone(), installed.clone());
                     let key = (dependency.clone(), installed.to_string());
                     visiting.insert(key.clone());
                     let transitive =
-                        stage_closure_for_manifest(config, &installed_manifest, visiting).await;
+                        stage_closure_for_manifest(config, &installed_manifest, visiting, selected)
+                            .await;
                     visiting.remove(&key);
                     staged.extend(transitive?);
                     continue;
@@ -498,7 +538,8 @@ pub(crate) fn stage_closure_for_manifest<'a>(
                 }
             }
             let dep_staged =
-                stage_single_with_closure(config, dependency, &requirement, visiting).await?;
+                stage_single_with_closure(config, dependency, &requirement, visiting, selected)
+                    .await?;
             staged.extend(dep_staged);
         }
         Ok(staged)
@@ -513,6 +554,7 @@ pub(crate) fn stage_single_with_closure<'a>(
     id: &'a str,
     requirement: &'a semver::VersionReq,
     visiting: &'a mut Visiting,
+    selected: &'a mut Selected,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<StagedInstall>>> + Send + 'a>> {
     Box::pin(async move {
         ensure_safe_install_id(id)?;
@@ -560,9 +602,15 @@ pub(crate) fn stage_single_with_closure<'a>(
         let key = (id.to_string(), resolved.entry.version.clone());
         visiting.insert(key.clone());
         let staged_manifest = staged.contract.manifest.clone();
-        let staged_closure = stage_closure_for_manifest(config, &staged_manifest, visiting).await;
+        let staged_closure =
+            stage_closure_for_manifest(config, &staged_manifest, visiting, selected).await;
         visiting.remove(&key);
         let mut transitive = staged_closure?;
+        // Record the resolved version so sibling branches reuse it (when
+        // compatible) or refuse on conflict instead of staging twice.
+        let staged_version = semver::Version::parse(&resolved.entry.version)
+            .with_context(|| format!("registry package `{id}` has an invalid version"))?;
+        selected.insert(id.to_string(), staged_version);
         // Deps first, self last: committing in order never leaves a parent
         // without its dependencies staged.
         transitive.push(staged);
