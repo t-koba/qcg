@@ -18,8 +18,8 @@ are matched against Cargo's registered tests and executed in CI.
 | Bounded read performance | [measurement protocol](performance-validation.md) | Read-view counters, HTTP snapshot/list and full-history SSE matrices; release measurements and 54 slow live-tail conditions in both store modes |
 | Product comparison | [comparison protocol](comparison-protocol.md) | Deterministic real qcg/LangGraph/Temporal runs are recorded; Dify runs through a separate native-DSL adapter with the same input/output validator; real LLM comparison requires a common model credential |
 
-Local validation in this change uses Linux. A workflow definition is not evidence
-that macOS/Windows jobs have executed; those remain pending CI on those hosts.
+Local validation uses Linux. A workflow definition is not evidence
+that macOS/Windows jobs have executed; that coverage requires CI on those hosts.
 Environment mutation tests execute in isolated subprocesses with 60-second
 whole-test deadlines. OTLP configuration validation injects values directly.
 Socket-dependent suites require permission to bind local loopback listeners.
