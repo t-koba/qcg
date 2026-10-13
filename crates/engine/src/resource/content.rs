@@ -95,9 +95,10 @@ pub(crate) fn resolve_resource_file(
         });
     }
     let file = root.join(relative);
-    // Reject symlinks at every component without following them: a
-    // canonicalize-then-read sequence alone leaves a swap window where a
-    // planted symlink redirects the later read outside the root (E13).
+    // Reject pre-existing symlinks at every component without following
+    // them. This narrows but does not close the swap window on its own: a
+    // leaf substituted after this check is refused at open time instead,
+    // because every selection read goes through the no-follow opener (E13).
     {
         let mut current = root.to_path_buf();
         for part in relative.split('/') {
@@ -253,7 +254,10 @@ pub(crate) fn read_bytes_bounded(
     path: &camino::Utf8Path,
     max_bytes: Option<usize>,
 ) -> Result<Vec<u8>, std::io::Error> {
-    let file = std::fs::File::open(path)?;
+    // Open without following a terminal symlink: validation (component
+    // rejection plus canonicalization) runs before this read, so a leaf
+    // swapped in between must fail here instead of being followed (E13).
+    let file = files::open_read_nofollow(path)?;
     let Some(max_bytes) = max_bytes else {
         let mut bytes = Vec::new();
         std::io::Read::read_to_end(&mut std::io::BufReader::new(file), &mut bytes)?;

@@ -131,6 +131,45 @@ mod tests {
         std::fs::remove_dir_all(root).expect("temporary directory should be removed");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn resource_selection_refuses_a_leaf_swapped_for_a_symlink() {
+        // E13: the selector resolves a regular leaf, then the leaf is
+        // swapped for a symlink to an outside file before the read. The
+        // no-follow open must refuse instead of returning outside content.
+        let root = test_directory("leaf-swap");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("directory should be created");
+        let outside = test_directory("leaf-swap-outside");
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).expect("directory should be created");
+        std::fs::write(outside.join("secret.txt"), "outside fixture")
+            .expect("outside file should be written");
+        let leaf = root.join("doc.txt");
+        std::fs::write(&leaf, "inside content").expect("leaf should be written");
+        let selected =
+            resolve_resource_file("docs", &root, "doc.txt").expect("regular leaf should resolve");
+        assert_eq!(
+            read_to_string_bounded(&selected, Some(64)).expect("regular leaf should read"),
+            "inside content"
+        );
+        std::fs::remove_file(&leaf).expect("leaf should be removed");
+        std::os::unix::fs::symlink(outside.join("secret.txt"), &leaf)
+            .expect("leaf should be swapped for a symlink");
+        let error = read_to_string_bounded(&selected, Some(64))
+            .expect_err("swapped leaf must be refused, never followed");
+        assert!(
+            matches!(
+                error,
+                ResourceError::Read { ref source, .. }
+                if source.raw_os_error() == Some(libc::ELOOP)
+            ),
+            "swapped leaf must fail with ELOOP, got: {error}"
+        );
+        std::fs::remove_dir_all(root).expect("temporary directory should be removed");
+        std::fs::remove_dir_all(outside).expect("temporary directory should be removed");
+    }
+
     #[test]
     fn resource_text_reads_stop_at_the_configured_bound() {
         let root = test_directory("read-bound");
