@@ -37,6 +37,14 @@ use crate::validate::{
 
 const DEFAULT_RESPONSE_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
+#[derive(Debug, thiserror::Error)]
+enum SseBodyError {
+    #[error(transparent)]
+    Http(#[from] reqwest::Error),
+    #[error("response body limit exceeded")]
+    LimitExceeded,
+}
+
 pub struct HttpProvider {
     id: String,
     api: ApiFlavor,
@@ -562,8 +570,35 @@ impl HttpProvider {
                 format!("{} provider returned HTTP {}", self.id, status.as_u16()),
             ));
         }
-        let mut stream = SseStream::from_bytes_stream(response.bytes_stream());
-        let mut total_bytes = 0_usize;
+        let body = response.bytes_stream().scan(
+            (self.response_body_limit_bytes, false),
+            |(remaining, terminated), chunk| {
+                let item = if *terminated {
+                    None
+                } else {
+                    match chunk {
+                        Err(error) => {
+                            *terminated = true;
+                            Some(Err(SseBodyError::Http(error)))
+                        }
+                        Ok(chunk) if chunk.len() <= *remaining => {
+                            // Count all response-body bytes before the parser
+                            // can buffer them, including SSE framing/comments.
+                            *remaining -= chunk.len();
+                            Some(Ok(chunk))
+                        }
+                        Ok(_) => {
+                            // Reject the crossing chunk in full and terminate
+                            // the adapter after surfacing the explicit error.
+                            *terminated = true;
+                            Some(Err(SseBodyError::LimitExceeded))
+                        }
+                    }
+                };
+                std::future::ready(item)
+            },
+        );
+        let mut stream = SseStream::from_bytes_stream(body);
         let mut accumulator = HttpStreamAccumulator::new(self.api)?;
         // Pre-publication gate for the provider credential (B04): text
         // deltas pass through it, and only prefixes proven free of the
@@ -578,7 +613,18 @@ impl HttpProvider {
         // single ingest can block waiting for that drain.
         let (gate_tx, mut gate_rx) = mpsc::channel::<ChatStreamEvent>(64);
         while let Some(event) = stream.next().await {
-            let event = event.map_err(|_| {
+            let event = event.map_err(|error| {
+                if let sse_stream::Error::Body(error) = error
+                    && let Ok(error) = error.downcast::<SseBodyError>()
+                {
+                    return match *error {
+                        SseBodyError::Http(error) => llm_http_error(error),
+                        SseBodyError::LimitExceeded => LlmError::invalid_response(format!(
+                            "{} provider stream exceeded response_body_limit_bytes ({})",
+                            self.id, self.response_body_limit_bytes
+                        )),
+                    };
+                }
                 LlmError::invalid_response(format!("{} provider returned invalid SSE", self.id))
             })?;
             let Some(data) = event.data else {
@@ -586,18 +632,6 @@ impl HttpProvider {
             };
             if data.trim() == "[DONE]" {
                 break;
-            }
-            total_bytes = total_bytes.checked_add(data.len()).ok_or_else(|| {
-                LlmError::invalid_response(format!(
-                    "{} provider stream exceeded the configured body limit",
-                    self.id
-                ))
-            })?;
-            if total_bytes > self.response_body_limit_bytes {
-                return Err(LlmError::invalid_response(format!(
-                    "{} provider stream exceeded response_body_limit_bytes ({})",
-                    self.id, self.response_body_limit_bytes
-                )));
             }
             if credential
                 .as_deref()
@@ -981,6 +1015,150 @@ mod loopback_stream_tests {
             let _ = stream.write_all(&response);
         });
         (format!("http://{address}"), handle)
+    }
+
+    /// Writes raw SSE body parts without adding data framing. The response is
+    /// close-delimited, but the socket stays open until the client has returned
+    /// (or timed out), so the body limit cannot rely on EOF. Parts need not
+    /// correspond to TCP packets or reqwest chunks.
+    fn spawn_raw_sse_stream(
+        body_parts: Vec<String>,
+    ) -> (
+        String,
+        std::sync::mpsc::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener should have an address");
+        listener
+            .set_nonblocking(true)
+            .expect("test listener should be nonblocking");
+        let (release, released) = std::sync::mpsc::channel();
+        let server = tokio::task::spawn_blocking(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline
+                            || !matches!(
+                                released.try_recv(),
+                                Err(std::sync::mpsc::TryRecvError::Empty)
+                            )
+                        {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("test listener failed: {error}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("test socket should set read timeout");
+            socket
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("test socket should set write timeout");
+            let mut request = Vec::new();
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let mut buffer = [0_u8; 1024];
+                let count = socket
+                    .read(&mut buffer)
+                    .expect("test request should arrive");
+                assert!(count > 0, "test request ended before its headers");
+                request.extend_from_slice(&buffer[..count]);
+                assert!(request.len() <= 8192, "test request headers are too large");
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                )
+                .expect("test response headers should write");
+            for part in body_parts {
+                if Instant::now() >= deadline || socket.write_all(part.as_bytes()).is_err() {
+                    // A client that already refused the body may close early.
+                    break;
+                }
+            }
+            let _ = released.recv_timeout(Duration::from_secs(10));
+        });
+        (format!("http://{address}"), release, server)
+    }
+
+    async fn run_raw_stream(
+        body_parts: Vec<String>,
+        limit: usize,
+    ) -> (Result<(), LlmError>, String, bool) {
+        let (base_url, release, server) = spawn_raw_sse_stream(body_parts);
+        let spec: ProviderSpec = serde_json::from_value(json!({
+            "id": "loopback",
+            "api": "chat_completions",
+            "base_url": base_url,
+            "capabilities": {"streaming": true},
+            "response_body_limit_bytes": limit,
+        }))
+        .expect("test provider spec should parse");
+        let provider = HttpProvider::from_spec(spec);
+        let (events, mut receiver) = mpsc::channel(16);
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            provider.stream(sample_stream_request(), events),
+        )
+        .await;
+        // Release even on timeout, before any assertions can panic. Joining is
+        // separately bounded, and the server also bounds every blocking wait.
+        let _ = release.send(());
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("raw SSE server cleanup must not hang")
+            .expect("raw SSE server must not panic");
+        let result = result.expect("raw stream must return without waiting for EOF");
+        let (published, completed) = collect_text(&mut receiver);
+        (result, published, completed)
+    }
+
+    async fn assert_raw_stream_limit(body_parts: Vec<String>, limit: usize) {
+        let (result, _, completed) = run_raw_stream(body_parts, limit).await;
+        let error = result.expect_err("excess raw body must fail the stream");
+        assert_eq!(error.kind, LlmErrorKind::InvalidResponse, "{error}");
+        assert_eq!(
+            error.message,
+            format!("loopback provider stream exceeded response_body_limit_bytes ({limit})")
+        );
+        assert!(!completed, "a capped stream must not report completion");
+    }
+
+    #[tokio::test]
+    async fn raw_stream_limit_rejects_unfinished_data_line_before_eof() {
+        assert_raw_stream_limit(vec![format!("data: {}", "x".repeat(65))], 64).await;
+    }
+
+    #[tokio::test]
+    async fn raw_stream_limit_counts_cumulative_data_lines_without_terminator() {
+        // Each line is below the cap; there is never a blank event terminator.
+        assert_raw_stream_limit(vec!["data: x\n".to_owned(); 12], 64).await;
+    }
+
+    #[tokio::test]
+    async fn raw_stream_limit_counts_comments_before_eof() {
+        assert_raw_stream_limit(vec![": heartbeat\n".to_owned(); 8], 64).await;
+    }
+
+    #[tokio::test]
+    async fn raw_stream_limit_accepts_complete_stream_at_and_below_limit() {
+        let body = format!(
+            ": heartbeat\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            chat_chunk("hello, ", None),
+            chat_chunk("world", Some("stop")),
+        );
+        for limit in [body.len(), body.len() + 1] {
+            let (result, published, completed) = run_raw_stream(vec![body.clone()], limit).await;
+            result.expect("complete stream within the raw body cap must succeed");
+            assert_eq!(published, "hello, world");
+            assert!(completed, "valid stream must report completion");
+        }
     }
 
     fn chat_chunk(content: &str, finish_reason: Option<&str>) -> String {

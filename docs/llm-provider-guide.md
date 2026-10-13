@@ -133,9 +133,15 @@ Fields:
 - `retry_backoff_exponent_cap`: largest exponent applied to the exponential
   backoff, 1 to 16. The default is 8; a higher cap grows waits further per
   attempt before they level off.
-- `response_body_limit_bytes`: maximum response body size. The default is
-  16 MiB; larger responses fail before JSON parsing instead of growing memory
-  without a bound. An explicit value has no mechanistic ceiling.
+- `response_body_limit_bytes`: maximum response-body size. The default is
+  16 MiB; oversized non-streaming responses fail before JSON parsing. For
+  streaming responses, the limit counts raw response-body bytes delivered by
+  reqwest, including SSE framing and comments. Each received chunk is checked
+  before SSE parsing;
+  a chunk crossing the limit is rejected in full, so the parser never accepts
+  bytes beyond the limit. Reqwest has already allocated the received chunk:
+  this is an application/parser bound, not a guarantee on all transport
+  allocation. An explicit value has no mechanistic ceiling.
 - `max_concurrency` and `requests_per_minute`: optional provider-local admission
   limits. Requests wait for capacity instead of creating an unbounded burst.
 - `circuit_breaker_failures` and `circuit_breaker_cooldown_seconds`: consecutive
