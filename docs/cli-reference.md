@@ -15,8 +15,7 @@ JSON event output go to stdout.
 ## Generator commands
 
 - `qcg new <path> [--id ID] [--force]` creates a minimal generator skeleton.
-  Mechanism only: directory layout (`qcg.toml` plus empty `prompts/`,
-  `templates/`, `schemas/`) and immediate `validate`. Prompt text, schemas,
+  Mechanism only: a valid `qcg.toml` and immediate `validate`. Prompt text, schemas,
   budgets, and permissions stay author policy as follow-up edits. Fails closed
   when the target is non-empty without `--force` or when the skeleton does not
   validate.

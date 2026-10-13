@@ -3,7 +3,7 @@ use camino::Utf8PathBuf;
 
 /// Create a minimal generator skeleton.
 ///
-/// Mechanism only: directory layout plus a valid `qcg.toml`.
+/// Mechanism only: a valid `qcg.toml`.
 /// All policy content (prompts, schemas, budgets, permissions) stays
 /// with the author as explicit follow-up edits.
 pub(crate) fn new_generator(path: &Utf8PathBuf, id: Option<&str>, force: bool) -> Result<()> {
@@ -28,15 +28,6 @@ pub(crate) fn new_generator(path: &Utf8PathBuf, id: Option<&str>, force: bool) -
     } else {
         std::fs::create_dir_all(path)
             .with_context(|| format!("failed to create target `{path}`"))?;
-    }
-    for dir in ["prompts", "templates", "schemas"] {
-        let dir_path = path.join(dir);
-        std::fs::create_dir_all(&dir_path)
-            .with_context(|| format!("failed to create `{dir_path}`"))?;
-        let keep = dir_path.join(".gitkeep");
-        if !keep.exists() {
-            std::fs::write(&keep, "").with_context(|| format!("failed to write `{keep}`"))?;
-        }
     }
     let manifest = minimal_manifest(&id);
     let manifest_path = path.join(contract::MANIFEST_FILE);
@@ -146,8 +137,13 @@ mod tests {
         new_generator(&target, None, false).expect("skeleton creation must succeed");
         let contract = contract::Contract::load(&target).expect("skeleton must validate");
         assert_eq!(contract.manifest.generator.id, "demo-gen");
-        assert!(target.join("prompts").join(".gitkeep").exists());
         assert!(target.join(contract::MANIFEST_FILE).exists());
+        for dir in ["prompts", "templates", "schemas"] {
+            assert!(
+                !target.join(dir).exists(),
+                "skeleton must stay manifest-only; `{dir}` is author policy"
+            );
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 }
