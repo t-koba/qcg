@@ -149,9 +149,11 @@ version = "0.1.0"
 id = "agent"
 output = "agent_result"
 type = "llm.agent"
-# 5s lets a slow shell land `touch ran` before the kill; the 30s sleep
-# still guarantees the interrupt, so attempt 2 always observes `ran`.
-retry = {{ max_attempts = 2, backoff_ms = 0, timeout_secs = 5, on_indeterminate = "{on_indeterminate}" }}
+# 15s covers the whole agent attempt (LLM/checkpoint/guard plus shell
+# spawn) on slow Windows runners so the marker lands before the kill;
+# the 60s sleep still guarantees the interrupt, so attempt 2 always
+# observes `ran`.
+retry = {{ max_attempts = 2, backoff_ms = 0, timeout_secs = 15, on_indeterminate = "{on_indeterminate}" }}
 
 [flow.params]
 max_iterations = 4
@@ -161,7 +163,7 @@ prompt = "prompts/agent.j2"
 [[flow.params.tools]]
 kind = "command"
 name = "long_task"
-command = ["sh", "-c", "if [ ! -f ran ]; then touch ran; sleep 30; else echo done; fi"]
+command = ["sh", "-c", "if [ ! -f ran ]; then : > ran; sleep 60; else echo done; fi"]
 
 [llm]
 max_tokens = 256
@@ -177,7 +179,7 @@ fs_write = []
 network = []
 side_effects_scope = "invocation"
 side_effects = "allowed"
-commands = [{{ bin = "sh", args = ["-c", "if [ ! -f ran ]; then touch ran; sleep 30; else echo done; fi"], purpose = "interrupted side effect", isolation = "trusted_host" }}]
+commands = [{{ bin = "sh", args = ["-c", "if [ ! -f ran ]; then : > ran; sleep 60; else echo done; fi"], purpose = "interrupted side effect", isolation = "trusted_host" }}]
 
 [permissions.containers]
 enabled = false"#
@@ -257,9 +259,10 @@ pub(crate) async fn wait_for_runs_store_release(runs: &Utf8Path) {
 }
 
 pub(crate) async fn wait_for_terminal_snapshot(service: &LocalService, id: &str) -> RunSnapshot {
-    // 20s polling budget: long-timeout interrupt tests (5s attempt
-    // timeout plus retry) must fit inside the wait.
-    for _ in 0..2000 {
+    // 60s polling budget: long-timeout interrupt tests (15s attempt
+    // timeout plus retry and Windows scheduling overhead) must fit
+    // inside the wait.
+    for _ in 0..6000 {
         let snapshot = service
             .snapshot(id.to_string())
             .await
