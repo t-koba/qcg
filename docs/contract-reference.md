@@ -534,6 +534,12 @@ fields with numeric array indices (`inputs.sites.0`). Missing paths read as
 expression such as `sort(inputs.tags)`. Unknown functions and type mismatches
 are explicit errors.
 
+Equality is one relation everywhere: numbers compare by numeric value
+across integer and float representations (`1 == 1.0`), and arrays and
+objects compare recursively element by element, so `==`/`!=`, `contains`,
+and `unique` always agree with each other. Values of distinct types never
+compare equal.
+
 ## Step Types
 
 `render`

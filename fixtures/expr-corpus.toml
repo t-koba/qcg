@@ -362,3 +362,27 @@ expected = true
 [[cases]]
 expr = "inputs.count == sum([1, 1, 1])"
 expected = true
+
+[[cases]]
+expr = "contains([inputs.count], 3)"
+expected = true
+
+[[cases]]
+expr = "contains([inputs.count], 3.0)"
+expected = true
+
+[[cases]]
+expr = "[inputs.count] == [3.0]"
+expected = true
+
+[[cases]]
+expr = "[[inputs.count]] == [[3.0]]"
+expected = true
+
+[[cases]]
+expr = "len(unique([inputs.count, 3.0])) == 1"
+expected = true
+
+[[cases]]
+expr = "len(unique([inputs.count, 4])) == 2"
+expected = true

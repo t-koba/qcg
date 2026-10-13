@@ -30,9 +30,29 @@ pub(crate) fn evaluate_binary(
     }
 }
 
+/// The one expression equality relation, shared by `==`/`!=`, array
+/// `contains`, and `unique` so they can never disagree: numbers compare by
+/// numeric value across integer and float representations, while arrays and
+/// objects compare recursively element by element. Values of distinct types
+/// never compare equal.
 fn values_equal(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Number(left), Value::Number(right)) => left.as_f64() == right.as_f64(),
+        (Value::Array(left), Value::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| values_equal(left, right))
+        }
+        (Value::Object(left), Value::Object(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(key, value)| {
+                    right
+                        .get(key)
+                        .is_some_and(|other| values_equal(value, other))
+                })
+        }
         _ => left == right,
     }
 }
@@ -81,7 +101,9 @@ pub(crate) fn evaluate_call(name: &str, arguments: &[Value]) -> Result<Value, St
         }
         ("contains", [container, needle]) => Ok(Value::Bool(match (container, needle) {
             (Value::String(container), Value::String(needle)) => container.contains(needle),
-            (Value::Array(container), needle) => container.contains(needle),
+            (Value::Array(container), needle) => {
+                container.iter().any(|item| values_equal(item, needle))
+            }
             (Value::Object(container), Value::String(needle)) => container.contains_key(needle),
             _ => return Err("contains() received incompatible arguments".into()),
         })),
@@ -174,7 +196,7 @@ pub(crate) fn evaluate_call(name: &str, arguments: &[Value]) -> Result<Value, St
             Value::Array(items) => {
                 let mut unique = Vec::new();
                 for item in items {
-                    if !unique.contains(item) {
+                    if !unique.iter().any(|seen| values_equal(seen, item)) {
                         unique.push(item.clone());
                     }
                 }

@@ -273,6 +273,48 @@ mod tests {
     }
 
     #[test]
+    fn numeric_equality_agrees_across_scalar_contains_and_unique() {
+        // One equality relation: a TOML/JSON integer input must compare
+        // like the same numeric literal under `==`, array `contains`,
+        // nested array equality, and `unique` deduplication.
+        let bag = corpus_bag();
+        for (expr, expected) in [
+            ("inputs.count == 3", true),
+            ("inputs.count == 3.0", true),
+            ("inputs.count != 3.0", false),
+            ("contains([inputs.count], 3)", true),
+            ("contains([inputs.count], 3.0)", true),
+            ("contains([3.0], inputs.count)", true),
+            ("[inputs.count] == [3]", true),
+            ("[inputs.count] == [3.0]", true),
+            ("[[inputs.count]] == [[3.0]]", true),
+            ("len(unique([inputs.count, 3])) == 1", true),
+            ("len(unique([inputs.count, 3.0])) == 1", true),
+            ("len(unique([inputs.count, 4])) == 2", true),
+            ("inputs.count == '3'", false),
+            ("[inputs.count] == [4]", false),
+        ] {
+            assert_eq!(
+                bag.eval_bool(Some(&Expr(expr.into())))
+                    .expect("equality probe should evaluate"),
+                expected,
+                "numeric equality must agree for `{expr}`"
+            );
+        }
+        // Objects compare recursively too: same shape with mixed integer
+        // and float representations compares equal.
+        let mut inputs = BTreeMap::new();
+        inputs.insert("left".into(), json!({ "rank": 7, "tags": [1, 2] }));
+        inputs.insert("right".into(), json!({ "rank": 7.0, "tags": [1.0, 2.0] }));
+        let bag = ValueBag::with_inputs(inputs);
+        assert!(
+            bag.eval_bool(Some(&Expr("inputs.left == inputs.right".into())))
+                .expect("object probe should evaluate"),
+            "structurally equal objects must compare equal across numeric representations"
+        );
+    }
+
+    #[test]
     fn shared_expr_corpus_fixture_matches_expected_results() {
         let fixture = include_str!("../../../fixtures/expr-corpus.toml");
         let parsed =
