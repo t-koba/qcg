@@ -905,10 +905,19 @@ impl StepExecutor for TestDelayedUserStep {
 
     async fn execute(
         &self,
-        _ctx: &mut StepContext<'_>,
+        ctx: &mut StepContext<'_>,
         _node: &NodeDef,
     ) -> Result<StepOutcome, StepError> {
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        // Suspend just past the run's monotonic elapsed deadline so the
+        // suspension lands inside the cooperative grace window no matter
+        // how slow the runner was before this step started: a fixed sleep
+        // races setup delay against the deadline, while the deadline
+        // itself is the grace window's anchor.
+        if let Some(deadline) = ctx.run.elapsed_deadline {
+            tokio::time::sleep_until(deadline + std::time::Duration::from_millis(100)).await;
+        } else {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
         Ok(StepOutcome::NeedsUser {
             question: api::FormSpec {
                 id: "delayed-question".into(),
@@ -2128,7 +2137,9 @@ async fn foreach_timeout_charges_cooperative_and_uncooperative_once() {
 async fn elapsed_grace_preserves_interaction_with_marker() {
     // E11: a HITL suspension that lands inside the elapsed-deadline
     // grace window is delivered (not discarded) with an
-    // elapsed-exceeded marker event.
+    // elapsed-exceeded marker event. The step suspends relative to the
+    // run's own deadline (not after a fixed sleep) so slow-runner setup
+    // delay cannot push the suspension past the grace window.
     let mut manifest = manifest(vec![node("ask", "test.delayed_user")]);
     manifest.budget.max_elapsed_seconds = Some(1);
     let run_dir = temp_run_dir("elapsed-grace-interaction");
