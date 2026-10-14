@@ -1055,6 +1055,12 @@ mod loopback_stream_tests {
                     Err(error) => panic!("test listener failed: {error}"),
                 }
             };
+            // Some Unix platforms inherit O_NONBLOCK from the listener on
+            // accepted sockets; request reads below rely on blocking I/O with
+            // the configured timeout instead.
+            socket
+                .set_nonblocking(false)
+                .expect("test socket should be blocking");
             socket
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .expect("test socket should set read timeout");
