@@ -45,7 +45,9 @@ pub(crate) fn local_cli_service(
         policy::DEFAULT_MAX_ACTIVE_RUNS,
         policy::DEFAULT_MAX_TRACKED_RUNS,
         service::RunStoreMode::Exclusive,
-        service::ServiceDeploymentPolicy::default(),
+        service::ServiceDeploymentPolicy::default()
+            .with_scheduling_env()
+            .map_err(anyhow::Error::msg)?,
     )?)
 }
 

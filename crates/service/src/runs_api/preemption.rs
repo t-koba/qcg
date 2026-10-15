@@ -12,29 +12,63 @@ impl LocalService {
         }
         let victim = {
             let runs = self.inner.runs.read().await;
+            let occupied = runs
+                .values()
+                .filter(|record| record.state == RunStatus::Running && !record.ephemeral)
+                .count();
             let running = runs
                 .iter()
-                .filter(|(_, record)| record.state == RunStatus::Running && !record.ephemeral)
+                .filter(|(_, record)| {
+                    record.state == RunStatus::Running && !record.ephemeral && !record.preempted
+                })
                 .map(|(run_id, record)| (run_id.as_str(), record.priority))
                 .collect::<Vec<_>>();
-            crate::queue::select_preemption_victim(&running, self.inner.max_active_runs, priority)
+            crate::queue::select_preemption_victim(
+                &running,
+                occupied,
+                self.inner.max_active_runs,
+                priority,
+            )
         };
-        if let Some(victim) = victim
-            && let Err(error) = self.preempt_run(&victim).await
-        {
-            tracing::warn!(%error, run_id = %victim, "priority preemption failed");
+        if let Some(victim) = victim {
+            let service = self.clone();
+            // The rendezvous must survive an arriving client's disconnect;
+            // otherwise a yielded victim could be left without a requeue owner.
+            let result = tokio::spawn(async move {
+                if let Err(error) = service.preempt_run(&victim).await {
+                    tracing::warn!(%error, run_id = %victim, "priority preemption failed");
+                }
+            })
+            .await;
+            if let Err(error) = result {
+                tracing::error!(%error, "priority preemption rendezvous task failed");
+            }
         }
     }
 
     pub(super) async fn preempt_run(&self, id: &str) -> Result<(), ApiError> {
-        let (handle, requeue) = {
+        let boundary =
+            self.inner.deployment_policy.preemption_mode == policy::PreemptionMode::StepBoundary;
+        let (handle, completion, requeue) = {
             let mut runs = self.inner.runs.write().await;
             let Some(record) = runs.get_mut(id) else {
                 return Err(api_not_found(format!("run `{id}` was not found")));
             };
-            if record.state != RunStatus::Running {
+            if record.state != RunStatus::Running || record.preempted {
                 return Ok(());
             }
+            // Observe this exact task without taking cancellation/shutdown's
+            // join handle. The shared slot can be taken or replaced by a
+            // concurrent cancel/HITL resume; it is not a completion witness.
+            let completion = if boundary {
+                let slot = record.task.lock().unwrap_or_else(PoisonError::into_inner);
+                let Some(handle) = slot.as_ref() else {
+                    return Ok(());
+                };
+                Some(handle.abort_handle())
+            } else {
+                None
+            };
             let requeue = RunRecord {
                 contract: record.contract.clone(),
                 contract_sha256: record.contract_sha256.clone(),
@@ -51,31 +85,48 @@ impl LocalService {
                 confirm: None,
                 events: record.events.clone(),
                 cancellation: CancellationToken::new(),
+                scheduler_yield: CancellationToken::new(),
                 task: Arc::clone(&record.task),
                 queued_at: None,
                 owner_id: self.inner.owner_id.clone(),
                 ephemeral: false,
             };
-            record.cancellation.cancel();
-            record.state = RunStatus::Queued;
-            record.question = None;
-            record.confirm = None;
-            record.artifacts = None;
             record.preempted = true;
-            let handle = record
-                .task
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take();
-            (handle, requeue)
+            let handle = if self.inner.deployment_policy.preemption_mode
+                == policy::PreemptionMode::Interrupt
+            {
+                record.cancellation.cancel();
+                record.state = RunStatus::Queued;
+                record.question = None;
+                record.confirm = None;
+                record.artifacts = None;
+                record
+                    .task
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take()
+            } else {
+                record.scheduler_yield.cancel();
+                // Leave the handle installed so user cancellation and shutdown
+                // retain their bounded-stop/abort authority while we drain.
+                None
+            };
+            (handle, completion, requeue)
         };
         let staged = requeue;
+        if let Some(completion) = completion {
+            // No timeout-to-interrupt fallback: only user cancellation,
+            // shutdown, or the run's own budgets may interrupt started work.
+            while !completion.is_finished() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
         // Single-writer rule: wait for the preempted engine task and its
         // journal writer to exit before appending requeue state. Writing
         // run_queued earlier races with cancel-time events from the old
         // writer, producing duplicate seq and last-writer-wins state.json.
-        // Bounded with abort like cancel and shutdown so a stuck executor
-        // cannot wedge preemption or leak a detached writer.
+        // Interrupt mode alone uses the bounded abort fallback. Boundary
+        // mode above never turns a stop timeout into an implicit interrupt.
         if let Some(handle) = handle {
             let mut handle = handle;
             tokio::select! {
@@ -91,13 +142,47 @@ impl LocalService {
                 }
             }
         }
-        truncate_trailing_canceled_events(&staged.run_dir).map_err(api_internal)?;
+        // Hold the execution lease across requeue. A resumer or peer must
+        // not start a writer between the rendezvous and the durable event.
+        let lease =
+            crate::run_dirs::try_lock_run_execution(&staged.run_dir).map_err(api_internal)?;
+        let Some(lease) = lease else {
+            return Err(api_internal("preemption requeue lost execution lease"));
+        };
+        if !boundary {
+            truncate_trailing_canceled_events(&staged.run_dir).map_err(api_internal)?;
+        }
         // Preemption requeues preserve the journaled effective policy:
         // re-resolving under a changed ceiling would diverge admission from
         // execution (E04). An unreadable journal fails the requeue instead
         // of silently running under the current ceiling (E04).
         let prior_events =
             crate::summaries::read_journal_events(&staged.run_dir).map_err(api_internal)?;
+        let state = engine::RunState::fold_values(&prior_events).map_err(api_internal)?;
+        if boundary {
+            let mut runs = self.inner.runs.write().await;
+            let Some(record) = runs.get_mut(id) else {
+                return Ok(());
+            };
+            // A concurrent cancel, completion, or HITL settlement wins.
+            if record.state != RunStatus::Running
+                || !record.preempted
+                || state.terminal.is_some()
+                || state.pending.is_some()
+            {
+                return Ok(());
+            }
+            let last = prior_events
+                .last()
+                .and_then(|event| event.get("t"))
+                .and_then(Value::as_str);
+            if last != Some("run_yielded") {
+                return Err(api_internal(
+                    "boundary preemption refused: task exited without a durable yield",
+                ));
+            }
+            record.state = RunStatus::Queued;
+        }
         let requeue_effective = crate::types::ResolvedExecutionPolicy::for_execution(
             &prior_events,
             self.inner.deployment_policy.max_parallel_steps,
@@ -137,6 +222,7 @@ impl LocalService {
                 _ => false,
             }
         };
+        drop(lease);
         if resume {
             let runs = self.inner.runs.read().await;
             let Some(record) = runs.get(id) else {

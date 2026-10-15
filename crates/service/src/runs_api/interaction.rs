@@ -165,6 +165,8 @@ impl LocalService {
                     record.artifacts = None;
                     let cancellation = CancellationToken::new();
                     record.cancellation = cancellation.clone();
+                    record.scheduler_yield = CancellationToken::new();
+                    record.preempted = false;
                     AnswerDecision::Spawn(Box::new(crate::lifecycle::SpawnRun {
                         run_id: id.clone(),
                         contract: record.contract.clone(),
@@ -347,6 +349,8 @@ impl LocalService {
                 record.artifacts = None;
                 let cancellation = CancellationToken::new();
                 record.cancellation = cancellation.clone();
+                record.scheduler_yield = CancellationToken::new();
+                record.preempted = false;
                 AfterLock::Spawn(Box::new(SpawnRun {
                     run_id: id.clone(),
                     contract: record.contract.clone(),

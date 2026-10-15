@@ -9,6 +9,7 @@ pub mod destination_decider;
 pub mod limits;
 pub mod params;
 pub mod path;
+pub mod scheduling;
 pub mod schema;
 pub mod service;
 
@@ -56,6 +57,7 @@ pub use path::{
     is_safe_path_component, is_safe_relative_path, normalize_path_prefix, path_is_within_prefix,
     portable_relative_path,
 };
+pub use scheduling::PreemptionMode;
 pub use schema::{
     MAX_JSON_SCHEMA_BYTES, MAX_JSON_SCHEMA_DEPTH, MAX_JSON_SCHEMA_NODES,
     MAX_JSON_SCHEMA_OBJECT_MEMBERS, MAX_JSON_SCHEMA_STRING_BYTES, MAX_PATTERN_BACKTRACK_LIMIT,

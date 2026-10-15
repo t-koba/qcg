@@ -635,11 +635,67 @@ Unattended limits:
 `priority` (default 0, higher runs first). Queued runs start in priority
 order with FIFO ties; `queue_position` in snapshots follows the same order.
 When all execution slots are busy and a higher-priority run arrives, the
-lowest-priority running run is preempted: it returns to `Queued` keeping its
-journal, and already finished steps replay on resume instead of re-running.
-Equal priorities never preempt each other, and cancellation during backoff or
-a concurrent `cancel` wins over the resume. Priorities persist in the run
-journal, so rehydrated queues keep their order across restarts.
+lowest-priority eligible running run is requested to yield. Equal priorities
+never preempt each other. The victim keeps its journal: completed work replays
+on resume instead of re-executing.
+
+The server and CLI host resolve these independent **deployment** settings at
+boot. `PREEMPTION_MODE` accepts only the listed spellings: invalid, empty, or
+non-Unicode values refuse startup, even when preemption is disabled. Embedded
+services pass the typed fields on
+`ServiceDeploymentPolicy` (or call `with_scheduling_env` before construction).
+Run requests and generator contracts cannot override them.
+
+| Environment | Accepted spellings | Default |
+| --- | --- | --- |
+| `PREEMPTION` | `1`/`0`, `true`/`false`, `yes`/`no`, `on`/`off` (case-insensitive) | `true` |
+| `PREEMPTION_MODE` | `step_boundary`, `interrupt` | `step_boundary` |
+
+`step_boundary` requests a cooperative yield distinct from ordinary cancellation.
+The current flow node (including nested execution), or a complete already-started
+parallel wave, finishes and checkpoints before yielding; no next node/wave starts.
+Startup/lifecycle work belongs to the current boundary. A yield is nonterminal:
+it does not run failure hooks or write a canceled/failed settlement. Completion,
+HITL suspension, and actual execution failures retain their normal handling.
+The yield marker syncs the journal, and the service waits for the old task and
+writer to exit, then holds the execution lease across requeue. There is **no
+five-second timeout-to-interrupt fallback** in this mode. Urgent work waits for
+the current boundary; user cancellation, shutdown, command timeouts, and elapsed
+budgets remain separate and effective, and may still interrupt work.
+
+`interrupt` retains immediate execution cancellation, with the existing
+five-second bounded-stop/abort fallback. This can leave an `operation_started`
+without a determinate result. Resume still **refuses to replay indeterminate
+external effects**; choosing interrupt does not weaken that fail-closed guard.
+
+FIFO and elapsed-budget semantics are unchanged: a preempted victim rejoins the
+tail among equal-priority queued runs; elapsed budgets count total wall-clock
+age, including queued/preempted/HITL waiting time. A concurrent `cancel` wins
+over resume. Priorities and queue order persist in the journal across restarts.
+
+### Measured latency/safety tradeoff
+
+The supplied interrupt baseline for the one-slot long-command regression was
+0.48 s test time: urgent work dispatched before the 60 s command ended, but the
+victim later failed with indeterminate replay refusal. That regression now
+explicitly selects `interrupt` to keep exercising the safety guard.
+
+A bounded real one-slot comparison is reproducible with
+`cargo test -p service --locked --offline bounded_scheduler_comparison -- --nocapture`.
+It requests preemption during a command that sleeps 0.3 s before appending an
+effect, followed by a dependent node. Boundary mode checkpoints the command once,
+starts urgent work before the dependent node, then resumes without duplicate
+effects and succeeds. In a focused local debug run, urgent work was admitted in
+397 ms with default StepBoundary versus 77 ms with Interrupt (command delay: 300 ms).
+Interrupt dispatched sooner but the victim failed with indeterminate replay
+refusal. The original long-command regression passed in 0.48 s test time.
+Additional regressions cover cancel racing with a draining yield, complete
+parallel-wave checkpoint/replay, HITL winning over yield, and a gated command
+held past five seconds without an implicit abort.
+
+Local timings are observations, not guarantees:
+the default trades current-boundary latency for avoiding scheduler-created
+indeterminate side effects.
 
 ## Run families: fork links and await
 

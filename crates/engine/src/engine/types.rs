@@ -48,6 +48,8 @@ pub enum EngineError {
     Rewound(String),
     #[error("run was canceled")]
     Canceled,
+    #[error("run yielded at a scheduler boundary")]
+    Yielded,
     #[error("run is waiting for user input: {question_id}")]
     NeedsUser {
         question_id: String,
@@ -62,6 +64,7 @@ pub enum EngineError {
 
 #[derive(Debug)]
 pub enum Progress {
+    Yielded,
     Advanced,
     Suspended(crate::Interaction),
     Done(OutputManifest),
@@ -208,6 +211,9 @@ pub struct RunOptions {
     /// Resolved `run_ref` resources by resource name. An unresolved
     /// referenced resource fails the run instead of silently skipping it.
     pub run_refs: BTreeMap<String, RunRefMaterial>,
+    /// Cooperative scheduler request, observed only between complete nodes/waves.
+    /// Unlike cancellation this never interrupts already-started work.
+    pub scheduler_yield: CancellationToken,
     pub cancellation: CancellationToken,
     /// Service shutdown token for shutdown-aware cancel settlement (E05).
     /// When already cancelled at cancel-settle time, the engine journals

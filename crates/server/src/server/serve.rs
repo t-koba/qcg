@@ -97,6 +97,7 @@ pub struct ResolvedServerPolicy {
     pub validated_cors: Vec<HeaderValue>,
     pub auto_gc: bool,
     pub preemption_enabled: bool,
+    pub preemption_mode: policy::PreemptionMode,
     /// Deployment HTTP rate limit resolved at boot (E04 freeze). `None`
     /// leaves the server unthrottled; `Some` installs one shared
     /// anonymous/instance bucket plus one bucket for verified identity
@@ -160,6 +161,7 @@ pub fn resolve_server_policy(config: &ServerConfig) -> Result<ResolvedServerPoli
         .map_err(|detail| format!("invalid GC configuration: {detail}"))?;
     let preemption_enabled = policy::parse_bool_env("PREEMPTION", true)
         .map_err(|detail| format!("invalid preemption configuration: {detail}"))?;
+    let preemption_mode = policy::PreemptionMode::from_env("PREEMPTION_MODE")?;
     // Rate limit: strict positive integers only, never a silent fold. Unset
     // rps disables the layer; every other invalid or incomplete combination
     // refuses boot (E04).
@@ -334,6 +336,7 @@ pub fn resolve_server_policy(config: &ServerConfig) -> Result<ResolvedServerPoli
         validated_cors,
         auto_gc,
         preemption_enabled,
+        preemption_mode,
         rate_limit,
         audit_floor,
         otlp,
@@ -410,6 +413,7 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
         validated_cors,
         auto_gc,
         preemption_enabled,
+        preemption_mode,
         rate_limit,
         audit_floor,
         otlp,
@@ -432,6 +436,7 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
         max_total_steps = max_total_steps,
         auto_gc,
         preemption_enabled,
+        ?preemption_mode,
         rate_limit_rps = rate_limit.as_ref().map(|policy| policy.rps),
         rate_limit_burst = rate_limit.as_ref().map(|policy| policy.burst),
         rate_limit_max_identities = rate_limit.as_ref().map(|policy| policy.max_identities),
@@ -466,6 +471,7 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
             read_cache_max_bytes,
             max_total_steps,
             preemption_enabled,
+            preemption_mode,
             audit_floor,
             gc_keep,
             gc_keep_failed,
@@ -2415,6 +2421,8 @@ command = ["sh", "-c", "sleep 30"]"#,
         let cases: Vec<(&str, &str, &str)> = vec![
             ("AUTO_GC", "maybe", "GC"),
             ("PREEMPTION", "maybe", "preemption"),
+            ("PREEMPTION_MODE", "fast", "PREEMPTION_MODE"),
+            ("PREEMPTION_MODE", "", "PREEMPTION_MODE"),
             ("RATE_LIMIT_RPS", "0", "rate limit"),
             ("RATE_LIMIT_RPS", "fast", "rate limit"),
             ("IDEMPOTENCY_TTL_SECS", "0", "idempotency"),
@@ -2433,6 +2441,10 @@ command = ["sh", "-c", "sleep 30"]"#,
             // SAFETY: the guard serializes environment mutation across tests.
             unsafe {
                 std::env::set_var(variable, value);
+                if variable == "PREEMPTION_MODE" {
+                    // Mode validation is independent of enabling preemption.
+                    std::env::set_var("PREEMPTION", "false");
+                }
             }
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
@@ -2447,6 +2459,9 @@ command = ["sh", "-c", "sleep 30"]"#,
             // SAFETY: still holding the guard.
             unsafe {
                 std::env::remove_var(variable);
+                if variable == "PREEMPTION_MODE" {
+                    std::env::remove_var("PREEMPTION");
+                }
             }
             // A refused boot must not pin the run-store lock.
             try_single_run_service(&generators, &runs)

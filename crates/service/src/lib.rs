@@ -24,3 +24,5 @@ pub use types::*;
 #[cfg(test)]
 #[path = "tests/mod.rs"]
 mod tests;
+
+pub use policy::PreemptionMode;

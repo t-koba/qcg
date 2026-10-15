@@ -29,6 +29,8 @@ pub struct ServiceDeploymentPolicy {
     pub read_cache_max_bytes: usize,
     pub max_total_steps: Option<usize>,
     pub preemption_enabled: bool,
+    /// Cooperative step/wave boundary by default; interrupt is explicit.
+    pub preemption_mode: policy::PreemptionMode,
     /// Deployment audit floor. It can only raise observation persistence:
     /// a `standard` floor overrides any generator-level reduction.
     pub audit_floor: policy::AuditFloor,
@@ -59,6 +61,7 @@ impl Default for ServiceDeploymentPolicy {
             read_cache_max_bytes: policy::DEFAULT_READ_CACHE_BYTES,
             max_total_steps: None,
             preemption_enabled: true,
+            preemption_mode: policy::PreemptionMode::default(),
             audit_floor: policy::AuditFloor::Minimal,
             gc_keep: policy::DEFAULT_GC_KEEP,
             gc_keep_failed: policy::DEFAULT_GC_KEEP_FAILED,
@@ -93,6 +96,16 @@ pub enum ServiceError {
 impl From<ServiceError> for ApiError {
     fn from(error: ServiceError) -> Self {
         Self::internal(error.to_string())
+    }
+}
+
+impl ServiceDeploymentPolicy {
+    /// Resolve host scheduling environment once before constructing a service.
+    /// Callers cannot supply any of these choices on a run request.
+    pub fn with_scheduling_env(mut self) -> Result<Self, String> {
+        self.preemption_enabled = policy::parse_bool_env("PREEMPTION", true)?;
+        self.preemption_mode = policy::PreemptionMode::from_env("PREEMPTION_MODE")?;
+        Ok(self)
     }
 }
 
@@ -185,6 +198,7 @@ pub(crate) struct RunRecord {
     pub(crate) confirm: Option<ConfirmSpec>,
     pub(crate) events: broadcast::Sender<RunEvent>,
     pub(crate) cancellation: CancellationToken,
+    pub(crate) scheduler_yield: CancellationToken,
     // Plain `std` mutex by design: every critical section only takes or
     // inspects the handle without awaiting while held, so it never blocks
     // the executor; a Tokio mutex would add no safety here (E03).

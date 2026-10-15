@@ -317,6 +317,7 @@ fn adoption_snapshot_covers_seed_and_fork_inputs_without_second_read() {
         confirm: None,
         events,
         cancellation: CancellationToken::new(),
+        scheduler_yield: CancellationToken::new(),
         task: Arc::new(Mutex::new(None)),
         queued_at: None,
         owner_id: String::new(),

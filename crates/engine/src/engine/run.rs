@@ -193,6 +193,7 @@ impl Engine {
             .await
         {
             Ok(manifest) => Progress::Done(manifest),
+            Err(EngineError::Yielded) => Progress::Yielded,
             Err(EngineError::NeedsUser { question, .. }) => {
                 Progress::Suspended(crate::Interaction::Question {
                     question: *question,
@@ -689,6 +690,14 @@ impl Engine {
         loop {
             if context.cancellation.is_cancelled() {
                 return Err(EngineError::Canceled);
+            }
+            // Only yield between nodes or complete parallel waves. All started
+            // work has checkpointed before re-entry; this is not cancellation
+            // and must bypass terminal settlement and failure hooks.
+            if options.scheduler_yield.is_cancelled() {
+                context.run_checkpoint()?;
+                journal.event("run_yielded", json!({}))?;
+                return Err(EngineError::Yielded);
             }
             let mut progressed = false;
             let mut ready = Vec::new();

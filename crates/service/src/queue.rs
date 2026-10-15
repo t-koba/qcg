@@ -50,14 +50,16 @@ pub(crate) fn queue_head(runs: &BTreeMap<String, RunRecord>) -> Option<String> {
 }
 
 /// Victim for priority preemption: capacity is judged on total running runs,
-/// then the lowest-priority run below the arrival priority is evicted.
+/// including cooperative yields still draining, then the lowest-priority
+/// eligible run below the arrival priority is evicted.
 /// Equal priorities never preempt each other.
 pub(crate) fn select_preemption_victim(
     running: &[(&str, i32)],
+    occupied_slots: usize,
     max_active_runs: usize,
     arrival_priority: i32,
 ) -> Option<String> {
-    if running.len() < max_active_runs {
+    if occupied_slots < max_active_runs {
         return None;
     }
     running
@@ -76,19 +78,31 @@ mod tests {
         let running = [("high", 10), ("low", 0)];
         // Capacity 2, arrival 5: only the lower-priority run is evictable.
         assert_eq!(
-            select_preemption_victim(&running, 2, 5).as_deref(),
+            select_preemption_victim(&running, running.len(), 2, 5).as_deref(),
             Some("low")
         );
+        // A draining yield still occupies a slot but cannot be selected
+        // twice. Other arrivals may preempt another eligible running run.
+        assert_eq!(
+            select_preemption_victim(&[("other", 0)], 2, 2, 5).as_deref(),
+            Some("other")
+        );
         // Free slot: no preemption even with an evictable candidate.
-        assert_eq!(select_preemption_victim(&running, 3, 5), None);
+        assert_eq!(
+            select_preemption_victim(&running, running.len(), 3, 5),
+            None
+        );
         // No candidate below arrival: no preemption when full.
-        assert_eq!(select_preemption_victim(&running, 2, 0), None);
-        assert_eq!(select_preemption_victim(&[("high", 10)], 1, 5), None);
+        assert_eq!(
+            select_preemption_victim(&running, running.len(), 2, 0),
+            None
+        );
+        assert_eq!(select_preemption_victim(&[("high", 10)], 1, 1, 5), None);
         // Equal priorities never preempt each other.
-        assert_eq!(select_preemption_victim(&[("same", 5)], 1, 5), None);
+        assert_eq!(select_preemption_victim(&[("same", 5)], 1, 1, 5), None);
         // Ties prefer the larger run id, matching scheduler order.
         assert_eq!(
-            select_preemption_victim(&[("a", 0), ("b", 0)], 2, 5).as_deref(),
+            select_preemption_victim(&[("a", 0), ("b", 0)], 2, 2, 5).as_deref(),
             Some("b")
         );
     }

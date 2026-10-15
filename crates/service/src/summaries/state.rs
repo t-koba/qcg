@@ -230,6 +230,7 @@ pub(crate) fn rehydrate_runs(
                 confirm,
                 events,
                 cancellation: CancellationToken::new(),
+                scheduler_yield: CancellationToken::new(),
                 task: Arc::new(Mutex::new(None)),
                 queued_at,
                 owner_id: String::new(),

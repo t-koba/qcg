@@ -873,6 +873,7 @@ impl LocalService {
                 // task; adopting one would double-execute.
                 .filter(|(_, record)| {
                     !record.ephemeral
+                        && !record.preempted
                         && (record.state == RunStatus::Queued
                             || record.state == RunStatus::Waiting
                             || record.state == RunStatus::Confirming
@@ -929,6 +930,7 @@ impl LocalService {
             runs.iter()
                 .filter(|(_, record)| {
                     !record.ephemeral
+                        && !record.preempted
                         && !crate::types::task_slot_is_live(&record.task)
                         // Stale queue entries re-enter admission; accepted
                         // cancellations without a task converge through the
@@ -1512,6 +1514,14 @@ impl LocalService {
                         return;
                     }
                 };
+                let scheduler_yield = service
+                    .inner
+                    .runs
+                    .read()
+                    .await
+                    .get(&run_id)
+                    .map(|record| record.scheduler_yield.clone())
+                    .unwrap_or_default();
                 let progress = engine
                     .advance_with_id(
                         run_id.clone(),
@@ -1532,6 +1542,7 @@ impl LocalService {
                             cancellation,
                             run_refs,
                             shutdown: Some(service.shutdown_token()),
+                            scheduler_yield,
                         },
                     )
                     .await;
@@ -1543,11 +1554,24 @@ impl LocalService {
                     .await
                     .get(&run_id)
                     .is_some_and(|record| record.preempted);
-                if !preempted {
+                if matches!(progress, Progress::Yielded) {
+                    // The preemption rendezvous owns requeue after this task
+                    // releases its execution lease and journal writer.
+                } else if !preempted
+                    || service.inner.deployment_policy.preemption_mode
+                        == policy::PreemptionMode::StepBoundary
+                {
+                    if service.inner.deployment_policy.preemption_mode
+                        == policy::PreemptionMode::StepBoundary
+                        && let Some(record) = service.inner.runs.write().await.get_mut(&run_id)
+                    {
+                        record.scheduler_yield = CancellationToken::new();
+                        record.preempted = false;
+                    }
                     service.finish_run(run_id, progress).await;
                 }
-                // Preempted runs stay Queued; preempt_run() respawns them so the
-                // journal replay skips already finished steps.
+                // preempt_run() owns the post-exit requeue for preempted runs;
+                // journal replay skips already finished steps on resume.
             });
             // Compare-and-install under the slot lock (E03): this spawn
             // holds the execution lease, so no rival spawn can be live for
@@ -1670,6 +1694,7 @@ impl LocalService {
                         confirm: None,
                         events: events.clone(),
                         cancellation: CancellationToken::new(),
+                        scheduler_yield: tokio_util::sync::CancellationToken::new(),
                         task: Arc::new(Mutex::new(None)),
                         queued_at: Some(chrono::Utc::now()),
                         owner_id: self.inner.owner_id.clone(),
@@ -1750,6 +1775,7 @@ impl LocalService {
                     // spawned runs: a shutdown mid-run ends the wait
                     // instead of overrunning it (E05).
                     shutdown: Some(self.shutdown_token()),
+                    scheduler_yield: tokio_util::sync::CancellationToken::new(),
                 },
             )
             .await;
@@ -1910,6 +1936,8 @@ impl LocalService {
         record.artifacts = None;
         let cancellation = CancellationToken::new();
         record.cancellation = cancellation.clone();
+        record.scheduler_yield = CancellationToken::new();
+        record.preempted = false;
         let request = SpawnRun {
             run_id: run_id.to_string(),
             contract: record.contract.clone(),
@@ -2012,7 +2040,7 @@ impl LocalService {
                         }),
                     ));
                 }
-                Progress::Advanced => {}
+                Progress::Advanced | Progress::Yielded => {}
             }
             for (kind, payload) in &transition.writes {
                 if let Err(error) = write_run_event(&record, kind, payload.clone()) {

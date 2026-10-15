@@ -811,7 +811,9 @@ impl JournalWriter {
             // Durability ordering (Q2): terminal events seal the run and
             // operation mappings (`operation_started`/`operation_finished`)
             // precede any external send, so both fsync the journal file
-            // before the atomic state persist below. The state persist
+            // before the atomic state persist below. Scheduler yields also
+            // sync: requeue must never expose a checkpoint ahead of its journal.
+            // The state persist
             // (file plus parent directory sync) follows, so the mapping is
             // durable in both the journal and state.json before the guard
             // returns and any gateway is touched. The journal parent
@@ -819,7 +821,10 @@ impl JournalWriter {
             // durability bar as mapping persist, so the directory entry is
             // durable alongside the bytes.
             if api::is_terminal_event_kind(kind)
-                || matches!(kind, "operation_started" | "operation_finished")
+                || matches!(
+                    kind,
+                    "operation_started" | "operation_finished" | "run_yielded"
+                )
             {
                 file.sync_data()?;
                 sync_parent_dir(&self.journal_path)?;
@@ -1047,7 +1052,10 @@ impl JournalWriter {
             let bytes = serialize_bounded(&value, limits.max_event_bytes, "event")?;
             append_serialized_json_line(&mut file, bytes, &mut stats, limits)?;
             if api::is_terminal_event_kind(kind)
-                || matches!(kind, "operation_started" | "operation_finished")
+                || matches!(
+                    kind,
+                    "operation_started" | "operation_finished" | "run_yielded"
+                )
             {
                 needs_sync = true;
             }

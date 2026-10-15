@@ -45,6 +45,7 @@ pub const INTERNAL_RUN_EVENT_KINDS: &[&str] = &[
     "operation_repeated",
     "operation_started",
     "run_forked",
+    "run_yielded",
     "state_patched",
     "step_interrupted",
     "step_timeout",

@@ -543,7 +543,10 @@ command_timeout_seconds = 300"#,
         1,
         DEFAULT_MAX_TRACKED_RUNS,
         RunStoreMode::Exclusive,
-        ServiceDeploymentPolicy::default(),
+        ServiceDeploymentPolicy {
+            preemption_mode: policy::PreemptionMode::Interrupt,
+            ..ServiceDeploymentPolicy::default()
+        },
     )
     .expect("service should initialize");
     let start_prioritized = async |service: &LocalService, priority: i32| {

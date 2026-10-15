@@ -36,6 +36,7 @@ fn run_options(output_dir: Utf8PathBuf) -> RunOptions {
         run_refs: BTreeMap::new(),
         cancellation: CancellationToken::new(),
         shutdown: None,
+        scheduler_yield: tokio_util::sync::CancellationToken::new(),
     }
 }
 
@@ -6470,4 +6471,153 @@ async fn acrfence_crash_after_commit_and_token_resurrection_replay_gap() {
 
     let _ = std::fs::remove_dir_all(&baseline_root);
     let _ = std::fs::remove_dir_all(&restore_root);
+}
+
+struct BoundaryProbe {
+    yield_request: CancellationToken,
+    completed: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl StepExecutor for BoundaryProbe {
+    fn type_id(&self) -> &'static str {
+        "test.boundary_probe"
+    }
+    fn traits(&self) -> StepTraits {
+        StepTraits::parallel()
+    }
+    async fn execute(
+        &self,
+        ctx: &mut StepContext<'_>,
+        node: &NodeDef,
+    ) -> Result<StepOutcome, StepError> {
+        // Request during started work, never at an artificial idle point.
+        self.yield_request.cancel();
+        if node.id == "prompt" {
+            return TestNeedsUserStep.execute(ctx, node).await;
+        }
+        let millis = node
+            .params
+            .get("millis")
+            .and_then(toml::Value::as_integer)
+            .unwrap_or(0) as u64;
+        tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+        self.completed.fetch_add(1, Ordering::SeqCst);
+        Ok(StepOutcome::Success {
+            output: Some(json!(node.id)),
+            files: vec![],
+        })
+    }
+}
+
+#[tokio::test]
+async fn boundary_yield_drains_and_checkpoints_parallel_wave_once() {
+    let root = temp_run_dir("boundary-wave");
+    let _ = std::fs::remove_dir_all(&root);
+    let token = CancellationToken::new();
+    let completed = Arc::new(AtomicUsize::new(0));
+    let mut registry = StepRegistry::new();
+    registry.register(BoundaryProbe {
+        yield_request: token.clone(),
+        completed: completed.clone(),
+    });
+    let mut a = node("a", "test.boundary_probe");
+    a.params.insert("millis".into(), toml::Value::Integer(100));
+    let mut b = node("b", "test.boundary_probe");
+    b.params.insert("millis".into(), toml::Value::Integer(200));
+    let mut after = node("after", "test.boundary_probe");
+    after.needs = vec!["a".into(), "b".into()];
+    let mut flow = manifest(vec![a, b, after]);
+    flow.parallel = vec!["a".into(), "b".into()];
+    flow.hooks.run_failed.push(hook(
+        "must_not_run",
+        "test.boundary_probe",
+        HookErrorPolicy::Fail,
+    ));
+    let contract = test_contract(&root, flow);
+    let engine = Engine::new(registry);
+    let options = RunOptions {
+        scheduler_yield: token,
+        max_parallel_steps: 2,
+        ..run_options(root.join("workspace"))
+    };
+    let result = engine
+        .run_with_id(
+            "boundary-wave".into(),
+            root.join("meta"),
+            contract.clone(),
+            BTreeMap::new(),
+            options,
+        )
+        .await;
+    assert!(matches!(result, Err(EngineError::Yielded)), "{result:?}");
+    assert_eq!(
+        completed.load(Ordering::SeqCst),
+        2,
+        "entire started wave drained"
+    );
+    let state = RunState::fold_journal(&root.join("meta/journal.jsonl")).unwrap();
+    assert!(state.terminal.is_none());
+    assert_eq!(state.nodes.len(), 2);
+    assert_eq!(state.budget.steps_executed, 2);
+    let journal = std::fs::read_to_string(root.join("meta/journal.jsonl")).unwrap();
+    assert!(!journal.contains("must_not_run"));
+    assert!(!journal.contains("run_canceled"));
+    assert!(!journal.contains("run_error"));
+    engine
+        .run_with_id(
+            "boundary-wave".into(),
+            root.join("meta"),
+            contract,
+            BTreeMap::new(),
+            RunOptions {
+                ..run_options(root.join("workspace"))
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        completed.load(Ordering::SeqCst),
+        3,
+        "durable wave replays without execution"
+    );
+    let state = RunState::fold_journal(&root.join("meta/journal.jsonl")).unwrap();
+    assert!(matches!(
+        state.terminal,
+        Some(crate::TerminalState::Succeeded)
+    ));
+}
+
+#[tokio::test]
+async fn hitl_suspension_wins_over_boundary_yield() {
+    let root = temp_run_dir("boundary-hitl-race");
+    let _ = std::fs::remove_dir_all(&root);
+    let token = CancellationToken::new();
+    let mut registry = StepRegistry::new();
+    registry.register(BoundaryProbe {
+        yield_request: token.clone(),
+        completed: Arc::new(AtomicUsize::new(0)),
+    });
+    let contract = test_contract(&root, manifest(vec![node("prompt", "test.boundary_probe")]));
+    let result = Engine::new(registry)
+        .run_with_id(
+            "hitl-race".into(),
+            root.join("meta"),
+            contract,
+            BTreeMap::new(),
+            RunOptions {
+                scheduler_yield: token,
+                ..run_options(root.join("workspace"))
+            },
+        )
+        .await;
+    assert!(
+        matches!(result, Err(EngineError::NeedsUser { .. })),
+        "{result:?}"
+    );
+    let state = RunState::fold_journal(&root.join("meta/journal.jsonl")).unwrap();
+    assert!(state.terminal.is_none());
+    let journal = std::fs::read_to_string(root.join("meta/journal.jsonl")).unwrap();
+    assert!(!journal.contains("run_yielded"));
+    assert!(!journal.contains("run_error"));
 }

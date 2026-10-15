@@ -336,6 +336,7 @@ pub(crate) fn synthetic_hitl_record(root: &Utf8Path, run_id: &str) -> RunRecord 
         confirm: None,
         events,
         cancellation: CancellationToken::new(),
+        scheduler_yield: CancellationToken::new(),
         task: Arc::new(Mutex::new(None)),
         queued_at: Some(chrono::Utc::now()),
         owner_id: String::new(),
