@@ -659,19 +659,20 @@ pub fn unpack_package(
                 "archive expanded size exceeds {limit} bytes"
             )));
         }
-        // Every archive entry must carry an explicit Unix mode; mode-less
-        // entries are refused instead of inheriting the umask or falling
-        // back to silent defaults (E15-8). The mode is sanitized on restore
-        // so setuid/setgid/sticky never survive and world-writable is
-        // cleared (E15-1).
-        if header.version_made_by().creator_system() != rawzip::CreatorSystem::UNIX
-            || header.external_attributes() == 0
-        {
+        // Every archive entry must carry a nonzero mode in the high word
+        // of external attributes; creator-system metadata does not change
+        // where this explicit mode is stored. Mode-less entries are refused
+        // instead of inheriting the umask or falling back to silent defaults
+        // (E15-8). The raw mode is sanitized on restore so
+        // setuid/setgid/sticky never survive and world-writable is cleared
+        // (E15-1).
+        let raw_mode = header.external_attributes() >> 16;
+        if raw_mode == 0 {
             return Err(ServiceError::Invalid(format!(
                 "archive entry `{rel}` is missing an explicit Unix mode"
             )));
         }
-        let archived_mode = sanitize_restored_mode(header.mode().value());
+        let archived_mode = sanitize_restored_mode(raw_mode);
         let local = archive.get_entry(header.wayfinder()).map_err(invalid_zip)?;
         let reader = local.reader();
         let verification = reader.claim_verifier();
@@ -1618,9 +1619,9 @@ mod tests {
     fn unpack_refuses_entries_without_explicit_modes() {
         // E15-8: mode-less entries are refused instead of inheriting the
         // umask or falling back to silent defaults. The zip writer always
-        // normalizes a default mode, so a truly mode-less entry must have
-        // its central-directory external attributes cleared after writing;
-        // otherwise `unix_mode()` still reports the normalized default.
+        // stores a default mode in the high word, so this fixture clears
+        // that word while retaining low-word DOS attributes to prove they
+        // do not count as an explicit mode.
         use std::io::Write as _;
 
         let root = temp_dir("unpack-no-modes");
@@ -1687,7 +1688,10 @@ mod tests {
                 let name_start = offset + 46;
                 let name_end = name_start + name_len;
                 if name_end <= bytes.len() && &bytes[name_start..name_end] == b"data.txt" {
-                    bytes[offset + 38..offset + 42].copy_from_slice(&[0, 0, 0, 0]);
+                    // Keep a DOS attribute (read-only) while leaving the
+                    // high-word mode at zero: low-word attributes are not an
+                    // explicit mode.
+                    bytes[offset + 38..offset + 42].copy_from_slice(&0x01_u32.to_le_bytes());
                     stripped = true;
                 }
                 offset = name_end + extra_len + comment_len;
@@ -1702,6 +1706,105 @@ mod tests {
         assert!(
             error.to_string().contains("explicit Unix mode"),
             "the refusal must name the missing mode: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unpack_uses_explicit_mode_when_creator_system_is_dos() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = temp_dir("unpack-dos-creator-mode");
+        let _temp_guard = TempGuard(root.clone());
+        std::fs::create_dir_all(&root).expect("root should be created");
+        let archive = root.join("pkg.pkg");
+        let body = b"#!/bin/sh\necho package\n";
+        let sha256 = hex::encode(Sha256::digest(body));
+        {
+            let file = File::create(&archive).expect("archive should be created");
+            let mut writer = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default();
+            writer
+                .start_file("bin/tool", options.unix_permissions(0o755))
+                .expect("tool entry");
+            writer.write_all(body).expect("tool body");
+            let sbom = test_sbom(vec![test_sbom_file("bin/tool", &sha256, 0o755)]);
+            finish_archive(writer, options, &sbom);
+        }
+        // Change only the creator-system byte of the payload's central
+        // record from Unix to DOS/FAT. The external-attributes high word
+        // remains the explicit 0o100755 mode.
+        {
+            let mut bytes = std::fs::read(&archive).expect("archive should be readable");
+            let eocd_sig = [0x50u8, 0x4b, 0x05, 0x06];
+            let eocd_pos = bytes
+                .windows(4)
+                .rposition(|window| window == eocd_sig)
+                .expect("archive should have an End of Central Directory");
+            let central_size = u32::from_le_bytes(
+                bytes[eocd_pos + 12..eocd_pos + 16]
+                    .try_into()
+                    .expect("central size"),
+            ) as usize;
+            let central_offset = u32::from_le_bytes(
+                bytes[eocd_pos + 16..eocd_pos + 20]
+                    .try_into()
+                    .expect("central offset"),
+            ) as usize;
+            let central_end = central_offset + central_size;
+            let mut offset = central_offset;
+            let mut changed = false;
+            while offset + 46 <= central_end {
+                assert_eq!(&bytes[offset..offset + 4], b"PK\x01\x02");
+                let name_len = u16::from_le_bytes(
+                    bytes[offset + 28..offset + 30]
+                        .try_into()
+                        .expect("name length"),
+                ) as usize;
+                let extra_len = u16::from_le_bytes(
+                    bytes[offset + 30..offset + 32]
+                        .try_into()
+                        .expect("extra length"),
+                ) as usize;
+                let comment_len = u16::from_le_bytes(
+                    bytes[offset + 32..offset + 34]
+                        .try_into()
+                        .expect("comment length"),
+                ) as usize;
+                let name_start = offset + 46;
+                let name_end = name_start + name_len;
+                if &bytes[name_start..name_end] == b"bin/tool" {
+                    assert_eq!(bytes[offset + 5], rawzip::CreatorSystem::UNIX.as_u8());
+                    let external_attributes = u32::from_le_bytes(
+                        bytes[offset + 38..offset + 42]
+                            .try_into()
+                            .expect("external attributes"),
+                    );
+                    assert_eq!(external_attributes >> 16, 0o100755);
+                    bytes[offset + 5] = rawzip::CreatorSystem::FAT.as_u8();
+                    changed = true;
+                    break;
+                }
+                offset = name_end + extra_len + comment_len;
+            }
+            assert!(changed, "tool central header should be found");
+            std::fs::write(&archive, bytes).expect("mutated archive should be writable");
+        }
+
+        let target = root.join("out");
+        std::fs::create_dir_all(&target).expect("target should be created");
+        unpack_package(&archive, &target, &PackageLimits::default())
+            .expect("explicit high-word mode should unpack regardless of creator system");
+        let tool = target.join("bin/tool");
+        assert_eq!(std::fs::read(&tool).expect("tool content"), body);
+        assert_eq!(
+            std::fs::metadata(tool)
+                .expect("tool metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
         );
     }
 
