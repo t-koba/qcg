@@ -52,21 +52,44 @@ async fn created_snapshot(response: reqwest::Response) -> Value {
 }
 
 fn redact_ci_paths(message: &str) -> String {
-    let mut redacted = message.to_owned();
     let roots = [
         workspace_root().as_str().to_owned(),
         std::env::temp_dir().to_string_lossy().into_owned(),
     ];
+    redact_paths(message, &roots)
+}
+
+fn redact_paths(message: &str, roots: &[String]) -> String {
+    let mut redacted = message.to_owned();
     for root in roots {
         if root.is_empty() {
             continue;
         }
         let portable = root.replace('\\', "/");
+        // JSON string encoding doubles backslashes in Windows paths.
+        let json_escaped = root.replace('\\', "\\\\");
         redacted = redacted
-            .replace(&root, "<path>")
-            .replace(&portable, "<path>");
+            .replace(root, "<path>")
+            .replace(&portable, "<path>")
+            .replace(&json_escaped, "<path>");
     }
     redacted
+}
+
+#[test]
+fn ci_error_redaction_handles_json_escaped_windows_paths() {
+    let root = r"D:\a\qcg\qcg";
+    let body = serde_json::to_string(&json!({
+        "detail": format!(r"package walk failed at {root}\fixtures")
+    }))
+    .expect("problem details should serialize");
+    let escaped_root = root.replace('\\', "\\\\");
+    let redacted = redact_paths(&body, &[root.to_owned()]);
+    assert!(redacted.contains("<path>"), "{redacted}");
+    assert!(
+        !redacted.contains(&escaped_root),
+        "escaped Windows root leaked: {redacted}"
+    );
 }
 
 /// Restores `TEST_TOKEN` on drop so a panicking assertion cannot leak
