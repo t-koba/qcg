@@ -1305,7 +1305,7 @@ pub fn copy_dir_all(
         // swapped-in symlink is refused instead of followed) and gate on
         // the handle's own metadata, never on a pre-open following stat:
         // length, kind, and mode all come from the opened file (E15).
-        let mut input = open_source_file_nofollow(&path).map_err(|error| {
+        let mut input = open_source_entry_nofollow(&path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::PermissionDenied {
                 ServiceError::Invalid(format!("package source contains a symbolic link: {path}"))
             } else {
@@ -1463,9 +1463,11 @@ fn explicit_source_file_mode(metadata: &std::fs::Metadata) -> u32 {
     }
 }
 
-/// Opens a source file without following a terminal symlink on Unix
-/// (O_NOFOLLOW at use time, E15-6). Non-Unix pre-checks for a symlink.
-fn open_source_file_nofollow(path: &Utf8Path) -> Result<File, std::io::Error> {
+/// Opens a source entry (file or directory) without following a terminal
+/// symlink on Unix (O_NOFOLLOW at use time, E15-6). Non-Unix pre-checks
+/// for a symlink. Windows needs FILE_FLAG_BACKUP_SEMANTICS to open a
+/// directory so the copy path can check its kind and mode on the handle.
+fn open_source_entry_nofollow(path: &Utf8Path) -> Result<File, std::io::Error> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -1481,7 +1483,17 @@ fn open_source_file_nofollow(path: &Utf8Path) -> Result<File, std::io::Error> {
                 std::io::ErrorKind::PermissionDenied,
                 format!("refusing to open symbolic link `{path}`"),
             )),
-            Ok(_) => std::fs::File::open(path),
+            Ok(_) => {
+                let mut options = std::fs::OpenOptions::new();
+                options.read(true);
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::OpenOptionsExt as _;
+                    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+                    options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+                }
+                options.open(path)
+            }
             Err(error) => Err(error),
         }
     }
@@ -1648,7 +1660,7 @@ fn verify_package_inventory(root: &Utf8Path, limits: &PackageLimits) -> Result<(
 /// the open and fails closed on any link, with a documented residual
 /// window.
 fn open_verified_file_nofollow(path: &Utf8Path, relative: &str) -> Result<File, ServiceError> {
-    match open_source_file_nofollow(path) {
+    match open_source_entry_nofollow(path) {
         Ok(file) => Ok(file),
         Err(error) => {
             if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
@@ -1999,6 +2011,36 @@ mod tests {
         let error = package_identity_sha256(&root, &byte_limited)
             .expect_err("four bytes exceed the configured limit");
         assert!(error.to_string().contains("exceeds 3 bytes"), "{error}");
+    }
+
+    #[test]
+    fn copy_dir_all_preserves_nested_package_identity() {
+        // Admission snapshots must copy directories too: on Windows a plain
+        // File::open fails for directory entries even when files are readable.
+        let root = temp_dir("copy-identity");
+        let _temp_guard = TempGuard(root.clone());
+        let source = root.join("source");
+        let target = root.join("target");
+        std::fs::create_dir_all(source.join("templates/nested")).expect("source dirs");
+        std::fs::create_dir(source.join("empty")).expect("empty source dir");
+        std::fs::write(source.join("qcg.toml"), b"manifest").expect("root file");
+        std::fs::write(source.join("templates/nested/page.j2"), b"hello").expect("template");
+        std::fs::create_dir(&target).expect("target");
+        let expected =
+            package_identity_sha256(&source, &PackageLimits::default()).expect("source identity");
+
+        copy_dir_all(&source, &target, &PackageLimits::default()).expect("copy should succeed");
+        assert!(target.join("empty").is_dir());
+        assert_eq!(
+            std::fs::read(target.join("templates/nested/page.j2")).expect("copied template"),
+            b"hello"
+        );
+        crate::run_package::verify(&target, &expected).expect("snapshot identity must match");
+
+        std::fs::write(target.join("templates/nested/page.j2"), b"other").expect("tamper");
+        let error = crate::run_package::verify(&target, &expected)
+            .expect_err("changed snapshot must fail closed");
+        assert!(error.to_string().contains("identity mismatch"), "{error}");
     }
 
     #[cfg(unix)]
