@@ -42,6 +42,13 @@ use super::types::{
 /// `.part-` prefix. No current writer emits any other prefix.
 pub(crate) const STARTUP_SWEEP_FRAGMENTS: [&str; 1] = [".part-"];
 
+/// Refreshes only statuses and reasons from the journal fold. Live outputs,
+/// inputs, and foreach item remain owned by the execution scope.
+pub(super) fn sync_live_outcomes(vars: &mut ValueBag, journal: &JournalWriter) {
+    let folded = journal.state();
+    vars.sync_outcome_metadata(&folded.vars);
+}
+
 impl Engine {
     pub fn new(registry: StepRegistry) -> Self {
         Self {
@@ -216,6 +223,7 @@ impl Engine {
     ) -> Result<(), EngineError> {
         let hooks = context.contract.manifest.hooks.for_event(event).to_vec();
         for hook in hooks {
+            sync_live_outcomes(vars, journal);
             let node = hook.to_node(event);
             if let Some(replayed) = context.replayed_steps.get(&node.id) {
                 if let Some(output) = replayed.output.clone() {
@@ -326,7 +334,6 @@ impl Engine {
                         &context.checkpoint_accounting,
                     )?;
                     let output_name = super::types::output_name_for(&node);
-                    vars.publish_step_output(&node.id, node.output.as_deref(), &output, None);
                     journal.event(
                         "step_finished",
                         json!({
@@ -337,6 +344,8 @@ impl Engine {
                             "output_name": output_name,
                         }),
                     )?;
+                    vars.publish_step_output(&node.id, node.output.as_deref(), &output, None);
+                    sync_live_outcomes(vars, journal);
                     None
                 }
                 StepOutcome::CheckFailed {
@@ -365,6 +374,7 @@ impl Engine {
                             &file_pins,
                         )?,
                     )?;
+                    sync_live_outcomes(vars, journal);
                     Some(reason.message)
                 }
                 StepOutcome::NeedsUser { .. } | StepOutcome::NeedsConfirm { .. } => {
@@ -702,6 +712,7 @@ impl Engine {
                 if !context.contract.graph.needs_satisfied(node, &states) {
                     continue;
                 }
+                sync_live_outcomes(&mut vars, &journal);
                 let when =
                     vars.eval_bool(node.when.as_ref())
                         .map_err(|message| EngineError::Expr {
@@ -746,6 +757,7 @@ impl Engine {
                 // are already journaled per node inside the wave, so the
                 // run continues to shared failure settlement for hooks.
                 // HITL suspensions and cancellations still propagate.
+                sync_live_outcomes(&mut vars, &journal);
                 if let Err(error) = self
                     .execute_parallel_wave(
                         &context,
@@ -789,6 +801,7 @@ impl Engine {
                 // E10), not here, so retries pay while the start marker
                 // stays a single attempt-1 event.
                 context.run_checkpoint()?;
+                sync_live_outcomes(&mut vars, &journal);
                 states.insert(id.clone(), NodeState::Running);
                 // Record start before execution so long-running steps are
                 // observable and durations reflect actual processing time,
@@ -866,9 +879,10 @@ impl Engine {
                             &context.checkpoint_accounting,
                         )?;
                         let output_name = super::types::output_name_for(node);
-                        vars.publish_step_output(&node.id, node.output.as_deref(), &output, None);
                         states.insert(id.clone(), NodeState::Success);
                         journal.event("step_finished", json!({ "node": id, "status": "success", "files": file_pins, "output": output, "output_name": output_name }))?;
+                        vars.publish_step_output(&node.id, node.output.as_deref(), &output, None);
+                        sync_live_outcomes(&mut vars, &journal);
                     }
                     StepOutcome::CheckFailed {
                         findings,
@@ -1353,6 +1367,7 @@ impl Engine {
         context.run_checkpoint()?;
         self.run_hooks(&context, &journal, &mut vars, &mut budget, "run_succeeded")
             .await?;
+        sync_live_outcomes(&mut vars, &journal);
         let outputs = collect_outputs(
             &context.workspace,
             &context.contract.manifest,

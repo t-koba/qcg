@@ -340,6 +340,7 @@ impl Engine {
                 "step_replayed",
                 json!({ "node": node.id, "status": replayed.status }),
             )?;
+            vars.sync_step_outcome_subtree(&env.journal.state().vars, &node.id);
             return Ok(StepOutcome::Success {
                 output: replayed.output.clone(),
                 files: replayed
@@ -362,7 +363,33 @@ impl Engine {
         // wrapper as top-level nodes (E10).
         let outcome = self
             .execute_node_with_retry(env.context, env.journal, vars, budget, &node)
-            .await?;
+            .await;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error)
+                if error.is_canceled()
+                    || node.kind.as_str() == "llm.agent"
+                    || matches!(
+                        error,
+                        EngineError::NeedsUser { .. } | EngineError::NeedsConfirm { .. }
+                    ) =>
+            {
+                return Err(error);
+            }
+            Err(error) => {
+                let reason = FailureDetail::new(
+                    super::types::failure_code_for_error(&error),
+                    error.to_string(),
+                );
+                states.insert(graph_node_id.clone(), NodeState::Failed(reason.clone()));
+                env.journal.event(
+                    "step_finished",
+                    json!({ "node": node.id, "status": "failed", "reason": reason }),
+                )?;
+                vars.sync_step_outcome_subtree(&env.journal.state().vars, &node.id);
+                return Err(error);
+            }
+        };
         match &outcome {
             StepOutcome::Success { output, files } => {
                 let file_pins = pin_files(
@@ -373,17 +400,18 @@ impl Engine {
                     &env.context.checkpoint_accounting,
                 )?;
                 let output_name = super::types::output_name_for(&node);
+                states.insert(graph_node_id.clone(), NodeState::Success);
+                env.journal.event(
+                    "step_finished",
+                    json!({ "node": node.id, "status": "success", "files": file_pins, "output": output, "output_name": output_name }),
+                )?;
                 vars.publish_step_output(
                     &node.id,
                     node.output.as_deref(),
                     output,
                     Some(&graph_node_id),
                 );
-                states.insert(graph_node_id.clone(), NodeState::Success);
-                env.journal.event(
-                    "step_finished",
-                    json!({ "node": node.id, "status": "success", "files": file_pins, "output": output, "output_name": output_name }),
-                )?;
+                vars.sync_step_outcome_subtree(&env.journal.state().vars, &node.id);
             }
             StepOutcome::CheckFailed {
                 findings,
@@ -407,6 +435,7 @@ impl Engine {
                     "step_finished",
                     with_failed_evidence(json!({ "node": node.id, "status": "check_failed", "findings": findings, "reason": reason }), output, &file_pins)?,
                 )?;
+                vars.sync_step_outcome_subtree(&env.journal.state().vars, &node.id);
             }
             StepOutcome::NeedsUser { question } => {
                 // Unified notation for suspensions without a failed attempt:

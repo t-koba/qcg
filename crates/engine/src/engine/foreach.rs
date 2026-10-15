@@ -11,7 +11,8 @@ use super::checkpoint::{existing_regular_files, pin_files};
 use super::repair_support::failure_from_findings;
 use super::replay::BudgetTracker;
 use super::types::{
-    Engine, EngineError, ForeachControlParams, ForeachIteration, RunContext, with_failed_evidence,
+    Engine, EngineError, ForeachControlParams, ForeachIteration, RunContext,
+    failure_code_for_error, with_failed_evidence,
 };
 use policy::{MAX_FOREACH_ITERATIONS, MAX_FOREACH_PARALLELISM};
 
@@ -156,6 +157,7 @@ impl Engine {
                 // parent scope, so the two paths can never diverge through
                 // shared-mutation ordering (E10).
                 let mut iteration_vars = vars.clone();
+                iteration_vars.clear_step_outcome_subtree(&node.id);
                 let (iteration_files, outcome) = self
                     .execute_foreach_iteration(
                         context,
@@ -178,7 +180,7 @@ impl Engine {
                 // Per-iteration file pins already journaled as
                 // `step_finished` events persist for resume verification.
                 if outcome.is_none() {
-                    vars.absorb(&iteration_vars);
+                    vars.absorb_outputs(&iteration_vars);
                 }
                 files.extend(iteration_files);
                 if let Some(outcome) = outcome {
@@ -224,6 +226,7 @@ impl Engine {
                     let journal = Arc::clone(&journal);
                     let block = Arc::clone(&block);
                     let mut iteration_vars = vars.clone();
+                    iteration_vars.clear_step_outcome_subtree(&node.id);
                     // Shared budget atomics, not an isolated budget: the
                     // clone shares the run-wide counters, so every iteration
                     // charges the same budget (E10).
@@ -285,7 +288,7 @@ impl Engine {
                     // Only successful iterations contribute outputs to the
                     // parent scope; a failed child must not pollute it (E10).
                     Ok((iteration_vars, Ok((iteration_files, None)))) => {
-                        vars.absorb(&iteration_vars);
+                        vars.absorb_outputs(&iteration_vars);
                         files.extend(iteration_files);
                     }
                     Ok((_iteration_vars, Err(error))) => {
@@ -346,7 +349,9 @@ impl Engine {
             json!({ "node": node.id, "index": index }),
         )?;
         let foreach_path = NodePath::root(node.id.clone());
+        let iteration_scope = format!("{}[{index}]", node.id);
         for block_node in block {
+            vars.sync_step_outcome_subtree(&journal.state().vars, &iteration_scope);
             context.run_checkpoint()?;
             let block_path = foreach_path.foreach_child(index, &block_node.id);
             let mut addressed_node = block_node.clone();
@@ -377,6 +382,7 @@ impl Engine {
                         ),
                     }),
                 )?;
+                vars.sync_step_outcome_subtree(&journal.state().vars, &iteration_scope);
                 continue;
             }
             let block_id = block_path.to_string();
@@ -388,6 +394,7 @@ impl Engine {
                     "step_replayed",
                     json!({ "node": block_id, "status": replayed.status }),
                 )?;
+                vars.sync_step_outcome_subtree(&journal.state().vars, &iteration_scope);
                 continue;
             }
             // Single attempt counter per logical node (E10): `attempt: 1`
@@ -416,7 +423,7 @@ impl Engine {
             // parallel, and nested foreach (E10). The bound is
             // multiplicative: a child with max_attempts=2 inside a foreach
             // with max_attempts=2 runs at most 4 attempts total.
-            match self
+            let child_outcome = self
                 .execute_node_with_retry_charged(
                     context,
                     journal,
@@ -425,8 +432,32 @@ impl Engine {
                     &addressed_node,
                     false,
                 )
-                .await?
-            {
+                .await;
+            let child_outcome = match child_outcome {
+                Ok(outcome) => outcome,
+                Err(error)
+                    if error.is_canceled()
+                        || matches!(
+                            error,
+                            EngineError::NeedsUser { .. } | EngineError::NeedsConfirm { .. }
+                        ) =>
+                {
+                    vars.set_item(parent_item);
+                    return Err(error);
+                }
+                Err(error) => {
+                    let reason =
+                        FailureDetail::new(failure_code_for_error(&error), error.to_string());
+                    journal.event(
+                        "step_finished",
+                        json!({ "node": block_id, "status": "failed", "reason": reason }),
+                    )?;
+                    vars.sync_step_outcome_subtree(&journal.state().vars, &iteration_scope);
+                    vars.set_item(parent_item);
+                    return Err(error);
+                }
+            };
+            match child_outcome {
                 StepOutcome::Success {
                     output,
                     files: block_files,
@@ -450,6 +481,7 @@ impl Engine {
                         "step_finished",
                         json!({ "node": block_id, "status": "success", "output": output, "output_name": output_name, "files": file_pins }),
                     )?;
+                    vars.sync_step_outcome_subtree(&journal.state().vars, &iteration_scope);
                 }
                 StepOutcome::CheckFailed {
                     findings,
@@ -477,6 +509,7 @@ impl Engine {
                             &failed_pins,
                         )?,
                     )?;
+                    vars.sync_step_outcome_subtree(&journal.state().vars, &iteration_scope);
                     vars.set_item(parent_item);
                     let mut all_files = files;
                     all_files.extend(failed_files);
@@ -573,7 +606,7 @@ pub(crate) async fn drain_foreach_tasks(
                 .map_err(EngineError::Journal)?;
             continue;
         };
-        vars.absorb(&iteration_vars);
+        vars.absorb_outputs(&iteration_vars);
         files.extend(iteration_files);
     }
     if ignored > 0 {

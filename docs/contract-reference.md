@@ -451,8 +451,13 @@ Common node fields:
 - `params` (closed, step-specific table)
 
 Root-level `parallel = ["lint", "test"]` explicitly identifies a contiguous
-parallel group; normal flow order is sequential. `when` expressions may inspect
-both `steps.X.output` and `steps.X.status`.
+parallel group; normal flow order is sequential. Expressions and templates can
+inspect `steps.<output-name>.output` and `steps.<canonical-node-path>.status` or
+`.reason`. Outputs use the declared `output` alias when present; status and
+reason always use the canonical node path. Completed outcomes expose a
+string `.status` with value `success`, `failed`, or `skipped`. Failed and
+skipped outcomes expose `.reason` as the serialized `FailureDetail` object;
+it is absent for success and outcomes that have not completed.
 
 Blocks may contain nested `foreach` nodes. Every level consumes the global step
 budget, applies its own required iteration bound, uses a fully qualified node
@@ -516,10 +521,17 @@ during contract loading with a source line.
 
 ### Expressions
 
-`when` accepts a boolean expression over `inputs.*`, `steps.<id>.output`,
-`steps.<id>.status`, and (inside `foreach`) `item`. Paths resolve dotted
-fields with numeric array indices (`inputs.sites.0`). Missing paths read as
-`null`. Operators are `!`, `-` (unary), `||`, `&&`, `==`, `!=`, `>`, `<`,
+`when` accepts a boolean expression over `inputs.*`,
+`steps.<output-name>.output`, `steps.<canonical-node-path>.status` and `.reason`,
+and (inside `foreach`) `item`. `.status` is a string for completed outcomes:
+`success`, `failed`, or `skipped`. `.reason` is an optional `FailureDetail`
+object for failed or skipped outcomes and can be inspected through fields such as
+`.reason.code` and `.reason.message`. Status and reason paths use canonical
+node IDs, not output aliases. In templates, paths containing separators such
+as a foreach index can use map-key lookup, for example
+`steps["each[0]/child"].status`. Paths resolve dotted fields with numeric
+array indices (`inputs.sites.0`). Missing paths read as `null`. Operators are
+`!`, `-` (unary), `||`, `&&`, `==`, `!=`, `>`, `<`,
 `>=`, `<=`, `+`, `-`, `*`, `/`, `%`, with parentheses and array literals
 (`[1, 2]`). Available functions:
 

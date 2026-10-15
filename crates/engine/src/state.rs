@@ -720,7 +720,13 @@ impl RunState {
                             reason: reason.clone(),
                         },
                     );
-                    self.vars.set_step_status(path, "skipped");
+                    let serialized_reason = serde_json::to_value(&reason).map_err(|error| {
+                        crate::JournalError::InvalidEvent(format!(
+                            "invalid structured failure detail: {error}"
+                        ))
+                    })?;
+                    self.vars
+                        .set_step_outcome(path, "skipped", Some(serialized_reason));
                 }
             }
             "repair_attempt_started" => {
@@ -831,13 +837,32 @@ impl RunState {
                 }
             }
             "hook_failed" => {
-                // Warn-policy hook settlement (F07-02): the hook ran and was
-                // accepted as a warning, so resume must not re-execute it.
-                // Fail-policy hooks return Err immediately and never settle.
-                if event.get("policy").and_then(Value::as_str) == Some("warn")
-                    && let Some(hook) = event.get("hook").and_then(Value::as_str)
-                {
-                    self.hooks_settled.insert(hook.to_string());
+                if let Some(hook) = event.get("hook").and_then(Value::as_str) {
+                    // A check-failed hook already has a structured outcome
+                    // from its `step_finished` event. Execution errors only
+                    // have `hook_failed`, so project that completed failure
+                    // here without replacing a more specific existing reason.
+                    let status_path = format!("steps.{hook}.status");
+                    if self.vars.get_path(&status_path).is_none() {
+                        let message = event
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("hook execution failed");
+                        let reason = FailureDetail::new(FailureCode::ExecutionFailed, message);
+                        let serialized_reason = serde_json::to_value(&reason).map_err(|error| {
+                            crate::JournalError::InvalidEvent(format!(
+                                "invalid structured failure detail: {error}"
+                            ))
+                        })?;
+                        self.vars
+                            .set_step_outcome(hook, "failed", Some(serialized_reason));
+                    }
+                    // Warn-policy hook settlement (F07-02): the hook ran and
+                    // was accepted as a warning, so resume must not re-execute.
+                    // Fail-policy hooks return Err immediately and never settle.
+                    if event.get("policy").and_then(Value::as_str) == Some("warn") {
+                        self.hooks_settled.insert(hook.to_string());
+                    }
                 }
             }
             "hook_skipped" => {
@@ -845,6 +870,18 @@ impl RunState {
                 // grow on resume, so re-running would skip identically while
                 // risking an undeclared duplicate side effect.
                 if let Some(hook) = event.get("hook").and_then(Value::as_str) {
+                    let message = event
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("hook skipped because the run budget was exhausted");
+                    let reason = FailureDetail::new(FailureCode::BudgetExceeded, message);
+                    let serialized_reason = serde_json::to_value(&reason).map_err(|error| {
+                        crate::JournalError::InvalidEvent(format!(
+                            "invalid structured failure detail: {error}"
+                        ))
+                    })?;
+                    self.vars
+                        .set_step_outcome(hook, "skipped", Some(serialized_reason));
                     self.hooks_settled.insert(hook.to_string());
                 }
             }
@@ -1096,7 +1133,7 @@ impl RunState {
             if let Some(output) = output.clone() {
                 self.vars.set_step_output(output_name, output);
             }
-            self.vars.set_step_status(output_name, "success");
+            self.vars.set_step_outcome(path, "success", None);
             for pin in &files {
                 self.latest_file_pins
                     .insert(pin.path.to_string(), pin.sha256.clone());
@@ -1113,7 +1150,13 @@ impl RunState {
                     crate::JournalError::InvalidEvent("failed step count overflowed".into())
                 })?;
             let reason = failure_detail(event, FailureCode::ExecutionFailed, status)?;
-            self.vars.set_step_status(path, "failed");
+            let serialized_reason = serde_json::to_value(&reason).map_err(|error| {
+                crate::JournalError::InvalidEvent(format!(
+                    "invalid structured failure detail: {error}"
+                ))
+            })?;
+            self.vars
+                .set_step_outcome(path, "failed", Some(serialized_reason));
             self.nodes
                 .insert(NodePath::root(path), NodeOutcome::Failed { reason });
             self.checkpoints.remove(&NodePath::root(path));

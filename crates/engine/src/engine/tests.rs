@@ -505,6 +505,241 @@ async fn scheduler_when_skip_propagates_to_dependents() {
 }
 
 #[tokio::test]
+async fn live_when_reads_canonical_status_separate_from_output_alias() {
+    let mut first = node("canonical", "test.pass");
+    first.output = Some("result_alias".into());
+    let mut observe = node("observe", "test.pass");
+    observe.when = Some(contract::Expr(
+        "steps.canonical.status == \"success\" && steps.result_alias.status == null".into(),
+    ));
+    let manifest = manifest(vec![first, observe]);
+    let run_dir = temp_run_dir("live-status-canonical-alias");
+    run_manifest(manifest, run_dir.clone(), 1)
+        .await
+        .expect("live canonical status predicate should pass");
+
+    let state = RunState::fold_journal(&run_dir.join("meta/journal.jsonl"))
+        .expect("journal state should fold");
+    assert_eq!(
+        state
+            .vars
+            .get_path("steps.canonical.status")
+            .and_then(Value::as_str),
+        Some("success")
+    );
+    assert_eq!(state.vars.get_path("steps.result_alias.status"), None);
+    assert_eq!(
+        state
+            .vars
+            .get_path("steps.result_alias.output.node")
+            .and_then(Value::as_str),
+        Some("canonical")
+    );
+    let events = journal_events(&run_dir);
+    assert!(has_event(&events, "step_finished", "observe"));
+    let _ = std::fs::remove_dir_all(&run_dir);
+}
+
+#[tokio::test]
+async fn parallel_wave_statuses_are_visible_to_following_when() {
+    let mut observe = node("observe", "test.pass");
+    observe.when = Some(contract::Expr(
+        "steps.fast.status == \"success\" && steps.slow.status == \"success\"".into(),
+    ));
+    let mut flow = manifest(vec![
+        node("fast", "test.pass"),
+        node("slow", "test.pass"),
+        observe,
+    ]);
+    flow.parallel = vec!["fast".into(), "slow".into()];
+
+    let run_dir = temp_run_dir("parallel-wave-status-visibility");
+    run_manifest(flow, run_dir.clone(), 2)
+        .await
+        .expect("the following when predicate should observe both durable outcomes");
+    let events = journal_events(&run_dir);
+    assert!(has_event(&events, "step_finished", "observe"));
+    let _ = std::fs::remove_dir_all(&run_dir);
+}
+
+#[tokio::test]
+async fn failed_and_skipped_outcomes_are_visible_to_lifecycle_hooks() {
+    let failed_dir = temp_run_dir("failed-outcome-hook-metadata");
+    let mut failed_manifest = manifest(vec![node("broken", "test.check_fail")]);
+    failed_manifest.hooks.step_failed.push(hook(
+        "inspect",
+        "test.assert_failure_metadata",
+        HookErrorPolicy::Fail,
+    ));
+    let failed_contract = test_contract(&failed_dir, failed_manifest);
+    let mut registry = test_registry();
+    registry.register(AssertFailureMetadataStep);
+    let error = Engine::new(registry)
+        .run_with_id(
+            "failed-outcome-hook-metadata".into(),
+            failed_dir.join("meta"),
+            failed_contract,
+            BTreeMap::new(),
+            run_options(failed_dir.join("workspace")),
+        )
+        .await
+        .expect_err("the failed flow node should fail the run");
+    assert!(error.to_string().contains("failed"));
+    let failed_state = RunState::fold_journal(&failed_dir.join("meta/journal.jsonl"))
+        .expect("failed journal state should fold");
+    assert_eq!(
+        failed_state
+            .vars
+            .get_path("steps.broken.status")
+            .and_then(Value::as_str),
+        Some("failed")
+    );
+    assert_eq!(
+        failed_state
+            .vars
+            .get_path("steps.broken.reason.code")
+            .and_then(Value::as_str),
+        Some("check_failed")
+    );
+    assert_eq!(
+        failed_state.vars.get_path("steps.broken.output.reason"),
+        None
+    );
+    let _ = std::fs::remove_dir_all(&failed_dir);
+
+    let skipped_dir = temp_run_dir("skipped-outcome-hook-metadata");
+    let mut skipped = node("skipped", "test.pass");
+    skipped.when = Some(contract::Expr("false".into()));
+    let mut skipped_manifest = manifest(vec![skipped]);
+    skipped_manifest.hooks.run_succeeded.push(hook(
+        "inspect",
+        "test.assert_skipped_metadata",
+        HookErrorPolicy::Fail,
+    ));
+    let skipped_contract = test_contract(&skipped_dir, skipped_manifest);
+    let mut registry = test_registry();
+    registry.register(AssertSkippedMetadataStep);
+    Engine::new(registry)
+        .run_with_id(
+            "skipped-outcome-hook-metadata".into(),
+            skipped_dir.join("meta"),
+            skipped_contract,
+            BTreeMap::new(),
+            run_options(skipped_dir.join("workspace")),
+        )
+        .await
+        .expect("the skipped node and inspection hook should succeed");
+    let skipped_state = RunState::fold_journal(&skipped_dir.join("meta/journal.jsonl"))
+        .expect("skipped journal state should fold");
+    assert_eq!(
+        skipped_state
+            .vars
+            .get_path("steps.skipped.status")
+            .and_then(Value::as_str),
+        Some("skipped")
+    );
+    assert_eq!(
+        skipped_state
+            .vars
+            .get_path("steps.skipped.reason.code")
+            .and_then(Value::as_str),
+        Some("when_false")
+    );
+    let _ = std::fs::remove_dir_all(&skipped_dir);
+}
+
+#[tokio::test]
+async fn repair_recheck_sees_the_journal_folded_repair_child_status() {
+    let mut broken = node("broken", "test.check_fail");
+    broken.on_fail = Some(OnFail::Repair {
+        repair: "repair".into(),
+        recheck: "recheck".into(),
+        max_attempts: 1,
+        on_exhausted: ExhaustedAction::Fail,
+    });
+    let manifest = manifest(vec![
+        broken,
+        node("repair", "test.pass"),
+        node("recheck", "test.assert_repair_metadata"),
+    ]);
+    let run_dir = temp_run_dir("repair-child-status-visibility");
+    let mut registry = test_registry();
+    registry.register(AssertRepairMetadataStep);
+    Engine::new(registry)
+        .run_with_id(
+            "repair-child-status-visibility".into(),
+            run_dir.join("meta"),
+            test_contract(&run_dir, manifest),
+            BTreeMap::new(),
+            run_options(run_dir.join("workspace")),
+        )
+        .await
+        .expect("repair recheck should see the preceding repair child status");
+    let state = RunState::fold_journal(&run_dir.join("meta/journal.jsonl"))
+        .expect("repair journal should fold");
+    assert_eq!(
+        state
+            .vars
+            .get_path("steps.broken@repair.1/repair.status")
+            .and_then(Value::as_str),
+        Some("success")
+    );
+    let _ = std::fs::remove_dir_all(&run_dir);
+}
+
+#[tokio::test]
+async fn parallel_foreach_syncs_only_current_iteration_outcomes() {
+    let mut manifest = manifest(vec![foreach_node(
+        "each",
+        "each_body",
+        "inputs.items",
+        2,
+        10,
+    )]);
+    manifest.inputs = foreach_items_input();
+    manifest.blocks.insert(
+        "each_body".into(),
+        vec![
+            node("first", "test.delay_first_foreach"),
+            node("assert", "test.assert_foreach_outcome_scope"),
+        ],
+    );
+    let run_dir = temp_run_dir("foreach-outcome-scope");
+    let mut registry = test_registry();
+    registry.register(TestForeachStep);
+    registry.register(DelayFirstForeachStep);
+    registry.register(AssertForeachOutcomeScopeStep);
+    run_engine_with(
+        manifest,
+        registry,
+        BTreeMap::from([("items".into(), json!(["a", "b"]))]),
+        run_dir.clone(),
+        20,
+    )
+    .await
+    .expect("parallel iterations should see their own, not sibling, outcomes");
+    let state = RunState::fold_journal(&run_dir.join("meta/journal.jsonl"))
+        .expect("foreach journal should fold");
+    for index in 0..2 {
+        assert_eq!(
+            state
+                .vars
+                .get_path(&format!("steps.each[{index}]/first.status"))
+                .and_then(Value::as_str),
+            Some("success")
+        );
+        assert_eq!(
+            state
+                .vars
+                .get_path(&format!("steps.each[{index}]/assert.status"))
+                .and_then(Value::as_str),
+            Some("success")
+        );
+    }
+    let _ = std::fs::remove_dir_all(&run_dir);
+}
+
+#[tokio::test]
 async fn scheduler_repair_cycle_marks_original_step_repaired() {
     let mut broken = node("broken", "test.check_fail");
     broken.on_fail = Some(OnFail::Repair {
@@ -675,6 +910,208 @@ impl StepExecutor for AssertForeachVarsStep {
                     ),
                 ));
             }
+        }
+        Ok(StepOutcome::Success {
+            output: None,
+            files: vec![],
+        })
+    }
+}
+
+struct AssertFailureMetadataStep;
+
+#[async_trait]
+impl StepExecutor for AssertFailureMetadataStep {
+    fn type_id(&self) -> &'static str {
+        "test.assert_failure_metadata"
+    }
+
+    async fn execute(
+        &self,
+        ctx: &mut StepContext<'_>,
+        node: &NodeDef,
+    ) -> Result<StepOutcome, StepError> {
+        let status = ctx
+            .vars
+            .get_path("steps.broken.status")
+            .and_then(Value::as_str);
+        let code = ctx
+            .vars
+            .get_path("steps.broken.reason.code")
+            .and_then(Value::as_str);
+        if status != Some("failed") || code != Some("check_failed") {
+            return Err(StepError::failed(
+                &node.id,
+                format!("expected failed/check_failed metadata, got {status:?}/{code:?}"),
+            ));
+        }
+        let rendered = ctx.render_inline(
+            node,
+            "{{ steps.broken.status }}:{{ steps.broken.reason.code }}",
+        )?;
+        if rendered != "failed:check_failed" {
+            return Err(StepError::failed(
+                &node.id,
+                format!("template saw unexpected failure metadata: {rendered}"),
+            ));
+        }
+        Ok(StepOutcome::Success {
+            output: None,
+            files: vec![],
+        })
+    }
+}
+
+struct AssertSkippedMetadataStep;
+
+#[async_trait]
+impl StepExecutor for AssertSkippedMetadataStep {
+    fn type_id(&self) -> &'static str {
+        "test.assert_skipped_metadata"
+    }
+
+    async fn execute(
+        &self,
+        ctx: &mut StepContext<'_>,
+        node: &NodeDef,
+    ) -> Result<StepOutcome, StepError> {
+        let status = ctx
+            .vars
+            .get_path("steps.skipped.status")
+            .and_then(Value::as_str);
+        let code = ctx
+            .vars
+            .get_path("steps.skipped.reason.code")
+            .and_then(Value::as_str);
+        if status != Some("skipped") || code != Some("when_false") {
+            return Err(StepError::failed(
+                &node.id,
+                format!("expected skipped/when_false metadata, got {status:?}/{code:?}"),
+            ));
+        }
+        let rendered = ctx.render_inline(
+            node,
+            "{{ steps.skipped.status }}:{{ steps.skipped.reason.code }}",
+        )?;
+        if rendered != "skipped:when_false" {
+            return Err(StepError::failed(
+                &node.id,
+                format!("template saw unexpected skipped metadata: {rendered}"),
+            ));
+        }
+        Ok(StepOutcome::Success {
+            output: None,
+            files: vec![],
+        })
+    }
+}
+
+struct AssertRepairMetadataStep;
+
+#[async_trait]
+impl StepExecutor for AssertRepairMetadataStep {
+    fn type_id(&self) -> &'static str {
+        "test.assert_repair_metadata"
+    }
+
+    async fn execute(
+        &self,
+        ctx: &mut StepContext<'_>,
+        node: &NodeDef,
+    ) -> Result<StepOutcome, StepError> {
+        let status = ctx
+            .vars
+            .get_path("steps.broken@repair.1/repair.status")
+            .and_then(Value::as_str);
+        if status != Some("success") {
+            return Err(StepError::failed(
+                &node.id,
+                format!("repair child status was not visible: {status:?}"),
+            ));
+        }
+        let rendered =
+            ctx.render_inline(node, r#"{{ steps["broken@repair.1/repair"].status }}"#)?;
+        if rendered != "success" {
+            return Err(StepError::failed(
+                &node.id,
+                format!("template could not read canonical repair path: {rendered}"),
+            ));
+        }
+        Ok(StepOutcome::Success {
+            output: None,
+            files: vec![],
+        })
+    }
+}
+
+struct DelayFirstForeachStep;
+
+#[async_trait]
+impl StepExecutor for DelayFirstForeachStep {
+    fn type_id(&self) -> &'static str {
+        "test.delay_first_foreach"
+    }
+
+    fn traits(&self) -> StepTraits {
+        StepTraits {
+            parallel_safe: true,
+            ..StepTraits::default()
+        }
+    }
+
+    async fn execute(
+        &self,
+        ctx: &mut StepContext<'_>,
+        _node: &NodeDef,
+    ) -> Result<StepOutcome, StepError> {
+        if ctx.vars.item().and_then(Value::as_str) == Some("b") {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        Ok(StepOutcome::Success {
+            output: None,
+            files: vec![],
+        })
+    }
+}
+
+struct AssertForeachOutcomeScopeStep;
+
+#[async_trait]
+impl StepExecutor for AssertForeachOutcomeScopeStep {
+    fn type_id(&self) -> &'static str {
+        "test.assert_foreach_outcome_scope"
+    }
+
+    fn traits(&self) -> StepTraits {
+        StepTraits {
+            parallel_safe: true,
+            ..StepTraits::default()
+        }
+    }
+
+    async fn execute(
+        &self,
+        ctx: &mut StepContext<'_>,
+        node: &NodeDef,
+    ) -> Result<StepOutcome, StepError> {
+        let Some(item) = ctx.vars.item().and_then(Value::as_str) else {
+            return Err(StepError::failed(
+                &node.id,
+                "foreach item was not preserved",
+            ));
+        };
+        let (own, sibling) = if item == "a" { (0, 1) } else { (1, 0) };
+        let own_path = format!("steps.each[{own}]/first.status");
+        let sibling_path = format!("steps.each[{sibling}]/assert.status");
+        let own_status = ctx.vars.get_path(&own_path).and_then(Value::as_str);
+        let sibling_status = ctx.vars.get_path(&sibling_path).and_then(Value::as_str);
+        if own_status != Some("success") || sibling_status.is_some() {
+            return Err(StepError::failed(
+                &node.id,
+                format!(
+                    "iteration outcome scope leaked or missed data: own={own_status:?}, sibling={sibling_status:?}"
+                ),
+            ));
         }
         Ok(StepOutcome::Success {
             output: None,
@@ -1440,6 +1877,22 @@ async fn foreach_fails_fast_and_drains_remaining_iterations() {
         "the first failure must surface: {error}"
     );
     let events = journal_events(&run_dir);
+    let state = RunState::fold_journal(&run_dir.join("meta/journal.jsonl"))
+        .expect("foreach failure journal should fold");
+    assert_eq!(
+        state
+            .vars
+            .get_path("steps.each[0]/child.status")
+            .and_then(Value::as_str),
+        Some("failed")
+    );
+    assert_eq!(
+        state
+            .vars
+            .get_path("steps.each[0]/child.reason.code")
+            .and_then(Value::as_str),
+        Some("execution_failed")
+    );
     let started = events
         .iter()
         .filter(|event| {
@@ -4181,9 +4634,14 @@ async fn parallel_hitl_interruption_resumes_siblings() {
     let mut registry = StepRegistry::new();
     registry.register(AnswerOnceStep);
     registry.register(SlowPassStep);
+    registry.register(TestPassStep);
+    let mut observer = node("observer", "test.pass");
+    observer.when = Some(contract::Expr("steps.seed.status == \"success\"".into()));
     let mut flow_manifest = manifest(vec![
+        node("seed", "test.pass"),
         node("fast", "test.answer_once"),
         node("slow", "test.slow_pass"),
+        observer,
     ]);
     flow_manifest.parallel = vec!["fast".into(), "slow".into()];
     let graph = Graph::build(&flow_manifest).expect("test graph should build");
@@ -4245,6 +4703,12 @@ async fn parallel_hitl_interruption_resumes_siblings() {
     assert!(
         journal.contains("\"status\":\"success\""),
         "the resumed run must settle successfully: {journal}"
+    );
+    let events = journal_events(&run_dir);
+    assert!(has_event(&events, "step_replayed", "seed"));
+    assert!(
+        has_event(&events, "step_finished", "observer"),
+        "resume must expose the replayed seed status to the later when predicate"
     );
     let _ = std::fs::remove_dir_all(&run_dir);
 }

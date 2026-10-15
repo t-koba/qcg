@@ -128,10 +128,33 @@ pub(crate) fn tokenize(source: &str) -> Result<Vec<Token>, ExprError> {
         if ch.is_ascii_alphabetic() || ch == '_' {
             let start = index;
             index += 1;
-            while index < chars.len()
-                && (chars[index].is_ascii_alphanumeric() || matches!(chars[index], '_' | '.' | '-'))
-            {
-                index += 1;
+            let mut step_path = false;
+            let mut outcome_field = false;
+            while index < chars.len() {
+                let current = chars[index];
+                let plain_identifier =
+                    current.is_ascii_alphanumeric() || matches!(current, '_' | '.' | '-');
+                if plain_identifier {
+                    if current == '.' {
+                        if !step_path && chars[start..=index].iter().collect::<String>() == "steps."
+                        {
+                            step_path = true;
+                        } else if step_path && is_outcome_field(&chars[index + 1..]) {
+                            outcome_field = true;
+                        }
+                    }
+                    index += 1;
+                    continue;
+                }
+                if step_path && matches!(current, '@' | '[' | ']') {
+                    index += 1;
+                    continue;
+                }
+                if step_path && current == '/' && !outcome_field {
+                    index += 1;
+                    continue;
+                }
+                break;
             }
             let identifier = chars[start..index].iter().collect::<String>();
             push_token(
@@ -188,6 +211,16 @@ pub(crate) fn tokenize(source: &str) -> Result<Vec<Token>, ExprError> {
     }
     push_token(&mut tokens, Token::End)?;
     Ok(tokens)
+}
+
+fn is_outcome_field(rest: &[char]) -> bool {
+    ["output", "status", "reason"].iter().any(|field| {
+        rest.len() >= field.len()
+            && rest[..field.len()].iter().copied().eq(field.chars())
+            && rest
+                .get(field.len())
+                .is_none_or(|next| !next.is_ascii_alphanumeric() && *next != '_')
+    })
 }
 
 fn push_token(tokens: &mut Vec<Token>, token: Token) -> Result<(), ExprError> {
