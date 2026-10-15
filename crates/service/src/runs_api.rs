@@ -74,6 +74,7 @@ pub(crate) struct AdoptedRunSeed {
 pub(crate) struct AdoptedRunIdentity<'a> {
     pub(crate) inputs: &'a BTreeMap<String, Value>,
     pub(crate) contract_sha256: &'a str,
+    pub(crate) package_sha256: Option<&'a str>,
     pub(crate) priority: i32,
     pub(crate) parent: Option<&'a str>,
     pub(crate) answers: &'a BTreeMap<String, Value>,
@@ -131,6 +132,11 @@ fn seed_adopted_run_from_state(
     // with different inputs is refused instead of silently aliasing a
     // finished run (E03).
     let run_id = state.run_id.as_deref().unwrap_or("<unknown>");
+    if state.package_sha256.as_deref() != expected.package_sha256 {
+        return Err(ApiError::Conflict {
+            detail: "run was admitted with a different generator package; refusing adoption".into(),
+        });
+    }
     match state.contract_sha256.as_deref() {
         Some(sha256) if sha256 == expected.contract_sha256 => {}
         _ => {
@@ -341,25 +347,15 @@ pub(crate) fn fork_checkpoint_inputs(
         .map_err(|error| ApiError::invalid_field("state_patch.inputs", error.to_string()))
 }
 
-/// Single live-hit resolver for every fork admission path (E03): the caller
-/// holds the adopt snapshot (read before the live check, exactly like start
-/// admissions) and the live check reuses it instead of rescanning the
-/// journal or refolding the same events.
+/// Live-hit resolver for adopted fork admissions (E03): the caller holds
+/// the adopt snapshot (read before the live check, exactly like start
+/// admissions) and reuses it instead of rescanning or refolding the journal.
 fn resolve_fork_live_hit(
-    run_id: &str,
     snapshot: &crate::run_dirs::AdoptSnapshot,
-    adopted: bool,
     contract: &Contract,
     source_id: &str,
     request: &ForkRun,
 ) -> Result<(), ApiError> {
-    if !adopted {
-        return Err(ApiError::Conflict {
-            detail: format!(
-                "run `{run_id}` is live but has no journal; refusing to overwrite it with a fork copy"
-            ),
-        });
-    }
     let adopted_inputs = fork_checkpoint_inputs(snapshot, contract, source_id, request.at_seq)?;
     // The returned seed reuses the snapshot fold; converging callers only
     // need the identity proof, so the seed itself is not retained (E03).
@@ -368,6 +364,10 @@ fn resolve_fork_live_hit(
         &AdoptedRunIdentity {
             inputs: &adopted_inputs,
             contract_sha256: &contract.sha256,
+            package_sha256: snapshot
+                .state
+                .as_ref()
+                .and_then(|state| state.package_sha256.as_deref()),
             priority: request.priority.unwrap_or(0),
             parent: Some(source_id),
             answers: &request.answers,

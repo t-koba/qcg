@@ -72,6 +72,7 @@ impl LocalService {
             let requeue = RunRecord {
                 contract: record.contract.clone(),
                 contract_sha256: record.contract_sha256.clone(),
+                package_sha256: record.package_sha256.clone(),
                 inputs: record.inputs.clone(),
                 answers: record.answers.clone(),
                 confirmations: record.confirmations.clone(),
@@ -197,7 +198,8 @@ impl LocalService {
         let mut payload = json!({
             "run_id": id,
             "generator": format!("{}@{}", staged.contract.manifest.generator.id, staged.contract.manifest.generator.version),
-            "generator_path": &staged.contract.root,
+            "generator_path": read_run_generator_path(&staged.run_dir).map_err(api_internal)?,
+            "package_sha256": &staged.package_sha256,
             "contract_sha256": &staged.contract.sha256,
             "inputs": &staged.inputs,
             "answers": &staged.answers,

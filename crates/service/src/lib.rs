@@ -1,4 +1,5 @@
 pub mod package;
+mod run_package;
 pub use package::{
     ArtifactZipLimits, DEFAULT_PACKAGE_MAX_BYTES, DEFAULT_PACKAGE_MAX_ENTRIES, PackageLimits,
 };

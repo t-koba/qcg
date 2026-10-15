@@ -1257,7 +1257,7 @@ impl LocalService {
             let service = self.clone();
             let SpawnRun {
                 run_id,
-                mut contract,
+                contract,
                 inputs,
                 run_dir,
                 events,
@@ -1334,7 +1334,7 @@ impl LocalService {
                         _ = notified => continue,
                     }
                 };
-                let journaled = {
+                let (package_state, journaled) = {
                     let mut runs = service.inner.runs.write().await;
                     let Some(record) = runs.get_mut(&run_id) else {
                         return;
@@ -1401,7 +1401,7 @@ impl LocalService {
                                 })
                         }
                     };
-                    let journaled = match pre_state {
+                    let (package_state, journaled) = match pre_state {
                         Ok((state, _)) if state.terminal.is_some() => {
                             record.state = match state.terminal {
                                 Some(terminal) => terminal_status(&terminal),
@@ -1412,7 +1412,7 @@ impl LocalService {
                             record.confirm = None;
                             return;
                         }
-                        Ok((_, values)) => values,
+                        Ok((state, values)) => (state, values),
                         Err(error) => {
                             // Fail closed with an explicit error instead of
                             // leaving the run Queued for the 5s/10s resumer
@@ -1435,7 +1435,44 @@ impl LocalService {
                     // Claim shared-store ownership while holding the execution
                     // lease so peers observe the active owner.
                     record.owner_id = service.inner.owner_id.clone();
-                    journaled
+                    (package_state, journaled)
+                };
+                // Verify after queue delay and reload only the derived snapshot.
+                // Never execute the installed package, even if the snapshot vanished.
+                let pinned =
+                    crate::run_package::load(&run_dir, &package_state).and_then(|pinned| {
+                        if pinned.sha256 != contract.sha256 {
+                            return Err(crate::types::ServiceError::Invalid(
+                                "staged contract differs from pinned contract".into(),
+                            ));
+                        }
+                        Ok(pinned)
+                    });
+                let mut contract = match pinned {
+                    Ok(pinned) => pinned,
+                    Err(error) => {
+                        tracing::error!(%error, run_id = %run_id, "pinned generator verification failed; refusing execution");
+                        if let Err(journal_error) = engine::JournalWriter::append_single_event(
+                            &run_meta_dir(&run_dir).join("journal.jsonl"),
+                            &run_id,
+                            "run_error",
+                            serde_json::json!({"error": format!("pinned generator verification failed: {error}")}),
+                            engine::JournalLimits::default(),
+                            None,
+                        ) {
+                            tracing::error!(%journal_error, run_id = %run_id, "failed to journal package verification failure");
+                        }
+                        let mut runs = service.inner.runs.write().await;
+                        if let Some(record) = runs.get_mut(&run_id) {
+                            record.state = RunStatus::Failed;
+                            record.preempted = false;
+                            record.question = None;
+                            record.confirm = None;
+                        }
+                        drop(runs);
+                        service.inner.queue_notify.notify_waiters();
+                        return;
+                    }
                 };
                 // State validation and policy resolution share these exact
                 // events: one disk read without an admission snapshot, zero
@@ -1686,6 +1723,7 @@ impl LocalService {
                     RunRecord {
                         contract: contract.clone(),
                         contract_sha256: contract.sha256.clone(),
+                        package_sha256: None,
                         inputs: canonical_direct_inputs.clone(),
                         answers: run.answers.clone(),
                         confirmations: run.confirmations.clone(),

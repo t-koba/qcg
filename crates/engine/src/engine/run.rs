@@ -521,7 +521,8 @@ impl Engine {
         {
             journal.event("run_started", json!({
                 "generator": format!("{}@{}", contract.manifest.generator.id, contract.manifest.generator.version),
-                "generator_path": contract.root,
+                "generator_path": replay.state.generator_path.as_deref().unwrap_or(contract.root.as_str()),
+                "package_sha256": replay.state.package_sha256,
                 "contract_sha256": contract.sha256,
                 "inputs": inputs,
                 "resource_hashes": [],
@@ -643,7 +644,8 @@ impl Engine {
                 json!({
                     "run_id": run_id,
                     "generator": format!("{}@{}", context.contract.manifest.generator.id, context.contract.manifest.generator.version),
-                    "generator_path": context.contract.root,
+                    "generator_path": replay.state.generator_path.as_deref().unwrap_or(context.contract.root.as_str()),
+                    "package_sha256": replay.state.package_sha256,
                     "contract_sha256": context.contract.sha256,
                     "inputs": &canonical_inputs,
                     "resource_hashes": resource_hashes,

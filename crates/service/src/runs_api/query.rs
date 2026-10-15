@@ -627,15 +627,24 @@ impl LocalService {
         if calls.is_empty() {
             return Ok(true);
         }
-        let generator_path = crate::summaries::run_identity_event(run_dir, events)
+        let directory = run_dir.to_owned();
+        let identity = crate::summaries::run_identity_event(run_dir, events)
             .map_err(api_internal)?
             .1
-            .generator_path
             .clone();
         let contract = self
             .blocking_read(move || {
-                Contract::load(Utf8PathBuf::from(generator_path))
-                    .map_err(|error| ServiceError::Invalid(error.to_string()))
+                if identity.package_sha256.is_some() {
+                    crate::run_package::load_identity(
+                        &directory,
+                        identity.package_sha256.as_deref(),
+                        Some(&identity.contract_sha256),
+                    )
+                } else {
+                    // Historical observation only; never used for execution.
+                    Contract::load(Utf8PathBuf::from(identity.generator_path))
+                        .map_err(|error| ServiceError::Invalid(error.to_string()))
+                }
             })
             .await?;
         let priced: Vec<(String, String)> = contract

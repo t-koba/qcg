@@ -3,6 +3,12 @@
 This reference is generated from the OpenAPI `RunEvent` schema. Update it with
 `qcg docs run-events`.
 
+API-run identity events additionally carry `package_sha256`, the admitted full
+package identity preserved across start, requeue, and fork. It is optional in the
+schema for legacy/direct journals; the service refuses recovery or fork when it
+is absent. `generator_path` remains the original source path, not the derived
+per-run snapshot location. See [operations](operations.md#per-run-generator-package-snapshots).
+
 <!-- run-events:start -->
 ## RunEvent Reference
 

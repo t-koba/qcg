@@ -17,6 +17,10 @@ pub struct RunStartedEventData {
     pub generator: String,
     pub generator_path: String,
     pub contract_sha256: String,
+    /// Full package identity for API runs. Absent on legacy/direct runs;
+    /// those runs cannot be recovered or forked by the service.
+    #[serde(default)]
+    pub package_sha256: Option<String>,
     pub inputs: BTreeMap<String, Value>,
     #[serde(default)]
     pub answers: BTreeMap<String, Value>,

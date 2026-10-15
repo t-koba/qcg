@@ -36,6 +36,7 @@ async fn queued_snapshots_expose_admission_order() {
         let record = RunRecord {
             contract: contract.clone(),
             contract_sha256: contract.sha256.clone(),
+            package_sha256: None,
             inputs: BTreeMap::new(),
             answers: BTreeMap::new(),
             confirmations: BTreeMap::new(),
@@ -1018,6 +1019,7 @@ async fn unknown_admission_time_sorts_last() {
         let record = RunRecord {
             contract: contract.clone(),
             contract_sha256: contract.sha256.clone(),
+            package_sha256: None,
             inputs: BTreeMap::new(),
             answers: BTreeMap::new(),
             confirmations: BTreeMap::new(),

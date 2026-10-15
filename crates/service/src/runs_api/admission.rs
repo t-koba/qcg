@@ -158,17 +158,12 @@ impl LocalService {
     }
 
     /// Reserves the run id for a fork request before any side effect.
-    pub async fn reserve_fork_run_id(&self, source_id: &str) -> Result<String, ApiError> {
-        let source_dir = self.run_dir_for(source_id).await?;
-        let generator_path = read_run_generator_path(&source_dir).map_err(api_internal)?;
-        let contract = Contract::load(&generator_path).map_err(api_internal)?;
-        let reserved = format!(
-            "{}-fork-{}",
-            contract.manifest.generator.id,
-            uuid::Uuid::now_v7()
-        );
-        // The composed id names a run directory, so it is validated as one even
-        // though it is derived from an already-loaded contract.
+    pub async fn reserve_fork_run_id(&self, _source_id: &str) -> Result<String, ApiError> {
+        // This reservation precedes idempotency admission in the HTTP handler.
+        // It must not read the source run/package: a Ready or Pending replay
+        // must remain independent of the source's retention or snapshot state.
+        // A fresh owner validates and loads the pinned source in `fork_run_with_id`.
+        let reserved = format!("fork-{}", uuid::Uuid::now_v7());
         if !is_safe_run_id(&reserved) {
             return Err(api_bad_request(format!(
                 "fork run id `{reserved}` is not allowed"
@@ -210,18 +205,19 @@ impl LocalService {
     ) -> Result<String, ApiError> {
         self.ensure_running()?;
         let mut contract = self.load_generator(&req.generator_id)?;
+        let package_sha256 = crate::package::package_identity_sha256(
+            &contract.root,
+            &crate::package::PackageLimits::default(),
+        )
+        .map_err(|_| api_internal("failed to verify generator package identity"))?;
+        let generator_path = contract.root.clone();
         if let Some(expected) = expected_package_sha256 {
             if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                 return Err(api_bad_request(
                     "package identity must be a 64-character SHA-256 hex digest",
                 ));
             }
-            let current = crate::package::package_identity_sha256(
-                &contract.root,
-                &crate::package::PackageLimits::default(),
-            )
-            .map_err(|_| api_internal("failed to verify generator package identity"))?;
-            if !current.eq_ignore_ascii_case(expected) {
+            if !package_sha256.eq_ignore_ascii_case(expected) {
                 return Err(ApiError::Conflict {
                     detail: "generator package identity does not match the reviewed identity"
                         .into(),
@@ -309,6 +305,13 @@ impl LocalService {
         let adopt_snapshot = crate::run_dirs::try_adopt_run_dir_with_snapshot(&run_dir, &run_id)
             .map_err(api_internal)?;
         let adopted = adopt_snapshot.adopted;
+        if adopted {
+            let state = adopt_snapshot
+                .state
+                .as_ref()
+                .ok_or_else(|| api_internal("missing adoption state"))?;
+            crate::run_package::load(&run_dir, state).map_err(api_internal)?;
+        }
         if self.live_run_record(&run_id).await {
             // A live record holds the task, token, and channel: reuse it
             // only after proving the retry carries the admitted identity,
@@ -320,6 +323,7 @@ impl LocalService {
             let identity = AdoptedRunIdentity {
                 inputs: &canonical_inputs,
                 contract_sha256: &contract.sha256,
+                package_sha256: Some(&package_sha256),
                 priority: req.priority.unwrap_or(0),
                 parent: None,
                 answers: &req.answers,
@@ -348,6 +352,42 @@ impl LocalService {
             return Err(api_internal(error));
         }
         let created_fresh = !adopted;
+        if created_fresh {
+            let pinned = crate::run_package::copy(&generator_path, &run_dir, &package_sha256)
+                .and_then(|pinned| {
+                    if pinned.sha256 != contract.sha256 {
+                        return Err(crate::types::ServiceError::Invalid(
+                            "generator contract changed during admission".into(),
+                        ));
+                    }
+                    Ok(pinned)
+                });
+            match pinned {
+                Ok(pinned) => {
+                    contract = pinned;
+                    contract.apply_effective_audit(
+                        req.audit_level,
+                        self.inner.deployment_policy.audit_floor,
+                    );
+                }
+                Err(error) => {
+                    std::fs::remove_dir_all(&run_dir).map_err(api_internal)?;
+                    return Err(api_internal(error));
+                }
+            }
+        } else {
+            contract = crate::run_package::load(
+                &run_dir,
+                adopt_snapshot
+                    .state
+                    .as_ref()
+                    .ok_or_else(|| api_internal("missing adoption state"))?,
+            )
+            .map_err(api_internal)?;
+            contract
+                .apply_effective_audit(req.audit_level, self.inner.deployment_policy.audit_floor);
+        }
+
         // The seed's queued instant rides along so the staged record
         // below never re-scans the journal for it (E03).
         let mut adopted_queued_at = None;
@@ -357,6 +397,7 @@ impl LocalService {
                 &AdoptedRunIdentity {
                     inputs: &inputs,
                     contract_sha256: &contract.sha256,
+                    package_sha256: Some(&package_sha256),
                     priority,
                     parent: None,
                     answers: &answers,
@@ -390,6 +431,7 @@ impl LocalService {
                 let identity = AdoptedRunIdentity {
                     inputs: &inputs,
                     contract_sha256: &contract.sha256,
+                    package_sha256: Some(&package_sha256),
                     priority,
                     parent: None,
                     answers: &answers,
@@ -438,6 +480,7 @@ impl LocalService {
         let mut staged = RunRecord {
             contract: contract.clone(),
             contract_sha256: contract.sha256.clone(),
+            package_sha256: Some(package_sha256.clone()),
             inputs: inputs.clone(),
             answers: answers.clone(),
             confirmations: confirmations.clone(),
@@ -475,7 +518,8 @@ impl LocalService {
                 json!({
                     "run_id": &run_id,
                     "generator": format!("{}@{}", contract.manifest.generator.id, contract.manifest.generator.version),
-                    "generator_path": &contract.root,
+                    "generator_path": &generator_path,
+                    "package_sha256": &package_sha256,
                     "contract_sha256": &contract.sha256,
                     "inputs": &inputs,
                     "answers": &answers,
@@ -533,6 +577,7 @@ impl LocalService {
                 let identity = AdoptedRunIdentity {
                     inputs: &inputs,
                     contract_sha256: &contract.sha256,
+                    package_sha256: Some(&package_sha256),
                     priority,
                     parent: None,
                     answers: &answers,
@@ -672,17 +717,26 @@ impl LocalService {
                 "checkpoint sequence must be greater than zero",
             ));
         }
-        let source_dir = self.run_dir_for(source_id).await?;
-        let generator_path = read_run_generator_path(&source_dir).map_err(api_internal)?;
-        let mut contract = Contract::load(&generator_path).map_err(api_internal)?;
-        contract.apply_audit_floor(self.inner.deployment_policy.audit_floor);
-        let run_id = reserved_run_id.unwrap_or_else(|| {
-            format!(
+        // A reserved id comes from the HTTP idempotency admission. Do not
+        // inspect either the source package or target directory until the
+        // target's admission lock has been acquired: Ready/Pending retries
+        // must not depend on source retention, and target probes must be
+        // serialized before reading their pinned package.
+        let mut preloaded_source = None;
+        let run_id = if let Some(run_id) = reserved_run_id {
+            run_id
+        } else {
+            let source_dir = self.run_dir_for(source_id).await?;
+            let state = crate::summaries::fold_run_state(&source_dir).map_err(api_internal)?;
+            let contract = crate::run_package::load(&source_dir, &state).map_err(api_internal)?;
+            let run_id = format!(
                 "{}-fork-{}",
                 contract.manifest.generator.id,
                 uuid::Uuid::now_v7()
-            )
-        });
+            );
+            preloaded_source = Some((source_dir, state, contract));
+            run_id
+        };
         if !is_safe_run_id(&run_id) {
             return Err(api_bad_request(format!("run id `{run_id}` is not allowed")));
         }
@@ -701,70 +755,70 @@ impl LocalService {
         };
         // Re-checked under the admission lock so a drain racing the first
         // probe cannot be missed (E05).
-        // Filesystem preparation happens outside the run-map lock so concurrent
-        // runs never block on checkpoint copies, hashing, or journal I/O.
-        // An adopted retry skips preparation; its checkpoint copy already
-        // completed under the same key and digest. One snapshot serves
-        // adoption, fork inputs, the seed, and the queue instant: the fork
-        // never scans per field (E03).
-        // Same order as start admissions: the adopt snapshot comes first,
-        // then the live check reuses it. Live hits still converge before
-        // any checkpoint copy: copying first and discarding it on the live
-        // return would waste I/O and could mask a
-        // live-record-without-journal inconsistency (E03).
-        let adopt_snapshot = match crate::run_dirs::try_adopt_run_dir_with_snapshot(
-            &run_dir, &run_id,
-        ) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                match std::fs::symlink_metadata(&run_dir) {
-                    Ok(meta) if meta.file_type().is_symlink() => {
-                        return Err(api_internal(format!(
-                            "{error}; run directory `{run_id}` is a symlink; refusing cleanup"
-                        )));
-                    }
-                    Ok(_) => {
-                        if let Err(cleanup_error) = std::fs::remove_dir_all(&run_dir) {
-                            return Err(api_internal(format!(
-                                "{error}; failed to clean incomplete fork `{run_id}`: {cleanup_error}"
-                            )));
-                        }
-                    }
-                    Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(cleanup) => {
-                        return Err(api_internal(format!(
-                            "{error}; failed to stat incomplete fork `{run_id}`: {cleanup}"
-                        )));
-                    }
-                }
-                return Err(api_internal(error));
-            }
-        };
+        let adopt_snapshot = crate::run_dirs::try_adopt_run_dir_with_snapshot(&run_dir, &run_id)
+            .map_err(api_internal)?;
         let adopted = adopt_snapshot.adopted;
         let live_hit = self.live_run_record(&run_id).await;
+        if live_hit && !adopted {
+            return Err(ApiError::Conflict {
+                detail: format!(
+                    "run `{run_id}` is live but has no journal; refusing to overwrite it with a fork copy"
+                ),
+            });
+        }
+
+        let (package_sha256, generator_path, mut contract, source_dir) = if adopted {
+            let state = adopt_snapshot
+                .state
+                .as_ref()
+                .ok_or_else(|| api_internal("missing adoption state"))?;
+            let package_sha256 = state
+                .package_sha256
+                .clone()
+                .ok_or_else(|| api_internal("fork target has no pinned package identity"))?;
+            let generator_path = state
+                .generator_path
+                .clone()
+                .ok_or_else(|| api_internal("fork target has no original generator path"))?;
+            let contract = crate::run_package::load(&run_dir, state).map_err(api_internal)?;
+            (package_sha256, generator_path, contract, None)
+        } else {
+            let (source_dir, state, contract) = match preloaded_source {
+                Some(source) => source,
+                None => {
+                    let source_dir = self.run_dir_for(source_id).await?;
+                    let state =
+                        crate::summaries::fold_run_state(&source_dir).map_err(api_internal)?;
+                    let contract =
+                        crate::run_package::load(&source_dir, &state).map_err(api_internal)?;
+                    (source_dir, state, contract)
+                }
+            };
+            let package_sha256 = state.package_sha256.clone().ok_or_else(|| {
+                api_internal("fork source has no pinned generator package identity")
+            })?;
+            let generator_path = state
+                .generator_path
+                .clone()
+                .ok_or_else(|| api_internal("fork source has no original generator path"))?;
+            (package_sha256, generator_path, contract, Some(source_dir))
+        };
         if live_hit {
-            // One helper for every live-hit shape (E03): adopted journals
-            // verify against the snapshot above and converge, while a live
-            // record with no journal is refused instead of being
-            // overwritten by a fork copy.
-            resolve_fork_live_hit(
-                &run_id,
-                &adopt_snapshot,
-                adopted,
-                &contract,
-                source_id,
-                &request,
-            )?;
+            resolve_fork_live_hit(&adopt_snapshot, &contract, source_id, &request)?;
             return Ok(run_id);
         }
+        contract.apply_audit_floor(self.inner.deployment_policy.audit_floor);
+        let mut created_fresh = false;
         if !adopted {
+            let source_dir = source_dir
+                .as_deref()
+                .ok_or_else(|| api_internal("fresh fork is missing its source directory"))?;
             // A child adoption or live hit converges before source eligibility
-            // is consulted: retries never fail because the source changed
-            // after the original checkpoint copy. Shared-mode leases remain
-            // held through the copy and are released before child execution.
-            let source_lease = self.fork_source_copy_lease(source_id, &source_dir).await?;
-            prepare_checkpoint_fork(
-                &source_dir,
+            // is consulted. Shared-mode leases remain held through the copy
+            // and are released before child execution.
+            let source_lease = self.fork_source_copy_lease(source_id, source_dir).await?;
+            created_fresh = prepare_checkpoint_fork(
+                source_dir,
                 source_id,
                 &run_dir,
                 &run_id,
@@ -772,6 +826,20 @@ impl LocalService {
                 &request.state_patch,
             )
             .map_err(api_internal)?;
+            let copied = crate::run_package::copy(
+                &crate::run_package::package_dir(source_dir),
+                &run_dir,
+                &package_sha256,
+            );
+            match copied {
+                Ok(pinned) => contract = pinned,
+                Err(error) => {
+                    if created_fresh {
+                        std::fs::remove_dir_all(&run_dir).map_err(api_internal)?;
+                    }
+                    return Err(api_internal(error));
+                }
+            }
             drop(source_lease);
         }
         // Single snapshot for the whole fork admission: adopted reuses the
@@ -799,7 +867,7 @@ impl LocalService {
         let inputs = match fork_inputs {
             Ok(inputs) => inputs,
             Err(error) => {
-                if !adopted {
+                if created_fresh {
                     match std::fs::symlink_metadata(&run_dir) {
                         Ok(meta) if meta.file_type().is_symlink() => {
                             return Err(api_internal(format!(
@@ -807,7 +875,9 @@ impl LocalService {
                             )));
                         }
                         Ok(_) => {
-                            if let Err(cleanup_error) = std::fs::remove_dir_all(&run_dir) {
+                            if created_fresh
+                                && let Err(cleanup_error) = std::fs::remove_dir_all(&run_dir)
+                            {
                                 return Err(api_internal(format!(
                                     "{error}; failed to clean incomplete fork `{run_id}`: {cleanup_error}"
                                 )));
@@ -833,6 +903,7 @@ impl LocalService {
                 &AdoptedRunIdentity {
                     inputs: &inputs,
                     contract_sha256: &contract.sha256,
+                    package_sha256: Some(&package_sha256),
                     priority: request.priority.unwrap_or(0),
                     parent: Some(source_id),
                     answers: &fork_answers,
@@ -865,6 +936,7 @@ impl LocalService {
                 let identity = AdoptedRunIdentity {
                     inputs: &inputs,
                     contract_sha256: &contract.sha256,
+                    package_sha256: Some(&package_sha256),
                     priority: request.priority.unwrap_or(0),
                     parent: Some(source_id),
                     answers: &fork_answers,
@@ -882,7 +954,7 @@ impl LocalService {
                 // Same ownership rule as capacity below: a checkpoint copy
                 // this admission made is removed; an adopted one predates
                 // us and always survives (E03/E04).
-                if !adopted {
+                if created_fresh {
                     std::fs::remove_dir_all(&run_dir).map_err(api_internal)?;
                 }
                 return Err(ApiError::Unavailable {
@@ -893,7 +965,7 @@ impl LocalService {
                 // Only directories this admission created are removed: an
                 // adopted checkpoint copy predates us and always survives
                 // (E03).
-                if !adopted {
+                if created_fresh {
                     std::fs::remove_dir_all(&run_dir).map_err(api_internal)?;
                 }
                 return Err(ApiError::Unavailable {
@@ -913,6 +985,7 @@ impl LocalService {
         let mut staged = RunRecord {
             contract: contract.clone(),
             contract_sha256: contract.sha256.clone(),
+            package_sha256: Some(package_sha256.clone()),
             inputs: inputs.clone(),
             answers: fork_answers.clone(),
             confirmations: fork_confirmations.clone(),
@@ -960,7 +1033,8 @@ impl LocalService {
                 json!({
                     "run_id": &run_id,
                     "generator": format!("{}@{}", contract.manifest.generator.id, contract.manifest.generator.version),
-                    "generator_path": &contract.root,
+                    "generator_path": &generator_path,
+                    "package_sha256": &package_sha256,
                     "contract_sha256": &contract.sha256,
                     "inputs": &staged.inputs,
                     "answers": &staged.answers,
@@ -976,11 +1050,10 @@ impl LocalService {
                 }),
             )
         {
-            // This write runs only when `!adopted`, so the directory holds
-            // nothing but this admission's own checkpoint copy: removal
-            // cannot destroy foreign data (E03). Cleanup failures propagate
+            // Remove only a directory this admission created, never a retained
+            // incomplete directory or its mailbox. Cleanup failures propagate
             // with the write failure instead of leaking silently (E05).
-            if let Err(cleanup_error) = std::fs::remove_dir_all(&run_dir) {
+            if created_fresh && let Err(cleanup_error) = std::fs::remove_dir_all(&run_dir) {
                 return Err(api_internal(format!(
                     "{error}; failed to clean fork directory: {cleanup_error}"
                 )));
@@ -998,7 +1071,7 @@ impl LocalService {
             .register_admission(
                 run_id.to_string(),
                 staged,
-                (!adopted).then_some(run_dir.as_path()),
+                created_fresh.then_some(run_dir.as_path()),
             )
             .await
         {
@@ -1009,6 +1082,7 @@ impl LocalService {
                 let identity = AdoptedRunIdentity {
                     inputs: &inputs,
                     contract_sha256: &contract.sha256,
+                    package_sha256: Some(&package_sha256),
                     priority: request.priority.unwrap_or(0),
                     parent: Some(source_id),
                     answers: &fork_answers,
@@ -1065,7 +1139,8 @@ impl LocalService {
                 "trace_id": api::trace_id_for_run(&run_id),
                 "span_id": api::span_id_for_seq(next_seq),
                 "generator": format!("{}@{}", contract.manifest.generator.id, contract.manifest.generator.version),
-                "generator_path": &contract.root,
+                "generator_path": &generator_path,
+                "package_sha256": &package_sha256,
                 "contract_sha256": &contract.sha256,
                 "inputs": &inputs,
                 "answers": &fork_answers,

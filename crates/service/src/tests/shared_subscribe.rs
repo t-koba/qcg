@@ -54,6 +54,7 @@ content = "done""#,
     let contract = contract::Contract::load(&generator_dir).expect("contract should load");
     std::fs::create_dir_all(crate::summaries::run_meta_dir(&run_dir))
         .expect("meta dir should be created");
+    let package_sha256 = pin_test_package(&generator_dir, &run_dir);
     let writer = engine::JournalWriter::create(
         &crate::summaries::run_meta_dir(&run_dir).join("journal.jsonl"),
         &run_id,
@@ -68,6 +69,7 @@ content = "done""#,
                 "generator": "demo@0.1.0",
                 "generator_path": generator_dir,
                 "contract_sha256": contract.sha256,
+                "package_sha256": package_sha256,
                 "inputs": {},
                 "answers": {},
                 "confirmations": {},
@@ -89,6 +91,7 @@ content = "done""#,
                 "generator": "demo",
                 "generator_path": generator_dir,
                 "contract_sha256": contract.sha256,
+                "package_sha256": package_sha256,
                 "inputs": {},
                 "resource_hashes": [],
 

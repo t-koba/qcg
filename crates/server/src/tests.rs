@@ -2065,6 +2065,28 @@ async fn idempotent_fork_reuses_run_and_conflicts_on_digest() {
         first.headers().get(header::LOCATION),
         second.headers().get(header::LOCATION)
     );
+    // A Ready replay is not a new fork admission and must not consult the
+    // source's package snapshot, which retention or corruption may remove.
+    std::fs::remove_dir_all(runs.join(&source_id).join("generator-package"))
+        .expect("source snapshot should be removable for replay coverage");
+    let replay_after_source_package_removal = fork_run(
+        State(Arc::clone(&state)),
+        headers.clone(),
+        Path(source_id.clone()),
+        Json(ForkRun {
+            at_seq: 1,
+            state_patch: Default::default(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("Ready fork replay must not load the removed source package");
+    assert_eq!(
+        first.headers().get(header::LOCATION),
+        replay_after_source_package_removal
+            .headers()
+            .get(header::LOCATION)
+    );
     let divergent = ForkRun {
         at_seq: 2,
         state_patch: Default::default(),

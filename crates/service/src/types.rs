@@ -191,6 +191,8 @@ pub(crate) fn task_slot_is_live(slot: &Mutex<Option<JoinHandle<()>>>) -> bool {
 pub(crate) struct RunRecord {
     pub(crate) contract: Contract,
     pub(crate) contract_sha256: String,
+    /// API admissions always pin a package; direct ephemeral runs do not.
+    pub(crate) package_sha256: Option<String>,
     pub(crate) inputs: BTreeMap<String, Value>,
     pub(crate) answers: BTreeMap<String, Value>,
     pub(crate) confirmations: BTreeMap<String, bool>,

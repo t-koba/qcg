@@ -3188,6 +3188,14 @@
             "description": "Free-form run metadata admitted with the run. Metadata only: the runtime\nnever reads identity or enforces authorization from labels.",
             "type": "object"
           },
+          "package_sha256": {
+            "default": null,
+            "description": "Full package identity for API runs. Absent on legacy/direct runs;\nthose runs cannot be recovered or forked by the service.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "parent_run_id": {
             "default": null,
             "description": "Parent run id for runs created by fork.",

@@ -2943,6 +2943,12 @@ export interface components {
                 [key: string]: string;
             };
             /**
+             * @description Full package identity for API runs. Absent on legacy/direct runs;
+             *     those runs cannot be recovered or forked by the service.
+             * @default null
+             */
+            package_sha256: string | null;
+            /**
              * @description Parent run id for runs created by fork.
              * @default null
              */

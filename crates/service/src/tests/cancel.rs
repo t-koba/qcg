@@ -411,6 +411,7 @@ async fn shutdown_converges_when_executor_ignores_cancellation() {
     let record = RunRecord {
         contract: contract.clone(),
         contract_sha256: contract.sha256.clone(),
+        package_sha256: None,
         inputs: BTreeMap::new(),
         answers: BTreeMap::new(),
         confirmations: BTreeMap::new(),
@@ -933,6 +934,7 @@ async fn shutdown_leaves_never_tracked_queued_orphan_for_next_boot() {
     let queued_dir = runs.join(&queued_id);
     std::fs::create_dir_all(crate::summaries::run_meta_dir(&queued_dir))
         .expect("orphan meta should be created");
+    let package_sha256 = pin_test_package(&contract.root, &queued_dir);
     {
         let writer = engine::JournalWriter::create(
             &crate::summaries::run_meta_dir(&queued_dir).join("journal.jsonl"),
@@ -948,6 +950,7 @@ async fn shutdown_leaves_never_tracked_queued_orphan_for_next_boot() {
                     "generator": "ask-user@0.1.0",
                     "generator_path": generators.join("ask-user"),
                     "contract_sha256": contract.sha256,
+                    "package_sha256": package_sha256,
                     "inputs": {},
                     "answers": {},
                     "confirmations": {},
@@ -1456,6 +1459,7 @@ async fn g01_forced_cancel_settles_without_self_conflict() {
     let record = RunRecord {
         contract: contract.clone(),
         contract_sha256: contract.sha256.clone(),
+        package_sha256: None,
         inputs: BTreeMap::new(),
         answers: BTreeMap::new(),
         confirmations: BTreeMap::new(),

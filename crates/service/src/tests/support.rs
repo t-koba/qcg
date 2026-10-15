@@ -319,10 +319,12 @@ pub(crate) fn synthetic_hitl_record(root: &Utf8Path, run_id: &str) -> RunRecord 
         .expect("ask-user fixture should load");
     let run_dir = root.join("runs").join(run_id);
     prepare_api_run_directory(&run_dir).expect("run directory should prepare");
+    let package_sha256 = pin_test_package(&contract.root, &run_dir);
     let (events, _) = broadcast::channel(512);
     let record = RunRecord {
         contract: contract.clone(),
         contract_sha256: contract.sha256.clone(),
+        package_sha256: Some(package_sha256.clone()),
         inputs: BTreeMap::new(),
         answers: BTreeMap::new(),
         confirmations: BTreeMap::new(),
@@ -350,6 +352,7 @@ pub(crate) fn synthetic_hitl_record(root: &Utf8Path, run_id: &str) -> RunRecord 
             "generator": "ask-user@0.1.0",
             "generator_path": contract.root,
             "contract_sha256": contract.sha256,
+            "package_sha256": package_sha256,
             "inputs": {},
             "answers": {},
             "confirmations": {},
@@ -425,4 +428,13 @@ pub(crate) fn record_spawn_journal_use(path: &Utf8Path, snapshot: bool) {
             }
         }
     }
+}
+
+/// Complete a synthetic admission with the same pinned package as production.
+pub(crate) fn pin_test_package(source: &Utf8Path, run_dir: &Utf8Path) -> String {
+    let sha =
+        crate::package::package_identity_sha256(source, &crate::package::PackageLimits::default())
+            .expect("package identity");
+    crate::run_package::copy(source, run_dir, &sha).expect("pin test package");
+    sha
 }

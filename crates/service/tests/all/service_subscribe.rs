@@ -34,6 +34,21 @@ fn test_service(
     )
 }
 
+fn pin_fixture_package(generator_dir: &Utf8PathBuf, run_dir: &Utf8PathBuf) -> (Contract, String) {
+    let snapshot = run_dir.join("generator-package");
+    std::fs::create_dir_all(&snapshot).unwrap();
+    std::fs::copy(
+        generator_dir.join(contract::MANIFEST_FILE),
+        snapshot.join(contract::MANIFEST_FILE),
+    )
+    .unwrap();
+    let contract = Contract::load(&snapshot).unwrap();
+    let package_sha256 =
+        service::package::package_identity_sha256(&snapshot, &service::PackageLimits::default())
+            .unwrap();
+    (contract, package_sha256)
+}
+
 #[tokio::test]
 async fn subscribe_replays_history_and_resumes_an_orphaned_run() {
     let run_id = format!("history-{}", std::process::id());
@@ -73,7 +88,7 @@ output_file = "result.txt"
 content = "resumed""#,
     )
     .unwrap();
-    let contract = Contract::load(&generator_dir).unwrap();
+    let (contract, package_sha256) = pin_fixture_package(&generator_dir, &run_dir);
     std::fs::create_dir_all(run_meta_dir(&run_dir)).unwrap();
     // A realistic orphaned journal starts with the durable admission event:
     // execution reuses the journaled ceiling and refuses to re-resolve one
@@ -92,11 +107,13 @@ content = "resumed""#,
                 "generator": "demo@0.1.0",
                 "generator_path": generator_dir,
                 "contract_sha256": contract.sha256,
+                "package_sha256": &package_sha256,
                 "inputs": {},
                 "answers": {},
                 "confirmations": {},
 
-                "schema_version": 1,
+                "elapsed_budget_mode": "wall_clock",
+                "schema_version": api::JOURNAL_SCHEMA_VERSION,
                 "retention_days": 0,
                 "priority": 0,
                 "parent_run_id": null,
@@ -112,10 +129,12 @@ content = "resumed""#,
                 "generator": "demo",
                 "generator_path": generator_dir,
                 "contract_sha256": contract.sha256,
+                "package_sha256": &package_sha256,
                 "inputs": {},
                 "resource_hashes": [],
 
-                "schema_version": 1,
+                "elapsed_budget_mode": "wall_clock",
+                "schema_version": api::JOURNAL_SCHEMA_VERSION,
             }),
         )
         .unwrap();
@@ -204,6 +223,7 @@ output_file = "result.txt"
 content = "resumed""#,
     )
     .unwrap();
+    let (contract, package_sha256) = pin_fixture_package(&generator_dir, &run_dir);
     std::fs::create_dir_all(run_meta_dir(&run_dir)).unwrap();
     JournalWriter::create(
         &run_meta_dir(&run_dir).join("journal.jsonl"),
@@ -217,11 +237,13 @@ content = "resumed""#,
         json!({
             "generator": "demo",
             "generator_path": generator_dir,
-            "contract_sha256": "abc",
+            "contract_sha256": contract.sha256,
+            "package_sha256": &package_sha256,
             "inputs": {},
             "resource_hashes": [],
 
-            "schema_version": 1,
+            "elapsed_budget_mode": "wall_clock",
+                "schema_version": api::JOURNAL_SCHEMA_VERSION,
         }),
     )
     .unwrap();
@@ -281,6 +303,7 @@ output_file = "result.txt"
 content = "resumed""#,
     )
     .unwrap();
+    let (contract, package_sha256) = pin_fixture_package(&generator_dir, &run_dir);
     std::fs::create_dir_all(run_meta_dir(&run_dir)).unwrap();
     JournalWriter::create(
         &run_meta_dir(&run_dir).join("journal.jsonl"),
@@ -294,11 +317,13 @@ content = "resumed""#,
         json!({
             "generator": "demo",
             "generator_path": generator_dir,
-            "contract_sha256": "abc",
+            "contract_sha256": contract.sha256,
+            "package_sha256": &package_sha256,
             "inputs": {},
             "resource_hashes": [],
 
-            "schema_version": 1,
+            "elapsed_budget_mode": "wall_clock",
+                "schema_version": api::JOURNAL_SCHEMA_VERSION,
         }),
     )
     .unwrap();
@@ -363,6 +388,7 @@ output_file = "result.txt"
 content = "resumed""#,
     )
     .unwrap();
+    let (contract, package_sha256) = pin_fixture_package(&generator_dir, &run_dir);
     std::fs::create_dir_all(run_meta_dir(&run_dir)).unwrap();
     JournalWriter::create(
         &run_meta_dir(&run_dir).join("journal.jsonl"),
@@ -376,11 +402,13 @@ content = "resumed""#,
         json!({
             "generator": "demo",
             "generator_path": generator_dir,
-            "contract_sha256": "abc",
+            "contract_sha256": contract.sha256,
+            "package_sha256": &package_sha256,
             "inputs": {},
             "resource_hashes": [],
 
-            "schema_version": 1,
+            "elapsed_budget_mode": "wall_clock",
+                "schema_version": api::JOURNAL_SCHEMA_VERSION,
         }),
     )
     .unwrap();
@@ -851,7 +879,7 @@ output_file = "result.txt"
 content = "resumed""#,
     )
     .unwrap();
-    let contract = Contract::load(&generator_dir).unwrap();
+    let (contract, package_sha256) = pin_fixture_package(&generator_dir, &run_dir);
     std::fs::create_dir_all(run_meta_dir(&run_dir)).unwrap();
     let writer = JournalWriter::create(
         &run_meta_dir(&run_dir).join("journal.jsonl"),
@@ -867,11 +895,13 @@ content = "resumed""#,
                 "generator": "demo@0.1.0",
                 "generator_path": generator_dir,
                 "contract_sha256": contract.sha256,
+                "package_sha256": &package_sha256,
                 "inputs": {},
                 "answers": {},
                 "confirmations": {},
 
-                "schema_version": 1,
+                "elapsed_budget_mode": "wall_clock",
+                "schema_version": api::JOURNAL_SCHEMA_VERSION,
                 "retention_days": 0,
                 "priority": 0,
                 "parent_run_id": null,

@@ -304,6 +304,7 @@ fn adoption_snapshot_covers_seed_and_fork_inputs_without_second_read() {
     let record = RunRecord {
         contract: contract.clone(),
         contract_sha256: contract.sha256.clone(),
+        package_sha256: None,
         inputs: BTreeMap::new(),
         answers: BTreeMap::new(),
         confirmations: BTreeMap::new(),
@@ -367,6 +368,7 @@ fn adoption_snapshot_covers_seed_and_fork_inputs_without_second_read() {
         &crate::runs_api::AdoptedRunIdentity {
             inputs: &BTreeMap::new(),
             contract_sha256: &contract.sha256,
+            package_sha256: None,
             priority: 0,
             parent: None,
             answers: &BTreeMap::new(),
@@ -663,6 +665,10 @@ async fn fork_adoption_requires_the_same_source() {
                 &crate::runs_api::AdoptedRunIdentity {
                     inputs,
                     contract_sha256: sha,
+                    package_sha256: snapshot
+                        .state
+                        .as_ref()
+                        .and_then(|s| s.package_sha256.as_deref()),
                     priority,
                     parent,
                     answers: &empty,
@@ -761,6 +767,7 @@ async fn plain_start_cannot_adopt_a_fork_journal() {
         &crate::runs_api::AdoptedRunIdentity {
             inputs: &empty,
             contract_sha256: &contract.sha256,
+            package_sha256: None,
             priority: 0,
             parent: None,
             answers: &empty,
@@ -840,6 +847,7 @@ async fn adopted_seed_keeps_later_user_answers() {
         &crate::runs_api::AdoptedRunIdentity {
             inputs: &empty,
             contract_sha256: &contract.sha256,
+            package_sha256: None,
             priority: 0,
             parent: None,
             answers: &empty,
@@ -1445,6 +1453,7 @@ fn fork_adoption_ignores_source_admission_without_a_marker() {
             &crate::runs_api::AdoptedRunIdentity {
                 inputs: &inputs,
                 contract_sha256: "sha",
+                package_sha256: None,
                 priority: 0,
                 parent: Some("source"),
                 answers,

@@ -57,8 +57,8 @@ search provider runtimes and provider HTTP clients, so provider quotas and
 credentials are shared. MCP OAuth token managers are shared by profile, but
 each run owns an independent MCP protocol session.
 
-API runs use a UUID-based run ID and separate `meta/journal.jsonl` and
-`workspace/` directories below `--runs-dir`. Direct runs also reject a second
+API runs use a UUID-based run ID with `meta/journal.jsonl`, `workspace/`, and
+a pinned `generator-package/` tree inside each run directory below `--runs-dir`. Direct runs also reject a second
 concurrent invocation targeting the same output directory. Direct (`qcg run`)
 executions share the process execution permits with API runs, and warn when
 their runs directory is owned by a live server, whose `max_active_runs`
@@ -770,6 +770,42 @@ held past five seconds without an implicit abort.
 Local timings are observations, not guarantees:
 the default trades current-boundary latency for avoiding scheduler-created
 indeterminate side effects.
+
+## Per-run generator package snapshots
+
+API admission copies the accepted generator tree into the fixed
+`generator-package/` directory inside the run directory. The bounded, no-follow
+copy must hash to the accepted `package_sha256` before the run is queued. Runtime
+contracts and package-relative files are loaded from this copy, not the installed
+generator. Replacing or uninstalling the installed generator therefore cannot
+change queued work, a resumed run, or a fork. The snapshot is run-owned content:
+do not edit it; retention/GC removes it with the rest of the run directory.
+
+`run_queued` and `run_started` carry the same full-package SHA-256 identity,
+including across requeues and forks. `generator_path` retains its original
+source-path meaning; no snapshot absolute path is journaled. `contract_sha256`
+still identifies the contract, not the whole package, and package timestamps
+remain excluded from package identity. This is an additive schema-v2 field;
+legacy/direct events may omit `package_sha256` for read-only observation.
+
+Execution re-verifies the snapshot after queueing and before entering the
+engine. Restart recovery refuses non-terminal runs without a package identity,
+with a missing snapshot, or with mismatched content; it never reloads the current
+installed package to repair them. Such a refusal can prevent service startup or
+shared-store refresh until the store is repaired or the affected run is removed
+under the normal store ownership rules. Forks likewise verify and copy the source
+run's snapshot and refuse missing/legacy/mismatched content. A previously admitted
+fork retry verifies its own snapshot instead. Copy/checkpoint failures clean only
+the fresh target, never the source or a pre-existing target. Package pinning does
+not relax recovery refusal for indeterminate external effects.
+
+**Direct execution is not package-pinned by this slice.** Direct/ephemeral runs
+continue to use their supplied generator root, including reads after scheduler
+queue delay; they have no durable package admission snapshot. If interrupted
+before terminal settlement, they cannot be resumed and the recovery rule above
+may refuse service startup until the run is repaired or removed under normal
+store ownership. Their existing pre-engine queue-delay accounting limitation
+also remains unchanged.
 
 ## Run families: fork links and await
 

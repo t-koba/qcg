@@ -384,7 +384,45 @@ pub(crate) fn prepare_api_run_directory(run_dir: &Utf8Path) -> Result<(), Servic
     Ok(())
 }
 
+/// Returns whether this call created the target directory (cleanup ownership).
 pub(crate) fn prepare_checkpoint_fork(
+    source_dir: &Utf8Path,
+    source_id: &str,
+    target_dir: &Utf8Path,
+    target_id: &str,
+    at_seq: u64,
+    patch: &ForkStatePatch,
+) -> Result<bool, ServiceError> {
+    // An incomplete admission may retain its directory for a cancel mailbox.
+    // Record actual create-dir ownership before populating; whole-directory
+    // cleanup is permitted only for a fresh target, never a pre-existing one.
+    let created_fresh = match std::fs::create_dir(target_dir) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if !is_regular_directory(target_dir)? {
+                return Err(ServiceError::Invalid(
+                    "fork target is not a regular directory".into(),
+                ));
+            }
+            false
+        }
+        Err(error) => return Err(ServiceError::Io(error)),
+    };
+    let result = prepare_api_run_directory(target_dir).and_then(|()| {
+        populate_checkpoint_fork(source_dir, source_id, target_dir, target_id, at_seq, patch)
+    });
+    if let Err(error) = result {
+        if created_fresh && let Err(cleanup) = std::fs::remove_dir_all(target_dir) {
+            return Err(ServiceError::Invalid(format!(
+                "{error}; failed to clean fresh fork: {cleanup}"
+            )));
+        }
+        return Err(error);
+    }
+    Ok(created_fresh)
+}
+
+fn populate_checkpoint_fork(
     source_dir: &Utf8Path,
     source_id: &str,
     target_dir: &Utf8Path,
@@ -440,7 +478,6 @@ pub(crate) fn prepare_checkpoint_fork(
         )));
     }
 
-    prepare_api_run_directory(target_dir)?;
     let target_meta = run_meta_dir(target_dir);
     let target_workspace = run_workspace_dir(target_dir);
     std::fs::create_dir_all(&target_workspace)?;
@@ -1115,29 +1152,45 @@ pub(crate) fn try_adopt_run_dir_with_snapshot(
     // Single attempt (E03): every caller holds the per-run admission lock,
     // which serializes prepare/wipe/adopt for one run id, so no concurrent
     // admission can complete a journal while this probe runs.
-    let journal_path = run_meta_dir(run_dir).join("journal.jsonl");
-    // All probes use `symlink_metadata` (no-follow): a symlinked
-    // journal would otherwise redirect the fold outside the run
-    // directory while publish pins O_NOFOLLOW (E01). Symlinks fail
-    // closed here.
-    // One metadata stat serves the whole empty-journal probe (E03):
-    // every caller holds the per-run admission lock, so no concurrent
-    // admission can complete this journal while the probe runs.
+    match std::fs::symlink_metadata(run_dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AdoptSnapshot::empty());
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(ServiceError::Invalid(
+                "run directory is not a plain directory; refusing adoption".into(),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) => return Err(ServiceError::Io(error)),
+    }
+    let metadata_dir = run_meta_dir(run_dir);
+    match std::fs::symlink_metadata(&metadata_dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // No metadata directory after a crash between preparation and
+            // admission: wipe everything but the cancel mailbox (E03).
+            wipe_incomplete_run_dir(run_dir)?;
+            return Ok(AdoptSnapshot::empty());
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(ServiceError::Invalid(
+                "run metadata is not a plain directory; refusing adoption".into(),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) => return Err(ServiceError::Io(error)),
+    }
+    let journal_path = metadata_dir.join("journal.jsonl");
+    // The leaf is checked with `symlink_metadata` before its contents are read.
+    // One metadata stat serves the whole empty-journal probe (E03): every
+    // caller holds the per-run admission lock, so no concurrent admission
+    // can complete this journal while the probe runs.
     match std::fs::symlink_metadata(&journal_path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             // No journal with a possibly dirty workspace from a crash
-            // between directory preparation and admission: wipe
-            // everything but the cancel mailbox (E03). Existence uses
-            // `symlink_metadata` so a symlinked run dir never reads as
-            // present-and-followed (E01).
-            let run_exists = match std::fs::symlink_metadata(run_dir) {
-                Ok(_) => true,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-                Err(error) => return Err(ServiceError::Io(error)),
-            };
-            if run_exists {
-                wipe_incomplete_run_dir(run_dir)?;
-            }
+            // between directory preparation and admission: wipe everything
+            // but the cancel mailbox (E03).
+            wipe_incomplete_run_dir(run_dir)?;
             return Ok(AdoptSnapshot::empty());
         }
         Ok(meta) if meta.file_type().is_symlink() => {

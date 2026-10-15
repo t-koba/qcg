@@ -126,6 +126,13 @@ pub struct RunState {
     pub run_id: Option<String>,
     #[serde(deserialize_with = "required_presence")]
     pub contract_sha256: Option<String>,
+    /// Full package identity; absent in legacy/direct state. The service
+    /// refuses recovery/fork without it rather than inferring a current pin.
+    #[serde(default)]
+    pub package_sha256: Option<String>,
+    /// Original source path for identity events, not the runtime snapshot root.
+    #[serde(default)]
+    pub generator_path: Option<String>,
     /// Owning generator id derived from the journal identity event, so
     /// disk-only snapshots never parse it out of the run id string.
     /// Required on read: persisted state without an owner is corrupt and
@@ -238,6 +245,8 @@ impl Default for RunState {
             schema_version: RUN_STATE_SCHEMA_VERSION,
             run_id: None,
             contract_sha256: None,
+            package_sha256: None,
+            generator_path: None,
             generator_id: None,
             last_seq: 0,
             labels: BTreeMap::new(),
@@ -539,6 +548,17 @@ impl RunState {
                 }
                 self.run_id = event
                     .get("run_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let package = event.get("package_sha256").and_then(Value::as_str);
+                if self.package_sha256.is_some() && self.package_sha256.as_deref() != package {
+                    return Err(crate::JournalError::InvalidEvent(
+                        "generator package identity changed within lineage".into(),
+                    ));
+                }
+                self.package_sha256 = package.map(str::to_string);
+                self.generator_path = event
+                    .get("generator_path")
                     .and_then(Value::as_str)
                     .map(str::to_string);
                 self.contract_sha256 = event
@@ -1346,6 +1366,35 @@ mod tests {
             event["status"] = json!(status);
         }
         event
+    }
+
+    #[test]
+    fn package_identity_cannot_change_or_disappear_after_admission() {
+        let identity = |seq, kind, package| {
+            json!({
+                "seq": seq, "t": kind, "run_id": "run", "generator": "test@1",
+                "generator_path": "installed/test", "contract_sha256": "manifest",
+                "package_sha256": package, "inputs": {}, "schema_version": 2,
+                "elapsed_budget_mode": "wall_clock",
+            })
+        };
+        let mut state = RunState::default();
+        state
+            .apply(&identity(1, "run_queued", Some("package-a")))
+            .unwrap();
+        state
+            .apply(&identity(2, "run_started", Some("package-a")))
+            .unwrap();
+        assert_eq!(state.package_sha256.as_deref(), Some("package-a"));
+        assert_eq!(state.generator_path.as_deref(), Some("installed/test"));
+        for package in [Some("package-b"), None] {
+            assert!(
+                state
+                    .clone()
+                    .apply(&identity(3, "run_queued", package))
+                    .is_err()
+            );
+        }
     }
 
     #[test]

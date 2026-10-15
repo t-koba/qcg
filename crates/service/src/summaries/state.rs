@@ -2,7 +2,6 @@ use super::super::run_dirs::{is_regular_directory, is_regular_file, journal_is_e
 use super::super::types::{RunRecord, ServiceError};
 use api::{RunEvent, RunStatus};
 use camino::{Utf8Path, Utf8PathBuf};
-use contract::Contract;
 use engine::{Interaction, RunState, read_output_manifest};
 use model::OutputManifest;
 use std::collections::BTreeMap;
@@ -162,10 +161,9 @@ pub(crate) fn rehydrate_runs(
         if state.terminal.is_some() {
             continue;
         }
-        let journal_events = journal_values
-            .iter()
-            .map(|event| RunEvent::from_flat(event).map_err(ServiceError::Invalid))
-            .collect::<Result<Vec<_>, _>>()?;
+        for event in &journal_values {
+            RunEvent::from_flat(event).map_err(ServiceError::Invalid)?;
+        }
         if records.len() >= max_tracked_runs {
             return Err(ServiceError::Invalid(format!(
                 "run store contains more than {max_tracked_runs} non-terminal runs"
@@ -191,10 +189,7 @@ pub(crate) fn rehydrate_runs(
         } else {
             record_state
         };
-        let (_, started) = super::run_identity_event(&run_dir, &journal_events)?;
-        let generator_path = Utf8PathBuf::from(&started.generator_path);
-        let mut contract = Contract::load(&generator_path)
-            .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+        let mut contract = crate::run_package::load(&run_dir, &state)?;
         // H02: re-apply the journaled per-run raise so a restart does not
         // drop it. The deployment floor is re-applied at spawn time from
         // the current policy (see `spawn_engine_run`); both are idempotent.
@@ -215,6 +210,7 @@ pub(crate) fn rehydrate_runs(
             run_id,
             RunRecord {
                 contract_sha256: contract.sha256.clone(),
+                package_sha256: state.package_sha256.clone(),
                 contract,
                 inputs,
                 answers,

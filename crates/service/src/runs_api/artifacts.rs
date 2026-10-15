@@ -33,8 +33,14 @@ impl LocalService {
         id: String,
     ) -> Result<crate::types::JournalStream, ApiError> {
         let run_dir = self.run_dir_for(&id).await?;
-        let generator_path = read_run_generator_path(&run_dir).map_err(api_internal)?;
-        let contract = Contract::load(&generator_path).map_err(api_internal)?;
+        let state = crate::summaries::fold_run_state(&run_dir).map_err(api_internal)?;
+        let contract = if state.package_sha256.is_some() {
+            crate::run_package::load(&run_dir, &state).map_err(api_internal)?
+        } else {
+            // Read-only access to historical/direct journals is not recovery.
+            let generator_path = read_run_generator_path(&run_dir).map_err(api_internal)?;
+            Contract::load(&generator_path).map_err(api_internal)?
+        };
         let limits = JournalLimits::from(&contract.manifest.runtime);
         let path = run_meta_dir(&run_dir).join("journal.jsonl");
         let file = tokio::fs::File::open(&path).await.map_err(api_internal)?;
