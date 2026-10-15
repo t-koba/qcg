@@ -1,4 +1,3 @@
-use super::super::run_dirs::journal_is_empty;
 use super::super::types::ServiceError;
 use api::RunEvent;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -18,10 +17,11 @@ pub(crate) fn run_identity_event<'a>(
 
 /// Deletes expired or over-retention terminal runs.
 ///
-/// Successful, canceled, and interrupted runs count against `keep`; failed
-/// runs get an additional `keep_failed` post-mortem budget, mirroring
+/// Successful, canceled, and interrupted runs consume `keep`; failed runs
+/// consume only the separate `keep_failed` post-mortem budget, mirroring
 /// `runs gc`. A run past its contract `[retention].days` window is
-/// always deleted regardless of the counts.
+/// always deleted regardless of the counts. Unreadable or malformed
+/// candidates are logged and left untouched without stopping the sweep.
 pub fn gc_run_directories(
     runs_dir: &Utf8Path,
     keep: usize,
@@ -29,14 +29,28 @@ pub fn gc_run_directories(
     delete: bool,
     max_scan_entries: usize,
 ) -> Result<Vec<Utf8PathBuf>, ServiceError> {
-    if !runs_dir.exists() {
-        return Ok(Vec::new());
-    }
+    let entries = match std::fs::read_dir(runs_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
     let now = chrono::Utc::now();
     let mut candidates = Vec::new();
     let mut scanned = 0_usize;
-    for entry in std::fs::read_dir(runs_dir)? {
-        let entry = entry?;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                scanned = scanned.saturating_add(1);
+                if scanned > max_scan_entries {
+                    return Err(ServiceError::Invalid(format!(
+                        "runs directory contains more than {max_scan_entries} entries"
+                    )));
+                }
+                tracing::warn!(%error, "skipping unreadable runs-directory entry during retention GC");
+                continue;
+            }
+        };
         // G03: coordination entries never consume the scan budget (see
         // rehydrate_runs for the rationale).
         if entry
@@ -52,50 +66,78 @@ pub fn gc_run_directories(
                 "runs directory contains more than {max_scan_entries} entries"
             )));
         }
-        let path = Utf8PathBuf::from_path_buf(entry.path()).map_err(|path| {
-            ServiceError::Invalid(format!("run path is not valid UTF-8: {}", path.display()))
-        })?;
-        let journal_path = run_meta_dir(&path).join("journal.jsonl");
-        if !path.is_dir() || !journal_path.exists() || journal_is_empty(&journal_path)? {
+        let path = match Utf8PathBuf::from_path_buf(entry.path()) {
+            Ok(path) => path,
+            Err(path) => {
+                tracing::warn!(path = %path.display(), "skipping run with non-UTF-8 path during retention GC");
+                continue;
+            }
+        };
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                tracing::warn!(run_path = %path, %error, "skipping unreadable run candidate during retention GC");
+                continue;
+            }
+        };
+        if !metadata.is_dir() {
             continue;
         }
-        let summary = run_summary(&path)?;
+        let journal_path = run_meta_dir(&path).join("journal.jsonl");
+        let journal_metadata = match std::fs::metadata(&journal_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                tracing::warn!(run_path = %path, %error, "skipping run with unreadable journal during retention GC");
+                continue;
+            }
+        };
+        if journal_metadata.len() == 0 {
+            continue;
+        }
+        let summary = match run_summary(&path) {
+            Ok(summary) => summary,
+            Err(error) => {
+                tracing::warn!(run_path = %path, %error, "skipping run with unreadable or corrupt journal during retention GC");
+                continue;
+            }
+        };
         if !matches!(
             summary.status.as_str(),
             "success" | "failed" | "canceled" | "interrupted"
         ) {
             continue;
         }
-        let expired = match summary.retention_days {
-            Some(days) => {
-                let started =
-                    chrono::DateTime::parse_from_rfc3339(&summary.started_at).map_err(|error| {
-                        ServiceError::Invalid(format!(
-                            "run `{}` has invalid started_at: {error}",
-                            summary.run_id
-                        ))
-                    })?;
-                started.with_timezone(&chrono::Utc) < now - chrono::Duration::days(i64::from(days))
-            }
-            None => false,
-        };
-        let failed = summary.status == "failed";
-        candidates.push((summary.started_at, path, expired, failed));
-    }
-    candidates.sort_by(|left, right| right.0.cmp(&left.0));
-    let mut deleted = Vec::new();
-    let mut seen_failed = 0_usize;
-    for (index, (_, path, expired, failed)) in candidates.into_iter().enumerate() {
-        if failed {
-            // Failed runs keep their additional budget before the global
-            // count applies, so post-mortem data survives normal churn.
-            if seen_failed < keep_failed && !expired {
-                seen_failed += 1;
+        let started_at = match chrono::DateTime::parse_from_rfc3339(&summary.started_at) {
+            Ok(started_at) => started_at.with_timezone(&chrono::Utc),
+            Err(error) => {
+                tracing::warn!(run_path = %path, %error, "skipping run with invalid started_at during retention GC");
                 continue;
             }
-            seen_failed += 1;
-        }
-        if index < keep && !expired {
+        };
+        let expired = summary.retention_days.is_some_and(|days| {
+            chrono::Duration::try_days(i64::from(days))
+                .and_then(|duration| now.checked_sub_signed(duration))
+                .is_some_and(|cutoff| started_at < cutoff)
+        });
+        let failed = summary.status == "failed";
+        candidates.push((started_at, path, expired, failed));
+    }
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
+    let mut deleted = Vec::new();
+    let mut kept_non_failed = 0_usize;
+    let mut kept_failed = 0_usize;
+    for (_, path, expired, failed) in candidates {
+        let keep_candidate = if !expired && failed && kept_failed < keep_failed {
+            kept_failed += 1;
+            true
+        } else if !expired && !failed && kept_non_failed < keep {
+            kept_non_failed += 1;
+            true
+        } else {
+            false
+        };
+        if keep_candidate {
             continue;
         }
         if delete {
@@ -136,9 +178,11 @@ mod tests {
                 .to_rfc3339()
                 .replace("+00:00", "Z")
         };
-        write_run(&runs.join("failed-new"), "failed", &stamp(2), None);
+        write_run(&runs.join("failed-new"), "failed", &stamp(1), None);
+        write_run(&runs.join("success"), "success", &stamp(2), None);
+        write_run(&runs.join("failed-middle"), "failed", &stamp(3), None);
+        write_run(&runs.join("success-old"), "success", &stamp(4), None);
         write_run(&runs.join("failed-old"), "failed", &stamp(5), None);
-        write_run(&runs.join("success"), "success", &stamp(1), None);
         write_run(&runs.join("expired"), "success", &stamp(30), Some(0));
 
         let deleted = gc_run_directories(
@@ -154,17 +198,86 @@ mod tests {
             "an expired run is deleted regardless of keep counts: {deleted:?}"
         );
         assert!(
-            deleted.iter().any(|path| path.ends_with("failed-old")),
-            "the second failed run is over its post-mortem budget: {deleted:?}"
+            deleted.iter().any(|path| path.ends_with("failed-middle"))
+                && deleted.iter().any(|path| path.ends_with("failed-old")),
+            "failed runs beyond keep_failed are deleted: {deleted:?}"
+        );
+        assert!(
+            deleted.iter().any(|path| path.ends_with("success-old")),
+            "successful runs beyond keep are deleted: {deleted:?}"
         );
         assert!(
             runs.join("failed-new").is_dir(),
-            "the newest failed run stays inside keep_failed"
+            "the newest failed run stays inside keep_failed even though it is newer than success"
         );
         assert!(
             runs.join("success").is_dir(),
             "the newest success run stays inside the global keep count"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unrepresentably_long_retention_does_not_expire_a_run() {
+        let root = std::env::temp_dir().join(format!("gc-long-retention-{}", uuid::Uuid::now_v7()));
+        let runs = Utf8PathBuf::from_path_buf(root.clone()).expect("path should be UTF-8");
+        std::fs::create_dir_all(&runs).expect("runs dir should be created");
+        let now = chrono::Utc::now();
+        let started_at = (now - chrono::Duration::days(30))
+            .to_rfc3339()
+            .replace("+00:00", "Z");
+        write_run(
+            &runs.join("long-retention"),
+            "success",
+            &started_at,
+            Some(u32::MAX),
+        );
+
+        gc_run_directories(
+            &runs,
+            1,
+            0,
+            true,
+            policy::DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES,
+        )
+        .expect("a representable run with huge retention should not panic");
+        assert!(
+            runs.join("long-retention").is_dir(),
+            "an out-of-range retention interval is not treated as expired"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn corrupt_candidate_is_skipped_while_valid_over_budget_run_is_collected() {
+        let root = std::env::temp_dir().join(format!("gc-corrupt-{}", uuid::Uuid::now_v7()));
+        let runs = Utf8PathBuf::from_path_buf(root.clone()).expect("path should be UTF-8");
+        std::fs::create_dir_all(&runs).expect("runs dir should be created");
+        let now = chrono::Utc::now();
+        let stamp = now.to_rfc3339().replace("+00:00", "Z");
+        let corrupt = runs.join("corrupt");
+        std::fs::create_dir_all(run_meta_dir(&corrupt)).expect("meta dir should be created");
+        std::fs::write(run_meta_dir(&corrupt).join("journal.jsonl"), "not-json\n")
+            .expect("corrupt journal should be written");
+        write_run(&runs.join("valid"), "success", &stamp, None);
+
+        let deleted = gc_run_directories(
+            &runs,
+            0,
+            0,
+            true,
+            policy::DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES,
+        )
+        .expect("corrupt candidate should not abort gc");
+        assert!(
+            runs.join("corrupt").is_dir(),
+            "corrupt run remains untouched"
+        );
+        assert!(
+            !runs.join("valid").exists(),
+            "valid over-budget run is collected"
+        );
+        assert_eq!(deleted, vec![runs.join("valid")]);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
