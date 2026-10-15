@@ -130,8 +130,7 @@ fn resolve_source_run(
             })
         }
         "latest_success" | "latest_terminal" => {
-            let terminal_match = |status: &str| status == "success";
-            let mut best: Option<(String, String, Utf8PathBuf)> = None;
+            let mut best: Option<(String, String, String, Utf8PathBuf)> = None;
             let mut scanned = 0_usize;
             for entry in std::fs::read_dir(runs_dir)
                 .map_err(|error| format!("runs directory is unreadable: {error}"))?
@@ -163,11 +162,10 @@ fn resolve_source_run(
                 let matched = if *kind == "latest_success" {
                     summary.status == "success"
                 } else {
-                    terminal_match(&summary.status)
-                        || matches!(
-                            summary.status.as_str(),
-                            "failed" | "canceled" | "interrupted"
-                        )
+                    matches!(
+                        summary.status.as_str(),
+                        "success" | "failed" | "canceled" | "interrupted"
+                    )
                 };
                 if !matched {
                     continue;
@@ -175,16 +173,17 @@ fn resolve_source_run(
                 let candidate = (
                     summary.started_at.clone(),
                     summary.run_id.clone(),
+                    summary.status.clone(),
                     path.join("meta"),
                 );
                 if best
                     .as_ref()
-                    .is_none_or(|(started, _, _)| candidate.0 > *started)
+                    .is_none_or(|(started, _, _, _)| candidate.0 > *started)
                 {
                     best = Some(candidate);
                 }
             }
-            let Some((_, run_id, meta_dir)) = best else {
+            let Some((_, run_id, status, meta_dir)) = best else {
                 return Err(format!(
                     "no {} run of generator `{value}` is available",
                     if *kind == "latest_success" {
@@ -194,6 +193,11 @@ fn resolve_source_run(
                     }
                 ));
             };
+            if *kind == "latest_terminal" && status != "success" {
+                return Err(format!(
+                    "latest terminal run `{run_id}` of generator `{value}` is `{status}`; declared artifacts require a successful run"
+                ));
+            }
             Ok(SourceRun { run_id, meta_dir })
         }
         other => Err(format!("unsupported selector `{other}`")),
@@ -326,4 +330,116 @@ fn persist(
     let encoded = serde_json::to_vec_pretty(&index)?;
     let target = metadata_dir.join(RUN_REF_INDEX);
     files::write_file_atomic(&target, |file| file.write_all(&encoded))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use camino::Utf8Path;
+    use serde_json::{Value, json};
+
+    fn write_terminal_run(runs_dir: &Utf8Path, run_id: &str, status: &str, started_at: &str) {
+        let meta_dir = runs_dir.join(run_id).join("meta");
+        std::fs::create_dir_all(&meta_dir).expect("run metadata directory should be created");
+        let journal_path = meta_dir.join("journal.jsonl");
+        let journal = engine::JournalWriter::create(&journal_path, run_id, false, None)
+            .expect("test journal should be created");
+        journal
+            .event(
+                "run_started",
+                json!({
+                    "generator": "generator@1.0.0",
+                    "generator_path": "generator",
+                    "contract_sha256": "test-digest",
+                    "inputs": {},
+                    "resource_hashes": [],
+                    "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                }),
+            )
+            .expect("run should start");
+        match status {
+            "success" => journal
+                .event("run_finished", json!({"status": "success"}))
+                .expect("run should finish successfully"),
+            "failed" => journal
+                .event("run_error", json!({"error": "test failure"}))
+                .expect("run should fail"),
+            other => panic!("unsupported test terminal status `{other}`"),
+        }
+        drop(journal);
+
+        // Use explicit, stable start times so the selector tests do not rely
+        // on the host clock's timestamp precision or scheduling.
+        let contents = std::fs::read_to_string(&journal_path).expect("journal should be readable");
+        let mut events = contents
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("journal line should parse"))
+            .collect::<Vec<_>>();
+        events[0]["ts"] = Value::String(started_at.to_string());
+        let contents = events
+            .iter()
+            .map(|event| serde_json::to_string(event).expect("event should serialize"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(journal_path, format!("{contents}\n")).expect("journal should be updated");
+    }
+
+    fn test_runs_dir(name: &str) -> (Utf8PathBuf, crate::tests::support::TempGuard) {
+        let root = crate::tests::support::temp_run_dir(name);
+        std::fs::create_dir_all(&root).expect("temporary root should be created");
+        (root.join("runs"), crate::tests::support::TempGuard(root))
+    }
+
+    #[test]
+    fn latest_terminal_errors_for_newer_failed_run_instead_of_falling_back() {
+        let (runs_dir, _guard) = test_runs_dir("run-ref-latest-terminal-failure");
+        std::fs::create_dir_all(&runs_dir).expect("runs directory should be created");
+        write_terminal_run(
+            &runs_dir,
+            "older-success",
+            "success",
+            "2026-01-01T00:00:00Z",
+        );
+        write_terminal_run(&runs_dir, "newer-failure", "failed", "2026-01-02T00:00:00Z");
+
+        let error = resolve_source_run(&runs_dir, &Some(("latest_terminal", "generator")))
+            .expect_err("latest_terminal must reject the newest failed terminal run");
+        assert!(error.contains("newer-failure"), "{error}");
+        assert!(error.contains("failed"), "{error}");
+        assert!(!error.contains("older-success"), "{error}");
+    }
+
+    #[test]
+    fn latest_success_still_selects_older_success() {
+        let (runs_dir, _guard) = test_runs_dir("run-ref-latest-success");
+        std::fs::create_dir_all(&runs_dir).expect("runs directory should be created");
+        write_terminal_run(
+            &runs_dir,
+            "older-success",
+            "success",
+            "2026-01-01T00:00:00Z",
+        );
+        write_terminal_run(&runs_dir, "newer-failure", "failed", "2026-01-02T00:00:00Z");
+
+        let source = resolve_source_run(&runs_dir, &Some(("latest_success", "generator")))
+            .expect("latest_success should select the older successful run");
+        assert_eq!(source.run_id, "older-success");
+    }
+
+    #[test]
+    fn latest_terminal_resolves_newest_successful_terminal_run() {
+        let (runs_dir, _guard) = test_runs_dir("run-ref-latest-terminal-success");
+        std::fs::create_dir_all(&runs_dir).expect("runs directory should be created");
+        write_terminal_run(&runs_dir, "older-failure", "failed", "2026-01-01T00:00:00Z");
+        write_terminal_run(
+            &runs_dir,
+            "newer-success",
+            "success",
+            "2026-01-02T00:00:00Z",
+        );
+
+        let source = resolve_source_run(&runs_dir, &Some(("latest_terminal", "generator")))
+            .expect("latest_terminal should resolve a newest successful terminal run");
+        assert_eq!(source.run_id, "newer-success");
+    }
 }
