@@ -965,7 +965,9 @@ pub fn verify_installed_package(
 /// permission mode; regular-file bytes are streamed into the hash. Timestamps
 /// and filesystem traversal order are excluded. Symlinks, special entries,
 /// unsafe paths, concurrent changes, and configured entry/byte limit
-/// violations fail closed.
+/// violations fail closed. On Unix, change time is also checked so a same-size
+/// in-place edit that restores its modification time is detected while the
+/// tree is being scanned.
 pub fn package_identity_sha256(
     root: &Utf8Path,
     limits: &PackageLimits,
@@ -1071,6 +1073,10 @@ struct IdentityEntry {
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(unix)]
+    change_time: i64,
+    #[cfg(unix)]
+    change_time_nsec: i64,
 }
 
 fn collect_identity_entries(
@@ -1153,9 +1159,14 @@ fn collect_identity_entries(
         }
         let modified = metadata.modified().map_err(ServiceError::Io)?;
         #[cfg(unix)]
-        let (device, inode) = {
+        let (device, inode, change_time, change_time_nsec) = {
             use std::os::unix::fs::MetadataExt as _;
-            (metadata.dev(), metadata.ino())
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            )
         };
         entries.push(IdentityEntry {
             path: entry.path().to_path_buf(),
@@ -1168,6 +1179,10 @@ fn collect_identity_entries(
             device,
             #[cfg(unix)]
             inode,
+            #[cfg(unix)]
+            change_time,
+            #[cfg(unix)]
+            change_time_nsec,
         });
     }
     entries.sort_by(|left, right| left.relative.cmp(&right.relative));
@@ -1190,7 +1205,11 @@ fn identity_metadata_matches(
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        if metadata.dev() != entry.device || metadata.ino() != entry.inode {
+        if metadata.dev() != entry.device
+            || metadata.ino() != entry.inode
+            || metadata.ctime() != entry.change_time
+            || metadata.ctime_nsec() != entry.change_time_nsec
+        {
             return false;
         }
     }
@@ -1206,7 +1225,10 @@ fn identity_entries_match(left: &IdentityEntry, right: &IdentityEntry) -> bool {
         && {
             #[cfg(unix)]
             {
-                left.device == right.device && left.inode == right.inode
+                left.device == right.device
+                    && left.inode == right.inode
+                    && left.change_time == right.change_time
+                    && left.change_time_nsec == right.change_time_nsec
             }
             #[cfg(not(unix))]
             {
@@ -1871,6 +1893,49 @@ mod tests {
         let path_edit = package_identity_sha256(&root, &PackageLimits::default())
             .expect("path-edited identity");
         assert_ne!(content_edit, path_edit);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_identity_detects_same_size_edits_with_restored_mtime() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let root = temp_dir("identity-change-time");
+        let _temp_guard = TempGuard(root.clone());
+        std::fs::create_dir_all(&root).expect("root");
+        let file = root.join("payload");
+        std::fs::write(&file, b"AAAA").expect("initial content");
+        let entries =
+            collect_identity_entries(&root, &PackageLimits::default()).expect("initial entries");
+        let initial = entries.first().expect("file entry");
+        let before = std::fs::metadata(&file).expect("initial metadata");
+        let original_modified = before.modified().expect("initial mtime");
+        let original_identity =
+            package_identity_sha256(&root, &PackageLimits::default()).expect("initial identity");
+
+        std::fs::write(&file, b"BBBB").expect("same-size edit");
+        std::fs::File::open(&file)
+            .expect("file handle")
+            .set_times(std::fs::FileTimes::new().set_modified(original_modified))
+            .expect("restore original mtime");
+        let after = std::fs::metadata(&file).expect("edited metadata");
+        assert_eq!(before.len(), after.len());
+        assert_eq!(
+            before.modified().expect("initial mtime"),
+            after.modified().expect("restored mtime")
+        );
+        assert_ne!(
+            (before.ctime(), before.ctime_nsec()),
+            (after.ctime(), after.ctime_nsec()),
+            "ctime must record the write"
+        );
+        assert!(
+            !identity_metadata_matches(initial, &after, false),
+            "restoring mtime must not hide an in-place content edit"
+        );
+        let edited_identity =
+            package_identity_sha256(&root, &PackageLimits::default()).expect("edited identity");
+        assert_ne!(original_identity, edited_identity);
     }
 
     #[cfg(unix)]
