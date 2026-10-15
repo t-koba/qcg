@@ -944,12 +944,17 @@
           "inputs": {
             "$ref": "#/components/schemas/InputSpec"
           },
+          "package_sha256": {
+            "description": "SHA-256 identity of the complete generator package tree.",
+            "type": "string"
+          },
           "permissions": {
             "$ref": "#/components/schemas/Permissions"
           }
         },
         "required": [
           "generator",
+          "package_sha256",
           "inputs",
           "assets",
           "permissions"
@@ -4497,7 +4502,16 @@
       "post": {
         "parameters": [
           {
-            "description": "Retries with the same key and request body return the original run.",
+            "description": "Required SHA-256 identity from the loaded GeneratorDetail; start is rejected if the package changed.",
+            "in": "header",
+            "name": "X-QCG-Package-SHA256",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Retries with the same key, request body, and package identity return the original run.",
             "in": "header",
             "name": "Idempotency-Key",
             "required": false,

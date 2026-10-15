@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use super::config::AppState;
 use super::error::ApiHttpError;
-use super::idempotency::{IdempotentCall, with_idempotency};
+use super::idempotency::{
+    IdempotentCall, StartIdempotencyLookup, lookup_start_idempotency, with_idempotency,
+};
 use super::run_detail::{conditional_response, json_response_with_etag};
 
 pub(crate) async fn list_runs(
@@ -117,35 +119,96 @@ pub(crate) async fn start_run(
     headers: HeaderMap,
     Json(req): Json<StartRun>,
 ) -> Result<Response, ApiHttpError> {
+    let package_sha256 = reviewed_package_sha256(&headers)?;
     let body = serde_json::to_vec(&req).map_err(ApiHttpError::internal)?;
-    // Reserve the run id before the claim so a crash between run creation
-    // and Ready commit retries into the same run.
-    let reserved = state
-        .service
-        .reserve_start_run_id(&req.generator_id)
-        .map_err(ApiHttpError::from_api)?;
+    let generator_id = req.generator_id.clone();
     let service = state.service.clone();
-    with_idempotency(IdempotentCall {
+    let service_package_sha256 = package_sha256.clone();
+    let mut call = IdempotentCall {
         state: &state,
         headers: &headers,
         scope: "start_run",
         target: "",
         body: &body,
+        digest_context: Some(package_sha256.as_bytes()),
         created: true,
-        reserved_run_id: Some(reserved),
+        reserved_run_id: None,
         // The reservation rides in the pending claim and the commit proves
         // `request run_id == reserved run_id` (E02). A missing reservation
         // fails closed instead of minting an unclaimed run.
-        execute: |reserved| async move {
+        execute: move |reserved| async move {
             let Some(reserved) = reserved else {
                 return Err(api::ApiError::Internal {
                     detail: "idempotency reservation is missing; commit refused".into(),
                 });
             };
-            service.start_run_with_id(req, Some(reserved)).await
+            service
+                .start_run_with_package_identity(req, Some(reserved), &service_package_sha256)
+                .await
         },
-    })
-    .await
+    };
+    // Exact Ready replays and live Pending retries are not new admissions:
+    // return or wait for the original operation without consulting mutable
+    // package content. Only absent/expired claims require package preflight.
+    match lookup_start_idempotency(&call).await? {
+        StartIdempotencyLookup::Ready(response) => return Ok(response),
+        StartIdempotencyLookup::Pending => {}
+        StartIdempotencyLookup::Absent => {
+            let preflight = state.service.describe(&generator_id).await;
+            let needs_recheck = match &preflight {
+                Ok(detail) => !detail.package_sha256.eq_ignore_ascii_case(&package_sha256),
+                Err(_) => true,
+            };
+            if needs_recheck {
+                // A matching claim may have appeared while package detail was
+                // being read. Let that exact retry join/replay; otherwise
+                // preserve the original missing-package error or mismatch.
+                match lookup_start_idempotency(&call).await? {
+                    StartIdempotencyLookup::Ready(response) => return Ok(response),
+                    StartIdempotencyLookup::Pending => {}
+                    StartIdempotencyLookup::Absent => {
+                        return match preflight {
+                            Ok(_) => Err(ApiHttpError::from_api(api::ApiError::Conflict {
+                                detail: "generator package identity does not match the reviewed identity".into(),
+                            })),
+                            Err(error) => Err(ApiHttpError::from_api(error)),
+                        };
+                    }
+                }
+            }
+        }
+    }
+    // Reserve before the claim so a crash between creation and Ready commit
+    // retries into the same run. Pending claims still use the normal waiter.
+    call.reserved_run_id = Some(
+        state
+            .service
+            .reserve_start_run_id(&generator_id)
+            .map_err(ApiHttpError::from_api)?,
+    );
+    with_idempotency(call).await
+}
+
+const PACKAGE_SHA256_HEADER: &str = "x-qcg-package-sha256";
+
+fn reviewed_package_sha256(headers: &HeaderMap) -> Result<String, ApiHttpError> {
+    let invalid = || {
+        ApiHttpError::bad_request(
+            "X-QCG-Package-SHA256 is required exactly once and must be a 64-character SHA-256 hex digest",
+        )
+    };
+    let mut values = headers.get_all(PACKAGE_SHA256_HEADER).iter();
+    let value = values.next().ok_or_else(invalid)?;
+    if values.next().is_some() {
+        return Err(invalid());
+    }
+    let value = value.to_str().map_err(|_| invalid())?;
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ApiHttpError::bad_request(
+            "X-QCG-Package-SHA256 is required exactly once and must be a 64-character SHA-256 hex digest",
+        ));
+    }
+    Ok(value.to_ascii_lowercase())
 }
 
 pub(crate) fn respond_with_snapshot(
@@ -181,6 +244,7 @@ pub(crate) async fn fork_run(
         scope: "fork_run",
         target: &source_id,
         body: &body,
+        digest_context: None,
         created: true,
         reserved_run_id: Some(reserved),
         // Reservation check mirrors `start_run` (E02): a missing

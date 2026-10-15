@@ -158,6 +158,7 @@ pub(crate) async fn answer_run(
         scope: "answer",
         target: &id,
         body: &body,
+        digest_context: None,
         created: false,
         reserved_run_id: Some(id.clone()),
         // The target id rides in the pending claim for uniformity (E02).
@@ -195,6 +196,7 @@ pub(crate) async fn confirm_run(
         scope: "confirm",
         target: &id,
         body: &body,
+        digest_context: None,
         created: false,
         reserved_run_id: Some(id.clone()),
         // Reservation check mirrors `answer_run` (E02).
@@ -225,6 +227,7 @@ pub(crate) async fn cancel_run(
         scope: "cancel",
         target: &id,
         body: &[],
+        digest_context: None,
         created: false,
         reserved_run_id: Some(id.clone()),
         // Reservation check mirrors `answer_run` (E02).

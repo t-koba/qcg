@@ -938,6 +938,19 @@ fn read_durable_pending(runs_dir: &Utf8PathBuf, key: &str) -> PendingRead {
     parse_pending_bytes(key, &bytes)
 }
 
+/// Read-only digest lookup used before package preflight: an exact retry of a
+/// live pending start must join its owner even if the source package changed.
+pub(crate) fn load_durable_pending_digest_result(
+    runs_dir: &Utf8PathBuf,
+    key: &str,
+) -> Result<Option<String>, String> {
+    match read_durable_pending(runs_dir, key) {
+        PendingRead::Valid(record) => Ok(Some(record.digest)),
+        PendingRead::Expired(_) | PendingRead::Absent => Ok(None),
+        PendingRead::Unusable(detail) => Err(detail),
+    }
+}
+
 /// Pure parse-and-classify half of [`read_durable_pending`], shared by the
 /// single-read waiter and the snapshotted claim path so the same bytes are
 /// never parsed twice under different rules (E02).
@@ -1833,6 +1846,30 @@ mod tests {
                 Ok(OwnerCheck::Superseded)
             ),
             "an expired claim must read as superseded even with matching identity"
+        );
+    }
+
+    #[test]
+    fn pending_digest_lookup_is_read_only_and_reports_live_claims() {
+        let runs_dir = temp_runs_dir("pending-digest-read");
+        let _temp_guard = TempGuard(runs_dir.clone());
+        let key = "pending-read";
+        let digest = "reviewed-package-digest";
+        let outcome = claim_pending(&runs_dir, key, digest, "run-pending-read")
+            .expect("durable pending claim should be created");
+        assert!(matches!(outcome, ClaimOutcome::Owner { .. }));
+        let path = pending_path(&runs_dir, key);
+        let before = std::fs::read(path.as_std_path()).expect("pending record bytes");
+
+        assert_eq!(
+            load_durable_pending_digest_result(&runs_dir, key)
+                .expect("read-only pending lookup should succeed"),
+            Some(digest.to_string())
+        );
+        assert_eq!(
+            std::fs::read(path.as_std_path()).expect("pending record remains present"),
+            before,
+            "lookup must not mutate or reap the pending record"
         );
     }
 

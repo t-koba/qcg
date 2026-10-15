@@ -16,6 +16,23 @@ use tokio::sync::{Barrier, Mutex};
 
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
+async fn package_sha256(client: &reqwest::Client, base: &str, generator_id: &str) -> String {
+    let detail: Value = client
+        .get(format!("{base}/api/generators/{generator_id}"))
+        .send()
+        .await
+        .expect("generator detail should respond")
+        .error_for_status()
+        .expect("generator detail should load")
+        .json()
+        .await
+        .expect("generator detail should be JSON");
+    detail["package_sha256"]
+        .as_str()
+        .expect("generator detail should expose package identity")
+        .to_string()
+}
+
 /// Restores `TEST_TOKEN` on drop so a panicking assertion cannot leak
 /// the canary into the process environment for later tests. Callers hold
 /// `ENV_LOCK` for the whole mutation window, and the guard is declared
@@ -1939,6 +1956,10 @@ async fn agent_secret_tool_result_never_reaches_sse() {
     let base = format!("http://127.0.0.1:{port}");
     let start: Value = client
         .post(format!("{base}/api/runs"))
+        .header(
+            "x-qcg-package-sha256",
+            package_sha256(&client, &base, "agent-secret-result").await,
+        )
         .json(&json!({ "generator_id": "agent-secret-result", "inputs": {} }))
         .send()
         .await
@@ -2100,6 +2121,10 @@ async fn http_sse_replays_same_journal_event_sequence_for_run() {
     let base = format!("http://127.0.0.1:{port}");
     let start: Value = client
         .post(format!("{base}/api/runs"))
+        .header(
+            "x-qcg-package-sha256",
+            package_sha256(&client, &base, "hello-template").await,
+        )
         .json(&json!({ "generator_id": "hello-template", "inputs": { "name": "qcg" } }))
         .send()
         .await
@@ -2192,6 +2217,10 @@ async fn http_concurrent_runs_keep_artifacts_and_journals_isolated() {
                 barrier.wait().await;
                 let snapshot: Value = client
                     .post(format!("{base}/api/runs"))
+                    .header(
+                        "x-qcg-package-sha256",
+                        package_sha256(&client, &base, "assets-demo").await,
+                    )
                     .json(&json!({
                         "generator_id": "assets-demo",
                         "inputs": { "message": message }
@@ -2360,6 +2389,10 @@ content = "unexpected""#,
     let base = format!("http://127.0.0.1:{port}");
     let started: Value = client
         .post(format!("{base}/api/runs"))
+        .header(
+            "x-qcg-package-sha256",
+            package_sha256(&client, &base, "cancelable").await,
+        )
         .json(&json!({ "generator_id": "cancelable", "inputs": {} }))
         .send()
         .await
@@ -2531,7 +2564,7 @@ async fn http_assets_are_declared_generic_and_metadata_is_verbatim() {
         .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
         .header(
             header::ACCESS_CONTROL_REQUEST_HEADERS,
-            "content-type, idempotency-key",
+            "content-type, idempotency-key, x-qcg-package-sha256",
         )
         .send()
         .await
@@ -2548,6 +2581,7 @@ async fn http_assets_are_declared_generic_and_metadata_is_verbatim() {
         .expect("CORS should list allowed headers");
     assert!(allowed_headers.contains("content-type"));
     assert!(allowed_headers.contains("idempotency-key"));
+    assert!(allowed_headers.contains("x-qcg-package-sha256"));
     assert!(
         !preflight
             .headers()
@@ -2557,7 +2591,7 @@ async fn http_assets_are_declared_generic_and_metadata_is_verbatim() {
 }
 
 #[tokio::test]
-async fn http_server_is_unauthenticated_and_writes_need_no_extra_headers() {
+async fn http_server_start_requires_package_identity_but_not_authentication() {
     let runs_dir = run_dir("server-unauthenticated-runs");
     let _ = std::fs::remove_dir_all(&runs_dir);
     let Some(listener) = crate::bind_loopback().await else {
@@ -2618,6 +2652,10 @@ async fn http_server_is_unauthenticated_and_writes_need_no_extra_headers() {
 
     let start = client
         .post(format!("{base}/api/runs"))
+        .header(
+            "x-qcg-package-sha256",
+            package_sha256(&client, &base, "hello-template").await,
+        )
         .json(&json!({ "generator_id": "hello-template", "inputs": { "name": "qcg" } }))
         .send()
         .await
@@ -2632,6 +2670,10 @@ async fn http_server_is_unauthenticated_and_writes_need_no_extra_headers() {
 
     let malformed_file = client
         .post(format!("{base}/api/runs"))
+        .header(
+            "x-qcg-package-sha256",
+            package_sha256(&client, &base, "file-input").await,
+        )
         .json(&json!({
             "generator_id": "file-input",
             "inputs": { "config_file": "plain-string-is-invalid" }
@@ -2646,6 +2688,10 @@ async fn http_server_is_unauthenticated_and_writes_need_no_extra_headers() {
 
     let inline_file = client
         .post(format!("{base}/api/runs"))
+        .header(
+            "x-qcg-package-sha256",
+            package_sha256(&client, &base, "file-input").await,
+        )
         .json(&json!({
             "generator_id": "file-input",
             "inputs": {

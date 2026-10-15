@@ -627,8 +627,10 @@ export interface paths {
         post: {
             parameters: {
                 query?: never;
-                header?: {
-                    /** @description Retries with the same key and request body return the original run. */
+                header: {
+                    /** @description Required SHA-256 identity from the loaded GeneratorDetail; start is rejected if the package changed. */
+                    "X-QCG-Package-SHA256": string;
+                    /** @description Retries with the same key, request body, and package identity return the original run. */
                     "Idempotency-Key"?: string;
                 };
                 path?: never;
@@ -2140,6 +2142,8 @@ export interface components {
             assets: components["schemas"]["AssetSpec"];
             generator: components["schemas"]["GeneratorMeta"];
             inputs: components["schemas"]["InputSpec"];
+            /** @description SHA-256 identity of the complete generator package tree. */
+            package_sha256: string;
             permissions: components["schemas"]["Permissions"];
         };
         GeneratorMeta: {

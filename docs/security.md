@@ -537,16 +537,20 @@ runtime. JSON responses receive `default-src 'none'`. All responses use
 `X-Content-Type-Options: nosniff` and `X-Frame-Options: DENY`.
 
 CORS is off by default. When one or more exact `--cors-origin` values are
-supplied, allowed request headers are `authorization`, `content-type`, and
-`idempotency-key` (`apply_cors_layer` in
+supplied, allowed request headers are `authorization`, `content-type`,
+`idempotency-key`, and `x-qcg-package-sha256` (`apply_cors_layer` in
 `crates/server/src/server/serve.rs`); cookies and credentialed CORS are
 not supported. Availability is feature-gated: builds without the
 `server-cors` cargo feature refuse configured origins at boot/router build
 with an explicit error instead of silently serving without CORS
 (`parse_cors_origins`). The bundled generator UI keeps a bearer token in
 `sessionStorage` for the tab and sends it as an `Authorization` header on
-API calls, event streams, and artifact downloads; the token never enters a
-URL, a cookie, or `localStorage` (see `docs/http-server-guide.md`). Static
+API calls, event streams, and artifact downloads; pending run-start bodies
+are also retained in session storage with their original idempotency key and
+package identity for reload-safe retries. Successful starts and explicitly
+closed pending operations clear these records; unresolved failures remain
+only for the current browser session. The token never enters a URL, a cookie, or
+`localStorage` (see `docs/http-server-guide.md`). Static
 generator assets stay readable without a token so the UI shell can load;
 every JSON API route requires the credential when one is configured. On a
 loopback listener the server additionally rejects any request whose `Host`

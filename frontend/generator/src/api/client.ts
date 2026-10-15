@@ -71,6 +71,21 @@ export class ApiClient {
     return parseResponse<T>(response);
   }
 
+  async startRun<T>(body: unknown, packageSha256: string, idempotencyKey?: string): Promise<T> {
+    const headers: Record<string, string> = {
+      ...authHeaders(),
+      "content-type": "application/json",
+      "x-qcg-package-sha256": packageSha256,
+    };
+    if (idempotencyKey) headers["idempotency-key"] = idempotencyKey;
+    const response = await fetch(`${this.base}/api/runs`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+    return parseResponse<T>(response);
+  }
+
   async put<T>(path: string, body: unknown, idempotencyKey?: string, signal?: AbortSignal): Promise<T> {
     const headers: Record<string, string> = { ...authHeaders(), "content-type": "application/json" };
     if (idempotencyKey) headers["idempotency-key"] = idempotencyKey;

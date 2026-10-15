@@ -110,8 +110,13 @@ event, artifact, and journal routes. Principal paths include:
 `answers` (pre-provisioned answers keyed by question id) and `confirmations`
 (pre-provisioned decisions keyed by confirmation id) for unattended runs.
 `priority` (integer, default 0, higher runs first) orders the queue and may
-preempt lower-priority running runs, which resume from their journals.
-An
+preempt lower-priority running runs, which resume from their journals. Every
+start must include `X-QCG-Package-SHA256` with the `package_sha256` from the
+loaded `GET /api/generators/{id}` detail. The server rejects a missing,
+malformed, or stale identity before run admission; the identity covers the
+complete package tree and participates in start idempotency. A committed
+start retried with the same key, body, and identity replays the original run
+even if the installed package has since changed or disappeared. An
 `Idempotency-Key` header makes retries deterministic for 24 hours. Records
 are persisted under `<runs-dir>/idempotency/` so the same key returns the
 same run across process restarts and shared-store peers; TTL and entry caps
@@ -220,7 +225,8 @@ DNS-rebinding pages from driving the local API. Non-loopback binds leave
 
 CORS is disabled unless one or more exact `--cors-origin` values are supplied.
 Allowed request headers are `Authorization`, `Content-Type`, `idempotency-key`,
-`Last-Event-ID`, `If-None-Match`, `If-Range` and `Range`. Browsers can read
+`x-qcg-package-sha256`, `Last-Event-ID`, `If-None-Match`, `If-Range` and
+`Range`. Browsers can read
 `ETag`, `Location`, `Retry-After`, `Content-Disposition`, `Content-Range` and
 `Accept-Ranges`; credentialed CORS is not enabled. Builds without the
 `server-cors` cargo feature refuse configured origins with an explicit error

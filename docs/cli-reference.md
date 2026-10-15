@@ -279,7 +279,8 @@ use of the same output directory.
   contract's `[audit]` policy; a floor can only raise persistence.
 - `CORS_ORIGIN`: comma-separated exact origins allowed for cross-origin
   API requests. CORS is disabled when it is unset. Allowed request headers are
-  `authorization`, `content-type`, and `idempotency-key`; builds without the
+  `authorization`, `content-type`, `idempotency-key`, and
+  `x-qcg-package-sha256`; builds without the
   `server-cors` cargo feature refuse configured origins with an explicit error.
 - `PACKAGE_MAX_ENTRIES` (default `1000`), `PACKAGE_MAX_BYTES`
   (default `10485760`): entry and expanded-byte bounds for `qcg package`

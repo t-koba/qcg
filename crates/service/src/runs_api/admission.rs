@@ -178,7 +178,7 @@ impl LocalService {
     }
 
     pub async fn start_run(&self, req: StartRun) -> Result<String, ApiError> {
-        self.start_run_with_id(req, None).await
+        self.start_run_inner(req, None, None).await
     }
 
     pub async fn start_run_with_id(
@@ -186,8 +186,48 @@ impl LocalService {
         req: StartRun,
         reserved_run_id: Option<String>,
     ) -> Result<String, ApiError> {
+        self.start_run_inner(req, reserved_run_id, None).await
+    }
+
+    /// HTTP start admission with the package identity reviewed by the client.
+    /// This second check runs after idempotency admission but immediately
+    /// after loading the package and before any run-side filesystem effects.
+    pub async fn start_run_with_package_identity(
+        &self,
+        req: StartRun,
+        reserved_run_id: Option<String>,
+        expected_package_sha256: &str,
+    ) -> Result<String, ApiError> {
+        self.start_run_inner(req, reserved_run_id, Some(expected_package_sha256))
+            .await
+    }
+
+    async fn start_run_inner(
+        &self,
+        req: StartRun,
+        reserved_run_id: Option<String>,
+        expected_package_sha256: Option<&str>,
+    ) -> Result<String, ApiError> {
         self.ensure_running()?;
         let mut contract = self.load_generator(&req.generator_id)?;
+        if let Some(expected) = expected_package_sha256 {
+            if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(api_bad_request(
+                    "package identity must be a 64-character SHA-256 hex digest",
+                ));
+            }
+            let current = crate::package::package_identity_sha256(
+                &contract.root,
+                &crate::package::PackageLimits::default(),
+            )
+            .map_err(|_| api_internal("failed to verify generator package identity"))?;
+            if !current.eq_ignore_ascii_case(expected) {
+                return Err(ApiError::Conflict {
+                    detail: "generator package identity does not match the reviewed identity"
+                        .into(),
+                });
+            }
+        }
         // Run metadata is metadata only: it never confers authorization and
         // is bounded so a request cannot grow journals without limit.
         if req.labels.len() > policy::MAX_RUN_LABELS {

@@ -1106,6 +1106,7 @@ fn apply_cors_layer(app: Router, validated_cors: &[HeaderValue]) -> Result<Route
                 header::AUTHORIZATION,
                 header::CONTENT_TYPE,
                 header::HeaderName::from_static(IDEMPOTENCY_HEADER),
+                header::HeaderName::from_static("x-qcg-package-sha256"),
                 header::HeaderName::from_static("last-event-id"),
                 header::IF_NONE_MATCH,
                 header::IF_RANGE,

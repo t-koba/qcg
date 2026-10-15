@@ -372,3 +372,30 @@ fn schema_two_run_identity_requires_elapsed_mode_in_openapi() {
     let required = schema["required"].as_array().expect("required properties");
     assert!(required.iter().any(|name| name == "elapsed_budget_mode"));
 }
+
+#[test]
+fn generator_detail_and_start_document_the_package_identity_precondition() {
+    let document = api::openapi_document("test");
+    let detail = &document["components"]["schemas"]["GeneratorDetail"];
+    assert_eq!(detail["properties"]["package_sha256"]["type"], "string");
+    assert!(
+        detail["required"]
+            .as_array()
+            .is_some_and(|required| { required.iter().any(|field| field == "package_sha256") })
+    );
+
+    let operation = &document["paths"]["/api/runs"]["post"];
+    let package_header = operation["parameters"]
+        .as_array()
+        .expect("start request headers must be documented")
+        .iter()
+        .find(|parameter| parameter["name"] == "X-QCG-Package-SHA256")
+        .expect("the package identity header must be documented");
+    assert_eq!(package_header["in"], "header");
+    assert!(package_header["required"].as_bool().unwrap_or(false));
+    assert!(
+        package_header["description"]
+            .as_str()
+            .is_some_and(|description| { description.contains("loaded GeneratorDetail") })
+    );
+}

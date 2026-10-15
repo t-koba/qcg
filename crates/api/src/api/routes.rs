@@ -105,6 +105,18 @@ const IDEMPOTENCY_HEADERS: &[ApiHeader] = &[ApiHeader {
     description: "Retries with the same key and request body return the original run.",
     required: false,
 }];
+const START_RUN_REQUEST_HEADERS: &[ApiHeader] = &[
+    ApiHeader {
+        name: "X-QCG-Package-SHA256",
+        description: "Required SHA-256 identity from the loaded GeneratorDetail; start is rejected if the package changed.",
+        required: true,
+    },
+    ApiHeader {
+        name: "Idempotency-Key",
+        description: "Retries with the same key, request body, and package identity return the original run.",
+        required: false,
+    },
+];
 const LAST_EVENT_ID_HEADERS: &[ApiHeader] = &[ApiHeader {
     name: "Last-Event-ID",
     description: "Resume the event stream after this event sequence number.",
@@ -413,7 +425,7 @@ pub const API_ROUTES: &[ApiRoute] = &[
         },
         additional_responses: NO_ADDITIONAL_RESPONSES,
         request_schema: Some("StartRun"),
-        request_headers: IDEMPOTENCY_HEADERS,
+        request_headers: START_RUN_REQUEST_HEADERS,
         query_parameters: NO_QUERY_PARAMETERS,
         errors: ERR_START_RUN,
     },

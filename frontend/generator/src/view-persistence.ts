@@ -44,9 +44,10 @@ export function describeConfirmId(id: unknown, scope: unknown): string {
   return "unknown scope: cannot decompose id";
 }
 
-// Only tab order and selection persist. Question answers and form drafts may
-// carry secrets and already live server-side once submitted, so they are never
-// written to localStorage.
+// The persistent workspace view contains only tab order and selection.
+// Question answers and form drafts may carry secrets and are never written to
+// localStorage. A separate sessionStorage retry record retains a pending start
+// body only while the browser session is open, paired with its original key/hash.
 export interface PersistedView {
   version: number;
   selected: string;

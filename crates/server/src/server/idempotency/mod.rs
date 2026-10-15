@@ -32,6 +32,25 @@ use crate::server::config::AppState;
 use crate::server::error::ApiHttpError;
 use crate::server::runs::respond_with_snapshot;
 
+pub(crate) fn request_digest(
+    scope: &str,
+    target: &str,
+    body: &[u8],
+    context: Option<&[u8]>,
+) -> String {
+    let mut digest_input = Vec::with_capacity(scope.len() + target.len() + body.len() + 2);
+    digest_input.extend_from_slice(scope.as_bytes());
+    digest_input.push(0);
+    digest_input.extend_from_slice(target.as_bytes());
+    digest_input.push(0);
+    digest_input.extend_from_slice(body);
+    if let Some(context) = context {
+        digest_input.push(0);
+        digest_input.extend_from_slice(context);
+    }
+    hex::encode(Sha256::digest(&digest_input))
+}
+
 pub(crate) fn idempotency_key(headers: &HeaderMap) -> Result<Option<String>, ApiHttpError> {
     headers
         .get(IDEMPOTENCY_HEADER)
@@ -57,14 +76,132 @@ where
     pub(crate) scope: &'a str,
     pub(crate) target: &'a str,
     pub(crate) body: &'a [u8],
+    /// Additional request identity, used only by start runs. Other mutation
+    /// digests remain byte-for-byte unchanged when this is `None`.
+    pub(crate) digest_context: Option<&'a [u8]>,
     pub(crate) created: bool,
     pub(crate) reserved_run_id: Option<String>,
     pub(crate) execute: F,
 }
 
+/// Read-only status of a start request's current idempotency claim.
+pub(crate) enum StartIdempotencyLookup {
+    Ready(Response),
+    Pending,
+    Absent,
+}
+
+/// Looks up an exact start replay or live claim before package preflight.
+/// Matching Pending requests must reach the normal waiter even if the source
+/// package has changed; absent/expired claims still require current-package
+/// validation before a new claim is created.
+pub(crate) async fn lookup_start_idempotency<F, Fut>(
+    call: &IdempotentCall<'_, F, Fut>,
+) -> Result<StartIdempotencyLookup, ApiHttpError>
+where
+    F: FnOnce(Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<String, ApiError>>,
+{
+    let Some(key) = idempotency_key(call.headers)? else {
+        return Ok(StartIdempotencyLookup::Absent);
+    };
+    let digest = request_digest(call.scope, call.target, call.body, call.digest_context);
+    let (memory_run_id, memory_pending) = {
+        let entries = call.state.idempotency.lock().await;
+        match entries.get(&key) {
+            Some(IdempotencyEntry::Ready {
+                digest: stored,
+                created_at,
+                run_id,
+            }) if created_at.elapsed() < call.state.idempotency_ttl => {
+                if stored != &digest {
+                    return Err(idempotency_conflict());
+                }
+                (Some(run_id.clone()), false)
+            }
+            Some(IdempotencyEntry::Pending {
+                digest: stored,
+                created_at,
+                ..
+            }) if created_at.elapsed() < call.state.idempotency_ttl => {
+                if stored != &digest {
+                    return Err(idempotency_conflict());
+                }
+                (None, true)
+            }
+            _ => (None, false),
+        }
+    };
+
+    if let Some(run_id) = memory_run_id {
+        let snapshot = call
+            .state
+            .service
+            .snapshot(run_id)
+            .await
+            .map_err(ApiHttpError::from_api)?;
+        return respond_with_snapshot(snapshot, call.created).map(StartIdempotencyLookup::Ready);
+    }
+
+    // Check Ready before Pending, matching the normal peer-wait path.
+    if let Some(record) = load_durable_ready_async(
+        call.state.runs_dir.clone(),
+        key.clone(),
+        call.state.idempotency_ttl,
+    )
+    .await?
+    {
+        if record.digest != digest {
+            return Err(idempotency_conflict());
+        }
+        let snapshot = call
+            .state
+            .service
+            .snapshot(record.run_id)
+            .await
+            .map_err(ApiHttpError::from_api)?;
+        return respond_with_snapshot(snapshot, call.created).map(StartIdempotencyLookup::Ready);
+    }
+
+    if memory_pending {
+        return Ok(StartIdempotencyLookup::Pending);
+    }
+    if let Some(pending_digest) =
+        load_durable_pending_digest_async(call.state.runs_dir.clone(), key.to_string()).await?
+    {
+        if pending_digest != digest {
+            return Err(idempotency_conflict());
+        }
+        return Ok(StartIdempotencyLookup::Pending);
+    }
+
+    // A pending owner can publish Ready between the first Ready read and the
+    // pending observation. Re-read before declaring this request new.
+    if let Some(record) = load_durable_ready_async(
+        call.state.runs_dir.clone(),
+        key.clone(),
+        call.state.idempotency_ttl,
+    )
+    .await?
+    {
+        if record.digest != digest {
+            return Err(idempotency_conflict());
+        }
+        let snapshot = call
+            .state
+            .service
+            .snapshot(record.run_id)
+            .await
+            .map_err(ApiHttpError::from_api)?;
+        return respond_with_snapshot(snapshot, call.created).map(StartIdempotencyLookup::Ready);
+    }
+    Ok(StartIdempotencyLookup::Absent)
+}
+
 /// Runs a run mutation under an idempotency key when one is supplied.
-/// `scope`, `target`, and `body` feed the request digest, so a reused key
-/// with different content conflicts instead of aliasing another request.
+/// `scope`, `target`, `body`, and optional `digest_context` feed the request
+/// digest, so a reused key with different content conflicts instead of
+/// aliasing another request. `None` preserves the legacy digest bytes.
 /// `reserved_run_id` carries the pre-execution run reservation: for keyed
 /// start/fork requests the handler reserves the run id before the claim so
 /// a crash between run creation and Ready commit retries into the SAME run
@@ -84,17 +221,12 @@ where
         scope,
         target,
         body,
+        digest_context,
         created,
         reserved_run_id,
         execute,
     } = call;
-    let mut digest_input = Vec::with_capacity(scope.len() + target.len() + body.len() + 2);
-    digest_input.extend_from_slice(scope.as_bytes());
-    digest_input.push(0);
-    digest_input.extend_from_slice(target.as_bytes());
-    digest_input.push(0);
-    digest_input.extend_from_slice(body);
-    let request_digest = hex::encode(Sha256::digest(&digest_input));
+    let request_digest = request_digest(scope, target, body, digest_context);
     let Some(idempotency_key) = idempotency_key(headers)? else {
         // Unkeyed requests skip the claim/commit protocol, but a run-creating
         // handler has already reserved its run id; the executor must receive
@@ -780,6 +912,20 @@ async fn load_durable_ready_async(
         })
 }
 
+async fn load_durable_pending_digest_async(
+    runs_dir: camino::Utf8PathBuf,
+    key: String,
+) -> Result<Option<String>, ApiHttpError> {
+    tokio::task::spawn_blocking(move || {
+        durable::load_durable_pending_digest_result(&runs_dir, &key)
+    })
+    .await
+    .map_err(|error| ApiHttpError::internal(format!("idempotency load task failed: {error}")))?
+    .map_err(|error| {
+        ApiHttpError::internal(format!("failed to load pending idempotency claim: {error}"))
+    })
+}
+
 /// Blocking Ready commit offloaded from the async runtime (E02).
 async fn store_durable_ready_async(
     runs_dir: camino::Utf8PathBuf,
@@ -1031,6 +1177,7 @@ mod tests {
                 scope: "start_run",
                 target: "",
                 body: &body,
+                digest_context: None,
                 created: true,
                 reserved_run_id: Some(reserved),
                 execute: |adopted| async move {
@@ -1133,6 +1280,7 @@ mod tests {
             scope: "start_run",
             target: "",
             body: &body,
+            digest_context: None,
             created: true,
             reserved_run_id: Some(reserved),
             execute: |adopted| async move {
@@ -1219,6 +1367,29 @@ mod tests {
             snapshot.state.is_terminal(),
             "stale surplus run must be settled to terminal, got: {:?}",
             snapshot.state
+        );
+    }
+
+    #[test]
+    fn start_digest_includes_package_identity_but_other_mutation_digests_stay_unchanged() {
+        let body = br#"{"generator_id":"demo","inputs":{}}"#;
+        let first = request_digest("start_run", "", body, Some(&[b'a'; 64]));
+        let second = request_digest("start_run", "", body, Some(&[b'b'; 64]));
+        assert_ne!(
+            first, second,
+            "a changed package identity changes start request identity"
+        );
+
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(b"answer");
+        legacy.push(0);
+        legacy.extend_from_slice(b"run-1");
+        legacy.push(0);
+        legacy.extend_from_slice(body);
+        assert_eq!(
+            request_digest("answer", "run-1", body, None),
+            hex::encode(Sha256::digest(&legacy)),
+            "other mutation digests preserve the prior byte layout",
         );
     }
 }

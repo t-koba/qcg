@@ -1,5 +1,6 @@
 import { ApiClient, type ConfirmSpec, type FormSpec, type GeneratorDetail, type GeneratorSummary, type InputField, type OutputArtifact, type RunEvent, type RunListResponse, type RunSnapshot, type RunStatus } from "./api/client";
 import { SseParser } from "./api/sse";
+import { loadPendingStarts, removePendingStart, savePendingStart } from "./pending-starts";
 import { evalWhen } from "./expr/loader";
 import { encodeBase64, validateFileInput } from "./field";
 import {
@@ -76,6 +77,8 @@ export interface RunTab {
   startKey: string | null;
   /** Inputs for retrying the same start operation with the same key. */
   pendingInputs: Record<string, unknown> | null;
+  /** Exact package identity reviewed when this start operation was created. */
+  pendingPackageSha256: string | null;
   /** Stable idempotency key reused across cancel retries. */
   cancelKey: string | null;
 }
@@ -102,6 +105,7 @@ function emptyTab(runId: string, generatorId: string, generatorName: string): Ru
     pendingOp: null,
     startKey: null,
     pendingInputs: null,
+    pendingPackageSha256: null,
     cancelKey: null,
   };
 }
@@ -164,6 +168,7 @@ export class RunStore {
       await this.loadGenerators();
       await this.withError(() => this.refreshRuns());
       await this.withError(() => this.restorePersistedView());
+      this.restorePendingStarts();
     } finally {
       this.#restoring = false;
     }
@@ -391,6 +396,13 @@ export class RunStore {
     if (previous && previous !== runId) {
       this.#closeEventSource(previous);
     }
+    if (runId.startsWith("pending-")) {
+      // Pending starts are browser-local operations, not run resources: never
+      // put their placeholder id in the URL or query the server for it.
+      writeHashRunId(null);
+      this.persistView();
+      return;
+    }
     this.ensureSubscribed(runId);
     writeHashRunId(runId);
     this.persistView();
@@ -400,6 +412,10 @@ export class RunStore {
 
   closeTab(runId: string): void {
     this.#closeEventSource(runId);
+    const closing = this.tabs[runId];
+    if (closing?.runId.startsWith("pending-") && closing.startKey && !closing.pendingAction) {
+      removePendingStart(closing.startKey);
+    }
     delete this.tabs[runId];
     this.tabOrder = this.tabOrder.filter((id) => id !== runId);
     if (this.currentRun === runId) {
@@ -407,10 +423,14 @@ export class RunStore {
       if (neighbor && this.tabs[neighbor]) {
         this.currentRun = neighbor;
         this.restoreView(this.tabs[neighbor]);
-        this.ensureSubscribed(neighbor);
-        writeHashRunId(neighbor);
-        // The neighbor may have missed events while backgrounded; resync its state.
-        void this.withError(() => this.refreshRun(neighbor));
+        if (neighbor.startsWith("pending-")) {
+          writeHashRunId(null);
+        } else {
+          this.ensureSubscribed(neighbor);
+          writeHashRunId(neighbor);
+          // The neighbor may have missed events while backgrounded; resync its state.
+          void this.withError(() => this.refreshRun(neighbor));
+        }
       } else {
         this.showForm();
       }
@@ -445,12 +465,20 @@ export class RunStore {
     this.saveCurrentView();
     this.errorText = "";
     const inputs = overrideInputs ? { ...overrideInputs } : this.#collectInputs();
+    const packageSha256 = this.detail?.generator?.id === generatorId ? this.detail.package_sha256 : null;
+    if (!packageSha256 || !/^[0-9a-f]{64}$/.test(packageSha256)) {
+      throw new Error("The loaded generator package identity is unavailable. Reload the generator before starting.");
+    }
     // Each user gesture gets a fresh operation id. Retries of the same
     // gesture reuse it; an identical later gesture must start a new run.
     const startKey = randomId();
+    if (!savePendingStart({ startKey, generatorId, inputs, packageSha256 })) {
+      throw new Error("This start cannot be safely retried because its pending operation could not be saved in this session.");
+    }
     const tab = emptyTab("", generatorId, this.generators.find((candidate) => candidate.id === generatorId)?.name || generatorId);
     tab.pendingAction = "starting";
     tab.startKey = startKey;
+    tab.pendingPackageSha256 = packageSha256;
     // Publish an optimistic placeholder so the new tab is visible immediately.
     const placeholderId = `pending-${startKey.slice(0, 12)}`;
     tab.runId = placeholderId;
@@ -462,13 +490,15 @@ export class RunStore {
     const pendingTab = this.tabs[placeholderId];
     if (pendingTab) pendingTab.pendingInputs = inputs;
     try {
-      const response = await this.retryPendingStart(generatorId, inputs, startKey);
+      const response = await this.retryPendingStart(generatorId, inputs, startKey, packageSha256);
+      removePendingStart(startKey);
       const started = this.tabs[placeholderId];
       if (started) {
         // The start request settled; progress now arrives via snapshots and
         // events, so the optimistic placeholder must not block actions.
         started.pendingAction = null;
         started.pendingInputs = null;
+        started.pendingPackageSha256 = null;
       }
       if (this.currentRun === placeholderId) {
         this.pendingAction = null;
@@ -486,6 +516,7 @@ export class RunStore {
         failed.pendingAction = null;
         failed.startKey = startKey;
         failed.pendingInputs = inputs;
+        failed.pendingPackageSha256 = packageSha256;
       }
       if (this.currentRun === placeholderId) this.pendingAction = null;
       throw error;
@@ -500,6 +531,7 @@ export class RunStore {
       tab.runId.startsWith("pending-") &&
       tab.startKey &&
       tab.pendingInputs &&
+      tab.pendingPackageSha256 &&
       !tab.pendingAction
     ) {
       return tab.runId;
@@ -510,16 +542,19 @@ export class RunStore {
   /** Retry a failed placeholder start with its original key and inputs. */
   async retryFailedStart(placeholderId: string): Promise<void> {
     const tab = this.tabs[placeholderId];
-    if (!tab || !tab.startKey || !tab.pendingInputs) return;
+    if (!tab || !tab.startKey || !tab.pendingInputs || !tab.pendingPackageSha256) return;
     tab.pendingAction = "starting";
     try {
       const response = await this.retryPendingStart(
         tab.generatorId,
         tab.pendingInputs,
         tab.startKey,
+        tab.pendingPackageSha256,
       );
+      removePendingStart(tab.startKey);
       tab.pendingAction = null;
       tab.pendingInputs = null;
+      tab.pendingPackageSha256 = null;
       this.adoptTab(placeholderId, response);
       this.applySnapshot(response);
       this.selectTab(response.run_id);
@@ -540,10 +575,11 @@ export class RunStore {
     generatorId: string,
     inputs: Record<string, unknown>,
     startKey: string,
+    packageSha256: string,
   ): Promise<RunSnapshot> {
-    return this.api.post<RunSnapshot>(
-      "/api/runs",
+    return this.api.startRun<RunSnapshot>(
       { generator_id: generatorId, inputs },
+      packageSha256,
       startKey,
     );
   }
@@ -883,6 +919,29 @@ export class RunStore {
       }));
     } catch {
       // Storage may be unavailable or full; the workspace still works for this session.
+    }
+  }
+
+  /** Restore retry operations using their original identity, never a refreshed detail hash. */
+  private restorePendingStarts(): void {
+    for (const operation of loadPendingStarts()) {
+      const placeholderId = `pending-${operation.startKey.slice(0, 12)}`;
+      if (this.tabs[placeholderId]) continue;
+      const generatorName = this.generators.find((item) => item.id === operation.generatorId)?.name || operation.generatorId;
+      const tab = emptyTab(placeholderId, operation.generatorId, generatorName);
+      tab.startKey = operation.startKey;
+      tab.pendingInputs = operation.inputs;
+      tab.pendingPackageSha256 = operation.packageSha256;
+      this.tabs = { ...this.tabs, [placeholderId]: tab };
+      this.tabOrder = [...this.tabOrder, placeholderId];
+    }
+    if (!this.currentRun) {
+      const pending = this.tabOrder.filter((runId) => runId.startsWith("pending-"));
+      const latest = pending[pending.length - 1];
+      if (latest && this.tabs[latest]) {
+        this.currentRun = latest;
+        this.restoreView(this.tabs[latest]);
+      }
     }
   }
 

@@ -9,6 +9,58 @@ use std::collections::BTreeMap;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
+async fn generator_detail_exposes_bounded_package_tree_identity() {
+    let root = temp_run_dir("generator-detail-package-identity");
+    let _ = std::fs::remove_dir_all(&root);
+    let generators =
+        Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+    let service = test_service(vec![generators.clone()], root.clone());
+    let detail = service
+        .describe("hello-template")
+        .await
+        .expect("generator detail should load");
+    let expected = crate::package::package_identity_sha256(
+        &generators.join("hello-template"),
+        &crate::package::PackageLimits::default(),
+    )
+    .expect("fixture package identity should compute");
+    assert_eq!(detail.package_sha256, expected);
+    assert_eq!(detail.package_sha256.len(), 64);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn reviewed_package_mismatch_fails_before_run_side_effects() {
+    let root = temp_run_dir("start-package-mismatch");
+    let _ = std::fs::remove_dir_all(&root);
+    let generators =
+        Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+    let service = test_service(vec![generators], root.clone());
+    let detail = service.describe("hello-template").await.expect("detail");
+    let wrong = if detail.package_sha256.starts_with('0') {
+        format!("1{}", &detail.package_sha256[1..])
+    } else {
+        format!("0{}", &detail.package_sha256[1..])
+    };
+    let error = service
+        .start_run_with_package_identity(
+            StartRun {
+                generator_id: "hello-template".into(),
+                inputs: BTreeMap::from([("name".into(), json!("mismatch"))]),
+                ..Default::default()
+            },
+            Some("reserved-test-run".into()),
+            &wrong,
+        )
+        .await
+        .expect_err("changed package identity must be refused");
+    assert!(matches!(error, ApiError::Conflict { .. }));
+    assert!(service.list_run_items().await.expect("runs").is_empty());
+    assert!(!root.join("reserved-test-run").exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn snapshot_and_cost_endpoint_expose_terminal_metrics() {
     let root = temp_run_dir("cost-metrics");
     let _ = std::fs::remove_dir_all(&root);

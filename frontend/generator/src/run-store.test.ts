@@ -108,3 +108,87 @@ it("an old subscription cleanup preserves the replacement subscription", async (
   completions[1]({ done: true });
   await vi.waitFor(() => expect(readers[1].releaseLock).toHaveBeenCalledOnce());
 });
+
+it("retries a start with its stored package identity after another generator is selected", async () => {
+  const { loadPendingStarts } = await import("./pending-starts");
+  const storage = new Map<string, string>();
+  vi.stubGlobal("sessionStorage", {
+    getItem: (key: string) => storage.get(key) ?? null,
+    setItem: (key: string, value: string) => { storage.set(key, value); },
+    removeItem: (key: string) => { storage.delete(key); },
+  });
+  const store = new RunStore();
+  const originalHash = "a".repeat(64);
+  store.selected = "first-generator";
+  store.generators = [
+    { id: "first-generator", name: "First", version: "1", description: "" },
+    { id: "second-generator", name: "Second", version: "1", description: "" },
+  ];
+  store.detail = {
+    generator: { id: "first-generator", name: "First" },
+    package_sha256: originalHash,
+  } as unknown as import("./api/client").GeneratorDetail;
+  const start = vi.fn().mockRejectedValue(new Error("response lost"));
+  store.api.startRun = start as typeof store.api.startRun;
+  await expect(store.startRun({ prompt: "same request" })).rejects.toThrow("response lost");
+  const placeholder = store.failedPlaceholderId();
+  expect(placeholder).not.toBeNull();
+  const firstCall = start.mock.calls[0];
+  expect(firstCall?.[1]).toBe(originalHash);
+  const startKey = store.tabs[placeholder!]?.startKey;
+  expect(loadPendingStarts()).toMatchObject([{ startKey, generatorId: "first-generator", packageSha256: originalHash }]);
+
+  store.selected = "second-generator";
+  store.detail = {
+    generator: { id: "second-generator", name: "Second" },
+    package_sha256: "b".repeat(64),
+  } as unknown as import("./api/client").GeneratorDetail;
+  await expect(store.retryFailedStart(placeholder!)).rejects.toThrow("response lost");
+  expect(start).toHaveBeenCalledTimes(2);
+  expect(start.mock.calls[1]?.[1]).toBe(originalHash);
+  expect(start.mock.calls[1]?.[2]).toBe(startKey);
+  expect(start.mock.calls[1]?.[0]).toEqual({ generator_id: "first-generator", inputs: { prompt: "same request" } });
+  vi.unstubAllGlobals();
+});
+
+
+it("restores a pending start after reload without replacing its reviewed hash", async () => {
+  const { loadPendingStarts } = await import("./pending-starts");
+  const storage = new Map<string, string>();
+  vi.stubGlobal("sessionStorage", {
+    getItem: (key: string) => storage.get(key) ?? null,
+    setItem: (key: string, value: string) => { storage.set(key, value); },
+    removeItem: (key: string) => { storage.delete(key); },
+  });
+  const originalHash = "c".repeat(64);
+  const original = {
+    startKey: "stable-operation-key",
+    generatorId: "demo",
+    inputs: { prompt: "original body" },
+    packageSha256: originalHash,
+  };
+  const { savePendingStart } = await import("./pending-starts");
+  expect(savePendingStart(original)).toBe(true);
+
+  const restored = new RunStore();
+  restored.api.get = vi.fn(async (path: string) => {
+    if (path === "/api/generators") return [{ id: "demo", name: "Demo", version: "1", description: "" }];
+    if (path === "/api/generators/demo") {
+      return { generator: { id: "demo", name: "Demo" }, package_sha256: "d".repeat(64) };
+    }
+    throw new Error(`unexpected GET ${path}`);
+  }) as unknown as typeof restored.api.get;
+  restored.api.listRuns = vi.fn(async () => ({ items: [], next_cursor: null })) as typeof restored.api.listRuns;
+  await restored.initialize();
+  const placeholder = `pending-${original.startKey.slice(0, 12)}`;
+  expect(restored.currentRun).toBe(placeholder);
+  expect(restored.tabs[placeholder]).toMatchObject({
+    generatorId: "demo",
+    startKey: original.startKey,
+    pendingInputs: original.inputs,
+    pendingPackageSha256: originalHash,
+  });
+  expect(loadPendingStarts()).toEqual([original]);
+  restored.destroy();
+  vi.unstubAllGlobals();
+});

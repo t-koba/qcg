@@ -1,4 +1,5 @@
 use crate::artifacts::{api_bad_request, api_internal, api_not_found};
+use crate::package::{PackageLimits, package_identity_sha256};
 use crate::types::LocalService;
 use api::{
     ApiError, GeneratorDetail, GeneratorSummary, LlmCatalogCapabilities, LlmCatalogModel,
@@ -53,8 +54,11 @@ impl LocalService {
 
     pub async fn describe(&self, id: &str) -> Result<GeneratorDetail, ApiError> {
         let contract = self.load_generator(id)?;
+        let package_sha256 = package_identity_sha256(&contract.root, &PackageLimits::default())
+            .map_err(|_| api_internal("failed to compute generator package identity"))?;
         Ok(GeneratorDetail {
             generator: contract.manifest.generator,
+            package_sha256,
             inputs: contract.manifest.inputs,
             assets: contract.manifest.assets,
             permissions: contract.manifest.permissions,

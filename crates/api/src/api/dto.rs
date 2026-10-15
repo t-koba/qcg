@@ -16,6 +16,8 @@ pub struct GeneratorSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GeneratorDetail {
     pub generator: GeneratorMeta,
+    /// SHA-256 identity of the complete generator package tree.
+    pub package_sha256: String,
     pub inputs: InputSpec,
     pub assets: AssetSpec,
     pub permissions: Permissions,

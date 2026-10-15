@@ -29,6 +29,119 @@ async fn bind_loopback() -> Option<tokio::net::TcpListener> {
     }
 }
 
+async fn add_package_identity_header(
+    headers: &mut HeaderMap,
+    service: &LocalService,
+    generator_id: &str,
+) {
+    let detail = service
+        .describe(generator_id)
+        .await
+        .expect("generator detail should load");
+    headers.insert(
+        "x-qcg-package-sha256",
+        HeaderValue::from_str(&detail.package_sha256).expect("package identity is valid ASCII"),
+    );
+}
+
+#[tokio::test]
+async fn start_rejects_missing_malformed_and_mismatched_identity_before_reservation() {
+    let workspace = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("workspace root should exist")
+        .to_path_buf();
+    let runs = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+        .expect("temporary directory path should be UTF-8")
+        .join(format!("package-preflight-{}", uuid::Uuid::now_v7()));
+    let state = Arc::new(test_state(
+        crate::test_service(workspace.join("fixtures/generators"), runs.clone(), None)
+            .expect("service should initialize"),
+        runs.clone(),
+        None,
+        tokio_util::sync::CancellationToken::new(),
+    ));
+    let detail = state
+        .service
+        .describe("hello-template")
+        .await
+        .expect("detail");
+    let wrong = if detail.package_sha256.starts_with('0') {
+        format!("1{}", &detail.package_sha256[1..])
+    } else {
+        format!("0{}", &detail.package_sha256[1..])
+    };
+    let request = StartRun {
+        generator_id: "hello-template".into(),
+        inputs: BTreeMap::from([("name".into(), json!("preflight"))]),
+        ..Default::default()
+    };
+    for (identity, expected_status) in [
+        (None, StatusCode::BAD_REQUEST),
+        (Some("not-a-digest"), StatusCode::BAD_REQUEST),
+        (Some(wrong.as_str()), StatusCode::CONFLICT),
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            IDEMPOTENCY_HEADER,
+            HeaderValue::from_static("must-not-be-claimed"),
+        );
+        if let Some(identity) = identity {
+            headers.insert(
+                "x-qcg-package-sha256",
+                HeaderValue::from_str(identity).expect("header value"),
+            );
+        }
+        let error = start_run(State(Arc::clone(&state)), headers, Json(request.clone()))
+            .await
+            .expect_err("invalid reviewed package identity must fail");
+        assert_eq!(error.problem.status, expected_status.as_u16());
+        assert!(
+            !error.problem.detail.contains(runs.as_str()),
+            "errors must not disclose local paths"
+        );
+    }
+    let mut duplicate_headers = HeaderMap::new();
+    duplicate_headers.insert(
+        IDEMPOTENCY_HEADER,
+        HeaderValue::from_static("duplicate-header"),
+    );
+    duplicate_headers.insert(
+        "x-qcg-package-sha256",
+        HeaderValue::from_str(&detail.package_sha256).expect("valid header"),
+    );
+    duplicate_headers.append(
+        "x-qcg-package-sha256",
+        HeaderValue::from_static(
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        ),
+    );
+    let duplicate_error = start_run(State(Arc::clone(&state)), duplicate_headers, Json(request))
+        .await
+        .expect_err("ambiguous duplicate package identity headers must fail");
+    assert_eq!(
+        duplicate_error.problem.status,
+        StatusCode::BAD_REQUEST.as_u16()
+    );
+    assert!(
+        state.idempotency.lock().await.is_empty(),
+        "preflight must not touch idempotency state"
+    );
+    assert!(
+        state
+            .service
+            .list_run_items()
+            .await
+            .expect("run list")
+            .is_empty()
+    );
+    assert!(
+        !runs.join("idempotency").exists(),
+        "preflight must not create idempotency files"
+    );
+    let _ = std::fs::remove_dir_all(&runs);
+}
+
 /// `LocalService` for a test that must admit exactly one active run, so
 /// a queueing, cancel, or drain assertion observes the concurrency bound
 /// instead of racing the default. Exclusive store mode, no explicit
@@ -744,6 +857,15 @@ async fn shutdown_rejects_mutating_requests_and_closes_sse() {
                 .method(axum::http::Method::POST)
                 .uri("/api/runs")
                 .header(header::CONTENT_TYPE, "application/json")
+                .header(
+                    "x-qcg-package-sha256",
+                    state
+                        .service
+                        .describe("hello-template")
+                        .await
+                        .expect("detail")
+                        .package_sha256,
+                )
                 .body(axum::body::Body::from(
                     json!({ "generator_id": "hello-template", "inputs": { "name": "test" } })
                         .to_string(),
@@ -1034,6 +1156,7 @@ async fn concurrent_idempotent_start_creates_one_run() {
     ));
     let mut headers = HeaderMap::new();
     headers.insert(IDEMPOTENCY_HEADER, HeaderValue::from_static("same-run"));
+    add_package_identity_header(&mut headers, &state.service, "hello-template").await;
     let request = StartRun {
         generator_id: "hello-template".into(),
         inputs: BTreeMap::from([("name".into(), json!("test"))]),
@@ -1100,6 +1223,7 @@ async fn concurrent_idempotent_start_creates_one_run() {
     }
     let mut headers = HeaderMap::new();
     headers.insert(IDEMPOTENCY_HEADER, HeaderValue::from_static("at-capacity"));
+    add_package_identity_header(&mut headers, &state.service, "hello-template").await;
     let capacity_request = StartRun {
         generator_id: "hello-template".into(),
         inputs: BTreeMap::from([("name".into(), json!("test"))]),
@@ -1163,6 +1287,16 @@ async fn concurrent_idempotent_start_creates_one_run() {
         digest_input.push(0);
         digest_input.push(0);
         digest_input.extend_from_slice(&body);
+        digest_input.push(0);
+        digest_input.extend_from_slice(
+            state
+                .service
+                .describe("hello-template")
+                .await
+                .expect("detail")
+                .package_sha256
+                .as_bytes(),
+        );
         let digest = hex::encode(sha2::Sha256::digest(&digest_input));
         match crate::server::claim_durable_pending(
             &runs,
@@ -1216,6 +1350,7 @@ async fn idempotent_conflict_starts_no_second_run() {
     };
     let mut headers = HeaderMap::new();
     headers.insert(IDEMPOTENCY_HEADER, HeaderValue::from_static("conflict-run"));
+    add_package_identity_header(&mut headers, &state.service, "hello-template").await;
     start_run(
         State(Arc::clone(&state)),
         headers.clone(),
@@ -1264,6 +1399,318 @@ async fn idempotent_conflict_starts_no_second_run() {
 }
 
 #[tokio::test]
+async fn idempotent_start_replays_after_package_changes_or_disappears() {
+    let workspace = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("workspace root should exist")
+        .to_path_buf();
+    for restart in [false, true] {
+        let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .expect("temporary directory path should be UTF-8")
+            .join(format!(
+                "idempotency-package-replay-{}",
+                uuid::Uuid::now_v7()
+            ));
+        let _temp_guard = IdempotencyTempGuard(root.clone());
+        let generators = root.join("generators");
+        let package = generators.join("hello-template");
+        std::fs::create_dir_all(&package).expect("create package directory");
+        for file in ["qcg.toml", "suite.json"] {
+            std::fs::copy(
+                workspace
+                    .join("fixtures/generators/hello-template")
+                    .join(file),
+                package.join(file),
+            )
+            .expect("copy fixture package");
+        }
+        let runs = root.join("runs");
+        let mut state = Arc::new(test_state(
+            crate::test_service(generators.clone(), runs.clone(), None)
+                .expect("service should initialize"),
+            runs.clone(),
+            None,
+            tokio_util::sync::CancellationToken::new(),
+        ));
+        let mut headers = HeaderMap::new();
+        headers.insert(IDEMPOTENCY_HEADER, HeaderValue::from_static("reviewed-run"));
+        add_package_identity_header(&mut headers, &state.service, "hello-template").await;
+        let request = StartRun {
+            generator_id: "hello-template".into(),
+            inputs: BTreeMap::from([("name".into(), json!("test"))]),
+            ..Default::default()
+        };
+        let first = start_run(
+            State(Arc::clone(&state)),
+            headers.clone(),
+            Json(request.clone()),
+        )
+        .await
+        .expect("first request should start");
+        let location = first.headers()[header::LOCATION].clone();
+        let run_id = location
+            .to_str()
+            .expect("readable location")
+            .rsplit('/')
+            .next()
+            .expect("run id")
+            .to_string();
+        // Settle execution before removing its source; this test concerns replay,
+        // not execution or recovery from a changed package.
+        let mut settled = false;
+        for _ in 0..400 {
+            if state
+                .service
+                .snapshot(run_id.clone())
+                .await
+                .expect("snapshot")
+                .state
+                .is_terminal()
+            {
+                settled = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            settled,
+            "fixture run must settle before changing its package"
+        );
+
+        for removed in [false, true] {
+            if removed {
+                std::fs::remove_dir_all(&package).expect("remove selected package");
+            } else {
+                std::fs::write(package.join("changed.txt"), "package replacement")
+                    .expect("change package");
+            }
+            if restart {
+                drop(state);
+                // A fresh service exercises both durable idempotency and snapshot
+                // reads without relying on the old service's cached run/package.
+                state = {
+                    let mut attempts = 0;
+                    loop {
+                        match crate::test_service(generators.clone(), runs.clone(), None) {
+                            Ok(service) => {
+                                break Arc::new(test_state(
+                                    service,
+                                    runs.clone(),
+                                    None,
+                                    tokio_util::sync::CancellationToken::new(),
+                                ));
+                            }
+                            Err(_) if attempts < 100 => {
+                                attempts += 1;
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            }
+                            Err(error) => panic!("restarted service should initialize: {error}"),
+                        }
+                    }
+                };
+            }
+            let replay = start_run(
+                State(Arc::clone(&state)),
+                headers.clone(),
+                Json(request.clone()),
+            )
+            .await
+            .expect("committed start must replay independently of installed package");
+            assert_eq!(replay.status(), StatusCode::CREATED);
+            assert_eq!(replay.headers().get(header::LOCATION), Some(&location));
+
+            let mut changed_hash = headers.clone();
+            changed_hash.insert(
+                "x-qcg-package-sha256",
+                HeaderValue::from_static(
+                    "0000000000000000000000000000000000000000000000000000000000000000",
+                ),
+            );
+            let mut changed_body = request.clone();
+            changed_body.generator_id = "no-longer-installed".into();
+            for (conflict_headers, conflict_body) in [
+                (changed_hash, request.clone()),
+                (headers.clone(), changed_body),
+            ] {
+                let error = start_run(
+                    State(Arc::clone(&state)),
+                    conflict_headers,
+                    Json(conflict_body),
+                )
+                .await
+                .expect_err("same key with different hash or body must conflict");
+                assert_eq!(error.problem.status, StatusCode::CONFLICT.as_u16());
+            }
+            assert_eq!(
+                state
+                    .service
+                    .list_run_items()
+                    .await
+                    .expect("list runs")
+                    .len(),
+                1
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn matching_pending_start_waits_after_package_removal() {
+    let workspace = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("workspace root should exist")
+        .to_path_buf();
+    let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+        .expect("temporary directory path should be UTF-8")
+        .join(format!(
+            "idempotency-pending-package-{}",
+            uuid::Uuid::now_v7()
+        ));
+    let _temp_guard = IdempotencyTempGuard(root.clone());
+    let generators = root.join("generators");
+    let package = generators.join("hello-template");
+    std::fs::create_dir_all(&package).expect("create package directory");
+    for file in ["qcg.toml", "suite.json"] {
+        std::fs::copy(
+            workspace
+                .join("fixtures/generators/hello-template")
+                .join(file),
+            package.join(file),
+        )
+        .expect("copy fixture package");
+    }
+    let runs = root.join("runs");
+    let state = Arc::new(test_state(
+        crate::test_service(generators, runs, None).expect("service should initialize"),
+        root.join("runs"),
+        None,
+        tokio_util::sync::CancellationToken::new(),
+    ));
+    let detail = state
+        .service
+        .describe("hello-template")
+        .await
+        .expect("package detail");
+    let package_sha256 = detail.package_sha256;
+    let request = StartRun {
+        generator_id: "hello-template".into(),
+        inputs: BTreeMap::from([("name".into(), json!("pending-retry"))]),
+        ..Default::default()
+    };
+    let run_id = state
+        .service
+        .start_run(request.clone())
+        .await
+        .expect("seed a completed run to replay");
+    let mut settled = false;
+    for _ in 0..400 {
+        if state
+            .service
+            .snapshot(run_id.clone())
+            .await
+            .expect("snapshot")
+            .state
+            .is_terminal()
+        {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        settled,
+        "seed run must settle before its package is removed"
+    );
+
+    let key = "matching-pending-package";
+    let body = serde_json::to_vec(&request).expect("request serialization");
+    let digest = crate::request_digest("start_run", "", &body, Some(package_sha256.as_bytes()));
+    let (completed, initial_receiver) = tokio::sync::watch::channel(false);
+    drop(initial_receiver);
+    state.idempotency.lock().await.insert(
+        key.to_string(),
+        IdempotencyEntry::Pending {
+            digest: digest.clone(),
+            owner_id: uuid::Uuid::now_v7(),
+            created_at: Instant::now(),
+            completed: completed.clone(),
+        },
+    );
+    std::fs::remove_dir_all(&package).expect("remove package while owner is pending");
+
+    let mut headers = HeaderMap::new();
+    headers.insert(IDEMPOTENCY_HEADER, HeaderValue::from_static(key));
+    headers.insert(
+        "x-qcg-package-sha256",
+        HeaderValue::from_str(&package_sha256).expect("package identity header"),
+    );
+    let state_for_request = Arc::clone(&state);
+    let request_for_retry = request.clone();
+    let retry = tokio::spawn(async move {
+        start_run(State(state_for_request), headers, Json(request_for_retry)).await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while completed.receiver_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("matching pending retry should join the in-memory waiter");
+
+    // Different content with this key conflicts before inspecting the now
+    // missing package, while the exact matching request remains waiting.
+    let mut changed_request = request.clone();
+    changed_request
+        .inputs
+        .insert("name".into(), json!("different"));
+    let mut changed_headers = HeaderMap::new();
+    changed_headers.insert(IDEMPOTENCY_HEADER, HeaderValue::from_static(key));
+    changed_headers.insert(
+        "x-qcg-package-sha256",
+        HeaderValue::from_str(&package_sha256).expect("package identity header"),
+    );
+    let conflict = start_run(
+        State(Arc::clone(&state)),
+        changed_headers,
+        Json(changed_request),
+    )
+    .await
+    .expect_err("different body must conflict with the pending claim");
+    assert_eq!(conflict.problem.status, StatusCode::CONFLICT.as_u16());
+
+    state.idempotency.lock().await.insert(
+        key.to_string(),
+        IdempotencyEntry::Ready {
+            digest,
+            created_at: Instant::now(),
+            run_id: run_id.clone(),
+        },
+    );
+    completed.send(true).expect("wake pending retry");
+    let response = retry
+        .await
+        .expect("retry task should join")
+        .expect("matching pending retry should replay");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        response.headers().get(header::LOCATION),
+        Some(&HeaderValue::from_str(&format!("/api/runs/{run_id}")).expect("location"))
+    );
+    assert_eq!(
+        state
+            .service
+            .list_run_items()
+            .await
+            .expect("run list")
+            .len(),
+        1,
+        "pending retry must not create a second run"
+    );
+}
+
+#[tokio::test]
 async fn idempotent_start_reuses_run_after_restart() {
     let workspace = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -1285,6 +1732,7 @@ async fn idempotent_start_reuses_run_after_restart() {
     let state = make_state();
     let mut headers = HeaderMap::new();
     headers.insert(IDEMPOTENCY_HEADER, HeaderValue::from_static("restart-run"));
+    add_package_identity_header(&mut headers, &state.service, "hello-template").await;
     let request = StartRun {
         generator_id: "hello-template".into(),
         inputs: BTreeMap::from([("name".into(), json!("test"))]),
@@ -1432,15 +1880,16 @@ async fn concurrent_same_key_starts_converge_on_one_run() {
                 .map(|entry| entry.file_name().to_string_lossy().into_owned())
                 .collect()
         });
+    let state_a = make_state();
+    let state_b = make_state();
     let mut headers = HeaderMap::new();
     headers.insert(IDEMPOTENCY_HEADER, HeaderValue::from_static("race-once"));
+    add_package_identity_header(&mut headers, &state_a.service, "hello-template").await;
     let request = StartRun {
         generator_id: "hello-template".into(),
         inputs: BTreeMap::from([("name".into(), json!("test"))]),
         ..Default::default()
     };
-    let state_a = make_state();
-    let state_b = make_state();
     let headers_b = headers.clone();
     let request_b = request.clone();
     let (first, second) = tokio::join!(
@@ -1809,6 +2258,7 @@ async fn ready_persist_failure_then_retry_reuses_the_original_run() {
         IDEMPOTENCY_HEADER,
         HeaderValue::from_static("ready-fail-run"),
     );
+    add_package_identity_header(&mut headers, &state.service, "hello-template").await;
     let first = start_run(
         State(Arc::clone(&state)),
         headers.clone(),
