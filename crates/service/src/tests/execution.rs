@@ -545,6 +545,7 @@ command_timeout_seconds = 300"#,
         RunStoreMode::Exclusive,
         ServiceDeploymentPolicy {
             preemption_mode: policy::PreemptionMode::Interrupt,
+            preemption_queue_position: policy::PreemptionQueuePosition::Tail,
             ..ServiceDeploymentPolicy::default()
         },
     )

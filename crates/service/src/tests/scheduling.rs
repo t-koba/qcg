@@ -275,3 +275,213 @@ async fn boundary_drain_does_not_abort_after_five_seconds() {
     );
     service.shutdown_active_runs().await.unwrap();
 }
+
+#[tokio::test]
+async fn scheduler_preserves_fifo_key_by_default() {
+    preemption_fifo(ServiceDeploymentPolicy::default()).await;
+}
+
+#[tokio::test]
+async fn scheduler_tail_uses_actual_requeue_time() {
+    preemption_fifo(ServiceDeploymentPolicy {
+        preemption_queue_position: PreemptionQueuePosition::Tail,
+        ..Default::default()
+    })
+    .await;
+}
+
+async fn preemption_fifo(deployment: ServiceDeploymentPolicy) {
+    let preserve = deployment.preemption_queue_position == PreemptionQueuePosition::Preserve;
+    let root = temp_run_dir(&format!("scheduler-fifo-{preserve}"));
+    let _temp = TempGuard(root.clone());
+    generator(&root, "victim", "0.3");
+    generator(&root, "blocker", "60");
+    let manifest = root.join("victim").join(contract::MANIFEST_FILE);
+    let contents = std::fs::read_to_string(&manifest)
+        .unwrap()
+        .replace("sleep 0.3", "while [ ! -f release_first ]; do sleep 0.01; done")
+        .replace(
+            "echo after >> effects",
+            "echo second > second; while [ ! -f release_second ]; do sleep 0.01; done; echo after >> effects",
+        );
+    std::fs::write(
+        manifest,
+        format!(
+            r#"{contents}
+[[flow]]
+id = "ask"
+type = "ask_user"
+needs = ["after"]
+[flow.params]
+content = "Continue?"
+options = ["yes"]
+"#
+        ),
+    )
+    .unwrap();
+    let service = service(&root, deployment);
+    let victim = start(&service, "victim", 0).await;
+    operation_started(&service, &victim).await;
+    let initial_key = service.inner.runs.read().await[&victim].queued_at.unwrap();
+    let mut previous_key = initial_key;
+    for round in 0..2 {
+        if round == 1 {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !run_workspace_dir(&root.join("runs").join(&victim))
+                    .join("second")
+                    .exists()
+                {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        let equal = start(&service, "blocker", 0).await;
+        wait_for_snapshot(&service, &equal, RunStatus::Queued).await;
+        let arrival_service = service.clone();
+        let arrival = tokio::spawn(async move { start(&arrival_service, "blocker", 5).await });
+        // Explicit rendezvous avoids racing fixed sleeps under a busy test
+        // runner: release this command only once the scheduler requests yield.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !service.inner.runs.read().await[&victim]
+                .scheduler_yield
+                .is_cancelled()
+            {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        std::fs::write(
+            run_workspace_dir(&root.join("runs").join(&victim)).join(if round == 0 {
+                "release_first"
+            } else {
+                "release_second"
+            }),
+            "",
+        )
+        .unwrap();
+        let urgent = arrival.await.unwrap();
+        wait_for_snapshot(&service, &urgent, RunStatus::Running).await;
+        let snapshot = wait_for_snapshot(&service, &victim, RunStatus::Queued).await;
+        assert_eq!(snapshot.queue_position, Some(if preserve { 1 } else { 2 }));
+        assert_eq!(
+            service
+                .snapshot(equal.clone())
+                .await
+                .unwrap()
+                .queue_position,
+            Some(if preserve { 2 } else { 1 })
+        );
+        let dir = root.join("runs").join(&victim);
+        let values = crate::summaries::read_journal_events(&dir).unwrap();
+        let queued: Vec<_> = values.iter().filter(|e| e["t"] == "run_queued").collect();
+        assert_eq!(queued.len(), round + 2);
+        let requeue = queued.last().unwrap();
+        let event_at = chrono::DateTime::parse_from_rfc3339(requeue["ts"].as_str().unwrap())
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let key = service.inner.runs.read().await[&victim].queued_at.unwrap();
+        if preserve {
+            assert_eq!(key, initial_key);
+            assert_eq!(requeue["queued_at"], initial_key.to_rfc3339());
+            assert!(event_at > key, "event ts must not be backdated");
+        } else {
+            assert!(
+                requeue.get("queued_at").is_none(),
+                "tail omits the override"
+            );
+            assert_eq!(key, event_at);
+            assert!(key > previous_key);
+        }
+        previous_key = key;
+        let folded =
+            engine::RunState::fold_journal(&run_meta_dir(&dir).join("journal.jsonl")).unwrap();
+        let folded_at = chrono::DateTime::parse_from_rfc3339(folded.queued_at.as_deref().unwrap())
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(folded_at, key);
+        assert_eq!(snapshot.queued_at, folded.queued_at);
+        let recovered = crate::summaries::rehydrate_runs(
+            &root.join("runs"),
+            policy::DEFAULT_MAX_TRACKED_RUNS,
+            policy::DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES,
+        )
+        .unwrap();
+        assert_eq!(recovered[&victim].queued_at, Some(key));
+        // Use the same queue-head selector as execution after rehydration;
+        // exclude the active urgent run, which recovery correctly queues too.
+        let recovered_equals = recovered
+            .into_iter()
+            .filter(|(id, _)| id == &victim || id == &equal)
+            .collect();
+        let head = if preserve { &victim } else { &equal };
+        assert_eq!(
+            crate::queue::queue_head(&recovered_equals).as_ref(),
+            Some(head)
+        );
+
+        service.cancel(urgent).await.unwrap();
+        // Execution agrees with snapshot FIFO order, not just its display.
+        if preserve {
+            if round == 0 {
+                wait_for_snapshot(&service, &victim, RunStatus::Running).await;
+            }
+        } else {
+            wait_for_snapshot(&service, &equal, RunStatus::Running).await;
+        }
+        service.cancel(equal).await.unwrap();
+    }
+    let waiting = wait_for_snapshot(&service, &victim, RunStatus::Waiting).await;
+    let blocker = start(&service, "blocker", 5).await;
+    wait_for_snapshot(&service, &blocker, RunStatus::Running).await;
+    let values = crate::summaries::read_journal_events(&root.join("runs").join(&victim)).unwrap();
+    let checkpoint = values.iter().find(|e| e["t"] == "step_finished").unwrap();
+    let fork = service
+        .fork_run(
+            &victim,
+            api::ForkRun {
+                at_seq: checkpoint["seq"].as_u64().unwrap(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let fork_snapshot = wait_for_snapshot(&service, &fork, RunStatus::Queued).await;
+    let fork_at =
+        chrono::DateTime::parse_from_rfc3339(fork_snapshot.queued_at.as_deref().unwrap()).unwrap();
+    assert!(
+        fork_at > previous_key,
+        "fork admission must not inherit the source key"
+    );
+    assert_eq!(fork_snapshot.queue_position, Some(1));
+    service.cancel(fork).await.unwrap();
+    service
+        .answer(
+            victim.clone(),
+            waiting.question.unwrap().id,
+            api::AnswerPayload {
+                values: std::collections::BTreeMap::from([(
+                    "answer".into(),
+                    serde_json::json!("yes"),
+                )]),
+            },
+        )
+        .await
+        .unwrap();
+    let answered = wait_for_snapshot(&service, &victim, RunStatus::Queued).await;
+    let answer_at =
+        chrono::DateTime::parse_from_rfc3339(answered.queued_at.as_deref().unwrap()).unwrap();
+    assert!(
+        answer_at > previous_key,
+        "HITL answer establishes a new FIFO key"
+    );
+    assert_eq!(
+        service.inner.runs.read().await[&victim].queued_at.unwrap(),
+        answer_at
+    );
+    service.cancel(victim).await.unwrap();
+    service.cancel(blocker).await.unwrap();
+    service.shutdown_active_runs().await.unwrap();
+}

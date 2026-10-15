@@ -18,7 +18,7 @@ pub(crate) fn fold_run_state(run_dir: &Utf8Path) -> Result<RunState, ServiceErro
         .map_err(|error| ServiceError::Invalid(error.to_string()))
 }
 
-/// Latest durable admission instant: the explicit `queued_at` payload field
+/// Latest durable FIFO key: the explicit `queued_at` payload field
 /// when present, else the event timestamp. Memory, display, and recovery
 /// all derive from this single source so requeue order survives restarts
 /// without per-process re-stamping (C04).
@@ -35,7 +35,7 @@ pub(crate) fn read_last_queued_at(run_dir: &Utf8Path) -> Option<chrono::DateTime
     }
 }
 
-/// Latest queue instant from already-read journal values. Malformed
+/// Latest durable FIFO key from already-read journal values. Malformed
 /// timestamps are skipped toward older events instead of voiding the
 /// whole lookup: one corrupt event must not erase the surviving order.
 pub(crate) fn read_last_queued_at_from_values(
@@ -154,7 +154,7 @@ pub(crate) fn rehydrate_runs(
             continue;
         }
         // One bounded journal read serves the fold and every derivation
-        // below (identity, scheduling, HITL maps, queue instant): a restart
+        // below (identity, scheduling, HITL maps, queue key): a restart
         // never pays a scan per field per run.
         let journal_values = read_journal_events(&run_dir)?;
         let mut state = RunState::fold_values(&journal_values)
@@ -207,9 +207,8 @@ pub(crate) fn rehydrate_runs(
         // half-read maps. Continuations live in the typed journal store, so
         // only user answers join the memory map.
         let (answers, confirmations) = (state.answers.clone(), state.confirmations.clone());
-        // Restore FIFO admission order from the last run_queued timestamp so
-        // a restart preserves cross-generator submission order instead of
-        // falling back to run_id string order.
+        // Restore the durable FIFO key, including a scheduler-preserved
+        // queued_at override, instead of re-stamping on recovery.
         let queued_at = read_last_queued_at_from_values(&journal_values);
         let (events, _) = broadcast::channel(policy::LIVE_EVENT_CHANNEL_CAPACITY);
         records.insert(

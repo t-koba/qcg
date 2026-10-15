@@ -640,7 +640,8 @@ never preempt each other. The victim keeps its journal: completed work replays
 on resume instead of re-executing.
 
 The server and CLI host resolve these independent **deployment** settings at
-boot. `PREEMPTION_MODE` accepts only the listed spellings: invalid, empty, or
+boot. `PREEMPTION_MODE` and `PREEMPTION_QUEUE_POSITION` accept only the listed
+spellings: invalid, empty, or
 non-Unicode values refuse startup, even when preemption is disabled. Embedded
 services pass the typed fields on
 `ServiceDeploymentPolicy` (or call `with_scheduling_env` before construction).
@@ -650,6 +651,7 @@ Run requests and generator contracts cannot override them.
 | --- | --- | --- |
 | `PREEMPTION` | `1`/`0`, `true`/`false`, `yes`/`no`, `on`/`off` (case-insensitive) | `true` |
 | `PREEMPTION_MODE` | `step_boundary`, `interrupt` | `step_boundary` |
+| `PREEMPTION_QUEUE_POSITION` | `preserve`, `tail` | `preserve` |
 
 `step_boundary` requests a cooperative yield distinct from ordinary cancellation.
 The current flow node (including nested execution), or a complete already-started
@@ -668,10 +670,18 @@ five-second bounded-stop/abort fallback. This can leave an `operation_started`
 without a determinate result. Resume still **refuses to replay indeterminate
 external effects**; choosing interrupt does not weaken that fail-closed guard.
 
-FIFO and elapsed-budget semantics are unchanged: a preempted victim rejoins the
-tail among equal-priority queued runs; elapsed budgets count total wall-clock
-age, including queued/preempted/HITL waiting time. A concurrent `cancel` wins
-over resume. Priorities and queue order persist in the journal across restarts.
+`preserve` carries a scheduler-preempted victim's prior durable `queued_at`
+forward as its FIFO ordering key, including through repeated preemptions and
+restarts. `tail` instead rejoins the tail among equal-priority queued runs,
+using the requeue event's actual timestamp as the new key. Neither choice
+backdates journal event `ts`. This choice applies only to scheduler preemption:
+fresh admissions, forks, and HITL answer/confirmation queue episodes establish
+new current admission times. It is independent of `PREEMPTION` and
+`PREEMPTION_MODE`.
+
+Elapsed budgets remain total wall-clock age, including queued/preempted/HITL
+waiting time. A concurrent `cancel` wins over resume. Priorities and queue order
+persist in the journal across restarts.
 
 ### Measured latency/safety tradeoff
 
@@ -706,9 +716,12 @@ id-to-state map once every listed run is terminal. Unknown runs and timeouts
 fail explicitly. Typical fan-out/fan-in: start or fork children, then await
 them from a collector run before proceeding.
 
-Queued snapshots carry RFC 3339 queued_at stamped once at admission and
-shared by journal and memory; queue_position follows priority then queued_at
-then id (E16). Memory state is only a fallback for journals written before
+Queued snapshots carry RFC 3339 `queued_at`, the durable FIFO ordering key
+shared by journal and memory, not necessarily the latest transition time:
+under `preserve`, scheduler requeues retain the previous key. Fresh admissions,
+forks, and HITL acceptances stamp a new key; `tail` scheduler requeues use their
+actual event time. `queue_position` follows descending priority, then ascending
+`queued_at`, then id (E16). Memory state is only a fallback for journals written before
 the stamp existed; the journaled instant always wins, so every process
 observes identical FIFO order. Position merges live and on-disk queued runs
 under one FIFO; stores beyond 10,000 entries refuse the snapshot with an

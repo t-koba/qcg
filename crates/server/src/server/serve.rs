@@ -98,6 +98,7 @@ pub struct ResolvedServerPolicy {
     pub auto_gc: bool,
     pub preemption_enabled: bool,
     pub preemption_mode: policy::PreemptionMode,
+    pub preemption_queue_position: policy::PreemptionQueuePosition,
     /// Deployment HTTP rate limit resolved at boot (E04 freeze). `None`
     /// leaves the server unthrottled; `Some` installs one shared
     /// anonymous/instance bucket plus one bucket for verified identity
@@ -162,6 +163,8 @@ pub fn resolve_server_policy(config: &ServerConfig) -> Result<ResolvedServerPoli
     let preemption_enabled = policy::parse_bool_env("PREEMPTION", true)
         .map_err(|detail| format!("invalid preemption configuration: {detail}"))?;
     let preemption_mode = policy::PreemptionMode::from_env("PREEMPTION_MODE")?;
+    let preemption_queue_position =
+        policy::PreemptionQueuePosition::from_env("PREEMPTION_QUEUE_POSITION")?;
     // Rate limit: strict positive integers only, never a silent fold. Unset
     // rps disables the layer; every other invalid or incomplete combination
     // refuses boot (E04).
@@ -337,6 +340,7 @@ pub fn resolve_server_policy(config: &ServerConfig) -> Result<ResolvedServerPoli
         auto_gc,
         preemption_enabled,
         preemption_mode,
+        preemption_queue_position,
         rate_limit,
         audit_floor,
         otlp,
@@ -414,6 +418,7 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
         auto_gc,
         preemption_enabled,
         preemption_mode,
+        preemption_queue_position,
         rate_limit,
         audit_floor,
         otlp,
@@ -437,6 +442,7 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
         auto_gc,
         preemption_enabled,
         ?preemption_mode,
+        ?preemption_queue_position,
         rate_limit_rps = rate_limit.as_ref().map(|policy| policy.rps),
         rate_limit_burst = rate_limit.as_ref().map(|policy| policy.burst),
         rate_limit_max_identities = rate_limit.as_ref().map(|policy| policy.max_identities),
@@ -472,6 +478,7 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
             max_total_steps,
             preemption_enabled,
             preemption_mode,
+            preemption_queue_position,
             audit_floor,
             gc_keep,
             gc_keep_failed,
@@ -2405,6 +2412,70 @@ command = ["sh", "-c", "sleep 30"]"#,
     }
 
     #[tokio::test]
+    async fn preemption_queue_position_env_is_shared_strict_and_independent() {
+        if crate::tests::isolate_environment_test(
+            "server::serve::tests::preemption_queue_position_env_is_shared_strict_and_independent",
+        ) {
+            return;
+        }
+        let _env_guard = BOOT_ENV_GUARD.lock().await;
+        let root = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!("preemption-queue-policy-{}", uuid::Uuid::now_v7()));
+        let _temp_guard = TempGuard(root.clone());
+        let config = boot_config(&root.join("generators"), &root.join("runs"));
+        // SAFETY: this test runs in an isolated child process under the env guard.
+        unsafe {
+            std::env::remove_var("PREEMPTION_QUEUE_POSITION");
+            std::env::set_var("PREEMPTION", "false");
+            std::env::set_var("PREEMPTION_MODE", "interrupt");
+        }
+        for (value, expected) in [
+            (None, policy::PreemptionQueuePosition::Preserve),
+            (Some("tail"), policy::PreemptionQueuePosition::Tail),
+            (Some("preserve"), policy::PreemptionQueuePosition::Preserve),
+        ] {
+            // SAFETY: isolated process and guard as above.
+            unsafe {
+                if let Some(value) = value {
+                    std::env::set_var("PREEMPTION_QUEUE_POSITION", value);
+                }
+            }
+            let server = resolve_server_policy(&config).unwrap();
+            let host = service::ServiceDeploymentPolicy::default()
+                .with_scheduling_env()
+                .unwrap();
+            assert_eq!(server.preemption_queue_position, expected);
+            assert_eq!(host.preemption_queue_position, expected);
+            assert!(!server.preemption_enabled && !host.preemption_enabled);
+            assert_eq!(server.preemption_mode, policy::PreemptionMode::Interrupt);
+            assert_eq!(host.preemption_mode, policy::PreemptionMode::Interrupt);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            // SAFETY: isolated process and guard as above.
+            unsafe {
+                std::env::set_var(
+                    "PREEMPTION_QUEUE_POSITION",
+                    std::ffi::OsString::from_vec(vec![0xff]),
+                );
+            }
+            assert!(
+                resolve_server_policy(&config)
+                    .unwrap_err()
+                    .contains("PREEMPTION_QUEUE_POSITION")
+            );
+            assert!(
+                service::ServiceDeploymentPolicy::default()
+                    .with_scheduling_env()
+                    .unwrap_err()
+                    .contains("PREEMPTION_QUEUE_POSITION")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn invalid_boot_policy_refuses_serve_with_listener() {
         if crate::tests::isolate_environment_test(
             "server::serve::tests::invalid_boot_policy_refuses_serve_with_listener",
@@ -2423,6 +2494,12 @@ command = ["sh", "-c", "sleep 30"]"#,
             ("PREEMPTION", "maybe", "preemption"),
             ("PREEMPTION_MODE", "fast", "PREEMPTION_MODE"),
             ("PREEMPTION_MODE", "", "PREEMPTION_MODE"),
+            ("PREEMPTION_QUEUE_POSITION", "", "PREEMPTION_QUEUE_POSITION"),
+            (
+                "PREEMPTION_QUEUE_POSITION",
+                "Tail",
+                "PREEMPTION_QUEUE_POSITION",
+            ),
             ("RATE_LIMIT_RPS", "0", "rate limit"),
             ("RATE_LIMIT_RPS", "fast", "rate limit"),
             ("IDEMPOTENCY_TTL_SECS", "0", "idempotency"),
@@ -2441,8 +2518,8 @@ command = ["sh", "-c", "sleep 30"]"#,
             // SAFETY: the guard serializes environment mutation across tests.
             unsafe {
                 std::env::set_var(variable, value);
-                if variable == "PREEMPTION_MODE" {
-                    // Mode validation is independent of enabling preemption.
+                if matches!(variable, "PREEMPTION_MODE" | "PREEMPTION_QUEUE_POSITION") {
+                    // Scheduling choices are validated even with preemption disabled.
                     std::env::set_var("PREEMPTION", "false");
                 }
             }
@@ -2459,7 +2536,7 @@ command = ["sh", "-c", "sleep 30"]"#,
             // SAFETY: still holding the guard.
             unsafe {
                 std::env::remove_var(variable);
-                if variable == "PREEMPTION_MODE" {
+                if matches!(variable, "PREEMPTION_MODE" | "PREEMPTION_QUEUE_POSITION") {
                     std::env::remove_var("PREEMPTION");
                 }
             }

@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[command(
     version,
     about = "Contract-driven harness for bounded, purpose-specialized generation",
-    after_help = "Deployment scheduling env (strict): PREEMPTION=true|false (default true); PREEMPTION_MODE=step_boundary|interrupt (default step_boundary). Run callers cannot override these policies. See docs/operations.md."
+    after_help = "Deployment scheduling env (strict): PREEMPTION=true|false (default true); PREEMPTION_MODE=step_boundary|interrupt (default step_boundary); PREEMPTION_QUEUE_POSITION=preserve|tail (default preserve). Run callers cannot override these policies. See docs/operations.md."
 )]
 pub(crate) struct Cli {
     #[arg(long, global = true)]

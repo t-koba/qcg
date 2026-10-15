@@ -178,7 +178,7 @@ impl LocalService {
     }
 
     /// Snapshot assembly from one already-read journal snapshot. Every
-    /// durable derivation (fold, identity, queue instant, metrics) folds
+    /// durable derivation (fold, identity, queue key, metrics) folds
     /// the same in-memory values, so callers never re-scan the journal
     /// per field and the bundle path reuses this single read (E16).
     pub(super) async fn assemble_snapshot_from_read(
@@ -315,7 +315,7 @@ impl LocalService {
     /// live map with a bounded disk scan, regardless of where the target
     /// itself lives. Computing memory targets from memory alone would
     /// ignore disk-queued runs ahead of them and pin a stale 304 (E16).
-    /// The target's priority and instant come from the caller's single
+    /// The target's priority and FIFO key come from the caller's single
     /// journal read, never a second scan.
     /// The disk half is served from a 1 s process-wide cache shared across
     /// subscribers (E12): one store scan per second, not one per snapshot.

@@ -87,7 +87,9 @@ impl LocalService {
                 cancellation: CancellationToken::new(),
                 scheduler_yield: CancellationToken::new(),
                 task: Arc::clone(&record.task),
-                queued_at: None,
+                // Keep the durable key while the old writer drains. Only
+                // scheduler preemption may carry it into a new queue episode.
+                queued_at: record.queued_at,
                 owner_id: self.inner.owner_id.clone(),
                 ephemeral: false,
             };
@@ -188,28 +190,32 @@ impl LocalService {
             self.inner.deployment_policy.max_parallel_steps,
         )
         .map_err(|error| api_internal(format!("preemption requeue refused: {error}")))?;
-        write_run_event(
-            &staged,
-            "run_queued",
-            json!({
-                "run_id": id,
-                "generator": format!("{}@{}", staged.contract.manifest.generator.id, staged.contract.manifest.generator.version),
-                "generator_path": &staged.contract.root,
-                "contract_sha256": &staged.contract.sha256,
-                "inputs": &staged.inputs,
-                "answers": &staged.answers,
-                "confirmations": &staged.confirmations,
-                "schema_version": api::JOURNAL_SCHEMA_VERSION,
-                "retention_days": staged.contract.manifest.retention.days,
-                "priority": staged.priority,
-                "parent_run_id": staged.parent_run_id.clone(),
-                "effective_max_total_steps": requeue_effective.max_total_steps,
-                "effective_policy_origin": requeue_effective.origin,
-            }),
-        )
-        .map_err(api_internal)?;
+        let mut payload = json!({
+            "run_id": id,
+            "generator": format!("{}@{}", staged.contract.manifest.generator.id, staged.contract.manifest.generator.version),
+            "generator_path": &staged.contract.root,
+            "contract_sha256": &staged.contract.sha256,
+            "inputs": &staged.inputs,
+            "answers": &staged.answers,
+            "confirmations": &staged.confirmations,
+            "schema_version": api::JOURNAL_SCHEMA_VERSION,
+            "retention_days": staged.contract.manifest.retention.days,
+            "priority": staged.priority,
+            "parent_run_id": staged.parent_run_id.clone(),
+            "effective_max_total_steps": requeue_effective.max_total_steps,
+            "effective_policy_origin": requeue_effective.origin,
+        });
+        if self.inner.deployment_policy.preemption_queue_position
+            == policy::PreemptionQueuePosition::Preserve
+            && let Some(queued_at) = staged.queued_at
+        {
+            payload["queued_at"] = json!(queued_at.to_rfc3339());
+        }
+        // Tail omits the override: the writer's real event ts is the new
+        // FIFO key. Preserve never backdates that event timestamp.
+        write_run_event(&staged, "run_queued", payload).map_err(api_internal)?;
         let mut staged = staged;
-        // Memory observes the same durable requeue instant as restarts.
+        // Memory observes the same durable FIFO key as restarts.
         staged.queued_at = crate::summaries::read_last_queued_at(&staged.run_dir);
         let resume = {
             let mut runs = self.inner.runs.write().await;

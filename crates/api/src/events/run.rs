@@ -47,10 +47,9 @@ pub struct RunStartedEventData {
     /// Origin of the effective budget for audit display.
     #[serde(default)]
     pub effective_policy_origin: Option<String>,
-    /// Durable admission instant for queue ordering. Written by fork
-    /// admissions and requeues; absent entries fall back to the event
-    /// timestamp (C04). Required to be explicit when present, never
-    /// defaulted silently on write.
+    /// Durable FIFO ordering key. Scheduler preemption may preserve the
+    /// prior key; fresh/fork admissions establish a new one. Absent entries
+    /// use the actual event timestamp (C04), which is never backdated.
     #[serde(default)]
     pub queued_at: Option<String>,
 }

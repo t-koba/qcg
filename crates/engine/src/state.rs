@@ -182,7 +182,7 @@ pub struct RunState {
     #[serde(deserialize_with = "required_presence")]
     pub finished_at: Option<String>,
     /// Admission identity from the last `run_queued`: scheduling priority,
-    /// the parent run this one forked, and the recorded queue instant. A
+    /// the parent run this one forked, and its durable FIFO key. A
     /// restart reads these from the fold instead of rescanning the journal.
     pub priority: i32,
     pub parent_run_id: Option<String>,
@@ -520,9 +520,9 @@ impl RunState {
                         .get("parent_run_id")
                         .and_then(Value::as_str)
                         .map(str::to_string);
-                    // Requeue order must survive restarts, and an answer can
-                    // arrive long after admission, so the latest acceptance
-                    // restamps the instant too (C04).
+                    // Requeue order survives restarts. Preemption may
+                    // carry a preserved `queued_at` key; otherwise the actual
+                    // event timestamp becomes the new key (C04).
                     self.queued_at = event
                         .get("queued_at")
                         .and_then(Value::as_str)

@@ -192,7 +192,8 @@ pub struct RunSnapshot {
     pub artifacts: Option<OutputManifest>,
     pub question: Option<FormSpec>,
     pub confirm: Option<ConfirmSpec>,
-    /// RFC 3339 timestamp of the last transition to `Queued`, if any.
+    /// RFC 3339 durable FIFO key while queued. Scheduler preemption may
+    /// preserve the prior key rather than stamp the latest transition time.
     #[serde(default)]
     pub queued_at: Option<String>,
     /// 1-based position among queued runs, present only while `Queued`.

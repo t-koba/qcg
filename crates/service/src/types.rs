@@ -31,6 +31,8 @@ pub struct ServiceDeploymentPolicy {
     pub preemption_enabled: bool,
     /// Cooperative step/wave boundary by default; interrupt is explicit.
     pub preemption_mode: policy::PreemptionMode,
+    /// Preserve the prior FIFO key on scheduler preemption by default.
+    pub preemption_queue_position: policy::PreemptionQueuePosition,
     /// Deployment audit floor. It can only raise observation persistence:
     /// a `standard` floor overrides any generator-level reduction.
     pub audit_floor: policy::AuditFloor,
@@ -62,6 +64,7 @@ impl Default for ServiceDeploymentPolicy {
             max_total_steps: None,
             preemption_enabled: true,
             preemption_mode: policy::PreemptionMode::default(),
+            preemption_queue_position: policy::PreemptionQueuePosition::default(),
             audit_floor: policy::AuditFloor::Minimal,
             gc_keep: policy::DEFAULT_GC_KEEP,
             gc_keep_failed: policy::DEFAULT_GC_KEEP_FAILED,
@@ -105,6 +108,8 @@ impl ServiceDeploymentPolicy {
     pub fn with_scheduling_env(mut self) -> Result<Self, String> {
         self.preemption_enabled = policy::parse_bool_env("PREEMPTION", true)?;
         self.preemption_mode = policy::PreemptionMode::from_env("PREEMPTION_MODE")?;
+        self.preemption_queue_position =
+            policy::PreemptionQueuePosition::from_env("PREEMPTION_QUEUE_POSITION")?;
         Ok(self)
     }
 }

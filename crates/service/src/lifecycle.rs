@@ -530,14 +530,14 @@ impl LocalService {
                 }
                 // Refresh pending prompts and durable HITL maps from the journal.
                 // Journal I/O failures fail the refresh instead of merging
-                // half-read maps. Requeue instants always derive from the
+                // half-read maps. Queue-order keys always derive from the
                 // journal so every process observes identical FIFO order.
                 // The pre-I/O HITL snapshot is reused (no second read).
                 let mut pending = state.pending.clone();
                 let (answers, confirmations) = hitl;
                 let requeue = |record: &mut RunRecord| {
                     record.state = RunStatus::Queued;
-                    // The durable instant wins; the memory value survives only
+                    // The durable FIFO key wins; memory survives only
                     // when the journal has nothing to say. Nothing here stamps a
                     // fresh local time, so FIFO order is identical everywhere.
                     record.queued_at = journal_queued_at.or(record.queued_at);

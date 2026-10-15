@@ -2544,6 +2544,7 @@
               "run_resumed",
               "run_started",
               "run_waiting",
+              "run_yielded",
               "shutdown",
               "side_effect",
               "state_patched",
@@ -3047,7 +3048,7 @@
           },
           "queued_at": {
             "default": null,
-            "description": "RFC 3339 timestamp of the last transition to `Queued`, if any.",
+            "description": "RFC 3339 durable FIFO key while queued. Scheduler preemption may\npreserve the prior key rather than stamp the latest transition time.",
             "type": [
               "string",
               "null"
@@ -3164,7 +3165,7 @@
           },
           "queued_at": {
             "default": null,
-            "description": "Durable admission instant for queue ordering. Written by fork\nadmissions and requeues; absent entries fall back to the event\ntimestamp (C04). Required to be explicit when present, never\ndefaulted silently on write.",
+            "description": "Durable FIFO ordering key. Scheduler preemption may preserve the\nprior key; fresh/fork admissions establish a new one. Absent entries\nuse the actual event timestamp (C04), which is never backdated.",
             "type": [
               "string",
               "null"
