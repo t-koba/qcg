@@ -823,7 +823,10 @@ impl JournalWriter {
             if api::is_terminal_event_kind(kind)
                 || matches!(
                     kind,
-                    "operation_started" | "operation_finished" | "run_yielded"
+                    "operation_started"
+                        | "operation_finished"
+                        | "run_yielded"
+                        | "elapsed_accounted"
                 )
             {
                 file.sync_data()?;
@@ -1054,7 +1057,10 @@ impl JournalWriter {
             if api::is_terminal_event_kind(kind)
                 || matches!(
                     kind,
-                    "operation_started" | "operation_finished" | "run_yielded"
+                    "operation_started"
+                        | "operation_finished"
+                        | "run_yielded"
+                        | "elapsed_accounted"
                 )
             {
                 needs_sync = true;
@@ -1394,6 +1400,7 @@ mod tests {
                     "resource_hashes": [],
 
                     "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                    "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
                 }),
             )
             .expect("run_started should append");
@@ -1556,6 +1563,7 @@ mod tests {
                 "resource_hashes": [],
 
                 "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
             }),
             JournalLimits::default(),
             None,

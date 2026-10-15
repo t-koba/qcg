@@ -1,5 +1,5 @@
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -9,7 +9,7 @@ use super::resources::ResourceEventData;
 /// identity record and refuses to fold a journal or state whose version it
 /// does not implement, so an incompatible format fails closed instead of
 /// being reinterpreted.
-pub const JOURNAL_SCHEMA_VERSION: u32 = 1;
+pub const JOURNAL_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -25,6 +25,9 @@ pub struct RunStartedEventData {
     #[serde(default)]
     pub resource_hashes: Vec<ResourceEventData>,
     pub schema_version: u32,
+    /// Schema-1 absence means historical wall-clock accounting.
+    #[schemars(required)]
+    pub elapsed_budget_mode: policy::ElapsedBudgetMode,
     #[serde(default)]
     pub retention_days: Option<u64>,
     /// Scheduling priority recorded when the run was (re)queued.
@@ -58,4 +61,28 @@ pub struct RunStartedEventData {
 #[serde(deny_unknown_fields)]
 pub struct GraphResolvedEventData {
     pub nodes: Vec<String>,
+}
+
+/// Single durable active elapsed ledger, preserving subsecond consumption.
+#[derive(Debug, Clone, Serialize, serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ElapsedAccountedEventData {
+    pub active_nanoseconds: u64,
+    #[serde(deserialize_with = "required_active_start")]
+    #[schemars(required, schema_with = "nullable_active_start_schema")]
+    pub active_started_at: Option<String>,
+}
+
+fn nullable_active_start_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    <Option<String> as schemars::JsonSchema>::json_schema(generator)
+}
+
+fn required_active_start<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<String>, D::Error> {
+    let value = Option::<String>::deserialize(d)?;
+    if let Some(timestamp) = &value {
+        chrono::DateTime::parse_from_rfc3339(timestamp).map_err(serde::de::Error::custom)?;
+    }
+    Ok(value)
 }

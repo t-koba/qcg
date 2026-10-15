@@ -84,104 +84,166 @@ async fn operation_started(service: &LocalService, id: &str) {
 
 #[tokio::test]
 async fn bounded_scheduler_comparison_boundary_safety_and_interrupt_latency() {
-    for mode in [PreemptionMode::StepBoundary, PreemptionMode::Interrupt] {
-        let root = temp_run_dir(&format!("scheduler-comparison-{mode:?}"));
-        generator(&root, "slow", "0.3");
-        generator(&root, "urgent", "0.1");
-        let deployment = if mode == PreemptionMode::Interrupt {
-            ServiceDeploymentPolicy {
-                preemption_mode: mode,
-                ..Default::default()
+    for elapsed in [
+        ElapsedBudgetMode::WallClock,
+        ElapsedBudgetMode::ActiveExecution,
+    ] {
+        for mode in [PreemptionMode::StepBoundary, PreemptionMode::Interrupt] {
+            let root = temp_run_dir(&format!("scheduler-comparison-{mode:?}"));
+            generator(&root, "slow", "0.3");
+            generator(&root, "urgent", "0.1");
+            let mut deployment = if mode == PreemptionMode::Interrupt {
+                ServiceDeploymentPolicy {
+                    preemption_mode: mode,
+                    ..Default::default()
+                }
+            } else {
+                // Exercise the deployment default, not an explicit boundary override.
+                ServiceDeploymentPolicy::default()
+            };
+            deployment.elapsed_budget_mode = elapsed;
+            let service = service(&root, deployment);
+            let victim = start(&service, "slow", 0).await;
+            operation_started(&service, &victim).await;
+            let clock = Instant::now();
+            let urgent = start(&service, "urgent", 5).await;
+            wait_for_snapshot(&service, &urgent, RunStatus::Running).await;
+            let admission = clock.elapsed();
+            let journal = read_journal_string(&service, victim.clone()).await;
+            if mode == PreemptionMode::StepBoundary {
+                assert!(journal.contains("run_yielded"));
+                assert!(journal.contains("operation_finished"));
+                assert!(!journal.contains("run_canceled"));
+                assert!(!journal.contains("run_error"));
+                let events: Vec<serde_json::Value> = journal
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                let checkpoint = events
+                    .iter()
+                    .position(|e| e["t"] == "step_finished" && e["node"] == "first")
+                    .unwrap();
+                let yielded = events.iter().position(|e| e["t"] == "run_yielded").unwrap();
+                assert!(
+                    checkpoint < yielded,
+                    "checkpoint must precede durable handoff"
+                );
+                assert!(
+                    !journal.contains("\"node\":\"after\""),
+                    "no next node before handoff"
+                );
             }
-        } else {
-            // Exercise the deployment default, not an explicit boundary override.
-            ServiceDeploymentPolicy::default()
-        };
-        let service = service(&root, deployment);
-        let victim = start(&service, "slow", 0).await;
-        operation_started(&service, &victim).await;
-        let clock = Instant::now();
-        let urgent = start(&service, "urgent", 5).await;
-        wait_for_snapshot(&service, &urgent, RunStatus::Running).await;
-        let admission = clock.elapsed();
-        let journal = read_journal_string(&service, victim.clone()).await;
-        if mode == PreemptionMode::StepBoundary {
-            assert!(journal.contains("run_yielded"));
-            assert!(journal.contains("operation_finished"));
-            assert!(!journal.contains("run_canceled"));
-            assert!(!journal.contains("run_error"));
-            let events: Vec<serde_json::Value> = journal
-                .lines()
-                .map(|line| serde_json::from_str(line).unwrap())
-                .collect();
-            let checkpoint = events
-                .iter()
-                .position(|e| e["t"] == "step_finished" && e["node"] == "first")
-                .unwrap();
-            let yielded = events.iter().position(|e| e["t"] == "run_yielded").unwrap();
-            assert!(
-                checkpoint < yielded,
-                "checkpoint must precede durable handoff"
-            );
-            assert!(
-                !journal.contains("\"node\":\"after\""),
-                "no next node before handoff"
-            );
-        }
-        assert_eq!(
-            wait_for_terminal_snapshot(&service, &urgent).await.state,
-            RunStatus::Succeeded
-        );
-        let victim_state = wait_for_terminal_snapshot(&service, &victim).await.state;
-        eprintln!(
-            "scheduler comparison {mode:?}: urgent admission {} ms; victim {victim_state:?}",
-            admission.as_millis()
-        );
-        if mode == PreemptionMode::StepBoundary {
-            assert_eq!(victim_state, RunStatus::Succeeded);
-            let events: Vec<serde_json::Value> = read_journal_string(&service, victim.clone())
-                .await
-                .lines()
-                .map(|line| serde_json::from_str(line).unwrap())
-                .collect();
             assert_eq!(
-                events
-                    .iter()
-                    .filter(|e| e["t"] == "step_started" && e["node"] == "first")
-                    .count(),
-                1
+                wait_for_terminal_snapshot(&service, &urgent).await.state,
+                RunStatus::Succeeded
             );
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|e| e["t"] == "operation_started")
-                    .count(),
-                2,
-                "one command per node, no duplicate invocation"
+            let victim_state = wait_for_terminal_snapshot(&service, &victim).await.state;
+            eprintln!(
+                "scheduler comparison {mode:?}: urgent admission {} ms; victim {victim_state:?}",
+                admission.as_millis()
             );
-            assert_eq!(
-                events.iter().filter(|e| e["t"] == "run_finished").count(),
-                1
-            );
-            assert_eq!(
-                std::fs::read_to_string(
-                    run_workspace_dir(&root.join("runs").join(&victim)).join("effects")
-                )
-                .unwrap(),
-                "first\nafter\n"
-            );
-        } else {
-            assert_eq!(victim_state, RunStatus::Failed);
-            assert!(
-                read_journal_string(&service, victim)
+            if mode == PreemptionMode::StepBoundary {
+                assert_eq!(victim_state, RunStatus::Succeeded);
+                let events: Vec<serde_json::Value> = read_journal_string(&service, victim.clone())
                     .await
-                    .contains("indeterminate result after interruption")
-            );
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|e| e["t"] == "step_started" && e["node"] == "first")
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|e| e["t"] == "operation_started")
+                        .count(),
+                    2,
+                    "one command per node, no duplicate invocation"
+                );
+                assert_eq!(
+                    events.iter().filter(|e| e["t"] == "run_finished").count(),
+                    1
+                );
+                assert_eq!(
+                    std::fs::read_to_string(
+                        run_workspace_dir(&root.join("runs").join(&victim)).join("effects")
+                    )
+                    .unwrap(),
+                    "first\nafter\n"
+                );
+            } else {
+                assert_eq!(victim_state, RunStatus::Failed);
+                assert!(
+                    read_journal_string(&service, victim.clone())
+                        .await
+                        .contains("indeterminate result after interruption")
+                );
+            }
+            let values =
+                crate::summaries::read_journal_events(&root.join("runs").join(&victim)).unwrap();
+            let state = engine::RunState::fold_values(&values).unwrap();
+            assert_eq!(state.budget.elapsed_budget_mode, elapsed);
+            for event in values.iter().filter(|e| e["t"] == "run_queued") {
+                assert_eq!(
+                    event["elapsed_budget_mode"],
+                    serde_json::to_value(elapsed).unwrap()
+                );
+            }
+            if elapsed == ElapsedBudgetMode::ActiveExecution {
+                let requeue = values
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, event)| event["t"] == "run_queued")
+                    .nth(1)
+                    .map(|(index, _)| index)
+                    .expect("preemption must append a second queued episode");
+                let close = values[..requeue]
+                    .iter()
+                    .rposition(|event| {
+                        event["t"] == "elapsed_accounted" && event["active_started_at"].is_null()
+                    })
+                    .expect("active handoff must close its interval before requeue");
+                assert!(close < requeue);
+                let ledger = state.budget.elapsed.unwrap();
+                assert!(ledger.active_started_at.is_none());
+                assert!(ledger.active_nanoseconds > 0);
+                let first = chrono::DateTime::parse_from_rfc3339(
+                    values.first().unwrap()["ts"].as_str().unwrap(),
+                )
+                .unwrap();
+                let last = chrono::DateTime::parse_from_rfc3339(
+                    values.last().unwrap()["ts"].as_str().unwrap(),
+                )
+                .unwrap();
+                let lifetime = (last - first).to_std().unwrap();
+                assert!(
+                    lifetime
+                        >= Duration::from_nanos(ledger.active_nanoseconds)
+                            + Duration::from_millis(50),
+                    "urgent execution's preempted wait must not be charged"
+                );
+
+                // Ordinary cancel closes survive interrupt's canceled-suffix truncation.
+                let closes: Vec<_> = values
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| {
+                        e["t"] == "elapsed_accounted" && e["active_started_at"].is_null()
+                    })
+                    .collect();
+                assert!(
+                    closes.len() >= 2,
+                    "identity initializes the ledger; two execution episodes close"
+                );
+            }
+            service.shutdown_active_runs().await.unwrap();
         }
-        service.shutdown_active_runs().await.unwrap();
     }
 }
-
 #[tokio::test]
 async fn user_cancel_wins_while_boundary_preemption_drains() {
     let root = temp_run_dir("scheduler-boundary-cancel");
@@ -483,5 +545,392 @@ options = ["yes"]
     );
     service.cancel(victim).await.unwrap();
     service.cancel(blocker).await.unwrap();
+    service.shutdown_active_runs().await.unwrap();
+}
+
+#[tokio::test]
+async fn elapsed_modes_initial_queue_and_exhausted_admission_start_no_effects() {
+    for mode in [
+        ElapsedBudgetMode::WallClock,
+        ElapsedBudgetMode::ActiveExecution,
+    ] {
+        let root = temp_run_dir("elapsed-initial-queue");
+        let _temp = TempGuard(root.clone());
+        generator(&root, "blocker", "30");
+        generator(&root, "victim", "0.01");
+        let path = root.join("victim").join(contract::MANIFEST_FILE);
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(path, format!("{text}\n[budget]\nmax_elapsed_seconds = 1\n")).unwrap();
+        let service = service(
+            &root,
+            ServiceDeploymentPolicy {
+                elapsed_budget_mode: mode,
+                ..Default::default()
+            },
+        );
+        let blocker = start(&service, "blocker", 5).await;
+        operation_started(&service, &blocker).await;
+        let victim = start(&service, "victim", 0).await;
+        wait_for_snapshot(&service, &victim, RunStatus::Queued).await;
+        let queued_events =
+            crate::summaries::read_journal_events(&root.join("runs").join(&victim)).unwrap();
+        assert_eq!(
+            queued_events.len(),
+            1,
+            "admission is a single atomic identity append"
+        );
+        assert_eq!(queued_events[0]["t"], "run_queued");
+        let queued = engine::RunState::fold_values(&queued_events).unwrap();
+        if mode == ElapsedBudgetMode::ActiveExecution {
+            let ledger = queued.budget.elapsed.unwrap();
+            assert_eq!(ledger.active_nanoseconds, 0);
+            assert!(ledger.active_started_at.is_none());
+        } else {
+            assert!(queued.budget.elapsed.is_none());
+        }
+        tokio::time::sleep(Duration::from_millis(1150)).await;
+        service.cancel(blocker).await.unwrap();
+        let terminal = wait_for_terminal_snapshot(&service, &victim).await;
+        let workspace = run_workspace_dir(&root.join("runs").join(&victim));
+        if mode == ElapsedBudgetMode::WallClock {
+            assert_eq!(terminal.state, RunStatus::Failed);
+            assert!(!workspace.join("started").exists());
+            assert!(
+                !read_journal_string(&service, victim)
+                    .await
+                    .contains("operation_started")
+            );
+        } else {
+            assert_eq!(terminal.state, RunStatus::Succeeded);
+            let state = engine::RunState::fold_values(
+                &crate::summaries::read_journal_events(&root.join("runs").join(&victim)).unwrap(),
+            )
+            .unwrap();
+            assert!(state.budget.elapsed.unwrap().active_nanoseconds < 1_000_000_000);
+        }
+        service.shutdown_active_runs().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn elapsed_hitl_question_confirmation_restart_and_deployment_change() {
+    for mode in [
+        ElapsedBudgetMode::WallClock,
+        ElapsedBudgetMode::ActiveExecution,
+    ] {
+        let root = temp_run_dir("elapsed-hitl");
+        let _temp = TempGuard(root.clone());
+        let dir = root.join("hitl");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(contract::MANIFEST_FILE), r#"
+[generator]
+id = "hitl"
+name = "Elapsed HITL"
+version = "0.1.0"
+[budget]
+max_elapsed_seconds = 1
+[[flow]]
+id = "ask"
+type = "ask_user"
+[flow.params]
+content = "Continue?"
+options = ["yes"]
+[[flow]]
+id = "effect"
+type = "command"
+needs = ["ask"]
+[flow.params]
+command = ["sh", "-c", "echo effect > effect"]
+[permissions]
+fs_read = []
+fs_write = ["workspace"]
+network = []
+side_effects = "confirm"
+side_effects_scope = "invocation"
+commands = [{ bin = "sh", args = ["-c", "echo effect > effect"], purpose = "probe", isolation = "trusted_host" }]
+[permissions.containers]
+enabled = false
+"#).unwrap();
+        let first = service(
+            &root,
+            ServiceDeploymentPolicy {
+                elapsed_budget_mode: mode,
+                ..Default::default()
+            },
+        );
+        let id = start(&first, "hitl", 0).await;
+        let waiting = wait_for_snapshot(&first, &id, RunStatus::Waiting).await;
+        let before = engine::RunState::fold_values(
+            &crate::summaries::read_journal_events(&root.join("runs").join(&id)).unwrap(),
+        )
+        .unwrap();
+        if mode == ElapsedBudgetMode::ActiveExecution {
+            assert!(
+                before
+                    .budget
+                    .elapsed
+                    .as_ref()
+                    .unwrap()
+                    .active_started_at
+                    .is_none()
+            );
+        }
+        first.mark_shutting_down();
+        drop(first);
+        tokio::time::sleep(Duration::from_millis(1150)).await;
+        // Restart with the opposite configuration: journal truth must win.
+        let service = service(
+            &root,
+            ServiceDeploymentPolicy {
+                elapsed_budget_mode: if mode == ElapsedBudgetMode::WallClock {
+                    ElapsedBudgetMode::ActiveExecution
+                } else {
+                    ElapsedBudgetMode::WallClock
+                },
+                ..Default::default()
+            },
+        );
+        if mode == ElapsedBudgetMode::ActiveExecution {
+            let values =
+                crate::summaries::read_journal_events(&root.join("runs").join(&id)).unwrap();
+            let fork = service
+                .fork_run(
+                    &id,
+                    api::ForkRun {
+                        at_seq: values.last().unwrap()["seq"].as_u64().unwrap(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            wait_for_snapshot(&service, &fork, RunStatus::Waiting).await;
+            let fork_values =
+                crate::summaries::read_journal_events(&root.join("runs").join(&fork)).unwrap();
+            let inherited = engine::RunState::fold_values(&fork_values).unwrap();
+            assert_eq!(inherited.budget.elapsed_budget_mode, mode);
+            assert!(
+                inherited.budget.elapsed.unwrap().active_nanoseconds
+                    >= before.budget.elapsed.as_ref().unwrap().active_nanoseconds
+            );
+            assert_eq!(
+                fork_values
+                    .iter()
+                    .rfind(|e| e["t"] == "run_queued")
+                    .unwrap()["elapsed_budget_mode"],
+                "active_execution"
+            );
+            service.cancel(fork).await.unwrap();
+        }
+        service
+            .answer(
+                id.clone(),
+                waiting.question.unwrap().id,
+                api::AnswerPayload {
+                    values: std::collections::BTreeMap::from([(
+                        "answer".into(),
+                        serde_json::json!("yes"),
+                    )]),
+                },
+            )
+            .await
+            .unwrap();
+        if mode == ElapsedBudgetMode::WallClock {
+            assert_eq!(
+                wait_for_terminal_snapshot(&service, &id).await.state,
+                RunStatus::Failed
+            );
+        } else {
+            let confirm = wait_for_snapshot(&service, &id, RunStatus::Confirming)
+                .await
+                .confirm
+                .unwrap();
+            let values =
+                crate::summaries::read_journal_events(&root.join("runs").join(&id)).unwrap();
+            let state = engine::RunState::fold_values(&values).unwrap();
+            assert_eq!(state.budget.elapsed_budget_mode, mode);
+            assert!(
+                state
+                    .budget
+                    .elapsed
+                    .as_ref()
+                    .unwrap()
+                    .active_started_at
+                    .is_none()
+            );
+            assert!(
+                state.budget.elapsed.as_ref().unwrap().active_nanoseconds
+                    >= before.budget.elapsed.unwrap().active_nanoseconds
+            );
+            tokio::time::sleep(Duration::from_millis(1150)).await;
+            service
+                .confirm(
+                    id.clone(),
+                    confirm.id,
+                    api::ConfirmDecision {
+                        decision: api::ConfirmationDecision::Approve,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                wait_for_terminal_snapshot(&service, &id).await.state,
+                RunStatus::Succeeded
+            );
+            assert!(
+                run_workspace_dir(&root.join("runs").join(&id))
+                    .join("effect")
+                    .exists()
+            );
+        }
+        service.shutdown_active_runs().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn active_open_prompt_crash_recovers_before_publishing_waiting() {
+    let root = temp_run_dir("elapsed-prompt-crash");
+    let _temp = TempGuard(root.clone());
+    generator(&root, "victim", "0.01");
+    let manifest = root.join("victim").join(contract::MANIFEST_FILE);
+    let text = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(
+        manifest,
+        format!(
+            r#"{text}
+[budget]
+max_elapsed_seconds = 10
+[[flow]]
+id = "ask"
+type = "ask_user"
+needs = ["after"]
+[flow.params]
+content = "Continue?"
+options = ["yes"]
+"#
+        ),
+    )
+    .unwrap();
+    let first = service(
+        &root,
+        ServiceDeploymentPolicy {
+            elapsed_budget_mode: ElapsedBudgetMode::ActiveExecution,
+            ..Default::default()
+        },
+    );
+    let id = start(&first, "victim", 0).await;
+    wait_for_snapshot(&first, &id, RunStatus::Waiting).await;
+    first.mark_shutting_down();
+    drop(first);
+    let journal_path = run_meta_dir(&root.join("runs").join(&id)).join("journal.jsonl");
+    let writer = engine::JournalWriter::create(&journal_path, &id, false, None).unwrap();
+    let total = writer
+        .state()
+        .budget
+        .elapsed
+        .as_ref()
+        .unwrap()
+        .active_nanoseconds;
+    // Simulate an episode that emitted its prompt and crashed before closing.
+    writer.event("elapsed_accounted", serde_json::json!({
+        "active_nanoseconds":total,
+        "active_started_at": (chrono::Utc::now() - chrono::Duration::seconds(2)).to_rfc3339()
+    })).unwrap();
+    assert!(writer.state().settled_pending().is_none());
+    drop(writer);
+    let restored = service(&root, ServiceDeploymentPolicy::default());
+    assert_eq!(
+        restored.inner.runs.read().await[&id].state,
+        RunStatus::Queued
+    );
+    restored.resume_recovered_runs().await;
+    wait_for_snapshot(&restored, &id, RunStatus::Waiting).await;
+    let recovered = engine::RunState::fold_journal(&journal_path).unwrap();
+    assert!(
+        recovered
+            .budget
+            .elapsed
+            .as_ref()
+            .unwrap()
+            .active_nanoseconds
+            >= total + 2_000_000_000
+    );
+    assert!(
+        recovered
+            .budget
+            .elapsed
+            .as_ref()
+            .unwrap()
+            .active_started_at
+            .is_none()
+    );
+    let values = crate::summaries::read_journal_events(&root.join("runs").join(&id)).unwrap();
+    assert_eq!(
+        values
+            .iter()
+            .filter(|e| e["t"] == "operation_started")
+            .count(),
+        2,
+        "completed effects must only replay"
+    );
+    restored.mark_shutting_down();
+    drop(restored);
+    let again = service(&root, ServiceDeploymentPolicy::default());
+    let seq = recovered.last_seq;
+    again.resume_recovered_runs().await;
+    assert_eq!(
+        engine::RunState::fold_journal(&journal_path)
+            .unwrap()
+            .last_seq,
+        seq,
+        "closed paused run is not recovered/charged again"
+    );
+    again.shutdown_active_runs().await.unwrap();
+}
+
+#[tokio::test]
+async fn wall_clock_confirmation_dwell_counts_before_effects() {
+    let root = temp_run_dir("wall-confirm-dwell");
+    let _temp = TempGuard(root.clone());
+    generator(&root, "victim", "0.01");
+    let manifest = root.join("victim").join(contract::MANIFEST_FILE);
+    let text = std::fs::read_to_string(&manifest)
+        .unwrap()
+        .replace("side_effects = \"allowed\"", "side_effects = \"confirm\"");
+    std::fs::write(
+        manifest,
+        format!("{text}\n[budget]\nmax_elapsed_seconds = 1\n"),
+    )
+    .unwrap();
+    let service = service(&root, ServiceDeploymentPolicy::default());
+    let id = start(&service, "victim", 0).await;
+    let confirm = wait_for_snapshot(&service, &id, RunStatus::Confirming)
+        .await
+        .confirm
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1150)).await;
+    service
+        .confirm(
+            id.clone(),
+            confirm.id,
+            api::ConfirmDecision {
+                decision: api::ConfirmationDecision::Approve,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        wait_for_terminal_snapshot(&service, &id).await.state,
+        RunStatus::Failed
+    );
+    assert!(
+        !read_journal_string(&service, id.clone())
+            .await
+            .contains("operation_started")
+    );
+    assert!(
+        !run_workspace_dir(&root.join("runs").join(&id))
+            .join("started")
+            .exists()
+    );
     service.shutdown_active_runs().await.unwrap();
 }

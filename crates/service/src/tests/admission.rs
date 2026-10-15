@@ -65,6 +65,7 @@ async fn queued_snapshots_expose_admission_order() {
                 "contract_sha256": contract.sha256,
                 "inputs": {},
                 "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
             }),
         )
         .expect("queued event should append");
@@ -1046,6 +1047,7 @@ async fn unknown_admission_time_sorts_last() {
                 "contract_sha256": contract.sha256,
                 "inputs": {},
                 "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
             }),
         )
         .expect("queued event should append");

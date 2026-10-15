@@ -356,8 +356,8 @@ pub(crate) fn elapsed_limit_secs(contract: &contract::Contract) -> Option<u64> {
 /// in loop scope where no single node is responsible (E11).
 ///
 /// Enforcement uses the monotonic `elapsed_deadline` only. Wall-clock time
-/// appears solely in durable records (`budget.started_at`) and diagnostic
-/// messages, never in an enforcement decision, so an NTP step cannot
+/// appears in durable identity/active-accounting records, recovery and diagnostic
+/// messages, never in an in-process deadline decision, so an NTP step cannot
 /// stretch or shrink the budget (E11). The deadline and its limit travel
 /// as one `Option<(Instant, u64)>` so a deadline without a limit is
 /// unrepresentable at the type level (E11).

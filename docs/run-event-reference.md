@@ -10,8 +10,9 @@ Generated from the OpenAPI `RunEvent` schema. Every event uses the required enve
 
 | Event | Required `data` fields |
 |---|---|
-| `run_queued` | `generator`, `generator_path`, `contract_sha256`, `inputs`, `schema_version` |
-| `run_started` | `generator`, `generator_path`, `contract_sha256`, `inputs`, `schema_version` |
+| `elapsed_accounted` | `active_nanoseconds`, `active_started_at` |
+| `run_queued` | `generator`, `generator_path`, `contract_sha256`, `inputs`, `schema_version`, `elapsed_budget_mode` |
+| `run_started` | `generator`, `generator_path`, `contract_sha256`, `inputs`, `schema_version`, `elapsed_budget_mode` |
 | `run_resumed` | none |
 | `graph_resolved` | `nodes` |
 | `resource` | `name`, `type`, `source`, `sha256`, `bytes`, `cache`, `trust`, `llm_visible` |

@@ -198,6 +198,7 @@ pub(crate) fn with_failed_evidence(
 
 #[derive(Clone)]
 pub struct RunOptions {
+    pub elapsed_budget_mode: policy::ElapsedBudgetMode,
     pub output_dir: Utf8PathBuf,
     pub json_events: bool,
     pub event_sender: Option<broadcast::Sender<RunEvent>>,

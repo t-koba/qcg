@@ -296,3 +296,44 @@ fn run_snapshot_step_summaries_schema_is_typed_and_required() {
         "null"
     );
 }
+
+#[test]
+fn elapsed_event_schema_is_required_and_nullable_and_wire_values_validate() {
+    let schema = &api::openapi_components()["schemas"]["ElapsedAccountedEventData"];
+    let required = schema["required"].as_array().expect("required properties");
+    assert!(required.iter().any(|name| name == "active_started_at"));
+    let active_start = &schema["properties"]["active_started_at"];
+    let serialized_schema = active_start.to_string();
+    assert!(
+        serialized_schema.contains("null"),
+        "active_started_at must admit explicit null: {active_start}"
+    );
+    assert!(
+        serialized_schema.contains("string"),
+        "active_started_at must admit an RFC3339 string: {active_start}"
+    );
+
+    for value in [
+        serde_json::json!({"active_nanoseconds": 5, "active_started_at": null}),
+        serde_json::json!({"active_nanoseconds": 5, "active_started_at": "2026-10-15T12:34:56.123Z"}),
+    ] {
+        serde_json::from_value::<api::ElapsedAccountedEventData>(value)
+            .expect("null and RFC3339 timestamp are valid anchors");
+    }
+    for value in [
+        serde_json::json!({"active_nanoseconds": 5}),
+        serde_json::json!({"active_nanoseconds": 5, "active_started_at": "not-a-timestamp"}),
+    ] {
+        assert!(
+            serde_json::from_value::<api::ElapsedAccountedEventData>(value).is_err(),
+            "missing or malformed active anchor must be rejected"
+        );
+    }
+}
+
+#[test]
+fn schema_two_run_identity_requires_elapsed_mode_in_openapi() {
+    let schema = &api::openapi_components()["schemas"]["RunStartedEventData"];
+    let required = schema["required"].as_array().expect("required properties");
+    assert!(required.iter().any(|name| name == "elapsed_budget_mode"));
+}

@@ -678,6 +678,28 @@
         ],
         "type": "object"
       },
+      "ElapsedAccountedEventData": {
+        "additionalProperties": false,
+        "description": "Single durable active elapsed ledger, preserving subsecond consumption.",
+        "properties": {
+          "active_nanoseconds": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "active_started_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "active_nanoseconds",
+          "active_started_at"
+        ],
+        "type": "object"
+      },
       "EmptyEventData": {
         "additionalProperties": false,
         "type": "object"
@@ -2506,6 +2528,7 @@
               "confirm_request",
               "context_compacted",
               "dry_run",
+              "elapsed_accounted",
               "elapsed_exceeded",
               "foreach_budget_exhausted",
               "foreach_iteration",
@@ -2611,6 +2634,9 @@
       },
       "RunEventData": {
         "anyOf": [
+          {
+            "$ref": "#/components/schemas/ElapsedAccountedEventData"
+          },
           {
             "$ref": "#/components/schemas/RunStartedEventData"
           },
@@ -3131,6 +3157,14 @@
               "null"
             ]
           },
+          "elapsed_budget_mode": {
+            "description": "Schema-1 absence means historical wall-clock accounting.",
+            "enum": [
+              "wall_clock",
+              "active_execution"
+            ],
+            "type": "string"
+          },
           "generator": {
             "type": "string"
           },
@@ -3198,7 +3232,8 @@
           "generator_path",
           "contract_sha256",
           "inputs",
-          "schema_version"
+          "schema_version",
+          "elapsed_budget_mode"
         ],
         "type": "object"
       },

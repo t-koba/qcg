@@ -41,7 +41,7 @@ pub fn run_summary_with_seq(run_dir: &Utf8Path) -> Result<(RunSummary, u64), Ser
 
 pub(crate) fn status_name_from_state(state: &engine::RunState) -> &'static str {
     use engine::{Interaction, TerminalState};
-    match (&state.terminal, &state.pending) {
+    match (&state.terminal, state.settled_pending()) {
         (Some(TerminalState::Succeeded), _) => "success",
         (Some(TerminalState::Failed), _) => "failed",
         (Some(TerminalState::Canceled), _) => "canceled",

@@ -44,6 +44,7 @@ impl LocalService {
             let runs = self.inner.runs.read().await;
             runs.get(id).cloned().unwrap_or_else(|| record.clone())
         };
+        crate::run_dirs::settle_active_elapsed(&settled_now).map_err(api_internal)?;
         write_run_event(
             &settled_now,
             "run_interrupted",
@@ -201,6 +202,8 @@ impl LocalService {
                             let runs = service.inner.runs.read().await;
                             runs.get(&id).cloned().unwrap_or_else(|| record.clone())
                         };
+                        crate::run_dirs::settle_active_elapsed(&settled_now)
+                            .map_err(api_internal)?;
                         write_run_event(
                             &settled_now,
                             "run_interrupted",
@@ -314,18 +317,29 @@ impl LocalService {
             if self.authoritative_state(&run_dir).await?.terminal.is_some() {
                 continue;
             }
-            let journal = crate::summaries::run_meta_dir(&run_dir).join("journal.jsonl");
-            engine::JournalWriter::append_single_event(
-                &journal,
+            let journal_path = crate::summaries::run_meta_dir(&run_dir).join("journal.jsonl");
+            // No RunRecord (or loaded contract) exists for this orphan. Use
+            // the same default read/write limits as the disk-only scan and
+            // settle under the execution lease before the terminal append.
+            // A failed recovery must leave the run non-terminal, not hide an
+            // open or corrupt ledger behind a successful interruption.
+            let journal = engine::JournalWriter::create_with_limits(
+                &journal_path,
                 &id,
-                "run_interrupted",
-                serde_json::json!({
-                    "reason": {"code": "interrupted", "message": "service shutdown"},
-                }),
-                engine::JournalLimits::default(),
+                false,
                 None,
+                engine::JournalLimits::default(),
             )
             .map_err(api_internal)?;
+            engine::settle_active_elapsed(&journal, chrono::Utc::now()).map_err(api_internal)?;
+            journal
+                .event(
+                    "run_interrupted",
+                    serde_json::json!({
+                        "reason": {"code": "interrupted", "message": "service shutdown"},
+                    }),
+                )
+                .map_err(api_internal)?;
         }
         // Detached container cleanups from dropped guards must finish
         // before shutdown reports done; otherwise "stopped" races orphaned

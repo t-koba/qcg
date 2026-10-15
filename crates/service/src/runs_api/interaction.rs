@@ -125,7 +125,7 @@ impl LocalService {
                             "a cancel was accepted".into(),
                         ));
                     }
-                    match &state.pending {
+                    match state.settled_pending() {
                         Some(engine::Interaction::Question { question })
                             if question.id == check_question_id => {}
                         _ => {
@@ -305,7 +305,7 @@ impl LocalService {
                             "a cancel was accepted".into(),
                         ));
                     }
-                    match &state.pending {
+                    match state.settled_pending() {
                         Some(engine::Interaction::Confirmation { confirm })
                             if confirm.id == check_confirmation_id => {}
                         _ => {

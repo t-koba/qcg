@@ -25,4 +25,4 @@ pub use types::*;
 #[path = "tests/mod.rs"]
 mod tests;
 
-pub use policy::{PreemptionMode, PreemptionQueuePosition};
+pub use policy::{ElapsedBudgetMode, PreemptionMode, PreemptionQueuePosition};

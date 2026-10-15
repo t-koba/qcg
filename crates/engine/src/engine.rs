@@ -1,4 +1,5 @@
 mod checkpoint;
+mod elapsed;
 mod execute;
 mod foreach;
 mod repair;
@@ -23,3 +24,26 @@ pub use types::*;
 
 #[cfg(test)]
 mod tests;
+
+/// Settle an active-execution ledger at a known handoff while the caller holds
+/// the run execution lease. Open intervals are charged through `now` using the
+/// same checked recovery path used when an engine resumes; closed intervals
+/// are left unchanged. Callers must not use this at process startup to mask an
+/// uncertain crash boundary.
+pub fn settle_active_elapsed(
+    journal: &crate::JournalWriter,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), EngineError> {
+    let state = journal.state();
+    if state.budget.elapsed_budget_mode != policy::ElapsedBudgetMode::ActiveExecution {
+        return Ok(());
+    }
+    if state.budget.elapsed.is_none() && !state.execution_started {
+        // A queued run canceled before its first execution has no active
+        // interval to settle. Once execution starts, a missing ledger is
+        // corruption and the normal checked recovery path refuses it.
+        return Ok(());
+    }
+    elapsed::recover(journal, now)?;
+    Ok(())
+}

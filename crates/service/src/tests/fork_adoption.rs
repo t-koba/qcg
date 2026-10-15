@@ -335,6 +335,7 @@ fn adoption_snapshot_covers_seed_and_fork_inputs_without_second_read() {
             "answers": {},
             "confirmations": {},
             "schema_version": api::JOURNAL_SCHEMA_VERSION,
+            "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
             "priority": 0,
             "parent_run_id": Value::Null,
         }),
@@ -635,6 +636,7 @@ async fn fork_adoption_requires_the_same_source() {
         "confirmations": {},
 
         "schema_version": api::JOURNAL_SCHEMA_VERSION,
+        "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
         "retention_days": 0,
         "priority": 0,
         "parent_run_id": source,
@@ -736,6 +738,7 @@ async fn plain_start_cannot_adopt_a_fork_journal() {
         "confirmations": {},
 
         "schema_version": api::JOURNAL_SCHEMA_VERSION,
+        "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
         "retention_days": 0,
         "priority": 0,
         "parent_run_id": "some-source",
@@ -800,6 +803,7 @@ async fn adopted_seed_keeps_later_user_answers() {
         "confirmations": {},
 
         "schema_version": api::JOURNAL_SCHEMA_VERSION,
+        "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
         "retention_days": 0,
         "priority": 0,
         "parent_run_id": null,
@@ -1013,6 +1017,7 @@ async fn fork_copies_every_referenced_checkpoint_revision() {
             "confirmations": {},
 
             "schema_version": api::JOURNAL_SCHEMA_VERSION,
+            "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
             "retention_days": 0,
             "priority": 0,
             "parent_run_id": null,
@@ -1113,6 +1118,7 @@ async fn fork_reverse_name_order_projects_journal_later_revision() {
             "confirmations": {},
 
             "schema_version": api::JOURNAL_SCHEMA_VERSION,
+            "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
             "retention_days": 0,
             "priority": 0,
             "parent_run_id": null,
@@ -1401,6 +1407,7 @@ fn fork_adoption_ignores_source_admission_without_a_marker() {
             "confirmations": {},
 
             "schema_version": api::JOURNAL_SCHEMA_VERSION,
+            "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
             "retention_days": 0,
             "priority": 0,
             "parent_run_id": null,

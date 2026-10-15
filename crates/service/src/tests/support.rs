@@ -354,6 +354,7 @@ pub(crate) fn synthetic_hitl_record(root: &Utf8Path, run_id: &str) -> RunRecord 
             "answers": {},
             "confirmations": {},
             "schema_version": api::JOURNAL_SCHEMA_VERSION,
+            "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
         }),
     )
     .expect("queued event should append");

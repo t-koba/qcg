@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const RUN_STATE_SCHEMA_VERSION: u32 = 1;
+pub const RUN_STATE_SCHEMA_VERSION: u32 = 2;
 
 /// Durable diagnostics that the journal keeps for operators but that carry no
 /// folded state. They are listed as explicit arms so the fold never depends on
@@ -91,6 +91,9 @@ pub enum NodeOutcome {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BudgetState {
+    pub elapsed_budget_mode: policy::ElapsedBudgetMode,
+    #[serde(deserialize_with = "required_presence")]
+    pub elapsed: Option<api::ElapsedAccountedEventData>,
     pub steps_executed: usize,
     /// Durable budget consumption (F13): sum of `budget_charged` deltas.
     /// Live execution and journal recovery share this counter so retry and
@@ -327,6 +330,24 @@ pub fn operation_id_for(run_id: &str, node_id: &str, invocation_id: &str) -> Str
 }
 
 impl RunState {
+    /// An active episode may emit a prompt before its cleanup has finished.
+    /// Publish/accept that interaction only once accounting is durably closed.
+    /// An open crash anchor must be recovered under the execution lease, not
+    /// parked indefinitely as a paused run by a service restart.
+    pub fn settled_pending(&self) -> Option<&Interaction> {
+        if self.budget.elapsed_budget_mode == policy::ElapsedBudgetMode::ActiveExecution
+            && self
+                .budget
+                .elapsed
+                .as_ref()
+                .is_none_or(|ledger| ledger.active_started_at.is_some())
+        {
+            None
+        } else {
+            self.pending.as_ref()
+        }
+    }
+
     /// Full journal fold without caller limits (recovery, fork, and resume
     /// verification paths that must observe complete durable truth).
     /// Kept only with this documented necessity and always bounded by the
@@ -445,9 +466,10 @@ impl RunState {
         }
         // Journal format gate: the identity record declares the schema
         // version. An unknown version is refused instead of being folded
-        // under current assumptions (fail closed, no compatibility branch).
+        // under current assumptions. Schema 1 has explicit historical wall-clock semantics.
         if matches!(kind, "run_queued" | "run_started")
             && let Some(version) = event.get("schema_version").and_then(Value::as_u64)
+            && version != 1
             && version != u64::from(api::JOURNAL_SCHEMA_VERSION)
         {
             return Err(crate::JournalError::InvalidEvent(format!(
@@ -457,6 +479,52 @@ impl RunState {
         }
         match kind {
             "run_queued" | "run_started" => {
+                // Only schema 1 may omit the mode: its historical meaning is WallClock.
+                let version = event
+                    .get("schema_version")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1);
+                let mode = match event.get("elapsed_budget_mode") {
+                    Some(value) => {
+                        serde_json::from_value::<policy::ElapsedBudgetMode>(value.clone())?
+                    }
+                    None if version == 1 => policy::ElapsedBudgetMode::WallClock,
+                    None => {
+                        return Err(crate::JournalError::InvalidEvent(
+                            "missing elapsed_budget_mode".into(),
+                        ));
+                    }
+                };
+                if version == 1 && mode != policy::ElapsedBudgetMode::WallClock {
+                    return Err(crate::JournalError::InvalidEvent(
+                        "schema 1 has only wall-clock accounting".into(),
+                    ));
+                }
+                if self.budget.started_at.is_some() && self.budget.elapsed_budget_mode != mode {
+                    return Err(crate::JournalError::InvalidEvent(
+                        "elapsed budget mode changed within lineage".into(),
+                    ));
+                }
+                // The first identity is also the atomic zero/closed ledger. Never
+                // reconstruct a missing ledger once identity/execution exists:
+                // a requeue or fork must preserve the inherited consumption.
+                if mode == policy::ElapsedBudgetMode::ActiveExecution
+                    && self.budget.elapsed.is_none()
+                {
+                    if self.contract_sha256.is_some()
+                        || self.budget.started_at.is_some()
+                        || self.execution_started
+                    {
+                        return Err(crate::JournalError::InvalidEvent(
+                            "missing active ledger after identity".into(),
+                        ));
+                    }
+                    self.budget.elapsed = Some(api::ElapsedAccountedEventData {
+                        active_nanoseconds: 0,
+                        active_started_at: None,
+                    });
+                }
+                self.budget.elapsed_budget_mode = mode;
                 // A different run id in the same journal is only a fork, and
                 // only when the admission names the run it forked from.
                 if let (Some(previous), Some(next)) = (
@@ -498,12 +566,12 @@ impl RunState {
                     self.vars = ValueBag::with_inputs(inputs);
                 }
                 self.terminal = None;
-                // Queue-inclusive elapsed start (E11): the first queued or
-                // started event stamps the run-wide budget clock, so queue
-                // time consumes the budget. Later events never move it, and
-                // HITL suspension does not pause it either: the wall clock
-                // here only feeds durable records, while enforcement uses
-                // the monotonic deadline built from this stamp.
+                // Wall-clock elapsed start (E11): the first queued or started
+                // event stamps this clock. WallClock mode charges queue and
+                // HITL wait time; ActiveExecution mode instead enforces from
+                // its durable episode ledger. Later identity events never
+                // move this stamp, and WallClock enforcement uses a monotonic
+                // deadline seeded from it.
                 if self.budget.started_at.is_none() {
                     self.budget.started_at =
                         event.get("ts").and_then(Value::as_str).map(str::to_string);
@@ -564,6 +632,46 @@ impl RunState {
                     self.budget.steps_executed.checked_add(1).ok_or_else(|| {
                         crate::JournalError::InvalidEvent("executed step count overflowed".into())
                     })?;
+            }
+            "elapsed_accounted" => {
+                if self.budget.elapsed_budget_mode != policy::ElapsedBudgetMode::ActiveExecution
+                    || self.run_id.is_none()
+                {
+                    return Err(crate::JournalError::InvalidEvent(
+                        "active ledger without active identity".into(),
+                    ));
+                }
+                let next: api::ElapsedAccountedEventData = serde_json::from_value(
+                    serde_json::json!({
+                        "active_nanoseconds": event.get("active_nanoseconds").ok_or_else(|| crate::JournalError::InvalidEvent("missing active total".into()))?,
+                        "active_started_at": event.get("active_started_at").ok_or_else(|| crate::JournalError::InvalidEvent("missing active anchor".into()))?,
+                    }),
+                )?;
+                if let Some(anchor) = &next.active_started_at {
+                    chrono::DateTime::parse_from_rfc3339(anchor).map_err(|_| {
+                        crate::JournalError::InvalidEvent("invalid active anchor".into())
+                    })?;
+                }
+                let legal = match &self.budget.elapsed {
+                    None => false,
+                    Some(previous) => {
+                        match (&previous.active_started_at, &next.active_started_at) {
+                            (None, Some(_)) => {
+                                next.active_nanoseconds == previous.active_nanoseconds
+                            }
+                            (Some(_), None) => {
+                                next.active_nanoseconds >= previous.active_nanoseconds
+                            }
+                            _ => false,
+                        }
+                    }
+                };
+                if !legal {
+                    return Err(crate::JournalError::InvalidEvent(
+                        "illegal active ledger transition".into(),
+                    ));
+                }
+                self.budget.elapsed = Some(next);
             }
             "budget_charged" => {
                 // Durable budget delta (F13): live and recovery share this

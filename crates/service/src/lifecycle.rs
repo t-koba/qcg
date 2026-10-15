@@ -533,7 +533,7 @@ impl LocalService {
                 // half-read maps. Queue-order keys always derive from the
                 // journal so every process observes identical FIFO order.
                 // The pre-I/O HITL snapshot is reused (no second read).
-                let mut pending = state.pending.clone();
+                let mut pending = state.settled_pending().cloned();
                 let (answers, confirmations) = hitl;
                 let requeue = |record: &mut RunRecord| {
                     record.state = RunStatus::Queued;
@@ -672,6 +672,10 @@ impl LocalService {
         } else {
             ("run_canceled", FailureCode::Canceled, RunStatus::Canceled)
         };
+        if let Err(error) = crate::run_dirs::settle_active_elapsed(&record) {
+            tracing::error!(run_id = %run_id, %error, "active elapsed settlement failed before queued terminal event");
+            return;
+        }
         match crate::run_dirs::write_run_event(
             &record,
             event_kind,
@@ -1529,6 +1533,7 @@ impl LocalService {
                         contract,
                         inputs,
                         RunOptions {
+                            elapsed_budget_mode: self.inner.deployment_policy.elapsed_budget_mode,
                             output_dir: run_workspace_dir(&run_dir),
                             json_events: false,
                             event_sender: Some(events.clone()),
@@ -1756,6 +1761,7 @@ impl LocalService {
                 contract,
                 canonical_direct_inputs.clone(),
                 RunOptions {
+                    elapsed_budget_mode: self.inner.deployment_policy.elapsed_budget_mode,
                     output_dir: run.output_dir.clone(),
                     json_events,
                     event_sender: match mode {
@@ -2042,6 +2048,16 @@ impl LocalService {
                 }
                 Progress::Advanced | Progress::Yielded => {}
             }
+            if transition.writes.iter().any(|(kind, _)| {
+                matches!(
+                    *kind,
+                    "run_finished" | "run_error" | "run_canceled" | "run_interrupted"
+                )
+            }) && let Err(error) = crate::run_dirs::settle_active_elapsed(&record)
+            {
+                tracing::error!(%error, %run_id, "active elapsed settlement failed before terminal event");
+                return;
+            }
             for (kind, payload) in &transition.writes {
                 if let Err(error) = write_run_event(&record, kind, payload.clone()) {
                     // Journal failure with a finished engine: memory must NOT
@@ -2167,6 +2183,17 @@ impl LocalService {
                     }
                 }
             }
+        }
+        if transition.writes.iter().any(|(kind, _)| {
+            matches!(
+                *kind,
+                "run_finished" | "run_error" | "run_canceled" | "run_interrupted"
+            )
+        }) && let Err(error) = crate::run_dirs::settle_active_elapsed(record)
+        {
+            tracing::error!(%error, %run_id, "active elapsed settlement failed before cancellation terminal event");
+            self.inner.queue_notify.notify_waiters();
+            return;
         }
         for (kind, payload) in &transition.writes {
             if let Err(error) = write_run_event(record, kind, payload.clone()) {

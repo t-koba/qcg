@@ -609,7 +609,8 @@ Unattended limits:
 - `Waiting` and `Confirming` runs release their execution slot but have no
   TTL in mechanism; an unanswered run stays paused until answered, confirmed,
   or canceled. Expire it from the orchestrator with `cancel` when policy
-  requires. Note `budget.max_elapsed_seconds` covers queue plus HITL dwell.
+  requires. By default `budget.max_elapsed_seconds` covers queue plus HITL dwell;
+  `ELAPSED_BUDGET_MODE=active_execution` excludes ordinary waits (see below).
 
 ## Observability
 
@@ -640,7 +641,7 @@ never preempt each other. The victim keeps its journal: completed work replays
 on resume instead of re-executing.
 
 The server and CLI host resolve these independent **deployment** settings at
-boot. `PREEMPTION_MODE` and `PREEMPTION_QUEUE_POSITION` accept only the listed
+boot. `PREEMPTION_MODE`, `PREEMPTION_QUEUE_POSITION`, and `ELAPSED_BUDGET_MODE` accept only the listed
 spellings: invalid, empty, or
 non-Unicode values refuse startup, even when preemption is disabled. Embedded
 services pass the typed fields on
@@ -652,6 +653,7 @@ Run requests and generator contracts cannot override them.
 | `PREEMPTION` | `1`/`0`, `true`/`false`, `yes`/`no`, `on`/`off` (case-insensitive) | `true` |
 | `PREEMPTION_MODE` | `step_boundary`, `interrupt` | `step_boundary` |
 | `PREEMPTION_QUEUE_POSITION` | `preserve`, `tail` | `preserve` |
+| `ELAPSED_BUDGET_MODE` | `wall_clock`, `active_execution` | `wall_clock` |
 
 `step_boundary` requests a cooperative yield distinct from ordinary cancellation.
 The current flow node (including nested execution), or a complete already-started
@@ -679,9 +681,71 @@ fresh admissions, forks, and HITL answer/confirmation queue episodes establish
 new current admission times. It is independent of `PREEMPTION` and
 `PREEMPTION_MODE`.
 
-Elapsed budgets remain total wall-clock age, including queued/preempted/HITL
-waiting time. A concurrent `cancel` wins over resume. Priorities and queue order
-persist in the journal across restarts.
+A concurrent `cancel` wins over resume. Priorities and queue order persist in
+the journal across restarts.
+
+### Elapsed-budget waiting policy
+
+`ElapsedBudgetMode::WallClock` (the default, `wall_clock`) preserves total
+wall-clock age from the first durable `run_queued` or direct `run_started`:
+initial queue, preempted queue, questions, confirmations, and downtime all count.
+Its existing resume-time clock-skew behavior is unchanged.
+
+`ElapsedBudgetMode::ActiveExecution` (`active_execution`) counts the elapsed
+wall duration of each **engine execution episode**, not CPU time. It includes
+gateway/resource/input setup and startup cleanup inside the episode, lifecycle
+hooks, retries and backoff, provider/network waits, and all already-started
+parallel work **once for the whole episode**, not once per node. Normal initial
+queue, scheduler-preempted queue, and HITL-paused intervals are excluded. Contract
+validation, input resolution and directory/journal opening are preflight, before
+an execution episode. An exhausted active allowance starts no new engine work.
+This setting is independent of all three preemption settings and cannot be
+selected by a run request or contract.
+
+Fresh admissions pin the resolved mode in `run_queued`; direct execution pins it
+in `run_started`. Requeues repeat that mode, adopted resumes read journal truth,
+and forks inherit the checkpoint's mode, accumulated consumption, and any open
+interval rather than applying today's deployment mode to the source's history.
+Changing deployment configuration cannot reinterpret existing runs. Journal
+schema 2 requires the pinned mode; schema-1 absence explicitly means historical
+`wall_clock`, never zero active consumption. Folded state is schema 2; old cached
+state is rebuilt from the journal. Unknown versions are refused.
+
+Active accounting uses one durable `elapsed_accounted` ledger: accumulated
+`active_nanoseconds` plus nullable `active_started_at`. The first active-mode
+identity (`run_queued`, or `run_started` for fresh direct execution) atomically
+establishes a zero total with a closed anchor, so a crash immediately after that
+append is recoverable without a separate initialization record. Later identities,
+including fork/requeue admissions, preserve the ledger and refuse a missing one;
+they never reset consumption. Opening and closing records
+sync the journal in both writer paths. An open record precedes episode work;
+ordinary exits close using monotonic elapsed time before terminal/yield settlement
+or publishing a service waiting/confirmation state. Pending prompts emitted by a
+still-open episode are provisional, not yet eligible for service answers or
+decisions. Nanosecond totals preserve subsecond consumption across suspensions;
+in-process hard deadlines use a precise `Duration` remainder and monotonic
+`Instant`, including while hooks, retries, and parallel waves run. Scheduler
+interrupt truncates only its canceled suffix, never accounting records. Operation
+replay still refuses indeterminate external effects.
+
+A process crash or task abort can leave the interval open. Recovery under the
+execution lease conservatively charges from its wall anchor through current wall
+time, **including downtime**, syncs the closed total exactly once, then opens the
+next episode if budget remains. A prompt with an open crash anchor is recovered,
+not indefinitely parked as a free HITL wait. A fork of an open checkpoint uses
+the same conservative rule. A closed record never charges the intervening wait
+again. This assumes a **non-regressing wall clock across recovery**: a future
+open anchor, invalid/missing active ledger, illegal transition, or arithmetic
+overflow refuses execution instead of clamping or resetting consumption. Clock
+jumps forward can overcharge after a crash; that is the deliberate fail-closed
+tradeoff, not a claim to measure CPU use or reconstruct lost monotonic time.
+
+Direct/ephemeral scheduler queueing has no durable admission and cannot charge
+its pre-engine queue delay. Direct `wall_clock` behavior is unchanged: its clock
+begins at `run_started`. Direct active episodes pin/account their mode when the
+engine starts, but likewise do not account that earlier queue. Snapshot and
+metrics `duration_ms` continue to mean wall lifetime, not active consumption.
+
 
 ### Measured latency/safety tradeoff
 

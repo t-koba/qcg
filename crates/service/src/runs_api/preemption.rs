@@ -154,6 +154,10 @@ impl LocalService {
         if !boundary {
             truncate_trailing_canceled_events(&staged.run_dir).map_err(api_internal)?;
         }
+        // The task is gone and any trailing canceled events have been
+        // truncated. Close a forced-abort episode at this known handoff so
+        // time spent waiting in the queue is never charged as active work.
+        crate::run_dirs::settle_active_elapsed(&staged).map_err(api_internal)?;
         // Preemption requeues preserve the journaled effective policy:
         // re-resolving under a changed ceiling would diverge admission from
         // execution (E04). An unreadable journal fails the requeue instead
@@ -199,6 +203,7 @@ impl LocalService {
             "answers": &staged.answers,
             "confirmations": &staged.confirmations,
             "schema_version": api::JOURNAL_SCHEMA_VERSION,
+            "elapsed_budget_mode": state.budget.elapsed_budget_mode,
             "retention_days": staged.contract.manifest.retention.days,
             "priority": staged.priority,
             "parent_run_id": staged.parent_run_id.clone(),

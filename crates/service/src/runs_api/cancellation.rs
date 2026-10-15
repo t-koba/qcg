@@ -266,6 +266,7 @@ impl LocalService {
                     "cancellation requested",
                 )
             };
+            crate::run_dirs::settle_active_elapsed(&settled_now).map_err(api_internal)?;
             write_run_event(
                 &settled_now,
                 event_kind,

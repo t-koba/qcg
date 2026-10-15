@@ -441,6 +441,7 @@ impl LocalService {
                     "answers": &answers,
                     "confirmations": &confirmations,
                     "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                    "elapsed_budget_mode": self.inner.deployment_policy.elapsed_budget_mode,
                     "retention_days": contract.manifest.retention.days,
                     "priority": priority,
                     "parent_run_id": Value::Null,
@@ -597,7 +598,9 @@ impl LocalService {
                 }
                 let pending_controls = crate::run_dirs::list_pending_cancel_controls(source_dir)
                     .map_err(api_internal)?;
-                if state.pending.is_some() && !state.cancel_requested && pending_controls.is_empty()
+                if state.settled_pending().is_some()
+                    && !state.cancel_requested
+                    && pending_controls.is_empty()
                 {
                     Ok(Some(lease))
                 } else {
@@ -745,6 +748,12 @@ impl LocalService {
                 state: Some(state),
             }
         };
+        let fork_elapsed_mode = fork_snapshot
+            .state
+            .as_ref()
+            .ok_or_else(|| api_internal("fork missing folded state"))?
+            .budget
+            .elapsed_budget_mode;
         let fork_inputs =
             fork_checkpoint_inputs(&fork_snapshot, &contract, source_id, request.at_seq);
         let inputs = match fork_inputs {
@@ -917,6 +926,7 @@ impl LocalService {
                     "answers": &staged.answers,
                     "confirmations": &staged.confirmations,
                     "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                    "elapsed_budget_mode": fork_elapsed_mode,
                     "retention_days": contract.manifest.retention.days,
                     "priority": staged.priority,
                     "parent_run_id": source_id,
@@ -1021,6 +1031,7 @@ impl LocalService {
                 "answers": &fork_answers,
                 "confirmations": &fork_confirmations,
                 "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                    "elapsed_budget_mode": fork_elapsed_mode,
                 "retention_days": contract.manifest.retention.days,
                 "priority": fork_priority,
                 "parent_run_id": source_id,

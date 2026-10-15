@@ -157,7 +157,7 @@ pub(crate) fn rehydrate_runs(
         // below (identity, scheduling, HITL maps, queue key): a restart
         // never pays a scan per field per run.
         let journal_values = read_journal_events(&run_dir)?;
-        let mut state = RunState::fold_values(&journal_values)
+        let state = RunState::fold_values(&journal_values)
             .map_err(|error| ServiceError::Invalid(error.to_string()))?;
         if state.terminal.is_some() {
             continue;
@@ -175,7 +175,7 @@ pub(crate) fn rehydrate_runs(
             .file_name()
             .ok_or_else(|| ServiceError::Invalid("run directory has no file name".into()))?
             .to_string();
-        let (record_state, question, confirm) = match state.pending.take() {
+        let (record_state, question, confirm) = match state.settled_pending().cloned() {
             Some(Interaction::Question { question }) => (RunStatus::Waiting, Some(question), None),
             Some(Interaction::Confirmation { confirm }) => {
                 (RunStatus::Confirming, None, Some(confirm))

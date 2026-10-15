@@ -4194,7 +4194,12 @@ fields are rejected when their structs define a closed schema.
    requires input/output pricing on the declared `[llm].model` entry.
    Guarantee strengths differ: `max_elapsed_seconds` is a hard deadline
    enforced monotonically (a running node is stopped and the finalization
-   re-checks it before settling success), while `max_tokens` and
+   re-checks it before settling success). Deployment `ELAPSED_BUDGET_MODE`
+   defaults to total wall-clock age including queued/HITL waits; the
+   `active_execution` alternative excludes normal waits, but conservatively
+   charges downtime for an unclosed crashed episode. The mode is pinned at
+   admission and inherited by forks; it is not a contract override (see
+   [operations](operations.md#elapsed-budget-waiting-policy)). `max_tokens` and
    `max_cost_usd` are enforced at attempt entry (`StepContext::step_checkpoint`)
    plus per-tool-call checkpoints inside agent execution (never mid-token-stream,
    but checked on every tool call boundary as well as every attempt start) (E11).

@@ -29,6 +29,24 @@ fn journal_target(
     Ok((run_id, path, limits))
 }
 
+/// Settle any active interval at a known service handoff. The caller holds
+/// the execution lease after the prior engine task has exited; this opens the
+/// journal with the run's configured limits and live event sender so the
+/// durable ledger and subscribers observe the same checked recovery event.
+pub(crate) fn settle_active_elapsed(record: &RunRecord) -> Result<(), ServiceError> {
+    let (run_id, journal_path, limits) = journal_target(record)?;
+    let journal = JournalWriter::create_with_limits(
+        &journal_path,
+        run_id,
+        false,
+        Some(record.events.clone()),
+        limits,
+    )
+    .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    engine::settle_active_elapsed(&journal, chrono::Utc::now())
+        .map_err(|error| ServiceError::Invalid(error.to_string()))
+}
+
 pub(crate) fn write_run_event(
     record: &RunRecord,
     kind: &str,

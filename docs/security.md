@@ -225,19 +225,32 @@ revision, not only the latest. File inputs are compared to the admitted bytes
 on resume unless a successful step pinned the path, so tampering outside the
 journal is refused.
 
-`budget.max_elapsed_seconds` is a hard deadline anchored to the durable
-acceptance timestamp (wall-clock `run_queued` instant): a node running past
-it stops with a distinct elapsed error that is never retried, separate from a
-node timeout or a cancellation. Enforcement after startup uses a monotonic
-clock so an NTP step cannot stretch or shrink the budget; only the
-resume-time remainder derivation reads the wall clock once (E11). Foreach child nodes honor their own retry
-policy, per-attempt timeout, and this deadline exactly like top-level nodes.
-The deadline runs from the durable acceptance timestamp, so it includes queue
-wait and time spent waiting for a user question or confirmation; it is not
-paused while a run is suspended or the service is restarted. An answer or
-confirmation accepted before the deadline lets the run continue; the deadline
-is re-evaluated at the next execution boundary, so a response accepted after
-the deadline surfaces as an elapsed failure instead of extending the budget.
+`budget.max_elapsed_seconds` is a hard deadline: a node running past it stops
+with a distinct elapsed error that is never retried, separate from a node timeout
+or cancellation. In-process enforcement uses a monotonic clock; foreach child
+nodes honor it just like top-level nodes. The deployment's pinned
+`ELAPSED_BUDGET_MODE` selects which wall durations consume the allowance:
+
+- `wall_clock` (default) retains the durable acceptance timestamp as its anchor,
+  including queue, preemption, HITL question/confirmation waits, and downtime.
+  A late answer/confirmation cannot extend the budget: the next execution
+  boundary recomputes its remainder. Existing resume-time skew behavior remains.
+- `active_execution` charges complete engine execution episodes, including setup,
+  hooks, retries/backoff, provider/network waits, and parallel work once. Normal
+  queued/preempted/HITL-paused intervals are excluded. Durably synced open/close
+  records retain nanosecond consumption. Missing/malformed ledgers and overflow
+  refuse execution. An unclosed crash interval conservatively charges downtime
+  through recovery under the execution lease; a closed interval does not charge
+  again. This assumes a non-regressing recovery wall clock: a future open anchor
+  refuses instead of being clamped to free time. A forward clock jump may
+  overcharge a crashed episode. It cannot extend a running monotonic deadline.
+
+Mode changes cannot reinterpret admitted runs or fork lineage. Schema-1 journals
+without a mode retain historical wall-clock semantics. Direct execution has no
+durable pre-engine queue admission and does not charge that earlier delay.
+Service waiting/confirmation is published only after an active episode closes;
+operation idempotency/refusal rules are unchanged by the elapsed policy. See
+[the operations policy](operations.md#elapsed-budget-waiting-policy) for details.
 A stop additionally allows a bounded 5 second cooperative settle grace for the
 executor to release resources; the outcome is still reported as elapsed and
 never as success.

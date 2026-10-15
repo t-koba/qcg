@@ -232,7 +232,7 @@ impl LocalService {
         // prompts clear it in the fold, so displaying it can neither show
         // stale work nor accept work the record cannot run: answers land
         // durably and the engine consumes them on start (E03).
-        let durable_pending = || match disk_state.pending.clone() {
+        let durable_pending = || match disk_state.settled_pending().cloned() {
             Some(engine::Interaction::Question { question }) => (Some(question), None),
             Some(engine::Interaction::Confirmation { confirm }) => (None, Some(confirm)),
             None => (None, None),
@@ -522,7 +522,10 @@ impl LocalService {
                 }
             };
             let folded = &view.state;
-            if folded.terminal.is_some() || folded.pending.is_some() || folded.cancel_requested {
+            if folded.terminal.is_some()
+                || folded.settled_pending().is_some()
+                || folded.cancel_requested
+            {
                 continue;
             }
             // Count only actually-queued disk runs: a journal with a

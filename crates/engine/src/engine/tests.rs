@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 /// needs something else overrides only that field.
 fn run_options(output_dir: Utf8PathBuf) -> RunOptions {
     RunOptions {
+        elapsed_budget_mode: policy::ElapsedBudgetMode::default(),
         output_dir,
         json_events: false,
         event_sender: None,
@@ -1474,6 +1475,7 @@ async fn run_engine_with(
             contract,
             inputs,
             RunOptions {
+                elapsed_budget_mode: policy::ElapsedBudgetMode::default(),
                 max_total_steps,
                 ..run_options(run_dir.join("workspace"))
             },
@@ -2679,6 +2681,7 @@ async fn foreach_nested_parallel_runs_every_leaf() {
             contract,
             BTreeMap::from([("items".into(), json!(["a", "b"]))]),
             RunOptions {
+                elapsed_budget_mode: policy::ElapsedBudgetMode::default(),
                 max_parallel_steps: 8,
                 ..run_options(run_dir.join("workspace"))
             },
@@ -3015,6 +3018,7 @@ async fn run_manifest(
             contract,
             BTreeMap::new(),
             RunOptions {
+                elapsed_budget_mode: policy::ElapsedBudgetMode::default(),
                 max_parallel_steps,
                 ..run_options(output_dir.join("workspace"))
             },
@@ -3689,6 +3693,7 @@ async fn deadline_precedence_is_deterministic() {
                 contract,
                 BTreeMap::new(),
                 RunOptions {
+                    elapsed_budget_mode: policy::ElapsedBudgetMode::default(),
                     cancellation,
                     ..run_options(run_dir.join("workspace"))
                 },
@@ -3758,6 +3763,7 @@ async fn cancel_wins_over_retry_backoff() {
             contract,
             BTreeMap::new(),
             RunOptions {
+                elapsed_budget_mode: policy::ElapsedBudgetMode::default(),
                 cancellation,
                 ..run_options(run_dir.join("workspace"))
             },
@@ -3904,6 +3910,7 @@ async fn parent_cancel_reaches_node_execution_promptly() {
             contract,
             BTreeMap::new(),
             RunOptions {
+                elapsed_budget_mode: policy::ElapsedBudgetMode::default(),
                 cancellation: run_cancellation,
                 ..run_options(run_dir.join("workspace"))
             },
@@ -3981,6 +3988,7 @@ async fn node_timeout_stops_only_the_node_and_adopts_cooperative_settlement() {
             contract,
             BTreeMap::new(),
             RunOptions {
+                elapsed_budget_mode: policy::ElapsedBudgetMode::default(),
                 cancellation: run_cancellation.clone(),
                 ..run_options(run_dir.join("workspace"))
             },
@@ -4135,6 +4143,7 @@ async fn parent_cancel_during_deadline_stays_canceled() {
             contract,
             BTreeMap::new(),
             RunOptions {
+                elapsed_budget_mode: policy::ElapsedBudgetMode::default(),
                 cancellation: run_cancellation,
                 ..run_options(run_dir.join("workspace"))
             },
@@ -4372,6 +4381,7 @@ async fn budget_exhausted_hooks_are_recorded_as_skipped() {
             contract,
             BTreeMap::new(),
             RunOptions {
+                elapsed_budget_mode: policy::ElapsedBudgetMode::default(),
                 max_total_steps: 1,
                 ..run_options(run_dir.join("workspace"))
             },
@@ -4688,6 +4698,7 @@ async fn budget_boundary_exact_succeeds_and_over_fails() {
         (run_dir, contract, registry, max_total_steps)
     };
     let run_options = |run_dir: &Utf8PathBuf, max_total_steps: usize| RunOptions {
+        elapsed_budget_mode: policy::ElapsedBudgetMode::default(),
         max_total_steps,
         ..run_options(run_dir.join("workspace"))
     };
@@ -4816,6 +4827,7 @@ async fn parallel_hitl_interruption_resumes_siblings() {
         sha256: "parallel-hitl".into(),
     };
     let options = |answers: BTreeMap<String, Value>| RunOptions {
+        elapsed_budget_mode: policy::ElapsedBudgetMode::default(),
         max_parallel_steps: 2,
         answers,
         ..run_options(run_dir.join("workspace"))
@@ -4922,6 +4934,7 @@ async fn sequential_and_parallel_waves_agree_on_success() {
         (run_dir, contract, registry)
     };
     let run_options = |run_dir: &Utf8PathBuf| RunOptions {
+        elapsed_budget_mode: policy::ElapsedBudgetMode::default(),
         max_parallel_steps: 2,
         ..run_options(run_dir.join("workspace"))
     };
@@ -5419,6 +5432,7 @@ async fn suspension_journal_carries_failed_evidence() {
                 contract,
                 BTreeMap::new(),
                 RunOptions {
+                    elapsed_budget_mode: policy::ElapsedBudgetMode::default(),
                     max_parallel_steps,
                     ..run_options(run_dir.join("workspace"))
                 },
@@ -5785,6 +5799,7 @@ async fn canceled_failure_does_not_append_elapsed_breach() {
             contract,
             BTreeMap::new(),
             RunOptions {
+                elapsed_budget_mode: policy::ElapsedBudgetMode::default(),
                 cancellation,
                 ..run_options(run_dir.join("workspace"))
             },
@@ -6029,6 +6044,7 @@ async fn queue_interrupt_resume_keeps_elapsed_budget_end_to_end() {
         "inputs": {},
         "resource_hashes": [],
         "schema_version": api::JOURNAL_SCHEMA_VERSION,
+        "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
     });
     let started_event = json!({
         "t": "run_started",
@@ -6043,6 +6059,7 @@ async fn queue_interrupt_resume_keeps_elapsed_budget_end_to_end() {
         "inputs": {},
         "resource_hashes": [],
         "schema_version": api::JOURNAL_SCHEMA_VERSION,
+        "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
     });
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -6537,6 +6554,7 @@ async fn boundary_yield_drains_and_checkpoints_parallel_wave_once() {
     let contract = test_contract(&root, flow);
     let engine = Engine::new(registry);
     let options = RunOptions {
+        elapsed_budget_mode: policy::ElapsedBudgetMode::default(),
         scheduler_yield: token,
         max_parallel_steps: 2,
         ..run_options(root.join("workspace"))
@@ -6571,6 +6589,7 @@ async fn boundary_yield_drains_and_checkpoints_parallel_wave_once() {
             contract,
             BTreeMap::new(),
             RunOptions {
+                elapsed_budget_mode: policy::ElapsedBudgetMode::default(),
                 ..run_options(root.join("workspace"))
             },
         )
@@ -6606,6 +6625,7 @@ async fn hitl_suspension_wins_over_boundary_yield() {
             contract,
             BTreeMap::new(),
             RunOptions {
+                elapsed_budget_mode: policy::ElapsedBudgetMode::default(),
                 scheduler_yield: token,
                 ..run_options(root.join("workspace"))
             },
@@ -6620,4 +6640,207 @@ async fn hitl_suspension_wins_over_boundary_yield() {
     let journal = std::fs::read_to_string(root.join("meta/journal.jsonl")).unwrap();
     assert!(!journal.contains("run_yielded"));
     assert!(!journal.contains("run_error"));
+}
+
+#[tokio::test]
+async fn active_elapsed_exhausted_or_crashed_run_starts_no_side_effects() {
+    for crashed in [false, true] {
+        let run_dir = temp_run_dir("active-exhaustion");
+        let mut manifest = manifest(vec![node("effect", "test.pass")]);
+        manifest.budget.max_elapsed_seconds = Some(1);
+        let contract = test_contract(&run_dir, manifest);
+        let meta = run_dir.join("meta");
+        let journal = crate::JournalWriter::create(
+            &meta.join("journal.jsonl"),
+            "active-exhaustion",
+            false,
+            None,
+        )
+        .unwrap();
+        journal.event("run_queued", json!({
+            "generator":"test@1", "generator_path":contract.root, "contract_sha256":contract.sha256,
+            "inputs":{}, "schema_version":2, "elapsed_budget_mode":"active_execution"
+        })).unwrap();
+        journal.event("elapsed_accounted", json!({"active_nanoseconds":0,
+            "active_started_at": (chrono::Utc::now() - chrono::Duration::seconds(3)).to_rfc3339()
+        })).unwrap();
+        if !crashed {
+            journal
+                .event(
+                    "elapsed_accounted",
+                    json!({"active_nanoseconds":1_000_000_000_u64, "active_started_at":null}),
+                )
+                .unwrap();
+        }
+        drop(journal);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = StepRegistry::new();
+        registry.register(CountingPassStep {
+            calls: calls.clone(),
+        });
+        let error = Engine::new(registry)
+            .run_with_id(
+                "active-exhaustion".into(),
+                meta.clone(),
+                contract,
+                BTreeMap::new(),
+                run_options(run_dir.join("workspace")),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            EngineError::Step(StepError::ElapsedExceeded { .. })
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let state = crate::RunState::fold_journal(&meta.join("journal.jsonl")).unwrap();
+        let ledger = state.budget.elapsed.unwrap();
+        assert!(ledger.active_started_at.is_none());
+        assert!(ledger.active_nanoseconds >= 1_000_000_000);
+        assert_eq!(state.budget.steps_executed, 0);
+        let _ = std::fs::remove_dir_all(run_dir);
+    }
+}
+
+struct EpisodeProbeStep;
+#[async_trait]
+impl StepExecutor for EpisodeProbeStep {
+    fn type_id(&self) -> &'static str {
+        "test.episode_probe"
+    }
+    fn traits(&self) -> StepTraits {
+        StepTraits {
+            parallel_safe: true,
+            ..Default::default()
+        }
+    }
+    async fn execute(
+        &self,
+        ctx: &mut StepContext<'_>,
+        node: &NodeDef,
+    ) -> Result<StepOutcome, StepError> {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        if node.id.as_str().starts_with("ask") && !ctx.run.answers.contains_key(node.id.as_str()) {
+            return Ok(StepOutcome::NeedsUser {
+                question: api::FormSpec {
+                    id: node.id.to_string(),
+                    title: "Continue".into(),
+                    title_i18n: Default::default(),
+                    fields: vec![],
+                },
+            });
+        }
+        Ok(StepOutcome::Success {
+            output: None,
+            files: vec![],
+        })
+    }
+}
+
+#[tokio::test]
+async fn active_direct_short_episodes_preserve_subseconds_and_pin_mode() {
+    let run_dir = temp_run_dir("active-short-episodes");
+    let mut manifest = manifest(vec![
+        node("ask1", "test.episode_probe"),
+        node("ask2", "test.episode_probe"),
+        node("ask3", "test.episode_probe"),
+    ]);
+    manifest.budget.max_elapsed_seconds = Some(10);
+    let mut registry = StepRegistry::new();
+    registry.register(EpisodeProbeStep);
+    let engine = Engine::new(registry);
+    let mut options = run_options(run_dir.join("workspace"));
+    options.elapsed_budget_mode = policy::ElapsedBudgetMode::ActiveExecution;
+    let mut previous = 0;
+    for question in [Some("ask1"), Some("ask2"), Some("ask3"), None] {
+        let result = engine
+            .run_with_id(
+                "short".into(),
+                run_dir.join("meta"),
+                test_contract(&run_dir, manifest.clone()),
+                BTreeMap::new(),
+                options.clone(),
+            )
+            .await;
+        if let Some(question) = question {
+            assert!(
+                matches!(result, Err(EngineError::NeedsUser { .. })),
+                "{result:?}"
+            );
+            options.answers.insert(question.into(), json!("yes"));
+        } else {
+            result.unwrap();
+        }
+        let state = crate::RunState::fold_journal(&run_dir.join("meta/journal.jsonl")).unwrap();
+        let ledger = state.budget.elapsed.unwrap();
+        assert!(ledger.active_started_at.is_none());
+        assert!(ledger.active_nanoseconds >= previous + 25_000_000);
+        previous = ledger.active_nanoseconds;
+        // Deployment change cannot reinterpret the next direct resume.
+        options.elapsed_budget_mode = policy::ElapsedBudgetMode::WallClock;
+    }
+    assert!(
+        previous >= 150_000_000,
+        "all six short attempts must be charged, not rounded away"
+    );
+    let _ = std::fs::remove_dir_all(run_dir);
+}
+
+#[tokio::test]
+async fn active_parallel_wave_has_one_elapsed_interval_not_one_per_node() {
+    let run_dir = temp_run_dir("active-parallel");
+    let mut registry = StepRegistry::new();
+    registry.register(EpisodeProbeStep);
+    let mut options = run_options(run_dir.join("workspace"));
+    options.elapsed_budget_mode = policy::ElapsedBudgetMode::ActiveExecution;
+    options.max_parallel_steps = 2;
+    let mut manifest = manifest(vec![
+        node("a", "test.episode_probe"),
+        node("b", "test.episode_probe"),
+    ]);
+    manifest.parallel = vec!["a".into(), "b".into()];
+    Engine::new(registry)
+        .run_with_id(
+            "parallel".into(),
+            run_dir.join("meta"),
+            test_contract(&run_dir, manifest),
+            BTreeMap::new(),
+            options,
+        )
+        .await
+        .unwrap();
+    let events = crate::read_journal_values(
+        &run_dir.join("meta/journal.jsonl"),
+        crate::JournalLimits::default(),
+    )
+    .unwrap()
+    .events;
+    let accounting: Vec<_> = events
+        .iter()
+        .filter(|e| e["t"] == "elapsed_accounted")
+        .collect();
+    assert_eq!(
+        accounting.len(),
+        2,
+        "identity initializes; only open and close records for the whole episode"
+    );
+    let first_finish = events
+        .iter()
+        .position(|e| e["t"] == "step_finished")
+        .unwrap();
+    assert_eq!(
+        events[..first_finish]
+            .iter()
+            .filter(|e| e["t"] == "step_started")
+            .count(),
+        2
+    );
+    assert!(
+        accounting.last().unwrap()["active_nanoseconds"]
+            .as_u64()
+            .unwrap()
+            >= 25_000_000
+    );
+    assert!(accounting.last().unwrap()["active_started_at"].is_null());
+    let _ = std::fs::remove_dir_all(run_dir);
 }

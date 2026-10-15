@@ -49,6 +49,53 @@ pub(super) fn sync_live_outcomes(vars: &mut ValueBag, journal: &JournalWriter) {
     vars.sync_outcome_metadata(&folded.vars);
 }
 
+fn startup_sweep(
+    workspace: &camino::Utf8Path,
+    metadata_dir: &camino::Utf8Path,
+) -> Result<(), EngineError> {
+    // Reap staging orphans left by a killed process before doing any
+    // work: callers hold the execution lease (or the direct-run lock),
+    // so no live writer exists for these directories, and the age gate
+    // additionally protects young files (E13b). Every known staging
+    // prefix is swept (see STARTUP_SWEEP_FRAGMENTS).
+    for fragment in STARTUP_SWEEP_FRAGMENTS {
+        if let Err(error) = crate::FsGateway::sweep_orphaned_staging_files(
+            workspace,
+            fragment,
+            std::time::Duration::from_secs(3600),
+        ) {
+            return Err(EngineError::Failed(format!(
+                "startup staging sweep for `{fragment}` failed: {error}"
+            )));
+        }
+    }
+    if let Err(error) = crate::FsGateway::sweep_orphaned_staging_files(
+        &metadata_dir.join("checkpoint-blobs"),
+        ".tmp-",
+        std::time::Duration::from_secs(3600),
+    ) {
+        return Err(EngineError::Failed(format!(
+            "startup checkpoint-blob sweep failed: {error}"
+        )));
+    }
+    // Fork blob staging uses the same `.part-` atomic-write prefix
+    // as workspace writes (E06/E13); the blob sweep above only covers
+    // `.tmp-`, so also reap `.part-` orphans here.
+    {
+        let fragment = ".part-";
+        if let Err(error) = crate::FsGateway::sweep_orphaned_staging_files(
+            &metadata_dir.join("checkpoint-blobs"),
+            fragment,
+            std::time::Duration::from_secs(3600),
+        ) {
+            return Err(EngineError::Failed(format!(
+                "startup checkpoint-blob sweep for `{fragment}` failed: {error}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl Engine {
     pub fn new(registry: StepRegistry) -> Self {
         Self {
@@ -432,46 +479,6 @@ impl Engine {
                 ))
             })?;
         std::fs::create_dir_all(&metadata_dir)?;
-        // Reap staging orphans left by a killed process before doing any
-        // work: callers hold the execution lease (or the direct-run lock),
-        // so no live writer exists for these directories, and the age gate
-        // additionally protects young files (E13b). Every known staging
-        // prefix is swept (see STARTUP_SWEEP_FRAGMENTS).
-        for fragment in STARTUP_SWEEP_FRAGMENTS {
-            if let Err(error) = crate::FsGateway::sweep_orphaned_staging_files(
-                &workspace,
-                fragment,
-                std::time::Duration::from_secs(3600),
-            ) {
-                return Err(EngineError::Failed(format!(
-                    "startup staging sweep for `{fragment}` failed: {error}"
-                )));
-            }
-        }
-        if let Err(error) = crate::FsGateway::sweep_orphaned_staging_files(
-            &metadata_dir.join("checkpoint-blobs"),
-            ".tmp-",
-            std::time::Duration::from_secs(3600),
-        ) {
-            return Err(EngineError::Failed(format!(
-                "startup checkpoint-blob sweep failed: {error}"
-            )));
-        }
-        // Fork blob staging uses the same `.part-` atomic-write prefix
-        // as workspace writes (E06/E13); the blob sweep above only covers
-        // `.tmp-`, so also reap `.part-` orphans here.
-        {
-            let fragment = ".part-";
-            if let Err(error) = crate::FsGateway::sweep_orphaned_staging_files(
-                &metadata_dir.join("checkpoint-blobs"),
-                fragment,
-                std::time::Duration::from_secs(3600),
-            ) {
-                return Err(EngineError::Failed(format!(
-                    "startup checkpoint-blob sweep for `{fragment}` failed: {error}"
-                )));
-            }
-        }
         let journal = JournalWriter::create_with_policies(
             &metadata_dir.join("journal.jsonl"),
             &requested_run_id,
@@ -499,24 +506,70 @@ impl Engine {
                 contract.sha256
             )));
         }
-        // Hard deadline for the run-wide elapsed budget: nodes stop at the
-        // limit instead of only noticing on their next checkpoint (E11).
-        let elapsed_deadline = contract
-            .manifest
-            .budget
-            .max_elapsed_seconds
-            .map(|limit_secs| {
-                let remaining = remaining_elapsed_secs(
-                    limit_secs,
-                    replay.state.budget.started_at.as_deref(),
-                    replay.state.execution_started,
-                    chrono::Utc::now(),
-                )?;
-                Ok::<_, EngineError>(
-                    tokio::time::Instant::now() + std::time::Duration::from_secs(remaining),
-                )
-            })
-            .transpose()?;
+        let mode = if replay.state.budget.started_at.is_some() {
+            replay.state.budget.elapsed_budget_mode
+        } else {
+            options.elapsed_budget_mode
+        };
+        if mode == policy::ElapsedBudgetMode::WallClock {
+            startup_sweep(&workspace, &metadata_dir)?;
+        }
+        // Active direct execution needs durable identity before opening the episode.
+        // Resource pins follow as individual records after resource validation.
+        if mode == policy::ElapsedBudgetMode::ActiveExecution
+            && replay.state.budget.started_at.is_none()
+        {
+            journal.event("run_started", json!({
+                "generator": format!("{}@{}", contract.manifest.generator.id, contract.manifest.generator.version),
+                "generator_path": contract.root,
+                "contract_sha256": contract.sha256,
+                "inputs": inputs,
+                "resource_hashes": [],
+                "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                "elapsed_budget_mode": mode,
+                "retention_days": contract.manifest.retention.days,
+            }))?;
+        }
+        let mut episode = None;
+        let elapsed_deadline = if mode == policy::ElapsedBudgetMode::ActiveExecution {
+            let total = super::elapsed::recover(&journal, chrono::Utc::now())?;
+            let remaining = contract
+                .manifest
+                .budget
+                .max_elapsed_seconds
+                .map(|limit| super::elapsed::remaining(limit, total))
+                .transpose()?;
+            let opened = super::elapsed::Episode::open(&journal, total)?;
+            let deadline = remaining
+                .map(|remaining| opened.deadline(remaining))
+                .transpose();
+            episode = Some(opened);
+            deadline
+        } else {
+            contract
+                .manifest
+                .budget
+                .max_elapsed_seconds
+                .map(|limit_secs| {
+                    let remaining = remaining_elapsed_secs(
+                        limit_secs,
+                        replay.state.budget.started_at.as_deref(),
+                        replay.state.execution_started,
+                        chrono::Utc::now(),
+                    )?;
+                    Ok::<_, EngineError>(
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(remaining),
+                    )
+                })
+                .transpose()
+        };
+        // Every ordinary return (including setup errors, HITL and cancellation)
+        // closes here. Terminal/yield records close explicitly before publication.
+        let result = async {
+        let elapsed_deadline = elapsed_deadline?;
+        if mode == policy::ElapsedBudgetMode::ActiveExecution {
+            startup_sweep(&workspace, &metadata_dir)?;
+        }
         let context = RunContext {
             run_id: run_id.clone(),
             elapsed_deadline,
@@ -584,6 +637,7 @@ impl Engine {
         };
         let resource_hashes = collect_resource_hashes(&context).await?;
         if !replay.state.execution_started {
+            if !journal.state().execution_started {
             journal.event(
                 "run_started",
                 json!({
@@ -594,9 +648,11 @@ impl Engine {
                     "inputs": &canonical_inputs,
                     "resource_hashes": resource_hashes,
                     "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                    "elapsed_budget_mode": mode,
                     "retention_days": context.contract.manifest.retention.days,
                 }),
             )?;
+            }
             for resource in &resource_hashes {
                 journal.event("resource", resource)?;
             }
@@ -696,6 +752,7 @@ impl Engine {
             // and must bypass terminal settlement and failure hooks.
             if options.scheduler_yield.is_cancelled() {
                 context.run_checkpoint()?;
+                super::elapsed::close(&mut episode, &journal)?;
                 journal.event("run_yielded", json!({}))?;
                 return Err(EngineError::Yielded);
             }
@@ -1348,6 +1405,7 @@ impl Engine {
                     failure: FailureDetail::new(FailureCode::ExecutionFailed, error.to_string()),
                 });
             }
+            super::elapsed::close(&mut episode, &journal)?;
             journal.event(
                 "run_finished",
                 json!({ "status": "failed", "failures": failed }),
@@ -1393,8 +1451,12 @@ impl Engine {
         for artifact in &outputs.artifacts {
             journal.event("artifact", artifact)?;
         }
+        super::elapsed::close(&mut episode, &journal)?;
         journal.event("run_finished", json!({ "status": "success" }))?;
         Ok(outputs)
+        }.await;
+        super::elapsed::close(&mut episode, &journal)?;
+        result
     }
 }
 

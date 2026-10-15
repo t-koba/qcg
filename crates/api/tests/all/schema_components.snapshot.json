@@ -28,6 +28,7 @@
   "DependencyFailure",
   "DependencyStatus",
   "DryRunEventData",
+  "ElapsedAccountedEventData",
   "EmptyEventData",
   "FailureCode",
   "FailureDetail",

@@ -354,6 +354,7 @@ mod tests {
                     "inputs": {},
                     "resource_hashes": [],
                     "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                    "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
                 }),
             )
             .expect("run should start");

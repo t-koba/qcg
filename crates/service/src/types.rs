@@ -30,6 +30,7 @@ pub struct ServiceDeploymentPolicy {
     pub max_total_steps: Option<usize>,
     pub preemption_enabled: bool,
     /// Cooperative step/wave boundary by default; interrupt is explicit.
+    pub elapsed_budget_mode: policy::ElapsedBudgetMode,
     pub preemption_mode: policy::PreemptionMode,
     /// Preserve the prior FIFO key on scheduler preemption by default.
     pub preemption_queue_position: policy::PreemptionQueuePosition,
@@ -63,6 +64,7 @@ impl Default for ServiceDeploymentPolicy {
             read_cache_max_bytes: policy::DEFAULT_READ_CACHE_BYTES,
             max_total_steps: None,
             preemption_enabled: true,
+            elapsed_budget_mode: policy::ElapsedBudgetMode::default(),
             preemption_mode: policy::PreemptionMode::default(),
             preemption_queue_position: policy::PreemptionQueuePosition::default(),
             audit_floor: policy::AuditFloor::Minimal,
@@ -107,6 +109,7 @@ impl ServiceDeploymentPolicy {
     /// Callers cannot supply any of these choices on a run request.
     pub fn with_scheduling_env(mut self) -> Result<Self, String> {
         self.preemption_enabled = policy::parse_bool_env("PREEMPTION", true)?;
+        self.elapsed_budget_mode = policy::ElapsedBudgetMode::from_env("ELAPSED_BUDGET_MODE")?;
         self.preemption_mode = policy::PreemptionMode::from_env("PREEMPTION_MODE")?;
         self.preemption_queue_position =
             policy::PreemptionQueuePosition::from_env("PREEMPTION_QUEUE_POSITION")?;

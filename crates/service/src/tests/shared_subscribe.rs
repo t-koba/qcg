@@ -73,6 +73,7 @@ content = "done""#,
                 "confirmations": {},
 
                 "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
                 "retention_days": 0,
                 "priority": 0,
                 "parent_run_id": null,
@@ -92,6 +93,7 @@ content = "done""#,
                 "resource_hashes": [],
 
                 "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
             }),
         )
         .expect("started event should append");

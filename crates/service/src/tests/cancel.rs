@@ -440,6 +440,7 @@ async fn shutdown_converges_when_executor_ignores_cancellation() {
             "contract_sha256": contract.sha256,
             "inputs": {},
             "schema_version": api::JOURNAL_SCHEMA_VERSION,
+            "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
         }),
     )
     .expect("queued event should append");
@@ -464,6 +465,82 @@ async fn shutdown_converges_when_executor_ignores_cancellation() {
         "abandoned work must be marked interrupted for restart triage"
     );
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn shutdown_closes_disk_only_active_ledger_before_interruption() {
+    let root = temp_run_dir("shutdown-disk-active");
+    let _guard = TempGuard(root.clone());
+    let service = test_service(vec![], root.join("runs"));
+    let run_id = "disk-only-active";
+    let run_dir = root.join("runs").join(run_id);
+    prepare_api_run_directory(&run_dir).unwrap();
+    let path = run_meta_dir(&run_dir).join("journal.jsonl");
+    let journal = engine::JournalWriter::create(&path, run_id, false, None).unwrap();
+    let identity = json!({
+        "generator": "test@1", "generator_path": "test", "contract_sha256": "test",
+        "inputs": {}, "schema_version": api::JOURNAL_SCHEMA_VERSION,
+        "elapsed_budget_mode": "active_execution"
+    });
+    journal.event("run_started", identity.clone()).unwrap();
+    journal
+        .event(
+            "elapsed_accounted",
+            json!({
+                "active_nanoseconds": 0,
+                "active_started_at": (chrono::Utc::now() - chrono::Duration::seconds(2)).to_rfc3339()
+            }),
+        )
+        .unwrap();
+    drop(journal);
+    assert!(service.inner.runs.read().await.is_empty());
+
+    service.shutdown_active_runs().await.unwrap();
+    assert!(service.inner.runs.read().await.is_empty());
+    let events = engine::read_journal_values(&path, engine::JournalLimits::default())
+        .unwrap()
+        .events;
+    let closed = events
+        .iter()
+        .position(|event| event["t"] == "elapsed_accounted" && event["active_started_at"].is_null())
+        .expect("shutdown must durably close the orphan's active interval");
+    let interrupted = events
+        .iter()
+        .position(|event| event["t"] == "run_interrupted")
+        .expect("shutdown must interrupt the orphan");
+    assert!(closed < interrupted);
+    let state = engine::RunState::fold_values(&events).unwrap();
+    let settled = state.budget.elapsed.unwrap();
+    assert!(settled.active_nanoseconds >= 2_000_000_000);
+    assert!(settled.active_started_at.is_none());
+
+    // A later settlement/resume cannot charge time after shutdown. A fork
+    // copies this closed history and must not charge its queue delay either.
+    let later = chrono::Utc::now() + chrono::Duration::hours(1);
+    let journal = engine::JournalWriter::create(&path, run_id, false, None).unwrap();
+    let seq = journal.state().last_seq;
+    engine::settle_active_elapsed(&journal, later).unwrap();
+    assert_eq!(journal.state().last_seq, seq);
+    drop(journal);
+    let fork_dir = root.join("fork");
+    std::fs::create_dir_all(&fork_dir).unwrap();
+    let fork_path = fork_dir.join("journal.jsonl");
+    let mut fork_history = String::new();
+    for mut event in events {
+        event["run_id"] = json!("fork");
+        event["trace_id"] = json!(api::trace_id_for_run("fork"));
+        fork_history.push_str(&serde_json::to_string(&event).unwrap());
+        fork_history.push('\n');
+    }
+    std::fs::write(&fork_path, fork_history).unwrap();
+    let fork = engine::JournalWriter::create(&fork_path, "fork", false, None).unwrap();
+    let mut fork_identity = identity;
+    fork_identity["parent_run_id"] = json!(run_id);
+    fork.event("run_queued", fork_identity).unwrap();
+    engine::settle_active_elapsed(&fork, later).unwrap();
+    let inherited = fork.state().budget.elapsed.unwrap();
+    assert_eq!(inherited.active_nanoseconds, settled.active_nanoseconds);
+    assert!(inherited.active_started_at.is_none());
 }
 
 #[tokio::test]
@@ -876,6 +953,7 @@ async fn shutdown_leaves_never_tracked_queued_orphan_for_next_boot() {
                     "confirmations": {},
 
                     "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                    "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
                     "retention_days": 0,
                     "priority": 0,
                     "parent_run_id": null,
@@ -911,6 +989,7 @@ async fn shutdown_leaves_never_tracked_queued_orphan_for_next_boot() {
                     "confirmations": {},
 
                     "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                    "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
                     "retention_days": 0,
                     "priority": 0,
                     "parent_run_id": null,
@@ -1406,6 +1485,7 @@ async fn g01_forced_cancel_settles_without_self_conflict() {
             "contract_sha256": contract.sha256,
             "inputs": {},
             "schema_version": api::JOURNAL_SCHEMA_VERSION,
+            "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
         }),
     )
     .expect("queued event should append");

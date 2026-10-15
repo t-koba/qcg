@@ -97,6 +97,7 @@ pub struct ResolvedServerPolicy {
     pub validated_cors: Vec<HeaderValue>,
     pub auto_gc: bool,
     pub preemption_enabled: bool,
+    pub elapsed_budget_mode: policy::ElapsedBudgetMode,
     pub preemption_mode: policy::PreemptionMode,
     pub preemption_queue_position: policy::PreemptionQueuePosition,
     /// Deployment HTTP rate limit resolved at boot (E04 freeze). `None`
@@ -162,6 +163,7 @@ pub fn resolve_server_policy(config: &ServerConfig) -> Result<ResolvedServerPoli
         .map_err(|detail| format!("invalid GC configuration: {detail}"))?;
     let preemption_enabled = policy::parse_bool_env("PREEMPTION", true)
         .map_err(|detail| format!("invalid preemption configuration: {detail}"))?;
+    let elapsed_budget_mode = policy::ElapsedBudgetMode::from_env("ELAPSED_BUDGET_MODE")?;
     let preemption_mode = policy::PreemptionMode::from_env("PREEMPTION_MODE")?;
     let preemption_queue_position =
         policy::PreemptionQueuePosition::from_env("PREEMPTION_QUEUE_POSITION")?;
@@ -339,6 +341,7 @@ pub fn resolve_server_policy(config: &ServerConfig) -> Result<ResolvedServerPoli
         validated_cors,
         auto_gc,
         preemption_enabled,
+        elapsed_budget_mode,
         preemption_mode,
         preemption_queue_position,
         rate_limit,
@@ -417,6 +420,7 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
         validated_cors,
         auto_gc,
         preemption_enabled,
+        elapsed_budget_mode,
         preemption_mode,
         preemption_queue_position,
         rate_limit,
@@ -477,6 +481,7 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
             read_cache_max_bytes,
             max_total_steps,
             preemption_enabled,
+            elapsed_budget_mode,
             preemption_mode,
             preemption_queue_position,
             audit_floor,
@@ -2409,6 +2414,94 @@ command = ["sh", "-c", "sleep 30"]"#,
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "draining must answer 503 before the limiter can answer 429"
         );
+    }
+
+    #[tokio::test]
+    async fn elapsed_budget_env_is_strict_shared_and_independent() {
+        if crate::tests::isolate_environment_test(
+            "server::serve::tests::elapsed_budget_env_is_strict_shared_and_independent",
+        ) {
+            return;
+        }
+        let _guard = BOOT_ENV_GUARD.lock().await;
+        let root = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!("elapsed-env-{}", uuid::Uuid::now_v7()));
+        let _temp = TempGuard(root.clone());
+        let config = boot_config(&root.join("generators"), &root.join("runs"));
+        // SAFETY: isolated child process, serialized by the boot env guard.
+        unsafe {
+            std::env::remove_var("ELAPSED_BUDGET_MODE");
+        }
+        assert_eq!(
+            resolve_server_policy(&config).unwrap().elapsed_budget_mode,
+            policy::ElapsedBudgetMode::WallClock
+        );
+        for preemption in ["true", "false"] {
+            for mode in ["step_boundary", "interrupt"] {
+                for queue in ["preserve", "tail"] {
+                    // SAFETY: isolated child process and guard as above.
+                    unsafe {
+                        std::env::set_var("PREEMPTION", preemption);
+                        std::env::set_var("PREEMPTION_MODE", mode);
+                        std::env::set_var("PREEMPTION_QUEUE_POSITION", queue);
+                        std::env::set_var("ELAPSED_BUDGET_MODE", "active_execution");
+                    }
+                    let server = resolve_server_policy(&config).unwrap();
+                    let host = service::ServiceDeploymentPolicy::default()
+                        .with_scheduling_env()
+                        .unwrap();
+                    assert_eq!(
+                        server.elapsed_budget_mode,
+                        policy::ElapsedBudgetMode::ActiveExecution
+                    );
+                    assert_eq!(host.elapsed_budget_mode, server.elapsed_budget_mode);
+                }
+            }
+        }
+        for bad in [
+            "",
+            "active",
+            "WALL_CLOCK",
+            " wall_clock",
+            "active_execution ",
+        ] {
+            // SAFETY: isolated child process and guard as above.
+            unsafe {
+                std::env::set_var("ELAPSED_BUDGET_MODE", bad);
+            }
+            assert!(
+                resolve_server_policy(&config)
+                    .unwrap_err()
+                    .contains("ELAPSED_BUDGET_MODE")
+            );
+            assert!(
+                service::ServiceDeploymentPolicy::default()
+                    .with_scheduling_env()
+                    .is_err()
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            // SAFETY: isolated child process and guard as above.
+            unsafe {
+                std::env::set_var(
+                    "ELAPSED_BUDGET_MODE",
+                    std::ffi::OsString::from_vec(vec![0xff]),
+                );
+            }
+            assert!(
+                resolve_server_policy(&config)
+                    .unwrap_err()
+                    .contains("Unicode")
+            );
+            assert!(
+                service::ServiceDeploymentPolicy::default()
+                    .with_scheduling_env()
+                    .is_err()
+            );
+        }
     }
 
     #[tokio::test]

@@ -45,6 +45,20 @@ macro_rules! run_event_data_registry {
 
         impl RunEventData {
             pub fn parse(kind: &str, data: Value) -> Result<Self, String> {
+                // Explicit schema-1 migration: historical run identity events
+                // omitted the mode and mean wall-clock accounting. Current
+                // schema-2 records must carry the required field.
+                let mut data = data;
+                if matches!(kind, "run_queued" | "run_started")
+                    && data.get("schema_version").and_then(Value::as_u64) == Some(1)
+                    && data.get("elapsed_budget_mode").is_none()
+                    && let Some(object) = data.as_object_mut()
+                {
+                    object.insert(
+                        "elapsed_budget_mode".into(),
+                        Value::String("wall_clock".into()),
+                    );
+                }
                 macro_rules! decode {
                     ($data_variant:ident, $payload:ty) => {
                         serde_json::from_value::<$payload>(data)
@@ -82,6 +96,7 @@ macro_rules! run_event_data_registry {
 
 run_event_data_registry! {
     terminal: ["run_finished", "run_error", "run_canceled", "run_interrupted"];
+    "elapsed_accounted" => ElapsedAccounted: super::run::ElapsedAccountedEventData,
     "run_queued" => RunQueued: RunStartedEventData,
     "run_started" => RunStarted: RunStartedEventData,
     "run_resumed" => RunResumed: EmptyEventData,
