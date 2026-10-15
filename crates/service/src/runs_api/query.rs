@@ -2,6 +2,31 @@
 use super::*;
 use crate::ServiceError;
 
+fn step_summaries_from_nodes(
+    nodes: &std::collections::BTreeMap<model::NodePath, engine::NodeOutcome>,
+) -> BTreeMap<String, api::StepSummary> {
+    nodes
+        .iter()
+        .map(|(path, outcome)| {
+            let summary = match outcome {
+                engine::NodeOutcome::Success { .. } => api::StepSummary {
+                    status: api::StepSummaryStatus::Success,
+                    reason: None,
+                },
+                engine::NodeOutcome::Failed { reason } => api::StepSummary {
+                    status: api::StepSummaryStatus::Failed,
+                    reason: Some(reason.clone()),
+                },
+                engine::NodeOutcome::Skipped { reason } => api::StepSummary {
+                    status: api::StepSummaryStatus::Skipped,
+                    reason: Some(reason.clone()),
+                },
+            };
+            (path.to_string(), summary)
+        })
+        .collect()
+}
+
 impl LocalService {
     /// Delete a terminal run directory. Active runs are rejected so deletion
     /// never interrupts execution; cancel first. Missing runs are an error.
@@ -281,6 +306,7 @@ impl LocalService {
             metrics: crate::summaries::read_run_metrics_from_view(journal_events, disk_state)
                 .map_err(api_internal)?,
             labels: disk_state.labels.clone(),
+            step_summaries: step_summaries_from_nodes(&disk_state.nodes),
         })
     }
 
@@ -632,5 +658,96 @@ impl LocalService {
                     entry_provider == provider && entry_model == model
                 })
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn step_summaries_project_folded_outcomes_and_canonical_paths() {
+        let mut state = RunState::default();
+        for event in [
+            json!({"t":"step_finished", "seq":1, "node":"successful", "status":"success", "output":"live output"}),
+            json!({"t":"step_finished", "seq":2, "node":"failed", "status":"failed", "reason":{"code":"check_failed", "message":"check failed"}}),
+            json!({"t":"step_skipped", "seq":3, "node":"skipped", "reason":{"code":"when_false", "message":"condition was false"}}),
+            json!({"t":"step_finished", "seq":4, "node":"each[0]/emit", "status":"success"}),
+            json!({"t":"step_finished", "seq":5, "node":"each[1]/emit", "status":"success"}),
+            json!({"t":"step_finished", "seq":6, "node":"build@repair.2/fix", "status":"repaired"}),
+        ] {
+            state.apply(&event).expect("journal event should fold");
+        }
+
+        // Deliberately make the live ValueBag disagree with the durable fold.
+        // Snapshot summaries must reflect NodeOutcome, not transient values.
+        for path in state.nodes.keys() {
+            state.vars.set_step_outcome(
+                path.as_str(),
+                "failed",
+                Some(json!({"code":"execution_failed", "message":"transient value"})),
+            );
+        }
+        let summaries = step_summaries_from_nodes(&state.nodes);
+        assert_eq!(summaries.len(), 6);
+        assert_eq!(
+            summaries["successful"].status,
+            api::StepSummaryStatus::Success
+        );
+        assert_eq!(summaries["successful"].reason, None);
+        assert_eq!(
+            serde_json::to_value(&summaries["successful"]).unwrap(),
+            json!({"status":"success", "reason":null})
+        );
+
+        assert_eq!(summaries["failed"].status, api::StepSummaryStatus::Failed);
+        assert_eq!(
+            serde_json::to_value(summaries["failed"].status).unwrap(),
+            json!("failed")
+        );
+        assert_eq!(
+            summaries["failed"]
+                .reason
+                .as_ref()
+                .map(|detail| detail.code),
+            Some(model::FailureCode::CheckFailed)
+        );
+        assert_eq!(
+            summaries["failed"].reason.as_ref().unwrap().message,
+            "check failed"
+        );
+        assert_eq!(summaries["skipped"].status, api::StepSummaryStatus::Skipped);
+        assert_eq!(
+            summaries["skipped"]
+                .reason
+                .as_ref()
+                .map(|detail| detail.code),
+            Some(model::FailureCode::WhenFalse)
+        );
+        assert!(summaries["skipped"].reason.is_some());
+
+        assert_eq!(
+            summaries["each[0]/emit"].status,
+            api::StepSummaryStatus::Success
+        );
+        assert_eq!(
+            summaries["each[1]/emit"].status,
+            api::StepSummaryStatus::Success
+        );
+        assert!(summaries.contains_key("build@repair.2/fix"));
+        assert_eq!(
+            summaries["build@repair.2/fix"].status,
+            api::StepSummaryStatus::Success,
+            "repaired outcomes map to terminal success without rewriting the canonical path"
+        );
+        assert_eq!(
+            summaries
+                .keys()
+                .filter(|path| path.starts_with("each["))
+                .count(),
+            2,
+            "each canonical foreach child path must occupy its own map entry"
+        );
     }
 }

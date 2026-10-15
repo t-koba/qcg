@@ -1304,6 +1304,7 @@ mod tests {
             parent_run_id: None,
             metrics: None,
             labels: std::collections::BTreeMap::new(),
+            step_summaries: std::collections::BTreeMap::new(),
         }
     }
 

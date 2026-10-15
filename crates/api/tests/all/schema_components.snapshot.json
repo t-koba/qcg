@@ -107,6 +107,8 @@
   "StepRetryEventData",
   "StepStartedEventData",
   "StepStatus",
+  "StepSummary",
+  "StepSummaryStatus",
   "StructuredOutputMode",
   "TokenUsageEventData",
   "ToolBackendResolvedEventData",

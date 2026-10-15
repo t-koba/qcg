@@ -1,5 +1,5 @@
 use contract::{AssetSpec, GeneratorMeta, InputField, InputSpec, Permissions};
-use model::{OutputManifest, RunMetrics};
+use model::{FailureDetail, OutputManifest, RunMetrics};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -160,6 +160,23 @@ pub enum QueuePositionQuality {
     Unavailable,
 }
 
+/// Terminal outcome of one step execution, projected from the run journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StepSummaryStatus {
+    Success,
+    Failed,
+    Skipped,
+}
+
+/// Journal-folded terminal summary for one canonical node path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct StepSummary {
+    pub status: StepSummaryStatus,
+    /// Present for failed and skipped steps; success has no reason.
+    pub reason: Option<FailureDetail>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RunSnapshot {
     pub run_id: String,
@@ -196,6 +213,9 @@ pub struct RunSnapshot {
     /// Run metadata admitted with the run; never authorization.
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    /// Terminal outcomes folded from journal records, keyed by canonical
+    /// `NodePath` strings. Live values and outputs are not summarized here.
+    pub step_summaries: BTreeMap<String, StepSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

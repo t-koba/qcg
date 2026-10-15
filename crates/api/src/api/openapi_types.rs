@@ -5,7 +5,8 @@ use super::dto::{
     AnswerPayload, ConfirmDecision, ForkRun, ForkStatePatch, GeneratorDetail, GeneratorSummary,
     LlmCatalogCapabilities, LlmCatalogModel, LlmCatalogProvider, LlmCatalogResponse,
     LlmCatalogSource, McpAuthorizationStart, McpServerList, McpServerSummary, ProblemDetails,
-    RunCostMetrics, RunListItem, RunListOrder, RunListResponse, RunSnapshot, StartRun,
+    RunCostMetrics, RunListItem, RunListOrder, RunListResponse, RunSnapshot, StartRun, StepSummary,
+    StepSummaryStatus,
 };
 use super::openapi_doc::{insert_schema, openapi_paths};
 use crate::events::RunEvent;
@@ -90,6 +91,8 @@ pub fn openapi_components() -> Value {
     insert_schema::<ForkStatePatch>(&mut schemas, "ForkStatePatch");
     insert_schema::<ForkRun>(&mut schemas, "ForkRun");
     insert_schema::<RunSnapshot>(&mut schemas, "RunSnapshot");
+    insert_schema::<StepSummary>(&mut schemas, "StepSummary");
+    insert_schema::<StepSummaryStatus>(&mut schemas, "StepSummaryStatus");
     insert_schema::<RunCostMetrics>(&mut schemas, "RunCostMetrics");
     insert_schema::<RunListItem>(&mut schemas, "RunListItem");
     insert_schema::<RunListResponse>(&mut schemas, "RunListResponse");

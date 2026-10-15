@@ -247,7 +247,12 @@ function pySnapshotTypes() {
     if (field.$ref) {
       const name = field.$ref.split('/').at(-1);
       if (enumValues(spec.components.schemas[name] ?? {})) { enums.add(name); return name; }
+      if (name === "StepSummary") return name;
       return "dict[str, Any]";
+    }
+    if (field.type === "object" && field.additionalProperties?.$ref === "#/components/schemas/StepSummary") {
+      type(field.additionalProperties);
+      return "dict[str, StepSummary]";
     }
     if (field.anyOf) return [...new Set(field.anyOf.map(type))].join(" | ");
     if (Array.isArray(field.type)) return field.type.map(value => type({type:value})).join(" | ");
@@ -262,11 +267,16 @@ function pySnapshotTypes() {
       default: return "Any";
     }
   };
+  const summarySchema = spec.components.schemas.StepSummary;
+  const summaryFields = Object.entries(summarySchema.properties).map(([name, field]) => [name, type(field)]);
   const fields = Object.entries(schema.properties).map(([name, field]) => [name, type(field)]);
   const required = new Set(schema.required);
   const aliases = [...enums].sort().map(name => `${name} = Literal[${enumValues(spec.components.schemas[name]).map(value => JSON.stringify(value)).join(", ")}]`).join("\n");
   const members = (needed) => fields.filter(([name]) => required.has(name) === needed).map(([name, value]) => `    ${name}: ${value}`).join("\n");
-  return `${aliases}\n\n\nclass _RunSnapshotRequired(TypedDict):\n${members(true)}\n\n\nclass RunSnapshot(_RunSnapshotRequired, total=False):\n${members(false)}`;
+  const summaryRequired = new Set(summarySchema.required);
+  const summaryRequiredMembers = summaryFields.filter(([name]) => summaryRequired.has(name)).map(([name, value]) => `    ${name}: ${value}`).join("\n");
+  const summaryOptionalMembers = summaryFields.filter(([name]) => !summaryRequired.has(name)).map(([name, value]) => `    ${name}: ${value}`).join("\n");
+  return `${aliases}\n\n\nclass _StepSummaryRequired(TypedDict):\n${summaryRequiredMembers}\n\n\nclass StepSummary(_StepSummaryRequired, total=False):\n${summaryOptionalMembers}\n\n\nclass _RunSnapshotRequired(TypedDict):\n${members(true)}\n\n\nclass RunSnapshot(_RunSnapshotRequired, total=False):\n${members(false)}`;
 }
 
 function pyOperation(entry) {

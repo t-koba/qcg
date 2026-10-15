@@ -2878,6 +2878,13 @@ export interface components {
              */
             seq: number;
             state: components["schemas"]["RunStatus"];
+            /**
+             * @description Terminal outcomes folded from journal records, keyed by canonical
+             *     `NodePath` strings. Live values and outputs are not summarized here.
+             */
+            step_summaries: {
+                [key: string]: components["schemas"]["StepSummary"];
+            };
         };
         RunStartedEventData: {
             /** @default {} */
@@ -3053,6 +3060,21 @@ export interface components {
         };
         /** @enum {string} */
         StepStatus: "success" | "repaired" | "routed" | "repair_exhausted" | "answered_on_fail" | "regenerated" | "regenerate_exhausted" | "needs_user" | "needs_confirm" | "check_failed" | "failed";
+        /**
+         * StepSummary
+         * @description Journal-folded terminal summary for one canonical node path.
+         */
+        StepSummary: {
+            /** @description Present for failed and skipped steps; success has no reason. */
+            reason?: components["schemas"]["FailureDetail"] | null;
+            status: components["schemas"]["StepSummaryStatus"];
+        };
+        /**
+         * StepSummaryStatus
+         * @description Terminal outcome of one step execution, projected from the run journal.
+         * @enum {string}
+         */
+        StepSummaryStatus: "success" | "failed" | "skipped";
         /** @enum {string} */
         StructuredOutputMode: "auto" | "native_strict" | "native_compatible" | "prompt";
         TokenUsageEventData: {

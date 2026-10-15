@@ -3064,12 +3064,20 @@
           },
           "state": {
             "$ref": "#/components/schemas/RunStatus"
+          },
+          "step_summaries": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/StepSummary"
+            },
+            "description": "Terminal outcomes folded from journal records, keyed by canonical\n`NodePath` strings. Live values and outputs are not summarized here.",
+            "type": "object"
           }
         },
         "required": [
           "run_id",
           "state",
-          "generator_id"
+          "generator_id",
+          "step_summaries"
         ],
         "title": "RunSnapshot",
         "type": "object"
@@ -3510,6 +3518,42 @@
           "check_failed",
           "failed"
         ],
+        "type": "string"
+      },
+      "StepSummary": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Journal-folded terminal summary for one canonical node path.",
+        "properties": {
+          "reason": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FailureDetail"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Present for failed and skipped steps; success has no reason."
+          },
+          "status": {
+            "$ref": "#/components/schemas/StepSummaryStatus"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "StepSummary",
+        "type": "object"
+      },
+      "StepSummaryStatus": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Terminal outcome of one step execution, projected from the run journal.",
+        "enum": [
+          "success",
+          "failed",
+          "skipped"
+        ],
+        "title": "StepSummaryStatus",
         "type": "string"
       },
       "StructuredOutputMode": {

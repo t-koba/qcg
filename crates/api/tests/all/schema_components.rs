@@ -274,3 +274,25 @@ fn openapi_file_value_requires_exclusive_content_and_safe_name() {
     assert_eq!(file_value["properties"]["text"]["type"], "string");
     assert_eq!(file_value["properties"]["content_base64"]["type"], "string");
 }
+
+#[test]
+fn run_snapshot_step_summaries_schema_is_typed_and_required() {
+    let components = api::openapi_components();
+    let snapshot = &components["schemas"]["RunSnapshot"];
+    assert!(
+        snapshot["required"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::String("step_summaries".into()))
+    );
+    assert_eq!(
+        snapshot["properties"]["step_summaries"]["additionalProperties"]["$ref"],
+        "#/components/schemas/StepSummary"
+    );
+    let status = &components["schemas"]["StepSummaryStatus"]["enum"];
+    assert_eq!(status, &serde_json::json!(["success", "failed", "skipped"]));
+    assert_eq!(
+        components["schemas"]["StepSummary"]["properties"]["reason"]["anyOf"][1]["type"],
+        "null"
+    );
+}

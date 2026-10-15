@@ -75,6 +75,7 @@ fn conditional_json_star_matches_any_existing_snapshot() {
         parent_run_id: None,
         metrics: None,
         labels: BTreeMap::new(),
+        step_summaries: BTreeMap::new(),
     };
     let body = serde_json::to_vec(&snapshot).expect("snapshot should serialize");
     let mut star = axum::http::HeaderMap::new();

@@ -14,12 +14,22 @@ from urllib.parse import quote, urlencode
 
 QueuePositionQuality = Literal["exact", "estimated", "unavailable"]
 RunStatus = Literal["queued", "running", "waiting", "confirming", "succeeded", "failed", "canceled", "interrupted", "cancel_requested"]
+StepSummaryStatus = Literal["success", "failed", "skipped"]
+
+
+class _StepSummaryRequired(TypedDict):
+    status: StepSummaryStatus
+
+
+class StepSummary(_StepSummaryRequired, total=False):
+    reason: dict[str, Any] | None
 
 
 class _RunSnapshotRequired(TypedDict):
     generator_id: str
     run_id: str
     state: RunStatus
+    step_summaries: dict[str, StepSummary]
 
 
 class RunSnapshot(_RunSnapshotRequired, total=False):

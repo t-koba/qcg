@@ -118,6 +118,23 @@ enabled = false"#,
         .expect("expression foreach should start");
     let snapshot = wait_for_terminal_snapshot(&service, &id).await;
     assert_eq!(snapshot.state, RunStatus::Succeeded);
+    for path in ["emit_sites[0]/write_site", "emit_sites[1]/write_site"] {
+        assert_eq!(
+            snapshot.step_summaries[path].status,
+            api::StepSummaryStatus::Success,
+            "each foreach iteration must keep its canonical child path"
+        );
+        assert!(snapshot.step_summaries[path].reason.is_none());
+    }
+    assert_eq!(
+        snapshot
+            .step_summaries
+            .keys()
+            .filter(|path| path.starts_with("emit_sites["))
+            .count(),
+        2,
+        "the two foreach children must not collapse to one node id"
+    );
     let workspace = run_workspace_dir(&runs.join(&id));
     assert_eq!(
         std::fs::read_to_string(workspace.join("sites/a.txt")).expect("site a should render"),
