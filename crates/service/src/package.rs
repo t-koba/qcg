@@ -960,6 +960,261 @@ pub fn verify_installed_package(
     verify_package_inventory(root, limits)
 }
 
+/// Computes a deterministic SHA-256 identity for a raw generator directory.
+/// Every non-root entry contributes its portable relative path, kind, and
+/// permission mode; regular-file bytes are streamed into the hash. Timestamps
+/// and filesystem traversal order are excluded. Symlinks, special entries,
+/// unsafe paths, concurrent changes, and configured entry/byte limit
+/// violations fail closed.
+pub fn package_identity_sha256(
+    root: &Utf8Path,
+    limits: &PackageLimits,
+) -> Result<String, ServiceError> {
+    let initial = collect_identity_entries(root, limits)?;
+    let mut digest = sha2::Sha256::new();
+    use sha2::Digest as _;
+    digest.update(b"qcg-package-identity-v1\0");
+    let entry_count = u64::try_from(initial.len())
+        .map_err(|_| ServiceError::Invalid("package entry count overflowed".into()))?;
+    digest.update(entry_count.to_le_bytes());
+
+    let mut total_bytes = 0_u64;
+    for entry in &initial {
+        let path_bytes = entry.relative.as_bytes();
+        let path_len = u64::try_from(path_bytes.len())
+            .map_err(|_| ServiceError::Invalid("package path length overflowed".into()))?;
+        digest.update(path_len.to_le_bytes());
+        digest.update(path_bytes);
+        digest.update([if entry.is_dir { 1 } else { 0 }]);
+        digest.update(entry.mode.to_le_bytes());
+        if entry.is_dir {
+            continue;
+        }
+
+        digest.update(entry.size.to_le_bytes());
+        let mut file = files::open_read_nofollow(&entry.path).map_err(|_error| {
+            if std::fs::symlink_metadata(&entry.path)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                ServiceError::Invalid("package source contains a symbolic link".into())
+            } else {
+                ServiceError::Invalid("failed to open a package file".into())
+            }
+        })?;
+        let opened = file
+            .metadata()
+            .map_err(|_| ServiceError::Invalid("failed to inspect a package file".into()))?;
+        if !identity_metadata_matches(entry, &opened, false) {
+            return Err(ServiceError::Invalid(
+                "a package file changed while its identity was computed".into(),
+            ));
+        }
+
+        let mut file_bytes = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            use std::io::Read as _;
+            let read_len = file.read(&mut buffer).map_err(ServiceError::Io)?;
+            if read_len == 0 {
+                break;
+            }
+            let read_bytes = u64::try_from(read_len)
+                .map_err(|_| ServiceError::Invalid("package byte count overflowed".into()))?;
+            file_bytes = file_bytes
+                .checked_add(read_bytes)
+                .ok_or_else(|| ServiceError::Invalid("package byte count overflowed".into()))?;
+            total_bytes = total_bytes
+                .checked_add(read_bytes)
+                .ok_or_else(|| ServiceError::Invalid("package byte count overflowed".into()))?;
+            if let Some(limit) = limits.max_bytes
+                && total_bytes > limit
+            {
+                return Err(ServiceError::Invalid(format!(
+                    "package source exceeds {limit} bytes"
+                )));
+            }
+            digest.update(&buffer[..read_len]);
+        }
+        let after = file.metadata().map_err(ServiceError::Io)?;
+        if file_bytes != entry.size || !identity_metadata_matches(entry, &after, false) {
+            return Err(ServiceError::Invalid(
+                "a package file changed while its identity was computed".into(),
+            ));
+        }
+    }
+
+    // A second inventory detects additions, removals, replacements, and mode
+    // changes that raced the streaming pass. Its traversal order is likewise
+    // discarded before comparison.
+    let final_inventory = collect_identity_entries(root, limits)?;
+    if initial.len() != final_inventory.len()
+        || initial
+            .iter()
+            .zip(&final_inventory)
+            .any(|(before, after)| !identity_entries_match(before, after))
+    {
+        return Err(ServiceError::Invalid(
+            "package source changed while its identity was computed".into(),
+        ));
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+
+struct IdentityEntry {
+    path: Utf8PathBuf,
+    relative: String,
+    is_dir: bool,
+    mode: u32,
+    size: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+fn collect_identity_entries(
+    root: &Utf8Path,
+    limits: &PackageLimits,
+) -> Result<Vec<IdentityEntry>, ServiceError> {
+    let root_metadata = std::fs::symlink_metadata(root).map_err(ServiceError::Io)?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(ServiceError::Invalid(
+            "package source is not a plain directory".into(),
+        ));
+    }
+
+    let mut entries = Vec::new();
+    let mut total_bytes = 0_u64;
+    for entry in files::WalkDir::new(root) {
+        let entry =
+            entry.map_err(|_| ServiceError::Invalid("failed to walk package source".into()))?;
+        let relative_path = entry.path().strip_prefix(root).map_err(|_| {
+            ServiceError::Invalid("package source yielded an invalid relative path".into())
+        })?;
+        if relative_path.as_str().is_empty() {
+            if entry.file_type().is_symlink() || !entry.file_type().is_dir() {
+                return Err(ServiceError::Invalid(
+                    "package source is not a plain directory".into(),
+                ));
+            }
+            continue;
+        }
+        let relative = portable_relative_path(relative_path);
+        if !is_safe_relative_path(&relative) {
+            return Err(ServiceError::Invalid(
+                "package source contains an unsafe relative path".into(),
+            ));
+        }
+        let file_type = entry.file_type();
+        if file_type.is_symlink() {
+            return Err(ServiceError::Invalid(
+                "package source contains a symbolic link".into(),
+            ));
+        }
+        let is_dir = file_type.is_dir();
+        if !is_dir && !file_type.is_file() {
+            return Err(ServiceError::Invalid(
+                "package source contains an unsupported entry".into(),
+            ));
+        }
+        let metadata = std::fs::symlink_metadata(entry.path()).map_err(ServiceError::Io)?;
+        if metadata.file_type().is_symlink()
+            || metadata.is_dir() != is_dir
+            || (!is_dir && !metadata.is_file())
+        {
+            return Err(ServiceError::Invalid(
+                "package source changed while being inspected".into(),
+            ));
+        }
+        let count = entries
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| ServiceError::Invalid("package entry count overflowed".into()))?;
+        if let Some(limit) = limits.max_entries
+            && count > limit
+        {
+            return Err(ServiceError::Invalid(format!(
+                "package source contains too many entries: {count} > {limit}"
+            )));
+        }
+        let size = if is_dir { 0 } else { metadata.len() };
+        if !is_dir {
+            total_bytes = total_bytes
+                .checked_add(size)
+                .ok_or_else(|| ServiceError::Invalid("package source size overflowed".into()))?;
+            if let Some(limit) = limits.max_bytes
+                && total_bytes > limit
+            {
+                return Err(ServiceError::Invalid(format!(
+                    "package source exceeds {limit} bytes"
+                )));
+            }
+        }
+        let modified = metadata.modified().map_err(ServiceError::Io)?;
+        #[cfg(unix)]
+        let (device, inode) = {
+            use std::os::unix::fs::MetadataExt as _;
+            (metadata.dev(), metadata.ino())
+        };
+        entries.push(IdentityEntry {
+            path: entry.path().to_path_buf(),
+            relative,
+            is_dir,
+            mode: explicit_source_mode(&metadata, is_dir),
+            size,
+            modified,
+            #[cfg(unix)]
+            device,
+            #[cfg(unix)]
+            inode,
+        });
+    }
+    entries.sort_by(|left, right| left.relative.cmp(&right.relative));
+    Ok(entries)
+}
+
+fn identity_metadata_matches(
+    entry: &IdentityEntry,
+    metadata: &std::fs::Metadata,
+    is_dir: bool,
+) -> bool {
+    if metadata.is_dir() != is_dir
+        || (!is_dir && !metadata.is_file())
+        || explicit_source_mode(metadata, is_dir) != entry.mode
+        || (!is_dir && metadata.len() != entry.size)
+        || metadata.modified().ok() != Some(entry.modified)
+    {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.dev() != entry.device || metadata.ino() != entry.inode {
+            return false;
+        }
+    }
+    true
+}
+
+fn identity_entries_match(left: &IdentityEntry, right: &IdentityEntry) -> bool {
+    left.relative == right.relative
+        && left.is_dir == right.is_dir
+        && left.mode == right.mode
+        && left.size == right.size
+        && left.modified == right.modified
+        && {
+            #[cfg(unix)]
+            {
+                left.device == right.device && left.inode == right.inode
+            }
+            #[cfg(not(unix))]
+            {
+                true
+            }
+        }
+}
+
 pub fn copy_dir_all(
     source: &Utf8Path,
     target: &Utf8Path,
@@ -1574,6 +1829,111 @@ mod tests {
                 tracing::warn!(path = %self.0, %error, "test temp cleanup failed");
             }
         }
+    }
+
+    #[test]
+    fn package_identity_is_independent_of_creation_order() {
+        let root = temp_dir("identity-order");
+        let _temp_guard = TempGuard(root.clone());
+        let left = root.join("left");
+        let right = root.join("right");
+        std::fs::create_dir_all(left.join("nested")).expect("left dirs");
+        std::fs::write(left.join("alpha.txt"), b"alpha").expect("left alpha");
+        std::fs::write(left.join("nested/beta.txt"), b"beta").expect("left beta");
+
+        std::fs::create_dir_all(right.join("nested")).expect("right dirs");
+        std::fs::write(right.join("nested/beta.txt"), b"beta").expect("right beta");
+        std::fs::write(right.join("alpha.txt"), b"alpha").expect("right alpha");
+
+        let left_id =
+            package_identity_sha256(&left, &PackageLimits::default()).expect("left identity");
+        let right_id =
+            package_identity_sha256(&right, &PackageLimits::default()).expect("right identity");
+        assert_eq!(left_id, right_id);
+    }
+
+    #[test]
+    fn package_identity_changes_with_content_and_path() {
+        let root = temp_dir("identity-content-path");
+        let _temp_guard = TempGuard(root.clone());
+        std::fs::create_dir_all(&root).expect("root");
+        let file = root.join("before.txt");
+        std::fs::write(&file, b"before").expect("file");
+        let original =
+            package_identity_sha256(&root, &PackageLimits::default()).expect("original identity");
+
+        std::fs::write(&file, b"after!").expect("edited content");
+        let content_edit = package_identity_sha256(&root, &PackageLimits::default())
+            .expect("content-edited identity");
+        assert_ne!(original, content_edit);
+
+        std::fs::rename(&file, root.join("after.txt")).expect("rename");
+        let path_edit = package_identity_sha256(&root, &PackageLimits::default())
+            .expect("path-edited identity");
+        assert_ne!(content_edit, path_edit);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_identity_changes_with_permission_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = temp_dir("identity-mode");
+        let _temp_guard = TempGuard(root.clone());
+        std::fs::create_dir_all(&root).expect("root");
+        let file = root.join("tool");
+        std::fs::write(&file, b"same bytes").expect("file");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644))
+            .expect("initial mode");
+        let before = package_identity_sha256(&root, &PackageLimits::default())
+            .expect("identity before mode edit");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755))
+            .expect("executable mode");
+        let after = package_identity_sha256(&root, &PackageLimits::default())
+            .expect("identity after mode edit");
+        assert_ne!(before, after);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_identity_refuses_symlinks() {
+        use std::os::unix::fs::symlink;
+        let root = temp_dir("identity-symlink");
+        let _temp_guard = TempGuard(root.clone());
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(root.join("target.txt"), b"target").expect("target");
+        symlink(root.join("target.txt"), root.join("link.txt")).expect("symlink");
+        let error = package_identity_sha256(&root, &PackageLimits::default())
+            .expect_err("a symlink must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("symbolic link"), "{message}");
+        assert!(
+            !message.contains(root.as_str()),
+            "package identity errors must not expose the absolute package path"
+        );
+    }
+
+    #[test]
+    fn package_identity_enforces_entry_and_byte_limits() {
+        let root = temp_dir("identity-limits");
+        let _temp_guard = TempGuard(root.clone());
+        std::fs::create_dir_all(root.join("nested")).expect("nested dir");
+        std::fs::write(root.join("nested/data.txt"), b"1234").expect("data");
+
+        let entry_limited = PackageLimits {
+            max_entries: Some(1),
+            ..PackageLimits::default()
+        };
+        let error = package_identity_sha256(&root, &entry_limited)
+            .expect_err("directory and file exceed one entry");
+        assert!(error.to_string().contains("too many entries"), "{error}");
+
+        let byte_limited = PackageLimits {
+            max_bytes: Some(3),
+            ..PackageLimits::default()
+        };
+        let error = package_identity_sha256(&root, &byte_limited)
+            .expect_err("four bytes exceed the configured limit");
+        assert!(error.to_string().contains("exceeds 3 bytes"), "{error}");
     }
 
     #[cfg(unix)]
