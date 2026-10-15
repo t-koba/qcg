@@ -4232,9 +4232,14 @@ fields are rejected when their structs define a closed schema.
    them and their `fail` policy adds to the recorded failure list.
    Hooks must not suspend: `ask_user`, `await`, and `foreach` are rejected at
    contract load, and a runtime suspension is a hook failure under
-   `on_error`. A hook that cannot run because the run budget is exhausted is
-   recorded as a durable `hook_skipped` event with `reason = "budget"` and is
-   not a failure: a hook never fails a successful run for lack of budget. A failure records a durable `hook_failed` event; `warn`
+   `on_error`. A hook that cannot run because a step, token, or cost budget is
+   exhausted is recorded as a durable `hook_skipped` event with
+   `reason = "budget"` and is not a failure. The elapsed deadline remains hard:
+   outside failed settlement an elapsed error is propagated and cannot be
+   downgraded by `warn`. During failed settlement, failure hooks reached after
+   the elapsed deadline, or interrupted by it, are recorded as skipped without
+   adding a hook failure to the original run failure. A failure records a
+   durable `hook_failed` event; `warn`
    continues the run, `fail` ends it with the hook error. Hook ids share the
    flow-node id namespace and must be unique.
 

@@ -234,6 +234,28 @@ impl Engine {
                 journal.event("hook_replayed", json!({ "hook": node.id, "event": event }))?;
                 continue;
             }
+            // Failure hooks cannot extend an elapsed-budget overrun. Check
+            // before recording a start or constructing the hook future so a
+            // post-deadline hook cannot perform side effects during the
+            // cooperative cancellation grace.
+            if is_failure_settlement_event(event) {
+                match context.run_checkpoint() {
+                    Ok(()) => {}
+                    Err(error) if is_elapsed_exhaustion(&error) => {
+                        journal.event(
+                            "hook_skipped",
+                            json!({
+                                "hook": node.id,
+                                "event": event,
+                                "reason": "budget",
+                                "error": error.to_string(),
+                            }),
+                        )?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             journal.event(
                 "step_started",
                 json!({ "node": node.id, "type": node.kind.to_string(), "attempt": 1 }),
@@ -246,11 +268,22 @@ impl Engine {
                 // Cancellation always aborts the run: it is never a hook
                 // outcome the contract can downgrade to a warning.
                 Err(error) if error.is_canceled() => return Err(error),
+                // The elapsed limit is hard outside failed settlement: do
+                // not let `warn` downgrade it or commit a successful run.
+                Err(error)
+                    if is_elapsed_exhaustion(&error) && !is_failure_settlement_event(event) =>
+                {
+                    return Err(error);
+                }
                 // An exhausted run budget is not a hook failure the
                 // contract can act on: the run already spent its allowance.
                 // The skip is recorded durably instead of silently dropping
                 // the hook or failing an otherwise successful run.
-                Err(error) if is_budget_exhaustion(&error) => {
+                Err(error)
+                    if is_budget_exhaustion(&error)
+                        || (is_failure_settlement_event(event)
+                            && is_elapsed_exhaustion(&error)) =>
+                {
                     journal.event(
                         "hook_skipped",
                         json!({
@@ -736,7 +769,7 @@ impl Engine {
                     // continue scheduling (dependents skip) toward
                     // settlement instead of bypassing failure hooks.
                     // Distinct classifications survive settlement (F07+E11).
-                    if is_budget_exhaustion(&error) {
+                    if is_budget_exhaustion(&error) || is_elapsed_exhaustion(&error) {
                         if first_distinct_error.is_none() {
                             first_distinct_error = Some(error);
                         }
@@ -801,7 +834,7 @@ impl Engine {
                         // Budget exhaustion cannot progress further: break
                         // to settlement instead of failing every remaining
                         // node identically.
-                        if is_budget_exhaustion(&error) {
+                        if is_budget_exhaustion(&error) || is_elapsed_exhaustion(&error) {
                             if first_distinct_error.is_none() {
                                 first_distinct_error = Some(error);
                             }
@@ -1339,7 +1372,7 @@ impl Engine {
     }
 }
 
-/// Whether a hook error is run-budget exhaustion rather than a hook failure.
+/// Whether an error exhausted a non-elapsed run budget.
 fn is_budget_exhaustion(error: &EngineError) -> bool {
     match error {
         EngineError::Step(StepError::BudgetExceeded { .. }) => true,
@@ -1348,6 +1381,14 @@ fn is_budget_exhaustion(error: &EngineError) -> bool {
         }
         _ => false,
     }
+}
+
+fn is_elapsed_exhaustion(error: &EngineError) -> bool {
+    matches!(error, EngineError::Step(StepError::ElapsedExceeded { .. }))
+}
+
+fn is_failure_settlement_event(event: &str) -> bool {
+    matches!(event, "step_failed" | "run_failed")
 }
 
 /// Execution errors with a distinct caller-visible classification (F07+E11):

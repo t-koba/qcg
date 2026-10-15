@@ -2761,6 +2761,215 @@ async fn elapsed_budget_is_a_hard_deadline() {
     let _ = std::fs::remove_dir_all(&run_dir);
 }
 
+struct CooperativeWaitStep {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl StepExecutor for CooperativeWaitStep {
+    fn type_id(&self) -> &'static str {
+        "test.cooperative_wait"
+    }
+
+    async fn execute(
+        &self,
+        ctx: &mut StepContext<'_>,
+        _node: &NodeDef,
+    ) -> Result<StepOutcome, StepError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                Ok(StepOutcome::Success {
+                    output: None,
+                    files: vec![],
+                })
+            }
+            _ = ctx.run.cancellation.cancelled() => Err(StepError::Cancelled),
+        }
+    }
+}
+
+#[tokio::test]
+async fn elapsed_node_overrun_settles_and_skips_failure_hooks() {
+    let slow_calls = Arc::new(AtomicUsize::new(0));
+    let later_calls = Arc::new(AtomicUsize::new(0));
+    let mut manifest = manifest(vec![
+        node("slow", "test.cooperative_wait"),
+        node("later", "test.pass"),
+    ]);
+    manifest.budget.max_elapsed_seconds = Some(3);
+    manifest
+        .hooks
+        .step_failed
+        .push(hook("report", "test.pass", HookErrorPolicy::Fail));
+    manifest
+        .hooks
+        .run_failed
+        .push(hook("notify", "test.pass", HookErrorPolicy::Fail));
+    let run_dir = temp_run_dir("elapsed-node-failure-hooks");
+    let contract = test_contract(&run_dir, manifest);
+    let mut registry = StepRegistry::new();
+    registry.register(CooperativeWaitStep {
+        calls: Arc::clone(&slow_calls),
+    });
+    registry.register(CountingPassStep {
+        calls: Arc::clone(&later_calls),
+    });
+
+    let error = Engine::new(registry)
+        .run_with_id(
+            "elapsed-node-failure-hooks".into(),
+            run_dir.join("meta"),
+            contract,
+            BTreeMap::new(),
+            run_options(run_dir.join("workspace")),
+        )
+        .await
+        .expect_err("the elapsed node must fail and settle");
+    assert!(
+        matches!(
+            error,
+            EngineError::Step(StepError::ElapsedExceeded { limit_secs: 3, .. })
+        ),
+        "the elapsed error must remain the run result: {error}"
+    );
+    assert_eq!(slow_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        later_calls.load(Ordering::SeqCst),
+        0,
+        "the run must not schedule more work after elapsed exhaustion"
+    );
+
+    let journal =
+        std::fs::read_to_string(run_dir.join("meta/journal.jsonl")).expect("journal reads");
+    assert_eq!(
+        journal.matches("\"t\":\"hook_skipped\"").count(),
+        2,
+        "both failure hooks must be durably skipped: {journal}"
+    );
+    assert!(journal.contains("\"reason\":\"budget\""), "{journal}");
+    assert!(!journal.contains("\"t\":\"hook_failed\""), "{journal}");
+    assert!(!journal.contains("ExecutionFailed"), "{journal}");
+    assert!(
+        journal.contains("\"t\":\"run_finished\"") && journal.contains("\"status\":\"failed\""),
+        "the original run failure must settle durably: {journal}"
+    );
+    let _ = std::fs::remove_dir_all(&run_dir);
+}
+
+#[tokio::test]
+async fn elapsed_overrun_skips_failure_hooks_without_hook_failures() {
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    let notify_calls = Arc::new(AtomicUsize::new(0));
+    let mut manifest = manifest(vec![node("broken", "test.check_fail")]);
+    manifest.budget.max_elapsed_seconds = Some(3);
+    manifest
+        .hooks
+        .step_failed
+        .push(hook("wait", "test.cooperative_wait", HookErrorPolicy::Fail));
+    manifest
+        .hooks
+        .run_failed
+        .push(hook("notify", "test.pass", HookErrorPolicy::Fail));
+    let run_dir = temp_run_dir("elapsed-failure-hooks");
+    let contract = test_contract(&run_dir, manifest);
+    let mut registry = StepRegistry::new();
+    registry.register(TestCheckFailStep);
+    registry.register(CooperativeWaitStep {
+        calls: Arc::clone(&hook_calls),
+    });
+    registry.register(CountingPassStep {
+        calls: Arc::clone(&notify_calls),
+    });
+
+    let error = Engine::new(registry)
+        .run_with_id(
+            "elapsed-failure-hooks".into(),
+            run_dir.join("meta"),
+            contract,
+            BTreeMap::new(),
+            run_options(run_dir.join("workspace")),
+        )
+        .await
+        .expect_err("the failed hook must not turn the run into a hook failure");
+    assert!(
+        matches!(error, EngineError::Failed(_)),
+        "the original node failure must remain the run result: {error}"
+    );
+    assert_eq!(
+        hook_calls.load(Ordering::SeqCst),
+        1,
+        "the step_failed hook should start before the elapsed deadline"
+    );
+    assert_eq!(
+        notify_calls.load(Ordering::SeqCst),
+        0,
+        "the run_failed hook must not begin after the elapsed deadline"
+    );
+
+    let journal =
+        std::fs::read_to_string(run_dir.join("meta/journal.jsonl")).expect("journal reads");
+    assert_eq!(
+        journal.matches("\"t\":\"hook_skipped\"").count(),
+        2,
+        "the interrupted and post-deadline failure hooks must be durably skipped: {journal}"
+    );
+    assert!(journal.contains("\"reason\":\"budget\""), "{journal}");
+    assert!(!journal.contains("\"t\":\"hook_failed\""), "{journal}");
+    assert!(!journal.contains("ExecutionFailed"), "{journal}");
+    assert!(
+        journal.contains("\"t\":\"run_finished\"") && journal.contains("\"status\":\"failed\""),
+        "the original run failure must settle durably: {journal}"
+    );
+    let _ = std::fs::remove_dir_all(&run_dir);
+}
+
+#[tokio::test]
+async fn elapsed_overrun_in_run_succeeded_hook_does_not_commit_success() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut manifest = manifest(vec![]);
+    manifest.budget.max_elapsed_seconds = Some(3);
+    manifest
+        .hooks
+        .run_succeeded
+        .push(hook("wait", "test.cooperative_wait", HookErrorPolicy::Warn));
+    let run_dir = temp_run_dir("elapsed-run-succeeded-hook");
+    let contract = test_contract(&run_dir, manifest);
+    let mut registry = StepRegistry::new();
+    registry.register(CooperativeWaitStep {
+        calls: Arc::clone(&calls),
+    });
+
+    let error = Engine::new(registry)
+        .run_with_id(
+            "elapsed-run-succeeded-hook".into(),
+            run_dir.join("meta"),
+            contract,
+            BTreeMap::new(),
+            run_options(run_dir.join("workspace")),
+        )
+        .await
+        .expect_err("a run_succeeded hook cannot downgrade the hard elapsed limit");
+    assert!(
+        matches!(
+            error,
+            EngineError::Step(StepError::ElapsedExceeded { limit_secs: 3, .. })
+        ),
+        "the elapsed error must remain the run result: {error}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the hook must be exercised"
+    );
+
+    let journal =
+        std::fs::read_to_string(run_dir.join("meta/journal.jsonl")).expect("journal reads");
+    assert!(!journal.contains("\"t\":\"hook_failed\""), "{journal}");
+    assert!(!journal.contains("\"status\":\"success\""), "{journal}");
+    let _ = std::fs::remove_dir_all(&run_dir);
+}
+
 #[tokio::test]
 async fn elapsed_deadline_binds_the_final_operation() {
     // E11 acceptance triple: a 2s side-effect-free FINAL operation with
