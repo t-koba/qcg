@@ -33,6 +33,42 @@ async fn package_sha256(client: &reqwest::Client, base: &str, generator_id: &str
         .to_string()
 }
 
+/// Keep the API error body in CI failures instead of discarding it through
+/// `error_for_status()`, while redacting the controlled workspace/temp roots.
+/// Admission must still return exactly 201.
+async fn created_snapshot(response: reqwest::Response) -> Value {
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .expect("start response should be text");
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CREATED,
+        "unexpected start response: {}",
+        redact_ci_paths(&body)
+    );
+    serde_json::from_str(&body).expect("start response should be JSON")
+}
+
+fn redact_ci_paths(message: &str) -> String {
+    let mut redacted = message.to_owned();
+    let roots = [
+        workspace_root().as_str().to_owned(),
+        std::env::temp_dir().to_string_lossy().into_owned(),
+    ];
+    for root in roots {
+        if root.is_empty() {
+            continue;
+        }
+        let portable = root.replace('\\', "/");
+        redacted = redacted
+            .replace(&root, "<path>")
+            .replace(&portable, "<path>");
+    }
+    redacted
+}
+
 /// Restores `TEST_TOKEN` on drop so a panicking assertion cannot leak
 /// the canary into the process environment for later tests. Callers hold
 /// `ENV_LOCK` for the whole mutation window, and the guard is declared
@@ -1954,7 +1990,7 @@ async fn agent_secret_tool_result_never_reaches_sse() {
     ));
     let client = reqwest::Client::new();
     let base = format!("http://127.0.0.1:{port}");
-    let start: Value = client
+    let start_response = client
         .post(format!("{base}/api/runs"))
         .header(
             "x-qcg-package-sha256",
@@ -1963,12 +1999,8 @@ async fn agent_secret_tool_result_never_reaches_sse() {
         .json(&json!({ "generator_id": "agent-secret-result", "inputs": {} }))
         .send()
         .await
-        .expect("run should start")
-        .error_for_status()
-        .expect("start response should be ok")
-        .json()
-        .await
-        .expect("start response should be JSON");
+        .expect("run should start");
+    let start = created_snapshot(start_response).await;
     let run_id = start["run_id"].as_str().expect("run_id should exist");
     let events = read_sse_until_terminal(&client, &base, run_id).await;
     server.abort();
@@ -2215,7 +2247,7 @@ async fn http_concurrent_runs_keep_artifacts_and_journals_isolated() {
             let base = base.clone();
             tokio::spawn(async move {
                 barrier.wait().await;
-                let snapshot: Value = client
+                let response = client
                     .post(format!("{base}/api/runs"))
                     .header(
                         "x-qcg-package-sha256",
@@ -2227,12 +2259,8 @@ async fn http_concurrent_runs_keep_artifacts_and_journals_isolated() {
                     }))
                     .send()
                     .await
-                    .expect("concurrent run should start")
-                    .error_for_status()
-                    .expect("start response should be successful")
-                    .json()
-                    .await
-                    .expect("start response should be JSON");
+                    .expect("concurrent run should start");
+                let snapshot = created_snapshot(response).await;
                 let run_id = snapshot["run_id"]
                     .as_str()
                     .expect("start response should contain run_id")
@@ -2701,11 +2729,7 @@ async fn http_server_start_requires_package_identity_but_not_authentication() {
         .send()
         .await
         .expect("inline file run should respond");
-    assert_eq!(inline_file.status(), reqwest::StatusCode::CREATED);
-    let inline_snapshot: Value = inline_file
-        .json()
-        .await
-        .expect("inline file snapshot should be JSON");
+    let inline_snapshot = created_snapshot(inline_file).await;
     let inline_run_id = inline_snapshot["run_id"]
         .as_str()
         .expect("inline file run id should be present");

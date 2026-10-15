@@ -64,7 +64,17 @@ pub(crate) fn copy(
 ) -> Result<Contract, ServiceError> {
     let target = package_dir(run_dir);
     std::fs::create_dir(&target)?;
-    copy_dir_all(source, &target, &PackageLimits::default())?;
-    verify(&target, expected)?;
-    Contract::load(&target).map_err(|error| ServiceError::Invalid(error.to_string()))
+    copy_dir_all(source, &target, &PackageLimits::default()).map_err(|error| {
+        ServiceError::Invalid(format!("generator package snapshot copy failed: {error}"))
+    })?;
+    verify(&target, expected).map_err(|error| {
+        ServiceError::Invalid(format!(
+            "generator package snapshot verification failed: {error}"
+        ))
+    })?;
+    Contract::load(&target).map_err(|error| {
+        ServiceError::Invalid(format!(
+            "generator package snapshot contract load failed: {error}"
+        ))
+    })
 }

@@ -1306,10 +1306,12 @@ pub fn copy_dir_all(
         // the handle's own metadata, never on a pre-open following stat:
         // length, kind, and mode all come from the opened file (E15).
         let mut input = open_source_entry_nofollow(&path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::PermissionDenied {
+            if std::fs::symlink_metadata(&path)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
                 ServiceError::Invalid(format!("package source contains a symbolic link: {path}"))
             } else {
-                ServiceError::Invalid(format!("failed to inspect package entry: {error}"))
+                ServiceError::Invalid(format!("failed to open package entry `{rel}`: {error}"))
             }
         })?;
         let source_metadata = input.metadata().map_err(|error| {
@@ -2041,6 +2043,55 @@ mod tests {
         let error = crate::run_package::verify(&target, &expected)
             .expect_err("changed snapshot must fail closed");
         assert!(error.to_string().contains("identity mismatch"), "{error}");
+    }
+
+    #[test]
+    fn run_package_snapshots_nested_http_fixtures_and_rejects_tampering() {
+        // Exercise the full admission snapshot path, not only the source
+        // opener: copy, destination identity verification, and contract load.
+        let root = temp_dir("http-snapshots");
+        let _temp_guard = TempGuard(root.clone());
+        let fixtures = Utf8Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("service crate is under crates")
+            .join("fixtures/generators");
+        for (name, nested_file) in [
+            ("file-input", "templates/summary.md.j2"),
+            ("assets-demo", "ui/app.js"),
+            ("agent-secret-result", "prompts/agent.j2"),
+        ] {
+            let source = fixtures.join(name);
+            let run_dir = root.join(name);
+            std::fs::create_dir_all(&run_dir).expect("fresh run directory");
+            let expected = package_identity_sha256(&source, &PackageLimits::default())
+                .expect("source package identity");
+            let original = contract::Contract::load(&source).expect("source contract");
+            let pinned = crate::run_package::copy(&source, &run_dir, &expected)
+                .unwrap_or_else(|_| panic!("{name} snapshot copy failed"));
+            assert_eq!(pinned.sha256, original.sha256, "{name}");
+            crate::run_package::load_identity(&run_dir, Some(&expected), Some(&original.sha256))
+                .unwrap_or_else(|_| panic!("{name} snapshot reload failed"));
+
+            std::fs::write(pinned.root.join(nested_file), b"tampered")
+                .expect("tamper with nested snapshot file");
+            let error = crate::run_package::load_identity(
+                &run_dir,
+                Some(&expected),
+                Some(&original.sha256),
+            )
+            .expect_err("tampered snapshot must refuse loading");
+            assert!(
+                error.to_string().contains("identity mismatch"),
+                "{name} snapshot tampering must fail with an identity mismatch"
+            );
+            assert_eq!(
+                package_identity_sha256(&source, &PackageLimits::default())
+                    .expect("source identity after tampering with snapshot"),
+                expected,
+                "{name} snapshot must not share writable bytes with its source"
+            );
+        }
     }
 
     #[cfg(unix)]
