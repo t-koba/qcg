@@ -1,6 +1,18 @@
 //! Admission operations.
 use super::*;
 
+fn verify_fork_source_identity(state: &engine::RunState, source_id: &str) -> Result<(), ApiError> {
+    match state.run_id.as_deref() {
+        Some(run_id) if !run_id.is_empty() && run_id == source_id => Ok(()),
+        Some(run_id) => Err(api_internal(format!(
+            "fork source `{source_id}` journal identifies run `{run_id}`; refusing checkpoint copy"
+        ))),
+        None => Err(api_internal(format!(
+            "fork source `{source_id}` journal has no durable run identity; refusing checkpoint copy"
+        ))),
+    }
+}
+
 impl LocalService {
     /// Fails write-path API calls during shutdown (E05).
     pub(crate) fn ensure_running(&self) -> Result<(), ApiError> {
@@ -538,6 +550,71 @@ impl LocalService {
         self.fork_run_with_id(source_id, request, None).await
     }
 
+    /// Checks source eligibility only for a fresh checkpoint copy. Shared
+    /// stores use the source journal as authority; a lease protects a
+    /// nonterminal pending checkpoint while it is copied. Terminal state
+    /// needs no lease, since its durable settlement already prevents further
+    /// execution writes.
+    async fn fork_source_copy_lease(
+        &self,
+        source_id: &str,
+        source_dir: &Utf8Path,
+    ) -> Result<Option<std::fs::File>, ApiError> {
+        let conflict = || ApiError::Conflict {
+            detail: format!(
+                "run `{source_id}` is still executing; fork a stable waiting or terminal checkpoint"
+            ),
+        };
+        if self.inner.run_store_mode == RunStoreMode::Exclusive {
+            if self
+                .inner
+                .runs
+                .read()
+                .await
+                .get(source_id)
+                .is_some_and(|source| {
+                    matches!(source.state, RunStatus::Queued | RunStatus::Running)
+                })
+            {
+                return Err(conflict());
+            }
+            return Ok(None);
+        }
+
+        let state = self.authoritative_state(source_dir).await?;
+        verify_fork_source_identity(&state, source_id)?;
+        if state.terminal.is_some() {
+            return Ok(None);
+        }
+
+        match crate::run_dirs::try_lock_run_execution(source_dir).map_err(api_internal)? {
+            Some(lease) => {
+                let state = self.authoritative_state(source_dir).await?;
+                verify_fork_source_identity(&state, source_id)?;
+                if state.terminal.is_some() {
+                    return Ok(None);
+                }
+                let pending_controls = crate::run_dirs::list_pending_cancel_controls(source_dir)
+                    .map_err(api_internal)?;
+                if state.pending.is_some() && !state.cancel_requested && pending_controls.is_empty()
+                {
+                    Ok(Some(lease))
+                } else {
+                    Err(conflict())
+                }
+            }
+            None => {
+                let state = self.authoritative_state(source_dir).await?;
+                verify_fork_source_identity(&state, source_id)?;
+                if state.terminal.is_some() {
+                    Ok(None)
+                } else {
+                    Err(conflict())
+                }
+            }
+        }
+    }
+
     pub async fn fork_run_with_id(
         &self,
         source_id: &str,
@@ -550,15 +627,6 @@ impl LocalService {
                 "at_seq",
                 "checkpoint sequence must be greater than zero",
             ));
-        }
-        if let Some(source) = self.inner.runs.read().await.get(source_id)
-            && matches!(source.state, RunStatus::Queued | RunStatus::Running)
-        {
-            return Err(ApiError::Conflict {
-                detail: format!(
-                    "run `{source_id}` is still executing; fork a stable waiting or terminal checkpoint"
-                ),
-            });
         }
         let source_dir = self.run_dir_for(source_id).await?;
         let generator_path = read_run_generator_path(&source_dir).map_err(api_internal)?;
@@ -646,6 +714,11 @@ impl LocalService {
             return Ok(run_id);
         }
         if !adopted {
+            // A child adoption or live hit converges before source eligibility
+            // is consulted: retries never fail because the source changed
+            // after the original checkpoint copy. Shared-mode leases remain
+            // held through the copy and are released before child execution.
+            let source_lease = self.fork_source_copy_lease(source_id, &source_dir).await?;
             prepare_checkpoint_fork(
                 &source_dir,
                 source_id,
@@ -655,6 +728,7 @@ impl LocalService {
                 &request.state_patch,
             )
             .map_err(api_internal)?;
+            drop(source_lease);
         }
         // Single snapshot for the whole fork admission: adopted reuses the
         // adoption read (with its fold), fresh reads and folds once after

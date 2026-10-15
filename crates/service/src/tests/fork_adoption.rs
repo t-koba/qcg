@@ -1724,3 +1724,341 @@ async fn a_rebuilt_service_rehydrates_a_waiting_run_after_shutdown() {
     drop(rebuilt);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+fn shared_fork_service(generators: Utf8PathBuf, runs: Utf8PathBuf) -> LocalService {
+    LocalService::with_generator_roots_policy_and_store_mode(
+        vec![generators],
+        runs,
+        None,
+        policy::DEFAULT_MAX_ACTIVE_RUNS,
+        DEFAULT_MAX_TRACKED_RUNS,
+        RunStoreMode::SharedFilesystem,
+        ServiceDeploymentPolicy::default(),
+    )
+    .expect("shared service should initialize")
+}
+
+async fn wait_for_free_execution_lease(run_dir: &Utf8Path) {
+    for _ in 0..2000 {
+        match crate::run_dirs::try_lock_run_execution(run_dir)
+            .expect("execution lease probe should succeed")
+        {
+            Some(lease) => {
+                drop(lease);
+                return;
+            }
+            None => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+        }
+    }
+    panic!("execution lease for `{run_dir}` did not become free");
+}
+
+fn latest_event_seq(run_dir: &Utf8Path, kind: &str) -> u64 {
+    read_journal_events(run_dir)
+        .expect("journal should read")
+        .iter()
+        .filter(|event| event.get("t").and_then(Value::as_str) == Some(kind))
+        .filter_map(|event| event.get("seq").and_then(Value::as_u64))
+        .max()
+        .expect("requested journal event should exist")
+}
+
+#[tokio::test]
+async fn shared_fork_uses_terminal_source_journal_despite_stale_cache_and_held_lease() {
+    let root = temp_run_dir("fork-shared-terminal-authority");
+    let _guard = TempGuard(root.clone());
+    let generators =
+        Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+    let runs = root.join("runs");
+    let owner = shared_fork_service(generators.clone(), runs.clone());
+    let source = owner
+        .start_run(StartRun {
+            generator_id: "ask-user".into(),
+            inputs: BTreeMap::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("source should start");
+    let waiting = wait_for_snapshot(&owner, &source, RunStatus::Waiting).await;
+    let source_dir = owner.run_dir_for(&source).await.expect("source directory");
+    wait_for_free_execution_lease(&source_dir).await;
+
+    // This peer sees the source while it is waiting, then its cache remains
+    // stale at Running as the owner durably settles the source.
+    let peer = shared_fork_service(generators, runs.clone());
+    peer.inner
+        .runs
+        .write()
+        .await
+        .get_mut(&source)
+        .expect("peer should rehydrate source")
+        .state = RunStatus::Running;
+    owner
+        .answer(
+            source.clone(),
+            waiting.question.expect("source question").id,
+            AnswerPayload {
+                values: BTreeMap::from([("answer".into(), json!("brief"))]),
+            },
+        )
+        .await
+        .expect("owner should accept answer");
+    assert_eq!(
+        wait_for_terminal_snapshot(&owner, &source).await.state,
+        RunStatus::Succeeded
+    );
+    assert_eq!(
+        peer.inner.runs.read().await.get(&source).unwrap().state,
+        RunStatus::Running,
+        "peer cache must remain stale after owner settlement"
+    );
+
+    let checkpoint = latest_event_seq(&source_dir, "step_finished");
+    let held_source_lease = crate::run_dirs::try_lock_run_execution(&source_dir)
+        .expect("source lease should be readable")
+        .expect("terminal source lease should be free for the test to hold");
+    // A fresh fork must inspect only its selected source, not scan/re-hydrate
+    // the whole shared store to discover this unrelated corrupt directory.
+    let unrelated = runs.join("unrelated-corrupt-run");
+    let unrelated_meta = run_meta_dir(&unrelated);
+    std::fs::create_dir_all(&unrelated_meta).expect("unrelated meta directory");
+    std::fs::write(unrelated_meta.join("journal.jsonl"), b"not-json\n")
+        .expect("unrelated corrupt journal");
+
+    let fork_id = peer
+        .fork_run_with_id(
+            &source,
+            ForkRun {
+                at_seq: checkpoint,
+                ..Default::default()
+            },
+            Some("ask-user-fork-shared-terminal".into()),
+        )
+        .await
+        .expect("durably terminal source should fork despite stale cache and held lease");
+    assert_eq!(fork_id, "ask-user-fork-shared-terminal");
+    assert!(
+        crate::run_dirs::try_lock_run_execution(&source_dir)
+            .expect("source lease probe should work")
+            .is_none(),
+        "terminal fast path must leave the externally held source lease alone"
+    );
+    assert_eq!(
+        wait_for_terminal_snapshot(&peer, &fork_id).await.state,
+        RunStatus::Succeeded,
+        "the historical checkpoint copy should execute successfully"
+    );
+    drop(held_source_lease);
+}
+
+#[tokio::test]
+async fn shared_fork_rejects_busy_nonterminal_source_and_unknown_or_corrupt_identity() {
+    let root = temp_run_dir("fork-shared-busy-source");
+    let _guard = TempGuard(root.clone());
+    let generators =
+        Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+    let runs = root.join("runs");
+    let owner = shared_fork_service(generators.clone(), runs.clone());
+    let source = owner
+        .start_run(StartRun {
+            generator_id: "ask-user".into(),
+            inputs: BTreeMap::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("source should start");
+    wait_for_snapshot(&owner, &source, RunStatus::Waiting).await;
+    let source_dir = owner.run_dir_for(&source).await.expect("source directory");
+    wait_for_free_execution_lease(&source_dir).await;
+    let peer = shared_fork_service(generators, runs.clone());
+    // Deliberately stale terminal cache: durable nonterminal state plus a
+    // busy lease must still reject rather than trusting peer memory.
+    peer.inner
+        .runs
+        .write()
+        .await
+        .get_mut(&source)
+        .expect("peer should rehydrate source")
+        .state = RunStatus::Succeeded;
+    let held_source_lease = crate::run_dirs::try_lock_run_execution(&source_dir)
+        .expect("source lease should be readable")
+        .expect("test should acquire source execution lease");
+    let busy_child = "ask-user-fork-shared-busy";
+    let error = peer
+        .fork_run_with_id(
+            &source,
+            ForkRun {
+                at_seq: latest_event_seq(&source_dir, "run_waiting"),
+                ..Default::default()
+            },
+            Some(busy_child.into()),
+        )
+        .await
+        .expect_err("a busy waiting source must not fork");
+    assert!(
+        matches!(error, ApiError::Conflict { .. }),
+        "busy nonterminal source must return the eligibility conflict: {error}"
+    );
+    assert!(
+        !runs.join(busy_child).exists(),
+        "rejection must not create a child run"
+    );
+    drop(held_source_lease);
+
+    // Empty durable state is not permission, and must not be converted into
+    // the ordinary executing-source conflict.
+    let journal = run_meta_dir(&source_dir).join("journal.jsonl");
+    std::fs::write(&journal, "").expect("source journal should be emptied");
+    let unknown_child = "ask-user-fork-shared-unknown";
+    let error = peer
+        .fork_run_with_id(
+            &source,
+            ForkRun {
+                at_seq: 1,
+                ..Default::default()
+            },
+            Some(unknown_child.into()),
+        )
+        .await
+        .expect_err("empty source identity must fail explicitly");
+    assert!(
+        matches!(error, ApiError::Internal { .. }),
+        "unknown source identity must be an explicit API error, not conflict: {error}"
+    );
+    assert!(!runs.join(unknown_child).exists());
+
+    std::fs::write(&journal, b"{corrupt-json\n").expect("corrupt source journal");
+    let corrupt_child = "ask-user-fork-shared-corrupt";
+    let error = peer
+        .fork_run_with_id(
+            &source,
+            ForkRun {
+                at_seq: 1,
+                ..Default::default()
+            },
+            Some(corrupt_child.into()),
+        )
+        .await
+        .expect_err("corrupt source journal must fail explicitly");
+    assert!(
+        matches!(error, ApiError::Internal { .. }),
+        "corrupt source journal must propagate as an API error: {error}"
+    );
+    assert!(!runs.join(corrupt_child).exists());
+}
+
+#[tokio::test]
+async fn shared_fork_allows_settled_waiting_source_when_execution_lease_is_free() {
+    let root = temp_run_dir("fork-shared-waiting-source");
+    let _guard = TempGuard(root.clone());
+    let generators =
+        Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+    let runs = root.join("runs");
+    let owner = shared_fork_service(generators.clone(), runs.clone());
+    let source = owner
+        .start_run(StartRun {
+            generator_id: "ask-user".into(),
+            inputs: BTreeMap::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("source should start");
+    wait_for_snapshot(&owner, &source, RunStatus::Waiting).await;
+    let source_dir = owner.run_dir_for(&source).await.expect("source directory");
+    wait_for_free_execution_lease(&source_dir).await;
+    let peer = shared_fork_service(generators, runs);
+    let fork = peer
+        .fork_run(
+            &source,
+            ForkRun {
+                at_seq: latest_event_seq(&source_dir, "run_waiting"),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("a genuinely pending source should fork once its lease is free");
+    assert_eq!(
+        wait_for_snapshot(&peer, &fork, RunStatus::Waiting)
+            .await
+            .state,
+        RunStatus::Waiting
+    );
+}
+
+#[tokio::test]
+async fn shared_fork_adoption_converges_after_source_settles() {
+    let root = temp_run_dir("fork-shared-adopt-after-source-settles");
+    let _guard = TempGuard(root.clone());
+    let generators =
+        Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+    let runs = root.join("runs");
+    let owner = shared_fork_service(generators.clone(), runs.clone());
+    let source = owner
+        .start_run(StartRun {
+            generator_id: "ask-user".into(),
+            inputs: BTreeMap::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("source should start");
+    let source_waiting = wait_for_snapshot(&owner, &source, RunStatus::Waiting).await;
+    let source_dir = owner.run_dir_for(&source).await.expect("source directory");
+    wait_for_free_execution_lease(&source_dir).await;
+    let peer = shared_fork_service(generators, runs.clone());
+    let fork_id = "ask-user-fork-adopt-after-source-settles";
+    let request = ForkRun {
+        at_seq: latest_event_seq(&source_dir, "run_waiting"),
+        ..Default::default()
+    };
+    assert_eq!(
+        peer.fork_run_with_id(&source, request.clone(), Some(fork_id.into()))
+            .await
+            .expect("initial fork should prepare"),
+        fork_id
+    );
+    wait_for_snapshot(&peer, fork_id, RunStatus::Waiting).await;
+    let child_dir = peer.run_dir_for(fork_id).await.expect("fork directory");
+    wait_for_free_execution_lease(&child_dir).await;
+
+    // Make the peer's source cache stale and settle the source in its owner.
+    peer.inner
+        .runs
+        .write()
+        .await
+        .get_mut(&source)
+        .expect("peer should track source")
+        .state = RunStatus::Running;
+    owner
+        .answer(
+            source.clone(),
+            source_waiting.question.expect("source question").id,
+            AnswerPayload {
+                values: BTreeMap::from([("answer".into(), json!("brief"))]),
+            },
+        )
+        .await
+        .expect("source answer should be accepted");
+    assert_eq!(
+        wait_for_terminal_snapshot(&owner, &source).await.state,
+        RunStatus::Succeeded
+    );
+    // Remove the peer's child record to force durable child adoption. The
+    // source lease is deliberately busy: this retry must not revalidate the
+    // source after the checkpoint was already copied and journaled.
+    peer.inner.runs.write().await.remove(fork_id);
+    let held_source_lease = crate::run_dirs::try_lock_run_execution(&source_dir)
+        .expect("source lease should be readable")
+        .expect("terminal source lease should be held by the test");
+    assert_eq!(
+        peer.fork_run_with_id(&source, request, Some(fork_id.into()))
+            .await
+            .expect("prepared child adoption must converge independently of source state"),
+        fork_id
+    );
+    assert!(
+        crate::run_dirs::try_lock_run_execution(&source_dir)
+            .expect("source lease probe should work")
+            .is_none()
+    );
+    drop(held_source_lease);
+}
