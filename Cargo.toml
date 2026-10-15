@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["vendor/zip-8.6.0"]
 members = [
   "crates/model",
   "crates/container",
@@ -87,3 +88,7 @@ strip = "symbols"
 
 [profile.release]
 strip = "symbols"
+
+# Local inventory-budget capability; provenance and patch notes are in vendor/zip-8.6.0/QCG-PATCH.md.
+[patch.crates-io]
+zip = { path = "vendor/zip-8.6.0" }

@@ -30,6 +30,7 @@ pub const DEFAULT_PACKAGE_MAX_BYTES: u64 = 10 * 1024 * 1024;
 /// `max_metadata_bytes` stays explicit-only (uncalibrated).
 #[derive(Debug, Clone, Copy)]
 pub struct PackageLimits {
+    /// Raw ZIP entries (including duplicate names), checked before inventory allocation.
     pub max_entries: Option<usize>,
     pub max_bytes: Option<u64>,
     pub max_metadata_bytes: Option<usize>,
@@ -496,7 +497,14 @@ pub fn unpack_package(
     // hashes per path; modes are restored through the sanitizer, which
     // never adopts setuid/setgid/world-writable bits (E15).
     let file = open_archive_nofollow(archive)?;
-    let mut archive = zip::ZipArchive::new(file)?;
+    let mut archive = zip::ZipArchive::with_config(
+        zip::read::Config {
+            max_entries: limits.max_entries,
+            ..Default::default()
+        },
+        file,
+    )?;
+    // Retain the post-construction gate as defense for the parser's normalized inventory.
     if let Some(limit) = limits.max_entries
         && archive.len() > limit
     {
