@@ -170,6 +170,41 @@ fn request_body_defaults_stay_optional_for_generated_clients() {
 }
 
 #[test]
+fn start_request_rejects_unknown_controls_but_keeps_free_form_maps_open() {
+    let error = serde_json::from_value::<api::StartRun>(serde_json::json!({
+        "generator_id": "example",
+        "inputs": {},
+        "prioritty": "must-not-be-echoed"
+    }))
+    .expect_err("unknown top-level controls must fail before admission");
+    let message = error.to_string();
+    assert!(message.contains("prioritty"));
+    assert!(!message.contains("must-not-be-echoed"));
+
+    let request: api::StartRun = serde_json::from_value(serde_json::json!({
+        "generator_id": "example",
+        "inputs": {"future_input": {"nested": true}},
+        "answers": {"future_question": {"answer": 1}},
+        "confirmations": {"future_confirmation": true},
+        "labels": {"owner": "team"}
+    }))
+    .expect("declared free-form maps keep their established semantics");
+    assert_eq!(request.inputs["future_input"]["nested"], true);
+    assert_eq!(request.answers["future_question"]["answer"], 1);
+
+    let schema = &api::openapi_components()["schemas"]["StartRun"];
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(
+        schema["properties"]["inputs"]["additionalProperties"], true,
+        "input names and JSON payloads remain free-form"
+    );
+    assert_eq!(
+        schema["properties"]["answers"]["additionalProperties"], true,
+        "answer keys and JSON payloads remain free-form"
+    );
+}
+
+#[test]
 fn openapi_documents_runtime_http_metadata() {
     let document = api::openapi_document("test");
     let paths = document

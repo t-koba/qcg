@@ -22,6 +22,7 @@ pub struct GeneratorDetail {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StartRun {
     pub generator_id: String,
     pub inputs: BTreeMap<String, Value>,
