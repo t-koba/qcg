@@ -159,7 +159,12 @@ JSON event output go to stdout.
 - `qcg runs gc [--runs-dir dir] [--keep 50] [--keep-failed 10] [--delete]`
 
 GC is a dry run without `--delete` and never removes a non-terminal run.
-Failed runs get an additional `--keep-failed` retention budget for post-mortems.
+`--keep` (default `50`) retains the newest nonfailed terminal runs (success,
+canceled, or interrupted). Failed runs do not consume that budget and are
+governed only by the separate `--keep-failed` budget (default `10`). Contract
+retention expiry overrides either count budget. A sweep with
+`--keep 50 --keep-failed 10` may retain up to 50 nonfailed terminal runs plus
+10 failed runs.
 
 ## Server and generated documentation
 
@@ -264,9 +269,11 @@ use of the same output directory.
   refuses boot instead of starting unauthenticated.
 - `GC_KEEP` (default `50`), `GC_KEEP_FAILED` (default `10`), and
   `GC_INTERVAL_SECS` (default `86400`, minimum `60`): automatic retention
-  sweep counts and cadence for `qcg serve`. Failed runs get the additional
-  post-mortem budget; a run past its contract retention window is always
-  deleted. Invalid or zero values refuse boot.
+  counts and cadence for `qcg serve`. `GC_KEEP` counts newest nonfailed
+  terminal runs (success, canceled, interrupted); failed runs do not consume
+  it and are governed only by the separate `GC_KEEP_FAILED` count. Contract
+  retention expiry overrides either count budget. Invalid or zero values
+  refuse boot.
 - `AUDIT_FLOOR=minimal|standard`: deployment audit floor. `standard`
   restores full observation-record persistence for every run regardless of the
   contract's `[audit]` policy; a floor can only raise persistence.

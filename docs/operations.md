@@ -126,11 +126,14 @@ call with its request state. Deprecated MCP sampling is not exposed.
 
 ## Run retention
 
-`qcg serve` periodically retains the newest 50 terminal run directories plus
-10 additional failed runs and deletes any run past its contract retention
-window. `GC_KEEP`, `GC_KEEP_FAILED`, and `GC_INTERVAL_SECS`
-(default `86400`, minimum `60`) retune the sweep; invalid or zero values
-refuse boot. Set `AUTO_GC=0` to disable automatic retention and use:
+`keep` (default 50) retains the newest nonfailed terminal runs (success,
+canceled, or interrupted). Failed runs do not consume this budget; they are
+governed only by the separate `keep_failed` budget (default 10). Contract
+retention expiry overrides either count budget. With defaults, a sweep may
+retain up to 50 nonfailed terminal runs plus 10 failed runs.
+`GC_KEEP`, `GC_KEEP_FAILED`, and `GC_INTERVAL_SECS` (default `86400`, minimum
+`60`) retune the sweep; invalid or zero values refuse boot. Set `AUTO_GC=0` to
+disable automatic retention and use:
 
 ```bash
 qcg runs gc --runs-dir /var/lib/qcg/runs --keep 50
@@ -138,8 +141,6 @@ qcg runs gc --runs-dir /var/lib/qcg/runs --keep 50 --keep-failed 10 --delete
 ```
 
 GC never removes a non-terminal run. The first command is a dry run.
-Failed runs keep an additional `--keep-failed` budget (default 10) for
-post-mortems even when they fall outside `--keep`.
 
 Retention is count-based only; there is no byte or disk-usage ceiling in
 mechanism. Size the `runs-dir` volume externally and export a run bundle
@@ -599,9 +600,12 @@ Unattended limits:
   after every restart.
 - A denied confirmation ends the run as `Failed`; retries, backoff, and
   notifications are the orchestrator's job, not qcg's.
-- `qcg serve` retains the newest 50 terminal run directories plus 10 failed
-  runs and sweeps every 24 hours; size the `runs-dir` volume and retention
-  for the schedule above.
+- `keep` (default 50) retains the newest nonfailed terminal runs (success,
+  canceled, or interrupted); failed runs do not consume that budget and are
+  governed only by the separate `keep_failed` budget (default 10). Contract
+  retention expiry overrides either count budget. With defaults, a sweep may
+  retain up to 50 nonfailed terminal runs plus 10 failed runs. It sweeps every
+  24 hours; size the `runs-dir` volume and retention for the schedule above.
 - `Waiting` and `Confirming` runs release their execution slot but have no
   TTL in mechanism; an unanswered run stays paused until answered, confirmed,
   or canceled. Expire it from the orchestrator with `cancel` when policy

@@ -395,7 +395,8 @@ pub(crate) enum RunsCommand {
         runs_dir: Utf8PathBuf,
         #[arg(long, default_value_t = 50)]
         keep: usize,
-        /// Retain at least this many failed runs even when they fall outside --keep.
+        /// Retain up to this many newest failed runs, separate from --keep;
+        /// contract retention expiry overrides both count budgets.
         #[arg(long = "keep-failed", default_value_t = 10)]
         keep_failed: usize,
         #[arg(long)]
