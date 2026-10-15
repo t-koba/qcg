@@ -73,9 +73,10 @@ class Managed:
         return self.metrics
 
 
-def request(url, value=None, method=None):
+def request(url, value=None, method=None, headers=None):
     data = json.dumps(value).encode() if value is not None else None
-    with urllib.request.urlopen(urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method=method), timeout=20) as response:
+    request_headers = {"Content-Type": "application/json", **(headers or {})}
+    with urllib.request.urlopen(urllib.request.Request(url, data=data, headers=request_headers, method=method), timeout=20) as response:
         body = response.read()
         return json.loads(body) if body else None
 
@@ -161,7 +162,16 @@ class Qcg:
 
     def trial(self, case, index):
         payload = canonical(index)
-        run = request(f"{self.base}/api/runs", {"generator_id": "generate" if case == "generation" else "approval", "inputs": {"payload": payload}})["run_id"]
+        generator_id = "generate" if case == "generation" else "approval"
+        detail = request(f"{self.base}/api/generators/{generator_id}")
+        package_sha256 = detail.get("package_sha256")
+        if not isinstance(package_sha256, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", package_sha256):
+            raise RuntimeError(f"generator {generator_id} returned an invalid package_sha256")
+        run = request(
+            f"{self.base}/api/runs",
+            {"generator_id": generator_id, "inputs": {"payload": payload}},
+            headers={"X-QCG-Package-SHA256": package_sha256},
+        )["run_id"]
         directory = self.root / "runs" / run / "workspace"
         if case != "generation":
             waiting = self.snapshot(run, {"waiting", "failed"})
@@ -183,7 +193,15 @@ class Qcg:
     def permission(self):
         before = set((self.root / "runs").iterdir())
         try:
-            result = request(f"{self.base}/api/runs", {"generator_id": "denied", "inputs": {"payload": canonical(0)}})
+            detail = request(f"{self.base}/api/generators/denied")
+            package_sha256 = detail.get("package_sha256")
+            if not isinstance(package_sha256, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", package_sha256):
+                raise RuntimeError("generator denied returned an invalid package_sha256")
+            result = request(
+                f"{self.base}/api/runs",
+                {"generator_id": "denied", "inputs": {"payload": canonical(0)}},
+                headers={"X-QCG-Package-SHA256": package_sha256},
+            )
             run = result["run_id"]
             final = self.snapshot(run, {"failed"})
             assert final["state"] == "failed"

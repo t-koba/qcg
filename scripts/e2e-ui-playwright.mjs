@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from "node:child_process";
-import { mkdtemp, mkdir, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
@@ -421,8 +421,9 @@ async function mergeGenerators(target) {
   await mkdir(target, { recursive: true });
   for (const source of ["fixtures/generators", "generators"]) {
     for (const entry of await readdir(source)) {
-      await rm(join(target, entry), { recursive: true, force: true });
-      await symlink(join(process.cwd(), source, entry), join(target, entry));
+      const destination = join(target, entry);
+      await rm(destination, { recursive: true, force: true });
+      await cp(join(process.cwd(), source, entry), destination, { recursive: true });
     }
   }
   const cancelable = join(target, "ui-cancelable");

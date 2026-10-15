@@ -27,7 +27,9 @@ merge_generators() {
     [ -d "$source" ] || continue
     for entry in "$source"/*; do
       [ -e "$entry" ] || continue
-      ln -sfn "$(pwd)/$entry" "$target/$(basename "$entry")"
+      local destination="$target/$(basename "$entry")"
+      rm -rf "$destination"
+      cp -a "$entry" "$destination"
     done
   done
 }
@@ -55,12 +57,18 @@ if ! curl -fsS "http://127.0.0.1:$port/healthz" >/dev/null; then
 fi
 curl -fsS "http://127.0.0.1:$port/api/openapi.json" | grep -q '"openapi"'
 curl -fsS "http://127.0.0.1:$port/api/generators" | grep -q 'hello-template'
+package_sha256="$(curl -fsS "http://127.0.0.1:$port/api/generators/hello-template" | python3 -c 'import json, sys; print(json.load(sys.stdin).get("package_sha256", ""))')"
+if [[ ! "$package_sha256" =~ ^[[:xdigit:]]{64}$ ]]; then
+  echo "generator detail returned an invalid package_sha256" >&2
+  exit 1
+fi
 curl -fsS "http://127.0.0.1:$port/api/generators/assets-demo/assets/index.html" | grep -q '<script'
 curl -fsS "http://127.0.0.1:$port/api/generators/assets-demo/assets/ui/app.js" | grep -q 'Assets loaded'
 
 run_id="$(
   curl -fsS \
     -H 'content-type: application/json' \
+    -H "X-QCG-Package-SHA256: $package_sha256" \
     -d '{"generator_id":"hello-template","inputs":{"name":"server"}}' \
     "http://127.0.0.1:$port/api/runs" \
     | sed -n 's/.*"run_id":"\([^"]*\)".*/\1/p'

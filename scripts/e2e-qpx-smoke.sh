@@ -51,7 +51,9 @@ for source in fixtures/generators generators; do
   if [ -d "$source" ]; then
     for entry in "$source"/*; do
       [ -e "$entry" ] || continue
-      ln -sfn "$(pwd)/$entry" "$generators_dir/$(basename "$entry")"
+      destination="$generators_dir/$(basename "$entry")"
+      rm -rf "$destination"
+      cp -a "$entry" "$destination"
     done
   fi
 done
@@ -64,6 +66,11 @@ for _ in {1..100}; do
   sleep 0.05
 done
 curl -fsS "http://127.0.0.1:$PORT/healthz" >/dev/null
+package_sha256="$(curl -fsS "http://127.0.0.1:$PORT/api/generators/hello-template" | python3 -c 'import json, sys; print(json.load(sys.stdin).get("package_sha256", ""))')"
+if [[ ! "$package_sha256" =~ ^[[:xdigit:]]{64}$ ]]; then
+  echo "generator detail returned an invalid package_sha256" >&2
+  exit 1
+fi
 
 "$QPXD_BIN" run --config "$tmp/qpx.yaml" >"$tmp/qpx.log" 2>&1 &
 qpx_pid=$!
@@ -76,6 +83,7 @@ curl -fsS "http://127.0.0.1:$QPX_PORT/api/openapi.json" | grep -q '"openapi"'
 response="$(curl -fsS -X POST "http://127.0.0.1:$QPX_PORT/api/runs" \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: qpx-smoke' \
+  -H "X-QCG-Package-SHA256: $package_sha256" \
   --data '{"generator_id":"hello-template","inputs":{"name":"qpx"}}')"
 run_id="$(printf '%s' "$response" | sed -n 's/.*"run_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
 if [[ -z "$run_id" ]]; then
