@@ -368,6 +368,7 @@ impl Engine {
             Ok(outcome) => outcome,
             Err(error)
                 if error.is_canceled()
+                    || error.is_resumable_agent()
                     || node.kind.as_str() == "llm.agent"
                     || matches!(
                         error,

@@ -445,6 +445,19 @@ impl Engine {
                     vars.set_item(parent_item);
                     return Err(error);
                 }
+                Err(error)
+                    if error.is_resumable_agent()
+                        || addressed_node.kind.as_str() == "llm.agent" =>
+                {
+                    vars.set_item(parent_item);
+                    // Carry the agent's continuation ownership through every
+                    // enclosing foreach and scheduler settlement boundary.
+                    return Err(if error.is_resumable_agent() {
+                        error
+                    } else {
+                        EngineError::ResumableAgent(Box::new(error))
+                    });
+                }
                 Err(error) => {
                     let reason =
                         FailureDetail::new(failure_code_for_error(&error), error.to_string());

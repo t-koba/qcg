@@ -26,6 +26,11 @@ pub enum EngineError {
     Contract(#[from] contract::ContractError),
     #[error(transparent)]
     Step(#[from] StepError),
+    /// An agent continuation must be re-entered on resume, not settled as a
+    /// terminal failure of its enclosing control-flow nodes. Preserve the
+    /// original error for diagnostics and failure classification.
+    #[error(transparent)]
+    ResumableAgent(Box<EngineError>),
     #[error(transparent)]
     Gateway(#[from] crate::GatewayError),
     #[error(transparent)]
@@ -100,6 +105,10 @@ pub(crate) struct ForeachIteration<'a> {
 }
 
 impl EngineError {
+    pub(crate) fn is_resumable_agent(&self) -> bool {
+        matches!(self, Self::ResumableAgent(_))
+    }
+
     pub fn is_canceled(&self) -> bool {
         matches!(
             self,
@@ -123,6 +132,7 @@ pub(crate) fn output_name_for(node: &contract::NodeDef) -> &str {
 /// `RunFailureKind::Rewound` preserves the distinct observable to `Progress`.
 pub(crate) fn failure_code_for_error(error: &EngineError) -> model::FailureCode {
     match error {
+        EngineError::ResumableAgent(error) => failure_code_for_error(error),
         EngineError::Step(crate::StepError::ElapsedExceeded { .. }) => {
             model::FailureCode::ElapsedExceeded
         }

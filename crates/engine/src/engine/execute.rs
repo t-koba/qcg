@@ -84,13 +84,21 @@ fn combine_terminal_errors(errors: Vec<EngineError>) -> Result<(), EngineError> 
     if errors.len() == 1 {
         return Err(errors.swap_remove(0));
     }
-    Err(EngineError::Failed(
+    let resumable_agent = errors.iter().any(EngineError::is_resumable_agent);
+    let combined = EngineError::Failed(
         errors
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("; "),
-    ))
+    );
+    // Ordinary sibling failures have already been settled per node. Do not
+    // erase a continuation marker when joining their diagnostics.
+    Err(if resumable_agent {
+        EngineError::ResumableAgent(Box::new(combined))
+    } else {
+        combined
+    })
 }
 
 /// Bounded cooperative grace after a fired deadline, shared by the
@@ -308,7 +316,7 @@ impl Engine {
                     // the loop re-executes it sequentially instead of
                     // stranding a terminal failure that resume would
                     // report as a stale error.
-                    if node.kind.as_str() == "llm.agent" {
+                    if node.kind.as_str() == "llm.agent" || error.is_resumable_agent() {
                         states.insert(node.id.clone(), NodeState::Pending);
                         journal.event(
                             "step_interrupted",
@@ -816,5 +824,22 @@ impl Engine {
         };
         step_context.step_checkpoint(node).await?;
         Ok(executor.execute(&mut step_context, node).await?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn combined_wave_errors_preserve_resumable_agent_marker() {
+        let error = combine_terminal_errors(vec![
+            EngineError::ResumableAgent(Box::new(StepError::failed("agent", "agent error").into())),
+            StepError::failed("sibling", "sibling error").into(),
+        ])
+        .expect_err("wave must fail");
+        assert!(error.is_resumable_agent());
+        assert!(error.to_string().contains("agent error"));
+        assert!(error.to_string().contains("sibling error"));
     }
 }

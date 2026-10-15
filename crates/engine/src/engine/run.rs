@@ -770,6 +770,7 @@ impl Engine {
                     .await
                 {
                     if error.is_canceled()
+                        || error.is_resumable_agent()
                         || matches!(
                             error,
                             EngineError::NeedsUser { .. } | EngineError::NeedsConfirm { .. }
@@ -828,6 +829,7 @@ impl Engine {
                     Ok(outcome) => outcome,
                     Err(error)
                         if error.is_canceled()
+                            || error.is_resumable_agent()
                             || matches!(
                                 error,
                                 EngineError::NeedsUser { .. } | EngineError::NeedsConfirm { .. }

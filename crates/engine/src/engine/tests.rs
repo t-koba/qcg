@@ -2260,6 +2260,169 @@ async fn foreach_child_timeout_wins_over_parent_timeout() {
     let _ = std::fs::remove_dir_all(&run_dir);
 }
 
+/// The agent executor owns continuation replay (and its operation guard), so
+/// the engine must let it decide what is safe on the next entry.
+struct FailOnceChildStep {
+    kind: &'static str,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl StepExecutor for FailOnceChildStep {
+    fn type_id(&self) -> &'static str {
+        self.kind
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &mut StepContext<'_>,
+        node: &NodeDef,
+    ) -> Result<StepOutcome, StepError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(StepError::failed(
+                &node.id,
+                "child failed before continuation",
+            ));
+        }
+        Ok(StepOutcome::Success {
+            output: None,
+            files: vec![],
+        })
+    }
+}
+
+#[tokio::test]
+async fn foreach_agent_child_error_resumes_without_terminalizing_owners() {
+    for nested in [false, true] {
+        let mut manifest = manifest(vec![foreach_node(
+            "each",
+            "each_body",
+            "inputs.items",
+            1,
+            10,
+        )]);
+        manifest.inputs = foreach_items_input();
+        let child = node("child", "llm.agent");
+        let paths = if nested {
+            manifest.blocks.insert(
+                "each_body".into(),
+                vec![foreach_node("inner", "inner_body", "inputs.items", 1, 10)],
+            );
+            manifest.blocks.insert("inner_body".into(), vec![child]);
+            vec!["each", "each[0]/inner", "each[0]/inner[0]/child"]
+        } else {
+            manifest.blocks.insert("each_body".into(), vec![child]);
+            vec!["each", "each[0]/child"]
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = StepRegistry::new();
+        registry.register(TestForeachStep);
+        registry.register(FailOnceChildStep {
+            kind: "llm.agent",
+            calls: Arc::clone(&calls),
+        });
+        let engine = Engine::new(registry);
+        let run_dir = temp_run_dir(&format!("foreach-agent-resume-{nested}"));
+        let _guard = TempGuard(run_dir.clone());
+        let contract = test_contract(&run_dir, manifest);
+        let inputs = || BTreeMap::from([("items".into(), json!(["a"]))]);
+        let error = engine
+            .run_with_id(
+                "agent-resume".into(),
+                run_dir.join("meta"),
+                contract.clone(),
+                inputs(),
+                run_options(run_dir.join("workspace")),
+            )
+            .await
+            .expect_err("first agent entry must fail");
+        assert!(error.is_resumable_agent(), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("child failed before continuation")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        for path in &paths {
+            assert!(
+                !has_event(&journal_events(&run_dir), "step_finished", path),
+                "{path} must remain resumable before resume",
+            );
+        }
+        engine
+            .run_with_id(
+                "agent-resume".into(),
+                run_dir.join("meta"),
+                contract,
+                inputs(),
+                run_options(run_dir.join("workspace")),
+            )
+            .await
+            .expect("resume must re-enter the agent and complete");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let events = journal_events(&run_dir);
+        for path in &paths {
+            let finishes: Vec<_> = events
+                .iter()
+                .filter(|event| event["t"] == "step_finished" && event["node"] == *path)
+                .collect();
+            assert_eq!(finishes.len(), 1, "{path}: {finishes:?}");
+            assert_eq!(finishes[0]["status"], "success", "{path}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn foreach_ordinary_child_error_stays_terminal_on_resume() {
+    let mut manifest = manifest(vec![foreach_node(
+        "each",
+        "each_body",
+        "inputs.items",
+        1,
+        10,
+    )]);
+    manifest.inputs = foreach_items_input();
+    manifest.blocks.insert(
+        "each_body".into(),
+        vec![node("child", "test.fail_once_child")],
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = StepRegistry::new();
+    registry.register(TestForeachStep);
+    registry.register(FailOnceChildStep {
+        kind: "test.fail_once_child",
+        calls: Arc::clone(&calls),
+    });
+    let engine = Engine::new(registry);
+    let run_dir = temp_run_dir("foreach-ordinary-child-terminal");
+    let _guard = TempGuard(run_dir.clone());
+    let contract = test_contract(&run_dir, manifest);
+    for _ in 0..2 {
+        engine
+            .run_with_id(
+                "ordinary-child-terminal".into(),
+                run_dir.join("meta"),
+                contract.clone(),
+                BTreeMap::from([("items".into(), json!(["a"]))]),
+                run_options(run_dir.join("workspace")),
+            )
+            .await
+            .expect_err("ordinary child failure remains terminal even on resume");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let events = journal_events(&run_dir);
+    for path in ["each", "each[0]/child"] {
+        assert!(
+            events.iter().any(|event| {
+                event["t"] == "step_finished"
+                    && event["node"] == path
+                    && event["status"] == "failed"
+            }),
+            "missing terminal failure for {path}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn foreach_nested_children_retry_inside() {
     // E10: nested foreach children apply their own retry at every
