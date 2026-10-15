@@ -4259,8 +4259,12 @@ fields are rejected when their structs define a closed schema.
 :: Immutable, hash-pinned snapshot of another run's declared artifact. The
    selector is policy and must name exactly one strategy: `run_id`,
    `latest_success = "<generator-id>"`, or `latest_terminal =
-   "<generator-id>"`. `artifact` is the declared output path in the source
-   run's output manifest, `max_bytes` is the required explicit byte bound,
+   "<generator-id>"`. `latest_terminal` selects the newest terminal run
+   (`success`, `failed`, `canceled`, or `interrupted`) and requires that run
+   to have succeeded; it fails without falling back to an older successful
+   run. `latest_success` explicitly selects the newest successful run even
+   when a newer terminal run was unsuccessful. `artifact` is the declared
+   output path in the source run's output manifest, `max_bytes` is the required explicit byte bound,
    and optional `require_sha256` pins the exact revision. Resolution happens
    once before execution: the bytes are verified against the source
    manifest, copied to the workspace at `run-refs/<name>/<file>`, and the
