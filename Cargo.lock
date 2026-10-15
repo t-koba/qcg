@@ -2293,6 +2293,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rawzip"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac9999039f74cd73c03158cddfe4362991703c74efe5ce5c8073026f80a5e48c"
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2808,6 +2814,7 @@ dependencies = [
  "dunce",
  "engine",
  "files",
+ "flate2",
  "futures-util",
  "hex",
  "libc",
@@ -2815,6 +2822,7 @@ dependencies = [
  "llm-steps",
  "model",
  "policy",
+ "rawzip",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -4022,6 +4030,8 @@ dependencies = [
 [[package]]
 name = "zip"
 version = "8.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
 dependencies = [
  "chrono",
  "crc32fast",

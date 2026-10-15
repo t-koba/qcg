@@ -15,6 +15,8 @@ camino.workspace = true
 chrono.workspace = true
 dunce.workspace = true
 futures-util.workspace = true
+flate2.workspace = true
+rawzip.workspace = true
 hex.workspace = true
 api = { path = "../api" }
 container = { path = "../container" }

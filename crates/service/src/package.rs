@@ -485,6 +485,111 @@ fn stage_file_path(
     ))
 }
 
+fn invalid_zip(error: rawzip::Error) -> ServiceError {
+    ServiceError::Invalid(format!("invalid package ZIP: {error}"))
+}
+
+/// Validate all raw records without allocating an inventory. The EOCD/ZIP64
+/// hint is a gate, not a trusted iterator length; duplicates count separately.
+/// Extraction makes a second streaming pass with the same parser and handle.
+fn validate_entry_count<R: rawzip::ReaderAt>(
+    archive: &rawzip::ZipArchive<R>,
+    buffer: &mut [u8],
+    limit: Option<usize>,
+) -> Result<(), ServiceError> {
+    let check = |count: u64| {
+        if let Some(limit) = limit
+            && count > limit as u64
+        {
+            return Err(ServiceError::Invalid(format!(
+                "archive contains too many entries: {count} > {limit}"
+            )));
+        }
+        Ok(())
+    };
+    check(archive.entries_hint())?;
+    let mut count = 0_u64;
+    let mut entries = archive.entries(buffer);
+    while entries.next_entry().map_err(invalid_zip)?.is_some() {
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| ServiceError::Invalid("archive entry count overflowed".into()))?;
+        check(count)?;
+    }
+    if count != archive.entries_hint() {
+        return Err(ServiceError::Invalid(format!(
+            "archive entry count mismatch: {count} != {}",
+            archive.entries_hint()
+        )));
+    }
+    Ok(())
+}
+
+fn package_entry_path(bytes: &[u8]) -> Result<Utf8PathBuf, ServiceError> {
+    let name = std::str::from_utf8(bytes)
+        .map_err(|_| ServiceError::Invalid("archive path is not UTF-8".into()))?;
+    let unsafe_path = || ServiceError::Invalid(format!("archive contains an unsafe path: {name}"));
+    // Normalize both ZIP separators, but never sanitize away an escaping
+    // parent or an absolute/drive prefix. rawzip's try_normalize deliberately
+    // strips those, which is unsuitable for a fail-closed package reader.
+    if name.starts_with(['/', '\\']) || name.contains(['\0', ':']) {
+        return Err(unsafe_path());
+    }
+    let mut rel = Utf8PathBuf::new();
+    for part in name.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if !rel.pop() {
+                    return Err(unsafe_path());
+                }
+            }
+            part => rel.push(part),
+        }
+    }
+    Ok(rel)
+}
+
+/// Bound actual expanded bytes before writing them and validate CRC/size at
+/// EOF, before the staging helper can rename the file. Verifying at EOF keeps
+/// the configured stream-budget error authoritative for lying small headers.
+fn copy_package_entry(
+    input: &mut dyn std::io::Read,
+    output: &mut dyn std::io::Write,
+    expected: rawzip::ZipVerification,
+    remaining: Option<u64>,
+    max_bytes: Option<u64>,
+) -> std::io::Result<()> {
+    use std::io::Read as _;
+    let mut input = input.take(remaining.map_or(u64::MAX, |n| n.saturating_add(1)));
+    let mut crc = rawzip::Crc32::new();
+    let mut copied = 0_u64;
+    let mut buffer = [0; 8192];
+    loop {
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        copied = copied
+            .checked_add(read as u64)
+            .ok_or_else(|| std::io::Error::other("archive expanded size overflowed"))?;
+        if remaining.is_some_and(|budget| copied > budget) {
+            return Err(std::io::Error::other(format!(
+                "archive expanded size exceeds {} bytes",
+                max_bytes.unwrap_or(u64::MAX)
+            )));
+        }
+        crc.update(&buffer[..read]);
+        output.write_all(&buffer[..read])?;
+    }
+    expected
+        .valid(rawzip::ZipVerification {
+            crc: crc.checksum(),
+            uncompressed_size: copied,
+        })
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
 pub fn unpack_package(
     archive: &Utf8Path,
     target: &Utf8Path,
@@ -497,38 +602,20 @@ pub fn unpack_package(
     // hashes per path; modes are restored through the sanitizer, which
     // never adopts setuid/setgid/world-writable bits (E15).
     let file = open_archive_nofollow(archive)?;
-    let mut archive = zip::ZipArchive::with_config(
-        zip::read::Config {
-            max_entries: limits.max_entries,
-            ..Default::default()
-        },
-        file,
-    )?;
-    // Retain the post-construction gate as defense for the parser's normalized inventory.
-    if let Some(limit) = limits.max_entries
-        && archive.len() > limit
-    {
-        return Err(ServiceError::Invalid(format!(
-            "archive contains too many entries: {} > {limit}",
-            archive.len(),
-        )));
-    }
+    // Fixed scratch space covers the largest legal central record (three
+    // u16-length fields plus the fixed header), not an archive-size policy.
+    let mut buffer = vec![0; 46 + 3 * usize::from(u16::MAX)];
+    let archive = rawzip::ZipArchive::from_file(file, &mut buffer).map_err(invalid_zip)?;
+    validate_entry_count(&archive, &mut buffer, limits.max_entries)?;
     let mut unpacked_bytes = 0_u64;
     let mut paths = BTreeSet::new();
     // Pin the target directory once (Unix): every parent creation and file
     // staging below runs relative to this fd (E15).
     #[cfg(unix)]
     let pinned_target = open_pinned_dir(target)?;
-    for index in 0..archive.len() {
-        let mut entry = archive.by_index(index)?;
-        let Some(enclosed) = entry.enclosed_name() else {
-            return Err(ServiceError::Invalid(format!(
-                "archive contains an unsafe path: {}",
-                entry.name()
-            )));
-        };
-        let rel = Utf8PathBuf::from_path_buf(enclosed.to_path_buf())
-            .map_err(|_| ServiceError::Invalid("archive path is not UTF-8".into()))?;
+    let mut entries = archive.entries(&mut buffer);
+    while let Some(header) = entries.next_entry().map_err(invalid_zip)? {
+        let rel = package_entry_path(header.file_path().as_bytes())?;
         if rel.as_str().is_empty() {
             continue;
         }
@@ -537,17 +624,33 @@ pub fn unpack_package(
                 "archive contains duplicate path `{rel}`"
             )));
         }
-        if entry
-            .unix_mode()
-            .is_some_and(|mode| mode & UNIX_MODE_TYPE_MASK == UNIX_MODE_SYMLINK)
-        {
+        // Inspect the raw type bits too: a non-Unix creator must not hide a
+        // symlink behind rawzip's synthesized DOS/default permissions.
+        if header.external_attributes() >> 16 & UNIX_MODE_TYPE_MASK == UNIX_MODE_SYMLINK {
             return Err(ServiceError::Invalid(format!(
                 "archive contains a symbolic link `{rel}`"
             )));
         }
+        if header.flags().is_encrypted()
+            || header.flags().has_strong_encryption()
+            || header.flags().is_masked()
+        {
+            return Err(ServiceError::Invalid(
+                "encrypted ZIP entries are unsupported".into(),
+            ));
+        }
+        let method = header.compression_method();
+        if !matches!(
+            method,
+            rawzip::CompressionMethod::STORE | rawzip::CompressionMethod::DEFLATE
+        ) {
+            return Err(ServiceError::Invalid(
+                "unsupported ZIP compression method".into(),
+            ));
+        }
         let prior_bytes = unpacked_bytes;
         unpacked_bytes = unpacked_bytes
-            .checked_add(entry.size())
+            .checked_add(header.uncompressed_size_hint())
             .ok_or_else(|| ServiceError::Invalid("archive expanded size overflowed".into()))?;
         if let Some(limit) = limits.max_bytes
             && unpacked_bytes > limit
@@ -561,13 +664,35 @@ pub fn unpack_package(
         // back to silent defaults (E15-8). The mode is sanitized on restore
         // so setuid/setgid/sticky never survive and world-writable is
         // cleared (E15-1).
-        let Some(raw_mode) = entry.unix_mode() else {
+        if header.version_made_by().creator_system() != rawzip::CreatorSystem::UNIX
+            || header.external_attributes() == 0
+        {
             return Err(ServiceError::Invalid(format!(
                 "archive entry `{rel}` is missing an explicit Unix mode"
             )));
+        }
+        let archived_mode = sanitize_restored_mode(header.mode().value());
+        let local = archive.get_entry(header.wayfinder()).map_err(invalid_zip)?;
+        let reader = local.reader();
+        let verification = reader.claim_verifier();
+        let mut entry: Box<dyn std::io::Read + '_> = match method {
+            rawzip::CompressionMethod::STORE => Box::new(reader),
+            rawzip::CompressionMethod::DEFLATE => {
+                Box::new(flate2::read::DeflateDecoder::new(reader))
+            }
+            _ => unreachable!("method checked above"),
         };
-        let archived_mode = sanitize_restored_mode(raw_mode);
-        if entry.is_dir() {
+        let remaining = limits
+            .max_bytes
+            .map(|limit| limit.saturating_sub(prior_bytes));
+        if header.is_dir() {
+            copy_package_entry(
+                &mut entry,
+                &mut std::io::sink(),
+                verification,
+                remaining,
+                limits.max_bytes,
+            )?;
             // Directory leaves are created (or adopted) with their final
             // sanitized mode applied on a handle, never chmodded through a
             // pathname link (E15).
@@ -586,42 +711,16 @@ pub fn unpack_package(
         } else {
             // File leaves are staged with the final mode applied BEFORE the
             // rename; no post-rename chmod ever runs (E15).
-            let expected = entry.size();
-            // Budget left for this entry's actual bytes: the declared-size
-            // gate above trusts the header, so bound the stream itself with
-            // `take` so a lying header (small declared, large actual) fails
-            // mid-stream instead of writing unbounded bytes before the
-            // post-copy size check.
-            let remaining = limits
-                .max_bytes
-                .map(|limit| limit.saturating_sub(prior_bytes));
             #[cfg(unix)]
             with_parent_fd(&pinned_target, &rel, |parent, leaf| {
                 stage_file_fd(parent, leaf, archived_mode, |output| {
-                    use std::io::Read as _;
-                    let copied = match remaining {
-                        Some(budget) => {
-                            let mut bounded = entry.take(budget.saturating_add(1));
-                            let copied = std::io::copy(&mut bounded, output)?;
-                            if copied > budget {
-                                return Err(std::io::Error::other(format!(
-                                    "archive expanded size exceeds {} bytes",
-                                    limits.max_bytes.unwrap_or(u64::MAX)
-                                )));
-                            }
-                            // Restore the wrapped entry for the borrow checker:
-                            // `take` holds `&mut entry`, dropped here.
-                            copied
-                        }
-                        None => std::io::copy(&mut entry, output)?,
-                    };
-                    if copied != expected {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("archive entry size changed while unpacking `{rel}`"),
-                        ));
-                    }
-                    Ok(())
+                    copy_package_entry(
+                        &mut entry,
+                        output,
+                        verification,
+                        remaining,
+                        limits.max_bytes,
+                    )
                 })
             })?;
             #[cfg(not(unix))]
@@ -645,28 +744,13 @@ pub fn unpack_package(
                     Err(error) => return Err(ServiceError::Io(error)),
                 }
                 stage_file_path(&out, archived_mode, |output| {
-                    use std::io::Read as _;
-                    let copied = match remaining {
-                        Some(budget) => {
-                            let mut bounded = entry.take(budget.saturating_add(1));
-                            let copied = std::io::copy(&mut bounded, output)?;
-                            if copied > budget {
-                                return Err(std::io::Error::other(format!(
-                                    "archive expanded size exceeds {} bytes",
-                                    limits.max_bytes.unwrap_or(u64::MAX)
-                                )));
-                            }
-                            copied
-                        }
-                        None => std::io::copy(&mut entry, output)?,
-                    };
-                    if copied != expected {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("archive entry size changed while unpacking `{rel}`"),
-                        ));
-                    }
-                    Ok(())
+                    copy_package_entry(
+                        &mut entry,
+                        output,
+                        verification,
+                        remaining,
+                        limits.max_bytes,
+                    )
                 })?;
             }
         }

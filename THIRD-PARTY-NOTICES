@@ -223,6 +223,7 @@ Rust packages (including build and verification dependencies):
 - rand_core@0.6.4 — MIT OR Apache-2.0
 - rand_core@0.10.1 — MIT OR Apache-2.0
 - rand_pcg@0.10.2 — MIT OR Apache-2.0
+- rawzip@0.5.2 — MIT
 - redox_syscall@0.5.18 — MIT
 - ref-cast@1.0.27 — MIT OR Apache-2.0
 - ref-cast-impl@1.0.27 — MIT OR Apache-2.0
