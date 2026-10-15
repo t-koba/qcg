@@ -912,8 +912,16 @@ version = "1.0.0"
             r#"{"id":"mygen"}"#,
         )
         .expect("marker");
-        reap_install_backup_siblings(&root, std::time::SystemTime::now())
-            .expect("uncontended sweep");
+        // Use the recorded mtime as the cutoff so filesystem timestamp
+        // precision cannot make this boundary check depend on wall-clock time.
+        assert_eq!(
+            install_commit::backup_marker_id(&backup).as_deref(),
+            Some("mygen"),
+            "the obsolete backup must have valid ownership metadata"
+        );
+        let cutoff = install_commit::backup_freshness(&backup)
+            .expect("the obsolete backup must have readable freshness metadata");
+        reap_install_backup_siblings(&root, cutoff).expect("uncontended sweep");
         assert!(
             !backup.exists(),
             "an owned obsolete backup should be removed"
