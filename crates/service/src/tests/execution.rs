@@ -860,7 +860,13 @@ async fn run_bundle_contains_snapshot_journal_and_artifacts() {
     .expect("bundle should write");
     let archive =
         zip::ZipArchive::new(std::io::Cursor::new(bundle)).expect("bundle should be a valid zip");
-    let mut names = archive.file_names().map(str::to_string).collect::<Vec<_>>();
+    let mut names = archive
+        .file_names()
+        .map(|name| {
+            name.expect("generated bundle entry name should be valid")
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
     names.sort();
     assert!(names.contains(&"snapshot.json".to_string()), "{names:?}");
     assert!(names.contains(&"inputs.json".to_string()), "{names:?}");
