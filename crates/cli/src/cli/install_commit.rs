@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
 
@@ -17,7 +18,7 @@ use super::plan::{confirm_stdin, ensure_safe_install_id, print_permission_summar
 use service::app_registry_with_providers as app_registry;
 
 use super::install::path_exists;
-use super::install_stage::{StagedInstall, load_verified_contract};
+use super::install_stage::{InstallConfig, Selected, StagedInstall, load_verified_contract};
 
 /// Single staging-cleanup guard (E14): owns every staging path that must
 /// vanish unless committed. Single-path users push once and use
@@ -84,6 +85,16 @@ pub(crate) fn remove_owned_path(path: &Utf8Path) -> Result<()> {
     Ok(())
 }
 
+/// Prepared on the destination filesystem, with all copies, prompts and
+/// copied-package verification complete. Drop removes unpublished copies.
+pub(crate) struct PreparedInstall {
+    temporary: CleanupPaths,
+    target: Utf8PathBuf,
+    replace_existing: bool,
+    manifest: contract::Manifest,
+}
+
+#[cfg(test)]
 pub(crate) fn finish_install(
     providers_path: Option<&Utf8Path>,
     staged: StagedInstall,
@@ -92,6 +103,44 @@ pub(crate) fn finish_install(
     force: bool,
     limits: &service::PackageLimits,
 ) -> Result<String> {
+    let id = staged.contract.manifest.generator.id.clone();
+    finish_closure(
+        InstallConfig {
+            providers_path,
+            generators_dir,
+            yes,
+            force,
+            limits,
+        },
+        vec![staged],
+        &Selected::new(),
+    )?;
+    Ok(id)
+}
+
+pub(crate) fn finish_closure(
+    config: InstallConfig<'_>,
+    stages: Vec<StagedInstall>,
+    selected: &Selected,
+) -> Result<()> {
+    let prepared = stages
+        .into_iter()
+        .map(|stage| prepare_install(config, stage))
+        .collect::<Result<Vec<_>>>()?;
+    commit_prepared_closure(config, prepared, selected)
+}
+
+pub(crate) fn prepare_install(
+    config: InstallConfig<'_>,
+    staged: StagedInstall,
+) -> Result<PreparedInstall> {
+    let InstallConfig {
+        providers_path,
+        generators_dir,
+        yes,
+        force,
+        limits,
+    } = config;
     // The staged contract was parsed once at stage time and threaded here
     // without re-opening or re-parsing the manifest (E14-1). Validation
     // below runs against these exact bytes.
@@ -122,7 +171,7 @@ pub(crate) fn finish_install(
         anyhow::bail!("install destination `{generators_dir}` is inside source `{staged_path}`");
     }
     let temporary = unique_directory_at(generators_dir, "install-temp")?;
-    let mut temporary = CleanupPaths::new(temporary);
+    let temporary = CleanupPaths::new(temporary);
     // Single copy (E14): the staged private copy is copied ONCE into the
     // parent-temp dir for an atomic same-filesystem rename. No double copy:
     // staging already lives in private staging; this is the commit copy.
@@ -171,9 +220,105 @@ pub(crate) fn finish_install(
             }
         }
     }
-    commit_install(temporary.armed()?, &target, target_exists)?;
-    temporary.disarm();
-    Ok(id)
+    Ok(PreparedInstall {
+        temporary,
+        target,
+        replace_existing: target_exists,
+        manifest: contract.manifest.clone(),
+    })
+}
+
+/// Publication holds shared global locks, then every distinct shard in
+/// ascending index order, then every closure ID file lock in ID order. Reused
+/// nodes stay protected through revalidation and all leaf-to-parent commits.
+/// Copies, prompts and copied inventory checks finish before this scope.
+pub(crate) fn commit_prepared_closure(
+    config: InstallConfig<'_>,
+    prepared: Vec<PreparedInstall>,
+    selected: &Selected,
+) -> Result<()> {
+    let _global_read = global_commit_rwlock()
+        .read()
+        .map_err(|_| anyhow::anyhow!("install global lock was poisoned"))?;
+    let _global_file = acquire_file_lock_shared(
+        &global_lock_path(config.generators_dir),
+        config.generators_dir,
+    )?;
+    let ids = prepared
+        .iter()
+        .map(|package| package.manifest.generator.id.as_str())
+        .chain(selected.keys().map(String::as_str));
+    let _id_guards = lock_closure_ids(config.generators_dir, ids)?;
+
+    // Include reused nodes, not just packages that happened to need staging.
+    // A same-version replacement may change dependencies too: validate the
+    // current manifests' edges against the complete selected set below.
+    let mut manifests = std::collections::BTreeMap::new();
+    for package in &prepared {
+        let id = package.manifest.generator.id.clone();
+        if manifests
+            .insert(id.clone(), package.manifest.clone())
+            .is_some()
+        {
+            anyhow::bail!("duplicate prepared generator `{id}`");
+        }
+    }
+    for (id, selection) in selected {
+        let version = &selection.version;
+        if !manifests.contains_key(id) {
+            let manifest = load_verified_contract(&config.generators_dir.join(id), config.limits)
+                .with_context(|| {
+                    format!(
+                        "selected dependency `{id}@{version}` changed or disappeared; retry install"
+                    )
+                })?
+                .manifest;
+            manifests.insert(id.clone(), manifest);
+        }
+        let manifest = &manifests[id];
+        if manifest.generator.id != *id
+            || semver::Version::parse(&manifest.generator.version)? != *version
+            || manifest.dependencies != selection.dependencies
+        {
+            anyhow::bail!(
+                "selected dependency `{id}@{version}` changed identity, version or dependencies; retry install"
+            );
+        }
+    }
+    for (id, manifest) in &manifests {
+        for (dependency, requirement) in &manifest.dependencies {
+            let requirement = semver::VersionReq::parse(requirement)?;
+            let Some(dependency_manifest) = manifests.get(dependency) else {
+                anyhow::bail!(
+                    "dependency closure changed for `{id}`: `{dependency}` was not selected; retry install"
+                );
+            };
+            if !requirement.matches(&semver::Version::parse(
+                &dependency_manifest.generator.version,
+            )?) {
+                anyhow::bail!(
+                    "dependency closure changed for `{id}`: `{dependency}` no longer satisfies `{requirement}`; retry install"
+                );
+            }
+        }
+    }
+    #[cfg(test)]
+    AFTER_CLOSURE_REVALIDATION.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+    // Leaf order from staging, parent last. Failures may leave standalone
+    // dependencies, but never publish the parent after a failed dependency.
+    for mut package in prepared {
+        commit_install_locked(
+            package.temporary.armed()?,
+            &package.target,
+            package.replace_existing,
+        )?;
+        package.temporary.disarm();
+    }
+    Ok(())
 }
 
 /// Renames the staged install into place. Without an existing target
@@ -280,7 +425,7 @@ pub(crate) fn check_no_replace_target(
 /// Hard-link-based NOREPLACE is infeasible for directories (hard links to
 /// directories are prohibited), so an atomic no-overwrite rename does not
 /// exist on this platform: the residual window below is truly unavoidable
-/// without OS support. Mitigation: `commit_install` holds the per-id file
+/// without OS support. Mitigation: `commit_install_locked` holds the per-id file
 /// lock (plus the in-process shard mutex) across the whole probe+rename
 /// window, so two concurrent same-id installs serialize — the second blocks
 /// on the lock, then observes the committed target and fails closed (or
@@ -312,45 +457,86 @@ pub(crate) fn rename_no_replace(
     Ok(())
 }
 
-/// In-process serialization sharded by install id (E14-5). Commits touch
-/// only `generators_dir/<id>` plus their own temp staging, which is
-/// per-id state: unrelated ids use different shards and different lock
-/// files, so they install in parallel. The same id serializes in-process
-/// here and across processes via the per-id file lock below, closing the
-/// fresh-install rename race (two NotFound observers) and the `--force`
-/// last-win window. Commits also hold the global lock in shared mode (see
-/// `global_commit_rwlock`): many installs may hold it together, but an
-/// uninstall holding it exclusive blocks new commits during its atomic
-/// dependents re-check plus removal.
-pub(crate) fn replace_mutex_for(id: &str) -> &'static Mutex<()> {
-    static SHARDS: OnceLock<[Mutex<()>; 16]> = OnceLock::new();
-    let shards = SHARDS.get_or_init(|| {
-        [
-            Mutex::new(()),
-            Mutex::new(()),
-            Mutex::new(()),
-            Mutex::new(()),
-            Mutex::new(()),
-            Mutex::new(()),
-            Mutex::new(()),
-            Mutex::new(()),
-            Mutex::new(()),
-            Mutex::new(()),
-            Mutex::new(()),
-            Mutex::new(()),
-            Mutex::new(()),
-            Mutex::new(()),
-            Mutex::new(()),
-            Mutex::new(()),
-        ]
-    });
-    // Stable shard from the id hash; collisions only over-serialize.
+/// Stable shard index, not ID ordering: ID-ordered acquisition can invert
+/// shard order, and colliding IDs must never recursively lock the same mutex.
+pub(crate) fn replace_shard_index(id: &str) -> usize {
     let mut hash: u64 = 0xcbf29ce484222325;
     for byte in id.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    &shards[(hash as usize) % shards.len()]
+    (hash as usize) % 16
+}
+
+fn replace_shards() -> &'static [Mutex<()>; 16] {
+    static SHARDS: OnceLock<[Mutex<()>; 16]> = OnceLock::new();
+    SHARDS.get_or_init(|| std::array::from_fn(|_| Mutex::new(())))
+}
+
+pub(crate) fn replace_mutex_for(id: &str) -> &'static Mutex<()> {
+    &replace_shards()[replace_shard_index(id)]
+}
+
+/// The two independent total orders used by publication. Sorting IDs alone
+/// is insufficient: e.g. `a`/`q` collide on shard 12, while `b` uses shard 5.
+pub(crate) fn closure_lock_order<'a>(
+    ids: impl IntoIterator<Item = &'a str>,
+) -> (BTreeSet<usize>, BTreeSet<&'a str>) {
+    let ids: BTreeSet<_> = ids.into_iter().collect();
+    let shards = ids.iter().map(|id| replace_shard_index(id)).collect();
+    (shards, ids)
+}
+
+/// Caller already holds both global locks. Retain all guards to completion;
+/// partial acquisition errors release everything acquired so far via RAII.
+fn lock_closure_ids<'a>(
+    parent: &Utf8Path,
+    ids: impl IntoIterator<Item = &'a str>,
+) -> Result<(Vec<std::sync::MutexGuard<'static, ()>>, Vec<std::fs::File>)> {
+    let (shards, ids) = closure_lock_order(ids);
+    let mut process_guards = Vec::with_capacity(shards.len());
+    for index in shards {
+        process_guards.push(
+            replace_shards()[index]
+                .lock()
+                .map_err(|_| anyhow::anyhow!("install replace shard {index} was poisoned"))?,
+        );
+    }
+    let mut file_guards = Vec::with_capacity(ids.len());
+    for id in ids {
+        file_guards.push(acquire_file_lock(
+            &parent.join(per_id_lock_name(id)),
+            &parent.join(id),
+        )?);
+    }
+    Ok((process_guards, file_guards))
+}
+
+#[cfg(test)]
+thread_local! {
+    // Thread-local so unrelated production-path tests cannot steal a hook.
+    static AFTER_CLOSURE_REVALIDATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_closure_publication_hook<T>(
+    hook: impl FnOnce() + 'static,
+    publish: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            AFTER_CLOSURE_REVALIDATION.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+    AFTER_CLOSURE_REVALIDATION.with(|slot| {
+        assert!(slot.borrow_mut().replace(Box::new(hook)).is_none());
+    });
+    let _reset = Reset;
+    publish()
 }
 
 /// Per-id cross-process lock file name. The id is sanitized so path
@@ -372,19 +558,16 @@ pub(crate) fn per_id_lock_name(id: &str) -> String {
     format!(".install-{safe}-{}.lock", &hash[..8])
 }
 
-/// Global cross-process lock for operations that mutate or depend on
-/// global state: uninstall's dependents re-check plus removal (the
-/// dependents graph spans all ids, so a concurrent install of a different
-/// id could add a new dependent between check and removal). Commits hold
-/// this lock in shared mode (many readers), uninstall holds it exclusive
-/// (single writer), so unrelated installs proceed in parallel but never
-/// interleave with an uninstall's atomic check-plus-remove.
+/// Global cross-process publication lock: shared for closure publication,
+/// exclusive for uninstall's dependents recheck/removal. Per-ID locks keep
+/// selected dependencies stable. Preparation never holds this lock.
 pub(crate) fn global_lock_path(parent: &Utf8Path) -> Utf8PathBuf {
     parent.join(".install-global.lock")
 }
 
-/// In-process global lock matching the file lock above: commits hold a
-/// read guard, uninstall holds a write guard across its atomic section.
+/// In-process global lock matching the file lock above. Always acquired
+/// before the global file lock, then distinct shards by ascending index,
+/// then per-ID file locks by ascending ID. Never upgrade or reacquire global.
 pub(crate) fn global_commit_rwlock() -> &'static std::sync::RwLock<()> {
     static GLOBAL_RWLOCK: OnceLock<std::sync::RwLock<()>> = OnceLock::new();
     GLOBAL_RWLOCK.get_or_init(|| std::sync::RwLock::new(()))
@@ -443,40 +626,41 @@ pub(crate) fn try_acquire_file_lock(lock_path: &Utf8Path) -> Result<Option<std::
     }
 }
 
+#[cfg(test)]
 pub(crate) fn commit_install(
     temporary: &Utf8Path,
     target: &Utf8Path,
     replace_existing: bool,
 ) -> Result<()> {
-    // Per-id serialization in-process plus per-id file lock across
-    // processes, held for the whole backup+rename window. Fresh installs
-    // race too (two NotFound observers both renaming): without the lock
-    // they last-win and both report success with a divergent closure (E14).
-    // Unrelated ids use different shards and lock files and proceed in
-    // parallel; only the same id serializes. The global lock is held
-    // shared so an uninstall holding it exclusive blocks new commits
-    // during its atomic check-plus-remove, while parallel commits share it.
+    let parent = target
+        .parent()
+        .context("install target must have a parent directory")?;
+    std::fs::create_dir_all(parent)?;
+    let _global_read = global_commit_rwlock()
+        .read()
+        .map_err(|_| anyhow::anyhow!("install global lock was poisoned for `{target}`"))?;
+    let _global_file = acquire_file_lock_shared(&global_lock_path(parent), target)?;
+    let id = target
+        .file_name()
+        .context("install target must have a file name")?;
+    let _id_guards = lock_closure_ids(parent, [id])?;
+    commit_install_locked(temporary, target, replace_existing)
+}
+
+/// Caller holds both global locks AND all closure shard/per-ID locks. Never
+/// reacquire them here. Per-ID locks also exclude maintenance, which never
+/// acquires global after per-ID and only restores/deletes owned backups.
+fn commit_install_locked(
+    temporary: &Utf8Path,
+    target: &Utf8Path,
+    replace_existing: bool,
+) -> Result<()> {
     let id = target
         .file_name()
         .context("install target must have a file name")?;
     let parent = target
         .parent()
         .context("install target must have a parent directory")?;
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create install parent `{parent}`"))?;
-    // Global before per-id ordering prevents deadlock with uninstall,
-    // which takes global exclusive then per-id.
-    let _global_read = global_commit_rwlock()
-        .read()
-        .map_err(|_| anyhow::anyhow!("install global lock was poisoned for `{target}`"))?;
-    let _process_guard = replace_mutex_for(id)
-        .lock()
-        .map_err(|_| anyhow::anyhow!("install replace lock was poisoned for `{target}`"))?;
-    // Cross-process locks, held for the whole commit.
-    let global_path = global_lock_path(parent);
-    let _global_file_guard = acquire_file_lock_shared(&global_path, target)?;
-    let lock_path = parent.join(per_id_lock_name(id));
-    let _file_guard = acquire_file_lock(&lock_path, target)?;
     recover_interrupted_backup(target);
     let backup = if replace_existing {
         let backup = loop {
@@ -585,20 +769,23 @@ pub(crate) fn uninstall(id: &str, generators_dir: &Utf8Path, yes: bool) -> Resul
     if !path_exists(&target.join(contract::MANIFEST_FILE))? {
         anyhow::bail!("generator `{id}` is not installed under `{generators_dir}`");
     }
+    if !yes {
+        confirm_stdin(&format!("Uninstall generator `{id}`?"))?;
+    }
     // Hold the install locks across the dependents re-check plus removal
     // so the check-then-remove is atomic: a concurrent install adding a
     // new dependent cannot slip between them. Global exclusive blocks new
-    // commits (which hold global shared), per-id exclusive serializes with
-    // same-id commits. Ordering is global before per-id, matching commits.
+    // closure publication; per-id exclusive also excludes maintenance.
+    // Ordering is global process, global file, shard, per-id file.
     std::fs::create_dir_all(generators_dir)
         .with_context(|| format!("failed to create install parent `{generators_dir}`"))?;
     let _global_write = global_commit_rwlock()
         .write()
         .map_err(|_| anyhow::anyhow!("install global lock was poisoned for uninstall `{id}`"))?;
+    let _global_file_guard = acquire_file_lock(&global_lock_path(generators_dir), &target)?;
     let _process_guard = replace_mutex_for(id)
         .lock()
         .map_err(|_| anyhow::anyhow!("install replace lock was poisoned for uninstall `{id}`"))?;
-    let _global_file_guard = acquire_file_lock(&global_lock_path(generators_dir), &target)?;
     let _per_id_file_guard =
         acquire_file_lock(&generators_dir.join(per_id_lock_name(id)), &target)?;
     // Re-check under the locks: fail closed when any installed generator
@@ -629,9 +816,6 @@ pub(crate) fn uninstall(id: &str, generators_dir: &Utf8Path, yes: bool) -> Resul
         Err(error) => {
             return Err(error).with_context(|| format!("failed to inspect `{target}`"));
         }
-    }
-    if !yes {
-        confirm_stdin(&format!("Uninstall generator `{id}`?"))?;
     }
     // Remove owned recovery copies while holding the same per-id lock.
     // Otherwise later maintenance could resurrect a successfully uninstalled id.

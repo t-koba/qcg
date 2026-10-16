@@ -557,8 +557,27 @@ before anything commits, for registry and direct path installs alike (a
 local directory or file stages its closure against the configured registries
 first); siblings sharing a dependency select a single version for the whole
 closure, and a missing or conflicting set refuses pre-commit with nothing
-committed, so there is no partial state to repair. A commit interrupted
-after the backup rename leaves the target missing with a
+committed, so there is no partial state to repair. Destination copies,
+provider validation and confirmations also finish before publication locks.
+Publication holds shared process-global and file-global guards, then locks the
+union of prepared and selected IDs (including all reused transitive nodes).
+Distinct process shards are locked once each in ascending shard-index order;
+per-ID file locks follow in deterministic ID order. All guards remain held
+through closure revalidation, leaf-first commits (parent last), fsyncs and
+backup cleanup. Disjoint closures on different shards can publish concurrently;
+overlapping closures serialize, and shard collisions may also serialize
+unrelated IDs. Uninstall remains global-exclusive and global-first across its
+dependents recheck and removal. Maintenance takes only per-ID file locks,
+never global locks after per-ID, and skips locked IDs.
+
+Reused packages are inventory-verified again and must retain the selected
+identity, version and dependency set. If a concurrent uninstall or replacement
+made the plan stale, installation refuses before publication and asks for a
+retry; it never fetches or prompts under the guards. A later commit failure
+can leave earlier standalone dependencies installed, but never commits the
+parent after a failed dependency.
+
+A commit interrupted after the backup rename leaves the target missing with a
 `.install-backup-*` sibling intact; every install restores a missing target
 from its backup automatically before sweeping, so rerunning the same command
 converges (manual rename of the newest backup back to the target is only a

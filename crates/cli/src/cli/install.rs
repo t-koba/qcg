@@ -22,9 +22,9 @@ use policy::MAX_SIGNING_KEY_BYTES;
 /// past the split through `install::` instead of naming submodules.
 #[cfg(test)]
 pub(crate) use super::install_commit::{
-    CleanupPaths, check_no_replace_target, commit_install, per_id_lock_name,
+    CleanupPaths, check_no_replace_target, commit_install, finish_install, per_id_lock_name,
 };
-pub(crate) use super::install_commit::{finish_install, remove_owned_path, uninstall};
+pub(crate) use super::install_commit::{finish_closure, remove_owned_path, uninstall};
 pub(crate) use super::install_stage::{
     InstallConfig, Selected, install_registry_package, is_cycle_error, stage_closure_for_manifest,
     stage_install_source,
@@ -337,35 +337,11 @@ pub(crate) async fn install(
             ));
         }
     };
-    // Single commit phase: dependencies first, parent last. Staging already
-    // verified the SBOM inventory (directory sources carry supply-chain
-    // metadata, fail-closed E14), so commit adds no second demand. The
-    // staged copy was already contract-validated; what must not happen is
-    // a committed parent without its closure.
-    for dep_staged in staged_closure {
-        let dep_id = dep_staged.contract.manifest.generator.id.clone();
-        finish_install(
-            providers_path,
-            dep_staged,
-            generators_dir,
-            yes,
-            force,
-            limits,
-        )
-        .map_err(|error| {
-            if is_cycle_error(&error) {
-                anyhow::anyhow!(
-                    "generator `{parent_id}` dependency cycle committing `{dep_id}`: {error}; refusing to commit parent"
-                )
-            } else {
-                anyhow::anyhow!(
-                    "dependency closure cannot be satisfied for generator `{parent_id}` committing `{dep_id}`: {error}; refusing to commit parent"
-                )
-            }
-        })?;
-    }
-    let installed_id = finish_install(providers_path, staged, generators_dir, yes, force, limits)?;
-    Ok(installed_id)
+    let mut stages = staged_closure;
+    stages.push(staged);
+    finish_closure(config, stages, &selected)
+        .with_context(|| format!("dependency closure cannot be satisfied for generator `{parent_id}`; refusing to commit parent"))?;
+    Ok(parent_id)
 }
 
 /// Checks existence without squashing IO errors: `Path::exists` returns
@@ -479,13 +455,17 @@ mod tests {
     }
 
     fn write_installed(dir: &Utf8Path, id: &str, dependency: &str) {
+        write_installed_version(dir, id, "1.0.0", dependency);
+    }
+
+    fn write_installed_version(dir: &Utf8Path, id: &str, version: &str, dependency: &str) {
         std::fs::create_dir_all(dir).expect("installed generator dir");
         let manifest = format!(
             r#"
 [generator]
 id = "{id}"
 name = "{id}"
-version = "1.0.0"
+version = "{version}"
 {dependency}
 "#
         );
@@ -1192,6 +1172,530 @@ version = "1.0.0"
         }
     }
 
+    fn fixture_stage(path: &Utf8Path, limits: &service::PackageLimits) -> StagedInstall {
+        StagedInstall {
+            path: path.to_path_buf(),
+            contract: load_verified_contract(path, limits).expect("verified fixture"),
+            _cleanup: CleanupPaths::default(),
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ClosureRace {
+        Uninstall,
+        ReplaceVersion,
+        ReplaceDependencies,
+    }
+
+    async fn reused_dependency_race(race: ClosureRace) {
+        let root = test_root("closure-race");
+        let _temp_guard = TempGuard(root.clone());
+        let generators = root.join("generators");
+        let parent = root.join("parent");
+        let limits = service::PackageLimits::default();
+        let config = InstallConfig {
+            yes: true,
+            ..test_config(&limits, &generators)
+        };
+        write_installed(&generators.join("dep"), "dep", "");
+        // Transitive reused nodes must be retained too, not just direct deps.
+        write_installed(
+            &generators.join("middle"),
+            "middle",
+            "[dependencies]\ndep = \"*\"",
+        );
+        write_installed(&parent, "parent", "[dependencies]\nmiddle = \"^1\"");
+        let parent_stage = fixture_stage(&parent, &limits);
+        let mut selected = Selected::new();
+        let mut visiting = BTreeSet::from([("parent".to_string(), "1.0.0".to_string())]);
+        let stages = stage_closure_for_manifest(
+            config,
+            &parent_stage.contract.manifest,
+            &mut visiting,
+            &mut selected,
+        )
+        .await
+        .expect("closure verified before the race");
+        assert!(stages.is_empty(), "all dependencies are reused");
+        assert_eq!(selected.len(), 2, "retain direct and transitive selections");
+        let prepared =
+            vec![install_commit::prepare_install(config, parent_stage).expect("parent prepared")];
+
+        // Explicit pause at the real preparation/publication boundary. The
+        // mutator completes a locked uninstall/replacement before publication;
+        // no sleep or scheduling assumption is involved.
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let mutator = scope.spawn(|| {
+                barrier.wait();
+                match race {
+                    ClosureRace::Uninstall => {
+                        // Remove middle first because uninstall protects installed dependents.
+                        uninstall("middle", &generators, true).expect("uninstall middle");
+                        uninstall("dep", &generators, true).expect("uninstall selected dep");
+                    }
+                    ClosureRace::ReplaceVersion => {
+                        let replacement = root.join("replacement");
+                        // Still satisfies `*`, but it is not the selected version.
+                        write_installed_version(&replacement, "dep", "2.0.0", "");
+                        finish_closure(
+                            InstallConfig {
+                                force: true,
+                                ..config
+                            },
+                            vec![fixture_stage(&replacement, &limits)],
+                            &Selected::new(),
+                        )
+                        .expect("replace selected version");
+                    }
+                    ClosureRace::ReplaceDependencies => {
+                        let replacement = root.join("replacement");
+                        write_installed(&generators.join("other"), "other", "");
+                        write_installed(&replacement, "dep", "[dependencies]\nother = \"^1\"");
+                        let other = load_verified_contract(&generators.join("other"), &limits)
+                            .expect("other");
+                        let replacement_selected = Selected::from([(
+                            "other".to_string(),
+                            super::super::install_stage::SelectedPackage::from_manifest(
+                                &other.manifest,
+                            )
+                            .expect("selection"),
+                        )]);
+                        finish_closure(
+                            InstallConfig {
+                                force: true,
+                                ..config
+                            },
+                            vec![fixture_stage(&replacement, &limits)],
+                            &replacement_selected,
+                        )
+                        .expect("replace selected dependency set");
+                    }
+                }
+            });
+            barrier.wait();
+            mutator.join().expect("mutator finished");
+        });
+        let error = install_commit::commit_prepared_closure(config, prepared, &selected)
+            .expect_err("stale selection must refuse parent publication");
+        assert!(format!("{error:#}").contains("retry install"), "{error:#}");
+        assert!(
+            !generators.join("parent").exists(),
+            "stale parent must not publish"
+        );
+        assert!(
+            !std::fs::read_dir(&generators)
+                .expect("generators")
+                .flatten()
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".install-temp-")),
+            "unpublished copies cleaned"
+        );
+    }
+
+    #[tokio::test]
+    async fn closure_commit_refuses_uninstalled_reused_dependency() {
+        reused_dependency_race(ClosureRace::Uninstall).await;
+    }
+
+    #[tokio::test]
+    async fn closure_commit_refuses_replaced_reused_version() {
+        reused_dependency_race(ClosureRace::ReplaceVersion).await;
+    }
+
+    #[tokio::test]
+    async fn closure_commit_refuses_changed_reused_dependencies() {
+        reused_dependency_race(ClosureRace::ReplaceDependencies).await;
+    }
+
+    const LOCK_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    fn closure_selection(generators: &Utf8Path, limits: &service::PackageLimits) -> Selected {
+        ["middle", "dep"]
+            .into_iter()
+            .map(|id| {
+                let manifest = load_verified_contract(&generators.join(id), limits)
+                    .expect("reused inventory")
+                    .manifest;
+                (
+                    id.to_string(),
+                    super::super::install_stage::SelectedPackage::from_manifest(&manifest)
+                        .expect("selection"),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parallel_closure_publications_of_disjoint_ids_proceed_together() {
+        // Isolate from unrelated tests' global-exclusive uninstall waiters.
+        if env_process::isolated() {
+            return;
+        }
+        let root = test_root("parallel-closures");
+        let _temp_guard = TempGuard(root.clone());
+        let generators = root.join("generators");
+        let limits = service::PackageLimits::default();
+        let config = InstallConfig {
+            yes: true,
+            ..test_config(&limits, &generators)
+        };
+        write_installed(&root.join("leaf"), "leaf", "");
+        write_installed(
+            &root.join("parent"),
+            "parent",
+            "[dependencies]\nleaf = \"^1\"",
+        );
+        let other = (0..100)
+            .map(|i| format!("other-{i}"))
+            .find(|id| {
+                ["parent", "leaf"].iter().all(|held| {
+                    install_commit::replace_shard_index(id)
+                        != install_commit::replace_shard_index(held)
+                })
+            })
+            .expect("disjoint shard");
+        write_installed(&root.join(&other), &other, "");
+        let stages: Vec<_> = ["leaf", "parent"]
+            .into_iter()
+            .map(|id| fixture_stage(&root.join(id), &limits))
+            .collect();
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let publisher = scope.spawn(|| {
+                install_commit::with_closure_publication_hook(
+                    move || {
+                        paused_tx.send(()).unwrap();
+                        release_rx
+                            .recv_timeout(LOCK_TEST_TIMEOUT * 2)
+                            .expect("release publication");
+                    },
+                    || finish_closure(config, stages, &Selected::new()),
+                )
+            });
+            paused_rx
+                .recv_timeout(LOCK_TEST_TIMEOUT)
+                .expect("closure revalidated under locks");
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let other_id = &other;
+            scope.spawn(move || {
+                done_tx
+                    .send(finish_closure(
+                        config,
+                        vec![fixture_stage(&root.join(other_id), &limits)],
+                        &Selected::new(),
+                    ))
+                    .unwrap();
+            });
+            done_rx
+                .recv_timeout(LOCK_TEST_TIMEOUT)
+                .expect("disjoint production publication must finish while first closure is paused")
+                .expect("disjoint publication");
+            assert!(generators.join(&other).exists());
+            assert!(!generators.join("parent").exists());
+            release_tx.send(()).unwrap();
+            publisher.join().unwrap().expect("first publication");
+        });
+        assert!(generators.join("parent").exists());
+    }
+
+    #[test]
+    fn closure_publication_holds_reused_direct_and_transitive_ids() {
+        if env_process::isolated() {
+            return;
+        }
+        // Exercise both mutators against both kinds of reused selections.
+        for target in ["middle", "dep"] {
+            for replace in [false, true] {
+                let root = test_root("protected-closure");
+                let _temp_guard = TempGuard(root.clone());
+                let generators = root.join("generators");
+                let limits = service::PackageLimits::default();
+                let config = InstallConfig {
+                    yes: true,
+                    ..test_config(&limits, &generators)
+                };
+                write_installed(&generators.join("dep"), "dep", "");
+                write_installed(
+                    &generators.join("middle"),
+                    "middle",
+                    "[dependencies]\ndep = \"^1\"",
+                );
+                write_installed(
+                    &root.join("parent"),
+                    "parent",
+                    "[dependencies]\nmiddle = \"^1\"",
+                );
+                write_installed(&root.join("replacement"), target, "");
+                let selected = closure_selection(&generators, &limits);
+                let stage = fixture_stage(&root.join("parent"), &limits);
+                let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                std::thread::scope(|scope| {
+                    let publisher = scope.spawn(|| {
+                        install_commit::with_closure_publication_hook(
+                            move || {
+                                paused_tx.send(()).unwrap();
+                                release_rx
+                                    .recv_timeout(LOCK_TEST_TIMEOUT * 2)
+                                    .expect("release publication");
+                            },
+                            || finish_closure(config, vec![stage], &selected),
+                        )
+                    });
+                    paused_rx
+                        .recv_timeout(LOCK_TEST_TIMEOUT)
+                        .expect("final revalidation");
+                    for id in ["middle", "dep"] {
+                        assert!(
+                            matches!(
+                                install_commit::replace_mutex_for(id).try_lock(),
+                                Err(std::sync::TryLockError::WouldBlock)
+                            ),
+                            "reused shard protected: {id}"
+                        );
+                        assert!(
+                            install_commit::try_acquire_file_lock(
+                                &generators.join(per_id_lock_name(id))
+                            )
+                            .expect("probe ID lock")
+                            .is_none(),
+                            "reused file protected: {id}"
+                        );
+                    }
+                    assert!(
+                        matches!(
+                            install_commit::global_commit_rwlock().try_write(),
+                            Err(std::sync::TryLockError::WouldBlock)
+                        ),
+                        "uninstall excluded"
+                    );
+                    // The existing exact-test subprocess mechanism also makes an
+                    // inexpensive check of real cross-process advisory locks.
+                    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "--exact",
+                            "cli::install::tests::closure_publication_file_lock_probe_child",
+                        ])
+                        .env("QCG_INSTALL_LOCK_PROBE", &generators)
+                        .spawn()
+                        .expect("lock probe child");
+                    let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+                    scope.spawn(move || probe_tx.send(child.wait()).unwrap());
+                    assert!(
+                        probe_rx
+                            .recv_timeout(LOCK_TEST_TIMEOUT)
+                            .expect("bounded child probe")
+                            .expect("child status")
+                            .success()
+                    );
+                    let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
+                    let (done_tx, done_rx) = std::sync::mpsc::channel();
+                    let generators = &generators;
+                    let root = &root;
+                    scope.spawn(move || {
+                        let result = if replace {
+                            let prepared = install_commit::prepare_install(
+                                InstallConfig {
+                                    force: true,
+                                    ..config
+                                },
+                                fixture_stage(&root.join("replacement"), &limits),
+                            )
+                            .expect("replacement prepared outside locks");
+                            attempt_tx.send(()).unwrap();
+                            let parent = generators.join("parent");
+                            install_commit::with_closure_publication_hook(
+                                move || {
+                                    assert!(
+                                        parent.exists(),
+                                        "replacement cannot revalidate before parent publication"
+                                    )
+                                },
+                                || {
+                                    install_commit::commit_prepared_closure(
+                                        config,
+                                        vec![prepared],
+                                        &Selected::new(),
+                                    )
+                                },
+                            )
+                        } else {
+                            attempt_tx.send(()).unwrap();
+                            uninstall(target, generators, true)
+                        };
+                        done_tx.send(result).unwrap();
+                    });
+                    attempt_rx
+                        .recv_timeout(LOCK_TEST_TIMEOUT)
+                        .expect("mutator started");
+                    // No timed negative assertion: the nonblocking lock probes
+                    // above prove exclusion. Completion follows release only.
+                    assert!(matches!(
+                        done_rx.try_recv(),
+                        Err(std::sync::mpsc::TryRecvError::Empty)
+                    ));
+                    assert!(!generators.join("parent").exists());
+                    release_tx.send(()).unwrap();
+                    publisher.join().unwrap().expect("parent publication");
+                    let result = done_rx
+                        .recv_timeout(LOCK_TEST_TIMEOUT)
+                        .expect("mutator released");
+                    if replace {
+                        result.expect("replacement proceeds after publication");
+                    } else {
+                        let error = result
+                            .expect_err("uninstall sees published dependent")
+                            .to_string();
+                        let dependent = if target == "middle" {
+                            "parent"
+                        } else {
+                            "middle"
+                        };
+                        assert!(
+                            error.contains("required by") && error.contains(dependent),
+                            "{error}"
+                        );
+                    }
+                });
+                assert!(generators.join(target).exists());
+            }
+        }
+    }
+
+    #[test]
+    fn closure_publication_file_lock_probe_child() {
+        let Some(path) = std::env::var_os("QCG_INSTALL_LOCK_PROBE") else {
+            return;
+        };
+        let generators = Utf8PathBuf::from_path_buf(path.into()).unwrap();
+        let global = std::fs::OpenOptions::new()
+            .write(true)
+            .open(install_commit::global_lock_path(&generators))
+            .unwrap();
+        global
+            .try_lock_shared()
+            .expect("publication global file lock is shared");
+        drop(global);
+        assert!(
+            install_commit::try_acquire_file_lock(&install_commit::global_lock_path(&generators))
+                .unwrap()
+                .is_none(),
+            "uninstall's global-exclusive file lock is blocked"
+        );
+        for id in ["middle", "dep"] {
+            assert!(
+                install_commit::try_acquire_file_lock(&generators.join(per_id_lock_name(id)))
+                    .unwrap()
+                    .is_none(),
+                "cross-process reused ID protected: {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn closure_lock_order_is_sorted_and_deduplicated() {
+        if env_process::isolated() {
+            return;
+        }
+        // Input order, duplicate IDs and shard collisions must not alter
+        // either acquisition order. ID order differs from shard order here.
+        let order = install_commit::closure_lock_order(["q", "b", "a", "b"]);
+        assert_eq!(order.0.iter().copied().collect::<Vec<_>>(), [5, 12]);
+        assert_eq!(order.1.iter().copied().collect::<Vec<_>>(), ["a", "b", "q"]);
+        assert_eq!(order, install_commit::closure_lock_order(["a", "b", "q"]));
+
+        // Exercise that very order through real closure publication too:
+        // a/q collide and the prepared sequence is opposite to file-ID order.
+        let root = test_root("closure-lock-order");
+        let _temp_guard = TempGuard(root.clone());
+        let generators = root.join("generators");
+        let limits = service::PackageLimits::default();
+        let config = InstallConfig {
+            yes: true,
+            ..test_config(&limits, &generators)
+        };
+        let stages = ["q", "b", "a"]
+            .into_iter()
+            .map(|id| {
+                write_installed(&root.join(id), id, "");
+                fixture_stage(&root.join(id), &limits)
+            })
+            .collect();
+        finish_closure(config, stages, &Selected::new()).expect("no recursive or inverted locking");
+        for id in ["a", "b", "q"] {
+            load_verified_contract(&generators.join(id), &limits).expect("published inventory");
+        }
+    }
+
+    #[test]
+    fn closure_commit_publishes_fresh_transitive_closure() {
+        if env_process::isolated() {
+            return;
+        }
+        let root = test_root("fresh-closure");
+        let _temp_guard = TempGuard(root.clone());
+        let generators = root.join("generators");
+        let limits = service::PackageLimits::default();
+        let config = InstallConfig {
+            yes: true,
+            ..test_config(&limits, &generators)
+        };
+        // Choose a collision to prove closure-wide locking deduplicates
+        // shards even when distinct closure IDs map to the same mutex.
+        let leaf = (0..100)
+            .map(|i| format!("leaf-{i}"))
+            .find(|id| {
+                std::ptr::eq(
+                    install_commit::replace_mutex_for(id),
+                    install_commit::replace_mutex_for("parent"),
+                )
+            })
+            .expect("colliding shard");
+        write_installed(&root.join(&leaf), &leaf, "");
+        write_installed(
+            &root.join("middle"),
+            "middle",
+            &format!("[dependencies]\n{leaf} = \"^1\""),
+        );
+        write_installed(
+            &root.join("parent"),
+            "parent",
+            "[dependencies]\nmiddle = \"^1\"",
+        );
+        let stages: Vec<_> = [&leaf, "middle", "parent"]
+            .into_iter()
+            .map(|id| fixture_stage(&root.join(id), &limits))
+            .collect();
+        let selected = stages
+            .iter()
+            .take(2)
+            .map(|stage| {
+                (
+                    stage.contract.manifest.generator.id.clone(),
+                    super::super::install_stage::SelectedPackage::from_manifest(
+                        &stage.contract.manifest,
+                    )
+                    .expect("selection"),
+                )
+            })
+            .collect();
+        finish_closure(config, stages, &selected).expect("fresh closure publication");
+        for id in [&leaf, "middle", "parent"] {
+            let contract = load_verified_contract(&generators.join(id), &limits)
+                .expect("installed inventory verifies");
+            assert_eq!(contract.manifest.generator.id, id);
+            assert_eq!(contract.manifest.generator.version, "1.0.0");
+        }
+        assert!(
+            uninstall(&leaf, &generators, true).is_err(),
+            "committed dependents protected"
+        );
+    }
+
     #[test]
     fn finish_install_force_replaces_existing_generator() {
         // E14: --force must replace an existing install; without it the
@@ -1705,13 +2209,13 @@ version = "1.0.0"
     }
 
     #[tokio::test]
-    async fn dependency_commit_failure_keeps_prior_deps_and_rerun_converges() {
+    async fn dependency_preparation_failure_commits_nothing_and_rerun_converges() {
         if env_process::isolated() {
             return;
         }
-        // E14: a dependency commit failure leaves already-committed earlier
-        // dependencies behind (documented, not rolled back); removing the
-        // blocker and rerunning converges the full closure.
+        // All destination copies and confirmations finish before publication.
+        // A preparation failure commits nothing; removing the blocker and
+        // rerunning converges the full closure.
         let root = test_root("commitseq");
         let _temp_guard = TempGuard(root.clone());
         let home = root.join("home");
@@ -1752,8 +2256,7 @@ version = "1.0.0"
         );
         // The blocker is planted before the first run: an empty directory at
         // dep-b's target reads as not-installed during staging (no qcg.toml)
-        // but refuses the commit as already-existing, so dep-b fails at
-        // commit time after dep-a is already committed (E14).
+        // but refuses preparation as already-existing, before any commit.
         std::fs::create_dir_all(generators.join("e2e-c-b")).expect("blocker should create");
         let error = install(
             None,
@@ -1765,12 +2268,10 @@ version = "1.0.0"
             &limits,
         )
         .await
-        .expect_err("dep-b commit must fail on the blocker");
-        // BTreeMap order stages e2e-c-a first: it stays committed while the
-        // parent is refused.
+        .expect_err("dep-b preparation must fail on the blocker");
         assert!(
-            generators.join("e2e-c-a/qcg.toml").exists(),
-            "the earlier dependency must remain committed: {error}"
+            !generators.join("e2e-c-a/qcg.toml").exists(),
+            "no dependency should commit before preparation finishes: {error}"
         );
         assert!(
             !generators.join("e2e-c-parent/qcg.toml").exists(),

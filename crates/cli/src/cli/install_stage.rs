@@ -17,7 +17,7 @@ use super::plan::ensure_safe_install_id;
 
 use super::install::path_exists;
 use super::install::verify_package_bytes;
-use super::install_commit::{CleanupPaths, finish_install, unique_stage_dir_in};
+use super::install_commit::{CleanupPaths, finish_closure, unique_stage_dir_in};
 
 pub(crate) struct StagedInstall {
     pub(crate) path: Utf8PathBuf,
@@ -41,8 +41,24 @@ pub(crate) fn visiting_contains(visiting: &Visiting, id: &str) -> bool {
 // recursion-stack cycle detection (`Visiting`): at most one staged version
 // per id per plan. A repeated id reuses its selection when the new
 // requirement matches and fails closed on conflict before any commit, so
-// diamonds stage once instead of once per branch.
-pub(crate) type Selected = BTreeMap<String, semver::Version>;
+// diamonds stage once instead of once per branch. Preserve each selected
+// dependency set too: same-version replacement must not introduce unwalked
+// edges or cycles between staging and publication.
+pub(crate) type Selected = BTreeMap<String, SelectedPackage>;
+
+pub(crate) struct SelectedPackage {
+    pub(crate) version: semver::Version,
+    pub(crate) dependencies: BTreeMap<String, String>,
+}
+
+impl SelectedPackage {
+    pub(crate) fn from_manifest(manifest: &contract::Manifest) -> Result<Self> {
+        Ok(Self {
+            version: semver::Version::parse(&manifest.generator.version)?,
+            dependencies: manifest.dependencies.clone(),
+        })
+    }
+}
 
 /// Reuse check for one closure dependency: no selection yet means stage
 /// normally; a matching selection means skip (already staged); a mismatch
@@ -54,9 +70,10 @@ pub(crate) fn selected_compatible(
 ) -> Result<Option<semver::Version>> {
     match selected.get(id) {
         None => Ok(None),
-        Some(version) if requirement.matches(version) => Ok(Some(version.clone())),
-        Some(version) => Err(anyhow::anyhow!(
-            "dependency `{id}` has conflicting requirements in one closure: `{requirement}` does not match already-selected `{id}@{version}`"
+        Some(package) if requirement.matches(&package.version) => Ok(Some(package.version.clone())),
+        Some(package) => Err(anyhow::anyhow!(
+            "dependency `{id}` has conflicting requirements in one closure: `{requirement}` does not match already-selected `{id}@{}`",
+            package.version
         )),
     }
 }
@@ -286,6 +303,7 @@ pub(crate) fn install_registry_package<'a>(
                 // with a rerun demand; a satisfied parent is never removed
                 // here — not even on cycle errors — since it pre-existed
                 // this run (user data).
+                selected.insert(id.to_string(), SelectedPackage::from_manifest(&manifest)?);
                 let key = (id.to_string(), installed.to_string());
                 visiting.insert(key.clone());
                 let staged_closure =
@@ -296,33 +314,9 @@ pub(crate) fn install_registry_package<'a>(
                             return Err(error);
                         }
                     };
-                // Single commit phase: dependencies only (leaf order from
-                // staging), parent last is SKIPPED since it pre-existed. A
-                // failed dependency commit never leaves a committed parent
-                // behind (there is none to leave); valid standalone
-                // dependency installs remain, never an incomplete parent.
-                for dep_staged in staged_closure {
-                    let dep_id = dep_staged.contract.manifest.generator.id.clone();
-                    if let Err(error) = finish_install(
-                        config.providers_path,
-                        dep_staged,
-                        generators_dir,
-                        config.yes,
-                        config.force,
-                        limits,
-                    ) {
-                        visiting.remove(&key);
-                        if is_cycle_error(&error) {
-                            return Err(anyhow::anyhow!(
-                                "generator `{id}` dependency cycle committing `{dep_id}`: {error}; refusing to commit parent"
-                            ));
-                        }
-                        return Err(anyhow::anyhow!(
-                            "dependency closure cannot be satisfied for generator `{id}` committing `{dep_id}`: {error}; refusing to commit parent"
-                        ));
-                    }
-                }
+                let result = finish_closure(config, staged_closure, selected);
                 visiting.remove(&key);
+                result.with_context(|| format!("dependency closure cannot be satisfied for generator `{id}`; refusing to commit parent"))?;
                 return Ok(id.to_string());
             }
             if !force {
@@ -344,13 +338,7 @@ pub(crate) async fn install_registry_package_inner<'a>(
     visiting: &'a mut Visiting,
     selected: &'a mut Selected,
 ) -> Result<String> {
-    let InstallConfig {
-        providers_path,
-        generators_dir,
-        yes,
-        force,
-        limits,
-    } = config;
+    let limits = config.limits;
     let home = crate::registry::home_dir()?;
     let registries = crate::registry::load_registries(&home)?;
     let keys = crate::registry::load_trusted_keys(&home)?;
@@ -426,41 +414,16 @@ pub(crate) async fn install_registry_package_inner<'a>(
             ));
         }
     };
-    // Single commit phase: dependencies first (leaf order from staging),
-    // parent last. A failed dependency commit never leaves a committed
-    // parent behind. A parent commit failure after dependencies leaves
-    // valid standalone dependency installs, never an incomplete parent.
-    for dep_staged in staged_closure {
-        let dep_id = dep_staged.contract.manifest.generator.id.clone();
-        if let Err(error) = finish_install(
-            providers_path,
-            dep_staged,
-            generators_dir,
-            yes,
-            force,
-            limits,
-        ) {
-            visiting.remove(&key);
-            if is_cycle_error(&error) {
-                return Err(anyhow::anyhow!(
-                    "generator `{id}` dependency cycle committing `{dep_id}`: {error}; refusing to commit parent"
-                ));
-            }
-            return Err(anyhow::anyhow!(
-                "dependency closure cannot be satisfied for generator `{id}` committing `{dep_id}`: {error}; refusing to commit parent"
-            ));
-        }
-    }
-    let installed_id =
-        match finish_install(providers_path, staged, generators_dir, yes, force, limits) {
-            Ok(id) => id,
-            Err(error) => {
-                visiting.remove(&key);
-                return Err(error);
-            }
-        };
+    let mut stages = staged_closure;
+    stages.push(staged);
+    let result = finish_closure(config, stages, selected);
     visiting.remove(&key);
-    Ok(installed_id)
+    result.with_context(|| {
+        format!(
+            "dependency closure cannot be satisfied for generator `{id}`; refusing to commit parent"
+        )
+    })?;
+    Ok(id.to_string())
 }
 
 /// Stages the full dependency closure of `manifest` without committing
@@ -521,7 +484,10 @@ pub(crate) fn stage_closure_for_manifest<'a>(
                     // The reuse is recorded so a later forced replacement of
                     // the same id within this plan conflicts instead of
                     // invalidating this verified reuse.
-                    selected.insert(dependency.clone(), installed.clone());
+                    selected.insert(
+                        dependency.clone(),
+                        SelectedPackage::from_manifest(&installed_manifest)?,
+                    );
                     let key = (dependency.clone(), installed.to_string());
                     visiting.insert(key.clone());
                     let transitive =
@@ -608,9 +574,10 @@ pub(crate) fn stage_single_with_closure<'a>(
         let mut transitive = staged_closure?;
         // Record the resolved version so sibling branches reuse it (when
         // compatible) or refuse on conflict instead of staging twice.
-        let staged_version = semver::Version::parse(&resolved.entry.version)
-            .with_context(|| format!("registry package `{id}` has an invalid version"))?;
-        selected.insert(id.to_string(), staged_version);
+        selected.insert(
+            id.to_string(),
+            SelectedPackage::from_manifest(&staged.contract.manifest)?,
+        );
         // Deps first, self last: committing in order never leaves a parent
         // without its dependencies staged.
         transitive.push(staged);
