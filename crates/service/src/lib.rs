@@ -8,6 +8,7 @@ mod artifacts;
 mod event_reader;
 pub use event_reader::{EVENT_BATCH_BYTES, EVENT_BATCH_COUNT, EventBatch, EventCursor};
 mod catalog;
+mod invalidation;
 mod lifecycle;
 mod queue;
 mod read_store;

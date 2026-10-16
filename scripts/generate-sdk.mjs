@@ -36,6 +36,7 @@ const OPERATION_NAMES = {
   "POST /api/runs": "startRun",
   "GET /api/runs/{id}": "getRun",
   "DELETE /api/runs/{id}": "deleteRun",
+  "POST /api/runs/{id}/invalidation": "invalidateRun",
   "POST /api/runs/{id}:cancel": "cancelRun",
   "POST /api/runs/{id}/fork": "forkRun",
   "GET /api/runs/{id}/events": "runEvents",

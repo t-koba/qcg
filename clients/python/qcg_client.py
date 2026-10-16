@@ -36,6 +36,7 @@ class RunSnapshot(_RunSnapshotRequired, total=False):
     artifacts: dict[str, Any] | None
     confirm: dict[str, Any] | None
     contract_sha256: str | None
+    invalidation: dict[str, Any] | None
     labels: dict[str, str]
     metrics: dict[str, Any] | None
     parent_run_id: str | None
@@ -450,6 +451,9 @@ class QcgClient:
 
     def fork_run(self, id, body=None, headers=None, idempotency_key=None) -> RunSnapshot | None:
         return self._request_json("POST", f"/api/runs/{_encode_segment(id)}/fork", body=body, headers=headers, idempotency_key=idempotency_key)
+
+    def invalidate_run(self, id, body=None):
+        return self._request_json("POST", f"/api/runs/{_encode_segment(id)}/invalidation", body=body)
 
     def read_run_journal(self, id):
         return self._request_ndjson("GET", f"/api/runs/{_encode_segment(id)}/journal")

@@ -6,7 +6,7 @@ mod runs;
 mod state;
 mod summary;
 
-pub use gc::*;
+pub(crate) use gc::*;
 pub use lists::*;
 pub use metrics::*;
 pub use reads::*;

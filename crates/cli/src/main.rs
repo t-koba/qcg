@@ -389,6 +389,32 @@ async fn run_async() -> Result<std::process::ExitCode> {
                 keep_failed,
                 delete,
             } => gc_runs(&runs_dir, keep, keep_failed, delete)?,
+            RunsCommand::Invalidate {
+                id,
+                runs_dir,
+                reason,
+                actor_label,
+                json,
+            } => {
+                let service = local_cli_service(Utf8PathBuf::new(), runs_dir, providers_path)?;
+                let record = service
+                    .invalidate_run(
+                        &id,
+                        api::InvalidateRun {
+                            reason,
+                            actor_label,
+                        },
+                    )
+                    .await?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&record)?);
+                } else {
+                    println!(
+                        "invalidated {id}: {} ({} at {})",
+                        record.reason, record.actor_label, record.invalidated_at
+                    );
+                }
+            }
             RunsCommand::Delete { id, runs_dir, json } => {
                 let service = local_cli_service(Utf8PathBuf::new(), runs_dir, providers_path)?;
                 service.delete_run(&id).await?;

@@ -29,9 +29,9 @@ use super::middleware::{
 };
 use super::rate_limit::{RateLimitOverflow, RateLimitPolicy, RateLimiter, enforce_rate_limit};
 use super::run_detail::{
-    answer_run, cancel_run_from_path, confirm_run, delete_run, dispatch_fallback, read_artifact,
-    read_artifacts_zip, read_cost_metrics, read_journal, read_run_bundle, run_artifacts,
-    run_events, run_snapshot,
+    answer_run, cancel_run_from_path, confirm_run, delete_run, dispatch_fallback, invalidate_run,
+    read_artifact, read_artifacts_zip, read_cost_metrics, read_journal, read_run_bundle,
+    run_artifacts, run_events, run_snapshot,
 };
 use super::runs::{fork_run, list_runs, start_run};
 #[cfg(feature = "server-cors")]
@@ -942,6 +942,10 @@ pub(crate) fn build_router(
             get(run_snapshot)
                 .post(cancel_run_from_path)
                 .delete(delete_run),
+        )
+        .route(
+            "/api/runs/{id}/invalidation",
+            axum::routing::post(invalidate_run),
         )
         .route("/api/runs/{id}/fork", axum::routing::post(fork_run))
         .route("/api/runs/{id}/questions/{qid}", put(answer_run))

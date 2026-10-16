@@ -28,6 +28,12 @@ pub fn run_summary(run_dir: &Utf8Path) -> Result<RunSummary, ServiceError> {
 /// Summary plus the folded `last_seq` from a single journal read: listing
 /// paths use this so one run never costs a summary scan plus a second fold.
 pub fn run_summary_with_seq(run_dir: &Utf8Path) -> Result<(RunSummary, u64), ServiceError> {
+    let (mut summary, seq) = run_summary_core_with_seq(run_dir)?;
+    summary.invalidation = crate::invalidation::read_invalidation(run_dir)?;
+    Ok((summary, seq))
+}
+
+fn run_summary_core_with_seq(run_dir: &Utf8Path) -> Result<(RunSummary, u64), ServiceError> {
     let values = read_journal_events(run_dir)?;
     let state = engine::RunState::fold_values(&values)
         .map_err(|error| ServiceError::Invalid(error.to_string()))?;
@@ -37,6 +43,37 @@ pub fn run_summary_with_seq(run_dir: &Utf8Path) -> Result<(RunSummary, u64), Ser
         .collect::<Result<Vec<_>, _>>()?;
     let summary = run_summary_from_state(run_dir, &events, &state)?;
     Ok((summary, state.last_seq))
+}
+
+/// Minimal journal projection for run-reference selector discovery. It does
+/// not read invalidation sidecars or output manifests: those are checked only
+/// after the journal identifies a selected candidate.
+pub(crate) struct RunSelectorInfo {
+    pub run_id: String,
+    pub generator: String,
+    pub status: String,
+    pub started_at: String,
+}
+
+pub(crate) fn run_selector_info(run_dir: &Utf8Path) -> Result<RunSelectorInfo, ServiceError> {
+    let values = read_journal_events(run_dir)?;
+    let state = engine::RunState::fold_values(&values)
+        .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    let events = values
+        .iter()
+        .map(|event| RunEvent::from_flat(event).map_err(ServiceError::Invalid))
+        .collect::<Result<Vec<_>, _>>()?;
+    let (started_event, started) = run_identity_event(run_dir, &events)?;
+    let run_id = run_dir
+        .file_name()
+        .ok_or_else(|| ServiceError::Invalid("run directory has no file name".into()))?
+        .to_string();
+    Ok(RunSelectorInfo {
+        run_id,
+        generator: started.generator.clone(),
+        status: status_name_from_state(&state).to_string(),
+        started_at: started_event.ts.clone(),
+    })
 }
 
 pub(crate) fn status_name_from_state(state: &engine::RunState) -> &'static str {
@@ -74,6 +111,7 @@ pub(crate) fn run_summary_from_state(
         .transpose()
         .map_err(|_| ServiceError::Invalid("retention_days exceeds u32".into()))?;
     Ok(RunSummary {
+        invalidation: None,
         run_id: run_dir
             .file_name()
             .ok_or_else(|| ServiceError::Invalid("run directory has no file name".into()))?

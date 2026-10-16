@@ -1047,7 +1047,7 @@ impl LocalService {
     /// is a normal skip. Every other lease or sweep failure propagates as
     /// Err so the GC task retries boundedly and then ends visibly instead
     /// of looping silently as Ok (E05).
-    async fn collect_retained_runs(&self) -> Result<(), ServiceError> {
+    pub(crate) async fn collect_retained_runs(&self) -> Result<(), ServiceError> {
         let directory = self.inner.runs_dir.clone();
         let policy = self.inner.deployment_policy;
         let maintenance_lock = self

@@ -3,10 +3,10 @@ use serde_json::{Value, json};
 
 use super::dto::{
     AnswerPayload, ConfirmDecision, ForkRun, ForkStatePatch, GeneratorDetail, GeneratorSummary,
-    LlmCatalogCapabilities, LlmCatalogModel, LlmCatalogProvider, LlmCatalogResponse,
+    InvalidateRun, LlmCatalogCapabilities, LlmCatalogModel, LlmCatalogProvider, LlmCatalogResponse,
     LlmCatalogSource, McpAuthorizationStart, McpServerList, McpServerSummary, ProblemDetails,
-    RunCostMetrics, RunListItem, RunListOrder, RunListResponse, RunSnapshot, StartRun, StepSummary,
-    StepSummaryStatus,
+    RunCostMetrics, RunInvalidation, RunListItem, RunListOrder, RunListResponse, RunSnapshot,
+    StartRun, StepSummary, StepSummaryStatus,
 };
 use super::openapi_doc::{insert_schema, openapi_paths};
 use crate::events::RunEvent;
@@ -90,6 +90,8 @@ pub fn openapi_components() -> Value {
     insert_schema::<StartRun>(&mut schemas, "StartRun");
     insert_schema::<ForkStatePatch>(&mut schemas, "ForkStatePatch");
     insert_schema::<ForkRun>(&mut schemas, "ForkRun");
+    insert_schema::<InvalidateRun>(&mut schemas, "InvalidateRun");
+    insert_schema::<RunInvalidation>(&mut schemas, "RunInvalidation");
     insert_schema::<RunSnapshot>(&mut schemas, "RunSnapshot");
     insert_schema::<StepSummary>(&mut schemas, "StepSummary");
     insert_schema::<StepSummaryStatus>(&mut schemas, "StepSummaryStatus");

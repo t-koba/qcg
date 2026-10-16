@@ -12,3 +12,5 @@ pub(crate) mod support;
 pub(crate) mod scheduling;
 
 pub(crate) mod package_pinning;
+
+mod invalidation;

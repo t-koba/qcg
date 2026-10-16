@@ -98,6 +98,13 @@ struct SourceArtifact {
     bytes: Vec<u8>,
 }
 
+struct SourceCandidate {
+    started_at: String,
+    run_id: String,
+    status: String,
+    run_dir: Utf8PathBuf,
+}
+
 fn resolve_source_run(
     runs_dir: &Utf8Path,
     selector: &Option<(&'static str, &str)>,
@@ -115,9 +122,18 @@ fn resolve_source_run(
                 ));
             }
             let source_dir = runs_dir.join(value);
-            let meta_dir = crate::summaries::run_meta_dir(&source_dir);
-            let summary = crate::summaries::run_summary(&source_dir)
+            let summary = crate::summaries::run_selector_info(&source_dir)
                 .map_err(|error| format!("source run `{value}` is unreadable: {error}"))?;
+            if let Some(record) =
+                crate::invalidation::read_invalidation(&source_dir).map_err(|error| {
+                    format!("source run `{value}` invalidation is unreadable: {error}")
+                })?
+            {
+                return Err(format!(
+                    "source run `{value}` is invalidated: {}",
+                    record.reason
+                ));
+            }
             if summary.status != "success" {
                 return Err(format!(
                     "source run `{value}` is `{}`; declared artifacts require a successful run",
@@ -126,11 +142,11 @@ fn resolve_source_run(
             }
             Ok(SourceRun {
                 run_id: value.to_string(),
-                meta_dir,
+                meta_dir: crate::summaries::run_meta_dir(&source_dir),
             })
         }
         "latest_success" | "latest_terminal" => {
-            let mut best: Option<(String, String, String, Utf8PathBuf)> = None;
+            let mut candidates = Vec::new();
             let mut scanned = 0_usize;
             for entry in std::fs::read_dir(runs_dir)
                 .map_err(|error| format!("runs directory is unreadable: {error}"))?
@@ -146,11 +162,14 @@ fn resolve_source_run(
                 if !path.join("meta").join("journal.jsonl").exists() {
                     continue;
                 }
-                let summary = match crate::summaries::run_summary(&path) {
+                // Read only execution history here. Invalidation is checked
+                // after generator/status filtering and candidate ordering, so
+                // unrelated or unchosen corrupt sidecars cannot shadow a valid
+                // selector result.
+                let summary = match crate::summaries::run_selector_info(&path) {
                     Ok(summary) => summary,
                     Err(_) => continue,
                 };
-                // Summaries carry `id@version`; the selector names the id.
                 let generator_id = summary
                     .generator
                     .split_once('@')
@@ -167,23 +186,38 @@ fn resolve_source_run(
                         "success" | "failed" | "canceled" | "interrupted"
                     )
                 };
-                if !matched {
-                    continue;
-                }
-                let candidate = (
-                    summary.started_at.clone(),
-                    summary.run_id.clone(),
-                    summary.status.clone(),
-                    path.join("meta"),
-                );
-                if best
-                    .as_ref()
-                    .is_none_or(|(started, _, _, _)| candidate.0 > *started)
-                {
-                    best = Some(candidate);
+                if matched {
+                    candidates.push(SourceCandidate {
+                        started_at: summary.started_at,
+                        run_id: summary.run_id,
+                        status: summary.status,
+                        run_dir: path,
+                    });
                 }
             }
-            let Some((_, run_id, status, meta_dir)) = best else {
+            // Stable ordering preserves the existing directory-order tie
+            // behavior while examining the newest candidate first.
+            candidates.sort_by(|left, right| right.started_at.cmp(&left.started_at));
+            let candidate = if *kind == "latest_success" {
+                let mut selected = None;
+                for candidate in candidates {
+                    let invalidation = crate::invalidation::read_invalidation(&candidate.run_dir)
+                        .map_err(|error| {
+                        format!(
+                            "source run `{}` invalidation is unreadable: {error}",
+                            candidate.run_id
+                        )
+                    })?;
+                    if invalidation.is_none() {
+                        selected = Some(candidate);
+                        break;
+                    }
+                }
+                selected
+            } else {
+                candidates.into_iter().next()
+            };
+            let Some(candidate) = candidate else {
                 return Err(format!(
                     "no {} run of generator `{value}` is available",
                     if *kind == "latest_success" {
@@ -193,12 +227,30 @@ fn resolve_source_run(
                     }
                 ));
             };
-            if *kind == "latest_terminal" && status != "success" {
+            if *kind == "latest_terminal"
+                && let Some(record) = crate::invalidation::read_invalidation(&candidate.run_dir)
+                    .map_err(|error| {
+                        format!(
+                            "source run `{}` invalidation is unreadable: {error}",
+                            candidate.run_id
+                        )
+                    })?
+            {
                 return Err(format!(
-                    "latest terminal run `{run_id}` of generator `{value}` is `{status}`; declared artifacts require a successful run"
+                    "source run `{}` is invalidated: {}",
+                    candidate.run_id, record.reason
                 ));
             }
-            Ok(SourceRun { run_id, meta_dir })
+            if *kind == "latest_terminal" && candidate.status != "success" {
+                return Err(format!(
+                    "latest terminal run `{}` of generator `{value}` is `{}`; declared artifacts require a successful run",
+                    candidate.run_id, candidate.status
+                ));
+            }
+            Ok(SourceRun {
+                run_id: candidate.run_id,
+                meta_dir: crate::summaries::run_meta_dir(&candidate.run_dir),
+            })
         }
         other => Err(format!("unsupported selector `{other}`")),
     }
@@ -339,6 +391,16 @@ mod tests {
     use serde_json::{Value, json};
 
     fn write_terminal_run(runs_dir: &Utf8Path, run_id: &str, status: &str, started_at: &str) {
+        write_terminal_run_for_generator(runs_dir, run_id, "generator", status, started_at);
+    }
+
+    fn write_terminal_run_for_generator(
+        runs_dir: &Utf8Path,
+        run_id: &str,
+        generator_id: &str,
+        status: &str,
+        started_at: &str,
+    ) {
         let meta_dir = runs_dir.join(run_id).join("meta");
         std::fs::create_dir_all(&meta_dir).expect("run metadata directory should be created");
         let journal_path = meta_dir.join("journal.jsonl");
@@ -348,7 +410,7 @@ mod tests {
             .event(
                 "run_started",
                 json!({
-                    "generator": "generator@1.0.0",
+                    "generator": format!("{generator_id}@1.0.0"),
                     "generator_path": "generator",
                     "contract_sha256": "test-digest",
                     "inputs": {},
@@ -442,5 +504,93 @@ mod tests {
         let source = resolve_source_run(&runs_dir, &Some(("latest_terminal", "generator")))
             .expect("latest_terminal should resolve a newest successful terminal run");
         assert_eq!(source.run_id, "newer-success");
+    }
+    #[test]
+    fn selectors_ignore_unrelated_and_unchosen_corrupt_invalidation_records() {
+        let (runs_dir, _guard) = test_runs_dir("run-ref-irrelevant-corruption");
+        write_terminal_run(
+            &runs_dir,
+            "older-corrupt",
+            "success",
+            "2026-01-01T00:00:00Z",
+        );
+        write_terminal_run(&runs_dir, "newer-valid", "success", "2026-01-02T00:00:00Z");
+        write_terminal_run_for_generator(
+            &runs_dir,
+            "other-generator-corrupt",
+            "other",
+            "success",
+            "2026-01-03T00:00:00Z",
+        );
+        std::fs::write(runs_dir.join("older-corrupt/meta/invalidation.json"), "{").unwrap();
+        std::fs::write(
+            runs_dir.join("other-generator-corrupt/meta/invalidation.json"),
+            "{",
+        )
+        .unwrap();
+
+        for selector in [
+            ("latest_success", "generator"),
+            ("latest_terminal", "generator"),
+        ] {
+            let source = resolve_source_run(&runs_dir, &Some(selector))
+                .expect("corrupt non-candidates must not shadow the selected run");
+            assert_eq!(source.run_id, "newer-valid");
+        }
+    }
+
+    #[tokio::test]
+    async fn invalidation_selectors_refuse_or_fall_back_and_corruption_fails_closed() {
+        let (runs_dir, _guard) = test_runs_dir("invalidation-run-refs");
+        write_terminal_run(&runs_dir, "older", "success", "2026-01-01T00:00:00Z");
+        write_terminal_run(&runs_dir, "newer", "success", "2026-01-02T00:00:00Z");
+        let service = crate::tests::support::test_service(vec![], runs_dir.clone());
+        service
+            .invalidate_run(
+                "newer",
+                api::InvalidateRun {
+                    reason: "incorrect data".into(),
+                    actor_label: "reviewer".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve_source_run(&runs_dir, &Some(("latest_success", "generator")))
+                .unwrap()
+                .run_id,
+            "older"
+        );
+        for selector in [("run_id", "newer"), ("latest_terminal", "generator")] {
+            let error = resolve_source_run(&runs_dir, &Some(selector)).unwrap_err();
+            assert!(error.contains("incorrect data"), "{error}");
+        }
+        // Persisted materials are deliberately independent of live source
+        // eligibility, including after the source is deleted.
+        let material = RunRefMaterial {
+            source_run_id: "newer".into(),
+            artifact: "out.txt".into(),
+            bytes: b"saved".to_vec(),
+            sha256: hex::encode(sha2::Sha256::digest(b"saved")),
+        };
+        let metadata = runs_dir.join("consumer/meta");
+        let materials = BTreeMap::from([("source".into(), material)]);
+        persist(&metadata, &materials).unwrap();
+        let resource: contract::ResourceDef =
+            serde_json::from_value(json!({"type": "run_ref"})).unwrap();
+        let loaded = load_persisted(&metadata, &[("source", &resource)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded["source"].bytes, b"saved");
+        assert_eq!(loaded["source"].source_run_id, "newer");
+        // Corrupt sidecars may not silently turn into absence or fallback.
+        std::fs::write(runs_dir.join("newer/meta/invalidation.json"), "{").unwrap();
+        for selector in [
+            ("run_id", "newer"),
+            ("latest_success", "generator"),
+            ("latest_terminal", "generator"),
+        ] {
+            assert!(resolve_source_run(&runs_dir, &Some(selector)).is_err());
+        }
     }
 }

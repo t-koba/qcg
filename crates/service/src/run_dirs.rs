@@ -357,9 +357,8 @@ pub(crate) fn read_run_execution_owner(run_dir: &Utf8Path) -> Option<String> {
     Some(owner)
 }
 
-pub(crate) fn try_lock_store_maintenance(
-    runs_dir: &Utf8Path,
-) -> Result<Option<File>, ServiceError> {
+/// Try the stable store maintenance lease. Acquire before any execution lease.
+pub fn try_lock_store_maintenance(runs_dir: &Utf8Path) -> Result<Option<File>, ServiceError> {
     std::fs::create_dir_all(runs_dir)?;
     let file = OpenOptions::new()
         .create(true)

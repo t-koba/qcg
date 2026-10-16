@@ -25,8 +25,19 @@ pub(crate) fn list_runs(
             continue;
         }
         println!(
-            "{}\t{}\t{}\t{}",
-            summary.run_id, summary.status, summary.generator, summary.started_at
+            "{}\t{}\t{}\t{}\t{}",
+            summary.run_id,
+            summary.status,
+            summary.generator,
+            summary.started_at,
+            summary
+                .invalidation
+                .as_ref()
+                .map(|r| format!(
+                    "invalidated: {} ({} at {})",
+                    r.reason, r.actor_label, r.invalidated_at
+                ))
+                .unwrap_or_default()
         );
     }
     Ok(())
@@ -57,6 +68,12 @@ pub(crate) fn show_run(
     }
     println!("run: {id}");
     println!("status: {}", summary.status);
+    if let Some(record) = &summary.invalidation {
+        println!(
+            "invalidated: {} ({} at {})",
+            record.reason, record.actor_label, record.invalidated_at
+        );
+    }
     println!("generator: {}", summary.generator);
     if !summary.started_at.is_empty() {
         println!("started_at: {}", summary.started_at);

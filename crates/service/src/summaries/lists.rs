@@ -96,6 +96,7 @@ pub(crate) fn list_items_cached(
         let view = store.read(&path)?;
         let (identity, started) = super::gc::run_identity_event(&path, &view.events)?;
         summaries.push(api::RunListItem {
+            invalidation: crate::invalidation::read_invalidation(&path)?,
             run_id: path.file_name().unwrap().to_owned(),
             state: super::state::status_from_journal(super::runs::status_name_from_state(
                 &view.state,

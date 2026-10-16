@@ -462,6 +462,22 @@ pub const API_ROUTES: &[ApiRoute] = &[
         errors: ERR_START_RUN,
     },
     ApiRoute {
+        method: "post",
+        path: "/api/runs/{id}/invalidation",
+        summary: "Invalidate a durably successful run (immutable; exact retries are no-ops)",
+        response: ApiResponse {
+            status: 200,
+            description: "Immutable invalidation record",
+            body: ResponseBody::Json(Some(ResponseSchema::Ref("RunInvalidation"))),
+            headers: NO_HEADERS,
+        },
+        additional_responses: NO_ADDITIONAL_RESPONSES,
+        request_schema: Some("InvalidateRun"),
+        request_headers: NO_HEADERS,
+        query_parameters: NO_QUERY_PARAMETERS,
+        errors: ERR_INTERACTION,
+    },
+    ApiRoute {
         method: "put",
         path: "/api/runs/{id}/questions/{qid}",
         summary: "Answer a pending run question",

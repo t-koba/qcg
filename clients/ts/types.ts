@@ -1458,6 +1458,104 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/runs/{id}/invalidation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Invalidate a durably successful run (immutable; exact retries are no-ops) */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["InvalidateRun"];
+                };
+            };
+            responses: {
+                /** @description Immutable invalidation record */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["RunInvalidation"];
+                    };
+                };
+                /** @description Invalid request */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/problem+json": components["schemas"]["ProblemDetails"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                /** @description Resource not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/problem+json": components["schemas"]["ProblemDetails"];
+                    };
+                };
+                /** @description Resource conflict */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/problem+json": components["schemas"]["ProblemDetails"];
+                    };
+                };
+                /** @description Validation failed */
+                422: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/problem+json": components["schemas"]["ProblemDetails"];
+                    };
+                };
+                429: components["responses"]["TooManyRequests"];
+                /** @description Internal server error */
+                500: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/problem+json": components["schemas"]["ProblemDetails"];
+                    };
+                };
+                /** @description Service unavailable */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/problem+json": components["schemas"]["ProblemDetails"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/runs/{id}/journal": {
         parameters: {
             query?: never;
@@ -2269,6 +2367,19 @@ export interface components {
             /** @default null */
             when: string | null;
         };
+        /**
+         * InvalidateRun
+         * @description Caller-provided audit metadata for an irreversible successful-run invalidation.
+         */
+        InvalidateRun: {
+            /**
+             * @description Descriptive label, NOT authenticated identity. Nonblank, no controls;
+             *     at most 128 UTF-8 bytes.
+             */
+            actor_label: string;
+            /** @description Nonblank, no control characters; at most 4096 UTF-8 bytes. */
+            reason: string;
+        };
         /** @enum {string} */
         LaggedAction: "resync_snapshot";
         LaggedEventData: {
@@ -2719,9 +2830,18 @@ export interface components {
             reason: components["schemas"]["FailureDetail"] | null;
             status: components["schemas"]["RunCompletionStatus"];
         };
+        /** RunInvalidation */
+        RunInvalidation: {
+            actor_label: string;
+            invalidated_at: string;
+            reason: string;
+            run_id: string;
+        };
         /** RunListItem */
         RunListItem: {
             generator_id: string;
+            /** @default null */
+            invalidation: components["schemas"]["RunInvalidation"] | null;
             run_id: string;
             /**
              * Format: uint64
@@ -2843,6 +2963,8 @@ export interface components {
              *     to guess from the run id.
              */
             generator_id: string;
+            /** @default null */
+            invalidation: components["schemas"]["RunInvalidation"] | null;
             /**
              * @description Run metadata admitted with the run; never authorization.
              * @default {}

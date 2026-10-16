@@ -95,6 +95,7 @@ event, artifact, and journal routes. Principal paths include:
 - `GET, POST /api/runs`
 - `GET /api/runs/{id}`
 - `DELETE /api/runs/{id}` (terminal runs only; active runs need cancel first)
+- `POST /api/runs/{id}/invalidation` (durably succeeded runs only)
 - `PUT /api/runs/{id}/questions/{qid}`
 - `PUT /api/runs/{id}/confirmations/{cid}`
 - `POST /api/runs/{id}:cancel`
@@ -105,6 +106,38 @@ event, artifact, and journal routes. Principal paths include:
 - `GET /api/runs/{id}/metrics` returns cost totals (`tokens_*`,
   `llm_calls`, `cost_microusd`, `cost_usd`, `duration_ms`) with a `priced`
   flag that is false when billed calls lacked contract pricing
+
+### Invalidating a successful result
+
+`POST /api/runs/{id}/invalidation` requires JSON:
+
+```json
+{"reason":"Result used incorrect source data", "actor_label":"quality-review"}
+```
+
+It returns `200` with `{run_id, reason, actor_label, invalidated_at}` (RFC 3339
+UTC timestamp). Reason and actor label must be nonblank and contain no control
+characters; limits are 4096 and 128 UTF-8 bytes respectively. The actor label is
+caller-provided descriptive audit metadata, **not authenticated identity**.
+The endpoint uses exactly the same bearer-auth middleware/authority as DELETE;
+when API authentication is disabled both operations remain available without a
+token. No extra role or permission is introduced.
+
+Only durably successful runs qualify: missing runs return `404`; active, failed,
+canceled, and interrupted runs return `409`. Exact reason+actor retries return
+the original record; changed values return `409`. Invalid strings return `400`.
+Store maintenance or an execution lease in progress can return `409`; retry
+after settlement. There is no un-invalidate or record replacement.
+
+Snapshots and list items expose nullable structured `invalidation`; execution
+`state` and journal `seq` remain unchanged. Bundles include it in `snapshot.json`.
+`latest_success` skips invalidated sources and falls back, pinned `run_id`
+refuses with the recorded reason, and `latest_terminal` refuses if its newest
+terminal selection is invalidated (no fallback). Persisted run-reference bytes
+remain usable on resume. Forks are allowed without inheriting invalidation.
+See [operations](operations.md#run-invalidation) for storage and retention.
+
+### Starting a run
 
 `POST /api/runs` accepts `generator_id`, an `inputs` object, and optional
 `answers` (pre-provisioned answers keyed by question id) and `confirmations`

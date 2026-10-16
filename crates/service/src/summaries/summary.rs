@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 pub struct RunSummary {
+    pub invalidation: Option<api::RunInvalidation>,
     pub run_id: String,
     pub status: String,
     pub generator: String,
@@ -21,6 +22,7 @@ impl RunSummary {
     pub fn to_json(&self) -> Value {
         json!({
             "run_id": self.run_id,
+            "invalidation": self.invalidation,
             "status": self.status,
             "generator": self.generator,
             "generator_path": self.generator_path,

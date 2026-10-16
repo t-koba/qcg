@@ -124,6 +124,48 @@ remote task when the run is canceled. Multi-round-trip `input_required`
 responses use the durable generator HITL boundary and resume the original tool
 call with its request state. Deprecated MCP sampling is not exposed.
 
+## Run invalidation
+
+A run that completed successfully can later be found wrong. Use
+`qcg runs invalidate <id> --reason "..." --actor-label "quality-review"`, or
+`POST /api/runs/{id}/invalidation` with those JSON fields. Only durable success
+qualifies; invalidation never changes `Succeeded`, appends an execution event,
+or changes the journal sequence/outcome. It writes one immutable
+`meta/invalidation.json` containing run id, reason, descriptive actor label,
+and `invalidated_at` timestamp. Actor labels are not authenticated identities.
+The HTTP authority is identical to run deletion, including disabled-auth mode.
+Reason (4096 UTF-8 bytes maximum) and actor label (128 bytes maximum) must be
+nonblank and control-free. Identical retries return the original record;
+different values conflict. No un-invalidate is provided.
+
+`latest_success` skips invalidated results, falling back to an older success.
+A pinned `run_id` refuses with the recorded reason before other eligibility
+checks. `latest_terminal` keeps selecting the newest terminal run and refuses
+an invalidated selection rather than falling back. Already-persisted run-ref
+material is unaffected on resume. Forking remains possible and creates an
+independent run with no inherited invalidation.
+
+Status, lists, CLI summaries, and bundle snapshots expose the structured record.
+Readers bypass the execution-journal cache for this metadata. Corrupt,
+unreadable, linked, or mismatched records fail closed for status and source
+selection; do not remove or edit the sidecar to restore eligibility. Journals,
+artifacts, and audit evidence are preserved. Invalidation does **not** change
+retention budgets or expiry: these runs still count as successful terminal
+runs, age out normally, and can be explicitly deleted. Export a bundle before
+deletion when evidence must survive.
+
+Invalidation, service deletion, automatic GC, and CLI deleting GC coordinate
+through the stable store-level `.maintenance.lock`, always acquired before an
+execution lease. Contended user mutations report a retryable conflict; service
+GC skips a contended sweep. Existence and durable state are checked under the
+leases so a missing/deleted run is never recreated by invalidation or deletion.
+Do not remove coordination files while any process uses the store.
+Publication syncs a same-directory temporary file, atomically renames it to
+the authoritative name without replacement under the store lease, and syncs
+the directory on Unix. A crash before publication leaves only an ignored
+staging file; after publication, readers see the complete record. Exact retries
+can safely inspect that record and return the original metadata.
+
 ## Run retention
 
 `keep` (default 50) retains the newest nonfailed terminal runs (success,

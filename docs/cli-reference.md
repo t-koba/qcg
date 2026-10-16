@@ -147,6 +147,14 @@ JSON event output go to stdout.
   content-addressed files and folded state
   at an exact journal sequence, applies explicit input/step patches, and resumes
   the remaining DAG as a new run.
+- `qcg runs invalidate <id> --reason "..." --actor-label "..."
+  [--runs-dir dir] [--json]` irreversibly invalidates a durably successful
+  run's result without changing its execution status or journal. Both strings
+  are required, nonblank, and control-free; limits are 4096 UTF-8 bytes for
+  the reason and 128 for the descriptive actor label (not authenticated identity).
+  Exact retries return the original record; changed values conflict. `show`,
+  `list`, and JSON summaries expose invalidation; `export` includes it in the
+  bundle snapshot. There is no un-invalidate. See [operations](operations.md#run-invalidation).
 - `qcg runs delete <id> [--runs-dir dir] [--json]` deletes a terminal run
   directory. Active runs are rejected; cancel first. A repeated delete
   reports not-found.

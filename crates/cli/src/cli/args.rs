@@ -403,6 +403,19 @@ pub(crate) enum RunsCommand {
         #[arg(long)]
         delete: bool,
     },
+    /// Irreversibly mark a durably successful run's outputs as invalid.
+    Invalidate {
+        id: String,
+        #[arg(long)]
+        reason: String,
+        /// Descriptive audit label, not authenticated identity.
+        #[arg(long)]
+        actor_label: String,
+        #[arg(long = "runs-dir", default_value = ".data/runs")]
+        runs_dir: Utf8PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     Delete {
         id: String,
         #[arg(long = "runs-dir", default_value = ".data/runs")]

@@ -38,6 +38,20 @@ pub(crate) async fn run_snapshot(
     conditional_response(&headers, body, "application/json")
 }
 
+pub(crate) async fn invalidate_run(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(request): Json<api::InvalidateRun>,
+) -> Result<Json<api::RunInvalidation>, ApiHttpError> {
+    Ok(Json(
+        state
+            .service
+            .invalidate_run(&id, request)
+            .await
+            .map_err(ApiHttpError::from_api)?,
+    ))
+}
+
 pub(crate) async fn delete_run(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1292,6 +1306,7 @@ mod tests {
         // E16: validator tests go through `RunSnapshot`, never ad-hoc JSON
         // bytes, so a queue-revision move is observed on the real shape.
         api::RunSnapshot {
+            invalidation: None,
             run_id: "run-etag".to_string(),
             state: api::RunStatus::Queued,
             seq,

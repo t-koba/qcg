@@ -37,7 +37,15 @@ impl LocalService {
         // shutdown settlement is still writing; refuse it like every other
         // mutating operation (E05).
         self.ensure_running()?;
+        // Stable store lock precedes execution lock; re-check disk even when
+        // the local map still contains a run deleted by a peer.
+        let _maintenance = crate::run_dirs::try_lock_store_maintenance(&self.inner.runs_dir)
+            .map_err(api_internal)?
+            .ok_or_else(|| ApiError::Conflict {
+                detail: "run store maintenance is busy; retry".into(),
+            })?;
         let run_dir = self.run_dir_for(id).await?;
+        crate::invalidation::require_run_directory(&run_dir)?;
         // A peer may own execution while this process sees no local task:
         // verify the execution lease and pending cancel mailbox in addition
         // to local terminal state (A02). Deletion before the owner ACKs the
@@ -68,18 +76,15 @@ impl LocalService {
         // the outer gate must not let the drain race a directory removal
         // (E05).
         self.ensure_running()?;
-        let terminal = match self.inner.runs.read().await.get(id) {
-            Some(record) => {
-                // A still-running local task means the run is active even if
-                // memory state was already marked canceled but not settled.
-                if crate::types::task_slot_is_live(&record.task) {
-                    false
-                } else {
-                    record.state.is_terminal()
-                }
-            }
-            None => self.authoritative_state(&run_dir).await?.terminal.is_some(),
-        };
+        crate::invalidation::require_run_directory(&run_dir)?;
+        let live_task = self
+            .inner
+            .runs
+            .read()
+            .await
+            .get(id)
+            .is_some_and(|record| crate::types::task_slot_is_live(&record.task));
+        let terminal = !live_task && self.authoritative_state(&run_dir).await?.terminal.is_some();
         if !terminal {
             return Err(ApiError::Conflict {
                 detail: format!("run `{id}` is still active; cancel it before deletion"),
@@ -290,6 +295,7 @@ impl LocalService {
         let (journal_priority, journal_parent) =
             (disk_state.priority, disk_state.parent_run_id.clone());
         Ok(RunSnapshot {
+            invalidation: crate::invalidation::read_invalidation(run_dir).map_err(api_internal)?,
             run_id: id,
             state,
             seq: disk_state.last_seq,

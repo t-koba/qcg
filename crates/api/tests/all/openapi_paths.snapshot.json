@@ -17,6 +17,7 @@
   "/api/runs/{id}/confirmations/{cid}",
   "/api/runs/{id}/events",
   "/api/runs/{id}/fork",
+  "/api/runs/{id}/invalidation",
   "/api/runs/{id}/journal",
   "/api/runs/{id}/metrics",
   "/api/runs/{id}/questions/{qid}",

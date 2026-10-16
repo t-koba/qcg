@@ -22,7 +22,7 @@ pub(crate) fn run_identity_event<'a>(
 /// `runs gc`. A run past its contract `[retention].days` window is
 /// always deleted regardless of the counts. Unreadable or malformed
 /// candidates are logged and left untouched without stopping the sweep.
-pub fn gc_run_directories(
+pub(crate) fn gc_run_directories(
     runs_dir: &Utf8Path,
     keep: usize,
     keep_failed: usize,

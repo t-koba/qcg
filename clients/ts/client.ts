@@ -415,6 +415,10 @@ export class QcgClient {
     return this.requestJson<paths["/api/runs/{id}/fork"]["post"]["responses"][201]["content"]["application/json"] | null>("POST", `/api/runs/${encodeURIComponent(id)}/fork`, { body: body ?? options?.body, headers: this.withIdempotency(options?.headers, options?.idempotencyKey) });
   }
 
+  async invalidateRun(id: string, body: paths["/api/runs/{id}/invalidation"]["post"]["requestBody"]["content"]["application/json"], options?: { body?: unknown; headers?: Record<string, string> }): Promise<paths["/api/runs/{id}/invalidation"]["post"]["responses"][200]["content"]["application/json"] | null> {
+    return this.requestJson<paths["/api/runs/{id}/invalidation"]["post"]["responses"][200]["content"]["application/json"] | null>("POST", `/api/runs/${encodeURIComponent(id)}/invalidation`, { body, headers: options?.headers });
+  }
+
   async readRunJournal(id: string): Promise<unknown[] | null> {
     return this.requestNdjson("GET", `/api/runs/${encodeURIComponent(id)}/journal`);
   }

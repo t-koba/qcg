@@ -20,6 +20,19 @@ pub(crate) fn gc_runs_impl(
     delete: bool,
     report: bool,
 ) -> Result<()> {
+    // Store lease first, held through scan and removal. Missing stores are
+    // not created by cleanup.
+    if !runs_dir.exists() {
+        return Ok(());
+    }
+    let _maintenance = if delete {
+        Some(
+            service::try_lock_store_maintenance(runs_dir)?
+                .context("run store maintenance is busy; retry")?,
+        )
+    } else {
+        None
+    };
     let entries = match std::fs::read_dir(runs_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -42,6 +55,13 @@ pub(crate) fn gc_runs_impl(
                 continue;
             }
         };
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name == ".maintenance.lock")
+        {
+            continue;
+        }
         scanned = scanned.saturating_add(1);
         if scanned > MAX_DIRECTORY_SCAN_ENTRIES {
             anyhow::bail!("runs directory contains more than {MAX_DIRECTORY_SCAN_ENTRIES} entries");

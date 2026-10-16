@@ -180,8 +180,30 @@ pub struct StepSummary {
     pub reason: Option<FailureDetail>,
 }
 
+/// Caller-provided audit metadata for an irreversible successful-run invalidation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InvalidateRun {
+    /// Nonblank, no control characters; at most 4096 UTF-8 bytes.
+    pub reason: String,
+    /// Descriptive label, NOT authenticated identity. Nonblank, no controls;
+    /// at most 128 UTF-8 bytes.
+    pub actor_label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RunInvalidation {
+    pub run_id: String,
+    pub reason: String,
+    pub actor_label: String,
+    pub invalidated_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RunSnapshot {
+    #[serde(default)]
+    pub invalidation: Option<RunInvalidation>,
     pub run_id: String,
     pub state: RunStatus,
     #[serde(default)]
@@ -224,6 +246,8 @@ pub struct RunSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RunListItem {
+    #[serde(default)]
+    pub invalidation: Option<RunInvalidation>,
     pub run_id: String,
     pub state: RunStatus,
     pub generator_id: String,
