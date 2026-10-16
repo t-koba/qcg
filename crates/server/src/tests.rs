@@ -2469,8 +2469,7 @@ async fn invalidation_http_has_delete_auth_parity_and_immutable_json_record() {
                 let body = axum::body::to_bytes(response.into_body(), 32768)
                     .await
                     .unwrap();
-                let retryable = expected_status == StatusCode::OK
-                    && status == StatusCode::CONFLICT
+                let retryable = status == StatusCode::CONFLICT
                     && serde_json::from_slice::<api::ProblemDetails>(&body).is_ok_and(|problem| {
                         matches!(
                             problem.detail.as_str(),
