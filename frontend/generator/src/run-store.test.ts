@@ -6,6 +6,7 @@ const snapshot = (seq: number, state: RunSnapshot["state"]): RunSnapshot => ({
   generator_id: "demo",
   seq,
   state,
+  invalidation: null,
   queue_position: null,
   queue_position_quality: "unavailable",
   priority: 0,
