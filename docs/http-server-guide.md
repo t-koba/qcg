@@ -216,7 +216,12 @@ fail-closed: when omitted, the server enforces the documented 2 MiB default
 (Axum's secure default), so FileValue and contract limits govern within that
 envelope. The effective bound is the configured value when set, otherwise
 2 MiB. The startup log reports the effective policy, and `GET /healthz`
-exposes it as `max_request_bytes` (always a number, never `null`).
+exposes it as `max_request_bytes` (always a number, never `null`). Health also
+includes `shared_store_recovery` (`disabled`, `starting`, `healthy`, `degraded`,
+or `restarting`), with no error or run details. `ok` remains process liveness,
+not readiness: recovery degradation does not make healthy operations
+unavailable. See [operations observability](operations.md#observability) for
+recovery isolation, retry, and startup boundaries.
 
 ## Assets and frontend development
 

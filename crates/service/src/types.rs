@@ -20,6 +20,18 @@ pub enum RunStoreMode {
     SharedFilesystem,
 }
 
+/// Shared-store recovery health, not process liveness or admission readiness.
+/// No error details or run identity are exposed through this status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedRecoveryStatus {
+    Disabled,
+    Starting,
+    Healthy,
+    Degraded,
+    Restarting,
+}
+
 /// Deployment policy applied atomically at service construction (E04).
 /// Bundled so constructors stay within the argument limit and policy can
 /// never be half-applied by a racing setter during recovery.
@@ -155,6 +167,7 @@ pub(crate) struct LocalServiceInner {
     pub(crate) max_active_runs: usize,
     pub(crate) max_tracked_runs: usize,
     pub(crate) run_store_mode: RunStoreMode,
+    pub(crate) shared_recovery_status: Mutex<SharedRecoveryStatus>,
     pub(crate) _runs_lock: Option<File>,
     pub(crate) queue_notify: Arc<tokio::sync::Notify>,
     /// Stable identity of this service process for shared-store ownership.

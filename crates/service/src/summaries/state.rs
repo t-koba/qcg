@@ -112,16 +112,38 @@ pub(crate) fn status_from_journal(status: &str) -> Result<RunStatus, ServiceErro
     }
 }
 
+/// Strict construction-time recovery: any unreadable entry refuses startup.
 pub(crate) fn rehydrate_runs(
     runs_dir: &Utf8Path,
     max_tracked_runs: usize,
     max_scan_entries: usize,
 ) -> Result<BTreeMap<String, RunRecord>, ServiceError> {
+    scan_runs(runs_dir, max_tracked_runs, max_scan_entries, false).map(|(runs, _)| runs)
+}
+
+/// Periodic recovery isolates entry failures, but never suppresses directory
+/// traversal or configured scan/cap errors. The count reports degraded scans.
+pub(crate) fn refresh_runs(
+    runs_dir: &Utf8Path,
+    max_tracked_runs: usize,
+    max_scan_entries: usize,
+) -> Result<(BTreeMap<String, RunRecord>, usize), ServiceError> {
+    scan_runs(runs_dir, max_tracked_runs, max_scan_entries, true)
+}
+
+fn scan_runs(
+    runs_dir: &Utf8Path,
+    max_tracked_runs: usize,
+    max_scan_entries: usize,
+    tolerate_entry_errors: bool,
+) -> Result<(BTreeMap<String, RunRecord>, usize), ServiceError> {
     let mut records = BTreeMap::new();
-    if !runs_dir.exists() {
-        return Ok(records);
+    let mut failures = 0;
+    if !tolerate_entry_errors && !runs_dir.exists() {
+        return Ok((records, failures));
     }
     let mut scanned = 0_usize;
+    let mut nonterminal_runs = 0_usize;
     for entry in std::fs::read_dir(runs_dir)? {
         let entry = entry?;
         // G03: coordination/metadata entries (dotfiles, legacy per-run
@@ -142,96 +164,117 @@ pub(crate) fn rehydrate_runs(
                 "run store contains more than {max_scan_entries} entries"
             )));
         }
-        let run_dir = Utf8PathBuf::from_path_buf(entry.path()).map_err(|path| {
-            ServiceError::Invalid(format!("run path is not valid UTF-8: {}", path.display()))
-        })?;
-        let journal_path = run_meta_dir(&run_dir).join("journal.jsonl");
-        if !is_regular_directory(&run_dir)? || !is_regular_file(&journal_path)? {
-            continue;
-        }
-        if journal_is_empty(&journal_path)? {
-            continue;
-        }
-        // One bounded journal read serves the fold and every derivation
-        // below (identity, scheduling, HITL maps, queue key): a restart
-        // never pays a scan per field per run.
-        let journal_values = read_journal_events(&run_dir)?;
-        let state = RunState::fold_values(&journal_values)
-            .map_err(|error| ServiceError::Invalid(error.to_string()))?;
-        if state.terminal.is_some() {
-            continue;
-        }
-        for event in &journal_values {
-            RunEvent::from_flat(event).map_err(ServiceError::Invalid)?;
-        }
-        if records.len() >= max_tracked_runs {
+        let recovered = Utf8PathBuf::from_path_buf(entry.path())
+            .map_err(|path| {
+                ServiceError::Invalid(format!("run path is not valid UTF-8: {}", path.display()))
+            })
+            .and_then(|run_dir| rehydrate_run(&run_dir, &mut nonterminal_runs));
+        // Count validated non-terminal journals even if their package or
+        // manifest could not be loaded; isolation must not bypass the cap.
+        if nonterminal_runs > max_tracked_runs {
             return Err(ServiceError::Invalid(format!(
                 "run store contains more than {max_tracked_runs} non-terminal runs"
             )));
         }
-        let run_id = run_dir
-            .file_name()
-            .ok_or_else(|| ServiceError::Invalid("run directory has no file name".into()))?
-            .to_string();
-        let (record_state, question, confirm) = match state.settled_pending().cloned() {
-            Some(Interaction::Question { question }) => (RunStatus::Waiting, Some(question), None),
-            Some(Interaction::Confirmation { confirm }) => {
-                (RunStatus::Confirming, None, Some(confirm))
+        match recovered {
+            Ok(Some((run_id, record))) => {
+                records.insert(run_id, record);
             }
-            None => (RunStatus::Queued, None, None),
-        };
-        // A mailbox cancel observed at rehydration is acceptance, not
-        // settlement: only a journaled terminal state reports `Canceled`.
-        let record_state = if record_state == RunStatus::Queued
-            && crate::run_dirs::has_pending_cancel_control(&run_dir)
-        {
-            RunStatus::CancelRequested
-        } else {
-            record_state
-        };
-        let mut contract = crate::run_package::load(&run_dir, &state)?;
-        // H02: re-apply the journaled per-run raise so a restart does not
-        // drop it. The deployment floor is re-applied at spawn time from
-        // the current policy (see `spawn_engine_run`); both are idempotent.
-        contract.apply_audit_raise(audit_raise_from_values(&journal_values));
-        // Folded inputs, not the admission event: a fork patches inputs, and
-        // the folded state is the only view that includes the patch.
-        let inputs = state.inputs.clone().unwrap_or_default();
-        let queued_identity = (state.priority, state.parent_run_id.clone());
-        // Journal I/O failures fail rehydration instead of recovering with
-        // half-read maps. Continuations live in the typed journal store, so
-        // only user answers join the memory map.
-        let (answers, confirmations) = (state.answers.clone(), state.confirmations.clone());
-        // Restore the durable FIFO key, including a scheduler-preserved
-        // queued_at override, instead of re-stamping on recovery.
-        let queued_at = read_last_queued_at_from_values(&journal_values);
-        let (events, _) = broadcast::channel(policy::LIVE_EVENT_CHANNEL_CAPACITY);
-        records.insert(
-            run_id,
-            RunRecord {
-                contract_sha256: contract.sha256.clone(),
-                package_sha256: state.package_sha256.clone(),
-                contract,
-                inputs,
-                answers,
-                confirmations,
-                priority: queued_identity.0,
-                parent_run_id: queued_identity.1,
-                preempted: false,
-                state: record_state,
-                run_dir: run_dir.clone(),
-                artifacts: read_optional_output_manifest(&run_dir)?,
-                question,
-                confirm,
-                events,
-                cancellation: CancellationToken::new(),
-                scheduler_yield: CancellationToken::new(),
-                task: Arc::new(Mutex::new(None)),
-                queued_at,
-                owner_id: String::new(),
-                ephemeral: false,
-            },
-        );
+            Ok(None) => {}
+            Err(error) if tolerate_entry_errors => {
+                failures += 1;
+                tracing::warn!(run_id = %entry.file_name().to_string_lossy(), %error,
+                    "shared recovery skipped unreadable run; keeping any tracked state");
+            }
+            Err(error) => return Err(error),
+        }
     }
-    Ok(records)
+    Ok((records, failures))
+}
+
+fn rehydrate_run(
+    run_dir: &Utf8Path,
+    nonterminal_runs: &mut usize,
+) -> Result<Option<(String, RunRecord)>, ServiceError> {
+    let journal_path = run_meta_dir(run_dir).join("journal.jsonl");
+    if !is_regular_directory(run_dir)? || !is_regular_file(&journal_path)? {
+        return Ok(None);
+    }
+    if journal_is_empty(&journal_path)? {
+        return Ok(None);
+    }
+    // One bounded journal read serves the fold and every derivation
+    // below (identity, scheduling, HITL maps, queue key): a restart
+    // never pays a scan per field per run.
+    let journal_values = read_journal_events(run_dir)?;
+    let state = RunState::fold_values(&journal_values)
+        .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    if state.terminal.is_some() {
+        return Ok(None);
+    }
+    for event in &journal_values {
+        RunEvent::from_flat(event).map_err(ServiceError::Invalid)?;
+    }
+    *nonterminal_runs = nonterminal_runs.saturating_add(1);
+    let run_id = run_dir
+        .file_name()
+        .ok_or_else(|| ServiceError::Invalid("run directory has no file name".into()))?
+        .to_string();
+    let (record_state, question, confirm) = match state.settled_pending().cloned() {
+        Some(Interaction::Question { question }) => (RunStatus::Waiting, Some(question), None),
+        Some(Interaction::Confirmation { confirm }) => (RunStatus::Confirming, None, Some(confirm)),
+        None => (RunStatus::Queued, None, None),
+    };
+    // A mailbox cancel observed at rehydration is acceptance, not
+    // settlement: only a journaled terminal state reports `Canceled`.
+    let record_state = if record_state == RunStatus::Queued
+        && crate::run_dirs::has_pending_cancel_control(run_dir)
+    {
+        RunStatus::CancelRequested
+    } else {
+        record_state
+    };
+    let mut contract = crate::run_package::load(run_dir, &state)?;
+    // H02: re-apply the journaled per-run raise so a restart does not
+    // drop it. The deployment floor is re-applied at spawn time from
+    // the current policy (see `spawn_engine_run`); both are idempotent.
+    contract.apply_audit_raise(audit_raise_from_values(&journal_values));
+    // Folded inputs, not the admission event: a fork patches inputs, and
+    // the folded state is the only view that includes the patch.
+    let inputs = state.inputs.clone().unwrap_or_default();
+    let queued_identity = (state.priority, state.parent_run_id.clone());
+    // Journal I/O failures fail rehydration instead of recovering with
+    // half-read maps. Continuations live in the typed journal store, so
+    // only user answers join the memory map.
+    let (answers, confirmations) = (state.answers.clone(), state.confirmations.clone());
+    // Restore the durable FIFO key, including a scheduler-preserved
+    // queued_at override, instead of re-stamping on recovery.
+    let queued_at = read_last_queued_at_from_values(&journal_values);
+    let (events, _) = broadcast::channel(policy::LIVE_EVENT_CHANNEL_CAPACITY);
+    Ok(Some((
+        run_id,
+        RunRecord {
+            contract_sha256: contract.sha256.clone(),
+            package_sha256: state.package_sha256.clone(),
+            contract,
+            inputs,
+            answers,
+            confirmations,
+            priority: queued_identity.0,
+            parent_run_id: queued_identity.1,
+            preempted: false,
+            state: record_state,
+            run_dir: run_dir.to_owned(),
+            artifacts: read_optional_output_manifest(run_dir)?,
+            question,
+            confirm,
+            events,
+            cancellation: CancellationToken::new(),
+            scheduler_yield: CancellationToken::new(),
+            task: Arc::new(Mutex::new(None)),
+            queued_at,
+            owner_id: String::new(),
+            ephemeral: false,
+        },
+    )))
 }

@@ -716,8 +716,31 @@ Unattended limits:
 
 ## Observability
 
-- `GET /healthz` is liveness only (`ok` plus `max_request_bytes`); readiness,
-  queue depth, lease, and GC state are not reported there.
+- `GET /healthz` reports process liveness (`ok: true`), the effective
+  `max_request_bytes`, and a status-only `shared_store_recovery` field:
+  `disabled` (exclusive store), `starting` (no refresh completed yet),
+  `healthy` (last refresh completed without skipped runs), `degraded` (a
+  store-wide failure or one or more skipped runs), or `restarting` (an
+  unexpectedly exited/panicked recovery worker is awaiting restart).
+  No error strings, paths, or run data are included. This is not readiness:
+  a bad run must not make healthy operations unavailable, so recovery
+  degradation does not change `ok` or the HTTP success status. Queue depth,
+  lease, and GC state are not reported there.
+- Startup rehydration stays strict: unreadable run data refuses startup.
+  Periodic shared-store refresh instead logs and skips individual unreadable
+  entries/runs, retaining a tracked run's last in-memory state and continuing
+  healthy-run adoption, journal convergence, and the normal resume pass.
+  Per-run journal reads/writes remain strict; skipped data is never guessed
+  or repaired by refresh. Store-wide traversal errors and configured scan/run
+  caps remain global refresh failures. A clean later refresh returns health
+  to `healthy`.
+- Global refresh failures retry indefinitely with exponential delays of
+  2, 4, 8, 16, 32, then at most 64 times `SHARED_STORE_RESCAN_SECS` (default
+  rescan cadence 5 s; maximum retry delay 320 s). Success resets the failure
+  backoff; isolated run failures keep the normal cadence. Unexpected worker
+  exits/panics are logged and supervised with the same bounded restart
+  backoff. Shutdown interrupts retry/restart waits; the server's existing
+  shutdown grace/deadline still bounds in-progress work.
 - `GET /metrics` exposes gauges only: durable runs by state, active, queued,
   waiting, confirming, in-flight preempted (`qcg_runs_preempted`), distinct
   generators, and per-generator counts under a bounded selection

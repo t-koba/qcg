@@ -3062,10 +3062,70 @@ command = ["sh", "-c", "sleep 30"]"#,
         let health =
             crate::server::generators::healthz(axum::extract::State(Arc::clone(&state))).await;
         let value = serde_json::to_value(health.0).expect("healthz should serialize");
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["shared_store_recovery"], "disabled");
         assert_eq!(
             value["max_request_bytes"],
             serde_json::json!(policy::DEFAULT_MAX_REQUEST_BYTES),
             "/healthz must report the default when omitted"
         );
+    }
+    #[tokio::test]
+    async fn healthz_reports_degraded_recovery_without_failing_liveness_or_leaking_details() {
+        let root = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!("health-recovery-{}", uuid::Uuid::now_v7()));
+        let _guard = TempGuard(root.clone());
+        let runs = root.join("runs");
+        let service = LocalService::with_generator_roots_policy_and_store_mode(
+            vec![root.join("generators")],
+            runs.clone(),
+            None,
+            1,
+            10,
+            service::RunStoreMode::SharedFilesystem,
+            service::ServiceDeploymentPolicy {
+                max_directory_scan_entries: 1,
+                ..service::ServiceDeploymentPolicy::default()
+            },
+        )
+        .unwrap();
+        let stop = CancellationToken::new();
+        let state = Arc::new(test_state(
+            service.clone(),
+            runs.clone(),
+            None,
+            stop.clone(),
+        ));
+        let health = crate::server::generators::healthz(axum::extract::State(state.clone()))
+            .await
+            .0;
+        assert_eq!(health["shared_store_recovery"], "starting");
+        // Exceed the configured global scan cap without renaming an open
+        // store directory (which is not portable to Windows). A store-wide
+        // error does not turn process liveness into readiness.
+        std::fs::write(runs.join("first-entry"), b"one").unwrap();
+        std::fs::write(runs.join("second-entry"), b"two").unwrap();
+        let handle = service.start_shared_store_recovery(stop.clone()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while service.shared_recovery_status() != service::SharedRecoveryStatus::Degraded {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("initial scan should report degraded");
+        let health = crate::server::generators::healthz(axum::extract::State(state))
+            .await
+            .0;
+        assert_eq!(
+            health,
+            serde_json::json!({
+                "ok": true,
+                "max_request_bytes": policy::DEFAULT_MAX_REQUEST_BYTES,
+                "shared_store_recovery": "degraded",
+            })
+        );
+        stop.cancel();
+        handle.await.unwrap().unwrap();
     }
 }

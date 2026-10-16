@@ -9,11 +9,12 @@ use crate::run_dirs::{
 };
 use crate::summaries::{
     fold_run_state, gc_run_directories, has_remote_cancel_request, read_merged_events_from_meta,
-    read_optional_output_manifest, rehydrate_runs, run_meta_dir, run_workspace_dir,
+    read_optional_output_manifest, refresh_runs, rehydrate_runs, run_meta_dir, run_workspace_dir,
 };
 use crate::types::{
     DirectRun, DirectRunEvents, FinishTransition, LocalService, LocalServiceInner, RunRecord,
     RunStoreMode, ServiceDeploymentPolicy, ServiceError, ServiceSnapshotSource,
+    SharedRecoveryStatus,
 };
 use api::RunEvent;
 use api::{
@@ -29,6 +30,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+
+/// Retry after 2, 4, ... 64 rescan periods, then stay capped. Saturating
+/// duration arithmetic also supports very large configured cadences.
+fn recovery_retry_delay(interval: std::time::Duration, failures: u32) -> std::time::Duration {
+    interval.saturating_mul(1_u32 << failures.min(6))
+}
 
 /// Maps a durable terminal outcome to its display status. Every memory
 /// convergence from journal truth goes through this one mapping so peers
@@ -171,6 +178,13 @@ impl LocalService {
                 execution_permits: Arc::new(PriorityPermits::new(max_active_runs)),
                 max_active_runs,
                 max_tracked_runs,
+                shared_recovery_status: Mutex::new(
+                    if run_store_mode == RunStoreMode::SharedFilesystem {
+                        SharedRecoveryStatus::Starting
+                    } else {
+                        SharedRecoveryStatus::Disabled
+                    },
+                ),
                 run_store_mode,
                 _runs_lock: runs_lock,
                 queue_notify: Arc::new(tokio::sync::Notify::new()),
@@ -366,6 +380,24 @@ impl LocalService {
         }))
     }
 
+    pub fn shared_recovery_status(&self) -> SharedRecoveryStatus {
+        *self
+            .inner
+            .shared_recovery_status
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn set_shared_recovery_status(&self, status: SharedRecoveryStatus) {
+        *self
+            .inner
+            .shared_recovery_status
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = status;
+    }
+
+    /// The returned resident handle supervises a worker. JoinSet ownership
+    /// ensures aborting this handle also aborts its worker, never detaches it.
     pub fn start_shared_store_recovery(
         &self,
         shutdown: CancellationToken,
@@ -373,38 +405,95 @@ impl LocalService {
         if self.inner.run_store_mode != RunStoreMode::SharedFilesystem {
             return None;
         }
+        self.set_shared_recovery_status(SharedRecoveryStatus::Starting);
         let service = self.clone();
-        let rescan_secs = self.inner.deployment_policy.shared_store_rescan_secs.max(1);
         Some(tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(rescan_secs));
-            let mut consecutive_failures: u32 = 0;
-            loop {
-                tokio::select! {
-                    _ = shutdown.cancelled() => return Ok(()),
-                    _ = interval.tick() => {}
-                }
-                if let Err(error) = service.refresh_shared_runs().await {
-                    consecutive_failures = consecutive_failures.saturating_add(1);
-                    tracing::error!(%error, failures = consecutive_failures, "failed to refresh shared run store");
-                    // Persistent failures end the task visibly instead of
-                    // looping silently with a wedged store (E05).
-                    if consecutive_failures >= 10 {
-                        return Err(error);
-                    }
-                    continue;
-                }
-                consecutive_failures = 0;
-                service.resume_recovered_runs().await;
-            }
+            service
+                .supervise_shared_recovery(shutdown, |worker, stop| async move {
+                    worker.shared_store_recovery_worker(stop).await
+                })
+                .await
         }))
     }
 
+    // Factory seam keeps panic/early-exit supervision independently testable;
+    // production always starts the same recovery worker above.
+    async fn supervise_shared_recovery<F, Fut>(
+        &self,
+        shutdown: CancellationToken,
+        mut start_worker: F,
+    ) -> Result<(), ServiceError>
+    where
+        F: FnMut(LocalService, CancellationToken) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut workers = tokio::task::JoinSet::new();
+        let mut restarts = 0_u32;
+        loop {
+            if shutdown.is_cancelled() {
+                return Ok(());
+            }
+            workers.spawn(start_worker(self.clone(), shutdown.clone()));
+            let result = workers.join_next().await;
+            if shutdown.is_cancelled() {
+                return Ok(());
+            }
+            restarts = restarts.saturating_add(1);
+            self.set_shared_recovery_status(SharedRecoveryStatus::Restarting);
+            tracing::error!(
+                ?result,
+                restarts,
+                "shared recovery worker exited unexpectedly; restarting"
+            );
+            tokio::select! {
+                _ = shutdown.cancelled() => return Ok(()),
+                _ = tokio::time::sleep(recovery_retry_delay(self.recovery_interval(), restarts)) => {}
+            }
+        }
+    }
+
+    fn recovery_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.inner.deployment_policy.shared_store_rescan_secs.max(1))
+    }
+
+    async fn shared_store_recovery_worker(&self, shutdown: CancellationToken) {
+        let interval = self.recovery_interval();
+        let mut failures = 0_u32;
+        let mut delay = std::time::Duration::ZERO;
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                _ = tokio::time::sleep(delay) => {}
+            }
+            match self.refresh_shared_runs().await {
+                Ok(()) => {
+                    failures = 0;
+                    delay = interval;
+                    self.resume_recovered_runs().await;
+                }
+                Err(error) => {
+                    failures = failures.saturating_add(1);
+                    self.set_shared_recovery_status(SharedRecoveryStatus::Degraded);
+                    delay = recovery_retry_delay(interval, failures);
+                    tracing::error!(%error, failures, retry_secs = delay.as_secs(), "failed to refresh shared run store; retrying");
+                }
+            }
+        }
+    }
+
     pub(crate) async fn refresh_shared_runs(&self) -> Result<(), ServiceError> {
-        let recovered = rehydrate_runs(
+        let (recovered, mut failures) = match refresh_runs(
             &self.inner.runs_dir,
             self.inner.max_tracked_runs,
             self.inner.deployment_policy.max_directory_scan_entries,
-        )?;
+        ) {
+            Ok(recovered) => recovered,
+            Err(error) => {
+                self.set_shared_recovery_status(SharedRecoveryStatus::Degraded);
+                return Err(error);
+            }
+        };
         {
             let mut runs = self.inner.runs.write().await;
             runs.retain(|_, record| !record.state.is_terminal());
@@ -454,11 +543,26 @@ impl LocalService {
                     continue;
                 };
                 // Filesystem observations without any run-map lock.
-                let cancel_probe = has_remote_cancel_request(&run_dir)?;
-                let directory = run_dir.clone();
-                let state = self
-                    .blocking_work(move || fold_run_state(&directory))
-                    .await?;
+                // Mark failed probes as visited too: one attempt per run per
+                // refresh, without changing its last known in-memory state.
+                refreshed.insert(run_id.clone());
+                let observed = async {
+                    let cancel = has_remote_cancel_request(&run_dir)?;
+                    let directory = run_dir.clone();
+                    let state = self
+                        .blocking_work(move || fold_run_state(&directory))
+                        .await?;
+                    Ok::<_, ServiceError>((cancel, state))
+                }
+                .await;
+                let (cancel_probe, state) = match observed {
+                    Ok(observed) => observed,
+                    Err(error) => {
+                        failures += 1;
+                        tracing::warn!(%run_id, %error, "shared refresh skipped run; keeping tracked state");
+                        continue;
+                    }
+                };
                 let hitl = (state.answers.clone(), state.confirmations.clone());
                 let journal_queued_at = state.queued_at.as_deref().and_then(|at| {
                     chrono::DateTime::parse_from_rfc3339(at)
@@ -497,7 +601,7 @@ impl LocalService {
                     // The engine task converts the control mailbox to a single
                     // journal event under its own writer; this refresh never
                     // appends while the owner writer is live. Journal I/O
-                    // failures propagate instead of silently missing a cancel.
+                    // failures skip this run instead of guessing cancel state.
                     if cancel_probe {
                         record.cancellation.cancel();
                     }
@@ -529,7 +633,7 @@ impl LocalService {
                     continue;
                 }
                 // Refresh pending prompts and durable HITL maps from the journal.
-                // Journal I/O failures fail the refresh instead of merging
+                // Journal I/O failures skip this run instead of merging
                 // half-read maps. Queue-order keys always derive from the
                 // journal so every process observes identical FIFO order.
                 // The pre-I/O HITL snapshot is reused (no second read).
@@ -600,6 +704,11 @@ impl LocalService {
                 refreshed.insert(run_id.to_string());
             }
         }
+        self.set_shared_recovery_status(if failures == 0 {
+            SharedRecoveryStatus::Healthy
+        } else {
+            SharedRecoveryStatus::Degraded
+        });
         Ok(())
     }
 
@@ -2292,3 +2401,7 @@ pub(crate) struct SpawnRun {
     pub(crate) cancellation: CancellationToken,
     pub(crate) task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
+
+#[cfg(test)]
+#[path = "tests/shared_recovery.rs"]
+mod shared_recovery_tests;

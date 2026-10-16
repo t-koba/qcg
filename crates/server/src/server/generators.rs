@@ -23,6 +23,7 @@ pub(crate) async fn healthz(State(state): State<Arc<AppState>>) -> Json<Value> {
     // the documented default. Never null/unlimited.
     Json(json!({
         "ok": true,
+        "shared_store_recovery": state.service.shared_recovery_status(),
         "max_request_bytes": super::config::effective_max_request_bytes(state.max_request_bytes),
     }))
 }
