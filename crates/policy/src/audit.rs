@@ -7,6 +7,7 @@
 //! Any kind not listed is durable, so a newly added durable record is never
 //! silently dropped by an unclassified audit policy.
 
+use crate::TOOL_EVENT_VALUE_LIMIT_BYTES;
 use crate::limits::DEFAULT_MAX_AUDIT_TOTAL_BYTES;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -134,9 +135,21 @@ pub struct AuditConfig {
     /// Audit record count retained for the run before degradation.
     #[serde(default)]
     pub max_events: Option<usize>,
+    /// Maximum serialized arguments or result bytes retained in one tool-call event.
+    /// Unset uses the 32 KiB mechanism ceiling.
+    #[serde(default)]
+    pub max_tool_value_bytes: Option<usize>,
 }
 
 impl AuditConfig {
+    /// Resolves the per-value tool-call event threshold. Contract validation
+    /// rejects explicit values outside `1..=TOOL_EVENT_VALUE_LIMIT_BYTES`.
+    pub fn tool_event_value_limit_bytes(&self) -> usize {
+        self.max_tool_value_bytes
+            .unwrap_or(TOOL_EVENT_VALUE_LIMIT_BYTES)
+            .min(TOOL_EVENT_VALUE_LIMIT_BYTES)
+    }
+
     /// Raises this configuration to the deployment floor. A `Standard` floor
     /// forces every observation class to `Full` and discards lower overrides.
     pub fn apply_floor(&mut self, floor: AuditFloor) {
@@ -205,6 +218,14 @@ impl AuditPolicy {
             return Err(format!(
                 "audit max_events must be between 1 and {}",
                 crate::DEFAULT_MAX_JOURNAL_EVENT_COUNT
+            ));
+        }
+        if config
+            .max_tool_value_bytes
+            .is_some_and(|value| value == 0 || value > TOOL_EVENT_VALUE_LIMIT_BYTES)
+        {
+            return Err(format!(
+                "audit max_tool_value_bytes must be between 1 and {TOOL_EVENT_VALUE_LIMIT_BYTES}"
             ));
         }
         for kind in config.classes.keys() {
@@ -375,6 +396,43 @@ mod tests {
         assert_eq!(policy.mode_for("llm_delta"), AuditMode::Full);
         assert_eq!(policy.mode_for("tool_call"), AuditMode::Full);
         assert!(policy.is_full());
+    }
+
+    #[test]
+    fn tool_value_limit_defaults_and_rejects_out_of_range_values() {
+        let default = AuditConfig::default();
+        assert_eq!(
+            default.tool_event_value_limit_bytes(),
+            TOOL_EVENT_VALUE_LIMIT_BYTES
+        );
+        assert!(AuditPolicy::from_config(&default).is_ok());
+
+        for invalid in [0, TOOL_EVENT_VALUE_LIMIT_BYTES + 1] {
+            let config = AuditConfig {
+                max_tool_value_bytes: Some(invalid),
+                ..AuditConfig::default()
+            };
+            let error = AuditPolicy::from_config(&config)
+                .expect_err("out-of-range tool value threshold must fail closed");
+            assert!(error.contains("max_tool_value_bytes"), "{error}");
+        }
+
+        let config = AuditConfig {
+            max_tool_value_bytes: Some(1),
+            ..AuditConfig::default()
+        };
+        assert_eq!(config.tool_event_value_limit_bytes(), 1);
+        assert!(AuditPolicy::from_config(&config).is_ok());
+
+        let config = AuditConfig {
+            max_tool_value_bytes: Some(TOOL_EVENT_VALUE_LIMIT_BYTES),
+            ..AuditConfig::default()
+        };
+        assert_eq!(
+            config.tool_event_value_limit_bytes(),
+            TOOL_EVENT_VALUE_LIMIT_BYTES
+        );
+        assert!(AuditPolicy::from_config(&config).is_ok());
     }
 
     #[test]

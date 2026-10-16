@@ -498,6 +498,7 @@ pub(crate) async fn execute_specialist_agent(
                             None,
                             tool_started,
                         ),
+                        &ctx.run.contract.manifest.audit,
                     )?;
                     ctx.journal.event("tool_call", event).step_err(&node.id)?;
                     return Ok(AgentToolOutcome::NeedsUser(question));
@@ -515,6 +516,7 @@ pub(crate) async fn execute_specialist_agent(
                             None,
                             tool_started,
                         ),
+                        &ctx.run.contract.manifest.audit,
                     )?;
                     ctx.journal.event("tool_call", event).step_err(&node.id)?;
                     return Ok(AgentToolOutcome::NeedsConfirm(confirm));
@@ -562,6 +564,7 @@ pub(crate) async fn execute_specialist_agent(
                     failed.then(|| tool_reported_error(&value)),
                     tool_started,
                 ),
+                &ctx.run.contract.manifest.audit,
             )?;
             let encoded = serde_json::to_string(&value)?;
             if let Err(error) = scan_llm_text(ctx, node, &encoded) {

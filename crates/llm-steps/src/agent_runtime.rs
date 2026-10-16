@@ -1579,6 +1579,7 @@ pub(crate) fn recover_agent_tool_call_failure(
             Some(tool_call_error(failure.tool_error_code, error)),
             failure.started,
         ),
+        &ctx.run.contract.manifest.audit,
     )?;
     ctx.journal.event("tool_call", event).step_err(&node.id)?;
     Ok(Some(ChatMessage::tool_result(call.id.clone(), encoded)))

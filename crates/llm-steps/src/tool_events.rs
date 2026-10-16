@@ -41,7 +41,9 @@ pub(crate) fn tool_call_event(
     call: &ChatToolCall,
     result: &Value,
     outcome: ToolCallEventOutcome,
+    audit: &policy::AuditConfig,
 ) -> Result<Value, serde_json::Error> {
+    let value_limit_bytes = audit.tool_event_value_limit_bytes();
     let sources = tool_call_sources(result);
     // Journaled arguments never carry plaintext secrets: HTTP query,
     // credential headers, and bodies plus `fs.write` contents and
@@ -52,12 +54,12 @@ pub(crate) fn tool_call_event(
     // undeclared secret never reaches the journal (E09-1). Execution
     // always uses the raw call; only this journaled copy is redacted.
     let (arguments, arguments_truncated) =
-        bounded_event_value(&redacted_tool_call_args(&call.args))?;
+        bounded_event_value(&redacted_tool_call_args(&call.args), value_limit_bytes)?;
     // E09-3: journaled results never carry plaintext credential headers or
     // query values. Authorization-like response headers are redacted and
-    // result URLs are query-redacted before the explicit 32 KiB truncation
-    // below; truncation bounds size, redaction removes secrets. The live
-    // tool result keeps full headers for execution.
+    // result URLs are query-redacted before the configured truncation below;
+    // its hard ceiling is 32 KiB. Truncation bounds size, redaction removes
+    // secrets. The live tool result keeps full headers for execution.
     let mut redacted_result = result.clone();
     if let Some(url) = redacted_result
         .get("url")
@@ -93,7 +95,7 @@ pub(crate) fn tool_call_event(
             }
         }
     }
-    let (result, result_truncated) = bounded_event_value(&redacted_result)?;
+    let (result, result_truncated) = bounded_event_value(&redacted_result, value_limit_bytes)?;
     let data = ToolCallEventData {
         server: server.map(str::to_owned),
         tool: call.name.clone(),
@@ -152,6 +154,7 @@ pub(crate) fn record_tool_call_failure(
             error: Some(tool_call_error(failure.code, error)),
             duration: failure.started.elapsed(),
         },
+        &ctx.run.contract.manifest.audit,
     )?;
     ctx.journal.event("tool_call", event).step_err(&node.id)
 }
@@ -215,9 +218,14 @@ pub(crate) fn tool_reported_error(result: &Value) -> ToolCallError {
     }
 }
 
-pub(crate) fn bounded_event_value(value: &Value) -> Result<(Value, bool), serde_json::Error> {
+pub(crate) fn bounded_event_value(
+    value: &Value,
+    value_limit_bytes: usize,
+) -> Result<(Value, bool), serde_json::Error> {
     let bytes = serde_json::to_vec(value)?;
-    if bytes.len() <= TOOL_EVENT_VALUE_LIMIT_BYTES {
+    // Contract validation rejects an explicitly larger value. Keep the
+    // mechanism ceiling here as a final guard for every event construction.
+    if bytes.len() <= value_limit_bytes.min(TOOL_EVENT_VALUE_LIMIT_BYTES) {
         Ok((value.clone(), false))
     } else {
         Ok((
@@ -1195,6 +1203,7 @@ mod tests {
                 None,
                 Instant::now(),
             ),
+            &policy::AuditConfig::default(),
         )
         .expect("event should build");
         let event_str = event.to_string();
@@ -1229,6 +1238,7 @@ mod tests {
                 None,
                 Instant::now(),
             ),
+            &policy::AuditConfig::default(),
         )
         .expect("patch event should build");
         let patch_str = patch_event.to_string();

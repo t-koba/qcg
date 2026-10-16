@@ -1342,6 +1342,7 @@ impl StepExecutor for LlmAgentStep {
                                 None,
                                 tool_started,
                             ),
+                            &ctx.run.contract.manifest.audit,
                         )?;
                         ctx.journal.event("tool_call", event).step_err(&node.id)?;
                         ctx.journal
@@ -1372,6 +1373,7 @@ impl StepExecutor for LlmAgentStep {
                                 None,
                                 tool_started,
                             ),
+                            &ctx.run.contract.manifest.audit,
                         )?;
                         // Persist the suspended call before the informational
                         // tool_call event: a crash between the two must not
@@ -1450,6 +1452,7 @@ impl StepExecutor for LlmAgentStep {
                                 None,
                                 tool_started,
                             ),
+                            &ctx.run.contract.manifest.audit,
                         )?;
                         // Same ordering as NeedsUser: checkpoint first so an
                         // interrupted turn resumes the exact approved call.
@@ -1555,6 +1558,7 @@ impl StepExecutor for LlmAgentStep {
                         tool_failed.then(|| tool_reported_error(&result)),
                         tool_started,
                     ),
+                    &ctx.run.contract.manifest.audit,
                 )?;
                 let encoded = serde_json::to_string(&result)?;
                 if let Err(error) = scan_llm_text(ctx, node, &encoded) {

@@ -4267,8 +4267,15 @@ fields are rejected when their structs define a closed schema.
    kinds are rejected as class keys. `max_bytes` and `max_events` bound the
    observation stream; a breach or write failure degrades audit persistence
    for the run and records a durable `audit_degraded` event instead of
-   failing the run. A deployment audit floor can only raise the effective
-   policy.
+   failing the run. `max_tool_value_bytes` optionally lowers the serialized
+   per-value size threshold for `tool_call` arguments and results; it must be
+   between 1 and 32768 bytes. Unset retains the 32 KiB default and values
+   beyond the 32 KiB hard ceiling are rejected. Values exceeding the effective
+   threshold are replaced by the existing `{type, bytes, truncated}` marker;
+   secret redaction and source extraction still happen before that replacement.
+   A deployment `audit_floor` only raises per-kind observation modes; it
+   does not raise the per-value threshold or the aggregate `max_bytes` /
+   `max_events` limits.
 
 `[[hooks.run_started]]`, `[[hooks.run_succeeded]]`, `[[hooks.run_failed]]`, `[[hooks.step_failed]]`
 :: Contract-declared lifecycle nodes (ADR 0001). Each entry is an inline

@@ -1792,6 +1792,7 @@ fn tool_call_event_preserves_details_and_sanitizes_sources() {
             error: None,
             duration: std::time::Duration::from_millis(17),
         },
+        &policy::AuditConfig::default(),
     )
     .expect("event should serialize");
     assert_eq!(event["agent"], "researcher");
@@ -1825,6 +1826,7 @@ fn tool_call_event_preserves_details_and_sanitizes_sources() {
             }),
             duration: std::time::Duration::from_millis(3),
         },
+        &policy::AuditConfig::default(),
     )
     .expect("failure event should serialize");
     assert_eq!(failed["status"], "failed");
@@ -1835,6 +1837,35 @@ fn tool_call_event_preserves_details_and_sanitizes_sources() {
 
 #[test]
 fn tool_call_event_bounds_large_payloads_without_losing_sources() {
+    let boundary_value = Value::String("x".repeat(TOOL_EVENT_VALUE_LIMIT_BYTES - 2));
+    let boundary_call = ChatToolCall {
+        id: "call-default-boundary".into(),
+        name: "fetch".into(),
+        args: boundary_value.clone(),
+    };
+    let boundary_event = tool_call_event(
+        "research",
+        None,
+        None,
+        &boundary_call,
+        &boundary_value,
+        ToolCallEventOutcome {
+            status: ToolCallStatus::Succeeded,
+            phase: ToolCallPhase::Completed,
+            error: None,
+            duration: std::time::Duration::ZERO,
+        },
+        &policy::AuditConfig::default(),
+    )
+    .expect("default boundary event should serialize");
+    assert_eq!(
+        serde_json::to_vec(&boundary_value).unwrap().len(),
+        TOOL_EVENT_VALUE_LIMIT_BYTES
+    );
+    assert_eq!(boundary_event["arguments"], boundary_value);
+    assert_eq!(boundary_event["result"], boundary_value);
+    assert_eq!(boundary_event["truncated"], false);
+
     let call = ChatToolCall {
         id: "call-2".into(),
         name: "fetch".into(),
@@ -1855,12 +1886,81 @@ fn tool_call_event_bounds_large_payloads_without_losing_sources() {
             error: None,
             duration: std::time::Duration::ZERO,
         },
+        &policy::AuditConfig::default(),
     )
     .expect("event should serialize");
     assert_eq!(event["arguments"]["truncated"], true);
     assert_eq!(event["result"]["truncated"], true);
     assert_eq!(event["sources"][0]["url"], "https://example.test/source");
     assert_eq!(event["truncated"], true);
+}
+
+#[test]
+fn configured_tool_event_value_limit_applies_to_success_and_failure_paths() {
+    let audit = policy::AuditConfig {
+        max_tool_value_bytes: Some(10),
+        ..policy::AuditConfig::default()
+    };
+    let boundary_call = ChatToolCall {
+        id: "call-boundary".into(),
+        name: "mcp.search".into(),
+        args: json!({ "x": "ab" }), // 10 serialized bytes, exactly at the limit.
+    };
+    let over_limit_result = json!({ "url": "https://example.test/source", "x": "abc" });
+    let success = tool_call_event(
+        "agent",
+        Some("researcher"),
+        Some("search-server"),
+        &boundary_call,
+        &over_limit_result,
+        ToolCallEventOutcome {
+            status: ToolCallStatus::Succeeded,
+            phase: ToolCallPhase::Completed,
+            error: None,
+            duration: std::time::Duration::ZERO,
+        },
+        &audit,
+    )
+    .expect("configured MCP success event should serialize");
+    assert_eq!(success["arguments"], json!({ "x": "ab" }));
+    assert_eq!(success["result"]["type"], "object");
+    assert_eq!(
+        success["result"]["bytes"],
+        serde_json::to_vec(&over_limit_result).unwrap().len()
+    );
+    assert_eq!(success["result"]["truncated"], true);
+    assert_eq!(success["sources"][0]["url"], "https://example.test/source");
+    assert_eq!(success["truncated"], true);
+
+    let over_limit_call = ChatToolCall {
+        id: "call-over-limit".into(),
+        name: "builtin.write".into(),
+        args: json!({ "x": "abc" }), // 11 serialized bytes, one above the limit.
+    };
+    let failure = tool_call_event(
+        "agent",
+        None,
+        None,
+        &over_limit_call,
+        &Value::Null,
+        ToolCallEventOutcome {
+            status: ToolCallStatus::Failed,
+            phase: ToolCallPhase::Execution,
+            error: Some(ToolCallError {
+                code: ToolCallErrorCode::ExecutionFailed,
+                message: "failed".into(),
+            }),
+            duration: std::time::Duration::ZERO,
+        },
+        &audit,
+    )
+    .expect("configured built-in failure event should serialize");
+    assert_eq!(failure["arguments"]["type"], "object");
+    assert_eq!(failure["arguments"]["bytes"], 11);
+    assert_eq!(failure["arguments"]["truncated"], true);
+    assert_eq!(failure["result"], Value::Null);
+    assert_eq!(failure["status"], "failed");
+    assert_eq!(failure["error"]["message"], "failed");
 }
 
 #[test]
