@@ -1055,13 +1055,13 @@ impl Drop for AsyncChild {
             if let Err(error) = child.start_kill() {
                 tracing::warn!(%error, "unreaped CLI child kill failed");
             }
-            retain_for_reaping(ReapChild::Async(child));
+            retain_for_reaping(ReapChild::Async(Box::new(child)));
         }
     }
 }
 
 enum ReapChild {
-    Async(tokio::process::Child),
+    Async(Box<tokio::process::Child>),
     Sync(std::process::Child),
 }
 
