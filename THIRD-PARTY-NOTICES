@@ -385,7 +385,7 @@ Rust packages (including build and verification dependencies):
 - zerotrie@0.2.5 — Unicode-3.0
 - zerovec@0.11.8 — Unicode-3.0
 - zerovec-derive@0.11.6 — Unicode-3.0
-- zip@8.6.0 — MIT
+- zip@9.0.3 — MIT
 - zlib-rs@0.6.7 — Zlib
 - zmij@1.0.23 — MIT
 - zvariant@5.15.0 — MIT
