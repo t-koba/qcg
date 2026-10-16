@@ -72,7 +72,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2"
 uuid = { version = "1", features = ["v7", "serde"] }
 wasm-bindgen = "0.2"
-zip = { version = "8", default-features = false, features = ["chrono", "deflate-flate2-zlib-rs"] }
+zip = { version = "9", default-features = false, features = ["chrono", "deflate-flate2-zlib-rs"] }
 
 [profile.dev]
 # Keep target/ from ballooning: line tables keep backtraces usable while
