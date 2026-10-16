@@ -30,6 +30,14 @@ behind (ADR 0001: no inert promises).
 | F14e | Backup recovery and sweeping exclude live commits; unknown ownership is retained | `backup_maintenance_excludes_live_commits_and_retains_unknown_ownership` |
 | F14f | Lock-open failure refuses backup deletion | `backup_sweep_refuses_unavailable_lock` |
 | F14g | Uninstall cannot be undone by backup recovery | `uninstall_removes_owned_backups_without_resurrecting_the_generator` |
+| F14h | Prepared backup collisions survive retry, sweep and uninstall; preparation never restores a directory | `backup_prepared_collision_survives_retry_maintenance_and_uninstall` |
+| F14i | Pre-ownership crash windows retain ambiguity; durable ownership permits recovery | `backup_crash_probes_cover_durable_sidecar_before_and_after_rename` |
+| F14j | Post-restore interruptions never adopt a replanted backup basename on retry, sweep or uninstall | `backup_restoring_collision_survives_retry_maintenance_and_uninstall` |
+| F14k | Pre-restore-rename interruption retains the original package without inferring ownership | `backup_restoring_interruption_before_rename_retains_original_package` |
+| F14l | Restoring sidecars retire only with an absent backup path and verified current target | `backup_restoring_orphan_retirement_requires_verified_target` |
+| F14m | Post-cleanup interruptions never adopt a replanted directory, file or symlink on retry, sweep or uninstall | `backup_cleaning_collision_survives_retry_maintenance_and_uninstall` |
+| F14n | Cleaning sidecars retire only with an absent backup path and verified current target; no-collision retries converge | `backup_cleaning_orphan_retirement_requires_verified_target` |
+| F14o | Durable cleaning precedes backup removal; interruption before removal retains the original package | `backup_cleaning_interruption_before_removal_retains_original_package` |
 | F15 | No-follow reads reject FIFOs without waiting for a writer (Unix) | `nofollow_read_refuses_fifo_without_waiting_for_a_writer` |
 | F16 | Local catalog and cache reads reject oversized files with visible errors | `oversized_local_catalog_and_cache_fail_with_visible_errors` |
 | F17 | Fork execution uses its admission snapshot; ordinary start/resume read once | `fork_snapshot_derivations_work_after_journal_removal` |

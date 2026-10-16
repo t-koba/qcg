@@ -196,7 +196,7 @@ fn reap_install_backup_siblings(
                 )
                 .context("recovery cleanup pending; current target is not verified")?;
                 install_commit::fsync_parent_dir(&target)?;
-                install_commit::remove_backup_record(&record)
+                install_commit::remove_backup_record(&record, &service::PackageLimits::default())
             });
         if let Err(error) = result {
             failures.push(format!("{}: {error:#}", record.sidecar));
@@ -836,7 +836,7 @@ version = "{version}"
             uuid::Uuid::now_v7()
         ));
         write_installed(&backup, "mygen", "");
-        install_commit::write_backup_marker(&backup, "mygen").expect("marker");
+        install_commit::write_owned_backup_marker(&backup, "mygen").expect("marker");
         // Target "mygen" is missing: recovery must restore it.
         reap_stale_install_tmps(&root).expect("sweep should succeed");
         assert!(
@@ -860,7 +860,7 @@ version = "{version}"
         write_installed(&target, "mygen", "");
         let backup = root.join(".install-backup-marked");
         write_installed(&backup, "mygen", "");
-        install_commit::write_backup_marker(&backup, "mygen").expect("marker");
+        install_commit::write_owned_backup_marker(&backup, "mygen").expect("marker");
         let lock_path = root.join(install_commit::per_id_lock_name("mygen"));
         let commit_guard =
             install_commit::acquire_file_lock(&lock_path, &target).expect("commit lock");
@@ -882,7 +882,7 @@ version = "{version}"
         assert!(!backup.exists());
 
         std::fs::create_dir_all(&backup).expect("obsolete backup");
-        install_commit::write_backup_marker(&backup, "mygen").expect("marker");
+        install_commit::write_owned_backup_marker(&backup, "mygen").expect("marker");
         // Use the recorded mtime as the cutoff so filesystem timestamp
         // precision cannot make this boundary check depend on wall-clock time.
         assert_eq!(
@@ -935,7 +935,7 @@ version = "{version}"
         write_installed(&root.join("mygen"), "mygen", "");
         let backup = root.join(".install-backup-owned");
         write_installed(&backup, "mygen", "");
-        install_commit::write_backup_marker(&backup, "mygen").expect("marker");
+        install_commit::write_owned_backup_marker(&backup, "mygen").expect("marker");
         let unknown = root.join(".install-backup-unknown");
         std::fs::create_dir_all(&unknown).expect("unknown backup");
         uninstall("mygen", &root, true).expect("uninstall");
@@ -958,7 +958,7 @@ version = "{version}"
         write_installed(&root.join("mygen"), "mygen", "");
         let backup = root.join(".install-backup-owned");
         write_installed(&backup, "mygen", "");
-        install_commit::write_backup_marker(&backup, "mygen").expect("marker");
+        install_commit::write_owned_backup_marker(&backup, "mygen").expect("marker");
         std::fs::create_dir_all(root.join(install_commit::per_id_lock_name("mygen")))
             .expect("unopenable lock");
         reap_install_backup_siblings(&root, std::time::SystemTime::now())
@@ -981,7 +981,7 @@ version = "{version}"
             uuid::Uuid::now_v7()
         ));
         std::fs::create_dir_all(&backup).expect("backup dir");
-        install_commit::write_backup_marker(&backup, "mygen").expect("marker");
+        install_commit::write_owned_backup_marker(&backup, "mygen").expect("marker");
         reap_stale_install_tmps(&root).expect("sweep should succeed");
         assert!(
             backup.exists(),
@@ -2756,8 +2756,72 @@ version = "{version}"
     }
 
     #[test]
+    fn backup_prepared_collision_survives_retry_maintenance_and_uninstall() {
+        if env_process::isolated() {
+            return;
+        }
+        let root = test_root("backup-prepared-collision");
+        let _guard = TempGuard(root.clone());
+        let target = root.join("mygen");
+        let staging = root.join("staging");
+        write_installed(&target, "mygen", "");
+        write_installed_version(&staging, "mygen", "2.0.0", "");
+        let observed_root = root.clone();
+        let sentinel = b"unrelated directory\0must survive\xff";
+        let error = install_commit::with_backup_probe(
+            move |point| {
+                if point == "marker-durable" {
+                    let records = install_commit::backup_records(&observed_root)?;
+                    assert_eq!(records.len(), 1);
+                    std::fs::create_dir(&records[0].backup)?;
+                    std::fs::write(records[0].backup.join("sentinel"), sentinel)?;
+                }
+                Ok(())
+            },
+            || install_commit::commit_install(&staging, &target, true),
+        )
+        .expect_err("no-replace must reject the planted backup directory");
+        assert!(format!("{error:#}").contains("failed to move existing generator"));
+        let records = install_commit::backup_records(&root).expect("records");
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        let metadata = std::fs::read(&record.sidecar).expect("prepared metadata");
+        install_commit::commit_install(&staging, &target, true).expect_err("ambiguous retry");
+        reap_install_backup_siblings(&root, std::time::SystemTime::now())
+            .expect_err("age and verified target cannot authorize deleting preparation");
+        uninstall("mygen", &root, true).expect_err("ambiguous uninstall");
+        assert_verified_package(&target, "mygen", "1.0.0");
+        assert_verified_package(&staging, "mygen", "2.0.0");
+        assert_eq!(
+            std::fs::read(record.backup.join("sentinel")).unwrap(),
+            sentinel
+        );
+        assert_eq!(std::fs::read(&record.sidecar).unwrap(), metadata);
+
+        // Preparation cannot restore either, even if the colliding directory
+        // happens to be a fully verified package with the expected identity.
+        std::fs::remove_file(record.backup.join("sentinel")).expect("replace collision fixture");
+        write_installed(&record.backup, "mygen", "");
+        std::fs::remove_dir_all(&target).expect("simulate missing target");
+        recover_test_target(&root, "mygen").expect_err("preparation is not ownership");
+        recover_generators_backups(&root).expect_err("maintenance refuses adoption");
+        assert!(!target.exists());
+        assert_verified_package(&record.backup, "mygen", "1.0.0");
+        assert_eq!(std::fs::read(&record.sidecar).unwrap(), metadata);
+    }
+
+    #[test]
     fn backup_crash_probes_cover_durable_sidecar_before_and_after_rename() {
-        for crash in ["marker-durable", "backup-renamed"] {
+        if env_process::isolated() {
+            return;
+        }
+        for crash in [
+            "marker-durable",
+            "backup-renamed",
+            "backup-sync",
+            "ownership-write",
+            "backup-owned",
+        ] {
             let root = test_root(crash);
             let _guard = TempGuard(root.clone());
             let target = root.join("mygen");
@@ -2782,7 +2846,7 @@ version = "{version}"
                         assert_eq!(records.len(), 1);
                         let record = &records[0];
                         assert!(record.sidecar.is_file());
-                        assert_eq!(record.backup.exists(), crash == "backup-renamed");
+                        assert_eq!(record.backup.exists(), crash != "marker-durable");
                         assert_eq!(
                             observed_root.join("mygen").exists(),
                             crash == "marker-durable"
@@ -2796,11 +2860,28 @@ version = "{version}"
             .expect_err("crash leaves recovery state without rollback or drop cleanup");
             let records = install_commit::backup_records(&root).expect("records");
             assert_eq!(records.len(), 1);
-            assert_eq!(records[0].backup.exists(), crash == "backup-renamed");
-            recover_test_target(&root, "mygen").expect("restore abandoned commit");
+            let record = &records[0];
+            assert_eq!(record.backup.exists(), crash != "marker-durable");
+            if matches!(crash, "backup-renamed" | "backup-sync" | "ownership-write") {
+                let metadata = std::fs::read(&record.sidecar).expect("metadata");
+                let error = recover_test_target(&root, "mygen").expect_err("ambiguous rename");
+                assert!(format!("{error:#}").contains("preparation does not prove ownership"));
+                recover_generators_backups(&root).expect_err("ambiguous maintenance");
+                install_commit::commit_install(&staging, &target, true)
+                    .expect_err("retry must not adopt a prepared directory");
+                assert!(!target.exists());
+                assert_verified_package(&record.backup, "mygen", "1.0.0");
+                assert_eq!(std::fs::read(&record.sidecar).unwrap(), metadata);
+                // An operator can validate and explicitly resolve this state;
+                // automatic recovery must never infer which rename occurred.
+                std::fs::rename(&record.backup, &target).expect("operator restores");
+                std::fs::remove_file(&record.sidecar).expect("operator resolves record");
+            } else {
+                recover_test_target(&root, "mygen").expect("recover owned or absent backup");
+            }
             assert_verified_package(&target, "mygen", "1.0.0");
-            // Orphan sidecar (pre-rename crash) is cleaned under verified target
-            // before the next replacement, not adopted as a missing backup.
+            // A missing prepared backup permits sidecar-only cleanup under the
+            // verified target; a durably owned backup permits verified restore.
             install_commit::commit_install(&staging, &target, true).expect("retry converges");
             assert_verified_package(&target, "mygen", "2.0.0");
             assert!(
@@ -2838,30 +2919,29 @@ version = "{version}"
     }
 
     #[test]
-    fn backup_publish_and_backup_sync_failures_restore_verified_old_package() {
-        for failure in ["backup-sync", "publish-rename"] {
-            let root = test_root(failure);
-            let _guard = TempGuard(root.clone());
-            let target = root.join("mygen");
-            let staging = root.join("staging");
-            write_installed(&target, "mygen", "");
-            write_installed_version(&staging, "mygen", "2.0.0", "");
-            install_commit::with_backup_probe(
-                move |point| {
-                    anyhow::ensure!(point != failure, "injected {failure}");
-                    Ok(())
-                },
-                || install_commit::commit_install(&staging, &target, true),
-            )
-            .expect_err("failed publication");
-            assert_verified_package(&target, "mygen", "1.0.0");
-            assert!(staging.exists());
-            assert!(
-                install_commit::backup_records(&root)
-                    .expect("records")
-                    .is_empty()
-            );
-        }
+    fn backup_publish_failure_restores_verified_old_package() {
+        let failure = "publish-rename";
+        let root = test_root(failure);
+        let _guard = TempGuard(root.clone());
+        let target = root.join("mygen");
+        let staging = root.join("staging");
+        write_installed(&target, "mygen", "");
+        write_installed_version(&staging, "mygen", "2.0.0", "");
+        install_commit::with_backup_probe(
+            move |point| {
+                anyhow::ensure!(point != failure, "injected {failure}");
+                Ok(())
+            },
+            || install_commit::commit_install(&staging, &target, true),
+        )
+        .expect_err("failed publication");
+        assert_verified_package(&target, "mygen", "1.0.0");
+        assert!(staging.exists());
+        assert!(
+            install_commit::backup_records(&root)
+                .expect("records")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2913,8 +2993,8 @@ version = "{version}"
     }
 
     #[test]
-    fn backup_restore_rename_and_sync_failures_retain_recovery_metadata() {
-        for failure in ["restore-rename", "restore-sync"] {
+    fn backup_restore_phase_write_and_sync_failures_retain_recovery_metadata() {
+        for failure in ["restoring-write", "restore-sync"] {
             let root = test_root(failure);
             let _guard = TempGuard(root.clone());
             let target = root.join("mygen");
@@ -2932,7 +3012,7 @@ version = "{version}"
             let records = install_commit::backup_records(&root).expect("records");
             assert_eq!(records.len(), 1);
             assert!(records[0].sidecar.exists());
-            assert_eq!(records[0].backup.exists(), failure == "restore-rename");
+            assert_eq!(records[0].backup.exists(), failure == "restoring-write");
             assert_eq!(target.exists(), failure == "restore-sync");
             recover_test_target(&root, "mygen").expect("retry recovery");
             assert_verified_package(&target, "mygen", "1.0.0");
@@ -2949,9 +3029,357 @@ version = "{version}"
     }
 
     #[test]
+    fn backup_restoring_collision_survives_retry_maintenance_and_uninstall() {
+        if env_process::isolated() {
+            return;
+        }
+        for interruption in ["restore-sync", "cleanup-sidecar"] {
+            let root = test_root(interruption);
+            let _guard = TempGuard(root.clone());
+            let target = root.join("mygen");
+            let backup = root.join(".install-backup-restored");
+            write_installed(&backup, "mygen", "");
+            let record = install_commit::write_owned_backup_marker(&backup, "mygen")
+                .expect("owned backup record");
+            install_commit::with_backup_probe(
+                move |point| {
+                    anyhow::ensure!(point != interruption, "interrupted at {interruption}");
+                    Ok(())
+                },
+                || recover_test_target(&root, "mygen"),
+            )
+            .expect_err("interruption after successful restore rename");
+            assert_verified_package(&target, "mygen", "1.0.0");
+            assert!(!backup.exists());
+            let metadata = std::fs::read(&record.sidecar).expect("restoring metadata");
+            let data: serde_json::Value = serde_json::from_slice(&metadata).unwrap();
+            assert_eq!(data["phase"], "restoring");
+
+            // A different package with the same ID still does not belong to
+            // this record. Neither verification nor age can adopt it.
+            write_installed_version(&backup, "mygen", "9.0.0", "");
+            let sentinel = b"unrelated directory\0must survive\xff";
+            std::fs::write(backup.join("sentinel"), sentinel).expect("sentinel");
+            let staging = root.join("staging");
+            write_installed_version(&staging, "mygen", "2.0.0", "");
+            install_commit::commit_install(&staging, &target, true)
+                .expect_err("retry must not delete a restoring collision");
+            reap_install_backup_siblings(&root, std::time::SystemTime::now())
+                .expect_err("sweep must retain restoring collision");
+            uninstall("mygen", &root, true)
+                .expect_err("uninstall must retain collision and target");
+            assert_verified_package(&target, "mygen", "1.0.0");
+            assert_verified_package(&staging, "mygen", "2.0.0");
+            assert_eq!(std::fs::read(backup.join("sentinel")).unwrap(), sentinel);
+            assert_eq!(std::fs::read(&record.sidecar).unwrap(), metadata);
+
+            std::fs::remove_dir_all(&target).expect("simulate lost target");
+            recover_test_target(&root, "mygen").expect_err("never restore a collision");
+            recover_generators_backups(&root).expect_err("maintenance must not adopt collision");
+            assert!(!target.exists());
+            assert_eq!(std::fs::read(backup.join("sentinel")).unwrap(), sentinel);
+            std::fs::remove_dir_all(&backup).expect("remove collision fixture");
+            recover_test_target(&root, "mygen")
+                .expect_err("missing target and backup are still ambiguous");
+            assert_eq!(std::fs::read(&record.sidecar).unwrap(), metadata);
+        }
+    }
+
+    #[test]
+    fn backup_restoring_interruption_before_rename_retains_original_package() {
+        if env_process::isolated() {
+            return;
+        }
+        let root = test_root("restoring-before-rename");
+        let _guard = TempGuard(root.clone());
+        let target = root.join("mygen");
+        let backup = root.join(".install-backup-original");
+        write_installed(&backup, "mygen", "");
+        let record = install_commit::write_owned_backup_marker(&backup, "mygen")
+            .expect("owned backup record");
+        install_commit::with_backup_probe(
+            |point| {
+                anyhow::ensure!(point != "restore-rename", "crash before rename syscall");
+                Ok(())
+            },
+            || recover_test_target(&root, "mygen"),
+        )
+        .expect_err("interrupted after durable restoring phase, before rename");
+        let metadata = std::fs::read(&record.sidecar).expect("restoring metadata");
+        let data: serde_json::Value = serde_json::from_slice(&metadata).unwrap();
+        assert_eq!(data["phase"], "restoring");
+        assert!(!target.exists());
+        let staging = root.join("staging");
+        write_installed_version(&staging, "mygen", "2.0.0", "");
+        recover_test_target(&root, "mygen").expect_err("ambiguous recovery");
+        recover_generators_backups(&root).expect_err("ambiguous maintenance");
+        install_commit::commit_install(&staging, &target, false).expect_err("ambiguous retry");
+        assert!(!target.exists());
+        assert_verified_package(&backup, "mygen", "1.0.0");
+        // Even a verified target arriving later does not authorize deletion
+        // of the original directory still at the restoring basename.
+        write_installed_version(&target, "mygen", "3.0.0", "");
+        reap_install_backup_siblings(&root, std::time::SystemTime::now())
+            .expect_err("retain original package");
+        uninstall("mygen", &root, true).expect_err("retain original and current packages");
+        assert_verified_package(&backup, "mygen", "1.0.0");
+        assert_verified_package(&target, "mygen", "3.0.0");
+        assert_eq!(std::fs::read(&record.sidecar).unwrap(), metadata);
+    }
+
+    #[test]
+    fn backup_restoring_orphan_retirement_requires_verified_target() {
+        if env_process::isolated() {
+            return;
+        }
+        for action in ["retry", "sweep", "uninstall"] {
+            let root = test_root(action);
+            let _guard = TempGuard(root.clone());
+            let target = root.join("mygen");
+            let backup = root.join(".install-backup-restored");
+            write_installed(&backup, "mygen", "");
+            let record = install_commit::write_owned_backup_marker(&backup, "mygen")
+                .expect("owned backup record");
+            install_commit::with_backup_probe(
+                |point| {
+                    anyhow::ensure!(point != "restore-sync", "interrupted after rename");
+                    Ok(())
+                },
+                || recover_test_target(&root, "mygen"),
+            )
+            .expect_err("restore interrupted");
+            let metadata = std::fs::read(&record.sidecar).unwrap();
+            let staging = root.join("staging");
+            write_installed_version(&staging, "mygen", "2.0.0", "");
+            let manifest = target.join(contract::MANIFEST_FILE);
+            let original = std::fs::read(&manifest).unwrap();
+            std::fs::write(&manifest, b"invalid manifest").unwrap();
+            let run = || match action {
+                "retry" => install_commit::commit_install(&staging, &target, true),
+                "sweep" => reap_install_backup_siblings(&root, std::time::SystemTime::now()),
+                "uninstall" => uninstall("mygen", &root, true),
+                _ => unreachable!(),
+            };
+            run().expect_err("unverified target cannot retire restoring sidecar");
+            assert_eq!(std::fs::read(&record.sidecar).unwrap(), metadata);
+            assert!(!backup.exists());
+            std::fs::write(&manifest, original).unwrap();
+            run().expect("verified target permits sidecar-only cleanup");
+            assert!(!record.sidecar.exists());
+            assert!(!backup.exists());
+            if action == "uninstall" {
+                assert!(!target.exists());
+            } else {
+                let version = if action == "retry" { "2.0.0" } else { "1.0.0" };
+                assert_verified_package(&target, "mygen", version);
+            }
+        }
+    }
+
+    #[test]
+    fn backup_restore_preserves_replanted_vacant_backup_path() {
+        let root = test_root("restore-replanted-backup");
+        let _guard = TempGuard(root.clone());
+        let target = root.join("mygen");
+        let backup = root.join(".install-backup-restored");
+        write_installed(&backup, "mygen", "");
+        let record = install_commit::write_owned_backup_marker(&backup, "mygen")
+            .expect("owned backup record");
+        let planted_backup = record.backup.clone();
+        let recovery_root = root.clone();
+        let sentinel = b"unrelated directory\0must survive\xff";
+
+        install_commit::with_backup_probe(
+            move |point| {
+                if point == "restore-sync" {
+                    std::fs::create_dir(&planted_backup)?;
+                    std::fs::write(planted_backup.join("sentinel"), sentinel)?;
+                }
+                Ok(())
+            },
+            move || recover_test_target(&recovery_root, "mygen"),
+        )
+        .expect("recovery should restore and retire its sidecar");
+
+        assert_verified_package(&target, "mygen", "1.0.0");
+        assert_eq!(
+            std::fs::read(record.backup.join("sentinel")).expect("sentinel bytes"),
+            sentinel
+        );
+        assert!(record.backup.is_dir(), "planted directory must remain");
+        assert!(
+            !record.sidecar.exists(),
+            "successful restoration retires only its sidecar"
+        );
+    }
+
+    fn interrupt_backup_cleanup(
+        root: &Utf8Path,
+        interruption: &'static str,
+    ) -> install_commit::BackupRecord {
+        let target = root.join("mygen");
+        let staging = root.join("staging");
+        write_installed(&target, "mygen", "");
+        write_installed_version(&staging, "mygen", "2.0.0", "");
+        install_commit::with_backup_probe(
+            move |point| {
+                anyhow::ensure!(point != interruption, "interrupted at {interruption}");
+                Ok(())
+            },
+            || install_commit::commit_install(&staging, &target, true),
+        )
+        .expect_err("cleanup interrupted");
+        assert_verified_package(&target, "mygen", "2.0.0");
+        let mut records = install_commit::backup_records(root).expect("records");
+        assert_eq!(records.len(), 1);
+        let record = records.pop().unwrap();
+        let data: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&record.sidecar).unwrap()).unwrap();
+        assert_eq!(data["phase"], "cleaning");
+        record
+    }
+
+    #[test]
+    fn backup_cleaning_collision_survives_retry_maintenance_and_uninstall() {
+        if env_process::isolated() {
+            return;
+        }
+        for collision in [
+            "directory",
+            "file",
+            #[cfg(unix)]
+            "symlink",
+        ] {
+            let root = test_root(collision);
+            let _guard = TempGuard(root.clone());
+            let target = root.join("mygen");
+            let record = interrupt_backup_cleanup(&root, "cleanup-sidecar");
+            assert!(!record.backup.exists());
+            let metadata = std::fs::read(&record.sidecar).unwrap();
+            let sentinel = b"unrelated directory\0must survive\xff";
+            let sentinel_dir = if collision == "directory" {
+                record.backup.clone()
+            } else {
+                root.join("unrelated")
+            };
+            std::fs::create_dir(&sentinel_dir).unwrap();
+            std::fs::write(sentinel_dir.join("sentinel"), sentinel).unwrap();
+            if collision == "file" {
+                std::fs::write(&record.backup, sentinel).unwrap();
+            }
+            #[cfg(unix)]
+            if collision == "symlink" {
+                std::os::unix::fs::symlink(&sentinel_dir, &record.backup).unwrap();
+            }
+            let staging = root.join("next");
+            write_installed_version(&staging, "mygen", "3.0.0", "");
+            install_commit::commit_install(&staging, &target, true)
+                .expect_err("retry must retain cleaning collision");
+            reap_install_backup_siblings(&root, std::time::SystemTime::now())
+                .expect_err("sweep must retain cleaning collision");
+            uninstall("mygen", &root, true)
+                .expect_err("uninstall must retain cleaning collision and target");
+            assert_verified_package(&target, "mygen", "2.0.0");
+            assert_verified_package(&staging, "mygen", "3.0.0");
+            assert_eq!(std::fs::read(&record.sidecar).unwrap(), metadata);
+            assert_eq!(
+                std::fs::read(sentinel_dir.join("sentinel")).unwrap(),
+                sentinel
+            );
+            let meta = std::fs::symlink_metadata(&record.backup).expect("collision retained");
+            match collision {
+                "directory" => assert!(meta.is_dir()),
+                "file" => assert_eq!(std::fs::read(&record.backup).unwrap(), sentinel),
+                #[cfg(unix)]
+                "symlink" => assert_eq!(std::fs::read_link(&record.backup).unwrap(), sentinel_dir),
+                _ => unreachable!(),
+            }
+
+            std::fs::remove_dir_all(&target).unwrap();
+            recover_test_target(&root, "mygen").expect_err("never restore a cleaning collision");
+            recover_generators_backups(&root).expect_err("maintenance must not adopt collision");
+            assert!(!target.exists());
+            assert_eq!(
+                std::fs::read(sentinel_dir.join("sentinel")).unwrap(),
+                sentinel
+            );
+            if meta.is_dir() {
+                std::fs::remove_dir_all(&record.backup).unwrap();
+            } else {
+                std::fs::remove_file(&record.backup).unwrap();
+            }
+            recover_test_target(&root, "mygen")
+                .expect_err("missing target and backup remain ambiguous");
+            assert_eq!(std::fs::read(&record.sidecar).unwrap(), metadata);
+        }
+    }
+
+    #[test]
+    fn backup_cleaning_orphan_retirement_requires_verified_target() {
+        if env_process::isolated() {
+            return;
+        }
+        for action in ["retry", "sweep", "uninstall"] {
+            let root = test_root(action);
+            let _guard = TempGuard(root.clone());
+            let target = root.join("mygen");
+            let record = interrupt_backup_cleanup(&root, "cleanup-sidecar");
+            assert!(!record.backup.exists());
+            let metadata = std::fs::read(&record.sidecar).unwrap();
+            let staging = root.join("next");
+            write_installed_version(&staging, "mygen", "3.0.0", "");
+            let manifest = target.join(contract::MANIFEST_FILE);
+            let original = std::fs::read(&manifest).unwrap();
+            std::fs::write(&manifest, b"invalid manifest").unwrap();
+            let run = || match action {
+                "retry" => install_commit::commit_install(&staging, &target, true),
+                "sweep" => reap_install_backup_siblings(&root, std::time::SystemTime::now()),
+                "uninstall" => uninstall("mygen", &root, true),
+                _ => unreachable!(),
+            };
+            run().expect_err("unverified target cannot retire cleaning sidecar");
+            assert_eq!(std::fs::read(&record.sidecar).unwrap(), metadata);
+            assert!(!record.backup.exists());
+            std::fs::write(&manifest, original).unwrap();
+            run().expect("verified target permits sidecar-only cleanup");
+            assert!(!record.sidecar.exists());
+            assert!(!record.backup.exists());
+            if action == "uninstall" {
+                assert!(!target.exists());
+            } else {
+                let version = if action == "retry" { "3.0.0" } else { "2.0.0" };
+                assert_verified_package(&target, "mygen", version);
+            }
+        }
+    }
+
+    #[test]
+    fn backup_cleaning_interruption_before_removal_retains_original_package() {
+        if env_process::isolated() {
+            return;
+        }
+        let root = test_root("cleaning-before-removal");
+        let _guard = TempGuard(root.clone());
+        let record = interrupt_backup_cleanup(&root, "cleaning-durable");
+        let metadata = std::fs::read(&record.sidecar).unwrap();
+        let target = root.join("mygen");
+        let staging = root.join("next");
+        write_installed_version(&staging, "mygen", "3.0.0", "");
+        install_commit::commit_install(&staging, &target, true)
+            .expect_err("ambiguous cleanup before removal");
+        reap_install_backup_siblings(&root, std::time::SystemTime::now())
+            .expect_err("retain original backup");
+        uninstall("mygen", &root, true).expect_err("retain original and current packages");
+        assert_verified_package(&record.backup, "mygen", "1.0.0");
+        assert_verified_package(&target, "mygen", "2.0.0");
+        assert_eq!(std::fs::read(&record.sidecar).unwrap(), metadata);
+    }
+
+    #[test]
     fn backup_cleanup_errors_converge_without_ambiguous_generations() {
         for failure in [
             "cleanup-backup",
+            "cleaning-write",
             "cleanup-backup-sync",
             "cleanup-sidecar",
             "cleanup-sidecar-sync",
@@ -2976,7 +3404,20 @@ version = "{version}"
                 assert!(records.is_empty());
             } else {
                 assert_eq!(records.len(), 1);
-                assert_eq!(records[0].backup.exists(), failure == "cleanup-backup");
+                assert_eq!(
+                    records[0].backup.exists(),
+                    matches!(failure, "cleanup-backup" | "cleaning-write")
+                );
+                let data: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&records[0].sidecar).unwrap()).unwrap();
+                assert_eq!(
+                    data["phase"],
+                    if matches!(failure, "cleanup-backup" | "cleaning-write") {
+                        "owned"
+                    } else {
+                        "cleaning"
+                    }
+                );
                 // Another attempt must stop at old cleanup, before allocating a
                 // new generation, if cleanup still fails.
                 write_installed_version(&staging, "mygen", "3.0.0", "");
@@ -3014,7 +3455,7 @@ version = "{version}"
         for nonce in ["first", "second"] {
             let backup = root.join(format!(".install-backup-{nonce}"));
             write_installed(&backup, "mygen", "");
-            install_commit::write_backup_marker(&backup, "mygen").expect("record");
+            install_commit::write_owned_backup_marker(&backup, "mygen").expect("record");
         }
         let error = recover_test_target(&root, "mygen").expect_err("never choose newest");
         assert!(error.to_string().contains("multiple recovery backups"));
@@ -3051,7 +3492,8 @@ version = "{version}"
         let root = test_root("invalid-sidecars");
         let _guard = TempGuard(root.clone());
         std::fs::create_dir_all(&root).expect("root");
-        let valid = |name: &str| serde_json::json!({"schema":1,"id":"mygen","backup":name});
+        let valid =
+            |name: &str| serde_json::json!({"schema":2,"id":"mygen","backup":name,"phase":"owned"});
         let cases = [
             "malformed",
             "oversized",
@@ -3061,6 +3503,9 @@ version = "{version}"
             "mismatch",
             "schema",
             "unknown",
+            "missing-phase",
+            "invalid-phase",
+            "intent-only-legacy",
         ];
         for case in cases {
             let basename = format!(".install-backup-{case}");
@@ -3072,8 +3517,16 @@ version = "{version}"
                 "slash" => data["id"] = "nested/id".into(),
                 "dot" => data["id"] = ".".into(),
                 "mismatch" => data["backup"] = ".install-backup-different".into(),
-                "schema" => data["schema"] = 2.into(),
+                "schema" => data["schema"] = 1.into(),
                 "unknown" => data["target"] = "/ignored-but-forbidden".into(),
+                "missing-phase" => {
+                    data.as_object_mut().unwrap().remove("phase");
+                }
+                "invalid-phase" => data["phase"] = "renamed".into(),
+                "intent-only-legacy" => {
+                    data["schema"] = 1.into();
+                    data.as_object_mut().unwrap().remove("phase");
+                }
                 _ => {}
             }
             let bytes = match case {
@@ -3120,7 +3573,7 @@ version = "{version}"
         write_installed(&root.join("mygen"), "mygen", "");
         let backup = root.join(".install-backup-symlink-marker");
         write_installed(&backup, "mygen", "");
-        let record = install_commit::write_backup_marker(&backup, "mygen").expect("record");
+        let record = install_commit::write_owned_backup_marker(&backup, "mygen").expect("record");
         let external = root.join("external.json");
         std::fs::rename(&record.sidecar, &external).expect("move metadata");
         symlink(&external, &record.sidecar).expect("sidecar link");
@@ -3130,7 +3583,7 @@ version = "{version}"
         );
         let linked_backup = root.join(".install-backup-symlink-tree");
         let linked_record =
-            install_commit::write_backup_marker(&linked_backup, "mygen").expect("record");
+            install_commit::write_owned_backup_marker(&linked_backup, "mygen").expect("record");
         symlink(&backup, &linked_backup).expect("backup link");
         assert!(
             install_commit::backup_records(&root)
@@ -3160,6 +3613,7 @@ version = "{version}"
     fn backup_uninstall_cleanup_failure_keeps_target_until_safe_cleanup() {
         for failure in [
             "cleanup-backup",
+            "cleaning-write",
             "cleanup-backup-sync",
             "cleanup-sidecar",
             "cleanup-sidecar-sync",
@@ -3169,7 +3623,7 @@ version = "{version}"
             write_installed(&root.join("mygen"), "mygen", "");
             let backup = root.join(".install-backup-owned");
             write_installed(&backup, "mygen", "");
-            install_commit::write_backup_marker(&backup, "mygen").expect("record");
+            install_commit::write_owned_backup_marker(&backup, "mygen").expect("record");
             install_commit::with_backup_probe(
                 move |point| {
                     anyhow::ensure!(point != failure, "injected {failure}");
@@ -3193,7 +3647,7 @@ version = "{version}"
         let _guard = TempGuard(root.clone());
         let backup = root.join(".install-backup-owned");
         write_installed(&backup, "mygen", "");
-        install_commit::write_backup_marker(&backup, "mygen").expect("record");
+        install_commit::write_owned_backup_marker(&backup, "mygen").expect("record");
         let target = root.join("mygen");
         let planted_target = target.clone();
         install_commit::with_backup_probe(
@@ -3208,7 +3662,12 @@ version = "{version}"
         .expect_err("no-replace must refuse");
         assert_verified_package(&target, "mygen", "9.0.0");
         assert_verified_package(&backup, "mygen", "1.0.0");
-        assert!(install_commit::backup_sidecar_path(&backup).exists());
+        let bytes = std::fs::read(install_commit::backup_sidecar_path(&backup)).unwrap();
+        let data: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            data["phase"], "owned",
+            "known no-move failure reverts ownership"
+        );
     }
 
     #[test]
@@ -3271,7 +3730,7 @@ version = "{version}"
         write_installed(&target, "mygen", "");
         let backup = root.join(".install-backup-owned");
         write_installed(&backup, "mygen", "");
-        let record = install_commit::write_backup_marker(&backup, "mygen").expect("record");
+        let record = install_commit::write_owned_backup_marker(&backup, "mygen").expect("record");
         std::fs::write(target.join("extra.txt"), "tampered").expect("tamper");
         reap_install_backup_siblings(&root, std::time::SystemTime::now())
             .expect_err("unverified target cannot authorize deletion");

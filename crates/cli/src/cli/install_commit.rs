@@ -652,7 +652,7 @@ fn commit_install_locked(
         )?;
         fsync_parent_dir(target)?;
         for record in pending {
-            remove_backup_record(&record)?;
+            remove_backup_record(&record, limits)?;
         }
     }
     if replace_existing {
@@ -678,19 +678,21 @@ fn commit_install_locked(
     }
     let backup = if replace_existing {
         let path = unique_nonexistent_path(parent, "install-backup")?;
-        let record = write_backup_marker(&path, id)?;
+        let mut record = write_backup_marker(&path, id)?;
         // Bytes AND directory entry flushed before destructive rename.
         backup_probe("marker-durable")?;
         if let Err(error) = rename_no_replace(target, &path) {
-            // Orphan sidecar is retained for verified cleanup on retry.
+            // Preparation is not ownership: retain any colliding directory.
             return Err(error).context("failed to move existing generator to backup");
         }
-        // Simulate interruption at precisely the old unmarked-backup window.
+        // A crash here is indistinguishable from a pre-rename collision.
+        // Never adopt the directory from preparation metadata alone.
         backup_probe("backup-renamed")?;
-        if let Err(error) = backup_probe("backup-sync").and_then(|()| Ok(fsync_parent_dir(target)?))
-        {
-            return rollback_error(error, &record, target, limits);
-        }
+        backup_probe("backup-sync")?;
+        fsync_parent_dir(target)
+            .context("backup rename durability uncertain; ambiguous recovery state retained")?;
+        confirm_backup_ownership(&mut record)?;
+        backup_probe("backup-owned")?;
         Some(record)
     } else {
         None
@@ -711,7 +713,7 @@ fn commit_install_locked(
     if let Some(record) = backup {
         verify_backup_identity(target, id, limits)
             .context("published target failed verification; recovery backup retained")?;
-        remove_backup_record(&record)
+        remove_backup_record(&record, limits)
             .context("installed generator but recovery cleanup pending; retry install")?;
     }
     Ok(())
@@ -803,7 +805,7 @@ pub(crate) fn uninstall(id: &str, generators_dir: &Utf8Path, yes: bool) -> Resul
     // Otherwise later maintenance could resurrect a successfully uninstalled id.
     // Do this before removing the target so cleanup failure leaves it installed.
     for record in backup_records_for(generators_dir, id)? {
-        remove_backup_record(&record)
+        remove_backup_record(&record, &service::PackageLimits::default())
             .context("failed to clean recovery record before uninstall; target retained")?;
     }
     std::fs::remove_dir_all(&target)
@@ -917,12 +919,23 @@ struct BackupMetadata {
     schema: u32,
     id: String,
     backup: String,
+    phase: BackupPhase,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum BackupPhase {
+    Prepared,
+    Owned,
+    Restoring,
+    Cleaning,
 }
 
 pub(crate) struct BackupRecord {
     pub(crate) backup: Utf8PathBuf,
     pub(crate) sidecar: Utf8PathBuf,
     pub(crate) id: String,
+    phase: BackupPhase,
 }
 
 fn valid_backup_name(name: &str) -> bool {
@@ -938,9 +951,11 @@ pub(crate) fn backup_sidecar_path(backup: &Utf8Path) -> Utf8PathBuf {
     backup.with_file_name(format!("{}.json", backup.file_name().unwrap_or_default()))
 }
 
-/// Missing backups are allowed (crash before rename or during cleanup).
-/// Non-directory backups, symlinks and invalid/legacy metadata prove no
-/// ownership. All paths derive from basenames under the scanned parent.
+/// Prepared/restoring/cleaning records report ambiguity, never directory ownership.
+/// With a verified target, missing backups allow sidecar-only cleanup.
+/// Non-directories, symlinks and invalid/legacy metadata prove no ownership.
+/// Restoring/cleaning records also recognize occupied non-directory paths to block cleanup.
+/// All paths derive from basenames under the scanned parent.
 fn read_backup_record(parent: &Utf8Path, name: &str) -> Option<BackupRecord> {
     let basename = name.strip_suffix(".json")?;
     if !valid_backup_name(basename) {
@@ -956,12 +971,14 @@ fn read_backup_record(parent: &Utf8Path, name: &str) -> Option<BackupRecord> {
     }
     let bytes = files::read_nofollow_bounded(&sidecar, Some(BACKUP_RECORD_LIMIT)).ok()?;
     let data: BackupMetadata = serde_json::from_slice(&bytes).ok()?;
-    if data.schema != 1 || data.backup != basename || !policy::is_safe_path_component(&data.id) {
+    if data.schema != 2 || data.backup != basename || !policy::is_safe_path_component(&data.id) {
         return None;
     }
     let backup = parent.join(basename);
     match std::fs::symlink_metadata(&backup) {
-        Ok(meta) if meta.file_type().is_dir() => {}
+        Ok(meta)
+            if meta.file_type().is_dir()
+                || matches!(data.phase, BackupPhase::Restoring | BackupPhase::Cleaning) => {}
         Err(error) if error.kind() == ErrorKind::NotFound => {}
         _ => return None,
     }
@@ -969,6 +986,7 @@ fn read_backup_record(parent: &Utf8Path, name: &str) -> Option<BackupRecord> {
         backup,
         sidecar,
         id: data.id,
+        phase: data.phase,
     })
 }
 
@@ -1010,9 +1028,10 @@ pub(crate) fn write_backup_marker(backup: &Utf8Path, id: &str) -> Result<BackupR
     anyhow::ensure!(valid_backup_name(basename), "unsafe backup basename");
     let sidecar = backup_sidecar_path(backup);
     let data = BackupMetadata {
-        schema: 1,
+        schema: 2,
         id: id.to_string(),
         backup: basename.to_string(),
+        phase: BackupPhase::Prepared,
     };
     let bytes = serde_json::to_vec(&data)?;
     anyhow::ensure!(
@@ -1038,7 +1057,84 @@ pub(crate) fn write_backup_marker(backup: &Utf8Path, id: &str) -> Result<BackupR
         backup: backup.to_path_buf(),
         sidecar,
         id: id.to_string(),
+        phase: BackupPhase::Prepared,
     })
+}
+
+/// Only the live commit that successfully renamed AND synced the old target
+/// may promote preparation to ownership. Recovery must never call this.
+fn confirm_backup_ownership(record: &mut BackupRecord) -> Result<()> {
+    let current = current_backup_record(record)?;
+    anyhow::ensure!(
+        current.phase == BackupPhase::Prepared,
+        "backup already owned"
+    );
+    backup_probe("ownership-write")?;
+    persist_backup_phase(record, BackupPhase::Owned)
+}
+
+/// Caller has validated the transition and holds the per-ID lock. A failed
+/// write/sync is ambiguous: no subsequent rename may run on that error path.
+fn persist_backup_phase(record: &mut BackupRecord, phase: BackupPhase) -> Result<()> {
+    current_backup_record(record)?;
+    let data = BackupMetadata {
+        schema: 2,
+        id: record.id.clone(),
+        backup: record
+            .backup
+            .file_name()
+            .context("backup has no basename")?
+            .to_string(),
+        phase,
+    };
+    let bytes = serde_json::to_vec(&data)?;
+    anyhow::ensure!(
+        bytes.len() <= BACKUP_RECORD_LIMIT,
+        "oversized recovery record"
+    );
+    files::write_sidecar_atomic(&record.sidecar, &bytes)
+        .context("failed to persist backup phase; retained for inspection")?;
+    record.phase = phase;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn write_owned_backup_marker(backup: &Utf8Path, id: &str) -> Result<BackupRecord> {
+    // Fixture for a commit that already renamed and synced its backup.
+    let mut record = write_backup_marker(backup, id)?;
+    fsync_parent_dir(backup)?;
+    confirm_backup_ownership(&mut record)?;
+    Ok(record)
+}
+
+fn current_backup_record(record: &BackupRecord) -> Result<BackupRecord> {
+    let parent = record.sidecar.parent().context("sidecar has no parent")?;
+    let current = read_backup_record(parent, record.sidecar.file_name().unwrap_or_default())
+        .context("recovery ownership changed; retained for inspection")?;
+    anyhow::ensure!(
+        current.id == record.id && current.backup == record.backup && current.phase == record.phase,
+        "recovery ownership changed"
+    );
+    Ok(current)
+}
+
+fn require_owned_backup(record: &BackupRecord) -> Result<()> {
+    anyhow::ensure!(
+        record.phase != BackupPhase::Restoring,
+        "ambiguous restoring record `{}`; retained untouched for inspection",
+        record.sidecar
+    );
+    anyhow::ensure!(
+        record.phase != BackupPhase::Cleaning,
+        "ambiguous cleaning record `{}`; retained untouched for inspection",
+        record.sidecar
+    );
+    anyhow::ensure!(
+        record.phase == BackupPhase::Owned,
+        "ambiguous recovery directory `{}`: preparation does not prove ownership; retained untouched for inspection",
+        record.backup
+    );
+    Ok(())
 }
 
 pub(crate) fn verify_backup_identity(
@@ -1058,20 +1154,110 @@ pub(crate) fn verify_backup_identity(
     Ok(())
 }
 
-/// Caller holds global -> shard -> per-ID locks. Remove backup, flush parent,
-/// then remove sidecar and flush again. No recovery backup has a Drop guard.
-pub(crate) fn remove_backup_record(record: &BackupRecord) -> Result<()> {
-    let parent = record.sidecar.parent().context("sidecar has no parent")?;
-    let current = read_backup_record(parent, record.sidecar.file_name().unwrap_or_default())
-        .context("recovery ownership changed; retained for inspection")?;
-    anyhow::ensure!(
-        current.id == record.id && current.backup == record.backup,
-        "recovery ownership changed"
-    );
+/// Caller holds global -> shard -> per-ID locks. Only Owned may remove a
+/// backup, after durably relinquishing ownership as Cleaning. Other phases
+/// require absence and retire only the sidecar; Restoring/Cleaning also require
+/// target verification here (including for uninstall). Flush
+/// between cleanup steps. No recovery backup has a Drop guard.
+pub(crate) fn remove_backup_record(
+    record: &BackupRecord,
+    limits: &service::PackageLimits,
+) -> Result<()> {
+    let mut current = current_backup_record(record)?;
+    if matches!(
+        current.phase,
+        BackupPhase::Restoring | BackupPhase::Cleaning
+    ) {
+        let phase = if current.phase == BackupPhase::Cleaning {
+            backup_probe("cleanup-backup")?;
+            "cleaning"
+        } else {
+            "restoring"
+        };
+        // Ownership was relinquished before mutation. On retry only an absent
+        // basename and verified target permit sidecar-only retirement.
+        match std::fs::symlink_metadata(&current.backup) {
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+            Ok(_) => anyhow::bail!(
+                "ambiguous {phase} record `{}`: backup path exists; retained untouched for inspection",
+                current.sidecar
+            ),
+        }
+        let target = current
+            .sidecar
+            .parent()
+            .context("sidecar has no parent")?
+            .join(&current.id);
+        verify_backup_identity(&target, &current.id, limits)
+            .with_context(|| format!("{phase} record requires a verified current target"))?;
+        fsync_parent_dir(&target)?;
+        return retire_vacated_backup_record(&current);
+    }
     backup_probe("cleanup-backup")?;
-    remove_owned_path(&record.backup)?;
+    if current.phase == BackupPhase::Owned {
+        // Probe pre-mutation failures before relinquishing ownership. Once
+        // Cleaning is durable, an error/crash must never reauthorize this path.
+        backup_probe("cleaning-write")?;
+        persist_backup_phase(&mut current, BackupPhase::Cleaning)?;
+        backup_probe("cleaning-durable")?;
+        remove_owned_path(&record.backup)?;
+    } else {
+        // A missing prepared backup permits deleting only the sidecar, never
+        // anything that appears at the chosen basename, even after this check.
+        match std::fs::symlink_metadata(&record.backup) {
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+            Ok(_) => require_owned_backup(&current)?,
+        }
+    }
     backup_probe("cleanup-backup-sync")?;
     fsync_parent_dir(&record.backup)?;
+    backup_probe("cleanup-sidecar")?;
+    std::fs::remove_file(&record.sidecar)?;
+    backup_probe("cleanup-sidecar-sync")?;
+    fsync_parent_dir(&record.sidecar)?;
+    Ok(())
+}
+
+/// Validate and retire a vacated backup's sidecar without touching its old
+/// basename: that path became vacant at rename/removal and may have been reused.
+fn retire_vacated_backup_record(record: &BackupRecord) -> Result<()> {
+    let parent = record.sidecar.parent().context("sidecar has no parent")?;
+    let backup_parent = record.backup.parent().context("backup has no parent")?;
+    let backup_name = record
+        .backup
+        .file_name()
+        .context("backup has no basename")?;
+    anyhow::ensure!(
+        parent == backup_parent && valid_backup_name(backup_name),
+        "recovery record paths changed"
+    );
+    let expected_sidecar = format!("{backup_name}.json");
+    anyhow::ensure!(
+        record.sidecar.file_name() == Some(expected_sidecar.as_str()),
+        "recovery record paths changed"
+    );
+    let metadata = std::fs::symlink_metadata(&record.sidecar)?;
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "recovery sidecar is not a regular file"
+    );
+    let bytes = files::read_nofollow_bounded(&record.sidecar, Some(BACKUP_RECORD_LIMIT))?;
+    let current: BackupMetadata = serde_json::from_slice(&bytes)?;
+    anyhow::ensure!(
+        current.schema == 2
+            && current.backup == backup_name
+            && policy::is_safe_path_component(&current.id)
+            && current.id == record.id
+            && current.phase == record.phase
+            && matches!(
+                current.phase,
+                BackupPhase::Restoring | BackupPhase::Cleaning
+            ),
+        "recovery ownership changed; retained for inspection"
+    );
+
     backup_probe("cleanup-sidecar")?;
     std::fs::remove_file(&record.sidecar)?;
     backup_probe("cleanup-sidecar-sync")?;
@@ -1084,12 +1270,26 @@ fn restore_backup(
     target: &Utf8Path,
     limits: &service::PackageLimits,
 ) -> Result<()> {
-    verify_backup_identity(&record.backup, &record.id, limits)?;
+    let mut current = current_backup_record(record)?;
+    require_owned_backup(&current)?;
+    verify_backup_identity(&current.backup, &current.id, limits)?;
+    backup_probe("restoring-write")?;
+    persist_backup_phase(&mut current, BackupPhase::Restoring)?;
+    // Probes model interruptions, not a syscall's known no-move result. Never
+    // revert the phase after a probe or after a successful rename.
     backup_probe("restore-rename")?;
-    rename_no_replace(&record.backup, target)?;
+    if let Err(error) = rename_no_replace(&current.backup, target) {
+        // A target conflict is a definite no-move result on both supported
+        // rename paths. Other errors (notably I/O) remain ambiguous.
+        if error.kind() == ErrorKind::AlreadyExists {
+            persist_backup_phase(&mut current, BackupPhase::Owned)
+                .context("restore did not move backup but failed to persist ownership")?;
+        }
+        return Err(error).context("failed to rename recovery backup");
+    }
     backup_probe("restore-sync")?;
     fsync_parent_dir(target)?;
-    remove_backup_record(record)
+    retire_vacated_backup_record(&current)
 }
 
 /// Restore exactly one unambiguous owned, inventory-verified package.
@@ -1110,8 +1310,15 @@ pub(crate) fn recover_interrupted_backup(
     ensure_safe_install_id(id)?;
     let mut candidates = Vec::new();
     for record in backup_records_for(parent, id)? {
+        if matches!(record.phase, BackupPhase::Restoring | BackupPhase::Cleaning) {
+            // Even an absent backup cannot resolve a missing target.
+            require_owned_backup(&record)?;
+        }
         match std::fs::symlink_metadata(&record.backup) {
-            Ok(_) => candidates.push(record),
+            Ok(_) => {
+                require_owned_backup(&record)?;
+                candidates.push(record);
+            }
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => return Err(error).context("failed to inspect recovery backup"),
         }

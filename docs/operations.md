@@ -613,11 +613,13 @@ can leave earlier standalone dependencies installed, but never commits the
 parent after a failed dependency.
 
 Before moving an existing target, replacement creates and flushes an external
-`.install-backup-<nonce>.json` ownership record beside the planned
+`.install-backup-<nonce>.json` preparation record beside the planned
 `.install-backup-<nonce>` directory. No recovery metadata is written inside a
 package (and inventory verification has no recovery-file exemptions).
-An interruption after the backup rename therefore leaves an owned recovery
-copy. Installs attempt recovery before sweeping: a missing target is restored
+Only after the backup rename and parent sync succeed does the live commit
+atomically persist ownership in that sidecar. An interruption before that
+update leaves an ambiguous copy retained for inspection, not automatic recovery.
+Installs attempt recovery before sweeping: a missing target is restored
 only from one unambiguous, inventory-verified backup with a matching manifest
 ID. Multiple candidates refuse recovery with an inspection error; never choose
 the newest by timestamp. See [Install backup maintenance](#install-backup-maintenance)
@@ -957,23 +959,69 @@ request/parser buffers and is not a total process RSS limit.
 ## Install backup maintenance
 
 Recovery records are external sibling files, not package contents. The bounded
-(4096-byte), typed JSON record contains `schema: 1`, a safe single-component
-`id`, and the exact `backup` basename. It is created exclusively without
-following an existing symlink; all bytes are written and the file is synced,
-then its parent is synced where supported, **before** moving the old target.
-A crash before that move can leave an orphan sidecar with no backup directory.
+(4096-byte), typed JSON record contains `schema: 2`, a safe single-component
+`id`, the exact `backup` basename, and `phase` (`prepared`, `owned`, `restoring`,
+or `cleaning`). It is created exclusively without following an existing symlink;
+all bytes and the file are synced, then its parent is synced where supported,
+**before** moving the old target.
+After the no-replace move, the parent is synced before the live commit
+atomically replaces and syncs the sidecar with `phase: "owned"` (including a
+parent sync). A crash before the move can leave an orphan prepared sidecar
+with no backup directory.
+
+A prepared sidecar proves intent only. If its backup basename exists, retry,
+recovery, sweep and uninstall retain the directory and record: they cannot
+know whether the no-replace move succeeded or an unrelated directory arrived
+first. Even a valid package with the expected ID does not resolve ownership.
+This includes crashes immediately after successful rename, backup-parent-sync
+failures, and interruptions before the ownership update. A missing target is
+not automatically restored in this ambiguous state; inspect and validate the
+copies, then explicitly move the intended package/records to resolve it. Never
+promote a prepared record to owned merely because a directory exists.
 
 Recovery, sweep, commit and uninstall share ownership parsing and ordered
-cleanup. Only regular sidecars with supported schema, safe ID and matching
-basename own a real backup directory (or an absent backup during pre-rename /
-cleanup interruption). Malformed, oversized, symlinked, unsafe or mismatched
-records, symlinked backup trees, unmarked backups and legacy in-package
-`.backup.json` markers are unknown: retain them for operator inspection, never
-adopt or age-delete them. Legacy markers are not migrated.
+cleanup. Only regular `owned` sidecars with supported schema, safe ID and
+matching basename own a real backup directory. Malformed, oversized, symlinked,
+unsafe or mismatched records; unmarked backups; schema-1 intent-only sidecars;
+legacy in-package `.backup.json` markers; and symlinked backup paths outside a
+restoring/cleaning record are unknown and retained for operator inspection,
+never adopted or age-deleted. Legacy markers are not migrated.
 
 For a missing target, recovery requires exactly one owned backup directory,
-validates its SBOM/inventory-aware contract and manifest ID, then renames it
-back without replacement. It syncs the parent before removing the sidecar.
+validates its SBOM/inventory-aware contract and manifest ID, then atomically
+persists and syncs `phase: "restoring"` **before** renaming it back without
+replacement. It syncs the parent before retiring only the restoring sidecar;
+this successful live path never accesses the now-vacant backup basename.
+A definite no-move target-conflict error from the rename permits the live
+process to persist `owned` again. Other rename errors, sync failures and
+interruptions (including just before the restore rename) retain ambiguity.
+
+A restoring record never authorizes deletion or restoration of anything at
+its backup basename. If that path exists (even as a valid matching package,
+symlink or non-directory), retry, sweep and uninstall retain it and the record.
+If the target is missing, retain the record for inspection even if the backup
+is also absent. Only an absent backup path plus an inventory-verified current
+target and successful parent sync permit retry/sweep/uninstall to retire the
+sidecar alone. This prevents a directory planted after the restore rename
+from being mistaken for the old recovery package. Resolve an interrupted
+pre-rename restore explicitly after inspecting the original package; never
+promote a restoring record merely because its backup still exists.
+
+Owned cleanup probes pre-mutation failures first, then atomically persists and
+syncs `phase: "cleaning"` **before** removing the backup. It syncs the parent,
+removes the sidecar and syncs the parent again. A crash/error after removal can
+therefore never leave an owned record authorizing deletion of a directory
+planted at the vacant basename. A cleaning record, like a restoring record,
+never authorizes deletion or restoration of an occupied basename, including
+non-directories and symlinks: retry, sweep and uninstall retain both path and
+record. Only an absent backup path, inventory-verified current target and
+successful parent sync permit retiring the sidecar alone. If the target is
+missing, retain the record even when the backup is also absent. An interruption
+before backup removal (or a partial/failed removal) leaves ambiguity requiring
+operator inspection; never promote a cleaning record merely because its backup
+still exists. This addresses persisted-phase interruption gaps, not general
+path replacement by a same-user process bypassing CLI locks.
+
 Invalid packages or multiple candidates produce an actionable error and remain
 untouched. Resolve ambiguity by inspecting and explicitly moving conflicting
 records/copies out of the generator parent; do not automatically select the
@@ -985,14 +1033,18 @@ followed by a parent-sync failure is **not** rolled back over the possibly
 published target: its backup and sidecar remain. Before a further replacement,
 old owned records must be cleaned only after the current target verifies and
 its parent sync succeeds; otherwise replacement refuses with cleanup pending.
-This also handles orphan sidecars. An orphan with no verified target needs
-operator inspection; it cannot authorize deletion or restoration by itself.
+This also handles orphan sidecars with no backup directory. A prepared,
+restoring or cleaning record can authorize removing only that sidecar, never a
+directory at its basename.
+An orphan with no verified target needs operator inspection; it cannot
+authorize deletion or restoration by itself.
 
 The stale sweep has a one-hour sidecar age gate, but age alone never authorizes
 removal: a verified current target and successful parent sync are required.
-Cleanup removes the backup first, syncs the parent, removes the sidecar, then
-syncs the parent again. Failures are reported and retryable; no recovery backup
-is owned by a delete-on-drop guard. Successful uninstall performs this cleanup
+Cleanup durably relinquishes ownership as cleaning before removing the backup,
+then syncs the parent, removes the sidecar and syncs the parent again. Failures
+are reported; retry retires a cleaning sidecar only under the absence and
+verification rules above. No recovery backup is owned by a delete-on-drop guard. Successful uninstall performs this cleanup
 under its exclusive-global/per-ID locks **before** removing the target, so
 later maintenance cannot resurrect it from owned records. Unknown data remains.
 Maintenance takes global-process → global-file → shard → per-ID locks in that
