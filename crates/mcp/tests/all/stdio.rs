@@ -167,3 +167,60 @@ async fn stdio_close_reaps_child_process() {
         .expect("closing a stdio child should be bounded");
     close_result.expect("stdio child process should be reaped on close");
 }
+
+#[cfg(unix)]
+#[allow(dead_code)]
+#[path = "../../../container/test_support/mod.rs"]
+mod daemon_policy_test_support;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn frozen_daemon_policy_reaches_normal_container_session_close() {
+    let Some(daemon) = daemon_policy_test_support::Daemon::isolated(
+        "stdio::frozen_daemon_policy_reaches_normal_container_session_close",
+    ) else {
+        return;
+    };
+    std::fs::write(daemon.root.join("server"), TEST_SERVER).unwrap();
+    let argv = vec!["mcp-server".to_string()];
+    let runtime = McpRuntime::from_specs(vec![spec("container", argv.clone())])
+        .unwrap()
+        .with_container_timeouts(policy::ContainerTimeouts::from_seconds([1; 4]).unwrap());
+    for docker in [false, true] {
+        daemon.mode("hang-stop");
+        let access = McpAccess {
+            network_hosts: BTreeSet::new(),
+            workspace: daemon.root.clone(),
+            commands: vec![McpCommandAccess {
+                argv: argv.clone(),
+                isolation: mcp::McpCommandIsolation::Container,
+                runtime: Some(if docker {
+                    mcp::McpContainerRuntime::Docker
+                } else {
+                    mcp::McpContainerRuntime::Incus
+                }),
+                image: Some(format!(
+                    "{}@sha256:{}",
+                    if docker { "alpine" } else { "images:alpine" },
+                    "a".repeat(64)
+                )),
+            }],
+        };
+        let session = runtime
+            .connect("container", &access, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(session.list_tools().await.unwrap()[0].name, "echo");
+        let start = std::time::Instant::now();
+        session.close().await.unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(4),
+            "close ignored captured stop timeout"
+        );
+        assert!(
+            daemon
+                .log()
+                .contains(if docker { "rm -f test-id" } else { "delete -f" })
+        );
+    }
+}

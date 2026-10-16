@@ -19,10 +19,12 @@ pub(crate) struct ReplayRequest {
     pub(crate) answers: BTreeMap<String, Value>,
     pub(crate) confirmations: BTreeMap<String, bool>,
     pub(crate) json_output: bool,
-    pub(crate) providers_path: Option<Utf8PathBuf>,
 }
 
-pub(crate) async fn replay_run(request: ReplayRequest) -> Result<()> {
+pub(crate) async fn replay_run(
+    request: ReplayRequest,
+    deployment: crate::CliDeployment,
+) -> Result<()> {
     let ReplayRequest {
         runs_dir,
         id,
@@ -32,7 +34,6 @@ pub(crate) async fn replay_run(request: ReplayRequest) -> Result<()> {
         answers,
         confirmations,
         json_output,
-        providers_path,
     } = request;
     let original_dir = resolve_run_dir(&runs_dir, &id)?;
     let inputs = read_run_inputs(&original_dir)?;
@@ -55,8 +56,7 @@ pub(crate) async fn replay_run(request: ReplayRequest) -> Result<()> {
             runs_dir.join(format!("{id}-replay-{timestamp}"))
         }
     };
-    let service =
-        crate::local_cli_service(Utf8PathBuf::new(), runs_dir.to_path_buf(), providers_path)?;
+    let service = crate::local_cli_service(Utf8PathBuf::new(), runs_dir.to_path_buf(), deployment)?;
     let replay_manifest = service
         .run_generator_path(DirectRun {
             generator_path: generator_path.clone(),

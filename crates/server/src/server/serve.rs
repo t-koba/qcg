@@ -90,6 +90,7 @@ pub async fn serve_with_resolved_policy(
 /// no occupied port, no lock, and no recovery behind (E04).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedServerPolicy {
+    pub container_timeouts: policy::ContainerTimeouts,
     pub read_cache_max_bytes: usize,
     pub idempotency_ttl: std::time::Duration,
     pub idempotency_max_entries: usize,
@@ -153,6 +154,14 @@ fn reject_zero_explicit_max(config: &ServerConfig) -> Result<(), String> {
 }
 
 pub fn resolve_server_policy(config: &ServerConfig) -> Result<ResolvedServerPolicy, String> {
+    resolve_server_policy_with_container_timeouts(config, policy::ContainerTimeouts::from_env()?)
+}
+
+/// Resolve server policy with the daemon bundle already frozen by CLI startup.
+pub fn resolve_server_policy_with_container_timeouts(
+    config: &ServerConfig,
+    container_timeouts: policy::ContainerTimeouts,
+) -> Result<ResolvedServerPolicy, String> {
     let idempotency_ttl = super::idempotency::effective_idempotency_ttl()
         .map_err(|detail| format!("invalid idempotency configuration: {detail}"))?;
     let idempotency_max_entries = super::idempotency::effective_idempotency_max_entries()
@@ -335,6 +344,7 @@ pub fn resolve_server_policy(config: &ServerConfig) -> Result<ResolvedServerPoli
         return Err("api_token must not be empty when set".into());
     }
     Ok(ResolvedServerPolicy {
+        container_timeouts,
         metrics_policy,
         read_cache_max_bytes,
         idempotency_ttl,
@@ -412,6 +422,7 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
     // explicit environment overrides (3.2). Invalid knobs refuse to boot
     // instead of degrading silently.
     let ResolvedServerPolicy {
+        container_timeouts,
         metrics_policy,
         read_cache_max_bytes,
         idempotency_ttl,
@@ -478,6 +489,7 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
         config.max_tracked_runs,
         config.run_store_mode,
         service::ServiceDeploymentPolicy {
+            container_timeouts,
             read_cache_max_bytes,
             max_total_steps,
             preemption_enabled,
@@ -1999,6 +2011,60 @@ command = ["sh", "-c", "sleep 30"]"#,
             max_asset_bytes: None,
             max_total_steps: None,
         }
+    }
+
+    #[tokio::test]
+    async fn container_timeout_env_is_resolved_once_and_fail_closed() {
+        if crate::tests::isolate_environment_test(
+            "server::serve::tests::container_timeout_env_is_resolved_once_and_fail_closed",
+        ) {
+            return;
+        }
+        let _env_guard = BOOT_ENV_GUARD.lock().await;
+        let root = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!("container-policy-{}", uuid::Uuid::now_v7()));
+        let config = boot_config(&root.join("generators"), &root.join("runs"));
+        // SAFETY: this test runs alone in a subprocess under the boot guard.
+        unsafe {
+            for name in policy::ContainerTimeouts::ENV_NAMES {
+                std::env::remove_var(name);
+            }
+        }
+        assert_eq!(
+            resolve_server_policy(&config).unwrap().container_timeouts,
+            policy::ContainerTimeouts::default()
+        );
+        // SAFETY: same isolated subprocess as above.
+        unsafe {
+            for (index, name) in policy::ContainerTimeouts::ENV_NAMES.iter().enumerate() {
+                std::env::set_var(name, (index + 1).to_string());
+            }
+        }
+        let frozen = resolve_server_policy(&config).unwrap();
+        assert_eq!(
+            frozen.container_timeouts,
+            policy::ContainerTimeouts::from_seconds([1, 2, 3, 4]).unwrap()
+        );
+        for name in policy::ContainerTimeouts::ENV_NAMES {
+            for value in ["bad", "0", "3601", "18446744073709551616"] {
+                // SAFETY: same isolated subprocess as above.
+                unsafe {
+                    std::env::set_var(name, value);
+                }
+                let error = resolve_server_policy(&config).unwrap_err();
+                assert!(error.contains(name), "{error}");
+                assert_eq!(
+                    frozen.container_timeouts,
+                    policy::ContainerTimeouts::from_seconds([1, 2, 3, 4]).unwrap()
+                );
+            }
+            // SAFETY: same isolated subprocess as above.
+            unsafe {
+                std::env::remove_var(name);
+            }
+        }
+        assert!(!root.exists(), "resolution must precede filesystem work");
     }
 
     #[tokio::test]

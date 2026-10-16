@@ -267,6 +267,24 @@ use of the same output directory.
   graceful shutdown phases. Settle must be at least drain; out-of-range values
   refuse boot. Total shutdown time is the sum of the configured drain and
   settle phases (180 s by default; at most 7200 s).
+- `CONTAINER_CREATE_TIMEOUT_SECS` (default `600`),
+  `CONTAINER_START_TIMEOUT_SECS` (default `120`),
+  `CONTAINER_ADMIN_TIMEOUT_SECS` (default `60`), and
+  `CONTAINER_STOP_TIMEOUT_SECS` (default `30`): host container-daemon
+  operation budgets in seconds, each in `1..=3600`. Unset selects the default;
+  malformed, zero, overflowing, or out-of-range values refuse server startup
+  before bind and CLI execution. The CLI resolves the bundle for `run` except
+  `--plan`, `eval`, `runs replay/fork`, and `serve`/`dev`. `models` and the
+  non-executing `runs invalidate`, `runs delete`, and `runs export` commands do
+  not consume daemon policy; service construction uses defaults. Unrelated
+  commands such as `new` are unaffected. All execution paths receive one
+  frozen deployment bundle for engine/MCP execution and cleanup. Create covers
+  managed create/init, start covers start/readiness, admin
+  covers discovery/configuration, and stop covers cleanup stop/kill/delete/rm.
+  Docker keeps one-shot `run` and its independent workload timeout; stop only
+  bounds cleanup. These are not generator, MCP profile, or per-run settings.
+  Probe cadence and server shutdown budgets are unchanged. See
+  [operations](operations.md#container-daemon-operation-policy).
 - `MAX_PARALLEL_STEPS`: deployment cap on parallel wave scheduling.
   Unset uses the CPU count; `0` and invalid values refuse boot.
 - `READ_CACHE_MAX_BYTES` (default `67108864`): maximum retained run read-view

@@ -1850,3 +1850,106 @@ async fn denied_confirmation_settles_failed_without_executing_side_effect() {
         "a denied side effect must never execute"
     );
 }
+
+#[cfg(unix)]
+#[allow(dead_code)]
+#[path = "../../../container/test_support/mod.rs"]
+mod daemon_policy_test_support;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn service_daemon_policy_reaches_direct_and_scheduled_engines() {
+    let Some(daemon) = daemon_policy_test_support::Daemon::isolated(
+        "tests::execution::service_daemon_policy_reaches_direct_and_scheduled_engines",
+    ) else {
+        return;
+    };
+    let root = Utf8PathBuf::from_path_buf(daemon.root.clone()).unwrap();
+    let generator = root.join("daemon-test");
+    std::fs::create_dir_all(&generator).unwrap();
+    std::fs::write(
+        generator.join(contract::MANIFEST_FILE),
+        format!(
+            r#"
+[generator]
+id = "daemon-test"
+name = "Daemon policy test"
+version = "0.1.0"
+[[flow]]
+id = "work"
+type = "command"
+[flow.params]
+command = ["echo"]
+[permissions]
+fs_read = []
+fs_write = ["workspace"]
+network = []
+side_effects = "allowed"
+side_effects_scope = "invocation"
+[[permissions.commands]]
+bin = "echo"
+args = []
+purpose = "daemon policy regression"
+isolation = "container"
+image = "images:alpine@sha256:{0}"
+[permissions.containers]
+enabled = true
+runtime = "incus"
+images = ["images:alpine@sha256:{0}"]
+"#,
+            "a".repeat(64)
+        ),
+    )
+    .unwrap();
+    let service = LocalService::with_generator_roots_policy_and_store_mode(
+        vec![root.clone()],
+        root.join("runs"),
+        None,
+        1,
+        DEFAULT_MAX_TRACKED_RUNS,
+        RunStoreMode::Exclusive,
+        ServiceDeploymentPolicy {
+            container_timeouts: policy::ContainerTimeouts::from_seconds([1; 4]).unwrap(),
+            ..ServiceDeploymentPolicy::default()
+        },
+    )
+    .unwrap();
+    daemon.mode("hang-admin");
+    let start = std::time::Instant::now();
+    let error = service
+        .run_generator_path(DirectRun {
+            generator_path: generator,
+            output_dir: root.join("direct"),
+            inputs: BTreeMap::new(),
+            json_events: false,
+            interactive: false,
+            answers: BTreeMap::new(),
+            confirmations: BTreeMap::new(),
+            llm_seed_override: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("discover-pool"), "{error}");
+    assert!(start.elapsed() < std::time::Duration::from_secs(4));
+    assert!(daemon.log().contains("delete -f"));
+
+    daemon.mode("hang-admin");
+    let start = std::time::Instant::now();
+    let id = service
+        .start_run(StartRun {
+            generator_id: "daemon-test".into(),
+            inputs: BTreeMap::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let terminal = wait_for_terminal_snapshot(&service, &id).await;
+    assert_eq!(terminal.state, RunStatus::Failed);
+    assert!(start.elapsed() < std::time::Duration::from_secs(4));
+    assert!(
+        read_journal_string(&service, id)
+            .await
+            .contains("discover-pool")
+    );
+    assert!(daemon.log().contains("delete -f"));
+}

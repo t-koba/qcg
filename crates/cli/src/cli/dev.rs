@@ -107,6 +107,7 @@ pub(crate) async fn run_dev(
     port: u16,
     watch_interval_ms: u64,
     eval_generator: Option<String>,
+    container_timeouts: policy::ContainerTimeouts,
 ) -> Result<()> {
     if watch_interval_ms == 0 {
         anyhow::bail!("watch interval must be greater than zero");
@@ -116,7 +117,10 @@ pub(crate) async fn run_dev(
         EvalTarget::new(
             &generators_dir,
             &config.runs_dir,
-            config.providers_path.clone(),
+            crate::CliDeployment {
+                providers_path: config.providers_path.clone(),
+                container_timeouts,
+            },
             generator_id,
         )
     });
@@ -138,7 +142,7 @@ pub(crate) async fn run_dev(
         Duration::from_millis(watch_interval_ms),
         eval_target,
     ));
-    crate::serve_with_config(config, &bind, port).await
+    crate::serve_with_config(config, &bind, port, container_timeouts).await
 }
 
 async fn watch_generators(
@@ -171,14 +175,14 @@ struct EvalTarget {
     generator: Utf8PathBuf,
     suite: Utf8PathBuf,
     runs_dir: Utf8PathBuf,
-    providers_path: Option<Utf8PathBuf>,
+    deployment: crate::CliDeployment,
 }
 
 impl EvalTarget {
     fn new(
         generators_dir: &Utf8Path,
         runs_dir: &Utf8Path,
-        providers_path: Option<Utf8PathBuf>,
+        deployment: crate::CliDeployment,
         generator_id: String,
     ) -> Self {
         let generator = generators_dir.join(&generator_id);
@@ -187,7 +191,7 @@ impl EvalTarget {
             generator,
             suite,
             runs_dir: runs_dir.join(EVAL_RUNS_DIR),
-            providers_path,
+            deployment,
         }
     }
 }
@@ -200,7 +204,7 @@ async fn run_dev_eval(target: &EvalTarget) {
         &target.suite,
         Utf8Path::new(EVAL_OUTPUT_ROOT),
         target.runs_dir.clone(),
-        target.providers_path.clone(),
+        target.deployment.clone(),
         None,
         false,
     )

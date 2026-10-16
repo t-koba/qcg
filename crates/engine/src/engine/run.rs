@@ -99,6 +99,7 @@ fn startup_sweep(
 impl Engine {
     pub fn new(registry: StepRegistry) -> Self {
         Self {
+            container_timeouts: policy::ContainerTimeouts::default(),
             registry,
             snapshot_source: None,
         }
@@ -106,6 +107,11 @@ impl Engine {
 
     /// Serve other runs' states to `await` nodes. The service sets this;
     /// direct runs leave it empty.
+    pub fn with_container_timeouts(mut self, timeouts: policy::ContainerTimeouts) -> Self {
+        self.container_timeouts = timeouts;
+        self
+    }
+
     pub fn with_snapshot_source(mut self, snapshot_source: Arc<dyn RunSnapshotSource>) -> Self {
         self.snapshot_source = Some(snapshot_source);
         self
@@ -583,6 +589,7 @@ impl Engine {
             // small config struct with zero behavioral gain.
             fs: FsGateway::new(workspace.clone(), &contract.manifest.permissions),
             cmd: CmdGateway::new(contract.manifest.permissions.clone(), workspace.clone())
+                .with_container_timeouts(self.container_timeouts)
                 .with_bounds(CommandBounds {
                     timeout_seconds: contract.manifest.runtime.command_timeout_seconds,
                     input_limit_bytes: contract.manifest.runtime.command_input_limit_bytes,

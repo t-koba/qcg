@@ -37,6 +37,8 @@ pub enum SharedRecoveryStatus {
 /// never be half-applied by a racing setter during recovery.
 #[derive(Debug, Clone, Copy)]
 pub struct ServiceDeploymentPolicy {
+    /// Frozen host daemon budgets, separate from workload/run policy.
+    pub container_timeouts: policy::ContainerTimeouts,
     /// Maximum retained read-view memory charge. Zero disables retention.
     pub read_cache_max_bytes: usize,
     pub max_total_steps: Option<usize>,
@@ -73,6 +75,7 @@ pub struct ServiceDeploymentPolicy {
 impl Default for ServiceDeploymentPolicy {
     fn default() -> Self {
         Self {
+            container_timeouts: policy::ContainerTimeouts::default(),
             read_cache_max_bytes: policy::DEFAULT_READ_CACHE_BYTES,
             max_total_steps: None,
             preemption_enabled: true,

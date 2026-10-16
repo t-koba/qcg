@@ -41,6 +41,91 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_daemon_policy_reaches_provision_and_failed_connection_cleanup() {
+        let Some(daemon) = crate::daemon_policy_test_support::Daemon::isolated(
+            "tests::mcp_daemon_policy_reaches_provision_and_failed_connection_cleanup",
+        ) else {
+            return;
+        };
+        let mut spec = remote_spec();
+        spec.id = "daemon-test".into();
+        spec.transport = McpTransport::Stdio;
+        spec.auth = McpAuth::None;
+        spec.url = None;
+        spec.command = vec!["mcp-server".into()];
+        spec.allowed_hosts.clear();
+        spec.timeout_seconds = 3;
+        let timeouts = policy::ContainerTimeouts::from_seconds([1; 4]).unwrap();
+        let runtime = McpRuntime::from_specs(vec![spec.clone()])
+            .unwrap()
+            .with_container_timeouts(timeouts);
+        let mut access = McpAccess {
+            network_hosts: BTreeSet::new(),
+            commands: vec![McpCommandAccess {
+                argv: spec.command.clone(),
+                isolation: McpCommandIsolation::Container,
+                image: Some(format!("images:alpine@sha256:{}", "a".repeat(64))),
+                runtime: Some(McpContainerRuntime::Incus),
+            }],
+            workspace: daemon.root.clone(),
+        };
+        for (mode, stage) in [
+            ("hang-admin", "discover-pool"),
+            ("hang-init", "init"),
+            ("hang-start", "start"),
+            ("hang-probe", "wait-ready"),
+        ] {
+            daemon.mode(mode);
+            let start = std::time::Instant::now();
+            let error = runtime
+                .connect(
+                    "daemon-test",
+                    &access,
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await
+                .err()
+                .expect("daemon stage should time out");
+            assert!(error.to_string().contains(stage), "{mode}: {error}");
+            assert!(start.elapsed() < Duration::from_secs(4));
+            assert!(daemon.log().contains("delete -f"));
+        }
+        // The fake workload exits without an MCP handshake. Its live session
+        // guard must retain the same stop policy after provisioning succeeds.
+        for docker in [false, true] {
+            if docker {
+                access.commands[0].runtime = Some(McpContainerRuntime::Docker);
+                access.commands[0].image = Some(format!("alpine@sha256:{}", "a".repeat(64)));
+            }
+            daemon.mode("hang-stop");
+            let start = std::time::Instant::now();
+            assert!(
+                runtime
+                    .connect(
+                        "daemon-test",
+                        &access,
+                        tokio_util::sync::CancellationToken::new()
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                container::await_outstanding_cleanups(Duration::from_secs(4))
+                    .await
+                    .outstanding,
+                0
+            );
+            assert!(start.elapsed() < Duration::from_secs(4));
+            let log = daemon.log();
+            assert!(
+                log.contains(if docker { "rm -f test-id" } else { "delete -f" }),
+                "{log}"
+            );
+        }
+    }
+
     #[test]
     fn transport_limits_have_no_hard_ceiling() {
         let mut timeout = remote_spec();
@@ -489,3 +574,8 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+#[allow(dead_code)]
+#[path = "../../container/test_support/mod.rs"]
+mod daemon_policy_test_support;

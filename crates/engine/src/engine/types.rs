@@ -289,6 +289,7 @@ pub struct RunRefMaterial {
 
 #[derive(Clone)]
 pub struct Engine {
+    pub(crate) container_timeouts: policy::ContainerTimeouts,
     pub(crate) registry: StepRegistry,
     pub(crate) snapshot_source: Option<Arc<dyn RunSnapshotSource>>,
 }

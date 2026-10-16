@@ -165,7 +165,7 @@ pub(crate) async fn run_eval(
     suite_path: &Utf8Path,
     output_root: &Utf8Path,
     runs_dir: Utf8PathBuf,
-    providers_path: Option<Utf8PathBuf>,
+    deployment: crate::CliDeployment,
     baseline_path: Option<&Utf8Path>,
     json_output: bool,
 ) -> Result<EvalReport> {
@@ -178,7 +178,7 @@ pub(crate) async fn run_eval(
     let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.fZ").to_string();
     let eval_root = output_root.join(&suite.name).join(timestamp);
     std::fs::create_dir_all(&eval_root)?;
-    let service = crate::local_cli_service(Utf8PathBuf::new(), runs_dir, providers_path)?;
+    let service = crate::local_cli_service(Utf8PathBuf::new(), runs_dir, deployment)?;
     let mut reports = Vec::with_capacity(suite.cases.len() * suite.repetitions);
     for repetition in 0..suite.repetitions {
         for (index, case) in suite.cases.iter().enumerate() {

@@ -66,6 +66,53 @@ otherwise does not apply across processes. A periodic resumer retries queued
 runs that lost their engine task; queue admission time and position are
 visible on run snapshots while queued.
 
+## Container daemon operation policy
+
+Container daemon budgets are deployment policy, shared by engine command
+execution and container-isolated MCP sessions. Configure them only through
+these startup environment variables (seconds):
+
+| Variable | Default | Applies to |
+| --- | ---: | --- |
+| `CONTAINER_CREATE_TIMEOUT_SECS` | 600 | Managed instance create/init |
+| `CONTAINER_START_TIMEOUT_SECS` | 120 | Managed start and readiness (each) |
+| `CONTAINER_ADMIN_TIMEOUT_SECS` | 60 | Daemon discovery and configuration (each command) |
+| `CONTAINER_STOP_TIMEOUT_SECS` | 30 | Cleanup stop/kill/delete/rm (each command) |
+
+Every value must be an integer in **1..=3600**; unset selects the documented
+operation default. Malformed (including empty or non-Unicode), zero,
+overflowing, and out-of-range values fail closed before server bind and before
+CLI execution starts. The CLI resolves the bundle for `run` except `--plan`,
+`eval`, `runs replay/fork`, and `serve`/`dev`. Non-executing operations such
+as `qcg models`, `qcg runs invalidate`, `qcg runs delete`, and
+`qcg runs export` do not validate or consume daemon policy; service construction
+uses defaults. Unrelated commands such as `qcg new` are unaffected.
+Startup resolves one frozen bundle and passes it through execution service,
+engine command gateways, and MCP runtimes. Operations never reread these
+variables; change them and restart to apply a new deployment policy.
+
+Every provision/session captures the bundle before daemon side effects,
+including partial provisions. Normal awaited teardown, synchronous teardown,
+detached Drop cleanup, and inline cleanup after thread-spawn failure use that
+same captured stop budget. A failed stop/kill still attempts delete/rm;
+a failed cleanup retains the existing reporting/retry semantics.
+
+If a timed-out daemon client must be killed, cleanup may spend up to an
+additional **100 ms per client** on local process reaping after the daemon
+operation deadline. Any direct client still unreaped is retained and reported
+as outstanding by the shutdown cleanup join; the process reaping allowance
+does not change the configured server shutdown wait budget. Descendants of a
+daemon client are outside local reaping ownership.
+
+These values do not belong in generator contracts, MCP profiles, per-run
+requests, or workload timeouts. Docker-compatible backends keep one-shot
+`run` with their existing workload timeout, not the managed create/start
+budgets; the stop budget applies only to cleanup. Readiness probes retain
+their 500 ms retry cadence, and the start budget also bounds a stuck probe.
+Server drain/settlement budgets are independent and unchanged: raising daemon
+budgets does not lengthen shutdown deadlines or guarantee cleanup finishes
+before those deadlines. Inspect reported cleanup failures/outstanding work.
+
 ## Search operation
 
 Web search is contract-level opt-in. A contract must declare a `web.search`

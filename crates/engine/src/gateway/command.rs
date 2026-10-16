@@ -25,6 +25,7 @@ pub struct CommandBounds {
 
 #[derive(Debug, Clone)]
 pub struct CmdGateway {
+    container_timeouts: policy::ContainerTimeouts,
     permissions: Permissions,
     bounds: CommandBounds,
     workspace: Utf8PathBuf,
@@ -50,6 +51,7 @@ pub struct CommandOutput {
 impl CmdGateway {
     pub fn new(permissions: Permissions, workspace: Utf8PathBuf) -> Self {
         Self {
+            container_timeouts: policy::ContainerTimeouts::default(),
             permissions,
             bounds: CommandBounds {
                 timeout_seconds: 30,
@@ -60,6 +62,11 @@ impl CmdGateway {
             extra_allowed_roots: Vec::new(),
             cancellation: CancellationToken::new(),
         }
+    }
+
+    pub fn with_container_timeouts(mut self, timeouts: policy::ContainerTimeouts) -> Self {
+        self.container_timeouts = timeouts;
+        self
     }
 
     pub fn with_bounds(mut self, bounds: CommandBounds) -> Self {
@@ -216,6 +223,7 @@ impl CmdGateway {
                     stdin_pipe: spec.stdin.is_some(),
                 });
                 let session = container::Session {
+                    timeouts: self.container_timeouts,
                     backend: backend.clone(),
                     id: container::InstanceId::CidFile(cidfile),
                 };
@@ -251,6 +259,7 @@ impl CmdGateway {
                 let provisioned = provision(
                     &managed,
                     &Provision {
+                        timeouts: self.container_timeouts,
                         image: spec.image,
                         mounts: &mounts,
                         id_prefix: "container",
@@ -729,5 +738,107 @@ mod tests {
                 .expect("argv serializes"),
         );
         assert_ne!(first, other_run, "cross-run digests must diverge");
+    }
+}
+
+#[cfg(all(test, unix))]
+#[allow(dead_code)]
+#[path = "../../../container/test_support/mod.rs"]
+mod daemon_policy_test_support;
+
+#[cfg(all(test, unix))]
+mod daemon_policy_tests {
+    use super::daemon_policy_test_support::Daemon;
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn gateway_daemon_policy_is_frozen_and_not_a_workload_limit() {
+        let Some(daemon) = Daemon::isolated(
+            "gateway::command::daemon_policy_tests::gateway_daemon_policy_is_frozen_and_not_a_workload_limit",
+        ) else {
+            return;
+        };
+        let mut permissions = Permissions::default();
+        permissions.containers.runtime = Some(contract::ContainerRuntime::Incus);
+        let gateway = CmdGateway::new(
+            permissions,
+            Utf8PathBuf::from_path_buf(daemon.root.clone()).unwrap(),
+        )
+        .with_container_timeouts(policy::ContainerTimeouts::from_seconds([1; 4]).unwrap());
+        let image = format!("images:alpine@sha256:{}", "a".repeat(64));
+        let argv = vec!["echo".to_string()];
+        for (mode, stage) in [
+            ("hang-admin", "discover-pool"),
+            ("hang-init", "init"),
+            ("hang-start", "start"),
+            ("hang-probe", "wait-ready"),
+        ] {
+            daemon.mode(mode);
+            let start = std::time::Instant::now();
+            let error = gateway
+                .run_container_workload(
+                    ContainerWorkload {
+                        image: &image,
+                        mounts: &[],
+                        workdir: None,
+                        workload_argv: &argv,
+                        stdin: None,
+                    },
+                    10,
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(stage), "{mode}: {error}");
+            assert!(start.elapsed() < Duration::from_secs(4), "{mode}");
+            assert!(daemon.log().contains("delete -f"));
+        }
+        daemon.mode("hang-stop");
+        let start = std::time::Instant::now();
+        gateway
+            .run_container_workload(
+                ContainerWorkload {
+                    image: &image,
+                    mounts: &[],
+                    workdir: None,
+                    workload_argv: &argv,
+                    stdin: None,
+                },
+                10,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(start.elapsed() < Duration::from_secs(4));
+        assert!(daemon.log().contains("delete -f"));
+
+        let mut permissions = Permissions::default();
+        permissions.containers.runtime = Some(contract::ContainerRuntime::Docker);
+        let docker = CmdGateway::new(permissions, gateway.workspace.clone())
+            .with_container_timeouts(gateway.container_timeouts);
+        daemon.mode("docker-workload");
+        let start = std::time::Instant::now();
+        docker
+            .run_container_workload(
+                ContainerWorkload {
+                    image: &format!("alpine@sha256:{}", "a".repeat(64)),
+                    mounts: &[],
+                    workdir: None,
+                    workload_argv: &argv,
+                    stdin: None,
+                },
+                5,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(start.elapsed() >= Duration::from_secs(2));
+        let log = daemon.log();
+        assert!(log.contains("run --rm"), "{log}");
+        assert!(
+            log.contains("kill test-id") && log.contains("rm -f test-id"),
+            "{log}"
+        );
     }
 }

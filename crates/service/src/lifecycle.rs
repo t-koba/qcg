@@ -163,7 +163,10 @@ impl LocalService {
             max_tracked_runs,
             policy.max_directory_scan_entries,
         )?;
-        let llm_runtime = crate::run_dirs::load_llm_runtime(providers_path.as_deref())?;
+        let llm_runtime = crate::run_dirs::load_llm_runtime_with_container_timeouts(
+            providers_path.as_deref(),
+            policy.container_timeouts,
+        )?;
         Ok(Self {
             inner: Arc::new(LocalServiceInner {
                 read_store: Arc::new(crate::read_store::ReadStore::new(
@@ -1622,11 +1625,11 @@ impl LocalService {
                         return;
                     }
                 };
-                let engine = Engine::new(app_registry(Arc::clone(&runtime))).with_snapshot_source(
-                    Arc::new(ServiceSnapshotSource {
+                let engine = Engine::new(app_registry(Arc::clone(&runtime)))
+                    .with_container_timeouts(self.inner.deployment_policy.container_timeouts)
+                    .with_snapshot_source(Arc::new(ServiceSnapshotSource {
                         service: service.clone(),
-                    }),
-                );
+                    }));
                 let run_refs = match crate::run_refs::load_or_resolve_run_refs(
                     &service.inner.runs_dir,
                     &contract,
@@ -1899,6 +1902,7 @@ impl LocalService {
         );
         let json_events = matches!(mode, DirectEventMode::None) && run.json_events;
         let manifest = Engine::new(app_registry(Arc::clone(&runtime)))
+            .with_container_timeouts(self.inner.deployment_policy.container_timeouts)
             .with_snapshot_source(Arc::new(ServiceSnapshotSource {
                 service: self.clone(),
             }))

@@ -2407,13 +2407,20 @@ pub(crate) fn app_registry(runtime: Arc<llm::LlmRuntime>) -> engine::StepRegistr
 pub fn load_llm_runtime(
     providers_path: Option<&Utf8Path>,
 ) -> Result<Arc<llm::LlmRuntime>, ServiceError> {
-    match llm::LlmRouter::load_optional(providers_path) {
-        Ok(Some(router)) => Ok(Arc::new(router.into_runtime())),
-        // No registry was found: built-in capabilities stay available
-        // while other ids receive setup guidance during validation.
-        Ok(None) => Ok(Arc::new(llm::LlmRuntime::builtins())),
-        Err(error) => Err(ServiceError::Invalid(error.to_string())),
-    }
+    load_llm_runtime_with_container_timeouts(providers_path, policy::ContainerTimeouts::default())
+}
+
+pub(crate) fn load_llm_runtime_with_container_timeouts(
+    providers_path: Option<&Utf8Path>,
+    timeouts: policy::ContainerTimeouts,
+) -> Result<Arc<llm::LlmRuntime>, ServiceError> {
+    let mut runtime = match llm::LlmRouter::load_optional(providers_path) {
+        Ok(Some(router)) => router.into_runtime(),
+        Ok(None) => llm::LlmRuntime::builtins(),
+        Err(error) => return Err(ServiceError::Invalid(error.to_string())),
+    };
+    runtime.mcp = runtime.mcp.with_container_timeouts(timeouts);
+    Ok(Arc::new(runtime))
 }
 
 /// Assembles the full application step registry, resolving the LLM runtime

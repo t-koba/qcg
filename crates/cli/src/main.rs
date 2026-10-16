@@ -30,24 +30,52 @@ use service::app_registry_with_providers as app_registry;
 // 8 MiB stack so behaviour is identical on every platform.
 const MAIN_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
 
+/// Frozen startup deployment inputs shared by local execution consumers.
+#[derive(Clone)]
+pub(crate) struct CliDeployment {
+    providers_path: Option<Utf8PathBuf>,
+    container_timeouts: policy::ContainerTimeouts,
+}
+
+impl CliDeployment {
+    fn from_env(providers_path: Option<Utf8PathBuf>) -> Result<Self> {
+        let container_timeouts =
+            policy::ContainerTimeouts::from_env().map_err(anyhow::Error::msg)?;
+        Ok(Self {
+            providers_path,
+            container_timeouts,
+        })
+    }
+
+    fn defaults(providers_path: Option<Utf8PathBuf>) -> Self {
+        Self {
+            providers_path,
+            container_timeouts: policy::ContainerTimeouts::default(),
+        }
+    }
+}
+
 /// CLI-owned service construction (E04): every CLI command builds the
 /// service through the policy constructor with explicit CLI defaults.
 /// No production path may use the test-only `LocalService::new`.
 pub(crate) fn local_cli_service(
     generators_dir: Utf8PathBuf,
     runs_dir: Utf8PathBuf,
-    providers_path: Option<Utf8PathBuf>,
+    deployment: CliDeployment,
 ) -> Result<LocalService> {
     Ok(LocalService::with_generator_roots_policy_and_store_mode(
         vec![generators_dir],
         runs_dir,
-        providers_path,
+        deployment.providers_path,
         policy::DEFAULT_MAX_ACTIVE_RUNS,
         policy::DEFAULT_MAX_TRACKED_RUNS,
         service::RunStoreMode::Exclusive,
-        service::ServiceDeploymentPolicy::default()
-            .with_scheduling_env()
-            .map_err(anyhow::Error::msg)?,
+        service::ServiceDeploymentPolicy {
+            container_timeouts: deployment.container_timeouts,
+            ..service::ServiceDeploymentPolicy::default()
+        }
+        .with_scheduling_env()
+        .map_err(anyhow::Error::msg)?,
     )?)
 }
 
@@ -58,8 +86,9 @@ pub(crate) async fn serve_with_config(
     config: server::ServerConfig,
     bind: &str,
     port: u16,
+    container_timeouts: policy::ContainerTimeouts,
 ) -> Result<()> {
-    let policy = server::resolve_server_policy(&config)
+    let policy = server::resolve_server_policy_with_container_timeouts(&config, container_timeouts)
         .map_err(|detail| anyhow::anyhow!("invalid server configuration: {detail}"))?;
     let addr: std::net::SocketAddr = format!("{bind}:{port}").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -177,7 +206,8 @@ async fn run_async() -> Result<std::process::ExitCode> {
                 return Ok(std::process::ExitCode::SUCCESS);
             }
             let runs_dir = Utf8PathBuf::from(".data/runs");
-            let service = local_cli_service(Utf8PathBuf::new(), runs_dir.clone(), providers_path)?;
+            let deployment = CliDeployment::from_env(providers_path.clone())?;
+            let service = local_cli_service(Utf8PathBuf::new(), runs_dir.clone(), deployment)?;
             auto_gc_runs(&runs_dir)?;
             let run = DirectRun {
                 generator_path: generator,
@@ -207,12 +237,13 @@ async fn run_async() -> Result<std::process::ExitCode> {
             baseline,
             json,
         } => {
+            let deployment = CliDeployment::from_env(providers_path.clone())?;
             run_eval(
                 generator,
                 &suite,
                 &output,
                 runs_dir,
-                providers_path,
+                deployment.clone(),
                 baseline.as_deref(),
                 json,
             )
@@ -260,10 +291,11 @@ async fn run_async() -> Result<std::process::ExitCode> {
             }
         }
         Command::Models { refresh, json } => {
+            let deployment = CliDeployment::defaults(providers_path.clone());
             let service = local_cli_service(
                 Utf8PathBuf::new(),
                 Utf8PathBuf::from(".data/runs"),
-                providers_path.clone(),
+                deployment,
             )?;
             let catalog = service.llm_catalog(refresh).await?;
             if json {
@@ -318,17 +350,20 @@ async fn run_async() -> Result<std::process::ExitCode> {
                 confirmations_file,
                 json,
             } => {
-                replay_run(ReplayRequest {
-                    runs_dir: runs_dir.clone(),
-                    id: id.clone(),
-                    generator: generator.clone(),
-                    output: output.clone(),
-                    reuse_seed,
-                    answers: load_answers(answers)?,
-                    confirmations: load_confirmations(confirms, confirmations_file)?,
-                    json_output: json,
-                    providers_path: providers_path.clone(),
-                })
+                let deployment = CliDeployment::from_env(providers_path.clone())?;
+                replay_run(
+                    ReplayRequest {
+                        runs_dir: runs_dir.clone(),
+                        id: id.clone(),
+                        generator: generator.clone(),
+                        output: output.clone(),
+                        reuse_seed,
+                        answers: load_answers(answers)?,
+                        confirmations: load_confirmations(confirms, confirmations_file)?,
+                        json_output: json,
+                    },
+                    deployment,
+                )
                 .await?
             }
             RunsCommand::Fork {
@@ -348,7 +383,8 @@ async fn run_async() -> Result<std::process::ExitCode> {
                     }
                     None => ForkStatePatch::default(),
                 };
-                let service = local_cli_service(Utf8PathBuf::new(), runs_dir, providers_path)?;
+                let deployment = CliDeployment::from_env(providers_path.clone())?;
+                let service = local_cli_service(Utf8PathBuf::new(), runs_dir, deployment)?;
                 let fork_id = service
                     .fork_run(
                         &id,
@@ -396,7 +432,8 @@ async fn run_async() -> Result<std::process::ExitCode> {
                 actor_label,
                 json,
             } => {
-                let service = local_cli_service(Utf8PathBuf::new(), runs_dir, providers_path)?;
+                let deployment = CliDeployment::defaults(providers_path.clone());
+                let service = local_cli_service(Utf8PathBuf::new(), runs_dir, deployment)?;
                 let record = service
                     .invalidate_run(
                         &id,
@@ -416,7 +453,8 @@ async fn run_async() -> Result<std::process::ExitCode> {
                 }
             }
             RunsCommand::Delete { id, runs_dir, json } => {
-                let service = local_cli_service(Utf8PathBuf::new(), runs_dir, providers_path)?;
+                let deployment = CliDeployment::defaults(providers_path.clone());
+                let service = local_cli_service(Utf8PathBuf::new(), runs_dir, deployment)?;
                 service.delete_run(&id).await?;
                 if json {
                     println!(
@@ -434,7 +472,8 @@ async fn run_async() -> Result<std::process::ExitCode> {
                 runs_dir,
                 output,
             } => {
-                let service = local_cli_service(Utf8PathBuf::new(), runs_dir, providers_path)?;
+                let deployment = CliDeployment::defaults(providers_path.clone());
+                let service = local_cli_service(Utf8PathBuf::new(), runs_dir, deployment)?;
                 let parts = service.run_bundle_parts(&id).await?;
                 let output =
                     output.unwrap_or_else(|| Utf8PathBuf::from(format!("{id}-bundle.zip")));
@@ -614,6 +653,8 @@ async fn run_async() -> Result<std::process::ExitCode> {
             max_artifact_entries,
             max_asset_bytes,
         } => {
+            let container_timeouts =
+                policy::ContainerTimeouts::from_env().map_err(anyhow::Error::msg)?;
             let api_token = resolve_api_token(api_token)?;
             let config = server::ServerConfig {
                 providers_path,
@@ -634,7 +675,7 @@ async fn run_async() -> Result<std::process::ExitCode> {
                 max_artifact_entries,
                 max_asset_bytes,
             };
-            serve_with_config(config, &bind, port).await?;
+            serve_with_config(config, &bind, port, container_timeouts).await?;
         }
         Command::Dev {
             bind,
@@ -645,6 +686,8 @@ async fn run_async() -> Result<std::process::ExitCode> {
             watch_interval_ms,
             eval,
         } => {
+            let container_timeouts =
+                policy::ContainerTimeouts::from_env().map_err(anyhow::Error::msg)?;
             let config = server::ServerConfig {
                 providers_path,
                 extra_generators_dirs: bundled_generators_root()
@@ -664,7 +707,15 @@ async fn run_async() -> Result<std::process::ExitCode> {
                 max_artifact_entries: None,
                 max_asset_bytes: None,
             };
-            cli::dev::run_dev(config, bind, port, watch_interval_ms, eval).await?;
+            cli::dev::run_dev(
+                config,
+                bind,
+                port,
+                watch_interval_ms,
+                eval,
+                container_timeouts,
+            )
+            .await?;
         }
     }
     Ok(std::process::ExitCode::SUCCESS)

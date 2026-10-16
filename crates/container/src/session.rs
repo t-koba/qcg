@@ -6,6 +6,7 @@
 //! dropped by an outer timeout or abort.
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -15,13 +16,6 @@ use super::backend::Backend;
 use super::error::ContainerError;
 use super::plans::{self, Mount};
 
-/// Bounds for daemon operations. Image downloads on first create dominate,
-/// so creation gets the largest budget; every bound surfaces explicitly
-/// instead of hanging.
-pub const CREATE_TIMEOUT: Duration = Duration::from_secs(600);
-pub const START_TIMEOUT: Duration = Duration::from_secs(120);
-pub const ADMIN_TIMEOUT: Duration = Duration::from_secs(60);
-pub const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 pub const PROBE_INTERVAL: Duration = Duration::from_millis(500);
 
 /// How a live instance is addressed during cleanup.
@@ -36,6 +30,8 @@ pub enum InstanceId {
 /// A live container handle owned until [`teardown`] runs.
 #[derive(Debug, Clone)]
 pub struct Session {
+    /// Deployment bundle captured before any daemon side effect.
+    pub timeouts: policy::ContainerTimeouts,
     pub backend: Backend,
     pub id: InstanceId,
 }
@@ -75,8 +71,9 @@ static OUTSTANDING_CLEANUPS: AtomicUsize = AtomicUsize::new(0);
 /// ones.
 static CLEANUP_FAILURES: AtomicUsize = AtomicUsize::new(0);
 
-/// Outcome of awaiting detached cleanups at shutdown. `outstanding`
-/// instances may still exist; `failed` cleanups need operator attention.
+/// Outcome of awaiting detached cleanups and retained client reaps at
+/// shutdown. `outstanding` means instances may still exist or local clients
+/// remain unreaped; `failed` cleanups need operator attention.
 /// Both are cumulative observations, never a proof of a clean stop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CleanupWaitOutcome {
@@ -91,14 +88,15 @@ pub fn record_cleanup_failure() {
     CLEANUP_FAILURES.fetch_add(1, Ordering::AcqRel);
 }
 
-/// Waits until Drop-spawned cleanups finish, up to `timeout`. Returns
-/// what is still outstanding plus the observed failure count so shutdown
-/// reports unrecovered instances instead of claiming a clean stop. Logs
+/// Waits until Drop-spawned cleanups and retained local client reaps finish,
+/// up to `timeout`. Returns what is still outstanding plus the observed
+/// failure count so shutdown reports unrecovered instances instead of claiming
+/// a clean stop. Logs
 /// the remainder instead of wedging shutdown forever.
 pub async fn await_outstanding_cleanups(timeout: Duration) -> CleanupWaitOutcome {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        let remaining = OUTSTANDING_CLEANUPS.load(Ordering::Acquire);
+        let remaining = OUTSTANDING_CLEANUPS.load(Ordering::Acquire) + reap_pending_children();
         if remaining == 0 {
             return CleanupWaitOutcome {
                 outstanding: 0,
@@ -124,24 +122,39 @@ pub async fn await_outstanding_cleanups(timeout: Duration) -> CleanupWaitOutcome
 /// an unspawnable thread falls back to inline teardown because blocking is
 /// preferable to orphaning the instance.
 fn spawn_detached_cleanup(session: Session, config_path: Option<PathBuf>) {
+    spawn_cleanup_with(session, config_path, |cleanup| {
+        std::thread::Builder::new()
+            .name("container-teardown".into())
+            .spawn(cleanup)
+            .is_ok()
+    });
+}
+
+fn spawn_cleanup_with(
+    session: Session,
+    config_path: Option<PathBuf>,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> bool,
+) {
     OUTSTANDING_CLEANUPS.fetch_add(1, Ordering::AcqRel);
     let thread_session = session.clone();
     let thread_config = config_path.clone();
-    let spawned = std::thread::Builder::new()
-        .name("container-teardown".into())
-        .spawn(move || {
-            if let Err(error) = teardown_sync(&thread_session) {
-                record_cleanup_failure();
-                tracing::warn!(%error, "detached container teardown failed");
-            }
-            if let Some(path) = &thread_config {
-                let _ = std::fs::remove_file(path);
-            }
-            OUTSTANDING_CLEANUPS.fetch_sub(1, Ordering::AcqRel);
-        })
-        .is_ok();
-    if !spawned {
+    let spawned = spawn(Box::new(move || {
+        if let Err(error) = teardown_sync(&thread_session) {
+            record_cleanup_failure();
+            tracing::warn!(%error, "detached container teardown failed");
+        }
+        if let Some(path) = &thread_config {
+            let _ = std::fs::remove_file(path);
+        }
         OUTSTANDING_CLEANUPS.fetch_sub(1, Ordering::AcqRel);
+    }));
+    if !spawned {
+        #[cfg(test)]
+        INLINE_CLEANUP_HOOK.with_borrow_mut(|hook| {
+            if let Some(hook) = hook.take() {
+                hook();
+            }
+        });
         if let Err(error) = teardown_sync(&session) {
             record_cleanup_failure();
             tracing::warn!(%error, "inline container teardown failed");
@@ -149,6 +162,7 @@ fn spawn_detached_cleanup(session: Session, config_path: Option<PathBuf>) {
         if let Some(path) = config_path {
             let _ = std::fs::remove_file(path);
         }
+        OUTSTANDING_CLEANUPS.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -171,6 +185,7 @@ impl Drop for SessionGuard {
 /// Teardown commands are idempotent, so cleaning a never-created instance
 /// is a harmless no-op.
 struct ProvisionGuard {
+    timeouts: policy::ContainerTimeouts,
     backend: Backend,
     name: String,
     config_path: Option<PathBuf>,
@@ -178,9 +193,15 @@ struct ProvisionGuard {
 }
 
 impl ProvisionGuard {
-    fn new(backend: &Backend, name: String, config_path: Option<PathBuf>) -> Self {
+    fn new(
+        backend: &Backend,
+        name: String,
+        config_path: Option<PathBuf>,
+        timeouts: policy::ContainerTimeouts,
+    ) -> Self {
         Self {
             backend: backend.clone(),
+            timeouts,
             name,
             config_path,
             committed: false,
@@ -207,6 +228,7 @@ impl Drop for ProvisionGuard {
         }
         let session = Session {
             backend: self.backend.clone(),
+            timeouts: self.timeouts,
             id: InstanceId::Name(self.name.clone()),
         };
         spawn_detached_cleanup(session, self.config_path.clone());
@@ -214,6 +236,8 @@ impl Drop for ProvisionGuard {
 }
 
 pub struct Provision<'a> {
+    /// Deployment bundle captured before any daemon side effect.
+    pub timeouts: policy::ContainerTimeouts,
     pub image: &'a str,
     pub mounts: &'a [Mount<'a>],
     /// Filename prefix for docker-family tracking files in the temp dir.
@@ -236,6 +260,7 @@ pub async fn provision(backend: &Backend, spec: &Provision<'_>) -> Result<Sessio
             ));
             Ok(Session {
                 backend: backend.clone(),
+                timeouts: spec.timeouts,
                 id: InstanceId::CidFile(cidfile),
             })
         }
@@ -253,8 +278,10 @@ async fn provision_incus(binary: &str, spec: &Provision<'_>) -> Result<Session, 
         },
         name.clone(),
         None,
+        spec.timeouts,
     );
     let cleanup = || Session {
+        timeouts: spec.timeouts,
         backend: Backend::Incus {
             binary: binary.to_string(),
         },
@@ -264,7 +291,7 @@ async fn provision_incus(binary: &str, spec: &Provision<'_>) -> Result<Session, 
         // Storage pool from the daemon's own default profile.
         let pool_output = run_admin(
             &plans::incus_pool_argv(binary),
-            ADMIN_TIMEOUT,
+            spec.timeouts.admin(),
             spec.cancel,
             &name,
             "discover-pool",
@@ -290,7 +317,7 @@ async fn provision_incus(binary: &str, spec: &Provision<'_>) -> Result<Session, 
         // local image fails closed and tells the operator to pre-pull it.
         run_admin(
             &plans::incus_init_argv(binary, &pool, fingerprint, &name),
-            CREATE_TIMEOUT,
+            spec.timeouts.create(),
             spec.cancel,
             &name,
             "init",
@@ -313,7 +340,7 @@ async fn provision_incus(binary: &str, spec: &Provision<'_>) -> Result<Session, 
                     mount.guest,
                     mount.readonly,
                 ),
-                ADMIN_TIMEOUT,
+                spec.timeouts.admin(),
                 spec.cancel,
                 &name,
                 "configure-mount",
@@ -322,7 +349,7 @@ async fn provision_incus(binary: &str, spec: &Provision<'_>) -> Result<Session, 
         }
         run_admin(
             &plans::incus_secure_argv(binary, &name),
-            ADMIN_TIMEOUT,
+            spec.timeouts.admin(),
             spec.cancel,
             &name,
             "configure-security",
@@ -330,7 +357,7 @@ async fn provision_incus(binary: &str, spec: &Provision<'_>) -> Result<Session, 
         .await?;
         run_admin(
             &plans::incus_start_argv(binary, &name),
-            START_TIMEOUT,
+            spec.timeouts.start(),
             spec.cancel,
             &name,
             "start",
@@ -338,7 +365,7 @@ async fn provision_incus(binary: &str, spec: &Provision<'_>) -> Result<Session, 
         .await?;
         wait_ready(
             &plans::incus_probe_argv(binary, &name),
-            START_TIMEOUT,
+            spec.timeouts.start(),
             spec.cancel,
             &name,
         )
@@ -419,18 +446,29 @@ pub async fn teardown(session: &Session) -> Result<(), ContainerError> {
         Session {
             backend: Backend::Docker { binary, .. },
             id: InstanceId::CidFile(cidfile),
+            ..
         } => {
             let Some(id) = read_cidfile(cidfile)? else {
                 let _ = std::fs::remove_file(cidfile);
                 return Ok(());
             };
-            if let Err(error) =
-                run_admin_timed(&[binary.as_str(), "kill", &id], STOP_TIMEOUT, &id, "kill").await
+            if let Err(error) = run_admin_timed(
+                &[binary.as_str(), "kill", &id],
+                session.timeouts.stop(),
+                &id,
+                "kill",
+            )
+            .await
             {
                 tracing::warn!(%error, instance = id.as_str(), "container kill failed; continuing to rm");
             }
-            match run_admin_timed(&[binary.as_str(), "rm", "-f", &id], STOP_TIMEOUT, &id, "rm")
-                .await
+            match run_admin_timed(
+                &[binary.as_str(), "rm", "-f", &id],
+                session.timeouts.stop(),
+                &id,
+                "rm",
+            )
+            .await
             {
                 Ok(()) | Err(ContainerError::InstanceAbsent { .. }) => {}
                 Err(error) => return Err(error),
@@ -443,10 +481,11 @@ pub async fn teardown(session: &Session) -> Result<(), ContainerError> {
         Session {
             backend: Backend::Incus { binary },
             id: InstanceId::Name(name),
+            ..
         } => {
             if let Err(error) = run_admin_timed_vec(
                 &plans::incus_stop_argv(binary, name),
-                STOP_TIMEOUT,
+                session.timeouts.stop(),
                 name,
                 "stop",
             )
@@ -456,7 +495,7 @@ pub async fn teardown(session: &Session) -> Result<(), ContainerError> {
             }
             match run_admin_timed_vec(
                 &plans::incus_delete_argv(binary, name),
-                STOP_TIMEOUT,
+                session.timeouts.stop(),
                 name,
                 "delete",
             )
@@ -484,18 +523,86 @@ fn is_daemon_absent_report(stderr: &str, instance: &str) -> bool {
     if lower.contains("file or directory") || lower.contains("socket") {
         return false;
     }
-    if !lower.contains(&instance.to_lowercase()) {
-        return false;
+    let instance = instance.to_lowercase();
+    // Keep the recognized daemon forms deliberately narrow: an absence
+    // phrase must identify this exact instance in the same line. In
+    // particular, a target name elsewhere in a multi-line diagnostic and
+    // an unrelated resource's "not found" are not proof of absence.
+    const FORMS: &[(&str, &str)] = &[
+        ("no such container", ""),
+        ("no such instance", ""),
+        ("instance", "not found"),
+        ("the instance", "not found"),
+        ("instance", "does not exist"),
+        ("the instance", "does not exist"),
+        ("could not find container", ""),
+    ];
+    lower.lines().any(|line| {
+        FORMS
+            .iter()
+            .any(|(prefix, suffix)| daemon_absence_line(line, prefix, suffix, &instance))
+    })
+}
+
+fn daemon_absence_line(line: &str, prefix: &str, suffix: &str, instance: &str) -> bool {
+    for (start, _) in line.match_indices(prefix) {
+        if start > 0
+            && line[..start]
+                .chars()
+                .next_back()
+                .is_some_and(is_instance_name_char)
+        {
+            continue;
+        }
+        let after_prefix = line[start + prefix.len()..].trim_start();
+        let after_prefix = after_prefix
+            .strip_prefix(':')
+            .unwrap_or(after_prefix)
+            .trim_start();
+        let Some(after_instance) = exact_instance_suffix(after_prefix, instance) else {
+            continue;
+        };
+        let rest = after_instance.trim_start();
+        if suffix.is_empty() {
+            if only_report_punctuation(rest) {
+                return true;
+            }
+        } else if let Some(rest) = rest.strip_prefix(suffix)
+            && rest
+                .chars()
+                .next()
+                .is_none_or(|ch| !ch.is_ascii_alphanumeric())
+            && only_report_punctuation(rest.trim_start())
+        {
+            return true;
+        }
     }
-    [
-        "no such",
-        "not found",
-        "does not exist",
-        "unknown instance",
-        "could not find",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
+    false
+}
+
+fn exact_instance_suffix<'a>(text: &'a str, instance: &str) -> Option<&'a str> {
+    if let Some(quote @ ('"' | '\'')) = text.chars().next() {
+        let quoted = &text[quote.len_utf8()..];
+        let end = quoted.find(quote)?;
+        if quoted[..end] == *instance {
+            return Some(&quoted[end + quote.len_utf8()..]);
+        }
+        return None;
+    }
+    let suffix = text.strip_prefix(instance)?;
+    if suffix.chars().next().is_some_and(is_instance_name_char) {
+        return None;
+    }
+    Some(suffix)
+}
+
+fn is_instance_name_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')
+}
+
+fn only_report_punctuation(text: &str) -> bool {
+    text.chars()
+        .all(|ch| ch.is_ascii_whitespace() || matches!(ch, '.' | ':' | ';' | ',' | '!'))
 }
 
 /// Blocking teardown for Drop paths. Bounded per command so a wedged daemon
@@ -507,6 +614,7 @@ pub fn teardown_sync(session: &Session) -> Result<(), ContainerError> {
         Session {
             backend: Backend::Docker { binary, .. },
             id: InstanceId::CidFile(cidfile),
+            ..
         } => {
             let Some(id) = read_cidfile(cidfile)? else {
                 let _ = std::fs::remove_file(cidfile);
@@ -516,7 +624,9 @@ pub fn teardown_sync(session: &Session) -> Result<(), ContainerError> {
                 (vec!["kill", id.as_str()], "kill"),
                 (vec!["rm", "-f", id.as_str()], "rm"),
             ] {
-                if let Err(error) = run_sync_bounded(binary, &args, STOP_TIMEOUT, &id, stage) {
+                if let Err(error) =
+                    run_sync_bounded(binary, &args, session.timeouts.stop(), &id, stage)
+                {
                     if stage == "rm" && matches!(error, ContainerError::InstanceAbsent { .. }) {
                         continue;
                     }
@@ -533,6 +643,7 @@ pub fn teardown_sync(session: &Session) -> Result<(), ContainerError> {
         Session {
             backend: Backend::Incus { binary },
             id: InstanceId::Name(name),
+            ..
         } => {
             for (argv, stage) in [
                 (plans::incus_stop_argv(binary, name), "stop"),
@@ -542,7 +653,9 @@ pub fn teardown_sync(session: &Session) -> Result<(), ContainerError> {
                     continue;
                 };
                 let args: Vec<&str> = args.iter().map(String::as_str).collect();
-                if let Err(error) = run_sync_bounded(bin, &args, STOP_TIMEOUT, name, stage) {
+                if let Err(error) =
+                    run_sync_bounded(bin, &args, session.timeouts.stop(), name, stage)
+                {
                     if matches!(error, ContainerError::InstanceAbsent { .. }) {
                         continue;
                     }
@@ -571,6 +684,9 @@ async fn run_admin(
     instance: &str,
     stage: &'static str,
 ) -> Result<AdminOutput, ContainerError> {
+    use tokio::io::AsyncReadExt as _;
+
+    reap_pending_children();
     let (bin, args) = argv
         .split_first()
         .ok_or_else(|| ContainerError::StageFailed {
@@ -594,14 +710,30 @@ async fn run_admin(
         command.env("HOME", home);
     }
     command.kill_on_drop(true);
-    let child = command.spawn()?;
-    // Dropping the wait future kills the child through kill_on_drop, so the
-    // cancel and timeout branches need no explicit kill.
+    let mut child = AsyncChild::new(command.spawn()?);
+    let mut stdout = child.child.as_mut().unwrap().stdout.take().unwrap();
+    let mut stderr = child.child.as_mut().unwrap().stderr.take().unwrap();
+    // Keep ownership outside the cancelable completion future. Both pipes
+    // must drain concurrently with wait, just as with wait_with_output.
+    let completion = async {
+        let mut stdout_bytes = Vec::new();
+        let mut stderr_bytes = Vec::new();
+        let (status, _, _) = tokio::try_join!(
+            child.wait(),
+            stdout.read_to_end(&mut stdout_bytes),
+            stderr.read_to_end(&mut stderr_bytes),
+        )?;
+        Ok::<_, std::io::Error>(std::process::Output {
+            status,
+            stdout: stdout_bytes,
+            stderr: stderr_bytes,
+        })
+    };
     let output = tokio::select! {
         _ = cancel.cancelled() => {
             return Err(ContainerError::Canceled);
         }
-        output = tokio::time::timeout(timeout, child.wait_with_output()) => {
+        output = tokio::time::timeout(timeout, completion) => {
             match output {
                 Ok(Ok(output)) => output,
                 Ok(Err(error)) => return Err(ContainerError::Io(error)),
@@ -653,6 +785,7 @@ async fn run_admin_timed(
     instance: &str,
     stage: &'static str,
 ) -> Result<(), ContainerError> {
+    reap_pending_children();
     let Some((bin, args)) = cmd.split_first() else {
         return Err(ContainerError::StageFailed {
             stage,
@@ -670,20 +803,25 @@ async fn run_admin_timed(
     if let Ok(path) = std::env::var("PATH") {
         command.env("PATH", path);
     }
+    if let Ok(home) = std::env::var("HOME") {
+        command.env("HOME", home);
+    }
     command.kill_on_drop(true);
-    let mut child = command
+    let child = command
         .spawn()
         .map_err(|error| ContainerError::StageFailed {
             stage,
             instance: instance.to_string(),
             detail: format!("teardown command failed to spawn: {error}"),
         })?;
-    // wait_with_output would move the child, losing the timeout kill path,
-    // so take the piped stderr and drain it after the wait resolves.
-    let mut stderr = child.stderr.take();
-    let status = match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(Ok(status)) => status,
-        Ok(Err(error)) => {
+    let mut child = AsyncChild::new(child);
+    // Drain while waiting: even a healthy client can fill its stderr pipe.
+    // EOF is part of completion, since descendants can inherit that pipe.
+    let stderr = child.child.as_mut().unwrap().stderr.take();
+    let completion = async { tokio::join!(child.wait(), collect_teardown_stderr(stderr)) };
+    let (status, stderr) = match tokio::time::timeout(timeout, completion).await {
+        Ok((Ok(status), stderr)) => (status, stderr),
+        Ok((Err(error), _)) => {
             return Err(ContainerError::StageFailed {
                 stage,
                 instance: instance.to_string(),
@@ -691,12 +829,18 @@ async fn run_admin_timed(
             });
         }
         Err(_) => {
-            if let Err(error) = child.kill().await {
-                tracing::warn!(%error, instance = instance.to_string(), "timed-out teardown child kill failed");
+            // The daemon deadline has expired; the collector (and its pipe)
+            // is already dropped. Only local kill/reap work remains. Do not
+            // leave reaping to a runtime that sync cleanup is about to destroy.
+            if let Some(process) = child.child.as_mut() {
+                if let Err(error) = process.start_kill() {
+                    tracing::warn!(%error, instance, "timed-out teardown child kill failed");
+                }
+                let _ = tokio::time::timeout(POST_KILL_REAP_TIMEOUT, child.wait()).await;
             }
-            if let Err(error) = child.wait().await {
-                tracing::warn!(%error, instance = instance.to_string(), "timed-out teardown child wait failed");
-            }
+            // Any unreaped child is transferred by Drop, including if this
+            // post-kill wait is itself canceled. A reaped child waiting only
+            // for inherited stderr needs no further local cleanup.
             return Err(ContainerError::StageTimedOut {
                 stage,
                 instance: instance.to_string(),
@@ -705,18 +849,7 @@ async fn run_admin_timed(
         }
     };
     if !status.success() {
-        use tokio::io::AsyncReadExt as _;
-        let mut err_text = String::new();
-        if let Some(mut pipe) = stderr.take()
-            && let Err(error) = pipe.read_to_string(&mut err_text).await
-        {
-            tracing::warn!(%error, instance = instance.to_string(), "teardown stderr drain failed; detail continues without it");
-        }
-        // Only a daemon-confirmed absence report for this instance proves
-        // there is nothing to tear down. Spawn failures and timeouts took
-        // earlier returns, so reaching here means the daemon ran and
-        // refused: anything else is a real failure (C05).
-        if is_daemon_absent_report(&err_text, instance) {
+        if stderr.proves_absent(instance) {
             return Err(ContainerError::InstanceAbsent {
                 stage,
                 instance: instance.to_string(),
@@ -725,10 +858,74 @@ async fn run_admin_timed(
         return Err(ContainerError::StageFailed {
             stage,
             instance: instance.to_string(),
-            detail: format!("exit {status}: {}", stderr_tail(err_text.as_bytes())),
+            detail: format!("exit {status}: {}", stderr.detail()),
         });
     }
     Ok(())
+}
+
+// Diagnostic storage, not an output limit: continue draining beyond this
+// bound so a verbose daemon cannot deadlock on a full pipe. Truncated,
+// missing, invalid UTF-8 or partially read output is never absence proof;
+// in particular a discarded prefix might contain a client-side error.
+const TEARDOWN_STDERR_CAPACITY: usize = 16 * 1024;
+
+#[derive(Default)]
+struct TeardownStderr {
+    tail: Vec<u8>,
+    complete: bool,
+    truncated: bool,
+}
+
+impl TeardownStderr {
+    fn push(&mut self, bytes: &[u8]) {
+        let excess = (self.tail.len() + bytes.len()).saturating_sub(TEARDOWN_STDERR_CAPACITY);
+        if excess > 0 {
+            self.truncated = true;
+            self.tail.drain(..excess.min(self.tail.len()));
+        }
+        self.tail
+            .extend_from_slice(&bytes[bytes.len().saturating_sub(TEARDOWN_STDERR_CAPACITY)..]);
+    }
+
+    fn proves_absent(&self, instance: &str) -> bool {
+        self.complete
+            && !self.truncated
+            && std::str::from_utf8(&self.tail)
+                .is_ok_and(|text| is_daemon_absent_report(text, instance))
+    }
+
+    fn detail(&self) -> String {
+        let note = if !self.complete {
+            "[stderr missing or unreadable] "
+        } else if self.truncated {
+            "[stderr truncated] "
+        } else {
+            ""
+        };
+        format!("{note}{}", stderr_tail(&self.tail))
+    }
+}
+
+async fn collect_teardown_stderr(
+    pipe: Option<impl tokio::io::AsyncRead + Unpin>,
+) -> TeardownStderr {
+    use tokio::io::AsyncReadExt as _;
+    let mut captured = TeardownStderr::default();
+    let Some(mut pipe) = pipe else {
+        return captured;
+    };
+    let mut buffer = [0; 4096];
+    loop {
+        match pipe.read(&mut buffer).await {
+            Ok(0) => {
+                captured.complete = true;
+                return captured;
+            }
+            Ok(count) => captured.push(&buffer[..count]),
+            Err(_) => return captured,
+        }
+    }
 }
 
 /// Last 500 chars of daemon stderr for failure details. Operates on chars,
@@ -763,10 +960,18 @@ async fn wait_ready(
     cancel: &CancellationToken,
     instance: &str,
 ) -> Result<(), ContainerError> {
+    reap_pending_children();
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if cancel.is_cancelled() {
             return Err(ContainerError::Canceled);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ContainerError::StageTimedOut {
+                stage: "wait-ready",
+                instance: instance.to_string(),
+                timeout_secs: timeout.as_secs(),
+            });
         }
         let Some((bin, args)) = probe_argv.split_first() else {
             return Err(ContainerError::StageFailed {
@@ -789,29 +994,106 @@ async fn wait_ready(
             command.env("HOME", home);
         }
         command.kill_on_drop(true);
-        if let Ok(mut child) = command.spawn()
-            && let Ok(status) = child.wait().await
-            && status.success()
-        {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(ContainerError::StageTimedOut {
-                stage: "wait-ready",
-                instance: instance.to_string(),
-                timeout_secs: timeout.as_secs(),
-            });
+        if let Ok(child) = command.spawn() {
+            let mut child = AsyncChild::new(child);
+            let status = tokio::select! {
+                _ = cancel.cancelled() => return Err(ContainerError::Canceled),
+                status = tokio::time::timeout_at(deadline, child.wait()) => status,
+            };
+            if matches!(status, Ok(Ok(status)) if status.success()) {
+                return Ok(());
+            }
+            // Drop kills and retains an unreaped probe without awaiting OS
+            // cleanup past the global start deadline (or on wait failure).
         }
         tokio::select! {
             _ = cancel.cancelled() => return Err(ContainerError::Canceled),
-            _ = tokio::time::sleep(PROBE_INTERVAL) => {}
+            _ = tokio::time::sleep_until(
+                (tokio::time::Instant::now() + PROBE_INTERVAL).min(deadline)
+            ) => {}
         }
     }
 }
 
+// A killed client normally reaps immediately. Allow at most 100 ms of
+// local post-kill work per command, separate from the daemon operation
+// deadline. This never extends the configured shutdown wait budget. If the
+// OS cannot reap yet (e.g. uninterruptible I/O), retain explicit ownership
+// outside any temporary runtime; subsequent commands and the shutdown join
+// poll these handles with try_wait. This covers direct CLI children used for
+// provisioning, readiness and teardown, not their descendants. Cancellation
+// hands off immediately rather than extending a daemon deadline with a wait.
+// Pending reaps count as outstanding at shutdown, never as a clean stop. No
+// extra thread is needed, even under thread exhaustion.
+const POST_KILL_REAP_TIMEOUT: Duration = Duration::from_millis(100);
+const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(5);
+static PENDING_REAPS: Mutex<Vec<ReapChild>> = Mutex::new(Vec::new());
+
+/// Owns a direct CLI child across every await, including any bounded
+/// post-kill wait. Tokio's kill-on-drop alone can leave reaping dependent on
+/// a runtime that the caller is about to destroy. Transfer that ownership
+/// explicitly on cancellation or wait failure; only a successful wait disarms.
+struct AsyncChild {
+    child: Option<tokio::process::Child>,
+}
+
+impl AsyncChild {
+    fn new(child: tokio::process::Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.as_mut().unwrap().wait().await?;
+        self.child = None;
+        Ok(status)
+    }
+}
+
+impl Drop for AsyncChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            if let Err(error) = child.start_kill() {
+                tracing::warn!(%error, "unreaped CLI child kill failed");
+            }
+            retain_for_reaping(ReapChild::Async(child));
+        }
+    }
+}
+
+enum ReapChild {
+    Async(tokio::process::Child),
+    Sync(std::process::Child),
+}
+
+impl ReapChild {
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        match self {
+            Self::Async(child) => child.try_wait(),
+            Self::Sync(child) => child.try_wait(),
+        }
+    }
+}
+
+fn retain_for_reaping(child: ReapChild) {
+    tracing::warn!("killed CLI child not yet reaped; retaining for shutdown join");
+    PENDING_REAPS.lock().unwrap().push(child);
+}
+
+fn reap_pending_children() -> usize {
+    let mut pending = PENDING_REAPS.lock().unwrap();
+    pending.retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
+    pending.len()
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_TEARDOWN_WORKER_SPAWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static INLINE_CLEANUP_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Blocking bounded subprocess for Drop paths. A non-zero exit is a
 /// failure with the exit code attached; callers map "already absent" to
-/// success.
+/// success only when a complete stderr report proves it.
 fn run_sync_bounded(
     binary: &str,
     args: &[&str],
@@ -819,68 +1101,125 @@ fn run_sync_bounded(
     instance: &str,
     stage: &'static str,
 ) -> Result<(), ContainerError> {
-    use std::io::Read as _;
+    reap_pending_children();
+    // A blocking pipe reader cannot be canceled portably when a descendant
+    // inherits stderr. Reuse the async collector on a short-lived thread,
+    // permitting sync cleanup from inside an existing Tokio runtime too.
+    let failed = |detail: String| ContainerError::StageFailed {
+        stage,
+        instance: instance.to_string(),
+        detail,
+    };
+    std::thread::scope(|scope| {
+        let work = || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    tracing::warn!(%error, "teardown runtime unavailable; attempting command without stderr");
+                    return run_sync_without_stderr(binary, args, timeout, instance, stage);
+                }
+            };
+            let cmd: Vec<&str> = std::iter::once(binary)
+                .chain(args.iter().copied())
+                .collect();
+            runtime.block_on(run_admin_timed(&cmd, timeout, instance, stage))
+        };
+        #[cfg(test)]
+        let fail_spawn = FAIL_TEARDOWN_WORKER_SPAWN.get();
+        #[cfg(not(test))]
+        let fail_spawn = false;
+        let worker = if fail_spawn {
+            Err(std::io::Error::other(
+                "injected teardown worker spawn failure",
+            ))
+        } else {
+            std::thread::Builder::new()
+                .name("container-teardown-command".into())
+                .spawn_scoped(scope, work)
+        };
+        match worker {
+            Ok(worker) => worker
+                .join()
+                .map_err(|_| failed("teardown worker panicked".into()))?,
+            Err(error) => {
+                tracing::warn!(%error, "teardown worker unavailable; attempting command without stderr");
+                run_sync_without_stderr(binary, args, timeout, instance, stage)
+            }
+        }
+    })
+}
+
+/// Last resort when even the command worker cannot spawn. Null stderr
+/// cannot fill a pipe, needs no reader thread, and cannot prove absence.
+/// Exit zero still proves command success; all nonzero exits fail closed.
+fn run_sync_without_stderr(
+    binary: &str,
+    args: &[&str],
+    timeout: Duration,
+    instance: &str,
+    stage: &'static str,
+) -> Result<(), ContainerError> {
+    let failed = |detail: String| ContainerError::StageFailed {
+        stage,
+        instance: instance.to_string(),
+        detail,
+    };
     let mut command = std::process::Command::new(binary);
     command
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
         .env_clear();
     if let Ok(path) = std::env::var("PATH") {
         command.env("PATH", path);
     }
-    let Ok(mut child) = command.spawn() else {
-        return Err(ContainerError::StageFailed {
-            stage,
-            instance: instance.to_string(),
-            detail: "teardown command failed to spawn".into(),
-        });
-    };
-    let mut stderr = child.stderr.take();
+    if let Ok(home) = std::env::var("HOME") {
+        command.env("HOME", home);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| failed(format!("teardown command failed to spawn: {error}")))?;
     let deadline = std::time::Instant::now() + timeout;
     loop {
         match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
             Ok(Some(status)) => {
-                let mut err_text = String::new();
-                if let Some(mut pipe) = stderr.take() {
-                    let _ = pipe.read_to_string(&mut err_text);
-                }
-                if !status.success() {
-                    // Same proof rule as the async path: only the daemon
-                    // naming this instance absent counts (C05).
-                    if is_daemon_absent_report(&err_text, instance) {
-                        return Err(ContainerError::InstanceAbsent {
-                            stage,
-                            instance: instance.to_string(),
-                        });
-                    }
-                    return Err(ContainerError::StageFailed {
-                        stage,
-                        instance: instance.to_string(),
-                        detail: format!("exit {status}: {}", stderr_tail(err_text.as_bytes())),
-                    });
-                }
-                return Ok(());
+                return Err(failed(format!("exit {status}: [stderr unavailable]")));
             }
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(ContainerError::StageTimedOut {
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(
+                    CHILD_POLL_INTERVAL
+                        .min(deadline.saturating_duration_since(std::time::Instant::now())),
+                );
+            }
+            outcome => {
+                let result = match outcome {
+                    Err(error) => failed(format!("teardown wait failed: {error}")),
+                    _ => ContainerError::StageTimedOut {
                         stage,
                         instance: instance.to_string(),
                         timeout_secs: timeout.as_secs(),
-                    });
+                    },
+                };
+                if let Err(error) = child.kill() {
+                    tracing::warn!(%error, instance, "teardown child kill failed");
                 }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(error) => {
-                return Err(ContainerError::StageFailed {
-                    stage,
-                    instance: instance.to_string(),
-                    detail: format!("teardown wait failed: {error}"),
-                });
+                let reap_deadline = std::time::Instant::now() + POST_KILL_REAP_TIMEOUT;
+                loop {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        break;
+                    }
+                    if std::time::Instant::now() >= reap_deadline {
+                        retain_for_reaping(ReapChild::Sync(child));
+                        break;
+                    }
+                    std::thread::sleep(CHILD_POLL_INTERVAL);
+                }
+                return Err(result);
             }
         }
     }
@@ -889,6 +1228,42 @@ fn run_sync_bounded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stderr_proof_requires_complete_readable_untruncated_output() {
+        use tokio::io::AsyncReadExt as _;
+
+        struct Unreadable;
+        impl tokio::io::AsyncRead for Unreadable {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Err(std::io::Error::other("unreadable stderr")))
+            }
+        }
+
+        let report = b"no such instance owned-id";
+        let complete = collect_teardown_stderr(Some(&report[..])).await;
+        assert!(complete.proves_absent("owned-id"));
+        let partial = collect_teardown_stderr(Some((&report[..]).chain(Unreadable))).await;
+        assert!(!partial.complete);
+        assert!(!partial.proves_absent("owned-id"));
+        assert!(partial.detail().contains("unreadable"));
+        let missing = collect_teardown_stderr(None::<&[u8]>).await;
+        assert!(!missing.proves_absent("owned-id"));
+
+        let mut large = TeardownStderr::default();
+        large.push(&vec![b'x'; 2 * TEARDOWN_STDERR_CAPACITY]);
+        large.push(report);
+        large.complete = true;
+        assert_eq!(large.tail.len(), TEARDOWN_STDERR_CAPACITY);
+        assert!(large.truncated);
+        assert!(large.tail.ends_with(report));
+        assert!(!large.proves_absent("owned-id"));
+        assert!(large.detail().len() < 1024);
+    }
 
     fn bogus_docker_session(id_contents: &str) -> (tempfile_like::TempCid, Session) {
         tempfile_like::TempCid::create(id_contents)
@@ -915,6 +1290,7 @@ mod tests {
                     .join(format!(".test-cid-{}", uuid::Uuid::now_v7().as_simple()));
                 std::fs::write(&path, contents).expect("test cidfile should be written");
                 let session = Session {
+                    timeouts: policy::ContainerTimeouts::default(),
                     backend: Backend::Docker {
                         binary: "definitely-not-a-binary".into(),
                         runtime_flag: None,
@@ -1062,16 +1438,19 @@ mod tests {
         // nothing to tear down. Client-side failures (missing executable,
         // unreachable socket) and nameless reports stay failures so a
         // live instance is never declared gone.
-        for report in [
-            "Error: No such container: ctr-1",
-            "Error response from daemon: No such container: ctr-1",
-            "Error: Instance \"1\" not found",
-            "error: The instance ctr-1 does not exist",
-            "could not find container ctr-1",
+        for (report, instance) in [
+            ("Error: No such container: ctr-1", "ctr-1"),
+            (
+                "Error response from daemon: No such container: ctr-1",
+                "ctr-1",
+            ),
+            ("Error: Instance \"1\" not found", "1"),
+            ("error: The instance ctr-1 does not exist", "ctr-1"),
+            ("could not find container ctr-1", "ctr-1"),
         ] {
             assert!(
-                is_daemon_absent_report(report, "1"),
-                "{report} must read as absent"
+                is_daemon_absent_report(report, instance),
+                "{report} must read as absent for {instance}"
             );
         }
         for report in [
@@ -1086,6 +1465,10 @@ mod tests {
             "Error response from daemon: No such object",
             "Instance not found",
             "Error: No such container: ctr-2",
+            "No such container: ctr-10",
+            "No such instance: owned-identifier",
+            "Failed deleting instance owned-id: storage pool default not found",
+            "Failed deleting owned-id\nError: project default does not exist",
         ] {
             assert!(
                 !is_daemon_absent_report(report, "1"),
@@ -1104,6 +1487,7 @@ mod tests {
             },
             format!("test{}", uuid::Uuid::now_v7().as_simple()),
             None,
+            policy::ContainerTimeouts::default(),
         );
         drop(guard);
         tokio::time::timeout(
@@ -1144,3 +1528,153 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "../test_support/mod.rs"]
+mod daemon_policy_test_support;
+
+#[cfg(all(test, unix))]
+mod daemon_policy_tests {
+    use super::daemon_policy_test_support::Daemon;
+    use super::*;
+
+    #[tokio::test]
+    async fn captured_policy_reaches_every_cleanup_path() {
+        let Some(daemon) = Daemon::isolated(
+            "session::daemon_policy_tests::captured_policy_reaches_every_cleanup_path",
+        ) else {
+            return;
+        };
+        let timeouts = policy::ContainerTimeouts::from_seconds([1; 4]).unwrap();
+        for docker in [false, true] {
+            for path in ["async", "sync", "drop", "spawn-failure"] {
+                daemon.mode("hang-stop");
+                let id = if docker {
+                    let file = daemon.root.join("cid");
+                    std::fs::write(&file, "owned-id").unwrap();
+                    InstanceId::CidFile(file)
+                } else {
+                    InstanceId::Name("owned-name".into())
+                };
+                let session = Session {
+                    timeouts,
+                    backend: if docker {
+                        Backend::Docker {
+                            binary: "docker".into(),
+                            runtime_flag: None,
+                        }
+                    } else {
+                        Backend::Incus {
+                            binary: "incus".into(),
+                        }
+                    },
+                    id,
+                };
+                let started = std::time::Instant::now();
+                match path {
+                    "async" => teardown(&session).await.unwrap(),
+                    "sync" => teardown_sync(&session).unwrap(),
+                    "drop" => {
+                        drop(SessionGuard::new(session));
+                        assert_eq!(
+                            await_outstanding_cleanups(Duration::from_secs(4))
+                                .await
+                                .outstanding,
+                            0
+                        );
+                    }
+                    "spawn-failure" => spawn_cleanup_with(session, None, |_| false),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(4),
+                    "{path} ignored frozen stop timeout"
+                );
+                assert!(daemon.log().contains(if docker {
+                    "rm -f owned-id"
+                } else {
+                    "delete -f owned-name"
+                }));
+            }
+            daemon.mode("hang-delete");
+            let session = if docker {
+                let file = daemon.root.join("cid-delete");
+                std::fs::write(&file, "owned-id").unwrap();
+                Session {
+                    timeouts,
+                    backend: Backend::Docker {
+                        binary: "docker".into(),
+                        runtime_flag: None,
+                    },
+                    id: InstanceId::CidFile(file),
+                }
+            } else {
+                Session {
+                    timeouts,
+                    backend: Backend::Incus {
+                        binary: "incus".into(),
+                    },
+                    id: InstanceId::Name("owned-name".into()),
+                }
+            };
+            for sync in [false, true] {
+                let start = std::time::Instant::now();
+                let error = if sync {
+                    teardown_sync(&session)
+                } else {
+                    teardown(&session).await
+                }
+                .unwrap_err();
+                assert!(matches!(
+                    error,
+                    ContainerError::StageTimedOut {
+                        timeout_secs: 1,
+                        ..
+                    }
+                ));
+                assert!(start.elapsed() < Duration::from_secs(4));
+            }
+        }
+
+        // Provision keeps the complete bundle on successful transfer too.
+        daemon.mode("ok");
+        let cancel = CancellationToken::new();
+        let backend = Backend::Incus {
+            binary: "incus".into(),
+        };
+        let image = format!("images:alpine@sha256:{}", "a".repeat(64));
+        let spec = Provision {
+            timeouts,
+            image: &image,
+            mounts: &[],
+            id_prefix: "test",
+            cancel: &cancel,
+        };
+        let session = provision(&backend, &spec).await.unwrap();
+        assert_eq!(session.timeouts, timeouts);
+        teardown(&session).await.unwrap();
+
+        // Abort during init: ProvisionGuard must already own the stop policy.
+        daemon.mode("hang-init");
+        let mut pending = Box::pin(provision(&backend, &spec));
+        tokio::select! {
+            _ = &mut pending => panic!("init should still be running"),
+            _ = daemon.wait_for("init ") => {}
+        }
+        daemon.mode("hang-stop");
+        let start = std::time::Instant::now();
+        drop(pending);
+        assert_eq!(
+            await_outstanding_cleanups(Duration::from_secs(4))
+                .await
+                .outstanding,
+            0
+        );
+        assert!(start.elapsed() < Duration::from_secs(4));
+        assert!(daemon.log().contains("delete -f"));
+    }
+}
+
+#[cfg(all(test, unix))]
+#[path = "../test_support/cleanup_stderr.rs"]
+mod cleanup_stderr_tests;

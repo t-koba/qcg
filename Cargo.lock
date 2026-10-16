@@ -656,6 +656,7 @@ name = "container"
 version = "0.1.0"
 dependencies = [
  "contract",
+ "policy",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",

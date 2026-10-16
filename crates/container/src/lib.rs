@@ -21,9 +21,8 @@ pub use plans::{
     validate_image_for_backend,
 };
 pub use session::{
-    ADMIN_TIMEOUT, CREATE_TIMEOUT, CleanupWaitOutcome, InstanceId, PROBE_INTERVAL, Provision,
-    START_TIMEOUT, STOP_TIMEOUT, Session, SessionGuard, await_outstanding_cleanups, provision,
-    record_cleanup_failure, teardown, teardown_sync,
+    CleanupWaitOutcome, InstanceId, PROBE_INTERVAL, Provision, Session, SessionGuard,
+    await_outstanding_cleanups, provision, record_cleanup_failure, teardown, teardown_sync,
 };
 
 #[cfg(test)]

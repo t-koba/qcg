@@ -75,6 +75,7 @@ struct McpRuntimeInner {
 
 #[derive(Clone)]
 pub struct McpRuntime {
+    container_timeouts: policy::ContainerTimeouts,
     inner: Arc<McpRuntimeInner>,
 }
 
@@ -115,6 +116,11 @@ impl std::fmt::Debug for McpRuntime {
 }
 
 impl McpRuntime {
+    pub fn with_container_timeouts(mut self, timeouts: policy::ContainerTimeouts) -> Self {
+        self.container_timeouts = timeouts;
+        self
+    }
+
     pub fn unavailable() -> Self {
         Self::from_specs(Vec::new()).expect("empty MCP registry is valid")
     }
@@ -192,6 +198,7 @@ impl McpRuntime {
             lifecycle_gates.insert(id, Arc::new(Mutex::new(())));
         }
         Ok(Self {
+            container_timeouts: policy::ContainerTimeouts::default(),
             inner: Arc::new(McpRuntimeInner {
                 profiles,
                 #[cfg(feature = "mcp-oauth")]
@@ -836,6 +843,7 @@ impl McpRuntime {
                         // values themselves are set by the shared env block
                         // below, so they never appear in argv.
                         let session = container::Session {
+                            timeouts: self.container_timeouts,
                             backend: backend.clone(),
                             id: container::InstanceId::CidFile(cidfile),
                         };
@@ -850,6 +858,7 @@ impl McpRuntime {
                         let session = container::provision(
                             managed,
                             &container::Provision {
+                                timeouts: self.container_timeouts,
                                 image,
                                 mounts: &[mount],
                                 id_prefix: "mcp-container",

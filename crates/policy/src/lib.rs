@@ -3,7 +3,9 @@
 //! policy here and pass plain values down.
 
 pub mod audit;
+pub mod container;
 pub mod cost;
+pub use container::ContainerTimeouts;
 pub mod credential;
 pub mod destination_decider;
 pub mod limits;
