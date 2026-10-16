@@ -2,7 +2,7 @@ use super::super::types::ServiceError;
 use api::RunEvent;
 use camino::{Utf8Path, Utf8PathBuf};
 
-use super::runs::run_summary;
+use super::runs::run_summary_core_with_seq;
 use super::summary::run_meta_dir;
 
 pub(crate) fn run_identity_event<'a>(
@@ -95,7 +95,7 @@ pub(crate) fn gc_run_directories(
         if journal_metadata.len() == 0 {
             continue;
         }
-        let summary = match run_summary(&path) {
+        let (summary, _) = match run_summary_core_with_seq(&path) {
             Ok(summary) => summary,
             Err(error) => {
                 tracing::warn!(run_path = %path, %error, "skipping run with unreadable or corrupt journal during retention GC");
@@ -213,6 +213,39 @@ mod tests {
         assert!(
             runs.join("success").is_dir(),
             "the newest success run stays inside the global keep count"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn malformed_invalidation_does_not_block_retention_gc() {
+        let root = std::env::temp_dir().join(format!("gc-invalidation-{}", uuid::Uuid::now_v7()));
+        let runs = Utf8PathBuf::from_path_buf(root.clone()).expect("path should be UTF-8");
+        std::fs::create_dir_all(&runs).expect("runs dir should be created");
+        let run = runs.join("expired");
+        let started_at = (chrono::Utc::now() - chrono::Duration::minutes(30))
+            .to_rfc3339()
+            .replace("+00:00", "Z");
+        write_run(&run, "success", &started_at, Some(0));
+        std::fs::write(run_meta_dir(&run).join("invalidation.json"), "not-json")
+            .expect("malformed invalidation should be written");
+
+        assert!(
+            crate::summaries::runs::run_summary(&run).is_err(),
+            "normal run summaries fail closed for malformed invalidation sidecars"
+        );
+        let deleted = gc_run_directories(
+            &runs,
+            10,
+            10,
+            true,
+            policy::DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES,
+        )
+        .expect("retention gc should use the core summary projection");
+        assert_eq!(deleted, vec![run]);
+        assert!(
+            !runs.join("expired").exists(),
+            "expired run should be collected"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

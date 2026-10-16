@@ -33,7 +33,11 @@ pub fn run_summary_with_seq(run_dir: &Utf8Path) -> Result<(RunSummary, u64), Ser
     Ok((summary, seq))
 }
 
-fn run_summary_core_with_seq(run_dir: &Utf8Path) -> Result<(RunSummary, u64), ServiceError> {
+/// Journal-derived summary without auxiliary invalidation metadata, used by
+/// retention so a broken invalidation sidecar cannot change expiry behavior.
+pub(super) fn run_summary_core_with_seq(
+    run_dir: &Utf8Path,
+) -> Result<(RunSummary, u64), ServiceError> {
     let values = read_journal_events(run_dir)?;
     let state = engine::RunState::fold_values(&values)
         .map_err(|error| ServiceError::Invalid(error.to_string()))?;
