@@ -1126,11 +1126,29 @@ content = "result"
                 .expect("nested directory entry")
                 .is_dir()
         );
+        assert_eq!(
+            archive
+                .by_name("nested/")
+                .expect("nested directory mode")
+                .unix_mode()
+                .expect("nested directory permissions")
+                & 0o777,
+            0o755
+        );
         assert!(
             archive
                 .by_name("nested/empty/")
                 .expect("empty directory entry")
                 .is_dir()
+        );
+        assert_eq!(
+            archive
+                .by_name("nested/empty/")
+                .expect("empty directory mode")
+                .unix_mode()
+                .expect("empty directory permissions")
+                & 0o777,
+            0o755
         );
         let entry = archive
             .by_name("nested/file.txt")
@@ -1147,6 +1165,13 @@ content = "result"
         let generated = archive
             .by_name("SBOM.spdx.json")
             .expect("generated metadata entry");
+        assert_eq!(
+            generated
+                .unix_mode()
+                .expect("generated metadata permissions")
+                & 0o777,
+            0o644
+        );
         assert!(
             generated
                 .last_modified()

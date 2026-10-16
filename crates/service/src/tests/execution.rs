@@ -858,7 +858,7 @@ async fn run_bundle_contains_snapshot_journal_and_artifacts() {
         &ArtifactZipLimits::default(),
     )
     .expect("bundle should write");
-    let archive =
+    let mut archive =
         zip::ZipArchive::new(std::io::Cursor::new(bundle)).expect("bundle should be a valid zip");
     let mut names = archive
         .file_names()
@@ -875,6 +875,24 @@ async fn run_bundle_contains_snapshot_journal_and_artifacts() {
     assert!(
         names.contains(&"artifacts/answer.txt".to_string()),
         "{names:?}"
+    );
+    assert_eq!(
+        archive
+            .by_name("snapshot.json")
+            .expect("snapshot entry")
+            .unix_mode()
+            .expect("snapshot permissions")
+            & 0o777,
+        0o644
+    );
+    assert_eq!(
+        archive
+            .by_name("artifacts/answer.txt")
+            .expect("artifact entry")
+            .unix_mode()
+            .expect("artifact permissions")
+            & 0o777,
+        0o644
     );
     let _ = std::fs::remove_dir_all(&runs);
 }

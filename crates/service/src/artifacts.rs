@@ -319,7 +319,11 @@ fn artifact_zip_options(
     } else {
         zip::CompressionMethod::Deflated
     };
-    let mut options = SimpleFileOptions::default().compression_method(compression);
+    // The archive carries POSIX modes even on non-Unix hosts; force the
+    // creator-system marker so readers honor those explicit bits.
+    let mut options = SimpleFileOptions::default()
+        .system(zip::System::Unix)
+        .compression_method(compression);
     let modified = metadata.modified()?;
     let modified = chrono::DateTime::<chrono::Utc>::from(modified).naive_utc();
     let modified = zip::DateTime::try_from(modified).map_err(|error| {
@@ -367,6 +371,7 @@ fn bundle_entry_options(directory: bool) -> SimpleFileOptions {
         zip::CompressionMethod::Deflated
     };
     SimpleFileOptions::default()
+        .system(zip::System::Unix)
         .compression_method(compression)
         .unix_permissions(if directory { 0o755 } else { 0o644 })
 }

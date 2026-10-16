@@ -372,11 +372,15 @@ fn deterministic_package_time() -> SystemTime {
 }
 
 fn package_zip_options(metadata: &std::fs::Metadata, directory: bool) -> Result<SimpleFileOptions> {
-    let mut options = SimpleFileOptions::default().compression_method(if directory {
-        zip::CompressionMethod::Stored
-    } else {
-        zip::CompressionMethod::Deflated
-    });
+    // ZIP mode bits are POSIX on every host; mark the creator as Unix so
+    // readers do not replace them with the DOS fallback mode.
+    let mut options = SimpleFileOptions::default()
+        .system(zip::System::Unix)
+        .compression_method(if directory {
+            zip::CompressionMethod::Stored
+        } else {
+            zip::CompressionMethod::Deflated
+        });
     options = with_zip_modified_time(options, metadata.modified()?)?;
     #[cfg(unix)]
     {
@@ -402,6 +406,7 @@ fn package_zip_options(metadata: &std::fs::Metadata, directory: bool) -> Result<
 fn generated_package_zip_options(modified: SystemTime) -> Result<SimpleFileOptions> {
     with_zip_modified_time(
         SimpleFileOptions::default()
+            .system(zip::System::Unix)
             .compression_method(zip::CompressionMethod::Deflated)
             .unix_permissions(0o644),
         modified,
