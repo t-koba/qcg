@@ -170,8 +170,17 @@ fn artifact_zip_contains_manifest_artifacts() {
     std::fs::create_dir_all(run_meta_dir(&run_dir)).expect("metadata should be created");
     std::fs::create_dir_all(run_workspace_dir(&run_dir).join("reports"))
         .expect("artifact directory should be written");
-    std::fs::write(run_workspace_dir(&run_dir).join("reports/result.txt"), "ok")
-        .expect("artifact should be written");
+    let report_dir = run_workspace_dir(&run_dir).join("reports");
+    let artifact_path = report_dir.join("result.txt");
+    std::fs::write(&artifact_path, "ok").expect("artifact should be written");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&report_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("artifact directory mode should be set");
+        std::fs::set_permissions(&artifact_path, std::fs::Permissions::from_mode(0o644))
+            .expect("artifact file mode should be set");
+    }
     std::fs::write(
         run_meta_dir(&run_dir).join("outputs.json"),
         serde_json::to_string(&json!({
@@ -197,9 +206,22 @@ fn artifact_zip_contains_manifest_artifacts() {
             .expect("directory entry")
             .is_dir()
     );
+    assert_eq!(
+        archive
+            .by_name("reports/")
+            .expect("directory mode entry")
+            .unix_mode()
+            .expect("directory permissions")
+            & 0o777,
+        0o755
+    );
     let mut entry = archive
         .by_name("reports/result.txt")
         .expect("artifact should be present");
+    assert_eq!(
+        entry.unix_mode().expect("artifact permissions") & 0o777,
+        0o644
+    );
     assert!(
         entry.last_modified().expect("artifact timestamp").year() > 1980,
         "artifact timestamp must come from source metadata"
