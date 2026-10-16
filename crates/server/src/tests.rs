@@ -2438,43 +2438,74 @@ async fn invalidation_http_has_delete_auth_parity_and_immutable_json_record() {
             }
         }
         let mut first = None;
+        const TRANSIENT_RETRIES: usize = 10;
         for reason in ["wrong output", "wrong output", "different"] {
-            let mut builder = axum::http::Request::builder()
-                .method("POST")
-                .uri("/api/runs/success/invalidation")
-                .header("content-type", "application/json");
-            if authenticated {
-                builder = builder.header("authorization", format!("Bearer {test_credential}"));
-            }
-            let response = app
-                .clone()
-                .oneshot(
-                    builder
-                        .body(axum::body::Body::from(
-                            json!({"reason": reason, "actor_label": "reviewer"}).to_string(),
-                        ))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                response.status(),
-                if reason == "different" {
-                    StatusCode::CONFLICT
-                } else {
-                    StatusCode::OK
+            let expected_status = if reason == "different" {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::OK
+            };
+            let mut result = None;
+            for attempt in 0..=TRANSIENT_RETRIES {
+                let mut builder = axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/runs/success/invalidation")
+                    .header("content-type", "application/json");
+                if authenticated {
+                    builder = builder.header("authorization", format!("Bearer {test_credential}"));
                 }
-            );
-            if reason != "different" {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        builder
+                            .body(axum::body::Body::from(
+                                json!({"reason": reason, "actor_label": "reviewer"}).to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
                 let body = axum::body::to_bytes(response.into_body(), 32768)
                     .await
                     .unwrap();
+                let retryable = expected_status == StatusCode::OK
+                    && status == StatusCode::CONFLICT
+                    && serde_json::from_slice::<api::ProblemDetails>(&body).is_ok_and(|problem| {
+                        matches!(
+                            problem.detail.as_str(),
+                            "run store maintenance is busy; retry"
+                                | "run is executing; wait for settlement"
+                        )
+                    });
+                if retryable && attempt < TRANSIENT_RETRIES {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                }
+                result = Some((status, body));
+                break;
+            }
+            let (status, body) =
+                result.expect("bounded invalidation request must produce a response");
+            assert_eq!(
+                status,
+                expected_status,
+                "reason={reason}, response body={}",
+                String::from_utf8_lossy(&body)
+            );
+            if reason != "different" {
                 let record: api::RunInvalidation = serde_json::from_slice(&body).unwrap();
                 if let Some(first) = &first {
                     assert_eq!(first, &record);
                 } else {
                     first = Some(record);
                 }
+            } else {
+                let problem: api::ProblemDetails = serde_json::from_slice(&body).unwrap();
+                assert_eq!(
+                    problem.detail,
+                    "run already has a different immutable invalidation"
+                );
             }
         }
         let response = app
