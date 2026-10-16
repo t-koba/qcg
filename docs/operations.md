@@ -567,8 +567,9 @@ through closure revalidation, leaf-first commits (parent last), fsyncs and
 backup cleanup. Disjoint closures on different shards can publish concurrently;
 overlapping closures serialize, and shard collisions may also serialize
 unrelated IDs. Uninstall remains global-exclusive and global-first across its
-dependents recheck and removal. Maintenance takes only per-ID file locks,
-never global locks after per-ID, and skips locked IDs.
+dependents recheck and removal. Maintenance uses the same global-process →
+global-file → shard → per-ID order, with shared global locks and try-lock/skip
+at every contended lock; it never acquires global locks after per-ID.
 
 Reused packages are inventory-verified again and must retain the selected
 identity, version and dependency set. If a concurrent uninstall or replacement
@@ -577,12 +578,16 @@ retry; it never fetches or prompts under the guards. A later commit failure
 can leave earlier standalone dependencies installed, but never commits the
 parent after a failed dependency.
 
-A commit interrupted after the backup rename leaves the target missing with a
-`.install-backup-*` sibling intact; every install restores a missing target
-from its backup automatically before sweeping, so rerunning the same command
-converges (manual rename of the newest backup back to the target is only a
-last resort). Backups are retained on failure paths and only reaped by the
-stale sweep after aging out.
+Before moving an existing target, replacement creates and flushes an external
+`.install-backup-<nonce>.json` ownership record beside the planned
+`.install-backup-<nonce>` directory. No recovery metadata is written inside a
+package (and inventory verification has no recovery-file exemptions).
+An interruption after the backup rename therefore leaves an owned recovery
+copy. Installs attempt recovery before sweeping: a missing target is restored
+only from one unambiguous, inventory-verified backup with a matching manifest
+ID. Multiple candidates refuse recovery with an inspection error; never choose
+the newest by timestamp. See [Install backup maintenance](#install-backup-maintenance)
+for cleanup, failure handling and platform limits.
 
 ## Shutdown and restart semantics
 
@@ -917,11 +922,56 @@ request/parser buffers and is not a total process RSS limit.
 
 ## Install backup maintenance
 
-Install recovery and stale-backup deletion hold the same per-generator lock as
-commits. Maintenance skips a live commit; lock failures refuse deletion. Only
-regular backup directories with a regular, bounded marker naming a safe target
-id are eligible. Unmarked, corrupt, oversized, or unsafe markers retain the
-backup for operator inspection; the old unmarked age-based deletion path is
-removed. Successful uninstall removes owned recovery copies under the lock so
-later maintenance cannot resurrect the generator. Unknown ownership is always
-retained.
+Recovery records are external sibling files, not package contents. The bounded
+(4096-byte), typed JSON record contains `schema: 1`, a safe single-component
+`id`, and the exact `backup` basename. It is created exclusively without
+following an existing symlink; all bytes are written and the file is synced,
+then its parent is synced where supported, **before** moving the old target.
+A crash before that move can leave an orphan sidecar with no backup directory.
+
+Recovery, sweep, commit and uninstall share ownership parsing and ordered
+cleanup. Only regular sidecars with supported schema, safe ID and matching
+basename own a real backup directory (or an absent backup during pre-rename /
+cleanup interruption). Malformed, oversized, symlinked, unsafe or mismatched
+records, symlinked backup trees, unmarked backups and legacy in-package
+`.backup.json` markers are unknown: retain them for operator inspection, never
+adopt or age-delete them. Legacy markers are not migrated.
+
+For a missing target, recovery requires exactly one owned backup directory,
+validates its SBOM/inventory-aware contract and manifest ID, then renames it
+back without replacement. It syncs the parent before removing the sidecar.
+Invalid packages or multiple candidates produce an actionable error and remain
+untouched. Resolve ambiguity by inspecting and explicitly moving conflicting
+records/copies out of the generator parent; do not automatically select the
+newest. Unknown copies require operator validation rather than automatic repair.
+
+An ordinary publication rename failure attempts the same no-replace, verified
+restore. Restore failure retains recovery state. A successful publish rename
+followed by a parent-sync failure is **not** rolled back over the possibly
+published target: its backup and sidecar remain. Before a further replacement,
+old owned records must be cleaned only after the current target verifies and
+its parent sync succeeds; otherwise replacement refuses with cleanup pending.
+This also handles orphan sidecars. An orphan with no verified target needs
+operator inspection; it cannot authorize deletion or restoration by itself.
+
+The stale sweep has a one-hour sidecar age gate, but age alone never authorizes
+removal: a verified current target and successful parent sync are required.
+Cleanup removes the backup first, syncs the parent, removes the sidecar, then
+syncs the parent again. Failures are reported and retryable; no recovery backup
+is owned by a delete-on-drop guard. Successful uninstall performs this cleanup
+under its exclusive-global/per-ID locks **before** removing the target, so
+later maintenance cannot resurrect it from owned records. Unknown data remains.
+Maintenance takes global-process → global-file → shard → per-ID locks in that
+order, tries rather than waits, and skips contention with active publication or
+uninstall. Closure publication retains its existing full-closure locking.
+
+Durability is platform/filesystem dependent. Unix parent-directory open/sync
+failures are surfaced. On non-Unix platforms the directory-sync helper is
+currently a no-op: the sidecar file is synced, but no directory-entry or
+power-loss durability is promised. Linux uses `RENAME_NOREPLACE`; elsewhere
+no-replace uses existence probes plus CLI locks and a plain directory rename,
+so lock-bypassing filesystem changes retain a check/rename race. Parent syncs
+order directory entries; they are not a claim that all package payload files
+are recursively flushed or that hardware/filesystems honor flushes under power
+loss. Fault-probe tests exercise protocol ordering and error retention, not
+physical power-loss behavior.

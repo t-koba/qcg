@@ -9,7 +9,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs::OpenOptions;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 
 use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
@@ -22,7 +22,7 @@ use super::install_stage::{InstallConfig, Selected, StagedInstall, load_verified
 
 /// Single staging-cleanup guard (E14): owns every staging path that must
 /// vanish unless committed. Single-path users push once and use
-/// `armed`/`disarm`/`cleanup`; multi-path users push several. Drop reaps
+/// `armed`/`disarm`; multi-path users push several. Drop reaps
 /// whatever is still owned. The former two-type split (`CleanupPaths` plus
 /// a single-path `CleanupPath`) is unified here so the reaping rule cannot
 /// drift between them.
@@ -38,13 +38,6 @@ impl CleanupPaths {
 
     pub(crate) fn push(&mut self, path: Utf8PathBuf) {
         self.paths.push(path);
-    }
-
-    fn cleanup(&mut self) -> Result<()> {
-        for path in self.paths.drain(..) {
-            remove_owned_path(&path)?;
-        }
-        Ok(())
     }
 
     fn disarm(&mut self) {
@@ -315,6 +308,7 @@ pub(crate) fn commit_prepared_closure(
             package.temporary.armed()?,
             &package.target,
             package.replace_existing,
+            config.limits,
         )?;
         package.temporary.disarm();
     }
@@ -325,22 +319,12 @@ pub(crate) fn commit_prepared_closure(
 /// the rename must not replace anything: `RENAME_NOREPLACE` closes the
 /// check-then-rename race on Linux, and other platforms run the
 /// existence probe in [`check_no_replace_target`] with the residual
-/// window documented there (E14). Durability: the parent directory is
-/// fsynced after a successful rename on every platform (Linux included)
-/// so the commit survives a crash (E14 parity).
+/// window documented there (E14). Reports rename only: callers must sync
+/// separately so a sync error cannot be confused with rename failure.
 #[cfg(target_os = "linux")]
-pub(crate) fn rename_no_replace(
-    temporary: &Utf8Path,
-    target: &Utf8Path,
-    replace_existing: bool,
-) -> std::io::Result<()> {
+pub(crate) fn rename_no_replace(temporary: &Utf8Path, target: &Utf8Path) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt as _;
-    if replace_existing {
-        std::fs::rename(temporary, target)?;
-        fsync_parent_dir(target)?;
-        return Ok(());
-    }
     let from = CString::new(temporary.as_std_path().as_os_str().as_bytes()).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -366,23 +350,19 @@ pub(crate) fn rename_no_replace(
     if rc != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    fsync_parent_dir(target)?;
     Ok(())
 }
 
-/// Fsyncs the parent directory of `target` so a completed rename is
-/// durable across a crash (E14). Best-effort on platforms where opening
-/// the parent fails: the rename itself already succeeded, so an fsync
-/// open failure is surfaced fail-closed (the caller fails, the target
-/// stands, and a rerun converges).
+/// Flushes the parent directory on Unix, surfacing open/sync failures.
+/// Other platforms currently have no directory flush here: success there
+/// does not promise directory-entry durability under power loss.
 pub(crate) fn fsync_parent_dir(target: &Utf8Path) -> std::io::Result<()> {
     let Some(parent) = target.parent() else {
         return Ok(());
     };
     // Windows cannot open a directory with `File::open`
-    // (`ERROR_ACCESS_DENIED`); NTFS journals the rename itself, so the
-    // entry flush is Unix-only (same convention as journal and
-    // idempotency persistence).
+    // (`ERROR_ACCESS_DENIED`); no directory-entry durability is claimed
+    // on platforms without this flush.
     #[cfg(not(unix))]
     let _ = parent;
     #[cfg(unix)]
@@ -418,10 +398,9 @@ pub(crate) fn check_no_replace_target(
 }
 
 /// Non-Linux fallback: no `RENAME_NOREPLACE` exists, so the pre-check plus
-/// a handle-pinned re-check narrow the window best-effort (E14-4). The
+/// a directory-kind re-check narrow the window best-effort (E14-4). The
 /// temporary must be a real directory (O_NOFOLLOW `symlink_metadata`), the
-/// target is re-probed just before rename, and the parent is fsynced after
-/// rename for durability (same `fsync_parent_dir` as Linux, fail-closed).
+/// target is re-probed just before rename. Callers flush the parent separately.
 /// Hard-link-based NOREPLACE is infeasible for directories (hard links to
 /// directories are prohibited), so an atomic no-overwrite rename does not
 /// exist on this platform: the residual window below is truly unavoidable
@@ -431,16 +410,13 @@ pub(crate) fn check_no_replace_target(
 /// on the lock, then observes the committed target and fails closed (or
 /// replaces under `--force` with serialization). Residual window remains
 /// only for lock-bypassing actors (manual filesystem meddling): two such
-/// actors can both observe NotFound and race; the loser fails on rename.
+/// actors can both observe NotFound and race; a plain rename can replace
+/// an empty directory planted by such an actor.
 /// Concurrent same-id installs on non-Linux without going through the CLI
 /// locks are operator error (serialize them).
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn rename_no_replace(
-    temporary: &Utf8Path,
-    target: &Utf8Path,
-    replace_existing: bool,
-) -> std::io::Result<()> {
-    check_no_replace_target(target, replace_existing)?;
+pub(crate) fn rename_no_replace(temporary: &Utf8Path, target: &Utf8Path) -> std::io::Result<()> {
+    check_no_replace_target(target, false)?;
     match std::fs::symlink_metadata(temporary) {
         Ok(metadata) if metadata.file_type().is_dir() => {}
         Ok(_) => {
@@ -451,9 +427,8 @@ pub(crate) fn rename_no_replace(
         }
         Err(error) => return Err(error),
     }
-    check_no_replace_target(target, replace_existing)?;
+    check_no_replace_target(target, false)?;
     std::fs::rename(temporary, target)?;
-    fsync_parent_dir(target)?;
     Ok(())
 }
 
@@ -644,7 +619,12 @@ pub(crate) fn commit_install(
         .file_name()
         .context("install target must have a file name")?;
     let _id_guards = lock_closure_ids(parent, [id])?;
-    commit_install_locked(temporary, target, replace_existing)
+    commit_install_locked(
+        temporary,
+        target,
+        replace_existing,
+        &service::PackageLimits::default(),
+    )
 }
 
 /// Caller holds both global locks AND all closure shard/per-ID locks. Never
@@ -654,102 +634,104 @@ fn commit_install_locked(
     temporary: &Utf8Path,
     target: &Utf8Path,
     replace_existing: bool,
+    limits: &service::PackageLimits,
 ) -> Result<()> {
     let id = target
         .file_name()
         .context("install target must have a file name")?;
+    ensure_safe_install_id(id)?;
     let parent = target
         .parent()
         .context("install target must have a parent directory")?;
-    recover_interrupted_backup(target);
-    let backup = if replace_existing {
-        let backup = loop {
-            let candidate = unique_nonexistent_path(parent, "install-backup")?;
-            match std::fs::rename(target, &candidate) {
-                Ok(()) => break candidate,
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("failed to move existing generator `{target}`"));
-                }
+    recover_interrupted_backup(target, limits)?;
+    // No second generation while an earlier recovery record is pending.
+    let pending = backup_records_for(parent, id)?;
+    if !pending.is_empty() {
+        verify_backup_identity(target, id, limits).context(
+            "recovery cleanup pending; verify/repair the current target before retrying",
+        )?;
+        fsync_parent_dir(target)?;
+        for record in pending {
+            remove_backup_record(&record)?;
+        }
+    }
+    if replace_existing {
+        match std::fs::symlink_metadata(target) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::bail!("refusing to replace symbolic-link generator target `{target}`");
             }
-        };
-        // Backup ownership marker (F14): rename preserves the old
-        // directory mtime, so a fresh backup would otherwise look
-        // 1h-stale to a concurrent sweep. The sidecar carries the target
-        // id, commit phase, owner pid, and creation time; its own mtime
-        // is the freshness signal. Recovery runs before sweep, so a
-        // missing target with a backup sibling restores instead of
-        // deleting.
-        if let Err(error) = write_backup_marker(&backup, id, target) {
-            let _ = std::fs::rename(&backup, target);
-            return Err(error)
-                .with_context(|| format!("failed to mark install backup for `{target}`"));
+            Ok(_) => {
+                anyhow::bail!("refusing to replace non-directory generator target `{target}`");
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                anyhow::bail!(
+                    "existing generator target `{target}` disappeared before replacement"
+                );
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to revalidate existing generator target `{target}`")
+                });
+            }
         }
-        // Durability: fsync the parent after moving the existing target to
-        // backup, before replacing (E14 backup→fsync→replace→fsync). A crash
-        // between backup and replace leaves `target` missing with `backup`
-        // intact; every install runs recovery before its sweep, so a missing
-        // target with a backup sibling restores automatically and rerunning
-        // the install converges (fresh target installed, orphan backup
-        // reaped later). Manual rename of the newest backup back to `target`
-        // is only a last resort if automatic recovery fails; the backup is
-        // retained on replace failure below for manual restore, never
-        // auto-deleted on failure paths.
-        if let Err(error) = fsync_parent_dir(target) {
-            // Best-effort rollback: try to restore the backup before
-            // reporting; if restore also fails, retain the backup path for
-            // manual recovery (same fail-closed retention as below).
-            let _ = std::fs::rename(&backup, target);
-            return Err(anyhow::Error::from(error).context(format!(
-                "failed to durably move existing generator `{target}`"
-            )));
+    }
+    let backup = if replace_existing {
+        let path = unique_nonexistent_path(parent, "install-backup")?;
+        let record = write_backup_marker(&path, id)?;
+        // Bytes AND directory entry flushed before destructive rename.
+        backup_probe("marker-durable")?;
+        if let Err(error) = rename_no_replace(target, &path) {
+            // Orphan sidecar is retained for verified cleanup on retry.
+            return Err(error).context("failed to move existing generator to backup");
         }
-        Some(CleanupPaths::new(backup))
+        // Simulate interruption at precisely the old unmarked-backup window.
+        backup_probe("backup-renamed")?;
+        if let Err(error) = backup_probe("backup-sync").and_then(|()| Ok(fsync_parent_dir(target)?))
+        {
+            return rollback_error(error, &record, target, limits);
+        }
+        Some(record)
     } else {
         None
     };
-
-    if !replace_existing {
-        match std::fs::symlink_metadata(target) {
-            Ok(_) => anyhow::bail!("install target `{target}` appeared during staging"),
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to inspect install target `{target}`"));
-            }
+    // --force must not overwrite an unexpected target after moving the old one.
+    let publish =
+        backup_probe("publish-rename").and_then(|()| Ok(rename_no_replace(temporary, target)?));
+    if let Err(error) = publish {
+        if let Some(record) = &backup {
+            return rollback_error(error, record, target, limits);
         }
+        return Err(error).with_context(|| format!("failed to commit generator `{target}`"));
     }
-
-    if let Err(error) = rename_no_replace(temporary, target, replace_existing) {
-        let Some(mut backup) = backup else {
-            return Err(error).with_context(|| format!("failed to commit generator `{target}`"));
-        };
-        let backup_path = backup.armed()?.to_owned();
-        match std::fs::rename(&backup_path, target) {
-            Ok(()) => {
-                backup.disarm();
-                return Err(error)
-                    .with_context(|| format!("failed to commit generator `{target}`"));
-            }
-            Err(restore_error) => {
-                // Retain the backup: deleting it would lose the previous
-                // version with nothing installed. Report its path so the
-                // operator can restore manually (E14).
-                backup.disarm();
-                return Err(anyhow::anyhow!(
-                    "failed to commit generator `{target}`: {error}; failed to restore existing generator: {restore_error}; previous version retained at `{backup_path}`"
-                ));
-            }
-        }
-    }
-
-    if let Some(mut backup) = backup {
-        backup
-            .cleanup()
-            .with_context(|| format!("installed `{target}` but failed to remove backup"))?;
+    // Rename succeeded: sync failure must NEVER enter ordinary rollback.
+    backup_probe("publish-sync")?;
+    fsync_parent_dir(target)
+        .context("published generator but failed to sync parent; recovery backup retained")?;
+    if let Some(record) = backup {
+        verify_backup_identity(target, id, limits)
+            .context("published target failed verification; recovery backup retained")?;
+        remove_backup_record(&record)
+            .context("installed generator but recovery cleanup pending; retry install")?;
     }
     Ok(())
+}
+
+fn rollback_error(
+    error: anyhow::Error,
+    record: &BackupRecord,
+    target: &Utf8Path,
+    limits: &service::PackageLimits,
+) -> Result<()> {
+    match restore_backup(record, target, limits) {
+        Ok(()) => Err(error).with_context(|| {
+            format!("failed to commit generator `{target}`; old package restored")
+        }),
+        Err(restore_error) => anyhow::bail!(
+            "failed to commit generator `{target}`: {error:#}; failed to restore existing generator: {restore_error:#}; inspect recovery record `{}`",
+            record.sidecar
+        ),
+    }
 }
 
 pub(crate) fn uninstall(id: &str, generators_dir: &Utf8Path, yes: bool) -> Result<()> {
@@ -820,12 +802,13 @@ pub(crate) fn uninstall(id: &str, generators_dir: &Utf8Path, yes: bool) -> Resul
     // Remove owned recovery copies while holding the same per-id lock.
     // Otherwise later maintenance could resurrect a successfully uninstalled id.
     // Do this before removing the target so cleanup failure leaves it installed.
-    for backup in backup_candidates_for(generators_dir, id) {
-        remove_owned_path(&backup)
-            .with_context(|| format!("failed to remove backup `{backup}` before uninstall"))?;
+    for record in backup_records_for(generators_dir, id)? {
+        remove_backup_record(&record)
+            .context("failed to clean recovery record before uninstall; target retained")?;
     }
     std::fs::remove_dir_all(&target)
         .with_context(|| format!("failed to remove generator `{target}`"))?;
+    fsync_parent_dir(&target)?;
     Ok(())
 }
 
@@ -925,119 +908,290 @@ pub(crate) fn unique_nonexistent_path(parent: &Utf8Path, prefix: &str) -> Result
     }
 }
 
-/// Sidecar marker that distinguishes a recovery backup from disposable
-/// scratch (F14). Written immediately after target->backup rename so the
-/// fresh backup has a fresh mtime even though the renamed directory keeps
-/// its old mtime.
-pub(crate) const BACKUP_MARKER_FILE: &str = ".backup.json";
+/// External metadata never changes authenticated package contents.
+const BACKUP_RECORD_LIMIT: usize = 4096;
 
-/// Best-effort recovery for a commit interrupted between target->backup
-/// and new-target publish (F14-02/F14-04). If `target` is missing but a
-/// backup sibling with a marker for this id exists, the newest backup is
-/// renamed back. Never deletes: on failure the backup and its location
-/// remain for manual recovery.
-pub(crate) fn recover_interrupted_backup(target: &Utf8Path) {
-    if std::fs::symlink_metadata(target).is_ok() {
-        return;
-    }
-    let Some(parent) = target.parent() else {
-        return;
-    };
-    let Some(id) = target.file_name() else {
-        return;
-    };
-    let candidates = backup_candidates_for(parent, id);
-    // Newest marker mtime first so the latest pre-commit state wins.
-    let mut newest: Option<(Utf8PathBuf, std::time::SystemTime)> = None;
-    for candidate in candidates {
-        let marker = candidate.join(BACKUP_MARKER_FILE);
-        let mtime = std::fs::symlink_metadata(&marker)
-            .and_then(|meta| meta.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        let is_newer = newest.as_ref().is_none_or(|(_, t)| mtime > *t);
-        if is_newer {
-            newest = Some((candidate, mtime));
-        }
-    }
-    if let Some((backup, _)) = newest
-        && std::fs::rename(&backup, target).is_ok()
-    {
-        let _ = fsync_parent_dir(target);
-    }
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackupMetadata {
+    schema: u32,
+    id: String,
+    backup: String,
 }
 
-/// Lists backup siblings whose marker names this target id (F14). Marker
-/// parsing is best-effort: unmarked directories have unknown ownership and are retained.
-pub(crate) fn backup_candidates_for(parent: &Utf8Path, id: &str) -> Vec<Utf8PathBuf> {
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(parent) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let Ok(name) = entry.file_name().into_string() else {
-            continue;
-        };
-        if !name.starts_with(".install-backup-") {
-            continue;
-        }
-        let path = match Utf8PathBuf::from_path_buf(entry.path()) {
-            Ok(path) => path,
-            Err(_) => continue,
-        };
-        if backup_marker_id(&path).as_deref() == Some(id) {
-            out.push(path);
-        }
-    }
-    out
+pub(crate) struct BackupRecord {
+    pub(crate) backup: Utf8PathBuf,
+    pub(crate) sidecar: Utf8PathBuf,
+    pub(crate) id: String,
 }
 
-pub(crate) fn backup_marker_id(backup: &Utf8Path) -> Option<String> {
-    if !std::fs::symlink_metadata(backup).ok()?.file_type().is_dir() {
+fn valid_backup_name(name: &str) -> bool {
+    name.strip_prefix(".install-backup-").is_some_and(|nonce| {
+        !nonce.is_empty()
+            && nonce
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    })
+}
+
+pub(crate) fn backup_sidecar_path(backup: &Utf8Path) -> Utf8PathBuf {
+    backup.with_file_name(format!("{}.json", backup.file_name().unwrap_or_default()))
+}
+
+/// Missing backups are allowed (crash before rename or during cleanup).
+/// Non-directory backups, symlinks and invalid/legacy metadata prove no
+/// ownership. All paths derive from basenames under the scanned parent.
+fn read_backup_record(parent: &Utf8Path, name: &str) -> Option<BackupRecord> {
+    let basename = name.strip_suffix(".json")?;
+    if !valid_backup_name(basename) {
         return None;
     }
-    let marker = backup.join(BACKUP_MARKER_FILE);
-    if !std::fs::symlink_metadata(&marker)
+    let sidecar = parent.join(name);
+    if !std::fs::symlink_metadata(&sidecar)
         .ok()?
         .file_type()
         .is_file()
     {
         return None;
     }
-    let bytes = files::read_nofollow_bounded(&marker, Some(16 * 1024)).ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let id = value.get("id")?.as_str()?;
-    policy::is_safe_path_component(id).then(|| id.to_string())
-}
-
-/// Freshness of a backup (F14-01): the max of the directory mtime and the
-/// marker mtime. Rename preserves the old directory mtime, so a just-made
-/// backup would otherwise look hours old.
-pub(crate) fn backup_freshness(backup: &Utf8Path) -> Option<std::time::SystemTime> {
-    let dir_mtime = std::fs::symlink_metadata(backup)
-        .and_then(|meta| meta.modified())
-        .ok();
-    let marker_mtime = std::fs::symlink_metadata(backup.join(BACKUP_MARKER_FILE))
-        .and_then(|meta| meta.modified())
-        .ok();
-    match (dir_mtime, marker_mtime) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
+    let bytes = files::read_nofollow_bounded(&sidecar, Some(BACKUP_RECORD_LIMIT)).ok()?;
+    let data: BackupMetadata = serde_json::from_slice(&bytes).ok()?;
+    if data.schema != 1 || data.backup != basename || !policy::is_safe_path_component(&data.id) {
+        return None;
     }
+    let backup = parent.join(basename);
+    match std::fs::symlink_metadata(&backup) {
+        Ok(meta) if meta.file_type().is_dir() => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        _ => return None,
+    }
+    Some(BackupRecord {
+        backup,
+        sidecar,
+        id: data.id,
+    })
 }
 
-fn write_backup_marker(backup: &Utf8Path, id: &str, target: &Utf8Path) -> Result<()> {
-    let marker = serde_json::json!({
-        "id": id,
-        "target": target.as_str(),
-        "phase": "backup-created",
-        "pid": std::process::id(),
-        "created_at": chrono::Utc::now().to_rfc3339(),
-    });
-    let bytes = serde_json::to_vec_pretty(&marker).context("backup marker is not serializable")?;
-    std::fs::write(backup.join(BACKUP_MARKER_FILE), &bytes)
-        .with_context(|| format!("failed to write backup marker for `{target}`"))?;
-    let _ = fsync_parent_dir(target);
+pub(crate) fn backup_records(parent: &Utf8Path) -> Result<Vec<BackupRecord>> {
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).context("failed to scan recovery records"),
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if let Some(name) = entry.file_name().to_str()
+            && let Some(record) = read_backup_record(parent, name)
+        {
+            out.push(record);
+        }
+    }
+    Ok(out)
+}
+
+fn backup_records_for(parent: &Utf8Path, id: &str) -> Result<Vec<BackupRecord>> {
+    Ok(backup_records(parent)?
+        .into_iter()
+        .filter(|record| record.id == id)
+        .collect())
+}
+
+pub(crate) fn backup_freshness(record: &BackupRecord) -> Option<std::time::SystemTime> {
+    std::fs::symlink_metadata(&record.sidecar)
+        .ok()?
+        .modified()
+        .ok()
+}
+
+pub(crate) fn write_backup_marker(backup: &Utf8Path, id: &str) -> Result<BackupRecord> {
+    anyhow::ensure!(policy::is_safe_path_component(id), "unsafe recovery ID");
+    let basename = backup.file_name().context("backup must have a basename")?;
+    anyhow::ensure!(valid_backup_name(basename), "unsafe backup basename");
+    let sidecar = backup_sidecar_path(backup);
+    let data = BackupMetadata {
+        schema: 1,
+        id: id.to_string(),
+        backup: basename.to_string(),
+    };
+    let bytes = serde_json::to_vec(&data)?;
+    anyhow::ensure!(
+        bytes.len() <= BACKUP_RECORD_LIMIT,
+        "oversized recovery record"
+    );
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(&sidecar)
+        .context("failed to create exclusive recovery sidecar")?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    backup_probe("marker-file-synced")?;
+    fsync_parent_dir(&sidecar)?;
+    backup_probe("marker-parent-synced")?;
+    Ok(BackupRecord {
+        backup: backup.to_path_buf(),
+        sidecar,
+        id: id.to_string(),
+    })
+}
+
+pub(crate) fn verify_backup_identity(
+    root: &Utf8Path,
+    id: &str,
+    limits: &service::PackageLimits,
+) -> Result<()> {
+    anyhow::ensure!(
+        std::fs::symlink_metadata(root)?.file_type().is_dir(),
+        "not a real package directory: `{root}`"
+    );
+    let contract = load_verified_contract(root, limits)?;
+    anyhow::ensure!(
+        contract.manifest.generator.id == id,
+        "recovery package manifest ID differs from `{id}`"
+    );
     Ok(())
+}
+
+/// Caller holds global -> shard -> per-ID locks. Remove backup, flush parent,
+/// then remove sidecar and flush again. No recovery backup has a Drop guard.
+pub(crate) fn remove_backup_record(record: &BackupRecord) -> Result<()> {
+    let parent = record.sidecar.parent().context("sidecar has no parent")?;
+    let current = read_backup_record(parent, record.sidecar.file_name().unwrap_or_default())
+        .context("recovery ownership changed; retained for inspection")?;
+    anyhow::ensure!(
+        current.id == record.id && current.backup == record.backup,
+        "recovery ownership changed"
+    );
+    backup_probe("cleanup-backup")?;
+    remove_owned_path(&record.backup)?;
+    backup_probe("cleanup-backup-sync")?;
+    fsync_parent_dir(&record.backup)?;
+    backup_probe("cleanup-sidecar")?;
+    std::fs::remove_file(&record.sidecar)?;
+    backup_probe("cleanup-sidecar-sync")?;
+    fsync_parent_dir(&record.sidecar)?;
+    Ok(())
+}
+
+fn restore_backup(
+    record: &BackupRecord,
+    target: &Utf8Path,
+    limits: &service::PackageLimits,
+) -> Result<()> {
+    verify_backup_identity(&record.backup, &record.id, limits)?;
+    backup_probe("restore-rename")?;
+    rename_no_replace(&record.backup, target)?;
+    backup_probe("restore-sync")?;
+    fsync_parent_dir(target)?;
+    remove_backup_record(record)
+}
+
+/// Restore exactly one unambiguous owned, inventory-verified package.
+/// Unknown/legacy backups are retained; invalid packages are actionable errors.
+pub(crate) fn recover_interrupted_backup(
+    target: &Utf8Path,
+    limits: &service::PackageLimits,
+) -> Result<()> {
+    match std::fs::symlink_metadata(target) {
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("failed to inspect recovery target"),
+    }
+    let parent = target.parent().context("recovery target has no parent")?;
+    let id = target
+        .file_name()
+        .context("recovery target has no basename")?;
+    ensure_safe_install_id(id)?;
+    let mut candidates = Vec::new();
+    for record in backup_records_for(parent, id)? {
+        match std::fs::symlink_metadata(&record.backup) {
+            Ok(_) => candidates.push(record),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("failed to inspect recovery backup"),
+        }
+    }
+    anyhow::ensure!(
+        candidates.len() <= 1,
+        "multiple recovery backups for `{id}`; retained untouched; inspect sibling .install-backup-* records and resolve ambiguity before retrying"
+    );
+    if let Some(record) = candidates.pop() {
+        restore_backup(&record, target, limits).with_context(|| {
+            format!(
+                "recovery failed; inspect retained record `{}`",
+                record.sidecar
+            )
+        })?;
+    }
+    Ok(())
+}
+
+// Thread-local probes keep fault tests independent of parallel tests.
+#[cfg(test)]
+thread_local! {
+    static BACKUP_PROBE: std::cell::RefCell<Option<BackupProbe>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+type BackupProbe = Box<dyn FnMut(&str) -> Result<()>>;
+
+#[cfg(test)]
+pub(crate) fn with_backup_probe<T>(
+    probe: impl FnMut(&str) -> Result<()> + 'static,
+    action: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            BACKUP_PROBE.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+    BACKUP_PROBE.with(|slot| *slot.borrow_mut() = Some(Box::new(probe)));
+    let _reset = Reset;
+    action()
+}
+
+fn backup_probe(_point: &str) -> Result<()> {
+    #[cfg(test)]
+    BACKUP_PROBE.with(|slot| {
+        if let Some(probe) = slot.borrow_mut().as_mut() {
+            probe(_point)
+        } else {
+            Ok(())
+        }
+    })?;
+    Ok(())
+}
+
+/// Maintenance uses the same order as closure publication, never waits, and
+/// never obtains a global lock after a shard/per-ID lock.
+pub(crate) fn with_backup_maintenance_lock(
+    parent: &Utf8Path,
+    id: &str,
+    action: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let _global = match global_commit_rwlock().try_read() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
+        Err(error) => anyhow::bail!("install global lock unavailable: {error}"),
+    };
+    let global_file = open_install_lock(&global_lock_path(parent))?;
+    match global_file.try_lock_shared() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Ok(()),
+        Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+    }
+    let _shard = match replace_mutex_for(id).try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
+        Err(error) => anyhow::bail!("install shard lock unavailable: {error}"),
+    };
+    let Some(_per_id) = try_acquire_file_lock(&parent.join(per_id_lock_name(id)))? else {
+        return Ok(());
+    };
+    action()
 }
