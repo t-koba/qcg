@@ -286,23 +286,26 @@ The complete file is verified before delivering a successful range response.
 On `SIGINT`/`SIGTERM` the server stops accepting mutating requests with
 `503` (JSON problem shape), closes active event streams with an explicit
 `shutdown` marker (distinguishing shutdown from truncation), stops resident
-tasks, and
-settles tracked runs as `Interrupted` under a 150 s outer deadline exceeded
-as an error to the host (total bound from signal to exit is 180 s: 30 s
-drain + 150 s outer; the outer starts after the drain, so a wedged drain
-delays settlement by design). Startup order is policy resolve, service build,
-router build, then recovery before resident tasks; shutdown order is signal,
-mutating-work gate, HTTP drain bounded by 30 s (`DRAIN_TIMEOUT`), then
-resident-task and active-run settlement concurrently under the outer
-deadline. Settled runs are terminal and cover every tracked
+tasks, and settles tracked runs as `Interrupted` under the configured
+`SHUTDOWN_SETTLE_SECS` outer deadline (default 150 s, range 1..=3600); a
+timeout is returned as an error to the host. The HTTP drain is bounded by
+`SHUTDOWN_DRAIN_SECS` (default 30 s, range 1..=3600), and settle must be at
+least drain. The total bound from signal to exit is the sum of the configured
+phases: 180 s by default, at most 7200 s under their validated ranges. The
+outer deadline starts after the drain, so a wedged drain delays settlement
+by design but is cut at its configured bound. Startup order is policy resolve,
+service build, router build, then recovery before resident tasks; shutdown order
+is signal, mutating-work gate, HTTP drain, then resident-task and active-run
+settlement concurrently under the outer deadline. Settled runs are terminal and cover every tracked
 non-terminal run including `Queued`; only work that was waiting on human
 input, explicitly requeued, or never tracked by the stopping peer resumes
 after a restart. Single-peer enforcement: the lease-holding peer settles
 its own runs; leaseless peers never touch others' runs. In shared mode stopping one peer settles only that peer's
 runs. A cancel racing the shutdown settles as `Interrupted` once shutdown
-started, else `Canceled`. The HTTP drain is bounded by 30 s: a wedged
-connection is cut so shutdown proceeds (warned, never silent). See `docs/operations.md` for the
-normative shutdown contract.
+started, else `Canceled`. The HTTP drain is bounded by the configured
+`SHUTDOWN_DRAIN_SECS` value; a wedged connection is cut so shutdown proceeds
+(warned, never silent). See `docs/operations.md` for the normative shutdown
+contract.
 
 ## Conditional snapshots
 

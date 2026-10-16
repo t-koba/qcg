@@ -4383,17 +4383,19 @@ mutating work is ever refused. SSE shutdown closes with an explicit
 `shutdown` marker event so clients distinguish shutdown from truncation.
 Startup order is resolve deployment policy once, build the service, build
 the router, then start recovery before resident tasks; shutdown order is
-signal, stop accepting mutating work, HTTP drain bounded by 30 s
-(`DRAIN_TIMEOUT`), mark the service shutting down, then resident-task
-shutdown and active-run settlement concurrently under a 150 second outer
-deadline (`SHUTDOWN_DEADLINE` in `crates/server/src/server/serve.rs`,
+signal, stop accepting mutating work, HTTP drain bounded by
+`SHUTDOWN_DRAIN_SECS` (default 30 s, range 1..=3600), mark the service
+shutting down, then resident-task shutdown and active-run settlement
+concurrently under the configured `SHUTDOWN_SETTLE_SECS` outer deadline
+(default 150 s, range 1..=3600, and at least the drain value). A timeout is
 returned as `Err` to the embedding host by `serve_with_listener_and_deadline`;
-see `docs/operations.md` for the normative shutdown contract). In shared mode,
-stopping one peer settles that peer's tracked runs only; other peers keep
-their own runs. The outer deadline starts
-after the HTTP drain completes: in-flight requests that drain promptly do not
-consume the settlement budget, while a wedged drain connection is cut after
-30 s so shutdown proceeds (the drain timeout is warned, never silent).
+see `docs/operations.md` for the normative shutdown contract. Total time from
+signal to exit is the sum of configured phases: 180 s by default and at most
+7200 s under validated ranges. In shared mode, stopping one peer settles only
+that peer's tracked runs; other peers keep their own runs. The outer deadline
+starts after the HTTP drain completes: in-flight requests that drain promptly
+do not consume the settlement budget, while a wedged drain connection is cut
+at its configured bound so shutdown proceeds (warned, never silent).
 
 Shutdown settles a cancel race as `Interrupted` when shutdown is already in
 effect, else `Canceled` (checked at settle time in `lifecycle.rs` and

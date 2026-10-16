@@ -495,18 +495,17 @@ this: a `GET` during drain is not rejected with `503`, but its long-lived
 body (SSE, journal stream, artifacts zip) ends at shutdown instead of holding
 the drain open, and the client reconnects from its last sequence number. The
 server closes SSE streams, stops maintenance tasks (shared-store refresh,
-queued resumer, retention GC), then settles active runs under a 150 second
-outer deadline (`SHUTDOWN_DEADLINE` in
-`crates/server/src/server/serve.rs`, returned as `Err` to the embedding
-host by `serve_with_listener_and_deadline`; see `docs/operations.md` for the
-normative shutdown contract). Startup order is policy resolve, service
-build, router build, then recovery before resident tasks; shutdown order is
-signal, mutating-work gate, HTTP drain bounded by 30 s (`DRAIN_TIMEOUT`),
-then resident-task and active-run settlement under the outer deadline. The
-deadline starts after the HTTP drain
-completes; HTTP drain is bounded by 30 s, so the total bound from signal to
-exit is 180 s (30 s drain + 150 s outer; a wedged drain connection is cut
-after 30 s with a warning and delays settlement by design).
+queued resumer, retention GC), then settles active runs under the configured
+`SHUTDOWN_SETTLE_SECS` outer deadline (default 150 s, range 1..=3600),
+returned as `Err` to the embedding host on timeout (see `docs/operations.md`
+for the normative contract). Startup order is policy resolve, service build,
+router build, then recovery before resident tasks; shutdown order is signal,
+mutating-work gate, HTTP drain bounded by `SHUTDOWN_DRAIN_SECS` (default 30 s,
+range 1..=3600), then resident-task and active-run settlement under the
+outer deadline. The settle value must be at least the drain value. The total
+bound from signal to exit is their configured sum: 180 s by default, at most
+7200 s under validated ranges. The outer deadline starts after the HTTP drain;
+a wedged drain is cut at its configured bound with a warning.
 
 Shutdown settles a cancel race as `Interrupted` when shutdown is already in
 effect, else `Canceled` (checked at settle time); settled runs journal

@@ -261,11 +261,12 @@ use of the same output directory.
   `JOURNAL_POLL_INTERVAL_MS` (default `250`, range `50..=5000`),
   `MAX_DIRECTORY_SCAN_ENTRIES` (default `100000`, range `1000..=10000000`),
   `SHARED_RESCAN_SECS` and `QUEUED_RESUMER_SECS` (default `5`, range
-  `1..=3600`), `SHUTDOWN_DRAIN_SECS` (default `30`) and
+  `1..=3600`), `SHUTDOWN_DRAIN_SECS` (default `30`, range `1..=3600`) and
   `SHUTDOWN_SETTLE_SECS` (default `150`, range `1..=3600`): deployment
   tuning for the live stream, shared-store cadence, directory scans, and the
-  graceful shutdown phases. Out-of-range values and a settle deadline below
-  the drain refuse boot.
+  graceful shutdown phases. Settle must be at least drain; out-of-range values
+  refuse boot. Total shutdown time is the sum of the configured drain and
+  settle phases (180 s by default; at most 7200 s).
 - `MAX_PARALLEL_STEPS`: deployment cap on parallel wave scheduling.
   Unset uses the CPU count; `0` and invalid values refuse boot.
 - `READ_CACHE_MAX_BYTES` (default `67108864`): maximum retained run read-view

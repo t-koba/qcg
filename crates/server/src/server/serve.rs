@@ -67,9 +67,9 @@ pub async fn serve_with_resolved_policy(
     serve_with_resolved_policy_and_deadline(policy, config, listener, settle).await
 }
 
-/// Serve with an explicit outer shutdown deadline. Production uses
-/// [`SHUTDOWN_DEADLINE`]; tests pass a short deadline so the timeout path
-/// surfaces fast instead of waiting 150 s (E05).
+/// Serve with an explicit outer shutdown deadline. Production passes the
+/// frozen `SHUTDOWN_SETTLE_SECS` policy value; tests may pass a short deadline
+/// so timeout paths run quickly (E05).
 /// Validates deployment policy without binding, locking, or creating
 /// directories: callers must run this before `TcpListener::bind` so a
 /// refused boot leaves no occupied port behind (E04). `serve_*` re-runs
@@ -128,9 +128,11 @@ pub struct ResolvedServerPolicy {
     pub shared_store_rescan_secs: u64,
     /// Queued-run resumer cadence, in seconds.
     pub queued_resumer_secs: u64,
-    /// Graceful HTTP drain timeout before settlement proceeds.
+    /// `SHUTDOWN_DRAIN_SECS` policy value (default 30, range 1..=3600):
+    /// HTTP drain time before settlement proceeds.
     pub shutdown_drain: std::time::Duration,
-    /// Outer graceful settlement deadline after the drain.
+    /// `SHUTDOWN_SETTLE_SECS` policy value (default 150, range 1..=3600,
+    /// and at least the drain value): outer settlement deadline after drain.
     pub shutdown_settle: std::time::Duration,
 }
 
@@ -400,8 +402,6 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
     // (keeping refused boots from occupying the port); this resolved path
     // never re-reads the environment, so the frozen policy is authoritative
     // even if the environment changed after bind (E04 single freeze).
-    // Total shutdown bound stays linked to its two phases (E05).
-    debug_assert_eq!(TOTAL_SHUTDOWN_BOUND, DRAIN_TIMEOUT + SHUTDOWN_DEADLINE);
     let actual_addr = listener.local_addr()?;
     // The frozen policy was validated before the service is created: a
     // misconfigured boot fails before acquiring the run-store lock or
@@ -668,38 +668,9 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
     Ok(actual_addr)
 }
 
-/// Global bound on graceful shutdown after HTTP has drained. Active-run
-/// settling and container cleanup have their own internal bounds; this is
-/// the outer guarantee returned to the embedding host. Tests override it
-/// via [`serve_with_resolved_policy_and_deadline`] so the timeout path runs
-/// fast (E05).
-/// Total shutdown bound is `DRAIN_TIMEOUT + SHUTDOWN_DEADLINE` = 180 s
-/// (E05): the outer deadline starts after the HTTP drain completes, so a
-/// wedged drain delays settlement by design (it is cut after 30 s with a
-/// warning) and the total time from signal to exit never exceeds 180 s.
-/// Documented in `docs/operations.md`.
-const SHUTDOWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(150);
-
-/// Bound on the HTTP drain phase itself: after the shutdown signal fires,
-/// in-flight connections have this long to drain before shutdown proceeds
-/// to resident-task and run settlement anyway (E05). Without it a wedged
-/// drain connection delays the outer deadline start indefinitely. Documented
-/// in `docs/operations.md` and `docs/http-server-guide.md`.
-/// Total bound with [`SHUTDOWN_DEADLINE`] is 180 s from signal to exit.
-const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Total bound from shutdown signal to process exit: drain plus outer
-/// settlement (E05). Kept as a named constant so the 180 s total cannot
-/// drift when either phase is retuned. Linked to the two phases by the
-/// compile-time assertion below (E04) so release builds check it too, not
-/// only debug builds and tests.
-const TOTAL_SHUTDOWN_BOUND: std::time::Duration = std::time::Duration::from_secs(180);
-
-// Compile-time linkage (E04): the total must stay drain + outer. A retune
-// of either phase without the total fails the build, not just a test.
-const _: () = assert!(
-    TOTAL_SHUTDOWN_BOUND.as_secs() == DRAIN_TIMEOUT.as_secs() + SHUTDOWN_DEADLINE.as_secs()
-);
+// Shutdown phase durations are resolved once in `ResolvedServerPolicy`.
+// The configured total from signal to exit is `shutdown_drain + shutdown_settle`;
+// do not duplicate that policy in fixed constants.
 
 /// Single shutdown initiation for the serve path (E05): cancels the shared
 /// token owned by the service. `LocalService::mark_shutting_down`
@@ -2349,6 +2320,14 @@ command = ["sh", "-c", "sleep 30"]"#,
         let policy = resolve_server_policy(&config).expect("valid shutdown phases should resolve");
         assert_eq!(policy.shutdown_drain.as_secs(), 60);
         assert_eq!(policy.shutdown_settle.as_secs(), 120);
+
+        // The configured upper bounds may exceed the old fixed 180 s total;
+        // runtime shutdown uses this resolved pair as its single source.
+        set("SHUTDOWN_DRAIN_SECS", "3600");
+        set("SHUTDOWN_SETTLE_SECS", "3600");
+        let policy = resolve_server_policy(&config).expect("maximum phase values should resolve");
+        assert_eq!(policy.shutdown_drain.as_secs(), 3600);
+        assert_eq!(policy.shutdown_settle.as_secs(), 3600);
         unset("SHUTDOWN_DRAIN_SECS");
         unset("SHUTDOWN_SETTLE_SECS");
     }

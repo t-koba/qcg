@@ -639,33 +639,32 @@ shutdown closes with an explicit `shutdown` marker event so clients
 distinguish shutdown from truncation (a terminal close carries its terminal
 event, a truncation carries neither). It
 closes SSE streams, stops maintenance tasks (shared-store refresh, queued
-resumer, retention GC), and then settles active runs under a 150 second
-outer deadline (`SHUTDOWN_DEADLINE` in
-`crates/server/src/server/serve.rs`, enforced by
-`serve_with_listener_and_deadline`); exceeding it is reported to the
-embedding host instead of
-being logged and ignored. Total bound from shutdown signal to process exit
-is 180 s (`TOTAL_SHUTDOWN_BOUND` = `DRAIN_TIMEOUT` 30 s + `SHUTDOWN_DEADLINE`
-150 s): the outer deadline starts after the HTTP drain completes, so a
-wedged drain delays settlement by design (cut after 30 s with a warning)
-and the total never exceeds 180 s. Startup order is resolve deployment policy once,
-build the service, build the router, then start recovery
+resumer, retention GC), and settles active runs under the configured outer
+`SHUTDOWN_SETTLE_SECS` deadline (default 150 s, range 1..=3600); exceeding
+it is reported to the embedding host instead of being logged and ignored.
+`SHUTDOWN_DRAIN_SECS` (default 30 s, range 1..=3600) bounds the preceding
+HTTP drain. The total bound from shutdown signal to process exit is the sum
+of these configured phases: 180 s by default, at most 7200 s under the
+validated ranges. `SHUTDOWN_SETTLE_SECS` must be at least
+`SHUTDOWN_DRAIN_SECS`. The outer deadline starts after the HTTP drain
+completes, so a wedged drain delays settlement by design but is cut at its
+configured bound with a warning. Startup order is resolve deployment policy
+once, build the service, build the router, then start recovery
 (`resume_recovered_runs`) before resident tasks; shutdown order is signal,
-stop accepting mutating work (shared token), HTTP drain bounded by 30 s
-(`DRAIN_TIMEOUT`), mark the service shutting down, then resident-task
-shutdown and active-run settlement concurrently under the 150 s outer
-deadline. Resident-join and run-convergence run concurrently by design
+stop accepting mutating work (shared token), HTTP drain, mark the service
+shutting down, then resident-task shutdown and active-run settlement
+concurrently under the outer deadline. Resident-join and run-convergence run concurrently by design
 (E05): serializing them would let one consume the other's settlement
 budget, so the outer deadline covers both together. Responsibility split
-(E05/Q3): the HTTP drain (30 s) ends accepting work, resident-task shutdown
+(E05/Q3): the configured HTTP drain ends accepting work, resident-task shutdown
 stops the execution sources (shared token, GC, resumer, shared-store
 refresh), active-run settlement converges the runs, and the resume exception
 (tracked runs terminate; only a durable `Queued` journal never tracked by the
 stopping peer resumes next boot) decides what restarts. Q3 owns the
 terminate-vs-resume policy; E05 owns the drain/join/settle mechanism. The outer deadline starts after the HTTP drain completes:
 in-flight requests that drain promptly do not consume the
-active-run settlement budget, while a wedged drain connection is cut after
-30 s so shutdown proceeds (the drain timeout is warned, never silent).
+active-run settlement budget, while a wedged drain connection is cut at the configured drain
+bound so shutdown proceeds (the drain timeout is warned, never silent).
 
 Shutdown signal platform matrix: Unix waits for Ctrl-C or SIGTERM;
 Windows waits for Ctrl-C plus the console/service controls tokio exposes
