@@ -322,8 +322,24 @@ effects are denied unless explicitly declared.
   can show how far an approval reaches, and the digest is recorded on
   `ConfirmSpec.operation_digest` (required): a confirmation without either is
   corrupt and fails closed, never an invocation-scoped default. Approvals
-  never cross runs: the operation id binds the run id, so an identical call
-  in another run always re-confirms. MCP approvals live in two namespaces
+  never cross runs: confirmations are stored per run, so an identical call
+  in another run always requires its own approval. qcg's separate operation
+  id also binds the run id and identifies its local operation journal/cache;
+  it is not a cross-run receiver claim. For side-effecting `HttpStep` calls,
+  a single case-insensitive `Idempotency-Key` entry in `params.headers` is the
+  receiver transport key and suppresses the default remote key; absent it, the
+  run-scoped operation id remains the default HTTP remote key. The rendered
+  header value is included in the operation/approval digest and sent unchanged;
+  empty or whitespace-only values are rejected. `GET`/`HEAD` retain their
+  existing behavior: declared headers are sent, with no qcg fallback.
+  Command steps have no operation-id environment ABI; a receiver needing
+  cross-run deduplication must use its own protocol in the existing
+  `params.input` JSON sent on stdin. The receiver owns deduplication,
+  payload-conflict behavior, and retention. Identifiers are not authorization
+  and must not contain secrets or personal data. qcg has no global cross-run
+  store and guarantees no exactly-once effect. A started operation without a
+  journaled completion has an unknown outcome and is refused automatic replay.
+  MCP approvals live in two namespaces
   that never mix: single-shot `mcp.call` steps bind the node execution
   (`execution:<node>:<count>` invocation id), while agent `mcp` tool calls
   bind the model call id plus canonical redacted args (continuation key
@@ -345,8 +361,13 @@ effects are denied unless explicitly declared.
   retries and crash resumes keep the current identity, while a repair or
   regenerate is a new invocation that re-confirms), or the stable model call
   id for agent tool calls. The operation id (`run:node:sha256(invocation)` in
-  `crates/engine/src/state.rs`) is the remote idempotency key, never a
-  confirmation id. Predict confirmation ids from a prior `confirm_request`
+  `crates/engine/src/state.rs`) is qcg's local journal/result-cache identity,
+  never a confirmation id. It is the default remote HTTP key only when a
+  declared `HttpStep` `Idempotency-Key` header is absent; an explicit header
+  does not replace local operation identity or separate run-scoped
+  confirmation IDs. Command receivers must use their own structured stdin
+  protocol for a remote key.
+  Predict confirmation ids from a prior `confirm_request`
   event or run snapshot `confirm.id` (both carry the full id including scope and invocation hash); `side_effect` events carry only the content digest and never predict invocation-scoped ids alone; a second
   approval for different content and native convergence across resends are
   covered by tests in `run_context.rs`.
@@ -598,6 +619,21 @@ compare equal.
 
 `http`
 : Execute an allowlisted HTTP request. Non-GET/HEAD methods are side effects.
+  For those methods, a single `params.headers` entry named
+  `Idempotency-Key` (case-insensitive) is sent unchanged as the receiver key
+  and suppresses qcg's run-scoped HTTP fallback. Without the header, the local
+  `operation_id` remains the default remote key; `GET`/`HEAD` behavior is
+  unchanged and qcg adds no fallback. An empty or whitespace-only rendered
+  key is rejected, while non-empty bytes are not normalized. Header values
+  remain bound by the existing operation/approval digest. The local
+  `operation_id` continues to identify qcg's journal and result cache, and
+  fresh-run approvals are still required; it is not a cross-run dedup store.
+  Command receivers must use their own existing structured `params.input`
+  JSON stdin protocol for any stable remote key. Receiver-owned deduplication,
+  key conflicts, and retention are required for cross-run behavior; keys are
+  identifiers rather than credentials, so avoid secrets and personal data.
+  qcg guarantees no exactly-once effect and refuses automatic replay when a
+  started operation has an unknown outcome.
 
 `ask_user`
 : Ask for a scalar answer, a static multi-field form through `fields`, or a

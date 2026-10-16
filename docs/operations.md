@@ -286,13 +286,44 @@ required network host, and mark the step `side_effects = "confirm"`. Operators
 then review and approve the delivery at the same HITL boundary as any other
 side effect.
 
+## Receiver idempotency for external effects
+
+qcg's `operation_id` is a run-scoped key for its external-operation journal
+and same-invocation result cache. Approvals use separate run-scoped
+confirmation IDs; neither local mechanism coordinates claims or approvals
+across runs. For `HttpStep` side-effect methods (anything other than
+`GET`/`HEAD`), one declared `params.headers` entry named
+`Idempotency-Key` (case-insensitive) is sent unchanged as the receiver's
+transport key and suppresses qcg's run-scoped fallback header. If absent,
+`HttpStep` keeps the existing behavior and sends its local `operation_id` as
+the default remote key. `GET`/`HEAD` behavior is unchanged: declared headers
+are sent, but qcg adds no fallback. The explicit header remains part of the
+HTTP operation/approval digest; invocation-scoped approvals are still fresh
+for each call, and approvals never cross runs.
+
+Commands have no `operation_id` environment-variable ABI. A command receiver
+that needs a stable key across runs must receive it through the existing
+structured `params.input` JSON on stdin and define/validate that input in its
+own protocol; qcg does not invent a command parameter or inject a key.
+
+The receiver owns deduplication, same-key/different-payload conflict handling,
+and retention duration. Define these semantics at the receiver and retain
+records long enough for the intended retry and fresh-run horizon. Keys are
+identifiers, not authorization credentials; do not put secrets or personal
+data in them. qcg does not guarantee exactly-once effects: if an external
+operation has started but no completion was journaled, qcg refuses automatic
+replay because the outcome is unknown. A receiver-side key can help reconcile
+or deduplicate a deliberate retry, but qcg maintains no global cross-run
+key store and makes no receiver claim on its behalf.
+
 ## Unattended operation
 
 qcg ships no scheduler, timer, or webhook receiver. Mechanism (durable runs,
-pre-provisioned answers, idempotent mutations) lives in qcg; policy (when to
-run, how often to retry, whom to notify) lives outside in cron, systemd
-timers, or a workflow orchestrator. A run whose questions and confirmations
-are all pre-provisioned completes without interaction.
+pre-provisioned answers, run-scoped effect guards, and receiver-key transport)
+lives in qcg; scheduling policy (when to run, how often to retry, whom to
+notify) lives outside in cron, systemd timers, or a workflow orchestrator. A
+run whose questions and confirmations are all pre-provisioned completes
+without interaction.
 
 Prerequisites for any unattended run:
 
@@ -315,8 +346,11 @@ Prerequisites for any unattended run:
   `execution:<node>:<count>` (finished-execution count, so a repair or
   regenerate is a new invocation); agent tool calls use the stable model call
   id. The operation id (`run:node:sha256(invocation)` in
-  `crates/engine/src/state.rs`) is a different value: it is the remote
-  idempotency key, never a confirmation id. The manifest
+  `crates/engine/src/state.rs`) is qcg's local journal/result-cache identity,
+  never a confirmation id. It is the default remote HTTP key only when a
+  caller-declared `HttpStep`
+  `Idempotency-Key` header is absent; command receivers must use their own
+  structured stdin protocol. The manifest
   `permissions.side_effects_scope` defaults to `invocation` when omitted;
   every minted `ConfirmSpec` carries an explicit `scope` and
   `operation_digest`, and a confirmation without either is corrupt and fails

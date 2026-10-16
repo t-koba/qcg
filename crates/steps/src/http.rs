@@ -161,6 +161,8 @@ impl StepExecutor for HttpStep {
                 "http body_text, body_json, body_base64, and body_file are mutually exclusive",
             ));
         }
+        explicit_idempotency_header(&params.headers)
+            .map_err(|error| StepError::failed(&node.id, error))?;
         if params.body_file.is_none()
             && !matches!(params.body_file_scope, HttpBodyFileScope::Workspace)
         {
@@ -203,6 +205,8 @@ impl StepExecutor for HttpStep {
         for (key, value) in &params.headers {
             headers.insert(key.clone(), ctx.render_inline(node, value)?);
         }
+        let has_explicit_idempotency_key = rendered_idempotency_header(&method, &headers)
+            .map_err(|error| StepError::failed(&node.id, error))?;
         let (body, inferred_content_type) = match (
             params.body_text.as_deref(),
             params.body_json.as_ref(),
@@ -372,8 +376,9 @@ impl StepExecutor for HttpStep {
         {
             return Ok(StepOutcome::NeedsConfirm { confirm });
         }
-        // Stable operation id doubles as the remote idempotency key so
-        // retries after a lost result deduplicate server-side. Started
+        // The stable operation id remains qcg's local journal/result-cache
+        // identity. It is also the default remote key for this HTTP step
+        // only when no caller-declared Idempotency-Key is present. Started
         // without finished refuses automatic replay (indeterminate result).
         // Same-invocation resends deserialize the cached native response
         // and continue through the identical output tail below.
@@ -409,6 +414,11 @@ impl StepExecutor for HttpStep {
                 &invocation,
             )? {
                 engine::GuardDecision::Proceed { operation_id } => {
+                    let idempotency_key = fallback_http_idempotency_key(
+                        &method,
+                        has_explicit_idempotency_key,
+                        &operation_id,
+                    );
                     let response = match ctx
                         .run
                         .http
@@ -423,7 +433,10 @@ impl StepExecutor for HttpStep {
                             // the gateway would refuse to follow it anyway.
                             // The 3xx response is the step's result.
                             follow_redirects: false,
-                            idempotency_key: Some(operation_id.clone()),
+                            // The caller-declared receiver key already
+                            // travels in `headers`, so never add the local
+                            // operation id as a second wire value.
+                            idempotency_key,
                         })
                         .await
                     {
@@ -543,6 +556,40 @@ impl StepExecutor for HttpStep {
     }
 }
 
+fn explicit_idempotency_header(
+    headers: &std::collections::BTreeMap<String, String>,
+) -> Result<Option<&str>, &'static str> {
+    let mut declared = None;
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("Idempotency-Key") {
+            if declared.is_some() {
+                return Err("http params.headers must contain at most one Idempotency-Key header");
+            }
+            declared = Some(value.as_str());
+        }
+    }
+    Ok(declared)
+}
+
+fn rendered_idempotency_header(
+    method: &str,
+    headers: &std::collections::BTreeMap<String, String>,
+) -> Result<bool, &'static str> {
+    let declared = explicit_idempotency_header(headers)?;
+    if !matches!(method, "GET" | "HEAD") && declared.is_some_and(|value| value.trim().is_empty()) {
+        return Err("http Idempotency-Key header must not be empty or whitespace-only");
+    }
+    Ok(declared.is_some())
+}
+
+fn fallback_http_idempotency_key(
+    method: &str,
+    has_explicit_key: bool,
+    operation_id: &str,
+) -> Option<String> {
+    (!matches!(method, "GET" | "HEAD") && !has_explicit_key).then(|| operation_id.to_owned())
+}
+
 fn http_params(node: &NodeDef) -> Result<HttpParams, StepError> {
     let params: HttpParams = node
         .deserialize_params()
@@ -568,6 +615,90 @@ pub(crate) fn http_approval_details(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn idempotency_header_rejects_case_insensitive_duplicates() {
+        use super::explicit_idempotency_header;
+        let headers = std::collections::BTreeMap::from([
+            ("Idempotency-Key".to_string(), "first".to_string()),
+            ("idempotency-key".to_string(), "second".to_string()),
+        ]);
+        assert_eq!(
+            explicit_idempotency_header(&headers),
+            Err("http params.headers must contain at most one Idempotency-Key header")
+        );
+    }
+
+    #[test]
+    fn rendered_empty_idempotency_header_is_rejected_without_echoing_value() {
+        use super::rendered_idempotency_header;
+        let value = " \t ";
+        let headers =
+            std::collections::BTreeMap::from([("Idempotency-Key".to_string(), value.to_string())]);
+        let error = rendered_idempotency_header("POST", &headers)
+            .expect_err("whitespace-only rendered key should be rejected");
+        assert_eq!(
+            error,
+            "http Idempotency-Key header must not be empty or whitespace-only"
+        );
+        assert!(!error.contains(value));
+        assert!(
+            rendered_idempotency_header("GET", &headers)
+                .expect("safe methods keep declared headers"),
+            "GET still sends the caller-declared header without a qcg fallback"
+        );
+    }
+
+    #[test]
+    fn explicit_receiver_key_suppresses_only_http_fallback() {
+        use super::fallback_http_idempotency_key;
+        assert_eq!(
+            fallback_http_idempotency_key("POST", true, "run-local-operation"),
+            None,
+            "the explicit header is sent as-is and qcg must not add a fallback"
+        );
+        assert_eq!(
+            fallback_http_idempotency_key("POST", false, "run-local-operation"),
+            Some("run-local-operation".to_string()),
+            "absent explicit header keeps the existing operation-id fallback"
+        );
+        assert_eq!(fallback_http_idempotency_key("GET", false, "unused"), None);
+        assert_eq!(fallback_http_idempotency_key("HEAD", true, "unused"), None);
+    }
+
+    #[test]
+    fn explicit_idempotency_header_remains_bound_to_approval_details() {
+        use super::http_approval_details;
+        let sensitive = std::collections::BTreeMap::new();
+        let headers = std::collections::BTreeMap::from([(
+            "Idempotency-Key".to_string(),
+            "receiver-key-one".to_string(),
+        )]);
+        let changed = std::collections::BTreeMap::from([(
+            "Idempotency-Key".to_string(),
+            "receiver-key-two".to_string(),
+        )]);
+        let details = http_approval_details(
+            "POST",
+            &headers,
+            None,
+            &sensitive,
+            "run-1",
+            "https://example.test/effect",
+        )
+        .expect("operation details should be present");
+        let changed_details = http_approval_details(
+            "POST",
+            &changed,
+            None,
+            &sensitive,
+            "run-1",
+            "https://example.test/effect",
+        )
+        .expect("operation details should be present");
+        assert_ne!(details["headers_sha256"], changed_details["headers_sha256"]);
+        assert!(!details.to_string().contains("receiver-key-one"));
+    }
+
     #[test]
     fn full_url_queries_bind_different_digests() {
         // E09a: different query strings must bind different approval

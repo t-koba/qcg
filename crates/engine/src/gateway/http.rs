@@ -137,8 +137,10 @@ pub struct HttpRequest {
     /// never auto-follow: the 3xx response is returned to the caller so an
     /// already-sent effect is never replayed at a new target.
     pub follow_redirects: bool,
-    /// Stable operation id for remote deduplication. Sent as
-    /// `Idempotency-Key` when present; receivers without support ignore it.
+    /// Optional gateway-added `Idempotency-Key`. It is sent in addition to
+    /// `headers` when present, so callers that already supply this header
+    /// must leave this unset to avoid duplicate wire values. Receivers
+    /// without support ignore it.
     pub idempotency_key: Option<String>,
 }
 
@@ -979,6 +981,35 @@ mod tests {
             follow_redirects: true,
             idempotency_key: None,
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_idempotency_header_is_sent_once_without_fallback() {
+        let (port, server) =
+            serve_once("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into())
+                .await;
+        let mut request = request("POST", format!("http://127.0.0.1:{port}/apply"), None);
+        request
+            .headers
+            .insert("Idempotency-Key".into(), "receiver-business-key".into());
+        request.follow_redirects = false;
+        // HttpStep suppresses its operation-id fallback when this declared
+        // header is present; verify the gateway sends its one caller value.
+        request.idempotency_key = None;
+        gateway()
+            .request(request)
+            .await
+            .expect("local gateway request should succeed");
+        let (head, _) = server.await.expect("local server should finish");
+        let keys = head
+            .lines()
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("Idempotency-Key")
+                    .then_some(value.trim())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(keys, ["receiver-business-key"]);
     }
 
     #[tokio::test]
