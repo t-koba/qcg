@@ -4,7 +4,7 @@ use contract::{
     ToolDef, ToolNetwork, ToolResolution, ToolWorkspace,
 };
 use engine::{StepContext, StepError, StepExecutor, StepOutcome};
-use model::{Finding, Severity};
+use model::Finding;
 use policy::{params_schema, string_array_schema, string_schema};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -129,12 +129,11 @@ impl StepExecutor for CheckContainerStep {
                     "reason": "container runtime was not found",
                 }))));
             }
-            return Ok(StepOutcome::check_failed(vec![Finding {
-                severity: Severity::Error,
-                message: "container runtime was not found".into(),
-                location: Some(node.id.clone()),
-                raw_output: None,
-            }]));
+            return Ok(StepOutcome::check_failed(vec![Finding::error(
+                "container runtime was not found".into(),
+                Some(node.id.clone()),
+                None,
+            )]));
         };
 
         let params = check_container_params(node)?;
@@ -168,12 +167,11 @@ impl StepExecutor for CheckContainerStep {
             }
         });
         if !status_matches {
-            findings.push(Finding {
-                severity: Severity::Error,
-                message: format!("container command exited with {}", output.status),
-                location: Some(node.id.clone()),
-                raw_output: Some(format!("{}{}", output.stdout, output.stderr)),
-            });
+            findings.push(Finding::error(
+                format!("container command exited with {}", output.status),
+                Some(node.id.clone()),
+                Some(format!("{}{}", output.stdout, output.stderr)),
+            ));
         }
         if let Some(needle) = params
             .expect
@@ -181,12 +179,11 @@ impl StepExecutor for CheckContainerStep {
             .and_then(|expect| expect.stdout_contains.as_ref())
             && !output.stdout.contains(needle)
         {
-            findings.push(Finding {
-                severity: Severity::Error,
-                message: format!("stdout did not contain `{needle}`"),
-                location: Some(node.id.clone()),
-                raw_output: Some(output.stdout.clone()),
-            });
+            findings.push(Finding::error(
+                format!("stdout did not contain `{needle}`"),
+                Some(node.id.clone()),
+                Some(output.stdout.clone()),
+            ));
         }
         if let Some(needle) = params
             .expect
@@ -194,12 +191,11 @@ impl StepExecutor for CheckContainerStep {
             .and_then(|expect| expect.stderr_contains.as_ref())
             && !output.stderr.contains(needle)
         {
-            findings.push(Finding {
-                severity: Severity::Error,
-                message: format!("stderr did not contain `{needle}`"),
-                location: Some(node.id.clone()),
-                raw_output: Some(output.stderr.clone()),
-            });
+            findings.push(Finding::error(
+                format!("stderr did not contain `{needle}`"),
+                Some(node.id.clone()),
+                Some(output.stderr.clone()),
+            ));
         }
         if let Some(pattern) = params
             .expect
@@ -213,12 +209,11 @@ impl StepExecutor for CheckContainerStep {
                 )
             })?;
             if !expression.is_match(&output.stdout) {
-                findings.push(Finding {
-                    severity: Severity::Error,
-                    message: format!("stdout did not match `{pattern}`"),
-                    location: Some(node.id.clone()),
-                    raw_output: Some(output.stdout.clone()),
-                });
+                findings.push(Finding::error(
+                    format!("stdout did not match `{pattern}`"),
+                    Some(node.id.clone()),
+                    Some(output.stdout.clone()),
+                ));
             }
         }
         if findings.is_empty() {

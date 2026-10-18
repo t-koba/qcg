@@ -2,7 +2,7 @@ use crate::common::{bounded_transform_text, require};
 use async_trait::async_trait;
 use contract::{Contract, NodeDef};
 use engine::{StepContext, StepError, StepExecutor, StepOutcome};
-use model::{Finding, Severity};
+use model::Finding;
 use policy::{params_schema, string_schema};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -78,12 +78,11 @@ impl StepExecutor for CheckFormatStep {
             Ok(()) => Ok(StepOutcome::success(Some(
                 json!({ "status": "pass", "source": source, "format": format }),
             ))),
-            Err(error) => Ok(StepOutcome::check_failed(vec![Finding {
-                severity: Severity::Error,
-                message: format!("invalid {format}: {error}"),
-                location: Some(source),
-                raw_output: None,
-            }])),
+            Err(error) => Ok(StepOutcome::check_failed(vec![Finding::error(
+                format!("invalid {format}: {error}"),
+                Some(source),
+                None,
+            )])),
         }
     }
 }

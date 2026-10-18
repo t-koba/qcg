@@ -19,6 +19,18 @@ pub struct Finding {
     pub raw_output: Option<String>,
 }
 
+impl Finding {
+    /// Construct a finding with error severity.
+    pub fn error(message: String, location: Option<String>, raw_output: Option<String>) -> Self {
+        Self {
+            severity: Severity::Error,
+            message,
+            location,
+            raw_output,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {

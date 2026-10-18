@@ -2,7 +2,7 @@ use crate::common::require;
 use async_trait::async_trait;
 use contract::{Contract, NodeDef};
 use engine::{StepContext, StepError, StepExecutor, StepOutcome};
-use model::{Finding, Severity};
+use model::Finding;
 use policy::{params_schema, string_schema};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -80,12 +80,11 @@ impl StepExecutor for CheckContractStep {
                 "version": contract.manifest.generator.version,
                 "contract_sha256": contract.sha256,
             })))),
-            Err(error) => Ok(StepOutcome::check_failed(vec![Finding {
-                severity: Severity::Error,
-                message: error.to_string(),
-                location: Some(source),
-                raw_output: None,
-            }])),
+            Err(error) => Ok(StepOutcome::check_failed(vec![Finding::error(
+                error.to_string(),
+                Some(source),
+                None,
+            )])),
         }
     }
 }

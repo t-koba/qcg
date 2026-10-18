@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use contract::{ExpectDef, NodeDef};
 use engine::{StepContext, StepError, StepExecutor, StepOutcome};
-use model::{Finding, Severity};
+use model::Finding;
 use policy::{params_schema, string_array_schema, string_schema};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -69,43 +69,39 @@ impl StepExecutor for CheckCommandStep {
             if let Some(exit_code) = expect.exit_code
                 && output.status != exit_code
             {
-                findings.push(Finding {
-                    severity: Severity::Error,
-                    message: format!("expected exit code {exit_code}, got {}", output.status),
-                    location: None,
-                    raw_output: Some(output.stderr.clone()),
-                });
+                findings.push(Finding::error(
+                    format!("expected exit code {exit_code}, got {}", output.status),
+                    None,
+                    Some(output.stderr.clone()),
+                ));
             }
             if !expect.exit_code_in.is_empty() && !expect.exit_code_in.contains(&output.status) {
-                findings.push(Finding {
-                    severity: Severity::Error,
-                    message: format!(
+                findings.push(Finding::error(
+                    format!(
                         "expected exit code in {:?}, got {}",
                         expect.exit_code_in, output.status
                     ),
-                    location: None,
-                    raw_output: Some(output.stderr.clone()),
-                });
+                    None,
+                    Some(output.stderr.clone()),
+                ));
             }
             if let Some(needle) = &expect.stdout_contains
                 && !output.stdout.contains(needle)
             {
-                findings.push(Finding {
-                    severity: Severity::Error,
-                    message: format!("stdout did not contain `{needle}`"),
-                    location: None,
-                    raw_output: Some(output.stdout.clone()),
-                });
+                findings.push(Finding::error(
+                    format!("stdout did not contain `{needle}`"),
+                    None,
+                    Some(output.stdout.clone()),
+                ));
             }
             if let Some(needle) = &expect.stderr_contains
                 && !output.stderr.contains(needle)
             {
-                findings.push(Finding {
-                    severity: Severity::Error,
-                    message: format!("stderr did not contain `{needle}`"),
-                    location: None,
-                    raw_output: Some(output.stderr.clone()),
-                });
+                findings.push(Finding::error(
+                    format!("stderr did not contain `{needle}`"),
+                    None,
+                    Some(output.stderr.clone()),
+                ));
             }
             if let Some(pattern) = &expect.stdout_matches {
                 let expression = regex::Regex::new(pattern).map_err(|error| {
@@ -115,21 +111,19 @@ impl StepExecutor for CheckCommandStep {
                     )
                 })?;
                 if !expression.is_match(&output.stdout) {
-                    findings.push(Finding {
-                        severity: Severity::Error,
-                        message: format!("stdout did not match `{pattern}`"),
-                        location: None,
-                        raw_output: Some(output.stdout.clone()),
-                    });
+                    findings.push(Finding::error(
+                        format!("stdout did not match `{pattern}`"),
+                        None,
+                        Some(output.stdout.clone()),
+                    ));
                 }
             }
         } else if output.status != 0 {
-            findings.push(Finding {
-                severity: Severity::Error,
-                message: format!("command exited with {}", output.status),
-                location: None,
-                raw_output: Some(output.stderr.clone()),
-            });
+            findings.push(Finding::error(
+                format!("command exited with {}", output.status),
+                None,
+                Some(output.stderr.clone()),
+            ));
         }
         if findings.is_empty() {
             Ok(StepOutcome::success(Some(

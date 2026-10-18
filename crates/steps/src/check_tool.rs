@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use contract::{NodeDef, ToolBackendKind, ToolDef, ToolFallback, ToolWorkspace};
 use engine::{StepContext, StepError, StepExecutor, StepOutcome};
-use model::{Finding, Severity};
+use model::Finding;
 use policy::{params_schema, string_schema};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -190,12 +190,11 @@ impl StepExecutor for CheckToolStep {
             let snapshot_source = _snapshot_cleanup.path.clone();
             return execute_tool_candidate(ctx, node, tool, candidate, snapshot_source).await;
         }
-        Ok(StepOutcome::check_failed(vec![Finding {
-            severity: Severity::Error,
-            message: format!("tool `{tool_name}` could not resolve an allowed backend"),
-            location: Some(node.id.clone()),
-            raw_output: Some(Value::Array(unavailable).to_string()),
-        }]))
+        Ok(StepOutcome::check_failed(vec![Finding::error(
+            format!("tool `{tool_name}` could not resolve an allowed backend"),
+            Some(node.id.clone()),
+            Some(Value::Array(unavailable).to_string()),
+        )]))
     }
 }
 
@@ -364,12 +363,11 @@ fn check_tool_output(
             "stderr": stderr,
         }))))
     } else {
-        Ok(StepOutcome::check_failed(vec![Finding {
-            severity: Severity::Error,
-            message: format!("tool backend `{backend}` exited with {status}"),
-            location: Some(node.id.clone()),
-            raw_output: Some(format!("{stdout}{stderr}")),
-        }]))
+        Ok(StepOutcome::check_failed(vec![Finding::error(
+            format!("tool backend `{backend}` exited with {status}"),
+            Some(node.id.clone()),
+            Some(format!("{stdout}{stderr}")),
+        )]))
     }
 }
 

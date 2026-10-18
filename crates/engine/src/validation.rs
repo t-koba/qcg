@@ -1,4 +1,4 @@
-use model::{Finding, Severity};
+use model::Finding;
 use serde_json::Value;
 
 use crate::StepError;
@@ -65,12 +65,11 @@ pub fn validate_json_schema_step(
 }
 
 fn error_finding(message: String, location: &str) -> Finding {
-    Finding {
-        severity: Severity::Error,
-        message: truncate_utf8(&message, MAX_SCHEMA_FINDING_MESSAGE_BYTES),
-        location: Some(truncate_utf8(location, MAX_SCHEMA_FINDING_MESSAGE_BYTES)),
-        raw_output: None,
-    }
+    Finding::error(
+        truncate_utf8(&message, MAX_SCHEMA_FINDING_MESSAGE_BYTES),
+        Some(truncate_utf8(location, MAX_SCHEMA_FINDING_MESSAGE_BYTES)),
+        None,
+    )
 }
 
 fn findings_fit(findings: &[Finding], candidate: &Finding) -> bool {
