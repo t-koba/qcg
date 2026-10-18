@@ -390,8 +390,22 @@ pub(crate) fn read_run_execution_owner(run_dir: &Utf8Path) -> Option<String> {
     Some(owner)
 }
 
+/// Store-wide maintenance ownership. Explicitly unlock on drop because a
+/// concurrent fork may temporarily retain the descriptor until exec.
+pub struct StoreMaintenanceLock(File);
+
+impl Drop for StoreMaintenanceLock {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.unlock() {
+            tracing::warn!(%error, "failed to unlock run store maintenance lease");
+        }
+    }
+}
+
 /// Try the stable store maintenance lease. Acquire before any execution lease.
-pub fn try_lock_store_maintenance(runs_dir: &Utf8Path) -> Result<Option<File>, ServiceError> {
+pub fn try_lock_store_maintenance(
+    runs_dir: &Utf8Path,
+) -> Result<Option<StoreMaintenanceLock>, ServiceError> {
     std::fs::create_dir_all(runs_dir)?;
     let file = OpenOptions::new()
         .create(true)
@@ -400,7 +414,7 @@ pub fn try_lock_store_maintenance(runs_dir: &Utf8Path) -> Result<Option<File>, S
         .write(true)
         .open(runs_dir.join(".maintenance.lock"))?;
     match file.try_lock() {
-        Ok(()) => Ok(Some(file)),
+        Ok(()) => Ok(Some(StoreMaintenanceLock(file))),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(error)) => Err(ServiceError::Io(error)),
     }
@@ -2551,6 +2565,31 @@ mod tests {
             .expect("the waiter should acquire after the prior owner releases")
             .expect("the waiter task should complete");
         drop(acquired);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn maintenance_lease_release_does_not_wait_for_inherited_descriptors() {
+        let root = temp_root("maintenance-lease-inheritance");
+        let lease = try_lock_store_maintenance(&root).unwrap().unwrap();
+        // dup shares the open file description just as fork does before exec
+        // closes CLOEXEC descriptors in a concurrently spawning command.
+        let inherited = lease.0.try_clone().unwrap();
+        assert!(try_lock_store_maintenance(&root).unwrap().is_none());
+        drop(lease);
+        let next = try_lock_store_maintenance(&root).unwrap();
+        assert!(
+            next.is_some(),
+            "a finished maintenance owner must release its lease while an inherited descriptor remains open"
+        );
+        drop(inherited);
+        assert!(
+            try_lock_store_maintenance(&root).unwrap().is_none(),
+            "closing an inherited descriptor must not release the next owner's lease"
+        );
+        drop(next);
+        assert!(try_lock_store_maintenance(&root).unwrap().is_some());
         std::fs::remove_dir_all(root).unwrap();
     }
 
