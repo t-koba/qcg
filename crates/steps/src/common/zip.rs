@@ -1,4 +1,4 @@
-use engine::StepError;
+use engine::{ResultExt, StepError};
 use files::WalkDir;
 use zip::write::SimpleFileOptions;
 
@@ -17,7 +17,7 @@ pub(crate) async fn write_zip_atomic(
     // prefix is the single unified temp prefix swept at startup.
     let snapshot = metadata.join(format!(".part-{}", uuid::Uuid::now_v7()));
     fs.snapshot_tree_to(source_path, &snapshot, input_limit, count_limit)
-        .map_err(|error| StepError::failed(node_id, error.to_string()))?;
+        .step_err(node_id)?;
     // Preserve the original skip: a previous output inside the source tree
     // must not be archived (the snapshot may hold an earlier revision).
     let snapshot_target = target_path
@@ -46,9 +46,8 @@ pub(crate) async fn write_zip_atomic(
     // Temp cleanup failures propagate fail-closed (E13-9): a leftover
     // snapshot must surface instead of silently accumulating, and the
     // uniquely named directory cannot collide with a later run.
-    streamed.map_err(|error| StepError::failed(node_id, error.to_string()))?;
-    std::fs::remove_dir_all(&snapshot)
-        .map_err(|error| StepError::failed(node_id, error.to_string()))?;
+    streamed.step_err(node_id)?;
+    std::fs::remove_dir_all(&snapshot).step_err(node_id)?;
     Ok(())
 }
 
@@ -80,8 +79,7 @@ fn open_zip_source_nofollow(
         }
         Err(error) => return Err(StepError::failed(node_id, error.to_string())),
     }
-    let file = files::open_read_nofollow(path)
-        .map_err(|error| StepError::failed(node_id, error.to_string()))?;
+    let file = files::open_read_nofollow(path).step_err(node_id)?;
     if file
         .metadata()
         .map(|metadata| !metadata.is_file())
@@ -128,7 +126,7 @@ pub(crate) fn build_zip<W: std::io::Write + std::io::Seek>(
         let metadata = std::fs::metadata(source_path)?;
         writer
             .start_file(name, zip_file_options(node_id, &metadata)?)
-            .map_err(|error| StepError::failed(node_id, error.to_string()))?;
+            .step_err(node_id)?;
         let mut source = open_zip_source_nofollow(node_id, source_path)?;
         copy_bounded(
             &mut source,
@@ -140,7 +138,7 @@ pub(crate) fn build_zip<W: std::io::Write + std::io::Seek>(
     } else if source_path.is_dir() {
         let mut entries = Vec::new();
         for entry in WalkDir::new(source_path).min_depth(1) {
-            let entry = entry.map_err(|error| StepError::failed(node_id, error.to_string()))?;
+            let entry = entry.step_err(node_id)?;
             if let Some(limit) = count_limit
                 && entries.len() >= limit
             {
@@ -157,13 +155,9 @@ pub(crate) fn build_zip<W: std::io::Write + std::io::Seek>(
             if path == target_path {
                 continue;
             }
-            let rel = path
-                .strip_prefix(source_path)
-                .map_err(|error| StepError::failed(node_id, error.to_string()))?;
+            let rel = path.strip_prefix(source_path).step_err(node_id)?;
             let entry_name = policy::portable_relative_path(rel);
-            let metadata = entry
-                .metadata()
-                .map_err(|error| StepError::failed(node_id, error.to_string()))?;
+            let metadata = entry.metadata().step_err(node_id)?;
             // E13o: symlinks are denied fail-closed, never silently skipped.
             if entry.file_type().is_symlink() {
                 return Err(StepError::failed(
@@ -177,11 +171,11 @@ pub(crate) fn build_zip<W: std::io::Write + std::io::Seek>(
                         format!("{entry_name}/"),
                         zip_directory_options(node_id, &metadata)?,
                     )
-                    .map_err(|error| StepError::failed(node_id, error.to_string()))?;
+                    .step_err(node_id)?;
             } else if entry.file_type().is_file() {
                 writer
                     .start_file(entry_name, zip_file_options(node_id, &metadata)?)
-                    .map_err(|error| StepError::failed(node_id, error.to_string()))?;
+                    .step_err(node_id)?;
                 let mut source = open_zip_source_nofollow(node_id, path.as_path())?;
                 copy_bounded(
                     &mut source,
@@ -203,9 +197,7 @@ pub(crate) fn build_zip<W: std::io::Write + std::io::Seek>(
             format!("source `{source_path}` is not a file or directory"),
         ));
     }
-    writer
-        .finish()
-        .map_err(|error| StepError::failed(node_id, error.to_string()))?;
+    writer.finish().step_err(node_id)?;
     Ok(())
 }
 
