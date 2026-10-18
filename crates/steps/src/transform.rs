@@ -331,9 +331,7 @@ impl StepExecutor for TransformStep {
 }
 
 fn transform_params(node: &NodeDef) -> Result<TransformParams, StepError> {
-    let params: TransformParams = node.deserialize_params().map_err(|error| {
-        StepError::failed(&node.id, format!("invalid transform params: {error}"))
-    })?;
+    let params: TransformParams = engine::step_params(node, "transform")?;
     require(node, Some(&params.transform), "transform")?;
     require(node, Some(&params.source), "source")?;
     require(node, Some(&params.target), "target")?;

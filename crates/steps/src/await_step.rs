@@ -103,9 +103,7 @@ impl StepExecutor for AwaitStep {
 }
 
 fn validate_await_params(node: &NodeDef) -> Result<AwaitParams, StepError> {
-    let params: AwaitParams = node
-        .deserialize_params()
-        .map_err(|error| StepError::failed(&node.id, format!("invalid await params: {error}")))?;
+    let params: AwaitParams = engine::step_params(node, "await")?;
     if params.runs.is_empty() {
         return Err(StepError::failed(
             &node.id,

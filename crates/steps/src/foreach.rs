@@ -69,9 +69,7 @@ impl StepExecutor for ForeachStep {
 }
 
 fn foreach_params(node: &NodeDef) -> Result<ForeachParams, StepError> {
-    let params: ForeachParams = node
-        .deserialize_params()
-        .map_err(|error| StepError::failed(&node.id, format!("invalid foreach params: {error}")))?;
+    let params: ForeachParams = engine::step_params(node, "foreach")?;
     require(node, Some(&params.items), "items")?;
     require(node, Some(&params.subflow), "subflow")?;
     if !(1..=MAX_FOREACH_ITERATIONS).contains(&params.max_iterations) {

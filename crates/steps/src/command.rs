@@ -481,9 +481,7 @@ async fn execute_bundled_tool(
 }
 
 fn command_params(node: &NodeDef) -> Result<CommandParams, StepError> {
-    let params: CommandParams = node
-        .deserialize_params()
-        .map_err(|error| StepError::failed(&node.id, format!("invalid command params: {error}")))?;
+    let params: CommandParams = engine::step_params(node, "command")?;
     if params.command.is_empty() && params.tool.is_none() {
         return Err(StepError::failed(&node.id, "command or tool is required"));
     }

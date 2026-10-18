@@ -591,9 +591,7 @@ fn fallback_http_idempotency_key(
 }
 
 fn http_params(node: &NodeDef) -> Result<HttpParams, StepError> {
-    let params: HttpParams = node
-        .deserialize_params()
-        .map_err(|error| StepError::failed(&node.id, format!("invalid http params: {error}")))?;
+    let params: HttpParams = engine::step_params(node, "http")?;
     require(node, Some(&params.url), "url")?;
     Ok(params)
 }
