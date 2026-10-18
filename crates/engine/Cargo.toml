@@ -39,6 +39,7 @@ uuid.workspace = true
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 toml.workspace = true
 
 [features]

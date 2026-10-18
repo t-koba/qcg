@@ -1408,11 +1408,11 @@ impl StepExecutor for TestDelayedUserStep {
         // how slow the runner was before this step started: a fixed sleep
         // races setup delay against the deadline, while the deadline
         // itself is the grace window's anchor.
-        if let Some(deadline) = ctx.run.elapsed_deadline {
-            tokio::time::sleep_until(deadline + std::time::Duration::from_millis(100)).await;
-        } else {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        }
+        let deadline = ctx
+            .run
+            .elapsed_deadline
+            .expect("the test contract configures an elapsed deadline");
+        tokio::time::sleep_until(deadline + std::time::Duration::from_millis(100)).await;
         Ok(StepOutcome::NeedsUser {
             question: api::FormSpec {
                 id: "delayed-question".into(),
@@ -2809,7 +2809,7 @@ async fn foreach_timeout_charges_cooperative_and_uncooperative_once() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn elapsed_grace_preserves_interaction_with_marker() {
     // E11: a HITL suspension that lands inside the elapsed-deadline
     // grace window is delivered (not discarded) with an
