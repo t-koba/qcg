@@ -29,7 +29,8 @@ pub struct ServerConfig {
     pub max_artifact_bytes: Option<u64>,
     /// Explicit max only. Omitted means no mechanistic limit.
     pub max_artifact_entries: Option<usize>,
-    /// Explicit max only. Omitted means no mechanistic limit.
+    /// Explicit override. Omitted means `policy::DEFAULT_MAX_ASSET_BYTES`
+    /// (16 MiB / 16777216 bytes), never unlimited.
     pub max_asset_bytes: Option<usize>,
     /// Deployment ceiling for per-run total steps. Omitted means the
     /// engine default. Set to cap every run below its contract budget.
