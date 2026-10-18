@@ -4221,9 +4221,14 @@ fields are rejected when their structs define a closed schema.
    `patch_hunks_limit` defaults to 32 edits per call and accepts 1 through 128.
    `patch_bytes_limit` defaults to 65536 bytes of replacement-line payload
    (excluding file content) and accepts 1 through 262144.
-   Other optional byte/count limits are unbounded when omitted (`None`); the
-   effective 8 MiB patch-target ceiling above still applies. Set an explicit
-   max in `qcg.toml` `[runtime]` when a bound is wanted for those fields;
+   `journal_event_limit_bytes` defaults to 8388608 bytes (8 MiB), and
+   `journal_total_limit_bytes` to 67108864 bytes (64 MiB).
+   `journal_event_count_limit` defaults to 1000000 events; `state_limit_bytes`
+   defaults to 16777216 bytes (16 MiB) and also bounds operation-result
+   sidecars. Explicit values override these defaults. Remaining optional
+   byte/count limits are unbounded when omitted (`None`); the effective 8 MiB
+   patch-target ceiling above still applies. Set an explicit max in
+   `qcg.toml` `[runtime]` for remaining fields when a bound is wanted;
    `http_redirect_limit = 0` follows no redirects. Timeouts, `template_fuel`,
    and budget counters keep greater-than-zero sanity checks but no hard ceiling.
    Confirmation plans display the command limits used by execution.

@@ -230,19 +230,19 @@ pub struct RuntimeLimits {
     /// Explicit max only. `None` means no mechanistic limit.
     #[serde(default)]
     pub template_context_limit_bytes: Option<usize>,
-    /// Explicit max only. `None` means no mechanistic limit.
+    /// Omitted (`None`) uses the 8 MiB engine default per journal event.
     #[serde(default)]
     pub journal_event_limit_bytes: Option<usize>,
     /// In-memory scan window for journal tail repair and seq recovery.
     #[serde(default)]
     pub journal_scan_window_bytes: Option<usize>,
-    /// Explicit max only. `None` means no mechanistic limit.
+    /// Omitted (`None`) uses the 64 MiB engine default for the journal.
     #[serde(default)]
     pub journal_total_limit_bytes: Option<usize>,
-    /// Explicit max only. `None` means no mechanistic limit.
+    /// Omitted (`None`) uses the 1,000,000-event engine default.
     #[serde(default)]
     pub journal_event_count_limit: Option<usize>,
-    /// Explicit max only. `None` means no mechanistic limit.
+    /// Omitted (`None`) uses the 16 MiB engine default for state.
     #[serde(default)]
     pub state_limit_bytes: Option<usize>,
     /// Explicit max only. `None` means no mechanistic limit.
