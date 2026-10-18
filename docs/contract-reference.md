@@ -72,10 +72,6 @@ Fields:
 - `max_tokens`: required positive output limit. For reasoning models this
   includes both hidden reasoning tokens and visible output tokens; qcg maps it
   to the field required by the selected API.
-- `journal_scan_window_bytes`: in-memory tail/repair scan window for the
-  run journal, between 4096 and 67108864 bytes. Omitted uses 1 MiB. The
-  window bounds repair memory; the total journal size stays governed by the
-  `journal_*` limits.
 - `max_context_bytes`
 - `max_context_tokens`
 - `max_media_bytes`: required aggregate byte limit when an LLM node declares
@@ -4202,8 +4198,9 @@ fields are rejected when their structs define a closed schema.
    `output_total_limit_bytes`,
    `output_artifact_limit`, `patch_hunks_limit`, `patch_bytes_limit`,
    `template_source_limit_bytes`,
-   `template_context_limit_bytes`, `journal_event_limit_bytes`,
-   `journal_total_limit_bytes`, `journal_event_count_limit`,
+   `template_context_limit_bytes`, `journal_scan_window_bytes`,
+   `journal_event_limit_bytes`, `journal_total_limit_bytes`,
+   `journal_event_count_limit`,
    `state_limit_bytes`, `template_output_limit_bytes`, and `template_fuel`.
    Template output is streamed through a bounded writer and each render gets a
    fresh fuel budget; exceeding either limit fails the render explicitly.
@@ -4217,11 +4214,18 @@ fields are rejected when their structs define a closed schema.
    (including `file`, `json`, and schema-backed custom fields), while
    `input_total_limit_bytes` bounds the sum of encoded input values. These
    limits apply to initial inputs and interactive form answers.
-   There is no mechanistic size limit: every byte/count limit is optional and
-   unbounded when omitted (`None`). Set an explicit max in `qcg.toml`
-   `[runtime]` only when a bound is wanted; `http_redirect_limit = 0` follows
-   no redirects. Timeouts, `template_fuel`, and budget counters keep
-   greater-than-zero sanity checks but no hard ceiling.
+   `journal_scan_window_bytes` bounds the in-memory tail/repair scan window
+   for the run journal. Omitted uses 1048576 bytes (1 MiB); explicit values
+   must be between 4096 and 67108864 bytes (inclusive). It bounds repair
+   memory; total journal size remains governed by the `journal_*` limits.
+   `patch_hunks_limit` defaults to 32 edits per call and accepts 1 through 128.
+   `patch_bytes_limit` defaults to 65536 bytes of replacement-line payload
+   (excluding file content) and accepts 1 through 262144.
+   Other optional byte/count limits are unbounded when omitted (`None`); the
+   effective 8 MiB patch-target ceiling above still applies. Set an explicit
+   max in `qcg.toml` `[runtime]` when a bound is wanted for those fields;
+   `http_redirect_limit = 0` follows no redirects. Timeouts, `template_fuel`,
+   and budget counters keep greater-than-zero sanity checks but no hard ceiling.
    Confirmation plans display the command limits used by execution.
 
 `[budget]`
