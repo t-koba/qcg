@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use contract::{Contract, ModelRef, NodeDef};
-use engine::{StepContext, StepError, StepExecutor, StepOutcome, StepTraits};
+use engine::{StepContext, StepError, StepExecutor, StepOutcome};
 use llm::{DecisionQuestion, DecisionRequest, LlmRuntime};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -182,9 +182,7 @@ impl StepExecutor for LlmDecideStep {
         "llm.decide"
     }
 
-    fn traits(&self) -> StepTraits {
-        StepTraits::parallel()
-    }
+    engine::parallel_step_traits!();
 
     fn params_schema(&self) -> Option<Value> {
         Some(json!({

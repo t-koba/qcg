@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use contract::{Contract, NodeDef};
-use engine::{StepContext, StepError, StepExecutor, StepOutcome, StepTraits};
+use engine::{StepContext, StepError, StepExecutor, StepOutcome};
 use policy::{params_schema, string_schema};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -36,9 +36,7 @@ impl StepExecutor for ReadAnchoredStep {
         ))
     }
 
-    fn traits(&self) -> StepTraits {
-        StepTraits::parallel()
-    }
+    engine::parallel_step_traits!();
 
     fn validate(&self, node: &NodeDef, _contract: &Contract) -> Result<(), StepError> {
         let params = read_anchored_params(node)?;
@@ -162,9 +160,7 @@ impl StepExecutor for PatchStep {
         ))
     }
 
-    fn traits(&self) -> StepTraits {
-        StepTraits::parallel()
-    }
+    engine::parallel_step_traits!();
 
     fn validate(&self, node: &NodeDef, contract: &Contract) -> Result<(), StepError> {
         let params = patch_params(node)?;

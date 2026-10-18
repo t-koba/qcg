@@ -30,9 +30,7 @@ impl StepExecutor for LlmGenerateStep {
         "llm.generate"
     }
 
-    fn traits(&self) -> engine::StepTraits {
-        engine::StepTraits::parallel()
-    }
+    engine::parallel_step_traits!();
 
     fn params_schema(&self) -> Option<Value> {
         Some(params_schema(&["prompt"], llm_common_properties(json!({}))))
@@ -76,9 +74,7 @@ impl StepExecutor for LlmFillStep {
         "llm.fill"
     }
 
-    fn traits(&self) -> engine::StepTraits {
-        engine::StepTraits::parallel()
-    }
+    engine::parallel_step_traits!();
 
     fn params_schema(&self) -> Option<Value> {
         Some(params_schema(

@@ -167,6 +167,16 @@ impl StepTraits {
     }
 }
 
+/// Implement the standard parallel-safe traits for a `StepExecutor`.
+#[macro_export]
+macro_rules! parallel_step_traits {
+    () => {
+        fn traits(&self) -> $crate::StepTraits {
+            $crate::StepTraits::parallel()
+        }
+    };
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum StepControlFlow {
     #[default]

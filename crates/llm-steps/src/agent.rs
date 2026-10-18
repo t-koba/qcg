@@ -340,9 +340,7 @@ impl StepExecutor for LlmAgentStep {
         "llm.agent"
     }
 
-    fn traits(&self) -> engine::StepTraits {
-        engine::StepTraits::parallel()
-    }
+    engine::parallel_step_traits!();
 
     fn params_schema(&self) -> Option<Value> {
         Some(params_schema(

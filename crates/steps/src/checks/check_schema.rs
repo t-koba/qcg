@@ -1,9 +1,7 @@
 use crate::common::{bounded_transform_text, package_file, require};
 use async_trait::async_trait;
 use contract::{Contract, NodeDef};
-use engine::{
-    StepContext, StepError, StepExecutor, StepOutcome, StepTraits, validate_json_schema_findings,
-};
+use engine::{StepContext, StepError, StepExecutor, StepOutcome, validate_json_schema_findings};
 use policy::{MAX_JSON_SCHEMA_BYTES, params_schema, string_schema, validate_bounded_json_schema};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -34,9 +32,7 @@ impl StepExecutor for CheckSchemaStep {
         ))
     }
 
-    fn traits(&self) -> StepTraits {
-        StepTraits::parallel()
-    }
+    engine::parallel_step_traits!();
 
     fn validate(&self, node: &NodeDef, contract: &Contract) -> Result<(), StepError> {
         let params = check_schema_params(node)?;

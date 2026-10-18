@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use contract::{NodeDef, ToolBackendKind, ToolDef, ToolFallback, ToolWorkspace};
-use engine::{StepContext, StepError, StepExecutor, StepOutcome, StepTraits};
+use engine::{StepContext, StepError, StepExecutor, StepOutcome};
 use model::{Finding, Severity};
 use policy::{params_schema, string_schema};
 use serde::Deserialize;
@@ -30,9 +30,7 @@ impl StepExecutor for CheckToolStep {
         ))
     }
 
-    fn traits(&self) -> StepTraits {
-        StepTraits::parallel()
-    }
+    engine::parallel_step_traits!();
 
     fn validate(&self, node: &NodeDef, contract: &Contract) -> Result<(), StepError> {
         let params = check_tool_params(node)?;

@@ -1,7 +1,7 @@
 use crate::common::{bounded_transform_text, require};
 use async_trait::async_trait;
 use contract::{Contract, NodeDef};
-use engine::{StepContext, StepError, StepExecutor, StepOutcome, StepTraits};
+use engine::{StepContext, StepError, StepExecutor, StepOutcome};
 use model::{Finding, Severity};
 use policy::{params_schema, string_schema};
 use serde::Deserialize;
@@ -32,9 +32,7 @@ impl StepExecutor for CheckFormatStep {
         ))
     }
 
-    fn traits(&self) -> StepTraits {
-        StepTraits::parallel()
-    }
+    engine::parallel_step_traits!();
 
     fn validate(&self, node: &NodeDef, _contract: &Contract) -> Result<(), StepError> {
         let _params = check_format_params(node)?;

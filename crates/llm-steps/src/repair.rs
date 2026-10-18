@@ -26,9 +26,7 @@ impl StepExecutor for LlmRepairStep {
         "llm.repair"
     }
 
-    fn traits(&self) -> engine::StepTraits {
-        engine::StepTraits::parallel()
-    }
+    engine::parallel_step_traits!();
 
     fn params_schema(&self) -> Option<Value> {
         Some(params_schema(
