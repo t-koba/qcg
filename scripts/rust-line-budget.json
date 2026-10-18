@@ -1,0 +1,22 @@
+{
+  "_comment": "Rust product-line budget. Metric: physical Rust source lines = text.split(\"\\n\") dropping only the empty trailing split after a final newline (empty file = 0; blank/comment lines count). Product lines = lines under crates/<crate>/src/**/*.rs excluding test-only files (any `tests/` path component, `tests.rs`, `test_support.rs`) and excluding inline test-only `mod NAME { ... }` bodies whose `#[cfg(predicate)]` logically implies `test` (direct `test`, `all(test, ...)` and nested test-implying forms; `any(test, ...)` with a production alternative, `not(test)` and other production cfgs stay product; optional intervening attributes allowed; `mod NAME;` and non-module test-cfg items stay product; nested spans unioned; predicates with more than 24 distinct non-test atoms or unparseable cfg predicates conservatively stay product; braces in line/nested-block comments, normal/raw strings and char literals including `\\xNN`/`\\u{...}` escapes ignored). Test lines = excluded src files/modules plus Rust under workspace tests/, scripts/test-support/ and per-crate tests/test_support dirs; tests are reported but never capped. Discovery and reads fail closed (missing optional test dirs contribute 0; any other unreadable path throws and fails the gate). This file enforces the exact crate set, per-crate product maxima and the total product maximum. Thresholds equal the observed baseline so current sources pass without allowing growth.",
+  "version": 1,
+  "totalMax": 94186,
+  "crates": {
+    "api": 2927,
+    "cli": 7617,
+    "container": 1691,
+    "contract": 6557,
+    "engine": 19028,
+    "expr-wasm": 175,
+    "files": 1224,
+    "llm": 7267,
+    "llm-steps": 12599,
+    "mcp": 3644,
+    "model": 775,
+    "policy": 1699,
+    "server": 7383,
+    "service": 14700,
+    "steps": 6900
+  }
+}

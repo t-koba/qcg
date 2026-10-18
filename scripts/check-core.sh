@@ -2,7 +2,8 @@
 # Canonical Rust/API/SDK verification, shared by local validation and OS CI.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-node --test scripts/product.test.mjs scripts/capabilities.test.mjs scripts/spdx.test.mjs
+node --test scripts/product.test.mjs scripts/capabilities.test.mjs scripts/spdx.test.mjs scripts/rust-line-budget.test.mjs
+node scripts/rust-line-budget.mjs
 cargo fmt --all -- --check
 cargo check --workspace --locked
 cargo check -p expr-wasm --target wasm32-unknown-unknown --locked
