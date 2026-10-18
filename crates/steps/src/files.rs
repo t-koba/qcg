@@ -92,9 +92,7 @@ impl StepExecutor for RenderStep {
 }
 
 fn render_params(node: &NodeDef) -> Result<RenderParams, StepError> {
-    let params: RenderParams = node
-        .deserialize_params()
-        .map_err(|error| StepError::failed(&node.id, format!("invalid render params: {error}")))?;
+    let params: RenderParams = engine::step_params(node, "render")?;
     require(node, Some(&params.template), "template")?;
     require(node, Some(&params.output_file), "output_file")?;
     Ok(params)
@@ -166,9 +164,7 @@ impl StepExecutor for WriteStep {
 }
 
 fn write_params(node: &NodeDef) -> Result<WriteParams, StepError> {
-    let params: WriteParams = node
-        .deserialize_params()
-        .map_err(|error| StepError::failed(&node.id, format!("invalid write params: {error}")))?;
+    let params: WriteParams = engine::step_params(node, "write")?;
     require(node, Some(&params.output_file), "output_file")?;
     require(node, Some(&params.content), "content")?;
     Ok(params)
@@ -240,9 +236,7 @@ impl StepExecutor for CopyStep {
 }
 
 fn copy_params(node: &NodeDef) -> Result<CopyParams, StepError> {
-    let params: CopyParams = node
-        .deserialize_params()
-        .map_err(|error| StepError::failed(&node.id, format!("invalid copy params: {error}")))?;
+    let params: CopyParams = engine::step_params(node, "copy")?;
     require(node, Some(&params.source), "source")?;
     require(node, Some(&params.target), "target")?;
     Ok(params)
