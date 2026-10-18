@@ -48,8 +48,12 @@ class Managed:
     def __init__(self, command, log: Path):
         self.log = log
         self.file = log.open("w")
-        self.process = subprocess.Popen(command, stdout=self.file, stderr=subprocess.STDOUT)
         self.metrics = {"cpu_ticks": 0, "max_rss_kib": 0}
+        try:
+            self.process = subprocess.Popen(command, stdout=self.file, stderr=subprocess.STDOUT)
+        except BaseException:
+            self.file.close()
+            raise
 
     def wait_text(self, pattern):
         deadline = time.monotonic() + 30
@@ -135,16 +139,24 @@ class Qcg:
         self.root = root
         self.server = None
         self.samples = []
-        generators = root / "generators"
-        for name, gate, deny in [("generate", False, False), ("approval", True, False), ("denied", False, True)]:
-            directory = generators / name
-            directory.mkdir(parents=True)
-            (directory / "qcg.toml").write_text(manifest(name, gate, deny))
-        self.start()
+        try:
+            generators = root / "generators"
+            for name, gate, deny in [("generate", False, False), ("approval", True, False), ("denied", False, True)]:
+                directory = generators / name
+                directory.mkdir(parents=True)
+                (directory / "qcg.toml").write_text(manifest(name, gate, deny))
+            self.start()
+        except BaseException:
+            self.stop()
+            raise
 
     def start(self):
         self.server = Managed([str(BINARY), "serve", "--port", "0", "--generators-dir", str(self.root / "generators"), "--runs-dir", str(self.root / "runs")], self.root / "server.log")
-        self.base = self.server.wait_text(r"listening on (http://\S+)")[1]
+        try:
+            self.base = self.server.wait_text(r"listening on (http://\S+)")[1]
+        except BaseException:
+            self.stop()
+            raise
 
     def stop(self, crash=False):
         if self.server:
@@ -220,14 +232,16 @@ async def main():
         root = Path(directory)
         qcg_root = root / "qcg"
         qcg_root.mkdir()
-        qcg = Qcg(qcg_root)
-        client = await Client.connect(TEMPORAL)
-        queue = "qcg-comparison-" + uuid.uuid4().hex
-        worker = Managed([sys.executable, str(Path(__file__).with_name("temporal_worker.py")), TEMPORAL, queue], root / "worker.log")
-        worker.wait_text("ready")
+        qcg = None
+        worker = None
         worker_samples = []
-        permissions = {"qcg": qcg.permission(), "langgraph": {"status": "application_defined", "scope": "This library does not supply qcg's declarative filesystem allowlist; deployment/application controls were not added"}, "temporal": {"status": "application_defined", "scope": "Activities use host permissions; no comparable built-in qcg filesystem allowlist is configured"}}
         try:
+            qcg = Qcg(qcg_root)
+            client = await Client.connect(TEMPORAL)
+            queue = "qcg-comparison-" + uuid.uuid4().hex
+            worker = Managed([sys.executable, str(Path(__file__).with_name("temporal_worker.py")), TEMPORAL, queue], root / "worker.log")
+            worker.wait_text("ready")
+            permissions = {"qcg": qcg.permission(), "langgraph": {"status": "application_defined", "scope": "This library does not supply qcg's declarative filesystem allowlist; deployment/application controls were not added"}, "temporal": {"status": "application_defined", "scope": "Activities use host permissions; no comparable built-in qcg filesystem allowlist is configured"}}
             for engine in ["qcg", "langgraph", "temporal"]:
                 for case in ["generation", "approval_resume", "restart_pending_approval"]:
                     trials = []
@@ -284,8 +298,13 @@ async def main():
                     REPORT.write_text(json.dumps({"recorded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "environment": system, "results": rows, "permission_boundaries": permissions, "failures": failures, "external_model": {"used": False, "tokens": 0, "cost": 0}, "limitations": ["No LLM calls: model and token cost are not compared.", "LangGraph in-process library, qcg HTTP service and Temporal gRPC service are different architectures; raw latency is not an overall rank.", "LangGraph restart replaces the client process after an interrupt; qcg and Temporal worker restart use SIGKILL at the equivalent pending gate.", "Temporal service remains available during worker interruption; qcg uses a local journal, LangGraph SQLite and Temporal a persistent dev server.", "Dify results are stored separately because its native output-variable delivery differs from filesystem artifacts."]}, indent=2)+"\n")
                     print(f"{engine}/{case}: {rows[-1]['successes']}/{COUNT}", flush=True)
         finally:
-            qcg.stop()
-            worker_samples.append(worker.stop())
+            try:
+                if qcg is not None:
+                    qcg.stop()
+            finally:
+                if worker is not None:
+                    worker_samples.append(worker.stop())
+                    worker = None
         data = json.loads(REPORT.read_text())
         data["qcg_server_instances"] = qcg.samples
         data["temporal_worker_instances"] = worker_samples

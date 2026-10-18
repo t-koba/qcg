@@ -13,6 +13,7 @@ bash scripts/check-generated-docs.sh
 bash scripts/check-capability-matrix.sh
 bash scripts/check-sdk.sh
 bash scripts/check-sdk-behavior.sh
+python3 scripts/comparison/test_run_cleanup.py
 bash scripts/check-third-party-notices.sh
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
