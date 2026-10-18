@@ -292,22 +292,5 @@ fn patch_limits(ctx: &StepContext<'_>) -> files::PatchLimits {
 }
 
 fn patch_error_message(error: &files::AnchoredPatchError) -> String {
-    use files::AnchoredPatchError as Error;
-    match error {
-        Error::AnchorStale {
-            anchor,
-            remaps,
-            current_base,
-        } => {
-            let hints: Vec<String> = remaps
-                .iter()
-                .map(|remap| format!("{} -> {}", remap.stale_anchor, remap.current_anchor))
-                .collect();
-            format!(
-                "patch anchor `{anchor}` is stale (base `{current_base}`); remaps: {}",
-                hints.join(", ")
-            )
-        }
-        other => format!("patch rejected: {other}"),
-    }
+    engine::anchored_patch_error_message(error, "patch")
 }

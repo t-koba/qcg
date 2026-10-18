@@ -268,24 +268,7 @@ impl LlmRepairStep {
 /// Stale anchors carry remaps so the cycle-level retry can show what
 /// moved; every other rejection names its cause.
 fn repair_patch_error(error: &files::AnchoredPatchError) -> String {
-    use files::AnchoredPatchError as Error;
-    match error {
-        Error::AnchorStale {
-            anchor,
-            remaps,
-            current_base,
-        } => {
-            let hints: Vec<String> = remaps
-                .iter()
-                .map(|remap| format!("{} -> {}", remap.stale_anchor, remap.current_anchor))
-                .collect();
-            format!(
-                "repair patch anchor `{anchor}` is stale (base `{current_base}`); remaps: {}",
-                hints.join(", ")
-            )
-        }
-        other => format!("repair patch rejected: {other}"),
-    }
+    engine::anchored_patch_error_message(error, "repair patch")
 }
 
 /// Refuses a self-repair write-back whose snapshot went stale.

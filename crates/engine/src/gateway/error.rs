@@ -76,3 +76,80 @@ pub enum GatewayError {
     #[error("file `{path}` is not valid UTF-8 for anchored patch")]
     PatchNotUtf8 { path: String },
 }
+
+/// Formats an anchored-patch failure with a caller-provided prefix.
+///
+/// Stale anchors render their remaps so the caller can show what moved;
+/// every other rejection names its cause. Pure over the error value so
+/// step flows share one formatter while keeping caller-specific prefixes.
+pub fn anchored_patch_error_message(error: &files::AnchoredPatchError, prefix: &str) -> String {
+    use files::AnchoredPatchError as Error;
+    match error {
+        Error::AnchorStale {
+            anchor,
+            remaps,
+            current_base,
+        } => {
+            let hints: Vec<String> = remaps
+                .iter()
+                .map(|remap| format!("{} -> {}", remap.stale_anchor, remap.current_anchor))
+                .collect();
+            format!(
+                "{prefix} anchor `{anchor}` is stale (base `{current_base}`); remaps: {}",
+                hints.join(", ")
+            )
+        }
+        other => format!("{prefix} rejected: {other}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::anchored_patch_error_message;
+
+    fn stale_error() -> files::AnchoredPatchError {
+        files::AnchoredPatchError::AnchorStale {
+            anchor: "2:deadbeef".into(),
+            remaps: vec![
+                files::AnchorRemap {
+                    stale_anchor: "2:deadbeef".into(),
+                    current_anchor: "2:015cadfe".into(),
+                },
+                files::AnchorRemap {
+                    stale_anchor: "3:aaaa".into(),
+                    current_anchor: "4:bbbb".into(),
+                },
+            ],
+            current_base: "abc".into(),
+        }
+    }
+
+    #[test]
+    fn stale_remap_pins_patch_prefix() {
+        assert_eq!(
+            anchored_patch_error_message(&stale_error(), "patch"),
+            "patch anchor `2:deadbeef` is stale (base `abc`); remaps: 2:deadbeef -> 2:015cadfe, 3:aaaa -> 4:bbbb"
+        );
+    }
+
+    #[test]
+    fn stale_remap_pins_repair_prefix() {
+        assert_eq!(
+            anchored_patch_error_message(&stale_error(), "repair patch"),
+            "repair patch anchor `2:deadbeef` is stale (base `abc`); remaps: 2:deadbeef -> 2:015cadfe, 3:aaaa -> 4:bbbb"
+        );
+    }
+
+    #[test]
+    fn generic_error_pins_both_prefixes() {
+        let error = files::AnchoredPatchError::EmptyEdits;
+        assert_eq!(
+            anchored_patch_error_message(&error, "patch"),
+            "patch rejected: patch has no edits"
+        );
+        assert_eq!(
+            anchored_patch_error_message(&error, "repair patch"),
+            "repair patch rejected: patch has no edits"
+        );
+    }
+}
