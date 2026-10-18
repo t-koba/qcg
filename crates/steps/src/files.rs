@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use contract::{Contract, NodeDef};
-use engine::{StepContext, StepError, StepExecutor, StepOutcome};
+use engine::{ResultExt, StepContext, StepError, StepExecutor, StepOutcome};
 use policy::{params_schema, string_schema};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -73,12 +73,8 @@ impl StepExecutor for RenderStep {
                 ctx.vars.to_json(),
                 &ctx.run.contract.manifest.runtime,
             )
-            .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
-        let path = ctx
-            .run
-            .fs
-            .resolve_write(&output_file)
-            .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
+            .step_err(&node.id)?;
+        let path = ctx.run.fs.resolve_write(&output_file).step_err(&node.id)?;
         write_atomic(&ctx.run.fs, &path, rendered.as_bytes(), None).await?;
         Ok(StepOutcome::Success {
             output: Some(json!({ "file": output_file })),
@@ -135,11 +131,7 @@ impl StepExecutor for WriteStep {
     ) -> Result<StepOutcome, StepError> {
         let params = write_params(node)?;
         let output_file = ctx.render_inline(node, &params.output_file)?;
-        let path = ctx
-            .run
-            .fs
-            .resolve_write(&output_file)
-            .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
+        let path = ctx.run.fs.resolve_write(&output_file).step_err(&node.id)?;
         let content = ctx.render_inline(node, &params.content)?;
         let unix_mode = params
             .unix_mode
@@ -201,20 +193,14 @@ impl StepExecutor for CopyStep {
         let params = copy_params(node)?;
         let source = package_file(&ctx.run.contract, node, &params.source, "copy source")?;
         let target_name = ctx.render_inline(node, &params.target)?;
-        let target = ctx
-            .run
-            .fs
-            .resolve_write(&target_name)
-            .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
+        let target = ctx.run.fs.resolve_write(&target_name).step_err(&node.id)?;
         let input_limit = ctx.run.contract.manifest.runtime.file_input_limit_bytes;
         // Package sources are service-trusted generator content; the
         // target below is written through the gateway (E13).
-        let source_file = std::fs::File::open(&source)
-            .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
+        let source_file = std::fs::File::open(&source).step_err(&node.id)?;
         let bytes = read_opened_bounded(source_file, input_limit, "copy source")
             .map_err(|error| StepError::failed(&node.id, error))?;
-        let source_mode = source_unix_mode(&source)
-            .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
+        let source_mode = source_unix_mode(&source).step_err(&node.id)?;
         write_atomic(&ctx.run.fs, &target, &bytes, source_mode).await?;
         Ok(StepOutcome::Success {
             output: Some(json!({ "file": target_name })),
