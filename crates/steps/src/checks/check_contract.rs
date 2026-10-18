@@ -102,9 +102,7 @@ impl StepExecutor for CheckContractStep {
 }
 
 fn check_contract_params(node: &NodeDef) -> Result<CheckContractParams, StepError> {
-    let params: CheckContractParams = node.deserialize_params().map_err(|error| {
-        StepError::failed(&node.id, format!("invalid check.contract params: {error}"))
-    })?;
+    let params: CheckContractParams = engine::step_params(node, "check.contract")?;
     require(node, Some(&params.source), "source")?;
     Ok(params)
 }

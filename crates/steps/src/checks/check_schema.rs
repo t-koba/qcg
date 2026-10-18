@@ -84,9 +84,7 @@ impl StepExecutor for CheckSchemaStep {
 }
 
 fn check_schema_params(node: &NodeDef) -> Result<CheckSchemaParams, StepError> {
-    let params: CheckSchemaParams = node.deserialize_params().map_err(|error| {
-        StepError::failed(&node.id, format!("invalid check.schema params: {error}"))
-    })?;
+    let params: CheckSchemaParams = engine::step_params(node, "check.schema")?;
     require(node, Some(&params.source), "source")?;
     require(node, Some(&params.schema), "schema")?;
     Ok(params)

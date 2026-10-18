@@ -406,6 +406,23 @@ fn required_step_field_preserves_missing_empty_and_whitespace_behavior() {
 }
 
 #[test]
+fn step_params_reports_node_id_and_label() {
+    let node = node("probe", "check.command");
+    let error = crate::step_params::<String>(&node, "check.command")
+        .expect_err("table params cannot deserialize as a string");
+    match error {
+        crate::StepError::Failed { node, message } => {
+            assert_eq!(node, "probe");
+            assert_eq!(
+                message,
+                "invalid check.command params: invalid type: map, expected a string"
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
 fn generator_cannot_claim_llm_provider_credential_environment() {
     let provider = llm::LlmRouter::parse_text(
         r#"

@@ -216,9 +216,7 @@ struct CheckToolParams {
 }
 
 fn check_tool_params(node: &NodeDef) -> Result<CheckToolParams, StepError> {
-    let params: CheckToolParams = node.deserialize_params().map_err(|error| {
-        StepError::failed(&node.id, format!("invalid check.tool params: {error}"))
-    })?;
+    let params: CheckToolParams = engine::step_params(node, "check.tool")?;
     if params.tool.trim().is_empty() {
         return Err(StepError::failed(&node.id, "tool is required"));
     }

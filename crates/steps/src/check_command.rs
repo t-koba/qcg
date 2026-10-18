@@ -149,9 +149,7 @@ impl StepExecutor for CheckCommandStep {
 }
 
 fn check_command_params(node: &NodeDef) -> Result<CheckCommandParams, StepError> {
-    let params: CheckCommandParams = node.deserialize_params().map_err(|error| {
-        StepError::failed(&node.id, format!("invalid check.command params: {error}"))
-    })?;
+    let params: CheckCommandParams = engine::step_params(node, "check.command")?;
     if params.command.is_empty() {
         return Err(StepError::failed(&node.id, "command must not be empty"));
     }

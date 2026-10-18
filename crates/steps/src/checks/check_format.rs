@@ -98,9 +98,7 @@ impl StepExecutor for CheckFormatStep {
 }
 
 fn check_format_params(node: &NodeDef) -> Result<CheckFormatParams, StepError> {
-    let params: CheckFormatParams = node.deserialize_params().map_err(|error| {
-        StepError::failed(&node.id, format!("invalid check.format params: {error}"))
-    })?;
+    let params: CheckFormatParams = engine::step_params(node, "check.format")?;
     require(node, Some(&params.source), "source")?;
     require(node, Some(&params.content), "content")?;
     if !matches!(params.content.as_str(), "json" | "toml") {

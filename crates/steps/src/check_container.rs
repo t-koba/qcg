@@ -252,9 +252,7 @@ impl StepExecutor for CheckContainerStep {
 }
 
 fn check_container_params(node: &NodeDef) -> Result<CheckContainerParams, StepError> {
-    let params: CheckContainerParams = node.deserialize_params().map_err(|error| {
-        StepError::failed(&node.id, format!("invalid check.container params: {error}"))
-    })?;
+    let params: CheckContainerParams = engine::step_params(node, "check.container")?;
     if params.command.is_empty() {
         return Err(StepError::failed(&node.id, "command must not be empty"));
     }

@@ -4,7 +4,7 @@ use camino::Utf8PathBuf;
 use contract::{Contract, NodeDef, RuntimeLimits, StepType};
 use minijinja::{Environment, ErrorKind};
 use model::Finding;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -75,6 +75,12 @@ impl StepError {
 
 pub trait ResultExt<T> {
     fn step_err(self, node: impl Into<String>) -> Result<T, StepError>;
+}
+
+/// Deserialize a step's params with the shared `invalid <label> params` diagnostic.
+pub fn step_params<T: DeserializeOwned>(node: &NodeDef, label: &str) -> Result<T, StepError> {
+    node.deserialize_params()
+        .map_err(|error| StepError::failed(&node.id, format!("invalid {label} params: {error}")))
 }
 
 /// Validate a required string field from a step's decoded parameters.
