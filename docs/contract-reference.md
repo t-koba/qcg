@@ -4369,11 +4369,12 @@ to the journal; any later non-terminal append clears it. A truncated tail
 WITH the marker refuses repair as possible tampering; WITHOUT the marker it
 repairs as crash residue. See `docs/operations.md` for operator guidance.
 
-Admission records vs `.admission-*.lock`: admission records are persistent
-(idempotency mappings under `<runs-dir>/idempotency/` with 24-hour TTL plus
-the durable `run_queued` journal event), while `.admission-*.lock` files are
-stateless coordination only — small fixed-size files that are never unlinked
-and hold no run state. Large operation results spill to a sidecar blob under
+Admission records and run coordination locks are different mechanisms.
+Admission records persist (idempotency mappings under `<runs-dir>/idempotency/`
+with 24-hour TTL plus the durable `run_queued` journal event), while the
+`.admission-shards/` and `.handoff-shards/` files are stateless fixed-shard
+locks that are never unlinked and hold no run state. Large operation results
+spill to a sidecar blob under
 the run meta dir past 64 KiB (`OPERATION_RESULT_MAX_BYTES`); the journal
 carries `result_ref` and the guard reloads the blob on resend. One shared
 per-run journal poller serves all SSE subscribers (`journal_pollers`); live

@@ -37,14 +37,24 @@ impl LocalService {
         // shutdown settlement is still writing; refuse it like every other
         // mutating operation (E05).
         self.ensure_running()?;
-        // Stable store lock precedes execution lock; re-check disk even when
-        // the local map still contains a run deleted by a peer.
+        // Stable store lock precedes handoff and execution locks; re-check
+        // disk even when the local map still contains a run deleted by a peer.
         let _maintenance = crate::run_dirs::try_lock_store_maintenance(&self.inner.runs_dir)
             .map_err(api_internal)?
             .ok_or_else(|| ApiError::Conflict {
                 detail: "run store maintenance is busy; retry".into(),
             })?;
         let run_dir = self.run_dir_for(id).await?;
+        let _admission = crate::run_dirs::try_lock_run_admission(&run_dir)
+            .map_err(api_internal)?
+            .ok_or_else(|| ApiError::Conflict {
+                detail: format!("run `{id}` admission is busy; retry deletion"),
+            })?;
+        let _handoff = crate::run_dirs::try_lock_run_handoff(&run_dir)
+            .map_err(api_internal)?
+            .ok_or_else(|| ApiError::Conflict {
+                detail: format!("run `{id}` is being requeued; retry deletion"),
+            })?;
         crate::invalidation::require_run_directory(&run_dir)?;
         // A peer may own execution while this process sees no local task:
         // verify the execution lease and pending cancel mailbox in addition

@@ -1162,28 +1162,34 @@ impl LocalService {
     pub(crate) async fn collect_retained_runs(&self) -> Result<(), ServiceError> {
         let directory = self.inner.runs_dir.clone();
         let policy = self.inner.deployment_policy;
-        let maintenance_lock = self
+        let maintenance = self
             .blocking_work(move || {
                 let Some(lock) = try_lock_store_maintenance(&directory)? else {
                     return Ok(None);
                 };
-                gc_run_directories(
+                let deleted = gc_run_directories(
                     &directory,
                     policy.gc_keep,
                     policy.gc_keep_failed,
                     true,
                     policy.max_directory_scan_entries,
                 )?;
-                Ok(Some(lock))
+                Ok(Some((lock, deleted)))
             })
             .await?;
-        let Some(maintenance_lock) = maintenance_lock else {
+        let Some((maintenance_lock, deleted)) = maintenance else {
             return Ok(());
         };
+        let deleted: std::collections::HashSet<_> = deleted.into_iter().collect();
         let mut runs = self.inner.runs.write().await;
         let mut removed = Vec::new();
         for (id, record) in runs.iter() {
-            if record.state.is_terminal() && !is_regular_directory(&record.run_dir)? {
+            // A directory deleted by this protected GC pass was terminal on
+            // disk under both leases even if the local task-completion path
+            // has not yet converged its in-memory status.
+            if (deleted.contains(&record.run_dir) && !is_regular_directory(&record.run_dir)?)
+                || (record.state.is_terminal() && !is_regular_directory(&record.run_dir)?)
+            {
                 removed.push(id.clone());
             }
         }

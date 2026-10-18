@@ -280,7 +280,7 @@ marker refuses repair as possible tampering; WITHOUT it the tail repairs as
 crash residue (complete JSON gains its newline, torn fragments truncate).
 The marker must be a non-symlink regular file; unreadable markers fail
 closed. See `docs/operations.md` durability section for the operator mapping
-table, admission-records vs `.admission-*.lock` distinction, large-result
+table, admission-records vs run-coordination-lock distinction, large-result
 sidecar spill (64 KiB bound, `result_ref`), shared per-run journal pollers,
 and second-precision snapshot durations for stable ETags. The model call-id
 registry fails closed: the same call id with different args is refused, never

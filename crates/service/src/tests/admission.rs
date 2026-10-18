@@ -942,7 +942,7 @@ fn colliding_reserved_ids() -> (String, String) {
             hash ^= u64::from(*byte);
             hash = hash.wrapping_mul(0x100000001b3);
         }
-        (hash as usize) & (crate::run_dirs::ADMISSION_SHARD_COUNT - 1)
+        (hash as usize) & (crate::run_dirs::RUN_COORDINATION_SHARD_COUNT - 1)
     }
     let mut seen: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
     for index in 0..4096u32 {
@@ -1660,9 +1660,9 @@ async fn g03_concurrent_same_run_admission_stays_exclusive() {
         .expect("shards should read")
         .count();
     assert!(
-        shard_files <= crate::run_dirs::ADMISSION_SHARD_COUNT,
+        shard_files <= crate::run_dirs::RUN_COORDINATION_SHARD_COUNT,
         "shard files must stay bounded at {}: {shard_files}",
-        crate::run_dirs::ADMISSION_SHARD_COUNT
+        crate::run_dirs::RUN_COORDINATION_SHARD_COUNT
     );
 }
 

@@ -47,14 +47,71 @@ impl LocalService {
     }
 
     pub(super) async fn preempt_run(&self, id: &str) -> Result<(), ApiError> {
+        self.preempt_run_inner(
+            id,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    async fn preempt_run_inner(
+        &self,
+        id: &str,
+        #[cfg(test)] pause: Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    ) -> Result<(), ApiError> {
+        let (run_dir, task_identity) = {
+            let runs = self.inner.runs.read().await;
+            let Some(record) = runs.get(id) else {
+                return Err(api_not_found(format!("run `{id}` was not found")));
+            };
+            if record.state != RunStatus::Running
+                || record.preempted
+                || record.ephemeral
+                || record.owner_id != self.inner.owner_id
+            {
+                return Ok(());
+            }
+            (record.run_dir.clone(), Arc::clone(&record.task))
+        };
+        // Acquire before canceling/marking the victim and retain through the
+        // old writer, inter-lease gap, durable requeue and shutdown settlement.
+        let Some(_handoff) = crate::run_dirs::lock_run_handoff(&run_dir, &self.inner.shutdown)
+            .await
+            .map_err(api_internal)?
+        else {
+            return Ok(());
+        };
+        // GC may have won before we acquired the handoff. A missing directory
+        // is a settled no-op; never recreate metadata from a stale map entry.
+        if !crate::run_dirs::is_regular_directory(&run_dir).map_err(api_internal)? {
+            return Ok(());
+        }
+        let summary = crate::summaries::run_selector_info(&run_dir).map_err(api_internal)?;
+        if summary.run_id != id
+            || summary.status != "running"
+            || crate::run_dirs::read_run_execution_owner(&run_dir)
+                .is_some_and(|owner| owner != self.inner.owner_id)
+        {
+            return Ok(());
+        }
         let boundary =
             self.inner.deployment_policy.preemption_mode == policy::PreemptionMode::StepBoundary;
         let (handle, completion, requeue) = {
             let mut runs = self.inner.runs.write().await;
             let Some(record) = runs.get_mut(id) else {
-                return Err(api_not_found(format!("run `{id}` was not found")));
+                return Ok(());
             };
-            if record.state != RunStatus::Running || record.preempted {
+            if record.state != RunStatus::Running
+                || record.preempted
+                || record.ephemeral
+                || record.owner_id != self.inner.owner_id
+                || record.run_dir != run_dir
+                || !Arc::ptr_eq(&record.task, &task_identity)
+            {
                 return Ok(());
             }
             // Observe this exact task without taking cancellation/shutdown's
@@ -145,6 +202,11 @@ impl LocalService {
                 }
             }
         }
+        #[cfg(test)]
+        if let Some((reached, proceed)) = pause {
+            let _ = reached.send(());
+            let _ = proceed.await;
+        }
         // Hold the execution lease across requeue. A resumer or peer must
         // not start a writer between the rendezvous and the durable event.
         // Contention can be transient during an owner handoff; once the old
@@ -155,6 +217,7 @@ impl LocalService {
                 .map_err(api_internal)?
         else {
             tracing::info!(run_id = %id, "preemption requeue stopped during service shutdown");
+            self.settle_shutdown_without_task(id, &staged).await?;
             return Ok(());
         };
         let mut staged = staged;
@@ -173,6 +236,9 @@ impl LocalService {
             let prior_events =
                 crate::summaries::read_journal_events(&staged.run_dir).map_err(api_internal)?;
             let state = engine::RunState::fold_values(&prior_events).map_err(api_internal)?;
+            if state.terminal.is_some() || state.pending.is_some() {
+                return Ok(None);
+            }
             if boundary {
                 let mut runs = self.inner.runs.write().await;
                 let Some(record) = runs.get_mut(id) else {
@@ -284,3 +350,6 @@ impl LocalService {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;

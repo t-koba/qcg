@@ -202,11 +202,18 @@ runs, age out normally, and can be explicitly deleted. Export a bundle before
 deletion when evidence must survive.
 
 Invalidation, service deletion, automatic GC, and CLI deleting GC coordinate
-through the stable store-level `.maintenance.lock`, always acquired before an
-execution lease. Contended user mutations report a retryable conflict; service
-GC skips a contended sweep. Existence and durable state are checked under the
-leases so a missing/deleted run is never recreated by invalidation or deletion.
-Do not remove coordination files while any process uses the store.
+through the stable store-level `.maintenance.lock`; service deletion and GC
+acquire it before coordination leases. Preemption acquires a fixed-sharded
+`.handoff-shards/` lease before canceling a victim and holds it through durable
+requeue. Service deletion and GC probe admission, handoff, and execution
+leases, then recheck terminal state immediately before removal; the admission
+shard prevents same-ID creation from racing deletion.
+A contended deletion reports a retryable conflict; service GC skips contended
+candidates rather than waiting. Maintenance, admission, and handoff
+coordination files live outside run directories; shard counts are fixed.
+Per-run execution locks live
+in run metadata. Never unlink a coordination file while any process uses the
+store.
 Publication syncs a same-directory temporary file, atomically renames it to
 the authoritative name without replacement under the store lease, and syncs
 the directory on Unix. A crash before publication leaves only an ignored
@@ -586,7 +593,7 @@ run without its shutdown claim, so both propagate and a continued run never
 carries a stale shutdown claim. The `failed_terminal_marker_fails_the_event_operation`
 native test pins this fail-closed behavior.
 
-Admission records vs `.admission-*.lock`: they are different mechanisms.
+Admission records and run coordination locks are different mechanisms.
 
 - Admission records are persistent: idempotency mappings under
   `<runs-dir>/idempotency/` (24-hour TTL, survive restarts and shared-store
@@ -598,11 +605,11 @@ Admission records vs `.admission-*.lock`: they are different mechanisms.
   briefly start its engine. Such surplus execution never commits and is
   canceled by the orphan settlement at commit time, so every stale execution
   converges or cancels and never leaks (E02).
-- Per-run admission locks are small, fixed-size files next to the run
-  directories (`.admission-*.lock`). They are intentionally never unlinked:
-  removing a locked file would let a later admission lock a fresh inode while
-  the current holder still owns the old one. They hold no run state, are
-  stateless coordination only, and can be ignored by operators.
+- Admission and preemption-handoff locks use separate fixed-size shard sets
+  in `.admission-shards/` and `.handoff-shards/` under the runs directory.
+  They are intentionally never unlinked: removing a locked file would let a
+  later operation lock a fresh inode while the current holder still owns the
+  old one. They hold no run state and are stateless coordination only.
 
 Large operation results spill to a sidecar blob under the run meta dir when
 they exceed 64 KiB (`OPERATION_RESULT_MAX_BYTES` in
@@ -832,9 +839,11 @@ parallel wave, finishes and checkpoints before yielding; no next node/wave start
 Startup/lifecycle work belongs to the current boundary. A yield is nonterminal:
 it does not run failure hooks or write a canceled/failed settlement. Completion,
 HITL suspension, and actual execution failures retain their normal handling.
-The yield marker syncs the journal, and the service waits for the old task and
-writer to exit, then holds the execution lease across requeue. There is **no
-five-second timeout-to-interrupt fallback** in this mode. Urgent work waits for
+The service acquires the handoff lease before requesting yield; after the old
+task and writer exit, it acquires the execution lease and holds both through
+requeue. Retention GC skips any candidate whose handoff or execution lease is
+owned, so temporary interrupt terminals cannot be collected mid-requeue. There
+is **no five-second timeout-to-interrupt fallback** in this mode. Urgent work waits for
 the current boundary; user cancellation, shutdown, command timeouts, and elapsed
 budgets remain separate and effective, and may still interrupt work.
 

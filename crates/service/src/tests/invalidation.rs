@@ -201,6 +201,24 @@ async fn invalidation_delete_and_gc_share_stable_maintenance_coordination() {
     service.collect_retained_runs().await.unwrap();
     assert!(root.join("success").exists());
     drop(lock);
+    let admission = crate::run_dirs::try_lock_run_admission(&root.join("success"))
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        service.delete_run("success").await,
+        Err(ApiError::Conflict { .. })
+    ));
+    assert!(root.join("success").exists());
+    drop(admission);
+    let handoff = crate::run_dirs::try_lock_run_handoff(&root.join("success"))
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        service.delete_run("success").await,
+        Err(ApiError::Conflict { .. })
+    ));
+    assert!(root.join("success").exists());
+    drop(handoff);
     service.invalidate_run("success", request()).await.unwrap();
     service.collect_retained_runs().await.unwrap();
     assert!(!root.join("success").exists());

@@ -115,19 +115,58 @@ pub(crate) fn gc_run_directories(
                 continue;
             }
         };
+        candidates.push((started_at, path));
+    }
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
+    let mut deleted = Vec::new();
+    let mut kept_non_failed = 0_usize;
+    let mut kept_failed = 0_usize;
+    for (started_at, path) in candidates {
+        // A temporary interrupt terminal is not collectible until the entire
+        // preemption handoff ends, including the gap between execution leases.
+        // Probe admission, handoff, and execution ownership before charging a
+        // keep slot. Admission fences same-ID recreation; busy/changed runs
+        // must not evict older, genuinely terminal runs from the budget.
+        let protection = (|| {
+            let Some(admission) = crate::run_dirs::try_lock_run_admission(&path)? else {
+                return Ok(None);
+            };
+            let Some(handoff) = crate::run_dirs::try_lock_run_handoff(&path)? else {
+                return Ok(None);
+            };
+            let Some(execution) = crate::run_dirs::try_lock_existing_run_execution(&path)? else {
+                return Ok(None);
+            };
+            let (summary, _) = run_summary_core_with_seq(&path)?;
+            Ok::<_, ServiceError>(Some((admission, handoff, execution, summary)))
+        })();
+        let (_admission, _handoff, _execution, summary) = match protection {
+            Ok(Some(protection)) => protection,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(run_path = %path, %error, "skipping unprotected or changed run during retention GC");
+                continue;
+            }
+        };
+        if !matches!(
+            summary.status.as_str(),
+            "success" | "failed" | "canceled" | "interrupted"
+        ) {
+            continue;
+        }
+        // A replaced identity must be sorted afresh on the next sweep.
+        if chrono::DateTime::parse_from_rfc3339(&summary.started_at)
+            .ok()
+            .is_none_or(|current| current != started_at)
+        {
+            continue;
+        }
         let expired = summary.retention_days.is_some_and(|days| {
             chrono::Duration::try_days(i64::from(days))
                 .and_then(|duration| now.checked_sub_signed(duration))
                 .is_some_and(|cutoff| started_at < cutoff)
         });
         let failed = summary.status == "failed";
-        candidates.push((started_at, path, expired, failed));
-    }
-    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
-    let mut deleted = Vec::new();
-    let mut kept_non_failed = 0_usize;
-    let mut kept_failed = 0_usize;
-    for (_, path, expired, failed) in candidates {
         let keep_candidate = if !expired && failed && kept_failed < keep_failed {
             kept_failed += 1;
             true
@@ -165,6 +204,79 @@ mod tests {
         );
         std::fs::write(run_meta_dir(run_dir).join("journal.jsonl"), lines)
             .expect("journal should be written");
+    }
+
+    #[test]
+    fn admission_owned_candidate_is_skipped_without_consuming_keep_slots() {
+        let root = crate::tests::support::temp_run_dir("gc-admission-owned");
+        std::fs::create_dir_all(&root).expect("temp root should be created");
+        let _temp = crate::tests::support::TempGuard(root.clone());
+        let stamp =
+            |minutes| (chrono::Utc::now() - chrono::Duration::minutes(minutes)).to_rfc3339();
+        let admission_owned = root.join("admission-owned");
+        let older = root.join("older-unlocked");
+        let oldest = root.join("oldest-unlocked");
+        write_run(&admission_owned, "success", &stamp(1), None);
+        write_run(&older, "success", &stamp(2), None);
+        write_run(&oldest, "success", &stamp(3), None);
+        let _admission = crate::run_dirs::try_lock_run_admission(&admission_owned)
+            .unwrap()
+            .unwrap();
+        let deleted = gc_run_directories(&root, 1, 0, true, 16).unwrap();
+        assert_eq!(
+            deleted,
+            vec![oldest],
+            "the busy candidate must not consume the only keep slot"
+        );
+        assert!(admission_owned.exists());
+        assert!(older.exists());
+    }
+
+    #[test]
+    fn execution_owned_terminals_survive_gc_without_consuming_keep_slots() {
+        let runs = crate::tests::support::temp_run_dir("gc-execution-owned");
+        std::fs::create_dir_all(&runs).unwrap();
+        let _temp = crate::tests::support::TempGuard(runs.clone());
+        let stamp =
+            |minutes| (chrono::Utc::now() - chrono::Duration::minutes(minutes)).to_rfc3339();
+        let active = runs.join("active");
+        let expired_active = runs.join("expired-active");
+        let older = runs.join("older");
+        let expired_idle = runs.join("expired-idle");
+        write_run(&active, "success", &stamp(1), None);
+        write_run(&older, "success", &stamp(2), None);
+        write_run(&expired_active, "success", &stamp(3), Some(0));
+        write_run(&expired_idle, "success", &stamp(4), Some(0));
+        let active_lease = crate::run_dirs::try_lock_run_execution(&active)
+            .unwrap()
+            .unwrap();
+        let expired_lease = crate::run_dirs::try_lock_run_execution(&expired_active)
+            .unwrap()
+            .unwrap();
+
+        let deleted = gc_run_directories(&runs, 1, 0, true, 4).unwrap();
+        assert_eq!(
+            deleted,
+            vec![expired_idle],
+            "ordinary unlocked expiry still wins"
+        );
+        assert!(active.is_dir());
+        assert!(
+            expired_active.is_dir(),
+            "even expired terminals are protected by execution ownership"
+        );
+        assert!(
+            older.is_dir(),
+            "a busy newer candidate must not consume the keep slot"
+        );
+        drop(active_lease);
+        drop(expired_lease);
+        let deleted = gc_run_directories(&runs, 1, 0, true, 4).unwrap();
+        assert_eq!(deleted, vec![older, expired_active]);
+        assert!(
+            active.is_dir(),
+            "normal newest-first retention resumes after unlock"
+        );
     }
 
     #[test]

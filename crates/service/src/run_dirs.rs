@@ -203,26 +203,26 @@ impl Drop for RunAdmissionLock {
     }
 }
 
-/// Number of admission-lock shards (G03). Power of two so the index is a
-/// bitmask; the file count in the store stays constant regardless of
-/// lifetime admissions.
-pub(crate) const ADMISSION_SHARD_COUNT: usize = 64;
+/// Number of run-coordination shards. Power of two so the index is a
+/// bitmask; each independent lock namespace has a fixed file count.
+pub(crate) const RUN_COORDINATION_SHARD_COUNT: usize = 64;
 
-/// Maps a run id to its admission shard (FNV-1a, 64-bit, same family as the
-/// workspace patch shards). Distinct spellings of one id share one shard
+/// Maps a run id to its coordination shard (FNV-1a, 64-bit, same family as
+/// the workspace patch shards). Distinct spellings of one id share one shard
 /// because the id itself (the directory name) is hashed, never a path.
-fn admission_shard_index(run_id: &str) -> usize {
+fn run_coordination_shard_index(run_id: &str) -> usize {
     let mut hash: u64 = 0xcbf29ce484222325;
     for byte in run_id.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    (hash as usize) & (ADMISSION_SHARD_COUNT - 1)
+    (hash as usize) & (RUN_COORDINATION_SHARD_COUNT - 1)
 }
 
 /// Whether a runs-directory entry is store coordination/metadata rather
 /// than a run directory (G03): hidden entries (`.service.lock`,
-/// `.maintenance.lock`, legacy `.admission-*.lock`, `.admission-shards/`)
+/// `.maintenance.lock`, legacy `.admission-*.lock`, `.admission-shards/`,
+/// `.handoff-shards/`)
 /// and the `idempotency` bookkeeping directory. Scans skip these WITHOUT
 /// counting them toward `max_scan_entries`, so lifetime admissions can
 /// never exhaust the recovery budget. Mirrors the shutdown orphan pass,
@@ -234,21 +234,62 @@ pub(crate) fn is_store_coordination_name(name: &str) -> bool {
 pub(crate) fn try_lock_run_admission(
     run_dir: &Utf8Path,
 ) -> Result<Option<RunAdmissionLock>, ServiceError> {
-    // Lock files are intentionally never unlinked: removing a locked file
-    // would let a later admission lock a fresh inode while the holder still
-    // owns the old one. Growth is bounded by the fixed shard count: every
-    // run id hashes to one of ADMISSION_SHARD_COUNT files under
-    // `.admission-shards/`, so the store holds O(1) coordination files no
-    // matter how many runs are admitted over its lifetime (G03).
+    Ok(try_lock_run_shard(run_dir, ".admission-shards")?.map(RunAdmissionLock))
+}
+
+/// Retention/preemption rendezvous, outside the deletable run directory.
+/// Separate from admission: a long boundary drain must not stall admissions
+/// sharing a shard. Fixed shards bound store entries; they are never unlinked.
+/// Lock order is handoff then execution; GC probes admission first, then
+/// handoff and execution, never waiting on any lease.
+pub(crate) struct RunHandoffLock(File);
+
+impl Drop for RunHandoffLock {
+    fn drop(&mut self) {
+        // A fork may retain the descriptor until exec; close alone is not
+        // sufficient to release ownership at the end of this handoff.
+        if let Err(error) = self.0.unlock() {
+            tracing::warn!(%error, "failed to unlock run handoff lease");
+        }
+    }
+}
+
+pub(crate) fn try_lock_run_handoff(
+    run_dir: &Utf8Path,
+) -> Result<Option<RunHandoffLock>, ServiceError> {
+    Ok(try_lock_run_shard(run_dir, ".handoff-shards")?.map(RunHandoffLock))
+}
+
+pub(crate) async fn lock_run_handoff(
+    run_dir: &Utf8Path,
+    shutdown: &CancellationToken,
+) -> Result<Option<RunHandoffLock>, ServiceError> {
+    loop {
+        if shutdown.is_cancelled() {
+            return Ok(None);
+        }
+        if let Some(lock) = try_lock_run_handoff(run_dir)? {
+            return Ok(Some(lock));
+        }
+        tokio::select! {
+            _ = shutdown.cancelled() => return Ok(None),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+        }
+    }
+}
+
+fn try_lock_run_shard(run_dir: &Utf8Path, directory: &str) -> Result<Option<File>, ServiceError> {
+    // Never unlink locked files: a fresh inode would split ownership.
+    // Both independent namespaces use the same fixed-size shard mapping.
     let runs_dir = run_dir
         .parent()
         .ok_or_else(|| ServiceError::Invalid(format!("run directory `{run_dir}` has no parent")))?;
-    let shards_dir = runs_dir.join(".admission-shards");
+    let shards_dir = runs_dir.join(directory);
     std::fs::create_dir_all(&shards_dir)?;
     let run_id = run_dir
         .file_name()
         .ok_or_else(|| ServiceError::Invalid(format!("run directory `{run_dir}` has no name")))?;
-    let shard = admission_shard_index(run_id);
+    let shard = run_coordination_shard_index(run_id);
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -256,7 +297,7 @@ pub(crate) fn try_lock_run_admission(
         .write(true)
         .open(shards_dir.join(format!("shard-{shard:02x}.lock")))?;
     match file.try_lock() {
-        Ok(()) => Ok(Some(RunAdmissionLock(file))),
+        Ok(()) => Ok(Some(file)),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(error)) => Err(ServiceError::Io(error)),
     }
@@ -336,12 +377,20 @@ pub(crate) fn try_lock_run_execution(
 ) -> Result<Option<RunExecutionLock>, ServiceError> {
     let metadata = run_meta_dir(run_dir);
     std::fs::create_dir_all(&metadata)?;
+    try_lock_existing_run_execution(run_dir)
+}
+
+/// Probe without recreating a missing run or metadata directory (retention).
+/// Older journals may not yet have an execution.lock, so create the file only.
+pub(crate) fn try_lock_existing_run_execution(
+    run_dir: &Utf8Path,
+) -> Result<Option<RunExecutionLock>, ServiceError> {
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(metadata.join("execution.lock"))?;
+        .open(run_meta_dir(run_dir).join("execution.lock"))?;
     match file.try_lock() {
         Ok(()) => Ok(Some(RunExecutionLock(file))),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
@@ -2533,6 +2582,60 @@ mod tests {
         .expect("temporary path must be UTF-8");
         std::fs::create_dir_all(root.as_std_path()).expect("temp root should be created");
         root
+    }
+
+    #[test]
+    fn handoff_shards_are_bounded_independent_and_explicitly_released() {
+        let root = temp_root("handoff-shards");
+        let _temp = TempGuard(root.clone());
+        let run_dir = root.join("victim");
+        let handoff = try_lock_run_handoff(&run_dir).unwrap().unwrap();
+        let inherited = handoff.0.try_clone().unwrap();
+        assert!(try_lock_run_handoff(&run_dir).unwrap().is_none());
+        let _admission = try_lock_run_admission(&run_dir).unwrap().unwrap();
+        assert!(
+            !run_dir.exists(),
+            "coordination must not create run metadata"
+        );
+        drop(handoff);
+        let next = try_lock_run_handoff(&run_dir).unwrap().unwrap();
+        drop(inherited);
+        assert!(try_lock_run_handoff(&run_dir).unwrap().is_none());
+        drop(next);
+        for id in 0..1000 {
+            drop(try_lock_run_handoff(&root.join(format!("run-{id}"))).unwrap());
+        }
+        assert!(
+            std::fs::read_dir(root.join(".handoff-shards"))
+                .unwrap()
+                .count()
+                <= RUN_COORDINATION_SHARD_COUNT
+        );
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn handoff_wait_is_shutdown_cancellable() {
+        let root = temp_root("handoff-shutdown");
+        let _temp = TempGuard(root.clone());
+        let run_dir = root.join("victim");
+        let _held = try_lock_run_handoff(&run_dir).unwrap().unwrap();
+        let shutdown = CancellationToken::new();
+        let wait = lock_run_handoff(&run_dir, &shutdown);
+        tokio::pin!(wait);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut wait)
+                .await
+                .is_err()
+        );
+        shutdown.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), wait)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[cfg(unix)]
