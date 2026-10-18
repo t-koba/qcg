@@ -316,7 +316,8 @@ use of the same output directory.
   bytes. Unset means no mechanistic limit for those two only.
 - `MAX_INPUTS_FILE_BYTES`: explicit max for `qcg run --inputs-file`.
   Unset means no mechanistic limit.
-- `MAX_REQUEST_BYTES`, `MAX_ARTIFACT_BYTES`,
-  `MAX_ARTIFACT_ENTRIES`, `MAX_ASSET_BYTES`: explicit max for
-  `qcg serve` request bodies, artifact ZIP output, and generator assets.
-  Unset means no mechanistic limit.
+- `MAX_REQUEST_BYTES` (default `2097152`, 2 MiB): whole-request-body limit
+  for `qcg serve`. Omitted means the default, never unlimited.
+- `MAX_ARTIFACT_BYTES`, `MAX_ARTIFACT_ENTRIES`, `MAX_ASSET_BYTES`:
+  explicit maxima for artifact ZIP output (bytes and entries) and generator
+  assets. Unset means no mechanistic limit for these three only.
