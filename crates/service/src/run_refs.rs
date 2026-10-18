@@ -52,7 +52,6 @@ pub(crate) fn load_or_resolve_run_refs(
         return Ok(persisted);
     }
     let mut resolved = BTreeMap::new();
-    let mut index = BTreeMap::new();
     for (name, resource) in &referenced {
         let params = resource
             .run_ref_params(name)
@@ -61,15 +60,6 @@ pub(crate) fn load_or_resolve_run_refs(
             .map_err(|reason| ApiError::invalid_field(*name, reason))?;
         let artifact = read_source_artifact(&source, &params)
             .map_err(|reason| ApiError::invalid_field(*name, reason))?;
-        index.insert(
-            (*name).to_string(),
-            PersistedRunRef {
-                source_run_id: source.run_id.clone(),
-                artifact: artifact.path.clone(),
-                sha256: artifact.sha256.clone(),
-                bytes: artifact.bytes.len(),
-            },
-        );
         resolved.insert(
             (*name).to_string(),
             RunRefMaterial {
