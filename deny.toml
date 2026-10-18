@@ -1,7 +1,15 @@
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+# These are maintenance-only notices, not vulnerability advisories. They come
+# from the Linux Secret Service backend in keyring 4.2.0, whose current upstream
+# release still uses the zbus 5 crate family. No zbus-6-compatible keyring or
+# backend release is published yet; remove these exceptions when it migrates.
+ignore = [
+  { id = "RUSTSEC-2026-0371", reason = "zbus_names 4.3.4 is required by keyring 4.2.0's Linux Secret Service backend; maintenance-only notice, no compatible upstream migration release yet." },
+  { id = "RUSTSEC-2026-0370", reason = "zvariant 5.15.0 is required by keyring 4.2.0's Linux Secret Service backend; maintenance-only notice, no compatible upstream migration release yet." },
+  { id = "RUSTSEC-2026-0372", reason = "zvariant_derive 5.15.0 is required by keyring 4.2.0's Linux Secret Service backend; maintenance-only notice, no compatible upstream migration release yet." },
+]
 
 [bans]
 multiple-versions = "warn"
