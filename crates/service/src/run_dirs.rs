@@ -289,7 +289,23 @@ pub(crate) async fn lock_run_admission(
     }
 }
 
-pub(crate) fn try_lock_run_execution(run_dir: &Utf8Path) -> Result<Option<File>, ServiceError> {
+/// Execution ownership ends when the guard drops, not when the last copy
+/// of its file descriptor closes. A concurrent command spawn can inherit
+/// the descriptor across fork until exec closes it; relying on File's close
+/// alone can therefore leave a finished task's lease locked at requeue.
+pub(crate) struct RunExecutionLock(File);
+
+impl Drop for RunExecutionLock {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.unlock() {
+            tracing::warn!(%error, "failed to unlock run execution lease");
+        }
+    }
+}
+
+pub(crate) fn try_lock_run_execution(
+    run_dir: &Utf8Path,
+) -> Result<Option<RunExecutionLock>, ServiceError> {
     let metadata = run_meta_dir(run_dir);
     std::fs::create_dir_all(&metadata)?;
     let file = OpenOptions::new()
@@ -299,7 +315,7 @@ pub(crate) fn try_lock_run_execution(run_dir: &Utf8Path) -> Result<Option<File>,
         .write(true)
         .open(metadata.join("execution.lock"))?;
     match file.try_lock() {
-        Ok(()) => Ok(Some(file)),
+        Ok(()) => Ok(Some(RunExecutionLock(file))),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(error)) => Err(ServiceError::Io(error)),
     }
@@ -312,9 +328,12 @@ pub(crate) fn try_lock_run_execution(run_dir: &Utf8Path) -> Result<Option<File>,
 /// `refresh_shared_runs`, which adopts it into memory on owner change. The
 /// claim is bounded and validated on read; malformed content reads as no
 /// claim, never as a foreign owner.
-pub(crate) fn claim_run_execution_owner(lock: &File, owner_id: &str) -> Result<(), ServiceError> {
+pub(crate) fn claim_run_execution_owner(
+    lock: &RunExecutionLock,
+    owner_id: &str,
+) -> Result<(), ServiceError> {
     use std::io::Seek as _;
-    let mut lock = lock;
+    let mut lock = &lock.0;
     lock.rewind().map_err(ServiceError::Io)?;
     lock.set_len(0).map_err(ServiceError::Io)?;
     lock.write_all(owner_id.as_bytes())
@@ -2472,6 +2491,31 @@ mod tests {
         .expect("temporary path must be UTF-8");
         std::fs::create_dir_all(root.as_std_path()).expect("temp root should be created");
         root
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execution_lease_release_does_not_wait_for_inherited_descriptors() {
+        let root = temp_root("execution-lease-inheritance");
+        let lease = try_lock_run_execution(&root).unwrap().unwrap();
+        // dup shares the open file description just as fork does before exec
+        // closes CLOEXEC descriptors in a concurrently spawning command.
+        let inherited = lease.0.try_clone().unwrap();
+        assert!(try_lock_run_execution(&root).unwrap().is_none());
+        drop(lease);
+        let next = try_lock_run_execution(&root).unwrap();
+        assert!(
+            next.is_some(),
+            "a finished execution owner must release its lease even while a fork/exec retains a descriptor"
+        );
+        drop(inherited);
+        assert!(
+            try_lock_run_execution(&root).unwrap().is_none(),
+            "closing an inherited descriptor must not release the next owner's lease"
+        );
+        drop(next);
+        assert!(try_lock_run_execution(&root).unwrap().is_some());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

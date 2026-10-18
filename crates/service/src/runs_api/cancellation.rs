@@ -233,7 +233,7 @@ impl LocalService {
         id: &str,
         fallback: &RunRecord,
         run_dir: &camino::Utf8PathBuf,
-        _lease: &std::fs::File,
+        _lease: &crate::run_dirs::RunExecutionLock,
     ) -> Result<bool, ApiError> {
         // No live engine writer, so settling here is safe. Drain the
         // mailbox to a single journal event first, then record cancel.

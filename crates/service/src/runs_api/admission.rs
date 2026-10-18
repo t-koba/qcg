@@ -646,7 +646,7 @@ impl LocalService {
         &self,
         source_id: &str,
         source_dir: &Utf8Path,
-    ) -> Result<Option<std::fs::File>, ApiError> {
+    ) -> Result<Option<crate::run_dirs::RunExecutionLock>, ApiError> {
         let conflict = || ApiError::Conflict {
             detail: format!(
                 "run `{source_id}` is still executing; fork a stable waiting or terminal checkpoint"
