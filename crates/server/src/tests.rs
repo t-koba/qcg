@@ -2354,9 +2354,86 @@ pub(crate) fn isolate_environment_test(name: &str) -> bool {
     }
 }
 
+fn invalidation_http_app(
+    root: &Utf8PathBuf,
+    runs: &Utf8PathBuf,
+    api_token: Option<String>,
+) -> (Arc<AppState>, axum::Router) {
+    use sha2::Digest as _;
+
+    let api_token_digest: Option<[u8; 32]> = api_token
+        .as_deref()
+        .map(|token| sha2::Sha256::digest(token.as_bytes()).into());
+    let state = Arc::new(test_state(
+        crate::test_service(root.join("generators"), runs.clone(), None).unwrap(),
+        runs.clone(),
+        api_token_digest,
+        tokio_util::sync::CancellationToken::new(),
+    ));
+    let config = ServerConfig {
+        generators_dir: root.join("generators"),
+        providers_path: None,
+        extra_generators_dirs: vec![],
+        runs_dir: runs.clone(),
+        max_active_runs: policy::DEFAULT_MAX_ACTIVE_RUNS,
+        max_tracked_runs: policy::DEFAULT_MAX_TRACKED_RUNS,
+        run_store_mode: RunStoreMode::Exclusive,
+        cors_origins: vec![],
+        api_token,
+        max_request_bytes: None,
+        max_artifact_bytes: None,
+        max_artifact_entries: None,
+        max_asset_bytes: None,
+        max_total_steps: None,
+    };
+    let cors = super::server::parse_cors_origins(&config.cors_origins).unwrap();
+    // Build only the router; ResidentTasks and retention GC are not started.
+    let app = super::server::build_router(&state, &config, &cors, None).unwrap();
+    (state, app)
+}
+
+#[tokio::test]
+async fn invalidation_http_reports_busy_maintenance_as_retryable_conflict() {
+    use tower::ServiceExt as _;
+
+    let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+        .unwrap()
+        .join(format!("invalidation-http-busy-{}", uuid::Uuid::now_v7()));
+    let runs = root.join("runs");
+    std::fs::create_dir_all(&runs).unwrap();
+    let (state, app) = invalidation_http_app(&root, &runs, None);
+    let maintenance = service::try_lock_store_maintenance(&runs)
+        .unwrap()
+        .expect("test fixture should acquire the maintenance lock");
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/runs/missing/invalidation")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"reason":"bad","actor_label":"reviewer"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = axum::body::to_bytes(response.into_body(), 32768)
+        .await
+        .unwrap();
+    let problem: api::ProblemDetails = serde_json::from_slice(&body).unwrap();
+    assert_eq!(problem.detail, "run store maintenance is busy; retry");
+    drop(maintenance);
+    state.service.shutdown_active_runs().await.unwrap();
+    drop(app);
+    drop(state);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[tokio::test]
 async fn invalidation_http_has_delete_auth_parity_and_immutable_json_record() {
-    use sha2::Digest as _;
     use tower::ServiceExt as _;
     for authenticated in [false, true] {
         let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
@@ -2379,32 +2456,11 @@ async fn invalidation_http_has_delete_auth_parity_and_immutable_json_record() {
         .unwrap();
         // Generated test-only credential, never an operator credential.
         let test_credential = uuid::Uuid::now_v7().to_string();
-        let digest: [u8; 32] = sha2::Sha256::digest(test_credential.as_bytes()).into();
-        let state = Arc::new(test_state(
-            crate::test_service(root.join("generators"), runs.clone(), None).unwrap(),
-            runs.clone(),
-            authenticated.then_some(digest),
-            tokio_util::sync::CancellationToken::new(),
-        ));
-        let config = ServerConfig {
-            generators_dir: root.join("generators"),
-            providers_path: None,
-            extra_generators_dirs: vec![],
-            runs_dir: runs.clone(),
-            max_active_runs: policy::DEFAULT_MAX_ACTIVE_RUNS,
-            max_tracked_runs: policy::DEFAULT_MAX_TRACKED_RUNS,
-            run_store_mode: RunStoreMode::Exclusive,
-            cors_origins: vec![],
-            api_token: authenticated.then_some(test_credential.clone()),
-            max_request_bytes: None,
-            max_artifact_bytes: None,
-            max_artifact_entries: None,
-            max_asset_bytes: None,
-            max_total_steps: None,
-        };
-        let cors = super::server::parse_cors_origins(&config.cors_origins).unwrap();
-        let app = super::server::build_router(&state, &config, &cors, None).unwrap();
-        const TRANSIENT_RETRIES: usize = 10;
+        let (state, app) = invalidation_http_app(
+            &root,
+            &runs,
+            authenticated.then_some(test_credential.clone()),
+        );
         for (method, uri) in [
             ("DELETE", "/api/runs/missing"),
             ("POST", "/api/runs/missing/invalidation"),
@@ -2415,62 +2471,11 @@ async fn invalidation_http_has_delete_auth_parity_and_immutable_json_record() {
                 } else {
                     StatusCode::NOT_FOUND
                 };
-                for attempt in 0..=TRANSIENT_RETRIES {
-                    let mut builder = axum::http::Request::builder()
-                        .method(method)
-                        .uri(uri)
-                        .header("content-type", "application/json");
-                    if authorized {
-                        builder =
-                            builder.header("authorization", format!("Bearer {test_credential}"));
-                    }
-                    let response = app
-                        .clone()
-                        .oneshot(
-                            builder
-                                .body(axum::body::Body::from(
-                                    r#"{"reason":"bad","actor_label":"reviewer"}"#,
-                                ))
-                                .unwrap(),
-                        )
-                        .await
-                        .unwrap();
-                    let status = response.status();
-                    let body = axum::body::to_bytes(response.into_body(), 32768)
-                        .await
-                        .unwrap();
-                    let retryable = status == StatusCode::CONFLICT
-                        && serde_json::from_slice::<api::ProblemDetails>(&body).is_ok_and(
-                            |problem| problem.detail == "run store maintenance is busy; retry",
-                        );
-                    if retryable && attempt < TRANSIENT_RETRIES {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                        continue;
-                    }
-                    assert_eq!(
-                        status,
-                        expected_status,
-                        "{method} {uri}, authenticated={authenticated}, authorized={authorized}, response body={}",
-                        String::from_utf8_lossy(&body)
-                    );
-                    break;
-                }
-            }
-        }
-        let mut first = None;
-        for reason in ["wrong output", "wrong output", "different"] {
-            let expected_status = if reason == "different" {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::OK
-            };
-            let mut result = None;
-            for attempt in 0..=TRANSIENT_RETRIES {
                 let mut builder = axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/api/runs/success/invalidation")
+                    .method(method)
+                    .uri(uri)
                     .header("content-type", "application/json");
-                if authenticated {
+                if authorized {
                     builder = builder.header("authorization", format!("Bearer {test_credential}"));
                 }
                 let response = app
@@ -2478,7 +2483,7 @@ async fn invalidation_http_has_delete_auth_parity_and_immutable_json_record() {
                     .oneshot(
                         builder
                             .body(axum::body::Body::from(
-                                json!({"reason": reason, "actor_label": "reviewer"}).to_string(),
+                                r#"{"reason":"bad","actor_label":"reviewer"}"#,
                             ))
                             .unwrap(),
                     )
@@ -2488,23 +2493,43 @@ async fn invalidation_http_has_delete_auth_parity_and_immutable_json_record() {
                 let body = axum::body::to_bytes(response.into_body(), 32768)
                     .await
                     .unwrap();
-                let retryable = status == StatusCode::CONFLICT
-                    && serde_json::from_slice::<api::ProblemDetails>(&body).is_ok_and(|problem| {
-                        matches!(
-                            problem.detail.as_str(),
-                            "run store maintenance is busy; retry"
-                                | "run is executing; wait for settlement"
-                        )
-                    });
-                if retryable && attempt < TRANSIENT_RETRIES {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    continue;
-                }
-                result = Some((status, body));
-                break;
+                assert_eq!(
+                    status,
+                    expected_status,
+                    "{method} {uri}, authenticated={authenticated}, authorized={authorized}, response body={}",
+                    String::from_utf8_lossy(&body)
+                );
             }
-            let (status, body) =
-                result.expect("bounded invalidation request must produce a response");
+        }
+        let mut first = None;
+        for reason in ["wrong output", "wrong output", "different"] {
+            let expected_status = if reason == "different" {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::OK
+            };
+            let mut builder = axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/runs/success/invalidation")
+                .header("content-type", "application/json");
+            if authenticated {
+                builder = builder.header("authorization", format!("Bearer {test_credential}"));
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    builder
+                        .body(axum::body::Body::from(
+                            json!({"reason": reason, "actor_label": "reviewer"}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 32768)
+                .await
+                .unwrap();
             assert_eq!(
                 status,
                 expected_status,
