@@ -232,8 +232,7 @@ pub(crate) enum Command {
         /// Explicit max only. Omitted means no mechanistic limit.
         #[arg(long = "max-artifact-entries", env = "MAX_ARTIFACT_ENTRIES")]
         max_artifact_entries: Option<usize>,
-        /// Explicit override. Omitted means the 16 MiB (16777216-byte) hard default,
-        /// never unlimited.
+        /// Omitted uses the 16 MiB hard asset default, never unlimited.
         #[arg(long = "max-asset-bytes", env = "MAX_ASSET_BYTES")]
         max_asset_bytes: Option<usize>,
     },
