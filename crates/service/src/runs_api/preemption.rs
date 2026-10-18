@@ -147,11 +147,11 @@ impl LocalService {
         }
         // Hold the execution lease across requeue. A resumer or peer must
         // not start a writer between the rendezvous and the durable event.
-        let lease =
-            crate::run_dirs::try_lock_run_execution(&staged.run_dir).map_err(api_internal)?;
-        let Some(lease) = lease else {
-            return Err(api_internal("preemption requeue lost execution lease"));
-        };
+        // Contention can be transient during an owner handoff; once the old
+        // task has yielded, never abandon its durable requeue on WouldBlock.
+        let lease = crate::run_dirs::lock_run_execution(&staged.run_dir)
+            .await
+            .map_err(api_internal)?;
         if !boundary {
             truncate_trailing_canceled_events(&staged.run_dir).map_err(api_internal)?;
         }

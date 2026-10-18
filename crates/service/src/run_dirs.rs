@@ -303,6 +303,20 @@ impl Drop for RunExecutionLock {
     }
 }
 
+/// Waits for execution ownership when a caller must complete a durable
+/// handoff. Unlike ordinary probes, a transient competing lease must not
+/// abandon a yielded run in the in-memory Running state.
+pub(crate) async fn lock_run_execution(
+    run_dir: &Utf8Path,
+) -> Result<RunExecutionLock, ServiceError> {
+    loop {
+        if let Some(lock) = try_lock_run_execution(run_dir)? {
+            return Ok(lock);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 pub(crate) fn try_lock_run_execution(
     run_dir: &Utf8Path,
 ) -> Result<Option<RunExecutionLock>, ServiceError> {
@@ -2515,6 +2529,28 @@ mod tests {
         );
         drop(next);
         assert!(try_lock_run_execution(&root).unwrap().is_some());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execution_lease_waiter_retries_transient_contention() {
+        let root = temp_root("execution-lease-contention");
+        let held = try_lock_run_execution(&root).unwrap().unwrap();
+        let waiter_root = root.clone();
+        let mut waiter =
+            tokio::spawn(async move { lock_run_execution(&waiter_root).await.unwrap() });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut waiter)
+                .await
+                .is_err(),
+            "the waiter must not claim a lease while another owner holds it"
+        );
+        drop(held);
+        let acquired = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("the waiter should acquire after the prior owner releases")
+            .expect("the waiter task should complete");
+        drop(acquired);
         std::fs::remove_dir_all(root).unwrap();
     }
 
