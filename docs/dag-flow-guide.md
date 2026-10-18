@@ -79,15 +79,18 @@ them in parallel if every node in that wave is deterministic and has no
 - `check.schema`
 - `check.format`
 - `check.contract`
+- `check.tool`
 
 Each parallel task receives the same immutable `ValueBag` snapshot. Outputs are
 merged back into the main run state in graph order after the wave completes, so
 downstream nodes see deterministic `steps.*` values. Parallel `patch` nodes
 must target disjoint files: overlapping patches stay caller-exclusive and the
 second writer fails with a base or anchor mismatch instead of overwriting
-silently. Side-effecting, LLM,
-interactive, container, command, HTTP, and `foreach` nodes stay on the
-single-node path.
+silently. The direct `command`, `check.command`, and `check.container` step
+types, along with LLM, HTTP, `ask_user`, and `foreach`, stay on the single-node
+path. `check.tool` is a parallel-safe validator step even when its selected
+tool backend uses command or container execution; existing fallback
+confirmation behavior still applies.
 
 Parallel starts and finishes are marked with `"parallel": true` in the journal.
 
