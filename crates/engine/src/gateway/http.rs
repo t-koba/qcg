@@ -4,7 +4,7 @@ use reqwest::{Client, Method, redirect::Policy};
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use tokio::time::Duration;
+use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
@@ -267,6 +267,45 @@ impl HttpGateway {
         ))
     }
 
+    fn validation_budget(&self, deadline: Instant) -> Result<Duration, GatewayError> {
+        if self.cancellation.is_cancelled() {
+            return Err(GatewayError::Canceled);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(GatewayError::HttpValidationTimedOut);
+        }
+        Ok(remaining)
+    }
+
+    /// Validation shares the hop's request budget. Dropping resolution stops
+    /// waiting, but an already-running blocking resolver may finish later.
+    async fn resolve_then_check_until(
+        &self,
+        url: &str,
+        deadline: Option<Instant>,
+    ) -> Result<Option<Vec<SocketAddr>>, GatewayError> {
+        if let Some(deadline) = deadline {
+            // An already-expired deadline must not poll DNS, even within the
+            // timer's sub-millisecond scheduling granularity.
+            self.validation_budget(deadline)?;
+            tokio::select! {
+                biased;
+                _ = self.cancellation.cancelled() => Err(GatewayError::Canceled),
+                _ = tokio::time::sleep_until(deadline) => Err(GatewayError::HttpValidationTimedOut),
+                result = self.resolve_then_check(url) => result,
+            }
+        } else {
+            // An unrepresentably long configured duration has no practical
+            // Tokio deadline; cancellation still interrupts the resolution.
+            tokio::select! {
+                biased;
+                _ = self.cancellation.cancelled() => Err(GatewayError::Canceled),
+                result = self.resolve_then_check(url) => result,
+            }
+        }
+    }
+
     pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
         self.cancellation = cancellation;
         self
@@ -331,13 +370,19 @@ impl HttpGateway {
             }
             redirects = redirects.saturating_add(1);
             ensure_url_allowed(&self.permissions, &url)?;
+            let deny_private_ips = self.deny_private_ips();
+            let hop_deadline = if deny_private_ips {
+                Instant::now().checked_add(self.timeout)
+            } else {
+                None
+            };
             // Opt-in SSRF hardening: resolve-then-check every hop (initial
-            // and each redirect target) and pin the connection to the
-            // validated addresses, closing the rebinding TOCTOU. One
-            // resolution per hop; the pinned client carries it.
+            // and each redirect target), then pin that exact set to the
+            // connection. The conditional final-URL check below validates
+            // only; it never changes the addresses used for this dispatch.
             let mut pinned_client: Option<Client> = None;
-            if self.deny_private_ips()
-                && let Some(addrs) = self.resolve_then_check(&url).await?
+            if deny_private_ips
+                && let Some(addrs) = self.resolve_then_check_until(&url, hop_deadline).await?
             {
                 let host = Url::parse(&url)
                     .map_err(|_| GatewayError::UnsupportedUrl {
@@ -382,9 +427,7 @@ impl HttpGateway {
                 }
             }
             let active_client = pinned_client.as_ref().unwrap_or(&self.client);
-            let mut builder = active_client
-                .request(parsed_method, request_url)
-                .timeout(self.timeout);
+            let mut builder = active_client.request(parsed_method, request_url);
             for (key, value) in &request.headers {
                 builder = builder.header(key, value);
             }
@@ -398,9 +441,16 @@ impl HttpGateway {
             if let Some(body) = &body {
                 builder = builder.body(body.clone());
             }
+            // Opt-out keeps the original reqwest-only timeout. Opt-in DNS
+            // validation and send/body share one budget, not two timeouts.
+            let timeout = if let Some(deadline) = hop_deadline {
+                self.validation_budget(deadline)?
+            } else {
+                self.timeout
+            };
             let mut response = tokio::select! {
                 _ = self.cancellation.cancelled() => return Err(GatewayError::Canceled),
-                response = builder.send() => response.map_err(|error| GatewayError::Http(error.without_url()))?,
+                response = builder.timeout(timeout).send() => response.map_err(|error| GatewayError::Http(error.without_url()))?,
             };
             let status = response.status();
             if !safe_method {
@@ -438,10 +488,11 @@ impl HttpGateway {
             }
             let final_url = response.url().to_string();
             ensure_url_allowed(&self.permissions, &final_url)?;
-            if self.deny_private_ips() && final_url != url {
-                // Different final URL (e.g. server-reported): re-validate
-                // its addresses; the dispatched hop itself stays pinned.
-                self.resolve_then_check(&final_url).await?;
+            if deny_private_ips && final_url != url {
+                // URL normalization or sensitive-query insertion can change
+                // the response URL. Revalidate it, keeping this hop pinned.
+                self.resolve_then_check_until(&final_url, hop_deadline)
+                    .await?;
             }
             let public_final_url = redact_query_parameters(&final_url, &request.sensitive_query)?;
             let headers = response
@@ -1162,6 +1213,152 @@ mod tests {
         )
         .expect("opt-in gateway should build")
         .with_stub_resolver(stub)
+    }
+
+    /// Releases and drains an active blocking stub even if a test panics.
+    /// A queued stub that has not started yet sees `released` immediately.
+    #[derive(Default)]
+    struct ResolverState {
+        released: bool,
+        running: bool,
+    }
+
+    struct ResolverGate(Arc<(std::sync::Mutex<ResolverState>, std::sync::Condvar)>);
+
+    impl Drop for ResolverGate {
+        fn drop(&mut self) {
+            let (state, changed) = &*self.0;
+            let mut state = state.lock().unwrap();
+            state.released = true;
+            changed.notify_all();
+            while state.running {
+                state = changed.wait(state).unwrap();
+            }
+        }
+    }
+
+    fn blocked_resolver() -> (StubDnsResolver, Arc<tokio::sync::Notify>, ResolverGate) {
+        let gate = ResolverGate(Arc::new((
+            std::sync::Mutex::new(ResolverState::default()),
+            std::sync::Condvar::new(),
+        )));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let state = Arc::clone(&gate.0);
+        let started = Arc::clone(&entered);
+        let stub = Arc::new(move |_host: &str| {
+            let (state, changed) = &*state;
+            let mut state = state.lock().unwrap();
+            state.running = true;
+            started.notify_one();
+            while !state.released {
+                state = changed.wait(state).unwrap();
+            }
+            state.running = false;
+            changed.notify_all();
+            Ok(vec!["93.184.216.34".parse().unwrap()])
+        });
+        (stub, entered, gate)
+    }
+
+    #[tokio::test]
+    async fn dns_preflight_timeout_returns_before_blocking_resolver_is_released() {
+        let (stub, entered, gate) = blocked_resolver();
+        let mut gateway = opt_in_gateway(stub);
+        gateway.timeout = Duration::from_secs(60);
+        let mut task = tokio::spawn(async move {
+            gateway
+                .request(request("POST", "http://allowed.example/".into(), None))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("resolver should enter its gate");
+        // Advance only after the blocking resolver is definitely running.
+        // Resume real time for a watchdog that also bounds a broken fix.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::time::resume();
+        let result = tokio::time::timeout(Duration::from_secs(5), &mut task).await;
+        task.abort();
+        drop(gate);
+        let error = result
+            .expect("request must finish while DNS is still blocked")
+            .expect("request task should not panic")
+            .expect_err("DNS validation must time out before dispatch");
+        assert!(matches!(error, GatewayError::HttpValidationTimedOut));
+        assert_eq!(error.to_string(), "HTTP URL validation timed out");
+    }
+
+    #[tokio::test]
+    async fn dns_preflight_cancellation_returns_before_blocking_resolver_is_released() {
+        let (stub, entered, gate) = blocked_resolver();
+        let cancellation = CancellationToken::new();
+        let mut gateway = opt_in_gateway(stub).with_cancellation(cancellation.clone());
+        gateway.timeout = Duration::from_secs(60);
+        let mut task = tokio::spawn(async move {
+            gateway
+                .request(request("POST", "http://allowed.example/".into(), None))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("resolver should enter its gate");
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(5), &mut task).await;
+        task.abort();
+        drop(gate);
+        assert!(matches!(
+            result.expect("cancellation must not wait for DNS").unwrap(),
+            Err(GatewayError::Canceled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn validation_budget_uses_remaining_per_hop_time() {
+        let stub: StubDnsResolver = Arc::new(|_| unreachable!("resolver should not run"));
+        let gateway = opt_in_gateway(stub);
+        tokio::time::pause();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        tokio::time::advance(Duration::from_secs(15)).await;
+        assert_eq!(
+            gateway.validation_budget(deadline).unwrap(),
+            Duration::from_secs(45)
+        );
+    }
+
+    #[tokio::test]
+    async fn dns_validation_prioritizes_precancel_and_reuses_the_hop_deadline() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&calls);
+        let stub: StubDnsResolver = Arc::new(move |_| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec!["93.184.216.34".parse().unwrap()])
+        });
+        let cancellation = CancellationToken::new();
+        let gateway = opt_in_gateway(stub).with_cancellation(cancellation.clone());
+        // Final-URL revalidation uses this same primitive with the original
+        // hop deadline: an exhausted budget must not start another lookup.
+        let deadline = Instant::now();
+        assert!(matches!(
+            gateway
+                .resolve_then_check_until("http://allowed.example/final", Some(deadline))
+                .await,
+            Err(GatewayError::HttpValidationTimedOut)
+        ));
+        cancellation.cancel();
+        assert!(matches!(
+            gateway
+                .resolve_then_check_until("http://allowed.example/final", Some(deadline))
+                .await,
+            Err(GatewayError::Canceled)
+        ));
+        assert!(matches!(
+            gateway
+                .request(request("POST", "http://allowed.example/".into(), None))
+                .await,
+            Err(GatewayError::Canceled)
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     fn stub_for(ip: &str) -> StubDnsResolver {

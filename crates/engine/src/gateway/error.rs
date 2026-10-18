@@ -58,6 +58,10 @@ pub enum GatewayError {
     HttpBodyTooLarge { url: String },
     #[error("HTTP request body exceeded limit for `{url}`")]
     HttpRequestBodyTooLarge { url: String },
+    /// A validation deadline expired, before dispatch or during final-URL
+    /// revalidation. Send history determines whether effects are possible.
+    #[error("HTTP URL validation timed out")]
+    HttpValidationTimedOut,
     #[error(transparent)]
     Http(#[from] reqwest::Error),
     /// A failure raised after this operation already dispatched a request

@@ -99,8 +99,9 @@ fn decide_operation_guard(
 
 impl OperationOutcome {
     /// Conservative taxonomy for gateway failures. Denials, validation, and
-    /// malformed requests prove nothing was sent (`Clean`); timeouts,
-    /// transport I/O, and container failures do not (`Indeterminate`).
+    /// malformed requests prove nothing was sent (`Clean`); transport
+    /// timeouts, I/O, and container failures do not (`Indeterminate`).
+    /// HTTP validation timeouts are clean unless send history says otherwise.
     /// `side_effect_free` covers safe methods (GET/HEAD), where even a
     /// transport failure cannot have applied an effect. Cancellation never
     /// reaches here: cancelled operations finish nothing.
@@ -139,6 +140,7 @@ impl OperationOutcome {
             | GatewayError::NetworkIpDenied { .. }
             | GatewayError::UnsupportedUrl { .. }
             | GatewayError::HttpRequestBodyTooLarge { .. }
+            | GatewayError::HttpValidationTimedOut
             | GatewayError::FsReadDenied
             | GatewayError::FsWriteDenied
             | GatewayError::PathDenied { .. } => OperationOutcome::CleanError,
@@ -1975,6 +1977,32 @@ mod tests {
             1,
             "the refused replay must not journal a new start"
         );
+    }
+
+    #[test]
+    fn http_validation_timeout_classification_respects_send_history() {
+        use crate::GatewayError;
+
+        for side_effect_free in [false, true] {
+            assert!(matches!(
+                OperationOutcome::gateway_error(
+                    &GatewayError::HttpValidationTimedOut,
+                    side_effect_free,
+                ),
+                OperationOutcome::CleanError,
+            ));
+            assert!(matches!(
+                OperationOutcome::gateway_error(
+                    &GatewayError::AfterSend(Box::new(GatewayError::HttpValidationTimedOut)),
+                    side_effect_free,
+                ),
+                OperationOutcome::Indeterminate { .. }
+            ));
+        }
+        assert!(matches!(
+            OperationOutcome::gateway_error(&GatewayError::Canceled, false),
+            OperationOutcome::Indeterminate { .. }
+        ));
     }
 
     /// C02: only pre-send reqwest failures classify as clean. A server
