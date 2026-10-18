@@ -1,5 +1,4 @@
 use api::FormSpec;
-use contract::{FieldType, InputField};
 use engine::StepError;
 use mcp::McpInputRequired;
 use serde_json::{Value, json};
@@ -58,79 +57,8 @@ pub(crate) fn mcp_form_spec(
     alias: &str,
     required: &McpInputRequired,
 ) -> Result<FormSpec, StepError> {
-    let mut fields = Vec::with_capacity(required.input_requests.len());
-    for (index, (request_id, request)) in
-        stable_mcp_input_requests(required).into_iter().enumerate()
-    {
-        let method = request
-            .get("method")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if method != "elicitation/create" {
-            return Err(StepError::failed(
-                alias,
-                format!("MCP input request `{request_id}` uses unsupported method `{method}`"),
-            ));
-        }
-        let params = request.get("params").unwrap_or(request);
-        // Only form-mode elicitation is supported. URL (out-of-band) mode
-        // must not be coerced into an in-band form: its payload must never
-        // pass through the client, and qcg has no external-navigation
-        // approval path, so fail closed. Legacy requests without a mode are
-        // treated as form, matching rmcp's LegacyForm wire handling.
-        if let Some(mode) = params.get("mode").and_then(Value::as_str)
-            && mode != "form"
-        {
-            return Err(StepError::failed(
-                alias,
-                format!(
-                    "MCP input request `{request_id}` uses unsupported elicitation mode `{mode}`"
-                ),
-            ));
-        }
-        if params.get("url").is_some()
-            || params.get("elicitationId").is_some()
-            || params.get("elicitation_id").is_some()
-        {
-            return Err(StepError::failed(
-                alias,
-                format!(
-                    "MCP input request `{request_id}` uses unsupported URL-mode elicitation; only form mode is supported"
-                ),
-            ));
-        }
-        let message = params
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("MCP tool requested structured input");
-        let label = message.to_string();
-        fields.push(InputField {
-            id: format!("response_{index}"),
-            label: Some(label),
-            label_i18n: Default::default(),
-            description: Some(message.to_string()),
-            description_i18n: Default::default(),
-            placeholder: None,
-            placeholder_i18n: Default::default(),
-            kind: FieldType::Json,
-            required: true,
-            default: None,
-            pattern: None,
-            options: vec![],
-            option_labels_i18n: Default::default(),
-            min_items: None,
-            item_type: None,
-            schema: params.get("requestedSchema").cloned(),
-            options_from: None,
-            ui: Default::default(),
-        });
-    }
-    Ok(FormSpec {
-        id: question_id,
-        title: format!("MCP tool `{alias}` requires input"),
-        title_i18n: Default::default(),
-        fields,
-    })
+    let requests = stable_mcp_input_requests(required);
+    engine::mcp_elicitation_form_spec(question_id, alias, &requests)
 }
 
 pub(crate) fn mcp_input_responses(

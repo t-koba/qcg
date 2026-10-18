@@ -1,7 +1,6 @@
 use api::{FormSpec, ToolCallErrorCode, ToolCallPhase, ToolCallStatus};
 use api::{ToolCallError, ToolCallEventData, ToolCallSource};
-use contract::InputField;
-use contract::{FieldType, NodeDef};
+use contract::NodeDef;
 use engine::{ResultExt, RunContext, StepContext, StepError, tool_call_sources};
 use mcp::{McpCallOutcome, McpError, McpInputRequired, McpSession};
 use serde_json::{Value, json};
@@ -387,77 +386,8 @@ fn direct_mcp_form_spec(
     alias: &str,
     required: &McpInputRequired,
 ) -> Result<FormSpec, StepError> {
-    let mut fields = Vec::with_capacity(required.input_requests.len());
-    for (index, (request_id, request)) in direct_mcp_requests(required).into_iter().enumerate() {
-        let method = request
-            .get("method")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if method != "elicitation/create" {
-            return Err(StepError::failed(
-                alias,
-                format!("MCP input request `{request_id}` uses unsupported method `{method}`"),
-            ));
-        }
-        let params = request.get("params").unwrap_or(request);
-        // Only form-mode elicitation is supported. URL (out-of-band) mode
-        // must not be coerced into an in-band form: its payload must never
-        // pass through the client, and qcg has no external-navigation
-        // approval path, so fail closed. Legacy requests without a mode are
-        // treated as form, matching rmcp's LegacyForm wire handling.
-        if let Some(mode) = params.get("mode").and_then(Value::as_str)
-            && mode != "form"
-        {
-            return Err(StepError::failed(
-                alias,
-                format!(
-                    "MCP input request `{request_id}` uses unsupported elicitation mode `{mode}`"
-                ),
-            ));
-        }
-        if params.get("url").is_some()
-            || params.get("elicitationId").is_some()
-            || params.get("elicitation_id").is_some()
-        {
-            return Err(StepError::failed(
-                alias,
-                format!(
-                    "MCP input request `{request_id}` uses unsupported URL-mode elicitation; only form mode is supported"
-                ),
-            ));
-        }
-        let message = params
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("MCP tool requested structured input");
-        let label = message.to_string();
-        fields.push(InputField {
-            id: format!("response_{index}"),
-            label: Some(label),
-            label_i18n: Default::default(),
-            description: Some(message.to_string()),
-            description_i18n: Default::default(),
-            placeholder: None,
-            placeholder_i18n: Default::default(),
-            kind: FieldType::Json,
-            required: true,
-            default: None,
-            pattern: None,
-            options: vec![],
-            option_labels_i18n: Default::default(),
-            min_items: None,
-            item_type: None,
-            schema: params.get("requestedSchema").cloned(),
-            options_from: None,
-            ui: Default::default(),
-        });
-    }
-    Ok(FormSpec {
-        id: question_id,
-        title: format!("MCP tool `{alias}` requires input"),
-        title_i18n: Default::default(),
-        fields,
-    })
+    let requests = direct_mcp_requests(required);
+    engine::mcp_elicitation_form_spec(question_id, alias, &requests)
 }
 
 fn direct_mcp_input_responses(
@@ -889,6 +819,51 @@ mod tests {
             question_id.to_string(),
             json!({"response_0": "first", "response_1": "second"}),
         )])
+    }
+
+    #[test]
+    fn direct_form_preserves_request_order_and_alias_diagnostics() {
+        let required = McpInputRequired {
+            input_requests: BTreeMap::from([
+                (
+                    "request-a".into(),
+                    json!({
+                        "method": "elicitation/create",
+                        "params": { "message": "Zebra" }
+                    }),
+                ),
+                (
+                    "request-z".into(),
+                    json!({
+                        "method": "elicitation/create",
+                        "params": { "message": "Apple" }
+                    }),
+                ),
+            ]),
+            request_state: None,
+        };
+        let form = direct_mcp_form_spec("question".into(), "server/tool", &required)
+            .expect("supported requests build a direct-call form");
+        let labels = form
+            .fields
+            .iter()
+            .map(|field| field.label.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, [Some("Apple"), Some("Zebra")]);
+
+        let invalid = McpInputRequired {
+            input_requests: BTreeMap::from([(
+                "request-1".into(),
+                json!({ "method": "sampling/createMessage" }),
+            )]),
+            request_state: None,
+        };
+        let error = direct_mcp_form_spec("question".into(), "server/tool", &invalid)
+            .expect_err("unsupported requests fail closed");
+        assert_eq!(
+            error.to_string(),
+            "step `server/tool` failed: MCP input request `request-1` uses unsupported method `sampling/createMessage`"
+        );
     }
 
     #[test]
