@@ -1,7 +1,7 @@
 {
-  "_comment": "Physical Rust lines under crates/<crate>/src: tests/ paths, tests.rs, test_support and inline #[cfg(test)] modules are uncapped tests; every other source line is capped product. Per-crate caps match current product counts. The HTTP preflight timeout fix raises engine and totalMax by 57 lines, justified by deterministic timeout, cancellation and remaining-budget regressions; totalMax ratchets down after each behavior-preserving deduplication slice.",
+  "_comment": "Physical Rust lines under crates/<crate>/src: tests/ paths, tests.rs, test_support and inline #[cfg(test)] modules are uncapped tests; every other source line is capped product. Per-crate caps match current product counts. The HTTP preflight timeout fix raises engine and totalMax by 57 lines, justified by deterministic timeout, cancellation and remaining-budget regressions; sharing check.command/check.container text expectations reduces steps and totalMax by 8 lines; totalMax ratchets down after each behavior-preserving deduplication slice.",
   "version": 1,
-  "totalMax": 95843,
+  "totalMax": 95835,
   "crates": {
     "api": 2927,
     "cli": 7661,
@@ -17,6 +17,6 @@
     "policy": 1699,
     "server": 7383,
     "service": 14945,
-    "steps": 6553
+    "steps": 6545
   }
 }

@@ -9,7 +9,7 @@ use policy::{params_schema, string_array_schema, string_schema};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::common::render_command;
+use super::common::{append_output_expect_findings, render_command};
 use super::container_backend::{
     ContainerMountSpec, ToolBackendCandidate, execute_container_backend_candidate,
     resolve_tool_backend,
@@ -173,49 +173,14 @@ impl StepExecutor for CheckContainerStep {
                 Some(format!("{}{}", output.stdout, output.stderr)),
             ));
         }
-        if let Some(needle) = params
-            .expect
-            .as_ref()
-            .and_then(|expect| expect.stdout_contains.as_ref())
-            && !output.stdout.contains(needle)
-        {
-            findings.push(Finding::error(
-                format!("stdout did not contain `{needle}`"),
-                Some(node.id.clone()),
-                Some(output.stdout.clone()),
-            ));
-        }
-        if let Some(needle) = params
-            .expect
-            .as_ref()
-            .and_then(|expect| expect.stderr_contains.as_ref())
-            && !output.stderr.contains(needle)
-        {
-            findings.push(Finding::error(
-                format!("stderr did not contain `{needle}`"),
-                Some(node.id.clone()),
-                Some(output.stderr.clone()),
-            ));
-        }
-        if let Some(pattern) = params
-            .expect
-            .as_ref()
-            .and_then(|expect| expect.stdout_matches.as_ref())
-        {
-            let expression = regex::Regex::new(pattern).map_err(|error| {
-                StepError::failed(
-                    &node.id,
-                    format!("invalid expect.stdout_matches regex: {error}"),
-                )
-            })?;
-            if !expression.is_match(&output.stdout) {
-                findings.push(Finding::error(
-                    format!("stdout did not match `{pattern}`"),
-                    Some(node.id.clone()),
-                    Some(output.stdout.clone()),
-                ));
-            }
-        }
+        append_output_expect_findings(
+            params.expect.as_ref(),
+            &output.stdout,
+            &output.stderr,
+            Some(&node.id),
+            &node.id,
+            &mut findings,
+        )?;
         if findings.is_empty() {
             Ok(StepOutcome::success(Some(json!({
                 "status": output.status,

@@ -6,7 +6,7 @@ use policy::{params_schema, string_array_schema, string_schema};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::common::render_command;
+use super::common::{append_output_expect_findings, render_command};
 use contract::Contract;
 pub(crate) struct CheckCommandStep;
 
@@ -85,39 +85,14 @@ impl StepExecutor for CheckCommandStep {
                     Some(output.stderr.clone()),
                 ));
             }
-            if let Some(needle) = &expect.stdout_contains
-                && !output.stdout.contains(needle)
-            {
-                findings.push(Finding::error(
-                    format!("stdout did not contain `{needle}`"),
-                    None,
-                    Some(output.stdout.clone()),
-                ));
-            }
-            if let Some(needle) = &expect.stderr_contains
-                && !output.stderr.contains(needle)
-            {
-                findings.push(Finding::error(
-                    format!("stderr did not contain `{needle}`"),
-                    None,
-                    Some(output.stderr.clone()),
-                ));
-            }
-            if let Some(pattern) = &expect.stdout_matches {
-                let expression = regex::Regex::new(pattern).map_err(|error| {
-                    StepError::failed(
-                        &node.id,
-                        format!("invalid expect.stdout_matches regex: {error}"),
-                    )
-                })?;
-                if !expression.is_match(&output.stdout) {
-                    findings.push(Finding::error(
-                        format!("stdout did not match `{pattern}`"),
-                        None,
-                        Some(output.stdout.clone()),
-                    ));
-                }
-            }
+            append_output_expect_findings(
+                Some(expect),
+                &output.stdout,
+                &output.stderr,
+                None,
+                &node.id,
+                &mut findings,
+            )?;
         } else if output.status != 0 {
             findings.push(Finding::error(
                 format!("command exited with {}", output.status),

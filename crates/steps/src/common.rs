@@ -1,6 +1,7 @@
 pub mod base64;
 pub mod files;
 pub mod json;
+mod output_expect;
 pub mod require;
 pub mod unix_mode;
 pub mod zip;
@@ -8,6 +9,7 @@ pub mod zip;
 pub(crate) use base64::*;
 pub(crate) use files::*;
 pub(crate) use json::*;
+pub(crate) use output_expect::*;
 pub(crate) use require::*;
 pub(crate) use unix_mode::*;
 pub(crate) use zip::*;
