@@ -636,37 +636,18 @@ pub(crate) async fn execute_agent_fs_write(
     operation_id: &str,
 ) -> Result<AgentToolOutcome, StepError> {
     let target = ctx.run.fs.resolve_write(path).step_err(&node.id)?;
-    match ctx
-        .run
+    ctx.run
         .fs
         .write_file_atomic(&target, content.as_bytes())
         .await
-    {
-        Ok(()) => {
-            let value = json!({ "file": path });
-            ctx.run.finish_external_operation(
-                ctx.journal,
-                node,
-                operation_id,
-                Some(value.clone()),
-            )?;
-            // Settlement cleanup (F02): the pending payload is no longer
-            // needed once the operation finished.
-            ctx.run.clear_pending_tool_payload(operation_id);
-            Ok(AgentToolOutcome::Result(value))
-        }
-        Err(error) => {
-            if !matches!(error, engine::GatewayError::Canceled) {
-                ctx.run.finish_external_operation_with_warn(
-                    ctx.journal,
-                    node,
-                    operation_id,
-                    engine::OperationOutcome::gateway_error(&error, false),
-                );
-            }
-            Err(StepError::from_gateway(&node.id, error))
-        }
-    }
+        .map_err(|error| ctx.side_effecting_gateway_error(node, operation_id, error))?;
+    let value = json!({ "file": path });
+    ctx.run
+        .finish_external_operation(ctx.journal, node, operation_id, Some(value.clone()))?;
+    // Settlement cleanup (F02): the pending payload is no longer
+    // needed once the operation finished.
+    ctx.run.clear_pending_tool_payload(operation_id);
+    Ok(AgentToolOutcome::Result(value))
 }
 
 /// Executes a verified `fs.patch` call. Policy (prefix, approval, guard,

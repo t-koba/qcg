@@ -390,6 +390,25 @@ impl StepContext<'_> {
         Ok(())
     }
 
+    /// Record a side-effecting gateway failure and map it to a step error.
+    /// Cancellation deliberately has no operation completion record.
+    pub fn side_effecting_gateway_error(
+        &self,
+        node: &NodeDef,
+        operation_id: &str,
+        error: crate::GatewayError,
+    ) -> StepError {
+        if !matches!(error, crate::GatewayError::Canceled) {
+            self.run.finish_external_operation_with_warn(
+                self.journal,
+                node,
+                operation_id,
+                crate::OperationOutcome::gateway_error(&error, false),
+            );
+        }
+        StepError::from_gateway(&node.id, error)
+    }
+
     pub async fn spawn_process(
         &self,
         node: &NodeDef,

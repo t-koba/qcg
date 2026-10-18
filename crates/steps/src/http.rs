@@ -417,7 +417,7 @@ impl StepExecutor for HttpStep {
                         has_explicit_idempotency_key,
                         &operation_id,
                     );
-                    let response = match ctx
+                    let response = ctx
                         .run
                         .http
                         .request(HttpRequest {
@@ -437,22 +437,9 @@ impl StepExecutor for HttpStep {
                             idempotency_key,
                         })
                         .await
-                    {
-                        Ok(response) => response,
-                        Err(error) => {
-                            // Cancellation finishes nothing: it
-                            // propagates without a completion record.
-                            if !matches!(error, engine::GatewayError::Canceled) {
-                                ctx.run.finish_external_operation_with_warn(
-                                    ctx.journal,
-                                    node,
-                                    &operation_id,
-                                    engine::OperationOutcome::gateway_error(&error, false),
-                                );
-                            }
-                            return Err(StepError::from_gateway(&node.id, error));
-                        }
-                    };
+                        .map_err(|error| {
+                            ctx.side_effecting_gateway_error(node, &operation_id, error)
+                        })?;
                     let response_value = serde_json::to_value(&response).map_err(|error| {
                         StepError::failed(
                             &node.id,

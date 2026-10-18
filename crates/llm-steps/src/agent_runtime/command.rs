@@ -81,22 +81,12 @@ pub(super) async fn execute_command(
             return Ok(AgentToolOutcome::Result(result));
         }
     };
-    let output = match ctx.run.cmd.run(command).await {
-        Ok(output) => output,
-        Err(error) => {
-            // Cancellation finishes nothing: it propagates
-            // without a completion record.
-            if !matches!(error, engine::GatewayError::Canceled) {
-                ctx.run.finish_external_operation_with_warn(
-                    ctx.journal,
-                    node,
-                    &operation_id,
-                    engine::OperationOutcome::gateway_error(&error, false),
-                );
-            }
-            return Err(StepError::from_gateway(&node.id, error));
-        }
-    };
+    let output = ctx
+        .run
+        .cmd
+        .run(command)
+        .await
+        .map_err(|error| ctx.side_effecting_gateway_error(node, &operation_id, error))?;
     let output = json!({
         "status": output.status,
         "stdout": output.stdout,

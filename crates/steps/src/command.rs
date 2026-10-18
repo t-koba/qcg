@@ -279,7 +279,7 @@ impl StepExecutor for CommandStep {
                 &invocation,
             )? {
                 engine::GuardDecision::Proceed { operation_id } => {
-                    let output = match ctx
+                    let output = ctx
                         .run
                         .cmd
                         .run_with_limits_and_stdin(
@@ -289,22 +289,9 @@ impl StepExecutor for CommandStep {
                             input.as_deref(),
                         )
                         .await
-                    {
-                        Ok(output) => output,
-                        Err(error) => {
-                            // Cancellation finishes nothing: it propagates
-                            // without a completion record.
-                            if !matches!(error, engine::GatewayError::Canceled) {
-                                ctx.run.finish_external_operation_with_warn(
-                                    ctx.journal,
-                                    node,
-                                    &operation_id,
-                                    engine::OperationOutcome::gateway_error(&error, false),
-                                );
-                            }
-                            return Err(StepError::from_gateway(&node.id, error));
-                        }
-                    };
+                        .map_err(|error| {
+                            ctx.side_effecting_gateway_error(node, &operation_id, error)
+                        })?;
                     let output_value = serde_json::to_value(&output).map_err(|error| {
                         StepError::failed(
                             &node.id,
