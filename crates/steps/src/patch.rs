@@ -103,9 +103,7 @@ impl StepExecutor for ReadAnchoredStep {
 }
 
 fn read_anchored_params(node: &NodeDef) -> Result<ReadAnchoredParams, StepError> {
-    let params: ReadAnchoredParams = node.deserialize_params().map_err(|error| {
-        StepError::failed(&node.id, format!("invalid read_anchored params: {error}"))
-    })?;
+    let params: ReadAnchoredParams = engine::step_params(node, "read_anchored")?;
     require(node, Some(&params.path), "path")?;
     Ok(params)
 }
@@ -271,9 +269,7 @@ impl StepExecutor for PatchStep {
 }
 
 fn patch_params(node: &NodeDef) -> Result<PatchParams, StepError> {
-    let params: PatchParams = node
-        .deserialize_params()
-        .map_err(|error| StepError::failed(&node.id, format!("invalid patch params: {error}")))?;
+    let params: PatchParams = engine::step_params(node, "patch")?;
     require(node, Some(&params.target), "target")?;
     require(
         node,
