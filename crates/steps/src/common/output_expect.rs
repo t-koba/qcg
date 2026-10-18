@@ -1,6 +1,21 @@
 use contract::ExpectDef;
 use engine::StepError;
 use model::Finding;
+use policy::string_schema;
+use serde_json::{Value, json};
+
+pub(crate) fn check_expect_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "exit_code": { "type": "integer" },
+            "exit_code_in": { "type": "array", "items": { "type": "integer" } },
+            "stdout_contains": string_schema(),
+            "stderr_contains": string_schema(),
+            "stdout_matches": string_schema(),
+        }
+    })
+}
 
 /// Append stdout/stderr text expectation findings in their established order.
 /// `location` controls finding attribution; `node_id` attributes regex errors.
@@ -76,6 +91,19 @@ mod tests {
         let mut findings = Vec::new();
         append_output_expect_findings(expect, stdout, stderr, location, node_id, &mut findings)?;
         Ok(findings)
+    }
+
+    #[test]
+    fn check_expect_schema_contains_all_supported_fields() {
+        let schema = check_expect_schema();
+        assert_eq!(schema["type"], "object");
+        let properties = schema["properties"].as_object().unwrap();
+        assert_eq!(properties.len(), 5);
+        assert_eq!(properties["exit_code"]["type"], "integer");
+        assert_eq!(properties["exit_code_in"]["items"]["type"], "integer");
+        for field in ["stdout_contains", "stderr_contains", "stdout_matches"] {
+            assert_eq!(properties[field]["type"], "string");
+        }
     }
 
     #[test]

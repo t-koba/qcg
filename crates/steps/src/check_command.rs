@@ -2,11 +2,11 @@ use async_trait::async_trait;
 use contract::{ExpectDef, NodeDef};
 use engine::{StepContext, StepError, StepExecutor, StepOutcome};
 use model::Finding;
-use policy::{params_schema, string_array_schema, string_schema};
+use policy::{params_schema, string_array_schema};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::common::{append_output_expect_findings, render_command};
+use super::common::{append_output_expect_findings, check_expect_schema, render_command};
 use contract::Contract;
 pub(crate) struct CheckCommandStep;
 
@@ -27,16 +27,7 @@ impl StepExecutor for CheckCommandStep {
             &["command"],
             json!({
                 "command": string_array_schema(),
-                "expect": {
-                    "type": "object",
-                    "properties": {
-                        "exit_code": { "type": "integer" },
-                        "exit_code_in": { "type": "array", "items": { "type": "integer" } },
-                        "stdout_contains": string_schema(),
-                        "stderr_contains": string_schema(),
-                        "stdout_matches": string_schema(),
-                    }
-                }
+                "expect": check_expect_schema()
             }),
         ))
     }
