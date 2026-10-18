@@ -389,6 +389,11 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn process_is_gone(error: &std::io::Error) -> bool {
+        error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+    }
+
+    #[cfg(target_os = "linux")]
     fn process_is_running(pid: i32) -> bool {
         match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
             Ok(stat) => {
@@ -397,9 +402,25 @@ mod tests {
                 let state = stat.rsplit_once(") ").unwrap().1.as_bytes()[0];
                 state != b'Z' && state != b'X'
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            // The task may exit between opening and reading procfs (ESRCH).
+            Err(error) if process_is_gone(&error) => false,
             Err(error) => panic!("cannot inspect worker: {error}"),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_probe_treats_disappearance_errors_as_stopped() {
+        assert!(process_is_gone(&std::io::Error::from_raw_os_error(
+            libc::ESRCH
+        )));
+        assert!(process_is_gone(&std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )));
+        assert!(!process_is_gone(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
+        assert!(!process_is_running(i32::MAX));
     }
 
     #[cfg(target_os = "linux")]
