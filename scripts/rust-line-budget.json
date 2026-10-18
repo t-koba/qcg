@@ -1,7 +1,7 @@
 {
   "_comment": "Physical Rust lines under crates/<crate>/src: tests/ paths, tests.rs, test_support and inline #[cfg(test)] modules are uncapped tests; every other source line is capped product, with per-crate and total caps below.",
   "version": 1,
-  "totalMax": 95692,
+  "totalMax": 95711,
   "crates": {
     "api": 2927,
     "cli": 7661,
@@ -16,7 +16,7 @@
     "model": 787,
     "policy": 1699,
     "server": 7383,
-    "service": 14747,
+    "service": 14766,
     "steps": 6686
   }
 }

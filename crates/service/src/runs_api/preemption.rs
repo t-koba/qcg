@@ -149,9 +149,14 @@ impl LocalService {
         // not start a writer between the rendezvous and the durable event.
         // Contention can be transient during an owner handoff; once the old
         // task has yielded, never abandon its durable requeue on WouldBlock.
-        let lease = crate::run_dirs::lock_run_execution(&staged.run_dir)
-            .await
-            .map_err(api_internal)?;
+        let Some(lease) =
+            crate::run_dirs::lock_run_execution(&staged.run_dir, &self.inner.shutdown)
+                .await
+                .map_err(api_internal)?
+        else {
+            tracing::info!(run_id = %id, "preemption requeue stopped during service shutdown");
+            return Ok(());
+        };
         if !boundary {
             truncate_trailing_canceled_events(&staged.run_dir).map_err(api_internal)?;
         }

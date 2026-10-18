@@ -15,6 +15,7 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
 use std::sync::Arc;
 use steps::deterministic_registry;
+use tokio_util::sync::CancellationToken;
 
 fn journal_target(
     record: &RunRecord,
@@ -305,15 +306,28 @@ impl Drop for RunExecutionLock {
 
 /// Waits for execution ownership when a caller must complete a durable
 /// handoff. Unlike ordinary probes, a transient competing lease must not
-/// abandon a yielded run in the in-memory Running state.
+/// abandon a yielded run in the in-memory Running state. Shutdown cancels
+/// the wait so preemption handoff work cannot pin the service's store lock.
 pub(crate) async fn lock_run_execution(
     run_dir: &Utf8Path,
-) -> Result<RunExecutionLock, ServiceError> {
+    shutdown: &CancellationToken,
+) -> Result<Option<RunExecutionLock>, ServiceError> {
     loop {
-        if let Some(lock) = try_lock_run_execution(run_dir)? {
-            return Ok(lock);
+        if shutdown.is_cancelled() {
+            return Ok(None);
         }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        if let Some(lock) = try_lock_run_execution(run_dir)? {
+            if shutdown.is_cancelled() {
+                drop(lock);
+                return Ok(None);
+            }
+            return Ok(Some(lock));
+        }
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return Ok(None),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+        }
     }
 }
 
@@ -2551,8 +2565,13 @@ mod tests {
         let root = temp_root("execution-lease-contention");
         let held = try_lock_run_execution(&root).unwrap().unwrap();
         let waiter_root = root.clone();
-        let mut waiter =
-            tokio::spawn(async move { lock_run_execution(&waiter_root).await.unwrap() });
+        let shutdown = CancellationToken::new();
+        let waiter_shutdown = shutdown.clone();
+        let mut waiter = tokio::spawn(async move {
+            lock_run_execution(&waiter_root, &waiter_shutdown)
+                .await
+                .unwrap()
+        });
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(30), &mut waiter)
                 .await
@@ -2564,7 +2583,38 @@ mod tests {
             .await
             .expect("the waiter should acquire after the prior owner releases")
             .expect("the waiter task should complete");
+        assert!(acquired.is_some());
         drop(acquired);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execution_lease_waiter_stops_on_shutdown() {
+        let root = temp_root("execution-lease-shutdown");
+        let held = try_lock_run_execution(&root).unwrap().unwrap();
+        let shutdown = CancellationToken::new();
+        let waiter_root = root.clone();
+        let waiter_shutdown = shutdown.clone();
+        let mut waiter = tokio::spawn(async move {
+            lock_run_execution(&waiter_root, &waiter_shutdown)
+                .await
+                .unwrap()
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut waiter)
+                .await
+                .is_err(),
+            "the waiter must remain blocked while another owner holds the lease"
+        );
+        shutdown.cancel();
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("shutdown must cancel the lease wait")
+            .expect("the waiter task should complete");
+        assert!(stopped.is_none());
+        assert!(try_lock_run_execution(&root).unwrap().is_none());
+        drop(held);
+        drop(try_lock_run_execution(&root).unwrap().unwrap());
         std::fs::remove_dir_all(root).unwrap();
     }
 
