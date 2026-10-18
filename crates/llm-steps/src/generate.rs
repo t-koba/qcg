@@ -26,9 +26,7 @@ pub(crate) struct LlmFillStep {
 }
 #[async_trait]
 impl StepExecutor for LlmGenerateStep {
-    fn type_id(&self) -> &'static str {
-        "llm.generate"
-    }
+    engine::step_type_id!("llm.generate");
 
     engine::parallel_step_traits!();
 
@@ -70,9 +68,7 @@ impl StepExecutor for LlmGenerateStep {
 
 #[async_trait]
 impl StepExecutor for LlmFillStep {
-    fn type_id(&self) -> &'static str {
-        "llm.fill"
-    }
+    engine::step_type_id!("llm.fill");
 
     engine::parallel_step_traits!();
 

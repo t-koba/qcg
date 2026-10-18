@@ -22,9 +22,7 @@ pub(crate) struct LlmRepairStep {
 }
 #[async_trait]
 impl StepExecutor for LlmRepairStep {
-    fn type_id(&self) -> &'static str {
-        "llm.repair"
-    }
+    engine::step_type_id!("llm.repair");
 
     engine::parallel_step_traits!();
 

@@ -20,9 +20,7 @@ struct CheckCommandParams {
 
 #[async_trait]
 impl StepExecutor for CheckCommandStep {
-    fn type_id(&self) -> &'static str {
-        "check.command"
-    }
+    engine::step_type_id!("check.command");
 
     fn params_schema(&self) -> Option<Value> {
         Some(params_schema(

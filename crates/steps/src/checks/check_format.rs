@@ -18,9 +18,7 @@ struct CheckFormatParams {
 
 #[async_trait]
 impl StepExecutor for CheckFormatStep {
-    fn type_id(&self) -> &'static str {
-        "check.format"
-    }
+    engine::step_type_id!("check.format");
 
     fn params_schema(&self) -> Option<Value> {
         Some(params_schema(

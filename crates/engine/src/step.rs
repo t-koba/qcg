@@ -177,6 +177,16 @@ macro_rules! parallel_step_traits {
     };
 }
 
+/// Implement a `StepExecutor`'s stable contract type identifier.
+#[macro_export]
+macro_rules! step_type_id {
+    ($type_id:literal) => {
+        fn type_id(&self) -> &'static str {
+            $type_id
+        }
+    };
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum StepControlFlow {
     #[default]

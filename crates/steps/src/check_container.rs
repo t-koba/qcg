@@ -30,9 +30,7 @@ struct CheckContainerParams {
 
 #[async_trait]
 impl StepExecutor for CheckContainerStep {
-    fn type_id(&self) -> &'static str {
-        "check.container"
-    }
+    engine::step_type_id!("check.container");
 
     fn params_schema(&self) -> Option<Value> {
         Some(params_schema(

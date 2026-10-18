@@ -178,9 +178,7 @@ fn question_schema(kind: &str, criteria: Value, required_criteria: bool) -> Valu
 
 #[async_trait]
 impl StepExecutor for LlmDecideStep {
-    fn type_id(&self) -> &'static str {
-        "llm.decide"
-    }
+    engine::step_type_id!("llm.decide");
 
     engine::parallel_step_traits!();
 

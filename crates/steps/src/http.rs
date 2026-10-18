@@ -120,9 +120,7 @@ enum HttpOutputMode {
 
 #[async_trait]
 impl StepExecutor for HttpStep {
-    fn type_id(&self) -> &'static str {
-        "http"
-    }
+    engine::step_type_id!("http");
 
     fn params_schema(&self) -> Option<Value> {
         Some(params_schema(

@@ -18,9 +18,7 @@ use super::validate::{
 
 #[async_trait]
 impl StepExecutor for McpCallStep {
-    fn type_id(&self) -> &'static str {
-        "mcp.call"
-    }
+    engine::step_type_id!("mcp.call");
 
     fn traits(&self) -> StepTraits {
         StepTraits::default()

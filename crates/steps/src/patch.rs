@@ -21,9 +21,7 @@ struct ReadAnchoredParams {
 
 #[async_trait]
 impl StepExecutor for ReadAnchoredStep {
-    fn type_id(&self) -> &'static str {
-        "read_anchored"
-    }
+    engine::step_type_id!("read_anchored");
 
     fn params_schema(&self) -> Option<Value> {
         Some(params_schema(
@@ -131,9 +129,7 @@ struct PatchParams {
 
 #[async_trait]
 impl StepExecutor for PatchStep {
-    fn type_id(&self) -> &'static str {
-        "patch"
-    }
+    engine::step_type_id!("patch");
 
     fn params_schema(&self) -> Option<Value> {
         Some(params_schema(

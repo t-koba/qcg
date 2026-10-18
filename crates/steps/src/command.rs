@@ -103,9 +103,7 @@ enum StructuredCommandStatus {
 
 #[async_trait]
 impl StepExecutor for CommandStep {
-    fn type_id(&self) -> &'static str {
-        "command"
-    }
+    engine::step_type_id!("command");
 
     fn params_schema(&self) -> Option<Value> {
         Some(params_schema(

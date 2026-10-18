@@ -21,9 +21,7 @@ pub(crate) struct LlmChooseStep {
 }
 #[async_trait]
 impl StepExecutor for LlmChooseStep {
-    fn type_id(&self) -> &'static str {
-        "llm.choose"
-    }
+    engine::step_type_id!("llm.choose");
 
     engine::parallel_step_traits!();
 

@@ -15,9 +15,7 @@ struct FailParams {
 
 #[async_trait]
 impl StepExecutor for FailStep {
-    fn type_id(&self) -> &'static str {
-        "fail"
-    }
+    engine::step_type_id!("fail");
 
     fn params_schema(&self) -> Option<Value> {
         Some(params_schema(&[], json!({ "content": string_schema() })))

@@ -18,9 +18,7 @@ struct AwaitParams {
 
 #[async_trait]
 impl StepExecutor for AwaitStep {
-    fn type_id(&self) -> &'static str {
-        "await"
-    }
+    engine::step_type_id!("await");
 
     fn params_schema(&self) -> Option<Value> {
         Some(params_schema(

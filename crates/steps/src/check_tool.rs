@@ -16,9 +16,7 @@ pub(crate) struct CheckToolStep;
 
 #[async_trait]
 impl StepExecutor for CheckToolStep {
-    fn type_id(&self) -> &'static str {
-        "check.tool"
-    }
+    engine::step_type_id!("check.tool");
 
     fn params_schema(&self) -> Option<Value> {
         Some(params_schema(

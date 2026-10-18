@@ -31,9 +31,7 @@ struct TransformParams {
 
 #[async_trait]
 impl StepExecutor for TransformStep {
-    fn type_id(&self) -> &'static str {
-        "transform"
-    }
+    engine::step_type_id!("transform");
 
     fn params_schema(&self) -> Option<Value> {
         Some(params_schema(

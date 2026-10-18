@@ -20,9 +20,7 @@ struct RenderParams {
 
 #[async_trait]
 impl StepExecutor for RenderStep {
-    fn type_id(&self) -> &'static str {
-        "render"
-    }
+    engine::step_type_id!("render");
 
     fn params_schema(&self) -> Option<Value> {
         Some(params_schema(
@@ -109,9 +107,7 @@ struct WriteParams {
 
 #[async_trait]
 impl StepExecutor for WriteStep {
-    fn type_id(&self) -> &'static str {
-        "write"
-    }
+    engine::step_type_id!("write");
 
     fn params_schema(&self) -> Option<Value> {
         Some(params_schema(
@@ -177,9 +173,7 @@ struct CopyParams {
 
 #[async_trait]
 impl StepExecutor for CopyStep {
-    fn type_id(&self) -> &'static str {
-        "copy"
-    }
+    engine::step_type_id!("copy");
 
     fn params_schema(&self) -> Option<Value> {
         Some(params_schema(

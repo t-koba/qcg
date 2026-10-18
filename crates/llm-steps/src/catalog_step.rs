@@ -47,9 +47,7 @@ fn default_enabled_only() -> bool {
 
 #[async_trait]
 impl StepExecutor for LlmCatalogStep {
-    fn type_id(&self) -> &'static str {
-        "llm.catalog"
-    }
+    engine::step_type_id!("llm.catalog");
 
     fn params_schema(&self) -> Option<Value> {
         Some(params_schema(

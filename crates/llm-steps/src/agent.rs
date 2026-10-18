@@ -336,9 +336,7 @@ fn resumed_builtin_call(checkpoint: Option<&AgentCheckpoint>) -> Option<McpSuspe
 
 #[async_trait]
 impl StepExecutor for LlmAgentStep {
-    fn type_id(&self) -> &'static str {
-        "llm.agent"
-    }
+    engine::step_type_id!("llm.agent");
 
     engine::parallel_step_traits!();
 

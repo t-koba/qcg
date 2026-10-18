@@ -40,9 +40,7 @@ struct AskUserParams {
 
 #[async_trait]
 impl StepExecutor for AskUserStep {
-    fn type_id(&self) -> &'static str {
-        "ask_user"
-    }
+    engine::step_type_id!("ask_user");
 
     fn params_schema(&self) -> Option<Value> {
         Some(params_schema(

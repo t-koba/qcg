@@ -22,9 +22,7 @@ struct ForeachParams {
 
 #[async_trait]
 impl StepExecutor for ForeachStep {
-    fn type_id(&self) -> &'static str {
-        "foreach"
-    }
+    engine::step_type_id!("foreach");
 
     fn params_schema(&self) -> Option<Value> {
         Some(params_schema(
