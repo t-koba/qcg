@@ -62,6 +62,7 @@ class CleanupTests(unittest.TestCase):
             mock.patch.object(run, "BINARY", binary),
             mock.patch.object(run, "REPORT", root / "report.json"),
             mock.patch.object(run, "COUNT", 1),
+            mock.patch.object(run.platform, "platform", return_value="test-platform"),
             mock.patch.object(run.os, "sysconf", return_value=100, create=True),
             mock.patch.object(run.subprocess, "check_output", return_value="test-revision"),
             mock.patch.object(run.importlib.metadata, "version", return_value="0.0.0"),
