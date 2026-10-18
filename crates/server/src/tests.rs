@@ -2404,41 +2404,60 @@ async fn invalidation_http_has_delete_auth_parity_and_immutable_json_record() {
         };
         let cors = super::server::parse_cors_origins(&config.cors_origins).unwrap();
         let app = super::server::build_router(&state, &config, &cors, None).unwrap();
+        const TRANSIENT_RETRIES: usize = 10;
         for (method, uri) in [
             ("DELETE", "/api/runs/missing"),
             ("POST", "/api/runs/missing/invalidation"),
         ] {
             for authorized in [false, true] {
-                let mut builder = axum::http::Request::builder()
-                    .method(method)
-                    .uri(uri)
-                    .header("content-type", "application/json");
-                if authorized {
-                    builder = builder.header("authorization", format!("Bearer {test_credential}"));
-                }
-                let response = app
-                    .clone()
-                    .oneshot(
-                        builder
-                            .body(axum::body::Body::from(
-                                r#"{"reason":"bad","actor_label":"reviewer"}"#,
-                            ))
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    response.status(),
-                    if authenticated && !authorized {
-                        StatusCode::UNAUTHORIZED
-                    } else {
-                        StatusCode::NOT_FOUND
+                let expected_status = if authenticated && !authorized {
+                    StatusCode::UNAUTHORIZED
+                } else {
+                    StatusCode::NOT_FOUND
+                };
+                for attempt in 0..=TRANSIENT_RETRIES {
+                    let mut builder = axum::http::Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("content-type", "application/json");
+                    if authorized {
+                        builder =
+                            builder.header("authorization", format!("Bearer {test_credential}"));
                     }
-                );
+                    let response = app
+                        .clone()
+                        .oneshot(
+                            builder
+                                .body(axum::body::Body::from(
+                                    r#"{"reason":"bad","actor_label":"reviewer"}"#,
+                                ))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    let status = response.status();
+                    let body = axum::body::to_bytes(response.into_body(), 32768)
+                        .await
+                        .unwrap();
+                    let retryable = status == StatusCode::CONFLICT
+                        && serde_json::from_slice::<api::ProblemDetails>(&body).is_ok_and(
+                            |problem| problem.detail == "run store maintenance is busy; retry",
+                        );
+                    if retryable && attempt < TRANSIENT_RETRIES {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
+                    assert_eq!(
+                        status,
+                        expected_status,
+                        "{method} {uri}, authenticated={authenticated}, authorized={authorized}, response body={}",
+                        String::from_utf8_lossy(&body)
+                    );
+                    break;
+                }
             }
         }
         let mut first = None;
-        const TRANSIENT_RETRIES: usize = 10;
         for reason in ["wrong output", "wrong output", "different"] {
             let expected_status = if reason == "different" {
                 StatusCode::CONFLICT
