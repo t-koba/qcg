@@ -390,6 +390,22 @@ fn step_registry_validation_errors_identify_flow_nodes_and_hooks() {
 }
 
 #[test]
+fn required_step_field_preserves_missing_empty_and_whitespace_behavior() {
+    let node = node("required_field", "test.step");
+    let error = crate::require_field(&node, None, "prompt").unwrap_err();
+    match error {
+        crate::StepError::Failed { node, message } => {
+            assert_eq!(node, "required_field");
+            assert_eq!(message, "prompt is required");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert!(crate::require_field(&node, Some(""), "prompt").is_err());
+    assert!(crate::require_field(&node, Some("value"), "prompt").is_ok());
+    assert!(crate::require_field(&node, Some(" "), "prompt").is_ok());
+}
+
+#[test]
 fn generator_cannot_claim_llm_provider_credential_environment() {
     let provider = llm::LlmRouter::parse_text(
         r#"

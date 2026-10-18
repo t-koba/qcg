@@ -370,11 +370,3 @@ pub(crate) fn has_capability(capabilities: &llm::Capabilities, name: &str) -> bo
         _ => false,
     }
 }
-
-pub(crate) fn require(node: &NodeDef, value: Option<&str>, field: &str) -> Result<(), StepError> {
-    if value.unwrap_or_default().is_empty() {
-        Err(StepError::failed(&node.id, format!("{field} is required")))
-    } else {
-        Ok(())
-    }
-}

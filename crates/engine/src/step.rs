@@ -77,6 +77,15 @@ pub trait ResultExt<T> {
     fn step_err(self, node: impl Into<String>) -> Result<T, StepError>;
 }
 
+/// Validate a required string field from a step's decoded parameters.
+pub fn require_field(node: &NodeDef, value: Option<&str>, field: &str) -> Result<(), StepError> {
+    if value.unwrap_or_default().is_empty() {
+        Err(StepError::failed(&node.id, format!("{field} is required")))
+    } else {
+        Ok(())
+    }
+}
+
 impl<T, E> ResultExt<T> for Result<T, E>
 where
     E: std::fmt::Display,

@@ -1,13 +1,6 @@
 use contract::{Contract, NodeDef};
+pub(crate) use engine::require_field as require;
 use engine::{StepContext, StepError};
-
-pub(crate) fn require(node: &NodeDef, value: Option<&str>, field: &str) -> Result<(), StepError> {
-    if value.unwrap_or_default().is_empty() {
-        Err(StepError::failed(&node.id, format!("{field} is required")))
-    } else {
-        Ok(())
-    }
-}
 
 pub(crate) fn package_file(
     contract: &Contract,

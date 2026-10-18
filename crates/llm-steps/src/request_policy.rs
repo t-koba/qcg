@@ -2,7 +2,7 @@ use contract::{
     ContextOverflowPolicy, ContextRef, LlmConfig, LlmRequestControl, LlmRequestPolicy, NodeDef,
     ReasoningEffortSpec, ToolDecl,
 };
-use engine::{StepContext, StepError};
+use engine::{StepContext, StepError, require_field as require};
 use llm::ImageDetail;
 use model::{ResponseVerbosity, StructuredOutputMode, ToolChoice};
 use serde::Deserialize;
@@ -10,7 +10,6 @@ use std::collections::BTreeSet;
 
 use crate::context::effective_context_byte_limit;
 use crate::guardrail::GuardrailDecl;
-use crate::validation::require;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
