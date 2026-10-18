@@ -221,20 +221,8 @@ impl StepRegistry {
             .iter()
             .chain(contract.manifest.blocks.values().flatten())
         {
-            let Some(executor) = self.get(&node.kind) else {
-                errors.push(format!(
-                    "node `{}`: {}",
-                    node.id,
-                    contract.line_hint(&format!("step type `{}` is not registered", node.kind))
-                ));
-                continue;
-            };
-            if let Err(error) = executor.validate(node, contract) {
-                errors.push(format!(
-                    "node `{}`: {}",
-                    node.id,
-                    contract.line_hint(&error.to_string())
-                ));
+            if let Some(error) = self.validation_error(node, contract, "node", &node.id) {
+                errors.push(error);
             }
         }
         // Lifecycle hooks execute through the same registry, so a hook with
@@ -242,18 +230,8 @@ impl StepRegistry {
         // instead of at run start.
         for (event, hook) in contract.manifest.hooks.entries() {
             let node = hook.to_node(event);
-            let Some(executor) = self.get(&node.kind) else {
-                errors.push(format!(
-                    "hook `{event}`: {}",
-                    contract.line_hint(&format!("step type `{}` is not registered", node.kind))
-                ));
-                continue;
-            };
-            if let Err(error) = executor.validate(&node, contract) {
-                errors.push(format!(
-                    "hook `{event}`: {}",
-                    contract.line_hint(&error.to_string())
-                ));
+            if let Some(error) = self.validation_error(&node, contract, "hook", event) {
+                errors.push(error);
             }
         }
         if errors.is_empty() {
@@ -278,6 +256,23 @@ impl StepRegistry {
                 ),
             ))
         }
+    }
+
+    fn validation_error(
+        &self,
+        node: &NodeDef,
+        contract: &Contract,
+        label: &str,
+        name: &str,
+    ) -> Option<String> {
+        let message = match self.get(&node.kind) {
+            Some(executor) => executor.validate(node, contract).err()?.to_string(),
+            None => format!("step type `{}` is not registered", node.kind),
+        };
+        Some(format!(
+            "{label} `{name}`: {}",
+            contract.line_hint(&message)
+        ))
     }
 }
 

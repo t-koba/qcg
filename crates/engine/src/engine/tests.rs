@@ -367,6 +367,29 @@ async fn resumed_file_inputs_reject_untracked_changes() {
 }
 
 #[test]
+fn step_registry_validation_errors_identify_flow_nodes_and_hooks() {
+    let mut manifest = manifest(vec![node("missing_node", "missing.step")]);
+    manifest
+        .hooks
+        .run_started
+        .push(hook("missing_hook", "missing.hook", HookErrorPolicy::Fail));
+    let contract = test_contract(Utf8Path::new("missing-root"), manifest);
+
+    let error = StepRegistry::new()
+        .validate_contract(&contract)
+        .expect_err("unregistered step types must be rejected")
+        .to_string();
+    assert!(
+        error.contains("node `missing_node`: line 1: step type `missing.step` is not registered"),
+        "{error}"
+    );
+    assert!(
+        error.contains("hook `run_started`: line 1: step type `missing.hook` is not registered"),
+        "{error}"
+    );
+}
+
+#[test]
 fn generator_cannot_claim_llm_provider_credential_environment() {
     let provider = llm::LlmRouter::parse_text(
         r#"
