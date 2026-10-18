@@ -1,5 +1,5 @@
 {
-  "_comment": "Physical Rust lines under crates/<crate>/src: tests/ paths, tests.rs, test_support and inline #[cfg(test)] modules are uncapped tests; every other source line is capped product, with per-crate and total caps below.",
+  "_comment": "Physical Rust lines under crates/<crate>/src: tests/ paths, tests.rs, test_support and inline #[cfg(test)] modules are uncapped tests; every other source line is capped product, with per-crate and total caps below. Caps reflect the common MCP destination journal writer moving into engine; consumer-crate caps rebalance the line allocation while totalMax stays unchanged.",
   "version": 1,
   "totalMax": 95900,
   "crates": {
@@ -7,16 +7,16 @@
     "cli": 7661,
     "container": 1832,
     "contract": 6557,
-    "engine": 20560,
+    "engine": 20591,
     "expr-wasm": 175,
     "files": 1224,
     "llm": 7267,
-    "llm-steps": 12543,
+    "llm-steps": 12526,
     "mcp": 3644,
     "model": 787,
     "policy": 1699,
     "server": 7383,
     "service": 14955,
-    "steps": 6686
+    "steps": 6666
   }
 }

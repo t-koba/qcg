@@ -9,6 +9,8 @@
 
 use super::command::CmdGateway;
 use super::error::GatewayError;
+use crate::{JournalWriter, StepError};
+use serde_json::json;
 
 /// Consults the operator decider for statically-missed hosts. `Ok(true)`
 /// allows the fetch; `Ok(false)` denies it (any spawn failure, timeout,
@@ -38,6 +40,34 @@ pub async fn decide_destination(
         output.status,
         &output.stdout_bytes,
     ))
+}
+
+/// Records one delegated destination verdict for audit. The event keeps
+/// the existing hosts-only payload; URLs, query values and arguments are
+/// never journaled.
+pub fn record_destination_decision(
+    journal: &JournalWriter,
+    node: &str,
+    server: &str,
+    tool: &str,
+    hosts: &[String],
+    timeout_seconds: u64,
+    allow: bool,
+) -> Result<(), StepError> {
+    journal
+        .event(
+            "mcp_destination_decision",
+            json!({
+                "node": node,
+                "server": server,
+                "tool": tool,
+                "hosts": hosts,
+                "verdict_source": "decider",
+                "allow": allow,
+                "timeout_seconds": timeout_seconds,
+            }),
+        )
+        .map_err(|error| StepError::failed(node, error.to_string()))
 }
 
 #[cfg(all(test, unix))]
@@ -163,5 +193,91 @@ mod tests {
             matches!(denied, Err(GatewayError::CommandTimedOut { .. })),
             "timeout must surface distinctly: {denied:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod journal_tests {
+    use super::record_destination_decision;
+    use crate::JournalWriter;
+    use camino::Utf8PathBuf;
+    use serde_json::{Value, json};
+
+    #[test]
+    fn destination_decision_writer_preserves_hosts_only_event() {
+        let root = std::env::temp_dir().join(format!(
+            "mcp-destination-decision-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let path = Utf8PathBuf::from_path_buf(root.join("journal.jsonl"))
+            .expect("temporary journal path should be UTF-8");
+        let journal = JournalWriter::create(&path, "decision-test", false, None)
+            .expect("journal should be created");
+        let hosts = vec!["example.test".to_string()];
+
+        record_destination_decision(
+            &journal,
+            "fetch-node",
+            "exa-public",
+            "fetch",
+            &hosts,
+            7,
+            false,
+        )
+        .expect("destination decision should be recorded");
+
+        drop(journal);
+        let contents = std::fs::read_to_string(&path).expect("journal should be readable");
+        let event: Value = serde_json::from_str(contents.lines().next().unwrap())
+            .expect("journal event should be valid JSON");
+        assert_eq!(event["t"], "mcp_destination_decision");
+        assert_eq!(event["node"], "fetch-node");
+        assert_eq!(event["server"], "exa-public");
+        assert_eq!(event["tool"], "fetch");
+        assert_eq!(event["hosts"], json!(["example.test"]));
+        assert_eq!(event["verdict_source"], "decider");
+        assert_eq!(event["allow"], false);
+        assert_eq!(event["timeout_seconds"], 7);
+        assert!(event.get("arguments").is_none());
+        std::fs::remove_dir_all(&root).expect("temporary journal directory should be removed");
+    }
+
+    #[test]
+    fn destination_decision_writer_maps_journal_errors_to_node_failures() {
+        let root = std::env::temp_dir().join(format!(
+            "mcp-destination-decision-error-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let path = Utf8PathBuf::from_path_buf(root.join("journal.jsonl"))
+            .expect("temporary journal path should be UTF-8");
+        let limits = crate::JournalLimits {
+            max_event_bytes: Some(1),
+            max_total_bytes: None,
+            max_event_count: None,
+            max_state_bytes: None,
+            scan_window_bytes: None,
+        };
+        let journal =
+            JournalWriter::create_with_limits(&path, "decision-test", false, None, limits)
+                .expect("journal should be created with bounded event size");
+        let error = record_destination_decision(
+            &journal,
+            "fetch-node",
+            "exa-public",
+            "fetch",
+            &["example.test".to_string()],
+            7,
+            false,
+        )
+        .expect_err("oversized event should fail");
+        assert!(matches!(
+            error,
+            crate::StepError::Failed { node, message }
+                if node == "fetch-node" && message.contains("journal event exceeds 1 bytes")
+        ));
+        drop(journal);
+        std::fs::remove_dir_all(&root).expect("temporary journal directory should be removed");
     }
 }

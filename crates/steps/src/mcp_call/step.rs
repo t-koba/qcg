@@ -310,12 +310,21 @@ async fn authorize_direct_destinations(
     .with_cancellation(ctx.run.cancellation.clone());
     let verdict =
         engine::decide_destination(&gateway, server, tool, &extracted, argv, timeout).await;
+    let record_decision = |allow| {
+        engine::record_destination_decision(
+            ctx.journal,
+            &node.id,
+            server,
+            tool,
+            &extracted,
+            timeout,
+            allow,
+        )
+    };
     match verdict {
         Err(engine::GatewayError::Canceled) => Err(engine::StepError::Cancelled),
         Err(error) => {
-            record_direct_destination_decision(
-                ctx, node, server, tool, &extracted, timeout, false,
-            )?;
+            record_decision(false)?;
             Err(engine::StepError::Refused {
                 node: node.id.clone(),
                 message: format!(
@@ -324,9 +333,7 @@ async fn authorize_direct_destinations(
             })
         }
         Ok(allow) => {
-            record_direct_destination_decision(
-                ctx, node, server, tool, &extracted, timeout, allow,
-            )?;
+            record_decision(allow)?;
             if allow {
                 Ok(())
             } else {
@@ -340,33 +347,6 @@ async fn authorize_direct_destinations(
             }
         }
     }
-}
-
-/// Journals one delegated destination verdict for audit (hosts only, never
-/// URLs, query values, or arguments).
-fn record_direct_destination_decision(
-    ctx: &StepContext<'_>,
-    node: &NodeDef,
-    server: &str,
-    tool: &str,
-    hosts: &[String],
-    timeout_seconds: u64,
-    allow: bool,
-) -> Result<(), engine::StepError> {
-    ctx.journal
-        .event(
-            "mcp_destination_decision",
-            json!({
-                "node": node.id,
-                "server": server,
-                "tool": tool,
-                "hosts": hosts,
-                "verdict_source": "decider",
-                "allow": allow,
-                "timeout_seconds": timeout_seconds,
-            }),
-        )
-        .map_err(|error| engine::StepError::failed(&node.id, error.to_string()))
 }
 
 /// Fail-closed destination-policy gate for the direct `mcp.call` path:

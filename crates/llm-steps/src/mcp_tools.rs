@@ -6,7 +6,7 @@ use mcp::{
     McpAccess, McpCallOutcome, McpCommandAccess, McpCommandIsolation, McpContainerRuntime,
     McpError, McpSession,
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::BTreeMap;
 
 use crate::agent::agent_command_permission;
@@ -438,10 +438,21 @@ impl McpAgentTools {
         .with_cancellation(ctx.run.cancellation.clone());
         let verdict =
             engine::decide_destination(&gateway, server, alias, &extracted, argv, *timeout).await;
+        let record_decision = |allow| {
+            engine::record_destination_decision(
+                ctx.journal,
+                &node.id,
+                server,
+                alias,
+                &extracted,
+                *timeout,
+                allow,
+            )
+        };
         match verdict {
             Err(engine::GatewayError::Canceled) => Err(StepError::Cancelled),
             Err(error) => {
-                record_destination_decision(ctx, node, server, alias, &extracted, *timeout, false)?;
+                record_decision(false)?;
                 Err(StepError::Refused {
                     node: node.id.clone(),
                     message: format!(
@@ -450,7 +461,7 @@ impl McpAgentTools {
                 })
             }
             Ok(allow) => {
-                record_destination_decision(ctx, node, server, alias, &extracted, *timeout, allow)?;
+                record_decision(allow)?;
                 if allow {
                     Ok(())
                 } else {
@@ -510,34 +521,6 @@ impl McpAgentTools {
         validate_mcp_complete_result(&node.id, alias, tool.output_validator.as_ref(), value)?;
         Ok(result)
     }
-}
-
-/// Journals one delegated destination verdict for audit. Hosts are
-/// plaintext (matching existing destination journaling); no URLs, query
-/// values, or arguments are recorded, so no secret reaches the journal.
-fn record_destination_decision(
-    ctx: &StepContext<'_>,
-    node: &NodeDef,
-    server: &str,
-    alias: &str,
-    hosts: &[String],
-    timeout_seconds: u64,
-    allow: bool,
-) -> Result<(), StepError> {
-    ctx.journal
-        .event(
-            "mcp_destination_decision",
-            json!({
-                "node": node.id,
-                "server": server,
-                "tool": alias,
-                "hosts": hosts,
-                "verdict_source": "decider",
-                "allow": allow,
-                "timeout_seconds": timeout_seconds,
-            }),
-        )
-        .map_err(|error| StepError::failed(&node.id, error.to_string()))
 }
 
 pub(crate) fn validate_mcp_complete_result(
