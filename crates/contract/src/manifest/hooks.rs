@@ -34,7 +34,7 @@ pub struct HooksConfig {
     pub run_failed: Vec<HookDef>,
     /// Runs once during failed settlement, after inputs are still available
     /// and before `run_failed` hooks. Failures are published as the
-    /// `step_failed` variable so a hook can render them.
+    /// `hook_failures` step variable so a hook can render them.
     #[serde(default)]
     pub step_failed: Vec<HookDef>,
 }
