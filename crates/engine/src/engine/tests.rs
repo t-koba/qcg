@@ -6177,19 +6177,38 @@ async fn duplicate_write_and_extra_effect_pass_shape_validation_with_wrong_readb
         workspace: &Utf8PathBuf,
         permissions: &Permissions,
         order_id: &str,
+        record_id: usize,
     ) -> Utf8PathBuf {
         let gateway = crate::FsGateway::new(workspace.clone(), permissions);
         let target = gateway
-            .resolve_write(&format!("orders/{order_id}.json"))
-            .expect("order path should resolve");
-        std::fs::create_dir_all(target.parent().expect("order file must have a parent"))
-            .expect("order parent should be creatable");
+            .resolve_write(&format!("orders/{order_id}/events/{record_id}.json"))
+            .expect("order record path should resolve");
+        std::fs::create_dir_all(target.parent().expect("order record must have a parent"))
+            .expect("order record parent should be creatable");
         let body = serde_json::json!({ "order_id": order_id }).to_string();
         gateway
             .write_file_atomic(&target, body.as_bytes())
             .await
-            .expect("order write should succeed");
+            .expect("order record write should succeed");
         target
+    }
+
+    fn persisted_order_record_count(workspace: &Utf8PathBuf, order_id: &str) -> usize {
+        let records_dir = workspace.join(format!("orders/{order_id}/events"));
+        std::fs::read_dir(records_dir)
+            .expect("order ledger should be readable")
+            .map(|entry| {
+                let path = entry.expect("order ledger entry should be readable").path();
+                let body = std::fs::read_to_string(path).expect("order record should be readable");
+                let record: serde_json::Value =
+                    serde_json::from_str(&body).expect("order record should be valid JSON");
+                assert_eq!(
+                    record["order_id"].as_str(),
+                    Some(order_id),
+                    "every persisted record must retain the checked order id"
+                );
+            })
+            .count()
     }
 
     let baseline_id = uuid::Uuid::now_v7().as_simple().to_string();
@@ -6197,9 +6216,10 @@ async fn duplicate_write_and_extra_effect_pass_shape_validation_with_wrong_readb
         std::env::temp_dir().join(format!("engine-duplicate-replay-{baseline_id}")),
     )
     .expect("temporary path must be UTF-8");
+    let _baseline_guard = TempGuard(baseline_root.clone());
     let baseline_workspace = baseline_root.join("workspace");
     std::fs::create_dir_all(&baseline_workspace).expect("workspace should be created");
-    let baseline_target = write_order(&baseline_workspace, &permissions, &baseline_id).await;
+    let baseline_target = write_order(&baseline_workspace, &permissions, &baseline_id, 1).await;
     let baseline_value = json!({ "order_id": baseline_id });
     assert!(
         crate::validate_json_schema_step("node", &schema, &baseline_value, "response").is_ok(),
@@ -6208,12 +6228,18 @@ async fn duplicate_write_and_extra_effect_pass_shape_validation_with_wrong_readb
     let baseline_bytes =
         std::fs::read_to_string(&baseline_target).expect("baseline order should be readable");
     assert!(baseline_bytes.contains(&baseline_id));
+    let baseline_records = persisted_order_record_count(&baseline_workspace, &baseline_id);
+    assert_eq!(
+        baseline_records, 1,
+        "valid control persists one order record"
+    );
 
     let duplicate_id = uuid::Uuid::now_v7().as_simple().to_string();
     let duplicate_root = Utf8PathBuf::from_path_buf(
         std::env::temp_dir().join(format!("engine-duplicate-replay-{duplicate_id}")),
     )
     .expect("temporary path must be UTF-8");
+    let _duplicate_guard = TempGuard(duplicate_root.clone());
     let duplicate_workspace = duplicate_root.join("workspace");
     std::fs::create_dir_all(&duplicate_workspace).expect("workspace should be created");
     let sequence = serde_json::to_string(&[
@@ -6290,32 +6316,50 @@ async fn duplicate_write_and_extra_effect_pass_shape_validation_with_wrong_readb
             (name.clone(), args.clone())
         })
         .collect::<Vec<_>>();
+    assert_eq!(scripted.len(), 2, "fixture should issue two tool calls");
     assert_eq!(
         scripted[0], scripted[1],
         "duplicate tool calls preserve every checked field"
     );
-    write_order(&duplicate_workspace, &permissions, &duplicate_id).await;
-    write_order(&duplicate_workspace, &permissions, &duplicate_id).await;
-    let duplicate_writes = 2;
+    // Dispatch each scripted call through the deterministic recording effect:
+    // every invocation creates a distinct ledger record despite identical
+    // arguments. Read persisted records independently below.
+    for (record_id, (name, args)) in scripted.iter().enumerate() {
+        assert_eq!(name, "write_order");
+        assert_eq!(
+            args["order_id"].as_str(),
+            Some(duplicate_id.as_str()),
+            "each call must preserve the checked order id"
+        );
+        write_order(
+            &duplicate_workspace,
+            &permissions,
+            &duplicate_id,
+            record_id + 1,
+        )
+        .await;
+    }
     let duplicate_value = json!({ "order_id": duplicate_id });
     assert!(
         crate::validate_json_schema_step("node", &schema, &duplicate_value, "response").is_ok(),
         "duplicate-write final response must PASS shape validation"
     );
-    assert_eq!(duplicate_writes, 2);
-    let duplicate_target = duplicate_workspace.join(format!("orders/{duplicate_id}.json"));
-    let duplicate_bytes =
-        std::fs::read_to_string(&duplicate_target).expect("duplicate order should be readable");
-    assert!(duplicate_bytes.contains(&duplicate_id));
+    let duplicate_records = persisted_order_record_count(&duplicate_workspace, &duplicate_id);
+    assert_eq!(
+        duplicate_records,
+        baseline_records + 1,
+        "same-argument duplicate writes persist an extra record versus the valid control"
+    );
 
     let extra_id = uuid::Uuid::now_v7().as_simple().to_string();
     let extra_root = Utf8PathBuf::from_path_buf(
         std::env::temp_dir().join(format!("engine-duplicate-replay-{extra_id}")),
     )
     .expect("temporary path must be UTF-8");
+    let _extra_guard = TempGuard(extra_root.clone());
     let extra_workspace = extra_root.join("workspace");
     std::fs::create_dir_all(&extra_workspace).expect("workspace should be created");
-    write_order(&extra_workspace, &permissions, &extra_id).await;
+    write_order(&extra_workspace, &permissions, &extra_id, 1).await;
     let gateway = crate::FsGateway::new(extra_workspace.clone(), &permissions);
     let extra_target = gateway
         .resolve_write(&format!("orders/{extra_id}-extra.json"))
@@ -6336,10 +6380,6 @@ async fn duplicate_write_and_extra_effect_pass_shape_validation_with_wrong_readb
         crate::validate_json_schema_step("node", &schema, &inside_extra, "response").is_err(),
         "in-JSON extras under a closed schema must FAIL"
     );
-
-    let _ = std::fs::remove_dir_all(&baseline_root);
-    let _ = std::fs::remove_dir_all(&duplicate_root);
-    let _ = std::fs::remove_dir_all(&extra_root);
 }
 
 #[tokio::test]
