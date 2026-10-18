@@ -317,10 +317,10 @@ pub(crate) async fn lock_run_execution(
             return Ok(None);
         }
         if let Some(lock) = try_lock_run_execution(run_dir)? {
-            if shutdown.is_cancelled() {
-                drop(lock);
-                return Ok(None);
-            }
+            // Acquisition transfers settlement responsibility to this
+            // caller. Do not drop a held lease merely because shutdown raced
+            // the successful lock attempt; the caller must settle or hand it
+            // off while ownership is still unambiguous.
             return Ok(Some(lock));
         }
         tokio::select! {
@@ -2585,6 +2585,24 @@ mod tests {
             .expect("the waiter task should complete");
         assert!(acquired.is_some());
         drop(acquired);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn acquired_execution_lease_remains_held_after_shutdown() {
+        let root = temp_root("execution-lease-acquired-shutdown");
+        let shutdown = CancellationToken::new();
+        let lease = lock_run_execution(&root, &shutdown)
+            .await
+            .unwrap()
+            .expect("a live service should acquire a free lease");
+        shutdown.cancel();
+        assert!(
+            try_lock_run_execution(&root).unwrap().is_none(),
+            "shutdown cannot release a lease after ownership has transferred to its caller"
+        );
+        drop(lease);
+        drop(try_lock_run_execution(&root).unwrap().unwrap());
         std::fs::remove_dir_all(root).unwrap();
     }
 

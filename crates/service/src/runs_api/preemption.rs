@@ -157,90 +157,106 @@ impl LocalService {
             tracing::info!(run_id = %id, "preemption requeue stopped during service shutdown");
             return Ok(());
         };
-        if !boundary {
-            truncate_trailing_canceled_events(&staged.run_dir).map_err(api_internal)?;
-        }
-        // The task is gone and any trailing canceled events have been
-        // truncated. Close a forced-abort episode at this known handoff so
-        // time spent waiting in the queue is never charged as active work.
-        crate::run_dirs::settle_active_elapsed(&staged).map_err(api_internal)?;
-        // Preemption requeues preserve the journaled effective policy:
-        // re-resolving under a changed ceiling would diverge admission from
-        // execution (E04). An unreadable journal fails the requeue instead
-        // of silently running under the current ceiling (E04).
-        let prior_events =
-            crate::summaries::read_journal_events(&staged.run_dir).map_err(api_internal)?;
-        let state = engine::RunState::fold_values(&prior_events).map_err(api_internal)?;
-        if boundary {
-            let mut runs = self.inner.runs.write().await;
-            let Some(record) = runs.get_mut(id) else {
-                return Ok(());
-            };
-            // A concurrent cancel, completion, or HITL settlement wins.
-            if record.state != RunStatus::Running
-                || !record.preempted
-                || state.terminal.is_some()
-                || state.pending.is_some()
-            {
-                return Ok(());
-            }
-            let last = prior_events
-                .last()
-                .and_then(|event| event.get("t"))
-                .and_then(Value::as_str);
-            if last != Some("run_yielded") {
-                return Err(api_internal(
-                    "boundary preemption refused: task exited without a durable yield",
-                ));
-            }
-            record.state = RunStatus::Queued;
-        }
-        let requeue_effective = crate::types::ResolvedExecutionPolicy::for_execution(
-            &prior_events,
-            self.inner.deployment_policy.max_parallel_steps,
-        )
-        .map_err(|error| api_internal(format!("preemption requeue refused: {error}")))?;
-        let mut payload = json!({
-            "run_id": id,
-            "generator": format!("{}@{}", staged.contract.manifest.generator.id, staged.contract.manifest.generator.version),
-            "generator_path": read_run_generator_path(&staged.run_dir).map_err(api_internal)?,
-            "package_sha256": &staged.package_sha256,
-            "contract_sha256": &staged.contract.sha256,
-            "inputs": &staged.inputs,
-            "answers": &staged.answers,
-            "confirmations": &staged.confirmations,
-            "schema_version": api::JOURNAL_SCHEMA_VERSION,
-            "elapsed_budget_mode": state.budget.elapsed_budget_mode,
-            "retention_days": staged.contract.manifest.retention.days,
-            "priority": staged.priority,
-            "parent_run_id": staged.parent_run_id.clone(),
-            "effective_max_total_steps": requeue_effective.max_total_steps,
-            "effective_policy_origin": requeue_effective.origin,
-        });
-        if self.inner.deployment_policy.preemption_queue_position
-            == policy::PreemptionQueuePosition::Preserve
-            && let Some(queued_at) = staged.queued_at
-        {
-            payload["queued_at"] = json!(queued_at.to_rfc3339());
-        }
-        // Tail omits the override: the writer's real event ts is the new
-        // FIFO key. Preserve never backdates that event timestamp.
-        write_run_event(&staged, "run_queued", payload).map_err(api_internal)?;
         let mut staged = staged;
-        // Memory observes the same durable FIFO key as restarts.
-        staged.queued_at = crate::summaries::read_last_queued_at(&staged.run_dir);
-        let resume = {
-            let mut runs = self.inner.runs.write().await;
-            match runs.get_mut(id) {
-                // A concurrent cancel() or delete wins over the resume.
-                Some(record) if record.state == RunStatus::Queued && record.preempted => {
-                    *record = staged.clone();
-                    true
-                }
-                _ => false,
+        let requeue: Result<Option<bool>, ApiError> = async {
+            if !boundary {
+                truncate_trailing_canceled_events(&staged.run_dir).map_err(api_internal)?;
             }
-        };
+            // The task is gone and any trailing canceled events have been
+            // truncated. Close a forced-abort episode at this known handoff so
+            // time spent waiting in the queue is never charged as active work.
+            crate::run_dirs::settle_active_elapsed(&staged).map_err(api_internal)?;
+            // Preemption requeues preserve the journaled effective policy:
+            // re-resolving under a changed ceiling would diverge admission from
+            // execution (E04). An unreadable journal fails the requeue instead
+            // of silently running under the current ceiling (E04).
+            let prior_events =
+                crate::summaries::read_journal_events(&staged.run_dir).map_err(api_internal)?;
+            let state = engine::RunState::fold_values(&prior_events).map_err(api_internal)?;
+            if boundary {
+                let mut runs = self.inner.runs.write().await;
+                let Some(record) = runs.get_mut(id) else {
+                    return Ok(None);
+                };
+                // A concurrent cancel, completion, or HITL settlement wins.
+                if record.state != RunStatus::Running
+                    || !record.preempted
+                    || state.terminal.is_some()
+                    || state.pending.is_some()
+                {
+                    return Ok(None);
+                }
+                let last = prior_events
+                    .last()
+                    .and_then(|event| event.get("t"))
+                    .and_then(Value::as_str);
+                if last != Some("run_yielded") {
+                    return Err(api_internal(
+                        "boundary preemption refused: task exited without a durable yield",
+                    ));
+                }
+                record.state = RunStatus::Queued;
+            }
+            let requeue_effective = crate::types::ResolvedExecutionPolicy::for_execution(
+                &prior_events,
+                self.inner.deployment_policy.max_parallel_steps,
+            )
+            .map_err(|error| api_internal(format!("preemption requeue refused: {error}")))?;
+            let mut payload = json!({
+                "run_id": id,
+                "generator": format!("{}@{}", staged.contract.manifest.generator.id, staged.contract.manifest.generator.version),
+                "generator_path": read_run_generator_path(&staged.run_dir).map_err(api_internal)?,
+                "package_sha256": &staged.package_sha256,
+                "contract_sha256": &staged.contract.sha256,
+                "inputs": &staged.inputs,
+                "answers": &staged.answers,
+                "confirmations": &staged.confirmations,
+                "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                "elapsed_budget_mode": state.budget.elapsed_budget_mode,
+                "retention_days": staged.contract.manifest.retention.days,
+                "priority": staged.priority,
+                "parent_run_id": staged.parent_run_id.clone(),
+                "effective_max_total_steps": requeue_effective.max_total_steps,
+                "effective_policy_origin": requeue_effective.origin,
+            });
+            if self.inner.deployment_policy.preemption_queue_position
+                == policy::PreemptionQueuePosition::Preserve
+                && let Some(queued_at) = staged.queued_at
+            {
+                payload["queued_at"] = json!(queued_at.to_rfc3339());
+            }
+            // Tail omits the override: the writer's real event ts is the new
+            // FIFO key. Preserve never backdates that event timestamp.
+            write_run_event(&staged, "run_queued", payload).map_err(api_internal)?;
+            // Memory observes the same durable FIFO key as restarts.
+            staged.queued_at = crate::summaries::read_last_queued_at(&staged.run_dir);
+            let resume = {
+                let mut runs = self.inner.runs.write().await;
+                match runs.get_mut(id) {
+                    // A concurrent cancel() or delete wins over the resume.
+                    Some(record) if record.state == RunStatus::Queued && record.preempted => {
+                        *record = staged.clone();
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            Ok(Some(resume))
+        }
+        .await;
         drop(lease);
+        if self.is_shutting_down() {
+            // Shutdown may have tried settlement while this handoff held the
+            // execution lease and correctly deferred to its owner. Recheck
+            // after releasing ownership and let the shutdown path settle the
+            // now-durable queue state before any resumed engine is spawned.
+            self.settle_shutdown_without_task(id, &staged).await?;
+            self.inner.queue_notify.notify_waiters();
+            return requeue.map(|_| ());
+        }
+        let Some(resume) = requeue? else {
+            return Ok(());
+        };
         if resume {
             let runs = self.inner.runs.read().await;
             let Some(record) = runs.get(id) else {
