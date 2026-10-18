@@ -37,6 +37,5 @@ impl StepExecutor for FailStep {
 }
 
 fn fail_params(node: &NodeDef) -> Result<FailParams, StepError> {
-    node.deserialize_params()
-        .map_err(|error| StepError::failed(&node.id, format!("invalid fail params: {error}")))
+    engine::step_params(node, "fail")
 }

@@ -374,9 +374,7 @@ fn read_option_source(
 }
 
 fn ask_user_params(node: &NodeDef) -> Result<AskUserParams, StepError> {
-    let params: AskUserParams = node.deserialize_params().map_err(|error| {
-        StepError::failed(&node.id, format!("invalid ask_user params: {error}"))
-    })?;
+    let params: AskUserParams = engine::step_params(node, "ask_user")?;
     require(node, Some(&params.content), "content")?;
     for field in &params.fields {
         if field.id.trim().is_empty() {

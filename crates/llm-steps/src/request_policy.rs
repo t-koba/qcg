@@ -467,8 +467,7 @@ pub(crate) enum MediaInputKind {
 }
 
 pub(crate) fn llm_params(node: &NodeDef) -> Result<LlmParams, StepError> {
-    node.deserialize_params()
-        .map_err(|error| StepError::failed(&node.id, format!("invalid LLM params: {error}")))
+    engine::step_params(node, "LLM")
 }
 
 pub(crate) fn require_prompt(node: &NodeDef, params: &LlmParams) -> Result<(), StepError> {

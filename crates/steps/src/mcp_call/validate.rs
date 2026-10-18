@@ -9,8 +9,7 @@ use super::direct::{DirectMcpToolEvent, record_direct_mcp_tool_event};
 use super::types::McpCallParams;
 
 pub(crate) fn mcp_call_params(node: &NodeDef) -> Result<McpCallParams, StepError> {
-    node.deserialize_params()
-        .map_err(|error| StepError::failed(&node.id, format!("invalid mcp.call params: {error}")))
+    engine::step_params(node, "mcp.call")
 }
 
 /// Record a transport failure and either fail or degrade to a null output

@@ -311,9 +311,7 @@ fn no_model_error(
 }
 
 fn catalog_params(node: &contract::NodeDef) -> Result<CatalogParams, StepError> {
-    node.deserialize_params().map_err(|error| {
-        StepError::failed(&node.id, format!("invalid llm.catalog params: {error}"))
-    })
+    engine::step_params(node, "llm.catalog")
 }
 
 fn require_param(
