@@ -151,10 +151,7 @@ impl StepExecutor for LlmFillStep {
                 last_error = Some(message);
                 continue;
             }
-            return Ok(StepOutcome::Success {
-                output: Some(value),
-                files: vec![],
-            });
+            return Ok(StepOutcome::success(Some(value)));
         }
         Err(StepError::failed(
             &node.id,

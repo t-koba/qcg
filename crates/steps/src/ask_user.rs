@@ -207,10 +207,7 @@ impl StepExecutor for AskUserStep {
                         json!({ "node": node.id, "source": "answer" }),
                     )
                     .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
-                return Ok(StepOutcome::Success {
-                    output: Some(answer.clone()),
-                    files: vec![],
-                });
+                return Ok(StepOutcome::success(Some(answer.clone())));
             }
             let answer = answer
                 .as_object()
@@ -224,10 +221,7 @@ impl StepExecutor for AskUserStep {
                     json!({ "node": node.id, "source": "answer" }),
                 )
                 .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
-            return Ok(StepOutcome::Success {
-                output: Some(Value::String(answer)),
-                files: vec![],
-            });
+            return Ok(StepOutcome::success(Some(Value::String(answer))));
         }
         if !ctx.run.interactive {
             return Ok(StepOutcome::NeedsUser {
@@ -256,10 +250,7 @@ impl StepExecutor for AskUserStep {
         ctx.journal
             .event("user_interaction", json!({ "node": node.id }))
             .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
-        Ok(StepOutcome::Success {
-            output: Some(Value::String(answer)),
-            files: vec![],
-        })
+        Ok(StepOutcome::success(Some(Value::String(answer))))
     }
 }
 

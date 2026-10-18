@@ -361,14 +361,11 @@ impl StepExecutor for CommandStep {
             // to the configured `command_output_limit_bytes` (never
             // unbounded); journaled `tool_call` events carry a further
             // 32 KiB truncated copy via `bounded_event_value`.
-            CommandResultMode::Process => Ok(StepOutcome::Success {
-                output: Some(json!({
-                    "status": output.status,
-                    "stdout": command_output_value(&output.stdout_bytes, &output.stdout),
-                    "stderr": command_output_value(&output.stderr_bytes, &output.stderr),
-                })),
-                files: vec![],
-            }),
+            CommandResultMode::Process => Ok(StepOutcome::success(Some(json!({
+                "status": output.status,
+                "stdout": command_output_value(&output.stdout_bytes, &output.stdout),
+                "stderr": command_output_value(&output.stderr_bytes, &output.stderr),
+            })))),
             CommandResultMode::Structured => structured_outcome(ctx, node, &params, &output).await,
         }
     }

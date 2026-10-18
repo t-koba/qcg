@@ -190,16 +190,12 @@ impl StepExecutor for CheckToolStep {
             let snapshot_source = _snapshot_cleanup.path.clone();
             return execute_tool_candidate(ctx, node, tool, candidate, snapshot_source).await;
         }
-        Ok(StepOutcome::CheckFailed {
-            findings: vec![Finding {
-                severity: Severity::Error,
-                message: format!("tool `{tool_name}` could not resolve an allowed backend"),
-                location: Some(node.id.clone()),
-                raw_output: Some(Value::Array(unavailable).to_string()),
-            }],
-            output: None,
-            files: vec![],
-        })
+        Ok(StepOutcome::check_failed(vec![Finding {
+            severity: Severity::Error,
+            message: format!("tool `{tool_name}` could not resolve an allowed backend"),
+            location: Some(node.id.clone()),
+            raw_output: Some(Value::Array(unavailable).to_string()),
+        }]))
     }
 }
 
@@ -361,26 +357,19 @@ fn check_tool_output(
     stderr: String,
 ) -> Result<StepOutcome, StepError> {
     if status == 0 {
-        Ok(StepOutcome::Success {
-            output: Some(json!({
-                "status": status,
-                "backend": backend.to_string(),
-                "stdout": stdout,
-                "stderr": stderr,
-            })),
-            files: vec![],
-        })
+        Ok(StepOutcome::success(Some(json!({
+            "status": status,
+            "backend": backend.to_string(),
+            "stdout": stdout,
+            "stderr": stderr,
+        }))))
     } else {
-        Ok(StepOutcome::CheckFailed {
-            findings: vec![Finding {
-                severity: Severity::Error,
-                message: format!("tool backend `{backend}` exited with {status}"),
-                location: Some(node.id.clone()),
-                raw_output: Some(format!("{stdout}{stderr}")),
-            }],
-            output: None,
-            files: vec![],
-        })
+        Ok(StepOutcome::check_failed(vec![Finding {
+            severity: Severity::Error,
+            message: format!("tool backend `{backend}` exited with {status}"),
+            location: Some(node.id.clone()),
+            raw_output: Some(format!("{stdout}{stderr}")),
+        }]))
     }
 }
 

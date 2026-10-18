@@ -124,24 +124,17 @@ impl StepExecutor for CheckContainerStep {
                 .as_deref()
                 .unwrap_or("error");
             if matches!(on_missing, "skip" | "skip_with_warning") {
-                return Ok(StepOutcome::Success {
-                    output: Some(json!({
-                        "status": "skipped",
-                        "reason": "container runtime was not found",
-                    })),
-                    files: vec![],
-                });
+                return Ok(StepOutcome::success(Some(json!({
+                    "status": "skipped",
+                    "reason": "container runtime was not found",
+                }))));
             }
-            return Ok(StepOutcome::CheckFailed {
-                findings: vec![Finding {
-                    severity: Severity::Error,
-                    message: "container runtime was not found".into(),
-                    location: Some(node.id.clone()),
-                    raw_output: None,
-                }],
-                output: None,
-                files: vec![],
-            });
+            return Ok(StepOutcome::check_failed(vec![Finding {
+                severity: Severity::Error,
+                message: "container runtime was not found".into(),
+                location: Some(node.id.clone()),
+                raw_output: None,
+            }]));
         };
 
         let params = check_container_params(node)?;
@@ -229,22 +222,15 @@ impl StepExecutor for CheckContainerStep {
             }
         }
         if findings.is_empty() {
-            Ok(StepOutcome::Success {
-                output: Some(json!({
-                    "status": output.status,
-                    "runtime": output.runtime,
-                    "image": image,
-                    "stdout": output.stdout,
-                    "stderr": output.stderr,
-                })),
-                files: vec![],
-            })
+            Ok(StepOutcome::success(Some(json!({
+                "status": output.status,
+                "runtime": output.runtime,
+                "image": image,
+                "stdout": output.stdout,
+                "stderr": output.stderr,
+            }))))
         } else {
-            Ok(StepOutcome::CheckFailed {
-                findings,
-                output: None,
-                files: vec![],
-            })
+            Ok(StepOutcome::check_failed(findings))
         }
     }
 }

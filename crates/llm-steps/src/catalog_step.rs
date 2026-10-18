@@ -277,10 +277,7 @@ impl StepExecutor for LlmCatalogStep {
                 }
             }
         };
-        Ok(StepOutcome::Success {
-            output: Some(output),
-            files: vec![],
-        })
+        Ok(StepOutcome::success(Some(output)))
     }
 }
 

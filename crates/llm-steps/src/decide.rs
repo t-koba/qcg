@@ -295,10 +295,7 @@ impl StepExecutor for LlmDecideStep {
         let response = gateway
             .decide(node, request, &params.model, params.max_tokens)
             .await?;
-        Ok(StepOutcome::Success {
-            output: Some(serde_json::to_value(response)?),
-            files: vec![],
-        })
+        Ok(StepOutcome::success(Some(serde_json::to_value(response)?)))
     }
 }
 

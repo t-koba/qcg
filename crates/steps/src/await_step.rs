@@ -76,12 +76,9 @@ impl StepExecutor for AwaitStep {
                 }
             }
             if !pending {
-                return Ok(StepOutcome::Success {
-                    output: Some(Value::Object(
-                        states.into_iter().collect::<serde_json::Map<_, _>>(),
-                    )),
-                    files: vec![],
-                });
+                return Ok(StepOutcome::success(Some(Value::Object(
+                    states.into_iter().collect::<serde_json::Map<_, _>>(),
+                ))));
             }
             if params
                 .timeout_secs

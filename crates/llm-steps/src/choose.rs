@@ -90,10 +90,7 @@ impl StepExecutor for LlmChooseStep {
             }
             let choice = response_text(response.content)?;
             if params.options.iter().any(|option| option == &choice) {
-                return Ok(StepOutcome::Success {
-                    output: Some(Value::String(choice)),
-                    files: vec![],
-                });
+                return Ok(StepOutcome::success(Some(Value::String(choice))));
             }
             let message = format!("LLM chose `{choice}`, which is outside declared options");
             record_llm_validation_failure(ctx, node, attempt, &message)?;

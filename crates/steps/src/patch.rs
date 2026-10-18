@@ -86,15 +86,12 @@ impl StepExecutor for ReadAnchoredStep {
             .iter()
             .map(|line| json!({"anchor": line.anchor(), "text": line.text}))
             .collect();
-        Ok(StepOutcome::Success {
-            output: Some(json!({
-                "file": path,
-                "base_sha256": snapshot.base_sha256,
-                "total_lines": snapshot.total_lines,
-                "lines": lines,
-            })),
-            files: vec![],
-        })
+        Ok(StepOutcome::success(Some(json!({
+            "file": path,
+            "base_sha256": snapshot.base_sha256,
+            "total_lines": snapshot.total_lines,
+            "lines": lines,
+        }))))
     }
 }
 

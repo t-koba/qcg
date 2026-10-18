@@ -74,25 +74,18 @@ impl StepExecutor for CheckContractStep {
         std::fs::remove_dir_all(&snapshot)
             .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
         match loaded {
-            Ok(contract) => Ok(StepOutcome::Success {
-                output: Some(json!({
-                    "status": "pass",
-                    "generator": contract.manifest.generator.id,
-                    "version": contract.manifest.generator.version,
-                    "contract_sha256": contract.sha256,
-                })),
-                files: vec![],
-            }),
-            Err(error) => Ok(StepOutcome::CheckFailed {
-                findings: vec![Finding {
-                    severity: Severity::Error,
-                    message: error.to_string(),
-                    location: Some(source),
-                    raw_output: None,
-                }],
-                output: None,
-                files: vec![],
-            }),
+            Ok(contract) => Ok(StepOutcome::success(Some(json!({
+                "status": "pass",
+                "generator": contract.manifest.generator.id,
+                "version": contract.manifest.generator.version,
+                "contract_sha256": contract.sha256,
+            })))),
+            Err(error) => Ok(StepOutcome::check_failed(vec![Finding {
+                severity: Severity::Error,
+                message: error.to_string(),
+                location: Some(source),
+                raw_output: None,
+            }])),
         }
     }
 }

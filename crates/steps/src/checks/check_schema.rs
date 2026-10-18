@@ -63,16 +63,11 @@ impl StepExecutor for CheckSchemaStep {
         let schema = load_package_schema(&ctx.run.contract, node, &params.schema)?;
         let findings = validate_json_schema_findings(&schema, &value, "$");
         if findings.is_empty() {
-            Ok(StepOutcome::Success {
-                output: Some(json!({ "status": "pass", "source": source })),
-                files: vec![],
-            })
+            Ok(StepOutcome::success(Some(
+                json!({ "status": "pass", "source": source }),
+            )))
         } else {
-            Ok(StepOutcome::CheckFailed {
-                findings,
-                output: None,
-                files: vec![],
-            })
+            Ok(StepOutcome::check_failed(findings))
         }
     }
 }

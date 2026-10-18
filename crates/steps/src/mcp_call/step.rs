@@ -215,10 +215,7 @@ impl StepExecutor for McpCallStep {
                     },
                 )?;
                 if optional {
-                    return Ok(StepOutcome::Success {
-                        output: None,
-                        files: vec![],
-                    });
+                    return Ok(StepOutcome::success(None));
                 }
                 return Err(error);
             }
@@ -263,15 +260,12 @@ impl StepExecutor for McpCallStep {
                 degraded: false,
             },
         )?;
-        Ok(StepOutcome::Success {
-            output: Some(json!({
-                "server": params.server,
-                "tool": params.tool,
-                "result": result,
-                "sources": sources,
-            })),
-            files: vec![],
-        })
+        Ok(StepOutcome::success(Some(json!({
+            "server": params.server,
+            "tool": params.tool,
+            "result": result,
+            "sources": sources,
+        }))))
     }
 }
 

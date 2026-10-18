@@ -37,10 +37,7 @@ pub(crate) async fn degrade_optional_mcp_call(
     if !params.optional {
         return Err(error);
     }
-    Ok(StepOutcome::Success {
-        output: None,
-        files: vec![],
-    })
+    Ok(StepOutcome::success(None))
 }
 
 pub(crate) fn validate_mcp_call_timeout(

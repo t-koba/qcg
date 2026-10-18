@@ -75,20 +75,15 @@ impl StepExecutor for CheckFormatStep {
             }
         };
         match result {
-            Ok(()) => Ok(StepOutcome::Success {
-                output: Some(json!({ "status": "pass", "source": source, "format": format })),
-                files: vec![],
-            }),
-            Err(error) => Ok(StepOutcome::CheckFailed {
-                findings: vec![Finding {
-                    severity: Severity::Error,
-                    message: format!("invalid {format}: {error}"),
-                    location: Some(source),
-                    raw_output: None,
-                }],
-                output: None,
-                files: vec![],
-            }),
+            Ok(()) => Ok(StepOutcome::success(Some(
+                json!({ "status": "pass", "source": source, "format": format }),
+            ))),
+            Err(error) => Ok(StepOutcome::check_failed(vec![Finding {
+                severity: Severity::Error,
+                message: format!("invalid {format}: {error}"),
+                location: Some(source),
+                raw_output: None,
+            }])),
         }
     }
 }

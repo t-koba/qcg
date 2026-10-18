@@ -128,6 +128,25 @@ pub enum StepOutcome {
     },
 }
 
+impl StepOutcome {
+    /// Construct a successful outcome that emitted no files.
+    pub fn success(output: Option<Value>) -> Self {
+        Self::Success {
+            output,
+            files: Vec::new(),
+        }
+    }
+
+    /// Construct a check failure without a separate output or emitted files.
+    pub fn check_failed(findings: Vec<Finding>) -> Self {
+        Self::CheckFailed {
+            findings,
+            output: None,
+            files: Vec::new(),
+        }
+    }
+}
+
 #[async_trait]
 pub trait StepExecutor: Send + Sync {
     fn type_id(&self) -> &'static str;

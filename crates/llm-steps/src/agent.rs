@@ -926,10 +926,7 @@ impl StepExecutor for LlmAgentStep {
                     &value,
                 )
                 .await?;
-                return Ok(StepOutcome::Success {
-                    output: Some(value),
-                    files: vec![],
-                });
+                return Ok(StepOutcome::success(Some(value)));
             }
             last_validation_error = None;
             if tool_calls.len() > 1
@@ -1351,10 +1348,7 @@ impl StepExecutor for LlmAgentStep {
                                 }),
                             )
                             .step_err(&node.id)?;
-                        return Ok(StepOutcome::Success {
-                            output: Some(value),
-                            files: vec![],
-                        });
+                        return Ok(StepOutcome::success(Some(value)));
                     }
                     AgentToolOutcome::NeedsUser(question) => {
                         let event = tool_call_event(

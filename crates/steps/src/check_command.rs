@@ -132,16 +132,11 @@ impl StepExecutor for CheckCommandStep {
             });
         }
         if findings.is_empty() {
-            Ok(StepOutcome::Success {
-                output: Some(json!({ "status": output.status, "stdout": output.stdout })),
-                files: vec![],
-            })
+            Ok(StepOutcome::success(Some(
+                json!({ "status": output.status, "stdout": output.stdout }),
+            )))
         } else {
-            Ok(StepOutcome::CheckFailed {
-                findings,
-                output: None,
-                files: vec![],
-            })
+            Ok(StepOutcome::check_failed(findings))
         }
     }
 }
