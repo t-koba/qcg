@@ -14,12 +14,15 @@ const target =
   )[1];
 const metadata = cargoMetadata(true, target);
 const wasmMetadata = cargoMetadata(true, "wasm32-unknown-unknown");
+const packageMetadata = new Map(
+  [...metadata.packages, ...wasmMetadata.packages].map((pkg) => [pkg.id, pkg]),
+);
 const product = resolveProduct(metadata, process.env.PRODUCT_ID || "qcg");
 const lock = JSON.parse(
   readFileSync("frontend/generator/package-lock.json", "utf8"),
 );
 const canonical = new Map(
-  metadata.packages.map((pkg) => [
+  [...packageMetadata.values()].map((pkg) => [
     pkg.id,
     `${pkg.source ?? "workspace"}:${pkg.name}@${pkg.version}`,
   ]),
@@ -92,7 +95,7 @@ for (const pkg of metadata.packages)
     });
   }
 relationships.push(...edges.values());
-for (const pkg of metadata.packages
+for (const pkg of [...packageMetadata.values()]
   .filter((pkg) => selected.has(pkg.id))
   .sort((a, b) => a.id.localeCompare(b.id))) {
   packages.push({

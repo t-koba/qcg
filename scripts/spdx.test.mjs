@@ -1,5 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { verifySpdx } from "./verify-spdx.mjs";
 import { declaredLicense } from "./licenses.mjs";
 
@@ -45,5 +50,23 @@ test("SPDX validation rejects broken identifiers, timestamp, dependency edges an
     const bom = valid();
     mutate(bom);
     assert.throws(() => verifySpdx(bom));
+  }
+});
+
+test("generated Cargo and npm SBOM has no dangling relationships", () => {
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const directory = mkdtempSync(join(tmpdir(), "qcg-spdx-"));
+  try {
+    const output = join(directory, "SBOM.spdx.json");
+    execFileSync(
+      process.execPath,
+      [join(root, "scripts/generate-sbom.mjs"), output],
+      { cwd: root },
+    );
+    assert.doesNotThrow(() =>
+      verifySpdx(JSON.parse(readFileSync(output, "utf8"))),
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 });
