@@ -287,7 +287,7 @@ fn read_source_artifact(
         ));
     }
     if let Some(required) = &params.require_sha256
-        && sha256 != *required
+        && !sha256.eq_ignore_ascii_case(required)
     {
         return Err(format!(
             "source artifact `{}` does not match the declared require_sha256",
@@ -441,6 +441,69 @@ mod tests {
         let root = crate::tests::support::temp_run_dir(name);
         std::fs::create_dir_all(&root).expect("temporary root should be created");
         (root.join("runs"), crate::tests::support::TempGuard(root))
+    }
+
+    #[test]
+    fn require_sha256_accepts_hex_case_and_rejects_wrong_pin() {
+        let bytes = b"hello";
+        let sha256 = hex::encode(sha2::Sha256::digest(bytes));
+        let (runs_dir, _guard) = test_runs_dir("run-ref-require-sha256-case");
+        let run_dir = runs_dir.join("producer-run");
+        let meta_dir = run_dir.join("meta");
+        let workspace = run_dir.join("workspace");
+        std::fs::create_dir_all(&meta_dir).expect("metadata directory should be created");
+        std::fs::create_dir_all(&workspace).expect("workspace should be created");
+        std::fs::write(workspace.join("report.txt"), bytes).expect("artifact should be written");
+        engine::write_output_manifest(
+            &meta_dir,
+            &model::OutputManifest {
+                artifacts: vec![model::OutputArtifact {
+                    path: "report.txt".into(),
+                    sha256: sha256.clone(),
+                    bytes: bytes.len() as u64,
+                    label: "Report".into(),
+                    required: true,
+                    mime: Some("text/plain".into()),
+                    description: String::new(),
+                    preview: model::ArtifactPreview::Text,
+                }],
+            },
+        )
+        .expect("output manifest should be written");
+        let source = SourceRun {
+            run_id: "producer-run".into(),
+            meta_dir,
+        };
+        let params_for_pin = |pin: &str| {
+            let resource: contract::ResourceDef = serde_json::from_value(json!({
+                "type": "run_ref",
+                "params": {
+                    "selector": { "run_id": "producer-run" },
+                    "artifact": "report.txt",
+                    "max_bytes": bytes.len(),
+                    "require_sha256": pin,
+                }
+            }))
+            .expect("run_ref resource should deserialize");
+            resource
+                .run_ref_params("report")
+                .expect("hexadecimal pin should validate")
+        };
+
+        for pin in [&sha256, &sha256.to_ascii_uppercase()] {
+            let artifact = read_source_artifact(&source, &params_for_pin(pin))
+                .expect("the matching digest should be accepted in either hex case");
+            assert_eq!(artifact.bytes, bytes);
+        }
+
+        let mut wrong_bytes = sha256.into_bytes();
+        wrong_bytes[0] = if wrong_bytes[0] == b'0' { b'1' } else { b'0' };
+        let wrong_pin = String::from_utf8(wrong_bytes).expect("hex digest is ASCII");
+        let error = match read_source_artifact(&source, &params_for_pin(&wrong_pin)) {
+            Ok(_) => panic!("a different SHA-256 pin must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.contains("require_sha256"), "{error}");
     }
 
     #[test]
