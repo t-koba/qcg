@@ -200,6 +200,7 @@ Rust packages (including build and verification dependencies):
 - parking@2.2.1 — Apache-2.0 OR MIT
 - parking_lot@0.12.5 — MIT OR Apache-2.0
 - parking_lot_core@0.9.12 — MIT OR Apache-2.0
+- pastey@0.2.3 — MIT OR Apache-2.0
 - percent-encoding@2.3.2 — MIT OR Apache-2.0
 - pin-project-lite@0.2.17 — Apache-2.0 OR MIT
 - piper@0.2.5 — MIT OR Apache-2.0
