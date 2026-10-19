@@ -2383,7 +2383,7 @@ mod tests {
 /// and resumes from the private sidecar after approval.
 #[cfg(test)]
 mod approval_e2e {
-    mod mcp_recovery;
+    mod tests;
     use super::*;
     use crate::agent::{AgentCheckpoint, record_agent_checkpoint};
     use crate::mcp_tools::McpAgentTools;
