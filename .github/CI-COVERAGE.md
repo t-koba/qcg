@@ -49,7 +49,7 @@ Canonical Rust/API/SDK verification shared by local runs and all 3 OS jobs.
 | `python3 scripts/comparison/test_run_cleanup.py` | Run-cleanup comparison oracle. |
 | `bash scripts/check-third-party-notices.sh` | `THIRD-PARTY-NOTICES` completeness. |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | Lints over all targets (unit + integration + bins). MSRV job keeps a separate plain `cargo check`. Cross-OS repetition value unresolved (§6). |
-| `cargo test --workspace --locked` | Default-feature suite: 1,428 listed tests on Linux (§3). |
+| `cargo test --workspace --locked` | Default-feature suite: 1,428 listed tests on Linux (§3); `check-core.sh` reports whole-command wall time in the job summary. Cargo `test result ... finished in` lines remain per-target harness timing, not per-test. |
 | `cargo test -p mcp --no-default-features` | mcp without `mcp-oauth`: 29 listed (vs 32 default). 4 OAuth/session tests drop out (`authorization_cannot_be_cleared_while_sessions_are_active`, `authorization_status_does_not_perform_network_discovery`, `keyring_unavailable_stays_actionable_while_protocol_errors_stay_opaque`, `oauth_redirect_requires_https_or_loopback_http`) and 1 no-OAuth assertion appears (`oauth_specs_are_rejected_without_the_oauth_feature`). |
 | `cargo test -p server --no-default-features` | server without `server-cors`: 111 listed, identical registered names to default. Both configurations run tests; the CORS implementation difference is compile-gated, so identical names do not prove identical exercised branches. |
 | `bash scripts/check-fixtures.sh` | Example/fixture smoke stays green. |
