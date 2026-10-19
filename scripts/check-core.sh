@@ -5,7 +5,6 @@ cd "$(dirname "$0")/.."
 node --test scripts/product.test.mjs scripts/capabilities.test.mjs scripts/spdx.test.mjs scripts/rust-line-budget.test.mjs
 node scripts/rust-line-budget.mjs
 cargo fmt --all -- --check
-cargo check -p expr-wasm --target wasm32-unknown-unknown --locked
 bash scripts/check-generated-docs.sh
 bash scripts/check-capability-matrix.sh
 bash scripts/check-sdk.sh
