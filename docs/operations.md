@@ -579,8 +579,9 @@ partial fragment is truncated so prior newline-terminated events survive and
 the next append does not fuse lines.
 
 Repair marker (tamper vs crash): a terminal event writes the
-`.clean_shutdown` marker (exact magic content `qcg-clean-shutdown-v1`)
-next to the journal; any later non-terminal append
+`.clean_shutdown` marker next to the journal, containing exactly
+`b"clean-shutdown-v1\n"` (ASCII `clean-shutdown-v1` followed by one LF
+byte, `0x0a`); any later non-terminal append
 clears it (`writer.rs`: `write_clean_shutdown_marker` /
 `clear_clean_shutdown_marker`). A truncated tail found WITH the magic
 marker present refuses repair as possible tampering (durable history was
