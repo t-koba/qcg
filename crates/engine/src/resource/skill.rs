@@ -1,7 +1,7 @@
 use crate::{EngineError, RunContext};
 use async_trait::async_trait;
 use camino::Utf8Path;
-use contract::{ResourceDef, SkillDoc, is_skill_library_entry, skill_metadata_value};
+use contract::{ResourceDef, ResourceKind, SkillDoc, is_skill_library_entry, skill_metadata_value};
 use serde_json::json;
 
 use super::content::{
@@ -11,8 +11,8 @@ use super::content::{
 use super::hash::{hash_resource_dir, resolve_resource_path, resolve_resource_path_for_engine};
 use super::snapshot::{DirectoryLimits, directory_limits};
 use super::types::{
-    ResourceCacheStatus, ResourceError, ResourceLoader, ResourceSelector, ResourceSnapshot,
-    ResourceSnapshotSource,
+    ResourceCacheStatus, ResourceError, ResourceFileSnapshot, ResourceLoader, ResourceSelector,
+    ResourceSnapshot, ResourceSnapshotSource,
 };
 
 pub(crate) struct SkillResourceLoader;
@@ -131,7 +131,7 @@ impl ResourceLoader for SkillLibraryResourceLoader {
             .map_err(|error| EngineError::Failed(error.to_string()))?;
         let (sha256, files) = hash_resource_dir(&full_path, limits)?;
         validate_resource_pin(name, resource, &sha256)?;
-        let skills = scan_skill_library(name, &full_path, limits)
+        let skills = scan_skill_library(name, &full_path, limits, &files)
             .map_err(|error| EngineError::Failed(error.to_string()))?;
         let mut diagnostics = Vec::new();
         for (dir, doc) in &skills {
@@ -182,11 +182,11 @@ impl ResourceLoader for SkillLibraryResourceLoader {
             })?;
         match selector {
             None => {
-                let skills = scan_skill_library(name, &root, limits)?;
+                let skills = scan_skill_library(name, &root, limits, &files)?;
                 Ok(serde_json::to_string_pretty(&skill_catalog(&skills))?)
             }
             Some(ResourceSelector::Named(selector)) if selector == "catalog" => {
-                let skills = scan_skill_library(name, &root, limits)?;
+                let skills = scan_skill_library(name, &root, limits, &files)?;
                 Ok(serde_json::to_string_pretty(&skill_catalog(&skills))?)
             }
             Some(ResourceSelector::Named(selector))
@@ -199,17 +199,17 @@ impl ResourceLoader for SkillLibraryResourceLoader {
             }
             Some(ResourceSelector::Named(selector)) => {
                 if let Some(skill) = selector.strip_prefix("meta/") {
-                    let skills = scan_skill_library(name, &root, limits)?;
+                    let skills = scan_skill_library(name, &root, limits, &files)?;
                     let doc = library_skill(name, &skills, skill)?;
                     return Ok(serde_json::to_string_pretty(&skill_metadata_value(doc))?);
                 }
                 if let Some(skill) = selector.strip_prefix("instructions/") {
-                    let skills = scan_skill_library(name, &root, limits)?;
+                    let skills = scan_skill_library(name, &root, limits, &files)?;
                     let doc = library_skill(name, &skills, skill)?;
                     return Ok(doc.instructions.clone());
                 }
                 if let Some(skill) = selector.strip_prefix("tree/") {
-                    let skills = scan_skill_library(name, &root, limits)?;
+                    let skills = scan_skill_library(name, &root, limits, &files)?;
                     library_skill(name, &skills, skill)?;
                     let skill_root = root.join(skill);
                     let (skill_sha256, skill_files) = hash_resource_dir(&skill_root, limits)
@@ -238,7 +238,7 @@ impl ResourceLoader for SkillLibraryResourceLoader {
                         resource: name.to_string(),
                     });
                 }
-                let skills = scan_skill_library(name, &root, limits)?;
+                let skills = scan_skill_library(name, &root, limits, &files)?;
                 library_skill(name, &skills, skill)?;
                 let skill_root = root.join(skill);
                 let file = resolve_resource_file(name, &skill_root, relative)?;
@@ -255,33 +255,20 @@ fn scan_skill_library(
     resource: &str,
     root: &Utf8Path,
     limits: DirectoryLimits,
+    files: &[ResourceFileSnapshot],
 ) -> Result<Vec<(String, SkillDoc)>, ResourceError> {
-    let entries = std::fs::read_dir(root).map_err(|source| ResourceError::Read {
-        path: root.to_path_buf(),
-        source,
-    })?;
-    let mut children: Vec<String> = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|source| ResourceError::Read {
-            path: root.to_path_buf(),
-            source,
-        })?;
-        let file_type = entry.file_type().map_err(|source| ResourceError::Read {
-            path: root.to_path_buf(),
-            source,
-        })?;
-        if !file_type.is_dir() {
-            continue;
-        }
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        if !is_skill_library_entry(&name) {
-            continue;
-        }
-        children.push(name);
-    }
+    // Reuse the bounded whole-tree walk's file list instead of starting an
+    // unbounded second directory traversal. It already counted every entry
+    // against max_entries and rejected symlinks.
+    let mut children: Vec<String> = files
+        .iter()
+        .filter_map(|file| {
+            let (child, filename) = file.path.split_once('/')?;
+            (filename == "SKILL.md" && is_skill_library_entry(child)).then(|| child.to_string())
+        })
+        .collect();
     children.sort();
+    children.dedup();
     let mut skills = Vec::new();
     for child in children {
         let skill_root = root.join(&child);
@@ -330,6 +317,72 @@ fn library_skill<'a>(
             resource: resource.to_string(),
             message: format!("skill_library has no skill directory `{key}`"),
         })
+}
+
+/// A validated skill document found in a resource.
+///
+/// `library_dir` is absent for a standalone `skill` and contains the member
+/// directory for a `skill_library` resource. Library results are sorted by
+/// directory name, matching loader discovery order.
+#[derive(Debug, Clone)]
+pub struct DiscoveredSkill {
+    pub library_dir: Option<String>,
+    pub doc: SkillDoc,
+}
+
+/// Loads the skill documents selected by a skill resource.
+///
+/// Takes an already package-resolved directory, parses the resource's
+/// configured directory limits (no defaults added), preflights the same
+/// bounded whole-tree hash the loaders run, then reads discovery documents
+/// with bounded no-follow reads. Rejects unsupported resource kinds and
+/// never verifies pins.
+pub fn discover_skill_docs(
+    name: &str,
+    resource: &ResourceDef,
+    root: &Utf8Path,
+) -> Result<Vec<DiscoveredSkill>, ResourceError> {
+    let is_library = match resource.kind {
+        ResourceKind::Skill => false,
+        ResourceKind::SkillLibrary => true,
+        _ => {
+            return Err(ResourceError::InvalidSkill {
+                resource: name.to_string(),
+                message: "resource type must be `skill` or `skill_library`".into(),
+            });
+        }
+    };
+    if !root.is_dir() {
+        return Err(ResourceError::InvalidSkill {
+            resource: name.to_string(),
+            message: if is_library {
+                "a skill_library resource must be a directory".into()
+            } else {
+                "a skill resource must be a directory containing SKILL.md".into()
+            },
+        });
+    }
+    let limits = directory_limits(name, resource)?;
+    let (_, files) = hash_resource_dir(root, limits).map_err(|source| ResourceError::Read {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    if is_library {
+        let skills = scan_skill_library(name, root, limits, &files)?;
+        Ok(skills
+            .into_iter()
+            .map(|(dir, doc)| DiscoveredSkill {
+                library_dir: Some(dir),
+                doc,
+            })
+            .collect())
+    } else {
+        let doc = read_skill_doc(name, root, limits.max_selected_bytes)?;
+        Ok(vec![DiscoveredSkill {
+            library_dir: None,
+            doc,
+        }])
+    }
 }
 
 #[cfg(test)]
@@ -411,7 +464,9 @@ mod tests {
             "node_modules",
             "---\nname: deps\ndescription: Must never be scanned.\n---\n",
         );
-        let skills = scan_skill_library("skills", &root, DirectoryLimits::default())
+        let (_, files) =
+            hash_resource_dir(&root, DirectoryLimits::default()).expect("library should hash");
+        let skills = scan_skill_library("skills", &root, DirectoryLimits::default(), &files)
             .expect("library should scan");
         let names: Vec<&str> = skills.iter().map(|(dir, _)| dir.as_str()).collect();
         assert_eq!(names, vec!["alpha", "beta"]);
@@ -429,13 +484,144 @@ mod tests {
             "alpha",
             "---\nname: alpha\ndescription: Alpha.\n---\n",
         );
-        let skills = scan_skill_library("skills", &root, DirectoryLimits::default())
+        let (_, files) =
+            hash_resource_dir(&root, DirectoryLimits::default()).expect("library should hash");
+        let skills = scan_skill_library("skills", &root, DirectoryLimits::default(), &files)
             .expect("library should scan");
         let doc = library_skill("skills", &skills, "alpha").expect("alpha should resolve");
         assert_eq!(doc.description, "Alpha.");
         let error =
             library_skill("skills", &skills, "missing").expect_err("unknown skill must fail");
         assert!(error.to_string().contains("missing"), "{error}");
+        std::fs::remove_dir_all(root).expect("temporary directory should be removed");
+    }
+
+    fn resource_def(kind: &str, params: serde_json::Value) -> ResourceDef {
+        serde_json::from_value(json!({"type": kind, "params": params}))
+            .expect("resource def should deserialize")
+    }
+
+    #[test]
+    fn discover_standalone_skill_enforces_selected_bytes() {
+        let root = temp_dir("discover-standalone");
+        write_skill(
+            &root,
+            "demo",
+            "---\nname: demo\ndescription: Demo.\n---\nBody.\n",
+        );
+        let skill_root = root.join("demo");
+        let len = std::fs::read(skill_root.join("SKILL.md"))
+            .expect("skill file should be readable")
+            .len();
+        let unbounded = resource_def("skill", json!({}));
+        let found = discover_skill_docs("demo", &unbounded, &skill_root)
+            .expect("no-limit discovery should succeed");
+        assert_eq!(found.len(), 1);
+        assert!(found[0].library_dir.is_none());
+        assert_eq!(found[0].doc.name, "demo");
+        let exact = resource_def("skill", json!({"max_selected_bytes": len}));
+        let found = discover_skill_docs("demo", &exact, &skill_root)
+            .expect("exact-bound discovery should succeed");
+        assert!(found[0].library_dir.is_none());
+        assert_eq!(found[0].doc.name, "demo");
+        let tight = resource_def("skill", json!({"max_selected_bytes": len - 1}));
+        let error = discover_skill_docs("demo", &tight, &skill_root)
+            .expect_err("oversized SKILL.md must fail at max_selected_bytes");
+        assert!(error.to_string().contains("max_bytes"), "{error}");
+        std::fs::remove_dir_all(root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn discover_library_member_enforces_selected_bytes() {
+        let root = temp_dir("discover-library-bytes");
+        write_skill(
+            &root,
+            "alpha",
+            "---\nname: alpha\ndescription: Alpha.\n---\nBody.\n",
+        );
+        let len = std::fs::read(root.join("alpha/SKILL.md"))
+            .expect("skill file should be readable")
+            .len();
+        let tight = resource_def("skill_library", json!({"max_selected_bytes": len - 1}));
+        let error = discover_skill_docs("lib", &tight, &root)
+            .expect_err("oversized library member must fail at max_selected_bytes");
+        assert!(error.to_string().contains("max_bytes"), "{error}");
+        let exact = resource_def("skill_library", json!({"max_selected_bytes": len}));
+        let found = discover_skill_docs("lib", &exact, &root)
+            .expect("exact-bound library discovery should succeed");
+        assert_eq!(
+            found
+                .iter()
+                .map(|item| item.library_dir.as_deref().expect("library member"))
+                .collect::<Vec<_>>(),
+            vec!["alpha"]
+        );
+        std::fs::remove_dir_all(root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn discover_library_enumeration_honors_max_entries() {
+        let root = temp_dir("discover-library-entries");
+        write_skill(&root, "beta", "---\nname: beta\ndescription: Beta.\n---\n");
+        write_skill(
+            &root,
+            "alpha",
+            "---\nname: alpha\ndescription: Alpha.\n---\n",
+        );
+        std::fs::create_dir_all(root.join("empty")).expect("empty dir should be created");
+        std::fs::write(root.join("notes.txt"), "not a skill").expect("note should be written");
+        // Walk entries: alpha/, alpha/SKILL.md, beta/, beta/SKILL.md,
+        // empty/, notes.txt (6 total); raw top-level entries: 4.
+        let exact = resource_def("skill_library", json!({"max_entries": 6}));
+        let found = discover_skill_docs("lib", &exact, &root)
+            .expect("exact-bound discovery should pass and stay sorted");
+        assert_eq!(
+            found
+                .iter()
+                .map(|item| item.library_dir.as_deref().expect("library member"))
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta"]
+        );
+        let tight = resource_def("skill_library", json!({"max_entries": 5}));
+        let error = discover_skill_docs("lib", &tight, &root)
+            .expect_err("empty and non-skill entries must count toward max_entries");
+        assert!(error.to_string().contains("max_entries"), "{error}");
+        std::fs::remove_dir_all(root).expect("temporary directory should be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_skill_docs_refuses_a_symlinked_skill_file() {
+        let root = temp_dir("discover-symlink");
+        let outside = temp_dir("discover-symlink-outside");
+        write_skill(
+            &outside,
+            "real",
+            "---\nname: demo\ndescription: Demo.\n---\nBody.\n",
+        );
+        let skill_root = root.join("demo");
+        std::fs::create_dir_all(&skill_root).expect("skill directory should be created");
+        std::os::unix::fs::symlink(outside.join("real/SKILL.md"), skill_root.join("SKILL.md"))
+            .expect("symlink should be created");
+        let unbounded = resource_def("skill", json!({}));
+        let error = discover_skill_docs("demo", &unbounded, &skill_root)
+            .expect_err("symlinked SKILL.md must be refused, never followed");
+        assert!(error.to_string().contains("demo"), "{error}");
+        std::fs::remove_dir_all(root).expect("temporary directory should be removed");
+        std::fs::remove_dir_all(outside).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn discover_skill_docs_rejects_unsupported_kinds() {
+        let root = temp_dir("discover-kind");
+        std::fs::create_dir_all(&root).expect("directory should be created");
+        let resource = resource_def("dir", json!({}));
+        let error = discover_skill_docs("docs", &resource, &root)
+            .expect_err("unsupported kinds must be rejected");
+        assert!(
+            error.to_string().contains("skill_library") || error.to_string().contains("skill"),
+            "{error}"
+        );
         std::fs::remove_dir_all(root).expect("temporary directory should be removed");
     }
 }

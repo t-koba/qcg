@@ -11,6 +11,7 @@ mod types;
 pub(crate) use content::*;
 #[cfg(test)]
 pub(crate) use hash::*;
+pub use skill::{DiscoveredSkill, discover_skill_docs};
 #[cfg(test)]
 pub(crate) use snapshot::*;
 pub use types::*;

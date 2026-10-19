@@ -1,8 +1,7 @@
-use contract::{
-    Contract, NodeDef, ResourceKind, ToolDecl, is_skill_library_entry, parse_skill_doc,
-    validate_skill_doc,
+use contract::{Contract, NodeDef, ResourceKind, ToolDecl};
+use engine::{
+    ResourceSelector, ResultExt, StepContext, StepError, discover_skill_docs, select_resource,
 };
-use engine::{ResourceSelector, ResultExt, StepContext, StepError, select_resource};
 use llm::ToolSpec;
 use serde_json::{Value, json};
 
@@ -299,85 +298,312 @@ fn collect_bindings(
                 "skill resource `{resource_name}` must set llm_visible = true"
             ));
         }
-        match resource.kind {
-            ResourceKind::Skill => {
-                let path = resource
-                    .path
-                    .as_deref()
-                    .ok_or_else(|| format!("skill resource `{resource_name}` requires path"))?;
-                let root = contract.resolve_package_path(path).map_err(|error| {
-                    format!("skill resource `{resource_name}` path is invalid: {error}")
-                })?;
-                let doc = read_skill_doc(resource_name, &root)?;
-                bindings.push(SkillBinding {
-                    name: doc.name,
-                    resource: resource_name.clone(),
-                    library_dir: None,
-                });
-            }
-            ResourceKind::SkillLibrary => {
-                let path = resource.path.as_deref().ok_or_else(|| {
-                    format!("skill_library resource `{resource_name}` requires path")
-                })?;
-                let root = contract.resolve_package_path(path).map_err(|error| {
-                    format!("skill_library resource `{resource_name}` path is invalid: {error}")
-                })?;
-                for dir in library_skill_dirs(resource_name, &root)? {
-                    read_skill_doc(resource_name, &root.join(&dir))?;
-                    bindings.push(SkillBinding {
-                        name: dir.clone(),
-                        resource: resource_name.clone(),
-                        library_dir: Some(dir),
-                    });
-                }
-            }
+        let is_library = match resource.kind {
+            ResourceKind::Skill => false,
+            ResourceKind::SkillLibrary => true,
             _ => {
                 return Err(format!(
                     "skill tool resource `{resource_name}` must use type `skill` or `skill_library`"
                 ));
             }
+        };
+        let path = resource.path.as_deref().ok_or_else(|| {
+            if is_library {
+                format!("skill_library resource `{resource_name}` requires path")
+            } else {
+                format!("skill resource `{resource_name}` requires path")
+            }
+        })?;
+        let root = contract.resolve_package_path(path).map_err(|error| {
+            if is_library {
+                format!("skill_library resource `{resource_name}` path is invalid: {error}")
+            } else {
+                format!("skill resource `{resource_name}` path is invalid: {error}")
+            }
+        })?;
+        // All discovery reads go through the engine's bounded no-follow
+        // path so configured `ResourceDef.params` limits apply here exactly
+        // as they do in snapshot/select; no direct filesystem reads remain.
+        let discovered = discover_skill_docs(resource_name, resource, &root)
+            .map_err(|error| error.to_string())?;
+        for item in discovered {
+            let name = item
+                .library_dir
+                .clone()
+                .unwrap_or_else(|| item.doc.name.clone());
+            bindings.push(SkillBinding {
+                name,
+                resource: resource_name.clone(),
+                library_dir: item.library_dir,
+            });
         }
     }
     Ok(bindings)
 }
 
-fn read_skill_doc(resource: &str, root: &camino::Utf8Path) -> Result<contract::SkillDoc, String> {
-    let skill_path = root.join("SKILL.md");
-    let source = std::fs::read_to_string(&skill_path).map_err(|error| {
-        format!("skill resource `{resource}` cannot read `{skill_path}`: {error}")
-    })?;
-    let doc = parse_skill_doc(&source)
-        .map_err(|error| format!("skill resource `{resource}` has invalid SKILL.md: {error}"))?;
-    validate_skill_doc(&doc, root.file_name())
-        .map_err(|error| format!("skill resource `{resource}` is invalid: {error}"))?;
-    Ok(doc)
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use contract::Contract;
+    use engine::{JournalWriter, RunContext};
+    use std::collections::BTreeMap;
 
-fn library_skill_dirs(resource: &str, root: &camino::Utf8Path) -> Result<Vec<String>, String> {
-    let entries = std::fs::read_dir(root).map_err(|error| {
-        format!("skill_library resource `{resource}` cannot read `{root}`: {error}")
-    })?;
-    let mut dirs = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|error| {
-            format!("skill_library resource `{resource}` cannot read entry: {error}")
-        })?;
-        let file_type = entry.file_type().map_err(|error| {
-            format!("skill_library resource `{resource}` cannot inspect entry: {error}")
-        })?;
-        if !file_type.is_dir() {
-            continue;
-        }
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        if !is_skill_library_entry(&name) {
-            continue;
-        }
-        if root.join(&name).join("SKILL.md").is_file() {
-            dirs.push(name);
+    fn test_node() -> NodeDef {
+        NodeDef {
+            id: "agent".into(),
+            kind: contract::StepType::literal("llm.agent"),
+            needs: vec![],
+            when: None,
+            on_deps: contract::OnDeps::AllSucceeded,
+            context: vec![],
+            output: None,
+            artifact: None,
+            on_fail: None,
+            failure: None,
+            retry: None,
+            params: Default::default(),
         }
     }
-    dirs.sort();
-    Ok(dirs)
+
+    fn skill_tool(resources: Vec<String>) -> ToolDecl {
+        ToolDecl::Skill {
+            name: "skills".into(),
+            description: None,
+            resources,
+            max_calls: 1,
+        }
+    }
+
+    fn write_skill(root: &camino::Utf8Path, dir: &str, body: &str) -> camino::Utf8PathBuf {
+        let skill_dir = root.join(dir);
+        std::fs::create_dir_all(&skill_dir).expect("skill directory should be created");
+        std::fs::write(skill_dir.join("SKILL.md"), body).expect("skill file should be written");
+        skill_dir
+    }
+
+    fn temp_root(name: &str) -> camino::Utf8PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
+            "llm-skill-tool-{name}-{}-{nanos}",
+            std::process::id(),
+        )))
+        .expect("temporary path should be UTF-8");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("fixture root should be created");
+        root
+    }
+
+    fn contract_with_skill(root: &camino::Utf8Path, resource_toml: &str) -> Contract {
+        std::fs::write(
+            root.join(contract::MANIFEST_FILE),
+            format!(
+                r#"
+[generator]
+id = "skill-test"
+name = "Skill Test"
+version = "0.1.0"
+
+[llm]
+model = {{ provider = "fake", model = "fake" }}
+max_tokens = 2048
+
+[[flow]]
+id = "gen"
+type = "llm.generate"
+
+[flow.params]
+prompt = "prompt.j2"
+
+{resource_toml}
+"#
+            ),
+        )
+        .expect("manifest should be written");
+        std::fs::write(root.join("prompt.j2"), "Generate a bounded result.")
+            .expect("prompt should be written");
+        Contract::load(root.to_path_buf()).expect("contract should load")
+    }
+
+    fn set_selected_bytes(contract: &mut Contract, resource: &str, bound: Option<usize>) {
+        let entry = contract
+            .manifest
+            .resources
+            .get_mut(resource)
+            .expect("skill resource should be declared");
+        if let Some(bound) = bound {
+            entry
+                .params
+                .insert("max_selected_bytes".into(), json!(bound));
+        } else {
+            entry.params.remove("max_selected_bytes");
+        }
+    }
+
+    fn spec_context<'a>(
+        run: &'a RunContext,
+        journal: &'a JournalWriter,
+        vars: &'a mut contract::ValueBag,
+    ) -> StepContext<'a> {
+        StepContext {
+            run,
+            journal,
+            vars,
+            llm: None,
+        }
+    }
+
+    #[test]
+    fn skill_validation_enforces_an_explicit_skill_doc_bound() {
+        let root = temp_root("validation-bound");
+        write_skill(
+            &root,
+            "demo",
+            "---\nname: demo\ndescription: Demo skill.\n---\nBody.\n",
+        );
+        let mut contract = contract_with_skill(
+            &root,
+            r#"
+[resources.demo]
+type = "skill"
+path = "demo"
+llm_visible = true
+"#,
+        );
+        let node = test_node();
+        let tool = skill_tool(vec!["demo".into()]);
+        validate_skill_tool(&node, &contract, &tool).expect("unbounded skill should validate");
+        let len = std::fs::read(root.join("demo/SKILL.md"))
+            .expect("skill file should be readable")
+            .len();
+        set_selected_bytes(&mut contract, "demo", Some(len));
+        validate_skill_tool(&node, &contract, &tool)
+            .expect("exact-bound skill should still validate");
+        set_selected_bytes(&mut contract, "demo", Some(len - 1));
+        let error = validate_skill_tool(&node, &contract, &tool)
+            .expect_err("oversized SKILL.md must fail validation at the configured bound");
+        assert!(error.to_string().contains("max_bytes"), "{error}");
+        std::fs::remove_dir_all(&root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn skill_library_validation_enforces_entry_bounds() {
+        let root = temp_root("library-entry-bound");
+        write_skill(
+            &root,
+            "skills/alpha",
+            "---\nname: alpha\ndescription: Alpha skill.\n---\nBody.\n",
+        );
+        std::fs::create_dir_all(root.join("skills/empty"))
+            .expect("empty library entry should be created");
+        std::fs::write(root.join("skills/notes.txt"), "not a skill")
+            .expect("non-skill entry should be written");
+        let mut contract = contract_with_skill(
+            &root,
+            r#"
+[resources.lib]
+type = "skill_library"
+path = "skills"
+llm_visible = true
+"#,
+        );
+        let resource = contract
+            .manifest
+            .resources
+            .get_mut("lib")
+            .expect("library should be declared");
+        resource.params.insert("max_entries".into(), json!(4));
+        let node = test_node();
+        let tool = skill_tool(vec!["lib".into()]);
+        validate_skill_tool(&node, &contract, &tool)
+            .expect("exact entry bound should validate, including ignored entries");
+        contract
+            .manifest
+            .resources
+            .get_mut("lib")
+            .expect("library should be declared")
+            .params
+            .insert("max_entries".into(), json!(3));
+        let error = validate_skill_tool(&node, &contract, &tool)
+            .expect_err("empty and non-skill entries must count toward max_entries");
+        assert!(error.to_string().contains("max_entries"), "{error}");
+        std::fs::remove_dir_all(&root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn skill_catalog_spec_enforces_the_same_explicit_bound() {
+        let root = temp_root("spec-bound");
+        write_skill(
+            &root,
+            "demo",
+            "---\nname: demo\ndescription: Demo skill.\n---\nBody.\n",
+        );
+        let mut contract = contract_with_skill(
+            &root,
+            r#"
+[resources.demo]
+type = "skill"
+path = "demo"
+llm_visible = true
+"#,
+        );
+        let len = std::fs::read(root.join("demo/SKILL.md"))
+            .expect("skill file should be readable")
+            .len();
+        let tool = skill_tool(vec!["demo".into()]);
+        std::fs::create_dir_all(root.join("workspace")).expect("workspace should be created");
+        std::fs::create_dir_all(root.join("meta")).expect("meta should be created");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let run_id = format!("skill-spec-{}-{nanos}", std::process::id());
+        let journal_path = root.join("meta/journal.jsonl");
+        set_selected_bytes(&mut contract, "demo", None);
+        let run = RunContext::for_tests(
+            run_id.clone(),
+            root.join("workspace"),
+            root.join("meta"),
+            contract.clone(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .expect("test context should build");
+        let journal = JournalWriter::create(&journal_path, &run_id, false, None)
+            .expect("journal should open");
+        let mut vars = contract::ValueBag::with_inputs(BTreeMap::new());
+        let spec = skill_tool_spec(&spec_context(&run, &journal, &mut vars), &tool)
+            .expect("unbounded skill should produce a catalog");
+        assert!(spec.description.contains("demo"), "{}", spec.description);
+        assert_eq!(
+            spec.input_schema["properties"]["skill"]["enum"],
+            json!(["demo"])
+        );
+        assert!(
+            spec.description.contains("Demo skill."),
+            "{}",
+            spec.description
+        );
+        drop(journal);
+        set_selected_bytes(&mut contract, "demo", Some(len - 1));
+        let run = RunContext::for_tests(
+            run_id.clone(),
+            root.join("workspace"),
+            root.join("meta"),
+            contract.clone(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .expect("bounded context should build");
+        let journal = JournalWriter::create(&journal_path, &run_id, false, None)
+            .expect("journal should reopen");
+        let mut vars = contract::ValueBag::with_inputs(BTreeMap::new());
+        let error = skill_tool_spec(&spec_context(&run, &journal, &mut vars), &tool)
+            .expect_err("oversized SKILL.md must fail spec generation at the same bound");
+        assert!(error.to_string().contains("max_bytes"), "{error}");
+        drop(journal);
+        std::fs::remove_dir_all(&root).expect("temporary directory should be removed");
+    }
 }
