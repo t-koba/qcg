@@ -29,21 +29,34 @@ async fn failed_engine_terminal_is_reconciled_before_fork() {
         wait_for_terminal_snapshot(&service, &source_id).await.state,
         RunStatus::Failed
     );
-    let mut task_finished = false;
-    for _ in 0..200 {
-        task_finished = service
-            .inner
-            .runs
-            .read()
-            .await
-            .get(&source_id)
-            .is_some_and(|record| !crate::types::task_slot_is_live(&record.task));
-        if task_finished {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    assert!(task_finished, "failed source task should have exited");
+    // The source is already terminal, so temporarily take and join its task.
+    // Restore the finished handle so fork adoption still exercises the
+    // service's completed-handle liveness check instead of an empty slot.
+    let task_slot = {
+        let runs = service.inner.runs.read().await;
+        Arc::clone(
+            &runs
+                .get(&source_id)
+                .expect("failed source record should remain available")
+                .task,
+        )
+    };
+    let mut task = task_slot
+        .lock()
+        .expect("source task slot should not be poisoned")
+        .take()
+        .expect("failed source task handle should remain in its slot");
+    (&mut task)
+        .await
+        .expect("failed source task should exit normally");
+    assert!(
+        task_slot
+            .lock()
+            .expect("source task slot should not be poisoned")
+            .replace(task)
+            .is_none(),
+        "no task should replace the joined source task"
+    );
     let events = crate::summaries::read_journal_events(&runs.join(&source_id))
         .expect("source journal should be readable");
     let terminal_events = events
