@@ -1735,9 +1735,16 @@ label = "Explicit label"
         assert!(!service.is_stale(), "fresh fetch is not stale");
         let view = service.view(false).await;
         assert!(!view.stale, "the view must agree while fresh");
-        // Whole-second TTL comparison needs a full two seconds past the
-        // one-second TTL.
-        std::thread::sleep(std::time::Duration::from_millis(2200));
+        // Age the snapshot past its one-second TTL; the comparison is in
+        // whole seconds, so two seconds exercises expiry without sleeping.
+        {
+            let mut snapshot = service
+                .snapshot
+                .write()
+                .unwrap_or_else(|error| error.into_inner());
+            snapshot.external.fetched_at =
+                Some((chrono::Utc::now() - chrono::Duration::seconds(2)).to_rfc3339());
+        }
         assert!(service.is_stale(), "TTL expiry must restore staleness");
         assert!(
             service.view(false).await.stale,
