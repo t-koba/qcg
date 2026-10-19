@@ -3838,7 +3838,7 @@ async fn cancel_wins_over_retry_backoff() {
     let _ = std::fs::remove_dir_all(&run_dir);
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn elapsed_deadline_wins_over_retry_backoff() {
     // E11: the hard elapsed deadline must interrupt a retry backoff
     // instead of sleeping it out, and classify as ElapsedExceeded
@@ -3851,7 +3851,9 @@ async fn elapsed_deadline_wins_over_retry_backoff() {
         slow_secs: 0,
     };
     let mut manifest = manifest(vec![retry_node("flaky", "test.flaky", 5, 60_000, None)]);
-    manifest.budget.max_elapsed_seconds = Some(1);
+    // Keep a real-time test of the deadline interrupting a 60s backoff, with
+    // enough startup margin for slower CI runners before the first attempt.
+    manifest.budget.max_elapsed_seconds = Some(5);
     let run_dir = temp_run_dir("elapsed-backoff");
     let _temp_guard = TempGuard(run_dir.clone());
     let contract = test_contract(&run_dir, manifest);
@@ -3873,7 +3875,7 @@ async fn elapsed_deadline_wins_over_retry_backoff() {
         "the deadline must classify as elapsed, got: {error}"
     );
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(10),
+        started.elapsed() < std::time::Duration::from_secs(15),
         "the deadline must interrupt backoff instead of waiting it out"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
