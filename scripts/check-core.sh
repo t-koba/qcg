@@ -6,8 +6,6 @@ node --test scripts/product.test.mjs scripts/capabilities.test.mjs scripts/spdx.
 node scripts/rust-line-budget.mjs
 cargo fmt --all -- --check
 cargo check -p expr-wasm --target wasm32-unknown-unknown --locked
-cargo check -p mcp --no-default-features --locked
-cargo check -p server --no-default-features --locked
 bash scripts/check-generated-docs.sh
 bash scripts/check-capability-matrix.sh
 bash scripts/check-sdk.sh
@@ -17,6 +15,7 @@ bash scripts/check-third-party-notices.sh
 # Clippy covers all targets here; the MSRV job keeps a separate plain workspace check.
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
+# These tests compile both the production library and tests for each feature set.
 cargo test -p mcp --no-default-features --locked
 cargo test -p server --no-default-features --locked
 bash scripts/check-fixtures.sh
