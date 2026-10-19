@@ -199,7 +199,11 @@ Fields:
 - `url`: remote URL, fetched through the network allowlist
 - `trust`: `trusted` or `untrusted`
 - `llm_visible`: required before an LLM context can include the resource
-- `pin_sha256`: optional hash pin for snapshotted URL/OpenAPI resources
+- `pin_sha256`: optional SHA-256 pin for `file`, `dir`, `url`, `skill`,
+  `skill_library`, `openapi`, and `exec` resources. Directory resources
+  (`dir`, `skill`, `skill_library`) hash all files by relative path and
+  content, not just a selected file such as `SKILL.md`. For `run_ref`, use
+  `params.require_sha256` to pin the selected artifact.
 - `cache_ttl_seconds`: optional remote snapshot TTL
 - `params`: optional explicit bounds for the selected built-in resource type.
   `file`, `url`, and `openapi` resources accept a positive
