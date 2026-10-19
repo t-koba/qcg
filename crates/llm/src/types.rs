@@ -203,13 +203,31 @@ pub enum ChatContent {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TokenUsage {
+    /// Total input, including the disjoint cache read and creation subsets.
     pub input: u64,
     pub output: u64,
     /// Reasoning tokens included in `output`, when reported by the provider.
     pub reasoning: u64,
     /// Input tokens served from provider cache, included in `input`.
-    /// Billed at the input rate; cache discounts are not modeled.
     pub cached_input: u64,
+    /// Input tokens used to create provider cache entries, included in `input`.
+    #[serde(default)]
+    pub cache_creation_input: u64,
+}
+
+impl TokenUsage {
+    /// Validate provider counters before metering disjoint input categories.
+    pub fn ordinary_input(&self) -> Result<u64, LlmError> {
+        if self.reasoning > self.output {
+            return Err(LlmError::invalid_response("reasoning usage exceeds output"));
+        }
+        self.cached_input
+            .checked_add(self.cache_creation_input)
+            .and_then(|cached| self.input.checked_sub(cached))
+            .ok_or_else(|| {
+                LlmError::invalid_response("cache usage exceeds total input or overflowed")
+            })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

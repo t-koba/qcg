@@ -1083,7 +1083,8 @@ fn response_parsers_report_cached_input_tokens() {
         }
     }))
     .expect("Anthropic response should parse");
-    assert_eq!(anthropic.usage.input, 100);
+    assert_eq!(anthropic.usage.input, 165);
+    assert_eq!(anthropic.usage.cache_creation_input, 5);
     assert_eq!(anthropic.usage.cached_input, 60);
 }
 
@@ -2379,6 +2380,7 @@ impl LlmProvider for RetryProvider {
                 output: 1,
                 reasoning: 0,
                 cached_input: 0,
+                cache_creation_input: 0,
             },
             stop: StopReason::EndTurn,
             provider_state: None,
@@ -2960,3 +2962,6 @@ fn bundled_anonymous_example_parses_without_credentials_or_discovery() {
     );
     assert!(!spec.capabilities.json_schema);
 }
+
+#[path = "tests/cache_usage.rs"]
+mod cache_usage;

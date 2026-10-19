@@ -407,6 +407,8 @@ pub struct LlmCatalogModel {
     pub reasoning_effort: Vec<String>,
     #[serde(default)]
     pub input_cost_per_million_usd: Option<f64>,
+    pub cache_creation_input_cost_per_million_usd: Option<f64>,
+    pub cache_read_input_cost_per_million_usd: Option<f64>,
     #[serde(default)]
     pub output_cost_per_million_usd: Option<f64>,
     #[serde(default)]

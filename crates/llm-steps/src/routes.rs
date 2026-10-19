@@ -28,49 +28,18 @@ pub(crate) fn invocation_routes(
         .find(|model| model.provider == request.provider && model.model == request.model);
     // Catalog prices fill contract gaps so operator-selected models can be
     // metered under `budget.max_cost_usd` without duplicating prices in every
-    // contract. The contract's explicit value always wins.
-    let catalog_pricing = ctx
-        .run
-        .llm_provider
-        .as_ref()
-        .and_then(|provider| provider.model_pricing_for(&request.provider, &request.model));
-    let mut routes = vec![contract::ModelRef {
-        provider: request.provider.clone(),
-        model: request.model.clone(),
-        input_cost_per_million_usd: pricing
-            .and_then(|model| model.input_cost_per_million_usd)
-            .or_else(|| {
-                catalog_pricing
-                    .as_ref()
-                    .and_then(|pricing| pricing.input_cost_per_million_usd)
-            }),
-        output_cost_per_million_usd: pricing
-            .and_then(|model| model.output_cost_per_million_usd)
-            .or_else(|| {
-                catalog_pricing
-                    .as_ref()
-                    .and_then(|pricing| pricing.output_cost_per_million_usd)
-            }),
-    }];
+    // contract. Explicit contract values always win, field by field.
+    let route = |provider: &str, model: &str, contract: Option<&contract::ModelRef>| {
+        let catalog = ctx
+            .run
+            .llm_provider
+            .as_ref()
+            .and_then(|registry| registry.model_pricing_for(provider, model));
+        priced_route(provider, model, contract, catalog)
+    };
+    let mut routes = vec![route(&request.provider, &request.model, pricing)];
     for fallback in fallback_override.unwrap_or(&params.fallback_models) {
-        let catalog_pricing =
-            ctx.run.llm_provider.as_ref().and_then(|provider| {
-                provider.model_pricing_for(&fallback.provider, &fallback.model)
-            });
-        routes.push(contract::ModelRef {
-            provider: fallback.provider.clone(),
-            model: fallback.model.clone(),
-            input_cost_per_million_usd: fallback.input_cost_per_million_usd.or_else(|| {
-                catalog_pricing
-                    .as_ref()
-                    .and_then(|pricing| pricing.input_cost_per_million_usd)
-            }),
-            output_cost_per_million_usd: fallback.output_cost_per_million_usd.or_else(|| {
-                catalog_pricing
-                    .as_ref()
-                    .and_then(|pricing| pricing.output_cost_per_million_usd)
-            }),
-        });
+        routes.push(route(&fallback.provider, &fallback.model, Some(fallback)));
     }
     validate_route_sequence(node, routes.first(), &routes[1..], "LLM routes")?;
     Ok(routes)
@@ -98,4 +67,75 @@ pub(crate) fn validate_route_sequence(
         }
     }
     Ok(())
+}
+
+fn priced_route(
+    provider: &str,
+    model: &str,
+    contract: Option<&contract::ModelRef>,
+    catalog: Option<llm::ModelPricing>,
+) -> contract::ModelRef {
+    contract::ModelRef {
+        provider: provider.to_owned(),
+        model: model.to_owned(),
+        input_cost_per_million_usd: contract
+            .and_then(|pricing| pricing.input_cost_per_million_usd)
+            .or_else(|| {
+                catalog
+                    .as_ref()
+                    .and_then(|pricing| pricing.input_cost_per_million_usd)
+            }),
+        cache_read_input_cost_per_million_usd: contract
+            .and_then(|pricing| pricing.cache_read_input_cost_per_million_usd)
+            .or_else(|| {
+                catalog
+                    .as_ref()
+                    .and_then(|pricing| pricing.cache_read_input_cost_per_million_usd)
+            }),
+        cache_creation_input_cost_per_million_usd: contract
+            .and_then(|pricing| pricing.cache_creation_input_cost_per_million_usd)
+            .or_else(|| {
+                catalog
+                    .as_ref()
+                    .and_then(|pricing| pricing.cache_creation_input_cost_per_million_usd)
+            }),
+        output_cost_per_million_usd: contract
+            .and_then(|pricing| pricing.output_cost_per_million_usd)
+            .or_else(|| {
+                catalog
+                    .as_ref()
+                    .and_then(|pricing| pricing.output_cost_per_million_usd)
+            }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_contract_rates_override_catalog_field_by_field() {
+        let contract = contract::ModelRef {
+            provider: "p".into(),
+            model: "m".into(),
+            input_cost_per_million_usd: Some(9.0),
+            cache_read_input_cost_per_million_usd: None,
+            cache_creation_input_cost_per_million_usd: Some(0.0),
+            output_cost_per_million_usd: None,
+        };
+        let catalog = llm::ModelPricing {
+            input_cost_per_million_usd: Some(1.0),
+            cache_creation_input_cost_per_million_usd: Some(1.5),
+            cache_read_input_cost_per_million_usd: Some(0.2),
+            output_cost_per_million_usd: Some(3.0),
+        };
+        let resolved = priced_route("p", "m", Some(&contract), Some(catalog));
+        assert_eq!(resolved.input_cost_per_million_usd, Some(9.0));
+        assert_eq!(resolved.cache_read_input_cost_per_million_usd, Some(0.2));
+        assert_eq!(
+            resolved.cache_creation_input_cost_per_million_usd,
+            Some(0.0)
+        );
+        assert_eq!(resolved.output_cost_per_million_usd, Some(3.0));
+    }
 }

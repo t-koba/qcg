@@ -13,6 +13,7 @@ mod router;
 mod stream;
 pub(crate) mod text_gate;
 mod types;
+mod usage;
 mod validate;
 
 #[cfg(test)]

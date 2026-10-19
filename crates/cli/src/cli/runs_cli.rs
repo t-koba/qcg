@@ -132,6 +132,7 @@ fn diagnose_run(run_dir: &Utf8Path) -> Result<Value> {
         tokens_input: u64,
         tokens_output: u64,
         tokens_cached_input: u64,
+        tokens_cache_creation_input: u64,
         cost_microusd: u64,
     }
     let mut node_costs: BTreeMap<String, NodeCost> = BTreeMap::new();
@@ -220,6 +221,12 @@ fn diagnose_run(run_dir: &Utf8Path) -> Result<Value> {
                     .and_then(Value::as_u64)
                     .unwrap_or(0),
             );
+            entry.tokens_cache_creation_input = entry.tokens_cache_creation_input.saturating_add(
+                data.get("tokens")
+                    .and_then(|tokens| tokens.get("cache_creation_input"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            );
             entry.cost_microusd = entry.cost_microusd.saturating_add(
                 data.get("cost_microusd")
                     .and_then(Value::as_u64)
@@ -236,6 +243,7 @@ fn diagnose_run(run_dir: &Utf8Path) -> Result<Value> {
                 "tokens_input": cost.tokens_input,
                 "tokens_output": cost.tokens_output,
                 "tokens_cached_input": cost.tokens_cached_input,
+                "tokens_cache_creation_input": cost.tokens_cache_creation_input,
                 "cost_microusd": cost.cost_microusd,
             })
         })
@@ -285,7 +293,7 @@ fn print_diagnosis(diagnosis: &Value) {
         println!("node costs:");
         for entry in node_costs {
             println!(
-                "  {} calls={} in={} out={} cached={} cost={}",
+                "  {} calls={} in={} out={} cached={} creation={} cost={}",
                 entry.get("node").and_then(Value::as_str).unwrap_or("-"),
                 entry.get("llm_calls").and_then(Value::as_u64).unwrap_or(0),
                 entry
@@ -298,6 +306,10 @@ fn print_diagnosis(diagnosis: &Value) {
                     .unwrap_or(0),
                 entry
                     .get("tokens_cached_input")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                entry
+                    .get("tokens_cache_creation_input")
                     .and_then(Value::as_u64)
                     .unwrap_or(0),
                 format_usd(
@@ -318,10 +330,11 @@ pub(crate) fn format_usd(cost_microusd: u64) -> String {
 
 fn print_run_metrics(metrics: &model::RunMetrics) {
     println!(
-        "tokens: in={} out={} cached={} total={} ({} calls)",
+        "tokens: in={} out={} cached={} creation={} total={} ({} calls)",
         metrics.tokens_input,
         metrics.tokens_output,
         metrics.tokens_cached_input,
+        metrics.tokens_cache_creation_input,
         metrics.tokens_input.saturating_add(metrics.tokens_output),
         metrics.llm_calls
     );
@@ -348,8 +361,11 @@ pub(crate) fn show_costs(
         tokens_input: u64,
         tokens_output: u64,
         tokens_cached_input: u64,
+        tokens_cache_creation_input: u64,
         cost_microusd: u64,
         input_rate: Option<f64>,
+        cache_read_rate: Option<f64>,
+        cache_creation_rate: Option<f64>,
         output_rate: Option<f64>,
         unpriced_calls: u64,
     }
@@ -418,14 +434,19 @@ pub(crate) fn show_costs(
                 entry.tokens_cached_input = entry
                     .tokens_cached_input
                     .saturating_add(data.tokens.cached_input);
+                entry.tokens_cache_creation_input = entry
+                    .tokens_cache_creation_input
+                    .saturating_add(data.tokens.cache_creation_input);
                 entry.cost_microusd = entry.cost_microusd.saturating_add(data.cost_microusd);
                 let billed = data.tokens.input.saturating_add(data.tokens.output) > 0;
                 match contract
                     .as_ref()
                     .and_then(|contract| find_pricing(contract, &data.provider, &data.model))
                 {
-                    Some((input_rate, output_rate)) => {
+                    Some((input_rate, cache_read_rate, cache_creation_rate, output_rate)) => {
                         entry.input_rate = Some(input_rate);
+                        entry.cache_read_rate = Some(cache_read_rate);
+                        entry.cache_creation_rate = Some(cache_creation_rate);
                         entry.output_rate = Some(output_rate);
                     }
                     None if billed && data.cost_microusd == 0 => {
@@ -456,6 +477,7 @@ pub(crate) fn show_costs(
                     "tokens_input": run.metrics.tokens_input,
                     "tokens_output": run.metrics.tokens_output,
                     "tokens_cached_input": run.metrics.tokens_cached_input,
+                    "tokens_cache_creation_input": run.metrics.tokens_cache_creation_input,
                     "llm_calls": run.metrics.llm_calls,
                     "cost_microusd": run.metrics.cost_microusd,
                     "cost_usd": run.metrics.cost_microusd as f64 / 1_000_000.0,
@@ -478,16 +500,17 @@ pub(crate) fn show_costs(
         );
         return Ok(());
     }
-    println!("run\tstate\tgenerator\ttokens(in/out/cached)\tcalls\tcost\tunpriced");
+    println!("run\tstate\tgenerator\ttokens(in/out/cached/creation)\tcalls\tcost\tunpriced");
     for run in &runs {
         println!(
-            "{}\t{}\t{}\t{}/{}/{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}/{}/{}/{}\t{}\t{}\t{}",
             run.run_id,
             run.state,
             run.generator,
             run.metrics.tokens_input,
             run.metrics.tokens_output,
             run.metrics.tokens_cached_input,
+            run.metrics.tokens_cache_creation_input,
             run.metrics.llm_calls,
             format_usd(run.metrics.cost_microusd),
             if run.unpriced { "yes" } else { "no" },
@@ -503,7 +526,7 @@ pub(crate) fn show_costs(
     );
     if by_model && !models.is_empty() {
         println!(
-            "model\tprovider\ttokens(in/out/cached)\tcalls\tunit(in/out USD per 1M)\tcost\tunpriced_calls"
+            "model\tprovider\ttokens(in/out/cached/creation)\tcalls\tunit(contract input/read/write/output USD per 1M)\tcost\tunpriced_calls"
         );
         let mut models: Vec<&ModelAggregate> = models.values().collect();
         models.sort_by(|left, right| {
@@ -511,17 +534,25 @@ pub(crate) fn show_costs(
                 .cmp(&(right.provider.clone(), right.model.clone()))
         });
         for entry in models {
-            let rates = match (entry.input_rate, entry.output_rate) {
-                (Some(input), Some(output)) => format!("{input}/{output}"),
+            let rates = match (
+                entry.input_rate,
+                entry.cache_read_rate,
+                entry.cache_creation_rate,
+                entry.output_rate,
+            ) {
+                (Some(input), Some(read), Some(creation), Some(output)) => {
+                    format!("{input}/{read}/{creation}/{output}")
+                }
                 _ => "n/a".into(),
             };
             println!(
-                "{}\t{}\t{}/{}/{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}/{}/{}/{}\t{}\t{}\t{}\t{}",
                 entry.model,
                 entry.provider,
                 entry.tokens_input,
                 entry.tokens_output,
                 entry.tokens_cached_input,
+                entry.tokens_cache_creation_input,
                 entry.calls,
                 rates,
                 format_usd(entry.cost_microusd),
@@ -533,16 +564,20 @@ pub(crate) fn show_costs(
 }
 
 /// Contract unit prices (USD per 1M tokens) for one provider/model route,
-/// preferring a fully priced entry like the execution gateway.
-pub(crate) fn find_pricing(contract: &Contract, provider: &str, model: &str) -> Option<(f64, f64)> {
+/// with omitted cache rates inheriting the ordinary input rate.
+pub(crate) fn find_pricing(
+    contract: &Contract,
+    provider: &str,
+    model: &str,
+) -> Option<(f64, f64, f64, f64)> {
     let candidates = contract
         .manifest
         .llm
         .as_ref()
         .map(|llm| {
-            llm.models
+            llm.model
                 .iter()
-                .chain(llm.model.as_ref())
+                .chain(&llm.models)
                 .filter(|entry| entry.provider == provider && entry.model == model)
                 .collect::<Vec<_>>()
         })
@@ -552,7 +587,14 @@ pub(crate) fn find_pricing(contract: &Contract, provider: &str, model: &str) -> 
             entry.input_cost_per_million_usd,
             entry.output_cost_per_million_usd,
         ) {
-            (Some(input), Some(output)) => Some((input, output)),
+            (Some(input), Some(output)) => Some((
+                input,
+                entry.cache_read_input_cost_per_million_usd.unwrap_or(input),
+                entry
+                    .cache_creation_input_cost_per_million_usd
+                    .unwrap_or(input),
+                output,
+            )),
             _ => None,
         }
     })

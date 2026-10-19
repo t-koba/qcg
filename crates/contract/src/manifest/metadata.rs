@@ -300,6 +300,14 @@ impl GeneratorMetadataRule {
                         model.input_cost_per_million_usd,
                     ),
                     (
+                        "cache_read_input_cost_per_million_usd",
+                        model.cache_read_input_cost_per_million_usd,
+                    ),
+                    (
+                        "cache_creation_input_cost_per_million_usd",
+                        model.cache_creation_input_cost_per_million_usd,
+                    ),
+                    (
                         "output_cost_per_million_usd",
                         model.output_cost_per_million_usd,
                     ),
@@ -333,6 +341,14 @@ impl GeneratorMetadataRule {
                     (
                         "input_cost_per_million_usd",
                         model.input_cost_per_million_usd,
+                    ),
+                    (
+                        "cache_read_input_cost_per_million_usd",
+                        model.cache_read_input_cost_per_million_usd,
+                    ),
+                    (
+                        "cache_creation_input_cost_per_million_usd",
+                        model.cache_creation_input_cost_per_million_usd,
                     ),
                     (
                         "output_cost_per_million_usd",

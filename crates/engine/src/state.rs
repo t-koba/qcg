@@ -114,6 +114,9 @@ pub struct BudgetState {
     pub tokens_input: u64,
     pub tokens_output: u64,
     pub tokens_cached_input: u64,
+    /// Input tokens used to create cache entries, included in total input.
+    #[serde(default)]
+    pub tokens_cache_creation_input: u64,
     pub cost_microusd: u64,
     #[serde(deserialize_with = "required_presence")]
     pub started_at: Option<String>,
@@ -723,13 +726,9 @@ impl RunState {
                     crate::JournalError::InvalidEvent("LLM call count overflowed".into())
                 })?;
                 if let Some(tokens) = event.get("tokens").and_then(Value::as_object) {
-                    // No wire-compat default (Q1): every `llm_call` journaled
-                    // by the current version carries all token counters and
-                    // `cost_microusd`. An absent counter is a corrupt or
-                    // foreign-old event and fails the fold instead of
-                    // defaulting to zero; present-but-wrongly-typed counters
-                    // fail the same way. Old test journals were converted to
-                    // the full form alongside this removal.
+                    // Ordinary input/output and cache-read counters are required.
+                    // Cache creation is optional with a zero default; present
+                    // malformed counters always fail closed.
                     let counter = |name: &str| -> Result<u64, crate::JournalError> {
                         tokens
                             .get(name)
@@ -768,6 +767,19 @@ impl RunState {
                         .ok_or_else(|| {
                             crate::JournalError::InvalidEvent(
                                 "cached input token count overflowed".into(),
+                            )
+                        })?;
+                    self.budget.tokens_cache_creation_input = self
+                        .budget
+                        .tokens_cache_creation_input
+                        .checked_add(if tokens.contains_key("cache_creation_input") {
+                            counter("cache_creation_input")?
+                        } else {
+                            0
+                        })
+                        .ok_or_else(|| {
+                            crate::JournalError::InvalidEvent(
+                                "cache creation input token count overflowed".into(),
                             )
                         })?;
                 }

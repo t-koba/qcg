@@ -853,7 +853,10 @@ params = { content = "x", output_file = "x.txt" }
         )
         .expect("manifest should be written");
         let contract = Contract::load(&root).expect("fixture contract should load");
-        assert_eq!(find_pricing(&contract, "main", "large"), Some((2.5, 10.0)));
+        assert_eq!(
+            find_pricing(&contract, "main", "large"),
+            Some((2.5, 2.5, 2.5, 10.0))
+        );
         assert_eq!(find_pricing(&contract, "alt", "small"), None);
         assert_eq!(find_pricing(&contract, "missing", "large"), None);
         let _ = std::fs::remove_dir_all(&root);

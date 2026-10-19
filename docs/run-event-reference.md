@@ -78,15 +78,37 @@ MCP call answers the original remote request instead of starting a new one.
 Every terminal event (`run_finished`, `run_error`, `run_canceled`,
 `run_interrupted`) carries a `metrics` object with accumulated step counts,
 `llm_calls`, `tokens_input`, `tokens_output`, `tokens_cached_input`,
+`tokens_cache_creation_input`,
 `tokens_total`, `cost_microusd`, and `duration_ms`. Totals on failed or
 canceled runs therefore stay queryable without replaying `llm_call` rows.
 
-`llm_call.tokens` reports `input`, `output`, `reasoning` (included in
-`output`), and `cached_input` (included in `input`) as parsed from the
-provider response. Costs are `microUSD` integers computed per call from the
-contract unit prices (`input_cost_per_million_usd` /
-`output_cost_per_million_usd`, USD per 1M tokens): `USD = cost_microusd /
-1_000_000`. Cached input is billed at the input rate; cache discounts are not
-modeled. Unit prices are contract-declared estimates, not provider invoices.
+`llm_call.tokens` reports total `input`, `output`, `reasoning` (included in
+`output`), `cached_input` (cache reads), and `cache_creation_input` (cache writes).
+The two cache buckets are disjoint subsets of `input`, not extra tokens to add
+to it. Missing optional cache counters are zero; malformed counts, overlapping
+subsets, and arithmetic overflow fail closed. OpenAI Chat/Responses already
+report inclusive input totals; Anthropic's ordinary input, cache reads, and
+cache creation counts are summed to obtain total input, including in streams.
+
+Costs are rounded `microUSD` integers (`USD = cost_microusd / 1_000_000`).
+For the selected provider/model pricing row, the per-call estimate is:
+
+```text
+ordinary_input = input - cached_input - cache_creation_input
+microUSD = ordinary_input * input_cost_per_million_usd
+         + cached_input * cache_read_input_cost_per_million_usd
+         + cache_creation_input * cache_creation_input_cost_per_million_usd
+         + output * output_cost_per_million_usd
+```
+
+Rates are USD per 1M tokens. Each omitted cache rate falls back to the same
+row's ordinary input rate; explicit zero is honored. `require_pricing` still
+requires ordinary input/output rates, not cache rates. Totals remain estimates,
+not provider invoices, especially unless all actual categories are configured.
+No vendor discounts or cache TTL tiers are inferred. Admission reservations
+use prompt bytes/4, the maximum requested output, and the highest configured
+input-category rate on the selected row; they remain heuristic because token
+count and fallback usage are not known before the request. Reported usage drives
+the post-call budget check.
 Calls without resolvable pricing contribute `0` unless a cost budget forces an
 error, so totals mixing priced and unpriced calls may understate spend.

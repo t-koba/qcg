@@ -1613,6 +1613,20 @@
       "LlmCatalogModel": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
+          "cache_creation_input_cost_per_million_usd": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "cache_read_input_cost_per_million_usd": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
           "capabilities": {
             "$ref": "#/components/schemas/LlmCatalogCapabilities"
           },
@@ -2179,6 +2193,7 @@
               "steps_skipped": 0,
               "steps_succeeded": 0,
               "steps_total": 0,
+              "tokens_cache_creation_input": 0,
               "tokens_cached_input": 0,
               "tokens_input": 0,
               "tokens_output": 0,
@@ -2510,6 +2525,7 @@
               "steps_skipped": 0,
               "steps_succeeded": 0,
               "steps_total": 0,
+              "tokens_cache_creation_input": 0,
               "tokens_cached_input": 0,
               "tokens_input": 0,
               "tokens_output": 0,
@@ -2995,6 +3011,13 @@
           },
           "steps_total": {
             "default": 0,
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tokens_cache_creation_input": {
+            "default": 0,
+            "description": "Input tokens used to create cache entries, included in total input.",
             "format": "uint64",
             "minimum": 0,
             "type": "integer"
@@ -3687,6 +3710,13 @@
       "TokenUsageEventData": {
         "additionalProperties": false,
         "properties": {
+          "cache_creation_input": {
+            "default": 0,
+            "description": "Input tokens used to create cache entries, included in total input.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "cached_input": {
             "default": 0,
             "description": "Input tokens served from provider cache, included in `input`.",

@@ -8,6 +8,8 @@ pub use types::*;
 
 #[cfg(test)]
 mod tests {
+    #[path = "cache_cost.rs"]
+    mod cache_cost;
     use super::*;
     use crate::{JournalWriter, SecretStore, StepError};
     use async_trait::async_trait;
@@ -101,6 +103,7 @@ mod tests {
                     output: 1,
                     reasoning: 0,
                     cached_input: 0,
+                    cache_creation_input: 0,
                 },
                 stop: StopReason::EndTurn,
                 provider_state: None,
@@ -222,6 +225,7 @@ mod tests {
                     output: 0,
                     reasoning: 0,
                     cached_input: 0,
+                    cache_creation_input: 0,
                 },
                 stop: StopReason::EndTurn,
                 provider_state: None,
@@ -251,6 +255,7 @@ mod tests {
                     output: 1,
                     reasoning: 0,
                     cached_input: 0,
+                    cache_creation_input: 0,
                 },
                 stop: StopReason::ToolUse,
                 provider_state: None,
@@ -323,6 +328,7 @@ mod tests {
                     output: 0,
                     reasoning: 0,
                     cached_input: 0,
+                    cache_creation_input: 0,
                 },
                 stop: StopReason::EndTurn,
                 provider_state: None,
@@ -352,6 +358,7 @@ mod tests {
                     output: 5,
                     reasoning: 5,
                     cached_input: 0,
+                    cache_creation_input: 0,
                 },
                 stop: StopReason::MaxTokens,
                 provider_state: None,
@@ -640,6 +647,8 @@ mod tests {
                 provider: "metered".into(),
                 model: "test".into(),
                 input_cost_per_million_usd: Some(1.0),
+                cache_creation_input_cost_per_million_usd: None,
+                cache_read_input_cost_per_million_usd: None,
                 output_cost_per_million_usd: Some(1.0),
             }],
         );
@@ -780,6 +789,8 @@ mod tests {
                 provider: (*provider).into(),
                 model: (*model).into(),
                 input_cost_per_million_usd: None,
+                cache_creation_input_cost_per_million_usd: None,
+                cache_read_input_cost_per_million_usd: None,
                 output_cost_per_million_usd: None,
             })
             .collect()

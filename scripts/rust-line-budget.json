@@ -1,22 +1,22 @@
 {
-  "_comment": "Physical Rust lines under crates/<crate>/src: tests/ paths, tests.rs, test_support, inline #[cfg(test)] modules and test-only #[cfg(all(..., test, ...))] modules are uncapped tests; every other source line is capped product. Per-crate caps match current product counts. The HTTP preflight timeout fix raises engine and totalMax by 57 lines, justified by deterministic timeout, cancellation and remaining-budget regressions; sharing check.command/check.container text expectations reduces steps and totalMax by 8 lines; sharing their ExpectDef schema reduces both by 3 more lines; totalMax ratchets down after each behavior-preserving deduplication slice. The skill-resource discovery fix replaces the duplicate unrestricted tool loader with the engine bounded reader (+54 engine lines, -40 llm-steps lines, +14 net), covering configured byte/entry limits and no-follow behavior in validation/catalog tests. Correcting the test-only cfg(all(..., test, ...)) classification ratchets cli/container/engine caps down by 44/141/1484 lines and totalMax by 1669; the 35-line gateway cancellation-test seam remains in uncapped test code.",
+  "_comment": "Physical Rust lines under crates/<crate>/src: tests/ paths, tests.rs, test_support, inline #[cfg(test)] modules and test-only #[cfg(all(..., test, ...))] modules are uncapped tests; every other source line is capped product. Per-crate caps match current product counts. The HTTP preflight timeout fix raises engine and totalMax by 57 lines, justified by deterministic timeout, cancellation and remaining-budget regressions; sharing check.command/check.container text expectations reduces steps and totalMax by 8 lines; sharing their ExpectDef schema reduces both by 3 more lines; totalMax ratchets down after each behavior-preserving deduplication slice. The skill-resource discovery fix replaces the duplicate unrestricted tool loader with the engine bounded reader (+54 engine lines, -40 llm-steps lines, +14 net), covering configured byte/entry limits and no-follow behavior in validation/catalog tests. Correcting the test-only cfg(all(..., test, ...)) classification ratchets cli/container/engine caps down by 44/141/1484 lines and totalMax by 1669; the 35-line gateway cancellation-test seam remains in uncapped test code. Cached-token accounting adds 236 net product lines: shared strict provider normalization, two optional category rates across existing model/catalog/contract/policy surfaces, disjoint metering and cache-creation reporting. Inclusive OpenAI/split Anthropic streaming parity, malformed/overflow counters, per-category fallback/explicit-zero rates, whole-row pricing precedence and post-usage budget boundary regressions justify this focused growth; The route-pricing overlay regression and four-category CLI rate display add 24 product lines; removing 10 lines of stale LLM cap slack makes totalMax rise by 14 net lines. Per-crate caps and totalMax below match the final measured product lines.",
   "version": 1,
-  "totalMax": 94177,
+  "totalMax": 94446,
   "crates": {
-    "api": 2927,
-    "cli": 7617,
+    "api": 2932,
+    "cli": 7659,
     "container": 1691,
-    "contract": 6557,
-    "engine": 19351,
+    "contract": 6583,
+    "engine": 19411,
     "expr-wasm": 175,
     "files": 1224,
-    "llm": 7267,
-    "llm-steps": 12368,
+    "llm": 7372,
+    "llm-steps": 12389,
     "mcp": 3644,
-    "model": 787,
-    "policy": 1699,
+    "model": 790,
+    "policy": 1701,
     "server": 7383,
-    "service": 14945,
+    "service": 14950,
     "steps": 6542
   }
 }

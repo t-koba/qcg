@@ -21,6 +21,8 @@ pub struct PricingRow<'a> {
     pub provider: &'a str,
     pub model: &'a str,
     pub input_cost_per_million_usd: Option<f64>,
+    pub cache_creation_input_cost_per_million_usd: Option<f64>,
+    pub cache_read_input_cost_per_million_usd: Option<f64>,
     pub output_cost_per_million_usd: Option<f64>,
 }
 
@@ -61,6 +63,8 @@ mod tests {
             provider,
             model,
             input_cost_per_million_usd: input,
+            cache_creation_input_cost_per_million_usd: None,
+            cache_read_input_cost_per_million_usd: None,
             output_cost_per_million_usd: output,
         }
     }

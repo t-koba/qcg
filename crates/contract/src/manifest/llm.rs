@@ -183,6 +183,12 @@ pub struct ModelRef {
     pub model: String,
     #[serde(default)]
     pub input_cost_per_million_usd: Option<f64>,
+    /// Cache creation input USD/1M; absent falls back to ordinary input.
+    #[serde(default)]
+    pub cache_creation_input_cost_per_million_usd: Option<f64>,
+    /// Cache read input USD/1M; absent falls back to ordinary input.
+    #[serde(default)]
+    pub cache_read_input_cost_per_million_usd: Option<f64>,
     #[serde(default)]
     pub output_cost_per_million_usd: Option<f64>,
 }

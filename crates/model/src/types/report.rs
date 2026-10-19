@@ -70,6 +70,9 @@ pub struct RunMetrics {
     /// Input tokens served from provider cache, included in `tokens_input`.
     #[serde(default)]
     pub tokens_cached_input: u64,
+    /// Input tokens used to create cache entries, included in total input.
+    #[serde(default)]
+    pub tokens_cache_creation_input: u64,
     #[serde(default)]
     pub tokens_total: u64,
     #[serde(default)]

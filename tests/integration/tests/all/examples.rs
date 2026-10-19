@@ -1210,6 +1210,8 @@ fn generator_research_nodes_deserialize_typed_bounded_mcp_contracts() {
         provider: "{{ steps.ask_llm_model.output.provider }}".into(),
         model: "{{ steps.ask_llm_model.output.model }}".into(),
         input_cost_per_million_usd: None,
+        cache_read_input_cost_per_million_usd: None,
+        cache_creation_input_cost_per_million_usd: None,
         output_cost_per_million_usd: None,
     };
 

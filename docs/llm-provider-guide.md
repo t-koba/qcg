@@ -272,7 +272,14 @@ Fields:
 - `reasoning_effort`: shorthand that overrides only the provider's advertised
   effort list, without restating every capability.
 - `input_cost_per_million_usd` / `output_cost_per_million_usd`: unit prices
-  used by `budget.max_cost_usd` when the contract itself declares no price.
+  used by `budget.max_cost_usd` when the contract leaves that price field unset.
+- `cache_read_input_cost_per_million_usd` /
+  `cache_creation_input_cost_per_million_usd`: optional cache input unit prices
+  (USD/1M). Each defaults to the ordinary input rate when omitted; explicit
+  zero is preserved. These rates flow through the catalog and per-call pricing.
+  No vendor prices or cache TTL tiers are built in. `require_pricing` continues
+  to require ordinary input/output rates only; costs remain estimates, not
+  invoices, particularly unless all actual categories have configured rates.
 - `context_tokens` / `max_output_tokens`: selection metadata.
 - `enabled`: `false` hides the model from `qcg models` and the catalog API.
 
@@ -295,7 +302,14 @@ An optional `[catalog]` section fetches model metadata from an external
 source. The `models_dev` kind accepts a models.dev `api.json` URL or a
 vendored file and maps `reasoning_options[type=effort]`, tool/structured
 output/attachment capabilities, context and output limits, and unit prices.
-Explicit `[[provider.models]]` entries win field by field.
+Explicit `[[provider.models]]` metadata overlays external catalog entries
+field by field. For a request, explicit contract rates likewise override the
+effective catalog model field by field. The cost meter then selects one pricing
+row among matching invocation routes and contract model entries: the first
+complete input/output row wins; if none is complete, the first matching partial
+row applies. It never mixes rates between those candidate rows. Missing cache
+rates fall back to ordinary input from that selected row; explicit zero is
+preserved.
 
 ```toml
 [catalog]
@@ -1105,3 +1119,20 @@ inference access. Explicit model entries curate the picker, not an access
 allowlist: contracts may still name other models. Do not infer free access
 from a name suffix, zero price, or successful model discovery. Availability
 and prices must be rechecked when changing the configuration.
+
+
+### Provider usage normalization
+
+[OpenAI prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching)
+reports total Chat `prompt_tokens` or Responses `input_tokens`, with
+`cached_tokens` and (when supplied) `cache_write_tokens` as disjoint subsets.
+qcg preserves the inclusive total and records reads as `cached_input` and
+writes as `cache_creation_input`. [Anthropic prompt caching](https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching)
+reports disjoint `input_tokens`, `cache_read_input_tokens`, and
+`cache_creation_input_tokens`. qcg sums them as total `input` and retains both
+cache buckets. Streaming uses the same normalization; cumulative delta counters
+replace earlier counters.
+The current Anthropic payload uses ephemeral cache markers with the default
+five-minute lifetime; no TTL tiers or prices are inferred from that marker.
+Missing optional counters are zero; present invalid counts, subset overflow,
+and cache sums exceeding total input fail closed instead of being clamped.

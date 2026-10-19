@@ -83,7 +83,7 @@ mod tests {
     }
 
     /// One `llm_call` record for `node` charging `input`, `output` and
-    /// `cached_input` tokens plus `cost_microusd`. The budget fold sums
+    /// `cached_input` and `cache_creation_input` tokens plus `cost_microusd`. The budget fold sums
     /// these fields verbatim, so the caller's numbers are exactly what the
     /// assertions count.
     fn llm_call_event(
@@ -91,6 +91,7 @@ mod tests {
         input: u64,
         output: u64,
         cached_input: u64,
+        cache_creation_input: u64,
         cost_microusd: u64,
     ) -> Value {
         json!({
@@ -98,7 +99,7 @@ mod tests {
             "provider": "fake",
             "model": "fake",
             "max_tokens": 128,
-            "tokens": { "input": input, "output": output, "cached_input": cached_input },
+            "tokens": { "input": input, "output": output, "cached_input": cached_input, "cache_creation_input": cache_creation_input },
             "cost_microusd": cost_microusd,
         })
     }
@@ -499,7 +500,7 @@ mod tests {
             )
             .unwrap();
         journal
-            .event("llm_call", llm_call_event("r", 7, 3, 2, 25))
+            .event("llm_call", llm_call_event("r", 7, 3, 2, 1, 25))
             .unwrap();
         journal
             .event("run_finished", json!({ "status": "failed" }))
@@ -519,6 +520,7 @@ mod tests {
         assert_eq!(event["metrics"]["tokens_input"], 7);
         assert_eq!(event["metrics"]["tokens_output"], 3);
         assert_eq!(event["metrics"]["tokens_cached_input"], 2);
+        assert_eq!(event["metrics"]["tokens_cache_creation_input"], 1);
         assert_eq!(event["metrics"]["tokens_total"], 10);
         assert_eq!(event["metrics"]["cost_microusd"], 25);
         assert!(event["metrics"]["duration_ms"].as_u64().is_some());
@@ -543,7 +545,7 @@ mod tests {
                 .event("run_started", run_started_event("terminal"))
                 .unwrap();
             journal
-                .event("llm_call", llm_call_event("r", 7, 3, 2, 25))
+                .event("llm_call", llm_call_event("r", 7, 3, 2, 1, 25))
                 .unwrap();
             journal.event(kind, payload).unwrap();
 
@@ -555,6 +557,7 @@ mod tests {
             assert_eq!(event["metrics"]["tokens_input"], 7);
             assert_eq!(event["metrics"]["tokens_output"], 3);
             assert_eq!(event["metrics"]["tokens_cached_input"], 2);
+            assert_eq!(event["metrics"]["tokens_cache_creation_input"], 1);
             assert_eq!(event["metrics"]["tokens_total"], 10);
             assert_eq!(event["metrics"]["cost_microusd"], 25);
         }
@@ -607,7 +610,7 @@ mod tests {
                 .event("step_finished", step_finished_event("first", "success"))
                 .expect("first step should finish");
             journal
-                .event("llm_call", llm_call_event("first", 7, 3, 2, 25))
+                .event("llm_call", llm_call_event("first", 7, 3, 2, 1, 25))
                 .expect("first LLM call should be recorded");
         }
 
@@ -623,7 +626,7 @@ mod tests {
             .event("step_finished", step_finished_event("second", "success"))
             .expect("second step should finish");
         journal
-            .event("llm_call", llm_call_event("second", 11, 5, 4, 75))
+            .event("llm_call", llm_call_event("second", 11, 5, 4, 1, 75))
             .expect("second LLM call should be recorded");
         journal
             .event("run_finished", json!({ "status": "success" }))
@@ -635,6 +638,7 @@ mod tests {
         assert_eq!(state.budget.tokens_input, 18);
         assert_eq!(state.budget.tokens_output, 8);
         assert_eq!(state.budget.tokens_cached_input, 6);
+        assert_eq!(state.budget.tokens_cache_creation_input, 2);
         assert_eq!(state.budget.cost_microusd, 100);
         let source = std::fs::read_to_string(&path).expect("journal should be readable");
         let finished: Value = serde_json::from_str(source.lines().last().expect("finished event"))
@@ -838,6 +842,26 @@ mod tests {
             .unwrap();
         let scan = read_journal_values(&path, JournalLimits::default()).unwrap();
         assert_eq!(scan.events.len(), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn cache_creation_counter_is_optional_but_malformed_values_fail_closed() {
+        let (dir, path) = test_journal_paths("cache-creation-counter");
+        let writer = JournalWriter::create(&path, "cache-creation-counter", false, None)
+            .expect("journal should open");
+        let mut event = llm_call_event("n", 10, 1, 2, 3, 20);
+        event["tokens"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cache_creation_input");
+        writer
+            .event("llm_call", event.clone())
+            .expect("absent creation is zero");
+        assert_eq!(writer.state().budget.tokens_cache_creation_input, 0);
+        for bad in [json!(null), json!(-1), json!(0.5), json!("3")] {
+            event["tokens"]["cache_creation_input"] = bad;
+            assert!(writer.event("llm_call", event.clone()).is_err());
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 }

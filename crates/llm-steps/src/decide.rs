@@ -41,7 +41,12 @@ impl LlmDecideStep {
                 "llm.decide does not support templates",
             ));
         }
-        for field in ["input_cost_per_million_usd", "output_cost_per_million_usd"] {
+        for field in [
+            "input_cost_per_million_usd",
+            "output_cost_per_million_usd",
+            "cache_read_input_cost_per_million_usd",
+            "cache_creation_input_cost_per_million_usd",
+        ] {
             if let Some(price) = value.get("model").and_then(|model| model.get(field))
                 && price
                     .as_f64()
@@ -216,6 +221,8 @@ impl StepExecutor for LlmDecideStep {
                         "provider": {"$ref": "#/$defs/text", "pattern": "\\S"},
                         "model": {"$ref": "#/$defs/text", "pattern": "\\S"},
                         "input_cost_per_million_usd": {"type": "number", "minimum": 0},
+                        "cache_read_input_cost_per_million_usd": {"type": "number", "minimum": 0},
+                        "cache_creation_input_cost_per_million_usd": {"type": "number", "minimum": 0},
                         "output_cost_per_million_usd": {"type": "number", "minimum": 0}
                     }
                 },
@@ -622,7 +629,12 @@ system = "Chat only"
     #[test]
     fn rejects_invalid_pricing_and_requires_explicit_prices_for_cost_budget() {
         let mut fixture = Fixture::new("");
-        for field in ["input_cost_per_million_usd", "output_cost_per_million_usd"] {
+        for field in [
+            "input_cost_per_million_usd",
+            "output_cost_per_million_usd",
+            "cache_read_input_cost_per_million_usd",
+            "cache_creation_input_cost_per_million_usd",
+        ] {
             for price in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
                 let mut node = fixture.node(params());
                 node.params

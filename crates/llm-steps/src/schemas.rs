@@ -64,6 +64,8 @@ pub(crate) fn model_ref_schema() -> Value {
             "provider": { "type": "string", "minLength": 1 },
             "model": { "type": "string", "minLength": 1 },
             "input_cost_per_million_usd": { "type": "number", "minimum": 0 },
+            "cache_read_input_cost_per_million_usd": { "type": "number", "minimum": 0 },
+            "cache_creation_input_cost_per_million_usd": { "type": "number", "minimum": 0 },
             "output_cost_per_million_usd": { "type": "number", "minimum": 0 }
         }
     })

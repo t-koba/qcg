@@ -251,12 +251,21 @@ pub enum ModelsDiscovery {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelPricing {
     pub input_cost_per_million_usd: Option<f64>,
+    /// Cache creation input USD/1M; absent falls back to ordinary input.
+    #[serde(default)]
+    pub cache_creation_input_cost_per_million_usd: Option<f64>,
+    /// Cache read input USD/1M; absent falls back to ordinary input.
+    #[serde(default)]
+    pub cache_read_input_cost_per_million_usd: Option<f64>,
     pub output_cost_per_million_usd: Option<f64>,
 }
 
 impl ModelPricing {
     pub fn is_empty(&self) -> bool {
-        self.input_cost_per_million_usd.is_none() && self.output_cost_per_million_usd.is_none()
+        self.input_cost_per_million_usd.is_none()
+            && self.output_cost_per_million_usd.is_none()
+            && self.cache_read_input_cost_per_million_usd.is_none()
+            && self.cache_creation_input_cost_per_million_usd.is_none()
     }
 }
 
@@ -275,6 +284,12 @@ pub struct ModelSpec {
     pub reasoning_effort: Option<Vec<ReasoningEffort>>,
     #[serde(default)]
     pub input_cost_per_million_usd: Option<f64>,
+    /// Cache creation input USD/1M; absent falls back to ordinary input.
+    #[serde(default)]
+    pub cache_creation_input_cost_per_million_usd: Option<f64>,
+    /// Cache read input USD/1M; absent falls back to ordinary input.
+    #[serde(default)]
+    pub cache_read_input_cost_per_million_usd: Option<f64>,
     #[serde(default)]
     pub output_cost_per_million_usd: Option<f64>,
     #[serde(default)]
@@ -306,6 +321,9 @@ impl ModelSpec {
     pub fn pricing(&self) -> Option<ModelPricing> {
         let pricing = ModelPricing {
             input_cost_per_million_usd: self.input_cost_per_million_usd,
+            cache_creation_input_cost_per_million_usd: self
+                .cache_creation_input_cost_per_million_usd,
+            cache_read_input_cost_per_million_usd: self.cache_read_input_cost_per_million_usd,
             output_cost_per_million_usd: self.output_cost_per_million_usd,
         };
         (!pricing.is_empty()).then_some(pricing)
@@ -325,6 +343,14 @@ impl ModelSpec {
             (
                 "input_cost_per_million_usd",
                 self.input_cost_per_million_usd,
+            ),
+            (
+                "cache_read_input_cost_per_million_usd",
+                self.cache_read_input_cost_per_million_usd,
+            ),
+            (
+                "cache_creation_input_cost_per_million_usd",
+                self.cache_creation_input_cost_per_million_usd,
             ),
             (
                 "output_cost_per_million_usd",
@@ -988,6 +1014,7 @@ impl LlmProvider for FakeLlmProvider {
                             output: 0,
                             reasoning: 0,
                             cached_input: 0,
+                            cache_creation_input: 0,
                         },
                         stop: StopReason::ToolUse,
                         provider_state: None,
@@ -1003,6 +1030,7 @@ impl LlmProvider for FakeLlmProvider {
                     output: 0,
                     reasoning: 0,
                     cached_input: 0,
+                    cache_creation_input: 0,
                 },
                 stop: StopReason::EndTurn,
                 provider_state: None,
@@ -1028,6 +1056,7 @@ impl LlmProvider for FakeLlmProvider {
                     output: 0,
                     reasoning: 0,
                     cached_input: 0,
+                    cache_creation_input: 0,
                 },
                 stop: StopReason::ToolUse,
                 provider_state: None,
@@ -1054,6 +1083,7 @@ impl LlmProvider for FakeLlmProvider {
                     output: 0,
                     reasoning: 0,
                     cached_input: 0,
+                    cache_creation_input: 0,
                 },
                 stop: StopReason::ToolUse,
                 provider_state: None,
@@ -1100,6 +1130,7 @@ impl LlmProvider for FakeLlmProvider {
                 output: 0,
                 reasoning: 0,
                 cached_input: 0,
+                cache_creation_input: 0,
             },
             stop: StopReason::EndTurn,
             provider_state: None,

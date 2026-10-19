@@ -200,6 +200,8 @@ pub struct CatalogModelView {
     pub capabilities: crate::types::Capabilities,
     pub reasoning_effort: Vec<ReasoningEffort>,
     pub input_cost_per_million_usd: Option<f64>,
+    pub cache_creation_input_cost_per_million_usd: Option<f64>,
+    pub cache_read_input_cost_per_million_usd: Option<f64>,
     pub output_cost_per_million_usd: Option<f64>,
     pub context_tokens: Option<u64>,
     pub max_output_tokens: Option<u64>,
@@ -581,6 +583,8 @@ impl CatalogService {
                                     capabilities: spec.capabilities.clone(),
                                     reasoning_effort: spec.capabilities.reasoning_effort.clone(),
                                     input_cost_per_million_usd: None,
+                                    cache_creation_input_cost_per_million_usd: None,
+                                    cache_read_input_cost_per_million_usd: None,
                                     output_cost_per_million_usd: None,
                                     context_tokens: None,
                                     max_output_tokens: None,
@@ -861,6 +865,8 @@ fn fake_provider_view() -> CatalogProviderView {
                 ReasoningEffort::Max,
             ],
             input_cost_per_million_usd: None,
+            cache_creation_input_cost_per_million_usd: None,
+            cache_read_input_cost_per_million_usd: None,
             output_cost_per_million_usd: None,
             context_tokens: None,
             max_output_tokens: None,
@@ -882,6 +888,8 @@ fn model_view(
         reasoning_effort: effective.reasoning_effort.clone(),
         capabilities: effective,
         input_cost_per_million_usd: model.input_cost_per_million_usd,
+        cache_creation_input_cost_per_million_usd: model.cache_creation_input_cost_per_million_usd,
+        cache_read_input_cost_per_million_usd: model.cache_read_input_cost_per_million_usd,
         output_cost_per_million_usd: model.output_cost_per_million_usd,
         context_tokens: model.context_tokens,
         max_output_tokens: model.max_output_tokens,
@@ -905,6 +913,12 @@ fn merge_model(base: &ModelSpec, over: &ModelSpec) -> ModelSpec {
         input_cost_per_million_usd: over
             .input_cost_per_million_usd
             .or(base.input_cost_per_million_usd),
+        cache_creation_input_cost_per_million_usd: over
+            .cache_creation_input_cost_per_million_usd
+            .or(base.cache_creation_input_cost_per_million_usd),
+        cache_read_input_cost_per_million_usd: over
+            .cache_read_input_cost_per_million_usd
+            .or(base.cache_read_input_cost_per_million_usd),
         output_cost_per_million_usd: over
             .output_cost_per_million_usd
             .or(base.output_cost_per_million_usd),
@@ -1198,6 +1212,8 @@ pub(crate) fn map_models_dev(text: &str) -> Result<ExternalCatalog, String> {
                     capabilities: Some(capabilities),
                     reasoning_effort: Some(reasoning_effort),
                     input_cost_per_million_usd: model.cost.as_ref().and_then(|cost| cost.input),
+                    cache_creation_input_cost_per_million_usd: None,
+                    cache_read_input_cost_per_million_usd: None,
                     output_cost_per_million_usd: model.cost.as_ref().and_then(|cost| cost.output),
                     context_tokens: model.limit.as_ref().and_then(|limit| limit.context),
                     max_output_tokens: model.limit.as_ref().and_then(|limit| limit.output),
@@ -1281,6 +1297,8 @@ mod tests {
             capabilities: None,
             reasoning_effort: Some(vec![ReasoningEffort::Low, ReasoningEffort::High]),
             input_cost_per_million_usd: Some(1.0),
+            cache_creation_input_cost_per_million_usd: None,
+            cache_read_input_cost_per_million_usd: None,
             output_cost_per_million_usd: Some(2.0),
             context_tokens: Some(1000),
             max_output_tokens: Some(500),
@@ -1292,6 +1310,8 @@ mod tests {
             capabilities: None,
             reasoning_effort: Some(vec![ReasoningEffort::Minimal]),
             input_cost_per_million_usd: None,
+            cache_creation_input_cost_per_million_usd: None,
+            cache_read_input_cost_per_million_usd: None,
             output_cost_per_million_usd: None,
             context_tokens: None,
             max_output_tokens: None,
@@ -1307,6 +1327,42 @@ mod tests {
         assert_eq!(merged.input_cost_per_million_usd, Some(1.0));
         assert_eq!(merged.context_tokens, Some(1000));
         assert_eq!(merged.enabled, Some(false));
+    }
+
+    #[test]
+    fn catalog_pricing_overrides_preserve_explicit_field_precedence() {
+        let base: ModelSpec = serde_json::from_value(serde_json::json!({
+            "id":"m", "input_cost_per_million_usd":2.0,
+            "output_cost_per_million_usd":3.0,
+            "cache_read_input_cost_per_million_usd":0.0,
+            "cache_creation_input_cost_per_million_usd":4.0
+        }))
+        .unwrap();
+        let mut over: ModelSpec = serde_json::from_value(serde_json::json!({
+            "id":"m", "input_cost_per_million_usd":10.0,
+            "output_cost_per_million_usd":20.0
+        }))
+        .unwrap();
+        let merged = merge_model(&base, &over);
+        assert_eq!(merged.input_cost_per_million_usd, Some(10.0));
+        assert_eq!(merged.output_cost_per_million_usd, Some(20.0));
+        assert_eq!(merged.cache_read_input_cost_per_million_usd, Some(0.0));
+        assert_eq!(merged.cache_creation_input_cost_per_million_usd, Some(4.0));
+        // Explicit fields override independently; unspecified rates retain the
+        // external schedule so a partial override remains useful.
+        over.output_cost_per_million_usd = None;
+        let merged = merge_model(&base, &over);
+        assert_eq!(merged.input_cost_per_million_usd, Some(10.0));
+        assert_eq!(merged.output_cost_per_million_usd, Some(3.0));
+        assert_eq!(merged.cache_read_input_cost_per_million_usd, Some(0.0));
+        assert_eq!(merged.cache_creation_input_cost_per_million_usd, Some(4.0));
+        over.input_cost_per_million_usd = None;
+        over.cache_read_input_cost_per_million_usd = Some(0.5);
+        let merged = merge_model(&base, &over);
+        assert_eq!(merged.input_cost_per_million_usd, Some(2.0));
+        assert_eq!(merged.output_cost_per_million_usd, Some(3.0));
+        assert_eq!(merged.cache_read_input_cost_per_million_usd, Some(0.5));
+        assert_eq!(merged.cache_creation_input_cost_per_million_usd, Some(4.0));
     }
 
     #[test]
@@ -1335,6 +1391,8 @@ mod tests {
         "id": "gpt-from-cache",
         "reasoning_effort": ["low", "high"],
         "input_cost_per_million_usd": 3.0,
+        "cache_read_input_cost_per_million_usd": 0.0,
+        "cache_creation_input_cost_per_million_usd": 4.0,
         "output_cost_per_million_usd": 12.0
       }}
     }}
@@ -1372,6 +1430,8 @@ capabilities = {{ tool_use = true, reasoning_effort = ["low"] }}
             .model_pricing("openai", "gpt-from-cache")
             .expect("pricing");
         assert_eq!(pricing.input_cost_per_million_usd, Some(3.0));
+        assert_eq!(pricing.cache_read_input_cost_per_million_usd, Some(0.0));
+        assert_eq!(pricing.cache_creation_input_cost_per_million_usd, Some(4.0));
         assert_eq!(pricing.output_cost_per_million_usd, Some(12.0));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1616,6 +1676,8 @@ label = "Explicit label"
                     capabilities: None,
                     reasoning_effort: Some(vec![ReasoningEffort::Low]),
                     input_cost_per_million_usd: Some(1.0),
+                    cache_creation_input_cost_per_million_usd: Some(3.0),
+                    cache_read_input_cost_per_million_usd: Some(0.0),
                     output_cost_per_million_usd: Some(2.0),
                     context_tokens: Some(1000),
                     max_output_tokens: Some(500),
@@ -1649,6 +1711,22 @@ label = "Explicit label"
         assert_eq!(
             model.input_cost_per_million_usd, runtime_pricing.input_cost_per_million_usd,
             "view pricing must equal runtime pricing"
+        );
+        assert_eq!(
+            runtime_pricing.cache_read_input_cost_per_million_usd,
+            Some(0.0)
+        );
+        assert_eq!(
+            runtime_pricing.cache_creation_input_cost_per_million_usd,
+            Some(3.0)
+        );
+        assert_eq!(
+            model.cache_read_input_cost_per_million_usd,
+            runtime_pricing.cache_read_input_cost_per_million_usd
+        );
+        assert_eq!(
+            model.cache_creation_input_cost_per_million_usd,
+            runtime_pricing.cache_creation_input_cost_per_million_usd
         );
         assert_eq!(model.label.as_deref(), Some("Explicit label"));
     }

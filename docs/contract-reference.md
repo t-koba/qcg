@@ -72,6 +72,15 @@ Fields:
 - `max_tokens`: required positive output limit. For reasoning models this
   includes both hidden reasoning tokens and visible output tokens; qcg maps it
   to the field required by the selected API.
+- `cache_read_input_cost_per_million_usd` /
+  `cache_creation_input_cost_per_million_usd` on `model`: optional USD/1M
+  rates for cache reads and cache creation. Missing rates use the selected
+  pricing row's ordinary input rate; explicit zero is valid. Explicit contract
+  rates override catalog prices field by field; unspecified fields may use the
+  catalog's matching model price. `require_pricing` still requires ordinary
+  input/output prices only. Budgets are estimates, not invoices, especially
+  when rates for actual token categories are unset. No vendor discounts or
+  TTL-specific prices are inferred. See [usage and cost accounting](run-event-reference.md).
 - `max_context_bytes`
 - `max_context_tokens`
 - `max_media_bytes`: required aggregate byte limit when an LLM node declares
@@ -83,7 +92,8 @@ Fields:
   `auto` attaches the selected provider's declared cache mechanism
   (`prompt_cache_field`). A provider that does not advertise
   `capabilities.prompt_cache` refuses an `auto` request explicitly instead of
-  dropping the policy. Cache reads are reported as `cached_input` tokens.
+  dropping the policy. Cache reads are reported as `cached_input`, cache
+  creation as `cache_creation_input`; both are disjoint subsets of total `input`.
 - `context_overflow`: `error` by default, or explicitly `truncate_head` /
   `truncate_tail`. Truncation is UTF-8 safe, visibly marked, deterministic,
   and recorded as `context_compacted`; no silent compaction occurs.
@@ -1236,6 +1246,14 @@ metadata. Update it with `qcg docs step-schemas`.
       "items": {
         "additionalProperties": false,
         "properties": {
+          "cache_creation_input_cost_per_million_usd": {
+            "minimum": 0,
+            "type": "number"
+          },
+          "cache_read_input_cost_per_million_usd": {
+            "minimum": 0,
+            "type": "number"
+          },
           "clear": {
             "items": {
               "enum": [
@@ -1374,6 +1392,14 @@ metadata. Update it with `qcg docs step-schemas`.
     "model": {
       "additionalProperties": false,
       "properties": {
+        "cache_creation_input_cost_per_million_usd": {
+          "minimum": 0,
+          "type": "number"
+        },
+        "cache_read_input_cost_per_million_usd": {
+          "minimum": 0,
+          "type": "number"
+        },
         "clear": {
           "items": {
             "enum": [
@@ -1758,6 +1784,14 @@ metadata. Update it with `qcg docs step-schemas`.
                 "items": {
                   "additionalProperties": false,
                   "properties": {
+                    "cache_creation_input_cost_per_million_usd": {
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "cache_read_input_cost_per_million_usd": {
+                      "minimum": 0,
+                      "type": "number"
+                    },
                     "clear": {
                       "items": {
                         "enum": [
@@ -1833,6 +1867,14 @@ metadata. Update it with `qcg docs step-schemas`.
               "model": {
                 "additionalProperties": false,
                 "properties": {
+                  "cache_creation_input_cost_per_million_usd": {
+                    "minimum": 0,
+                    "type": "number"
+                  },
+                  "cache_read_input_cost_per_million_usd": {
+                    "minimum": 0,
+                    "type": "number"
+                  },
                   "clear": {
                     "items": {
                       "enum": [
@@ -2181,6 +2223,14 @@ metadata. Update it with `qcg docs step-schemas`.
       "items": {
         "additionalProperties": false,
         "properties": {
+          "cache_creation_input_cost_per_million_usd": {
+            "minimum": 0,
+            "type": "number"
+          },
+          "cache_read_input_cost_per_million_usd": {
+            "minimum": 0,
+            "type": "number"
+          },
           "clear": {
             "items": {
               "enum": [
@@ -2270,6 +2320,14 @@ metadata. Update it with `qcg docs step-schemas`.
     "model": {
       "additionalProperties": false,
       "properties": {
+        "cache_creation_input_cost_per_million_usd": {
+          "minimum": 0,
+          "type": "number"
+        },
+        "cache_read_input_cost_per_million_usd": {
+          "minimum": 0,
+          "type": "number"
+        },
         "clear": {
           "items": {
             "enum": [
@@ -2548,6 +2606,14 @@ metadata. Update it with `qcg docs step-schemas`.
     "model": {
       "additionalProperties": false,
       "properties": {
+        "cache_creation_input_cost_per_million_usd": {
+          "minimum": 0,
+          "type": "number"
+        },
+        "cache_read_input_cost_per_million_usd": {
+          "minimum": 0,
+          "type": "number"
+        },
         "input_cost_per_million_usd": {
           "minimum": 0,
           "type": "number"
@@ -2732,6 +2798,14 @@ metadata. Update it with `qcg docs step-schemas`.
       "items": {
         "additionalProperties": false,
         "properties": {
+          "cache_creation_input_cost_per_million_usd": {
+            "minimum": 0,
+            "type": "number"
+          },
+          "cache_read_input_cost_per_million_usd": {
+            "minimum": 0,
+            "type": "number"
+          },
           "clear": {
             "items": {
               "enum": [
@@ -2821,6 +2895,14 @@ metadata. Update it with `qcg docs step-schemas`.
     "model": {
       "additionalProperties": false,
       "properties": {
+        "cache_creation_input_cost_per_million_usd": {
+          "minimum": 0,
+          "type": "number"
+        },
+        "cache_read_input_cost_per_million_usd": {
+          "minimum": 0,
+          "type": "number"
+        },
         "clear": {
           "items": {
             "enum": [
@@ -3057,6 +3139,14 @@ metadata. Update it with `qcg docs step-schemas`.
       "items": {
         "additionalProperties": false,
         "properties": {
+          "cache_creation_input_cost_per_million_usd": {
+            "minimum": 0,
+            "type": "number"
+          },
+          "cache_read_input_cost_per_million_usd": {
+            "minimum": 0,
+            "type": "number"
+          },
           "clear": {
             "items": {
               "enum": [
@@ -3138,6 +3228,14 @@ metadata. Update it with `qcg docs step-schemas`.
     "model": {
       "additionalProperties": false,
       "properties": {
+        "cache_creation_input_cost_per_million_usd": {
+          "minimum": 0,
+          "type": "number"
+        },
+        "cache_read_input_cost_per_million_usd": {
+          "minimum": 0,
+          "type": "number"
+        },
         "clear": {
           "items": {
             "enum": [
@@ -3372,6 +3470,14 @@ metadata. Update it with `qcg docs step-schemas`.
       "items": {
         "additionalProperties": false,
         "properties": {
+          "cache_creation_input_cost_per_million_usd": {
+            "minimum": 0,
+            "type": "number"
+          },
+          "cache_read_input_cost_per_million_usd": {
+            "minimum": 0,
+            "type": "number"
+          },
           "clear": {
             "items": {
               "enum": [
@@ -3460,6 +3566,14 @@ metadata. Update it with `qcg docs step-schemas`.
     "model": {
       "additionalProperties": false,
       "properties": {
+        "cache_creation_input_cost_per_million_usd": {
+          "minimum": 0,
+          "type": "number"
+        },
+        "cache_read_input_cost_per_million_usd": {
+          "minimum": 0,
+          "type": "number"
+        },
         "clear": {
           "items": {
             "enum": [

@@ -9,6 +9,10 @@ use super::nodes::default_true;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", deny_unknown_fields)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Cache pricing adds 32 bytes to inline ModelRef; retain the tool model API without indirection."
+)]
 pub enum ToolDecl {
     #[serde(rename = "fs.write")]
     FsWrite {

@@ -90,6 +90,7 @@ fn live_metrics(budget: &engine::BudgetState) -> RunMetrics {
         tokens_input: budget.tokens_input,
         tokens_output: budget.tokens_output,
         tokens_cached_input: budget.tokens_cached_input,
+        tokens_cache_creation_input: budget.tokens_cache_creation_input,
         tokens_total: budget.tokens_input.saturating_add(budget.tokens_output),
         cost_microusd: budget.cost_microusd,
         duration_ms,

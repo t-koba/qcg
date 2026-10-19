@@ -2466,6 +2466,10 @@ export interface components {
         };
         /** LlmCatalogModel */
         LlmCatalogModel: {
+            /** Format: double */
+            cache_creation_input_cost_per_million_usd?: number | null;
+            /** Format: double */
+            cache_read_input_cost_per_million_usd?: number | null;
             capabilities: components["schemas"]["LlmCatalogCapabilities"];
             /**
              * Format: uint64
@@ -2672,6 +2676,7 @@ export interface components {
              *       "steps_skipped": 0,
              *       "steps_succeeded": 0,
              *       "steps_total": 0,
+             *       "tokens_cache_creation_input": 0,
              *       "tokens_cached_input": 0,
              *       "tokens_input": 0,
              *       "tokens_output": 0,
@@ -2791,6 +2796,7 @@ export interface components {
              *       "steps_skipped": 0,
              *       "steps_succeeded": 0,
              *       "steps_total": 0,
+             *       "tokens_cache_creation_input": 0,
              *       "tokens_cached_input": 0,
              *       "tokens_input": 0,
              *       "tokens_output": 0,
@@ -2925,6 +2931,12 @@ export interface components {
              * @default 0
              */
             steps_total: number;
+            /**
+             * Format: uint64
+             * @description Input tokens used to create cache entries, included in total input.
+             * @default 0
+             */
+            tokens_cache_creation_input: number;
             /**
              * Format: uint64
              * @description Input tokens served from provider cache, included in `tokens_input`.
@@ -3221,6 +3233,12 @@ export interface components {
         /** @enum {string} */
         StructuredOutputMode: "auto" | "native_strict" | "native_compatible" | "prompt";
         TokenUsageEventData: {
+            /**
+             * Format: uint64
+             * @description Input tokens used to create cache entries, included in total input.
+             * @default 0
+             */
+            cache_creation_input: number;
             /**
              * Format: uint64
              * @description Input tokens served from provider cache, included in `input`.

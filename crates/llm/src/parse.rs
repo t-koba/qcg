@@ -1,6 +1,6 @@
 use serde_json::{Value, json};
 
-use crate::types::{ChatContent, ChatResponse, LlmError, LlmErrorKind, StopReason, TokenUsage};
+use crate::types::{ChatContent, ChatResponse, LlmError, LlmErrorKind, StopReason};
 
 pub(crate) fn parse_chat_completions_response(value: Value) -> Result<ChatResponse, LlmError> {
     let message = value
@@ -36,18 +36,7 @@ pub(crate) fn parse_chat_completions_response(value: Value) -> Result<ChatRespon
             "OpenAI-compatible response did not include text or tool calls",
         ));
     }
-    let usage = TokenUsage {
-        input: required_usage(&value, "/usage/prompt_tokens")?,
-        output: required_usage(&value, "/usage/completion_tokens")?,
-        reasoning: value
-            .pointer("/usage/completion_tokens_details/reasoning_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
-        cached_input: value
-            .pointer("/usage/prompt_tokens_details/cached_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
-    };
+    let usage = crate::usage::openai_usage(&value["usage"], true)?;
     let finish_reason = value
         .get("choices")
         .and_then(Value::as_array)
@@ -208,18 +197,7 @@ pub(crate) fn parse_responses_response(value: Value) -> Result<ChatResponse, Llm
             "Responses API response did not include text or tool calls",
         ));
     }
-    let usage = TokenUsage {
-        input: required_usage(&value, "/usage/input_tokens")?,
-        output: required_usage(&value, "/usage/output_tokens")?,
-        reasoning: value
-            .pointer("/usage/output_tokens_details/reasoning_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
-        cached_input: value
-            .pointer("/usage/input_tokens_details/cached_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
-    };
+    let usage = crate::usage::openai_usage(&value["usage"], false)?;
     let stop = match value.get("status").and_then(Value::as_str) {
         Some("incomplete") => match value
             .pointer("/incomplete_details/reason")
@@ -311,16 +289,8 @@ pub(crate) fn parse_anthropic_response(value: Value) -> Result<ChatResponse, Llm
             "Anthropic response did not include text or tool calls",
         ));
     }
-    let usage = TokenUsage {
-        input: required_usage(&value, "/usage/input_tokens")?,
-        output: required_usage(&value, "/usage/output_tokens")?,
-        reasoning: 0,
-        cached_input: value
-            .get("usage")
-            .and_then(|usage| usage.get("cache_read_input_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
-    };
+    let mut usage = crate::usage::anthropic_input(&value["usage"])?;
+    usage.output = crate::usage::count(&value["usage"], "output_tokens", true)?;
     let stop = match value.get("stop_reason").and_then(Value::as_str) {
         Some("tool_use") => StopReason::ToolUse,
         Some("max_tokens") => StopReason::MaxTokens,
@@ -358,17 +328,6 @@ pub(crate) fn parse_anthropic_response(value: Value) -> Result<ChatResponse, Llm
         stop,
         provider_state: None,
     })
-}
-
-fn required_usage(value: &Value, pointer: &str) -> Result<u64, LlmError> {
-    value
-        .pointer(pointer)
-        .and_then(Value::as_u64)
-        .ok_or_else(|| {
-            LlmError::invalid_response(format!(
-                "LLM provider response did not include integer `{pointer}`"
-            ))
-        })
 }
 
 pub(crate) fn llm_http_error(error: reqwest::Error) -> LlmError {

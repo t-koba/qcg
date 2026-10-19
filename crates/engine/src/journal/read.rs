@@ -193,6 +193,7 @@ pub(crate) fn journal_metrics(budget: &crate::BudgetState) -> Result<JournalMetr
         tokens_input: budget.tokens_input,
         tokens_output: budget.tokens_output,
         tokens_cached_input: budget.tokens_cached_input,
+        tokens_cache_creation_input: budget.tokens_cache_creation_input,
         steps_executed,
         budget_charged: u64::try_from(budget.budget_charged).map_err(|_| {
             JournalError::InvalidEvent("budget charge count exceeds journal metric range".into())

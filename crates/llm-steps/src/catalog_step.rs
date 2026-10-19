@@ -238,6 +238,8 @@ impl StepExecutor for LlmCatalogStep {
                                     "capabilities": serde_json::to_value(&model.capabilities)
                                         .unwrap_or(Value::Null),
                                     "input_cost_per_million_usd": model.input_cost_per_million_usd,
+                                    "cache_read_input_cost_per_million_usd": model.cache_read_input_cost_per_million_usd,
+                                    "cache_creation_input_cost_per_million_usd": model.cache_creation_input_cost_per_million_usd,
                                     "output_cost_per_million_usd": model.output_cost_per_million_usd,
                                     "context_tokens": model.context_tokens,
                                     "max_output_tokens": model.max_output_tokens,

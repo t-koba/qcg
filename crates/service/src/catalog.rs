@@ -188,6 +188,10 @@ fn map_llm_catalog(view: llm::CatalogView) -> LlmCatalogResponse {
                             .map(|effort| effort.as_str().to_string())
                             .collect(),
                         input_cost_per_million_usd: model.input_cost_per_million_usd,
+                        cache_creation_input_cost_per_million_usd: model
+                            .cache_creation_input_cost_per_million_usd,
+                        cache_read_input_cost_per_million_usd: model
+                            .cache_read_input_cost_per_million_usd,
                         output_cost_per_million_usd: model.output_cost_per_million_usd,
                         context_tokens: model.context_tokens,
                         max_output_tokens: model.max_output_tokens,

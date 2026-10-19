@@ -101,6 +101,12 @@ impl<'a> LlmGateway<'a> {
                 .input_cost_per_million_usd
                 .is_some_and(|price| !price.is_finite() || price < 0.0)
             || model
+                .cache_read_input_cost_per_million_usd
+                .is_some_and(|price| !price.is_finite() || price < 0.0)
+            || model
+                .cache_creation_input_cost_per_million_usd
+                .is_some_and(|price| !price.is_finite() || price < 0.0)
+            || model
                 .output_cost_per_million_usd
                 .is_some_and(|price| !price.is_finite() || price < 0.0)
         {
@@ -204,7 +210,7 @@ impl<'a> LlmGateway<'a> {
         // exceed the budget. Post-hoc enforcement alone lets N parallel
         // calls each pass and overspend N-fold; the estimate itself is not
         // a bound on real spend.
-        let reservation = self.estimate_reservation(node, &request)?;
+        let reservation = self.estimate_reservation(node, &request, routes)?;
         self.try_reserve(reservation.clone())?;
         let complete_result = self
             .complete_inner(node, request, routes, event_extra)
@@ -214,8 +220,8 @@ impl<'a> LlmGateway<'a> {
     }
 
     /// Estimated admission for one call: prompt bytes/4 input tokens plus
-    /// the full requested max output, priced on the initial request model
-    /// when known. Bytes/4 is an average heuristic, not a worst-case bound:
+    /// the full requested max output. The selected row's highest input-category
+    /// rate prices the estimate; input bytes/4 is not a worst-case bound:
     /// token-dense input can exceed it, a pricier fallback route can exceed
     /// the initial-route price, and retries can incur unreported usage.
     /// Unknown pricing with an enforced cost cap fails closed here instead
@@ -225,6 +231,7 @@ impl<'a> LlmGateway<'a> {
         &self,
         node: &NodeDef,
         request: &ChatRequest,
+        routes: &[ModelRef],
     ) -> Result<Option<PendingReservation>, StepError> {
         if self.budget.max_tokens.is_none() && self.budget.max_cost_microusd.is_none() {
             return Ok(None);
@@ -242,21 +249,30 @@ impl<'a> LlmGateway<'a> {
         let tokens = input_est.saturating_add(max_output);
         let mut cost_microusd = 0_u64;
         if self.budget.max_cost_microusd.is_some() {
-            let pricing = self
-                .pricing
-                .iter()
-                .find(|model| model.provider == request.provider && model.model == request.model);
+            let pricing = self.selected_pricing(routes, &request.provider, &request.model);
             match pricing {
-                Some(model) => {
+                Some(pricing) => {
                     match (
-                        model.input_cost_per_million_usd,
-                        model.output_cost_per_million_usd,
+                        pricing.input_cost_per_million_usd,
+                        pricing.output_cost_per_million_usd,
                     ) {
-                        (Some(input_price), Some(output_price)) => {
-                            let input_cost = (input_est as f64) * input_price / 1_000_000.0;
-                            let output_cost = (max_output as f64) * output_price / 1_000_000.0;
-                            cost_microusd =
-                                ((input_cost + output_cost) * 1_000_000.0).ceil() as u64;
+                        (Some(input), Some(output)) => {
+                            let read = pricing
+                                .cache_read_input_cost_per_million_usd
+                                .unwrap_or(input);
+                            let creation = pricing
+                                .cache_creation_input_cost_per_million_usd
+                                .unwrap_or(input);
+                            if [input, output, read, creation]
+                                .into_iter()
+                                .any(|rate| !rate.is_finite() || rate < 0.0)
+                            {
+                                return Err(StepError::failed(&node.id, "invalid model pricing"));
+                            }
+                            let input_rate = input.max(read).max(creation);
+                            cost_microusd = ((input_est as f64 * input_rate)
+                                + (max_output as f64 * output))
+                                .ceil() as u64;
                         }
                         _ => {
                             return Err(StepError::failed(
@@ -752,6 +768,8 @@ api_key_env = "{credential_env}"
                     provider: "decisions".into(),
                     model: "decision-model".into(),
                     input_cost_per_million_usd: Some(1.0),
+                    cache_creation_input_cost_per_million_usd: None,
+                    cache_read_input_cost_per_million_usd: None,
                     output_cost_per_million_usd: Some(1.0),
                 },
             }

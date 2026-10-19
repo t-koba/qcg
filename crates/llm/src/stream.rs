@@ -94,32 +94,10 @@ impl ChatCompletionAccumulator {
         value: &Value,
         events: &mpsc::Sender<ChatStreamEvent>,
     ) -> Result<(), LlmError> {
-        // Required usage counts are validated like the direct parser:
-        // present-but-malformed input/output marks the stream invalid
-        // instead of journaling fabricated zeros. Cached and reasoning
-        // details stay optional with zero defaults.
         if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) {
-            match (
-                usage.get("prompt_tokens").and_then(Value::as_u64),
-                usage.get("completion_tokens").and_then(Value::as_u64),
-            ) {
-                (Some(input), Some(output)) => {
-                    self.usage = Some(TokenUsage {
-                        input,
-                        output,
-                        reasoning: usage
-                            .pointer("/completion_tokens_details/reasoning_tokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or_default(),
-                        cached_input: usage
-                            .pointer("/prompt_tokens_details/cached_tokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or_default(),
-                    });
-                }
-                _ => {
-                    self.usage_invalid = true;
-                }
+            match crate::usage::openai_usage(usage, true) {
+                Ok(usage) => self.usage = Some(usage),
+                Err(_) => self.usage_invalid = true,
             }
         }
         let Some(choice) = value
@@ -281,8 +259,8 @@ async fn ingest_responses_stream(
 pub(crate) struct AnthropicAccumulator {
     text: String,
     tool_calls: BTreeMap<usize, PartialToolCall>,
-    input_tokens: Option<u64>,
-    cached_input_tokens: u64,
+    input_usage: Option<TokenUsage>,
+    usage_invalid: bool,
     output_tokens: Option<u64>,
     stop: Option<StopReason>,
 }
@@ -295,15 +273,16 @@ impl AnthropicAccumulator {
     ) -> Result<(), LlmError> {
         match value.get("type").and_then(Value::as_str) {
             Some("message_start") => {
-                // Like the direct parser, input usage is required: its
-                // absence fails at finish instead of journaling zero.
-                self.input_tokens = value
-                    .pointer("/message/usage/input_tokens")
-                    .and_then(Value::as_u64);
-                self.cached_input_tokens = value
-                    .pointer("/message/usage/cache_read_input_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_default();
+                match crate::usage::anthropic_input(&value["message"]["usage"]) {
+                    Ok(usage) => self.input_usage = Some(usage),
+                    Err(_) => self.usage_invalid = true,
+                }
+                if value["message"]["usage"].get("output_tokens").is_some() {
+                    match crate::usage::count(&value["message"]["usage"], "output_tokens", true) {
+                        Ok(output) => self.output_tokens = Some(output),
+                        Err(_) => self.usage_invalid = true,
+                    }
+                }
             }
             Some("content_block_start") => {
                 let index = value
@@ -356,9 +335,16 @@ impl AnthropicAccumulator {
                 }
             }
             Some("message_delta") => {
-                self.output_tokens = value
-                    .pointer("/usage/output_tokens")
-                    .and_then(Value::as_u64);
+                if let Some(previous) = &self.input_usage {
+                    match crate::usage::anthropic_update(&value["usage"], previous) {
+                        Ok(usage) => self.input_usage = Some(usage),
+                        Err(_) => self.usage_invalid = true,
+                    }
+                }
+                match crate::usage::count(&value["usage"], "output_tokens", true) {
+                    Ok(output) => self.output_tokens = Some(output),
+                    Err(_) => self.usage_invalid = true,
+                }
                 self.stop = value
                     .pointer("/delta/stop_reason")
                     .and_then(Value::as_str)
@@ -371,6 +357,11 @@ impl AnthropicAccumulator {
     }
 
     pub(crate) fn finish(self) -> Result<ChatResponse, LlmError> {
+        if self.usage_invalid {
+            return Err(LlmError::invalid_response(
+                "Anthropic stream included invalid usage",
+            ));
+        }
         let mut content = Vec::new();
         let mut structured_response = false;
         if !self.text.is_empty() {
@@ -426,14 +417,12 @@ impl AnthropicAccumulator {
         Ok(ChatResponse {
             content,
             usage: TokenUsage {
-                input: self.input_tokens.ok_or_else(|| {
-                    LlmError::invalid_response("Anthropic stream did not include input usage")
-                })?,
                 output: self.output_tokens.ok_or_else(|| {
                     LlmError::invalid_response("Anthropic stream did not include output usage")
                 })?,
-                reasoning: 0,
-                cached_input: self.cached_input_tokens,
+                ..self.input_usage.ok_or_else(|| {
+                    LlmError::invalid_response("Anthropic stream did not include input usage")
+                })?
             },
             stop,
             provider_state: None,

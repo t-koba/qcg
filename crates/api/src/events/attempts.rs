@@ -42,4 +42,7 @@ pub struct TokenUsageEventData {
     /// Input tokens served from provider cache, included in `input`.
     #[serde(default)]
     pub cached_input: u64,
+    /// Input tokens used to create cache entries, included in total input.
+    #[serde(default)]
+    pub cache_creation_input: u64,
 }
