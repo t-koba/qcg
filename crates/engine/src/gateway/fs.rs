@@ -1990,13 +1990,9 @@ mod unix_staging_tests {
 
     #[tokio::test]
     async fn h03_cancelled_stream_never_commits_stale_result() {
-        // H03-01/H03-02 (Unix analogue): a stream whose outer future is
-        // cancelled mid-producer must never commit afterwards, and a newer
-        // writer's result must survive the stale worker finishing late.
-        use std::sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        };
+        // H03-01/H03-02 (Unix analogue): cancel while the stale producer is
+        // blocked, commit the newer writer first, then let the stale blocking
+        // worker finish. Its revoked fence must preserve the newer result.
         let base = Utf8PathBuf::from_path_buf(
             std::env::temp_dir().join(format!("gateway-h03-{}", uuid::Uuid::now_v7().as_simple())),
         )
@@ -2012,54 +2008,65 @@ mod unix_staging_tests {
             .write_file_atomic(&target, b"original")
             .await
             .expect("seed");
-        // Async-aware rendezvous: never block the executor thread (the
-        // `#[tokio::test]` current-thread runtime would deadlock on a
-        // `std::sync::Barrier`).
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
-        let entered_tx = Arc::new(std::sync::Mutex::new(Some(entered_tx)));
-        let release = Arc::new(AtomicBool::new(false));
-        let release_clone = release.clone();
+        // Async-aware rendezvous: never block the current-thread executor;
+        // the release receiver blocks only the spawn_blocking producer.
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
         let gateway_clone = gateway.clone();
         let target_clone = target.clone();
         let stale = tokio::spawn(async move {
             gateway_clone
-                .write_file_atomic_stream(&target_clone, None, move |file| -> std::io::Result<()> {
-                    use std::io::Write as _;
-                    file.write_all(b"stale-cancelled")?;
-                    if let Some(tx) = entered_tx.lock().expect("entered lock").take() {
-                        let _ = tx.send(());
-                    }
-                    // Producer blocks until the outer is cancelled below.
-                    while !release_clone.load(Ordering::SeqCst) {
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                    }
-                    file.write_all(b"-tail")?;
-                    Ok(())
-                })
+                .write_file_atomic_stream(
+                    &target_clone,
+                    None,
+                    move |file| -> std::io::Result<StageWorkerFinished> {
+                        use std::io::Write as _;
+                        file.write_all(b"stale-cancelled")?;
+                        entered_tx.send(()).map_err(|_| {
+                            std::io::Error::other("producer start receiver dropped")
+                        })?;
+                        release_rx.recv().map_err(|_| {
+                            std::io::Error::other("producer release sender dropped")
+                        })?;
+                        file.write_all(b"-tail")?;
+                        Ok(StageWorkerFinished(Some(finished_tx)))
+                    },
+                )
                 .await
         });
-        // Wait until the producer is inside the worker, then cancel outer.
         tokio::time::timeout(std::time::Duration::from_secs(10), entered_rx)
             .await
             .expect("producer should enter")
             .expect("entered signal");
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         stale.abort();
-        let _ = stale.await;
-        // The stale worker may still be running (abort never stops a started
-        // blocking worker): let it finish, then run the newer writer.
-        release.store(true, Ordering::SeqCst);
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let aborted = stale
+            .await
+            .expect_err("the outer stale write must be cancelled");
+        assert!(
+            aborted.is_cancelled(),
+            "the stale outer task must report cancellation"
+        );
+        assert_eq!(
+            std::fs::read(workspace.join("out/data.txt")).expect("target before new writer"),
+            b"original",
+            "the blocked stale producer must not commit after cancellation"
+        );
         gateway
             .write_file_atomic(&target, b"new-successful-writer")
             .await
-            .expect("new writer should succeed");
-        // Give any late stale commit a chance to (incorrectly) land.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            .expect("new writer should commit while the stale producer is blocked");
+        release_tx
+            .send(())
+            .expect("stale producer should still be waiting for release");
+        tokio::time::timeout(std::time::Duration::from_secs(10), finished_rx)
+            .await
+            .expect("stale stage worker should finish after release")
+            .expect("stale stage completion signal should be delivered");
         assert_eq!(
             std::fs::read(workspace.join("out/data.txt")).expect("target"),
             b"new-successful-writer",
-            "H03-02: a cancelled worker must not overwrite the newer result"
+            "H03-02: a stale worker finishing after the newer writer must not overwrite it"
         );
         let leaked: Vec<String> = std::fs::read_dir(workspace.join("out"))
             .expect("out dir")
