@@ -179,6 +179,7 @@ impl ReadStore {
         }
         file.seek(std::io::SeekFrom::Start(view.offset))?;
         let mut reader = BufReader::new(file.take(revision.len - view.offset));
+        let mut terminated = true;
         loop {
             let mut line = Vec::new();
             let count = (&mut reader)
@@ -195,25 +196,33 @@ impl ReadStore {
             if count == 0 {
                 break;
             }
-            if count
-                > limits
-                    .max_event_bytes
-                    .unwrap_or(usize::MAX)
-                    .saturating_add(1)
-            {
+            let has_newline = line.last() == Some(&b'\n');
+            let body_len = line.len() - usize::from(has_newline);
+            if body_len > limits.max_event_bytes.unwrap_or(usize::MAX) {
                 return Err(ServiceError::Invalid(
                     "run journal event exceeds byte limit".into(),
                 ));
             }
-            if line.last() != Some(&b'\n') {
-                break;
+            // Even a complete JSON value or whitespace tail can change meaning
+            // after an append. Only LF-terminated views are safe to cache.
+            terminated = has_newline;
+            let body = &line[..body_len];
+            if body.iter().all(u8::is_ascii_whitespace) {
+                view.offset += count as u64;
+                continue;
             }
             if view.count >= limits.max_event_count.unwrap_or(usize::MAX) {
                 return Err(ServiceError::Invalid(
                     "run journal exceeds event count limit".into(),
                 ));
             }
-            let value: Value = serde_json::from_slice(&line)?;
+            let value: Value = match serde_json::from_slice(body) {
+                Ok(value) => value,
+                Err(error) if !has_newline && error.is_eof() && reader.fill_buf()?.is_empty() => {
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            };
             let event = RunEvent::from_flat(&value).map_err(ServiceError::Invalid)?;
             view.state
                 .apply(&value)
@@ -275,7 +284,7 @@ impl ReadStore {
             + std::mem::size_of::<Entry>()
             + 256;
         let view = Arc::new(view);
-        if bytes <= self.max_bytes && view.offset == revision.len {
+        if terminated && bytes <= self.max_bytes && view.offset == revision.len {
             let mut entries = self
                 .entries
                 .lock()
@@ -444,6 +453,233 @@ mod tests {
         );
         std::fs::remove_dir_all(directory).unwrap();
         std::fs::remove_dir_all(other).unwrap();
+    }
+    #[test]
+    fn read_includes_complete_final_value_without_trailing_lf() {
+        let (directory, writer) = journal();
+        writer
+            .event("run_started", serde_json::json!({"generator":"test","generator_path":"test","contract_sha256":"abc","inputs":{},"resource_hashes":[],"schema_version":1}))
+            .unwrap();
+        drop(writer);
+        let path = run_meta_dir(&directory).join("journal.jsonl");
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            bytes.ends_with(b"\n"),
+            "journal helper must LF-terminate events"
+        );
+        std::fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
+        let scan = engine::read_journal_values(&path, engine::JournalLimits::default()).unwrap();
+        assert_eq!(
+            scan.events.len(),
+            2,
+            "authoritative reader keeps final value without LF"
+        );
+        let authoritative = engine::RunState::fold_journal(&path).unwrap();
+        assert_eq!(authoritative.last_seq, 2);
+        let store = ReadStore::new(8, policy::DEFAULT_READ_CACHE_BYTES);
+        let view = store.read(&directory).unwrap();
+        assert_eq!(
+            view.state.last_seq, authoritative.last_seq,
+            "ReadStore must include a complete final JSON value without trailing LF"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn read_ignores_incomplete_tail_then_includes_completed_value() {
+        let (directory, writer) = journal();
+        writer
+            .event("run_started", serde_json::json!({"generator":"test","generator_path":"test","contract_sha256":"abc","inputs":{},"resource_hashes":[],"schema_version":1}))
+            .unwrap();
+        drop(writer);
+        let path = run_meta_dir(&directory).join("journal.jsonl");
+        let full = std::fs::read(&path).unwrap();
+        let first_end = full.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+        let (first_line, second_line) = full.split_at(first_end);
+        assert!(
+            second_line.ends_with(b"\n"),
+            "journal helper must LF-terminate events"
+        );
+        let body = &second_line[..second_line.len() - 1];
+        let cut = body.len() / 2;
+        assert!(cut > 0 && cut < body.len());
+        let (prefix, remainder) = body.split_at(cut);
+        let mut fragment = Vec::with_capacity(first_line.len() + prefix.len());
+        fragment.extend_from_slice(first_line);
+        fragment.extend_from_slice(prefix);
+        std::fs::write(&path, &fragment).unwrap();
+        let scan = engine::read_journal_values(&path, engine::JournalLimits::default()).unwrap();
+        assert_eq!(
+            scan.events.len(),
+            1,
+            "authoritative reader ignores an incomplete tail"
+        );
+        let store = ReadStore::new(8, policy::DEFAULT_READ_CACHE_BYTES);
+        assert_eq!(
+            store.read(&directory).unwrap().state.last_seq,
+            1,
+            "both readers ignore an incomplete final JSON fragment"
+        );
+        // Complete the fragment without adding a trailing LF: the result is a
+        // complete final JSON value at EOF, which the authoritative reader
+        // includes.
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(remainder).unwrap();
+        }
+        let scan = engine::read_journal_values(&path, engine::JournalLimits::default()).unwrap();
+        assert_eq!(
+            scan.events.len(),
+            2,
+            "authoritative reader keeps the completed final value"
+        );
+        let authoritative = engine::RunState::fold_journal(&path).unwrap();
+        assert_eq!(authoritative.last_seq, 2);
+        let store = ReadStore::new(8, policy::DEFAULT_READ_CACHE_BYTES);
+        let view = store.read(&directory).unwrap();
+        assert_eq!(
+            view.state.last_seq, authoritative.last_seq,
+            "ReadStore must include the completed final value without trailing LF"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn unterminated_lines_are_not_cached_and_appends_are_reparsed() {
+        use std::io::Write;
+        let (directory, writer) = journal();
+        drop(writer);
+        let path = run_meta_dir(&directory).join("journal.jsonl");
+        let original = std::fs::read(&path).unwrap();
+        let mut whitespace_tail = original.clone();
+        whitespace_tail.extend_from_slice(b" \t\r\x0c");
+        let mut incomplete_tail = original.clone();
+        incomplete_tail.extend_from_slice(b"{");
+        for bytes in [
+            original[..original.len() - 1].to_vec(),
+            whitespace_tail,
+            incomplete_tail,
+        ] {
+            std::fs::write(&path, &bytes).unwrap();
+            let store = ReadStore::new(8, policy::DEFAULT_READ_CACHE_BYTES);
+            let view = store.read(&directory).unwrap();
+            assert_eq!(view.state.last_seq, 1);
+            let expected_offset = if bytes.ends_with(b"{") {
+                original.len()
+            } else {
+                bytes.len()
+            };
+            assert_eq!(view.offset, expected_offset as u64);
+            assert!(store.entries.lock().unwrap().views.is_empty());
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(b"x\n").unwrap();
+            assert!(engine::read_journal_values(&path, engine::JournalLimits::default()).is_err());
+            assert!(store.read(&directory).is_err());
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn malformed_tails_and_lf_terminated_incomplete_json_are_errors() {
+        let (directory, writer) = journal();
+        drop(writer);
+        let path = run_meta_dir(&directory).join("journal.jsonl");
+        let original = std::fs::read(&path).unwrap();
+        for tail in [b"{\"bad\":!}".as_slice(), b"{\n", b"\x0b", b"\xc2\xa0"] {
+            let mut bytes = original.clone();
+            bytes.extend_from_slice(tail);
+            std::fs::write(&path, bytes).unwrap();
+            assert!(engine::read_journal_values(&path, engine::JournalLimits::default()).is_err());
+            let store = ReadStore::new(8, policy::DEFAULT_READ_CACHE_BYTES);
+            assert!(store.read(&directory).is_err());
+            assert!(store.entries.lock().unwrap().views.is_empty());
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn event_byte_limit_excludes_only_lf() {
+        let (directory, writer) = journal();
+        drop(writer);
+        let path = run_meta_dir(&directory).join("journal.jsonl");
+        let original = std::fs::read(&path).unwrap();
+        let limit = engine::JournalLimits::default().max_event_bytes.unwrap();
+        // Check both JSON and whitespace: size limits apply before blank-line
+        // skipping, and an unterminated body gets no extra byte allowance.
+        for whitespace in [false, true] {
+            for extra in 0..=2 {
+                for has_newline in [false, true] {
+                    let mut bytes = if whitespace {
+                        Vec::new()
+                    } else {
+                        original[..original.len() - 1].to_vec()
+                    };
+                    bytes.resize(limit + extra, b' ');
+                    if has_newline {
+                        bytes.push(b'\n');
+                    }
+                    std::fs::write(&path, &bytes).unwrap();
+                    let scan = engine::read_journal_values(&path, engine::JournalLimits::default());
+                    let store = ReadStore::new(8, policy::DEFAULT_READ_CACHE_BYTES);
+                    let view = store.read(&directory);
+                    assert_eq!(scan.is_ok(), extra == 0);
+                    assert_eq!(view.is_ok(), scan.is_ok());
+                    if let Ok(view) = view {
+                        assert_eq!(view.count, usize::from(!whitespace));
+                        assert_eq!(view.offset, bytes.len() as u64);
+                        assert_eq!(
+                            store.entries.lock().unwrap().views.len(),
+                            usize::from(has_newline)
+                        );
+                    }
+                }
+            }
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn read_skips_blank_and_whitespace_only_lines() {
+        let (directory, writer) = journal();
+        writer
+            .event("run_started", serde_json::json!({"generator":"test","generator_path":"test","contract_sha256":"abc","inputs":{},"resource_hashes":[],"schema_version":1}))
+            .unwrap();
+        drop(writer);
+        let path = run_meta_dir(&directory).join("journal.jsonl");
+        let original = std::fs::read(&path).unwrap();
+        let first_end = original.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+        let (first_line, rest) = original.split_at(first_end);
+        let mut with_blanks = Vec::new();
+        with_blanks.extend_from_slice(first_line);
+        with_blanks.extend_from_slice(b"\n");
+        with_blanks.extend_from_slice(b"   \n");
+        with_blanks.extend_from_slice(rest);
+        with_blanks.extend_from_slice(b"\t \t\n");
+        std::fs::write(&path, &with_blanks).unwrap();
+        let scan = engine::read_journal_values(&path, engine::JournalLimits::default()).unwrap();
+        assert_eq!(
+            scan.events.len(),
+            2,
+            "authoritative reader skips whitespace-only lines"
+        );
+        let authoritative = engine::RunState::fold_journal(&path).unwrap();
+        assert_eq!(authoritative.last_seq, 2);
+        let store = ReadStore::new(8, policy::DEFAULT_READ_CACHE_BYTES);
+        let view = store
+            .read(&directory)
+            .expect("ReadStore must accept blank and ASCII-whitespace-only lines");
+        assert_eq!(
+            view.state.last_seq, authoritative.last_seq,
+            "ReadStore must skip blank and whitespace-only lines like the engine reader"
+        );
+        assert_eq!(view.offset, with_blanks.len() as u64);
+        assert_eq!(store.entries.lock().unwrap().views.len(), 1);
+        let read = store.bytes_read.load(Ordering::Relaxed);
+        store.read(&directory).unwrap();
+        assert_eq!(store.bytes_read.load(Ordering::Relaxed), read);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
 
