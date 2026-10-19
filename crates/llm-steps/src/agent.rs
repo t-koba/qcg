@@ -1717,8 +1717,18 @@ pub(crate) fn record_agent_checkpoint(
         // fail later at resume time with a confusing refusal. Failing the
         // checkpoint here keeps the cause (sync/permission) diagnosable
         // and the run fail-closed at suspension instead (F02).
-        ctx.run
-            .store_pending_tool_payload(node, &operation_id, &payload)?;
+        // Recovery can re-checkpoint a redacted MCP journal copy when its
+        // sidecar is missing or invalid. Never promote those placeholders
+        // into an original-payload sidecar. Execution refuses them before
+        // starting an operation, but may still resend a verified success.
+        let unresolved_mcp = tools
+            .iter()
+            .any(|tool| matches!(tool, ToolDecl::Mcp { name, .. } if name == &call.name))
+            && engine::contains_redaction_marker(&call.args.to_string());
+        if !unresolved_mcp {
+            ctx.run
+                .store_pending_tool_payload(node, &operation_id, &payload)?;
+        }
     }
     if let Some(suspended) = checkpoint.pending_mcp_call.as_ref() {
         // E08-4 exact journaling rule. Builtin AskUser suspensions keep

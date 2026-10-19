@@ -342,6 +342,31 @@ pub(crate) async fn execute_mcp_tool(
     // continuation key already binds node, server, alias, call id, and
     // arguments, so a foreign resume cannot reach this path.
     let fresh = request_state.is_none() && input_responses.is_none();
+    // Journal recovery may re-enter as a fresh call when the private payload
+    // is missing or invalid. Refuse placeholders before the guard can start
+    // (or overwrite) an operation. Only a succeeded fresh invocation may
+    // reach the guard: it verifies the binding and loads the cached result,
+    // including spilled results, without authorizing new execution.
+    if engine::contains_redaction_marker(&args.to_string())
+        && !(fresh
+            && ctx
+                .journal
+                .state()
+                .operation_records
+                .get(&engine::operation_id_for(
+                    &ctx.run.run_id,
+                    &node.id,
+                    call_id,
+                ))
+                .is_some_and(|record| record.status == engine::OperationStatus::Succeeded))
+    {
+        return Err(StepError::Refused {
+            node: node.id.clone(),
+            message: format!(
+                "MCP call `{alias}` holds redacted arguments after a restart; refusing to execute placeholders remotely"
+            ),
+        });
+    }
     if fresh {
         supersede_agent_mcp_continuations(ctx, node, server, alias, call_id, &args)?;
     }
@@ -377,19 +402,6 @@ pub(crate) async fn execute_mcp_tool(
     // deterministic function of run, node, and call id below.
     let operation_id =
         operation_id.or_else(|| Some(engine::operation_id_for(&ctx.run.run_id, &node.id, call_id)));
-    // A post-restart resume re-issues the journaled (redacted) call copy:
-    // executing it would send `[REDACTED]` placeholders as real arguments.
-    // Refuse fail-closed instead; the caller re-issues with original bytes
-    // (E07). In-process resumes carry the raw memory checkpoint and never
-    // trip this gate.
-    if !fresh && engine::contains_redaction_marker(&args.to_string()) {
-        return Err(StepError::Refused {
-            node: node.id.clone(),
-            message: format!(
-                "MCP call `{alias}` holds redacted arguments after a restart; refusing to execute placeholders remotely"
-            ),
-        });
-    }
     for _round in 0..10 {
         // The node-scoped token: node timeout stops this wait without
         // touching the run, and parent cancellation propagates. The

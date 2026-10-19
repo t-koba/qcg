@@ -1716,6 +1716,7 @@ version = "0.1.0"
 dependencies = [
  "api",
  "async-trait",
+ "axum",
  "base64 0.23.1",
  "camino",
  "contract",
@@ -1729,6 +1730,7 @@ dependencies = [
  "model",
  "policy",
  "regex",
+ "rmcp",
  "serde",
  "serde_json",
  "sha2 0.11.0",

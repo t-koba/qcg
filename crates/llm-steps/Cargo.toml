@@ -35,3 +35,6 @@ url.workspace = true
 [dev-dependencies]
 # Enables engine's test-support builder for approval/resume e2e tests.
 engine = { path = "../engine", features = ["test-support"] }
+# Real in-process MCP transport for recovery/continuation regression tests.
+axum.workspace = true
+rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
