@@ -2,10 +2,12 @@
 id = "agent"
 output = "agent_result"
 type = "llm.agent"
+artifact = { label = "Agent result", required = true }
 
 [flow.params]
 max_iterations = 3
 max_tokens_total = 4096
+output_file = "agent-result.json"
 prompt = "prompts/agent.j2"
 
 [[flow.params.tools]]

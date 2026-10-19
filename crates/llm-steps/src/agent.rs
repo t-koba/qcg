@@ -24,6 +24,7 @@ use crate::context::{enforce_agent_transcript_limit, record_llm_validation_failu
 use crate::guardrail::{apply_guardrails, validate_guardrails};
 use crate::mcp_tools::{AgentToolOutcome, McpAgentTools};
 use crate::out_of_contract::{OutOfContractDecision, enforce_out_of_contract_policy};
+use crate::output::write_output_file;
 use crate::prompting::{
     append_agent_validation_retry, load_schema, parse_agent_final, render_prompt,
     validate_agent_stop,
@@ -926,7 +927,13 @@ impl StepExecutor for LlmAgentStep {
                     &value,
                 )
                 .await?;
-                return Ok(StepOutcome::success(Some(value)));
+                let content = serde_json::to_vec(&value)?;
+                let files =
+                    write_output_file(ctx, node, params.output_file.as_deref(), &content).await?;
+                return Ok(StepOutcome::Success {
+                    output: Some(value),
+                    files,
+                });
             }
             last_validation_error = None;
             if tool_calls.len() > 1
@@ -1348,7 +1355,14 @@ impl StepExecutor for LlmAgentStep {
                                 }),
                             )
                             .step_err(&node.id)?;
-                        return Ok(StepOutcome::success(Some(value)));
+                        let content = serde_json::to_vec(&value)?;
+                        let files =
+                            write_output_file(ctx, node, params.output_file.as_deref(), &content)
+                                .await?;
+                        return Ok(StepOutcome::Success {
+                            output: Some(value),
+                            files,
+                        });
                     }
                     AgentToolOutcome::NeedsUser(question) => {
                         let event = tool_call_event(

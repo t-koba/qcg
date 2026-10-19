@@ -10,6 +10,7 @@ use crate::completion::{
     checked_usage_total, complete_llm, complete_text_with_prompt, validate_retry_budget,
 };
 use crate::context::{record_llm_validation_failure, retry_prompt};
+use crate::output::write_output_file;
 use crate::prompting::{render_prompt, response_text};
 use crate::request::build_request;
 use crate::request_policy::{llm_params, require_prompt};
@@ -90,7 +91,13 @@ impl StepExecutor for LlmChooseStep {
             }
             let choice = response_text(response.content)?;
             if params.options.iter().any(|option| option == &choice) {
-                return Ok(StepOutcome::success(Some(Value::String(choice))));
+                let files =
+                    write_output_file(ctx, node, params.output_file.as_deref(), choice.as_bytes())
+                        .await?;
+                return Ok(StepOutcome::Success {
+                    output: Some(Value::String(choice)),
+                    files,
+                });
             }
             let message = format!("LLM chose `{choice}`, which is outside declared options");
             record_llm_validation_failure(ctx, node, attempt, &message)?;

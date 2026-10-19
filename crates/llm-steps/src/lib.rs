@@ -11,6 +11,7 @@ mod guardrail;
 mod mcp_forms;
 mod mcp_tools;
 mod out_of_contract;
+mod output;
 mod prompting;
 mod repair;
 mod request;

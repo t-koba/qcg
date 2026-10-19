@@ -1,8 +1,6 @@
 use async_trait::async_trait;
 use contract::{Contract, NodeDef};
-use engine::{
-    ResultExt, StepContext, StepError, StepExecutor, StepOutcome, validate_json_schema_step,
-};
+use engine::{StepContext, StepError, StepExecutor, StepOutcome, validate_json_schema_step};
 use llm::LlmRuntime;
 use policy::params_schema;
 use serde_json::{Value, json};
@@ -12,6 +10,7 @@ use crate::choose::complete_text;
 use crate::completion::{checked_usage_total, complete_text_with_prompt, validate_retry_budget};
 use crate::context::{record_llm_validation_failure, retry_prompt};
 use crate::out_of_contract::{OutOfContractDecision, enforce_out_of_contract_policy};
+use crate::output::write_output_file;
 use crate::prompting::{load_schema, parse_llm_json, render_prompt};
 use crate::request_policy::{llm_params, require_prompt};
 use crate::schemas::llm_common_properties;
@@ -47,18 +46,14 @@ impl StepExecutor for LlmGenerateStep {
         node: &NodeDef,
     ) -> Result<StepOutcome, StepError> {
         let response = complete_text(ctx, node, &self.runtime, None).await?;
-        let mut files = Vec::new();
         let params = llm_params(node)?;
-        if let Some(output_file) = &params.output_file {
-            let output_file = ctx.render_inline(node, output_file)?;
-            let path = ctx.run.fs.resolve_write(&output_file).step_err(&node.id)?;
-            ctx.run
-                .fs
-                .write_file_atomic(&path, response.as_bytes())
-                .await
-                .map_err(|error| StepError::from_gateway(&node.id, error))?;
-            files.push(path);
-        }
+        let files = write_output_file(
+            ctx,
+            node,
+            params.output_file.as_deref(),
+            response.as_bytes(),
+        )
+        .await?;
         Ok(StepOutcome::Success {
             output: Some(json!({ "text": response })),
             files,
@@ -151,18 +146,9 @@ impl StepExecutor for LlmFillStep {
                 last_error = Some(message);
                 continue;
             }
-            let mut files = Vec::new();
-            if let Some(output_file) = &params.output_file {
-                let output_file = ctx.render_inline(node, output_file)?;
-                let path = ctx.run.fs.resolve_write(&output_file).step_err(&node.id)?;
-                let content = serde_json::to_vec(&value)?;
-                ctx.run
-                    .fs
-                    .write_file_atomic(&path, &content)
-                    .await
-                    .map_err(|error| StepError::from_gateway(&node.id, error))?;
-                files.push(path);
-            }
+            let content = serde_json::to_vec(&value)?;
+            let files =
+                write_output_file(ctx, node, params.output_file.as_deref(), &content).await?;
             return Ok(StepOutcome::Success {
                 output: Some(value),
                 files,

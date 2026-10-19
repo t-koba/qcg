@@ -13,10 +13,12 @@ schema = "schemas/model.schema.json"
 id = "choose_layout"
 output = "layout"
 type = "llm.choose"
+artifact = { label = "Layout", required = true }
 
 [flow.params]
 max_iterations = 3
 max_tokens_total = 2048
+output_file = "layout.txt"
 options = [
     "single",
     "split",

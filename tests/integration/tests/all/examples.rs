@@ -296,6 +296,15 @@ async fn repair_exhausted_routes_to_fallback() {
 }
 
 #[tokio::test]
+async fn llm_choose_writes_its_selection_to_output_file() {
+    let run = run_fixture("llm-fake", inputs([("name", json!("test"))]), answers([]))
+        .await
+        .expect("llm-fake should run");
+    assert_file_eq(&run, "layout.txt", "single");
+    assert_required_artifact(&run, "layout.txt");
+}
+
+#[tokio::test]
 async fn llm_agent_fake_delegates_and_uses_declared_tool() {
     let run = run_fixture("llm-agent-fake", inputs([]), answers([]))
         .await
@@ -305,6 +314,8 @@ async fn llm_agent_fake_delegates_and_uses_declared_tool() {
         "drafts/result.txt",
         "agent delegated and wrote this\n",
     );
+    assert_file_eq(&run, "agent-result.json", "{\"text\":\"done\"}");
+    assert_required_artifact(&run, "agent-result.json");
     assert_journal_has(&run, |event| {
         event.get("t").and_then(Value::as_str) == Some("agent_delegated")
             && event.get("agent").and_then(Value::as_str) == Some("researcher")

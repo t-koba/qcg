@@ -722,7 +722,8 @@ compare equal.
 
 `llm.choose`
 : Choose from the closed `options` list. Out-of-set responses retry up to
-  `max_iterations` attempts.
+  `max_iterations` attempts. When `output_file` is set, the selected option is
+  written as UTF-8 text and reported as an output file.
 
 `llm.repair`
 : Ask the LLM to rewrite `source` into `target` in one shot. `mode`
@@ -740,7 +741,8 @@ compare equal.
 
 `llm.agent`
 : Run a bounded tool loop. Requires `max_iterations`,
-  `max_tokens_total`, and declared `tools`.
+  `max_tokens_total`, and declared `tools`. When `output_file` is set, the
+  successful result is written as compact JSON and reported as an output file.
 
 `foreach`
 : Iterate over an array or object at `items` and execute the named `subflow`
