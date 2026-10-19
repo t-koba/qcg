@@ -3838,7 +3838,7 @@ async fn cancel_wins_over_retry_backoff() {
     let _ = std::fs::remove_dir_all(&run_dir);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn elapsed_deadline_wins_over_retry_backoff() {
     // E11: the hard elapsed deadline must interrupt a retry backoff
     // instead of sleeping it out, and classify as ElapsedExceeded
@@ -3850,16 +3850,18 @@ async fn elapsed_deadline_wins_over_retry_backoff() {
         permanent: true,
         slow_secs: 0,
     };
-    let mut manifest = manifest(vec![retry_node("flaky", "test.flaky", 5, 60_000, None)]);
-    // Keep a real-time test of the deadline interrupting a 60s backoff, with
-    // enough startup margin for slower CI runners before the first attempt.
-    manifest.budget.max_elapsed_seconds = Some(5);
+    let elapsed_limit_secs = 1;
+    let backoff_ms = 60_000;
+    let deadline = std::time::Duration::from_secs(elapsed_limit_secs);
+    let backoff = std::time::Duration::from_millis(backoff_ms);
+    let mut manifest = manifest(vec![retry_node("flaky", "test.flaky", 5, backoff_ms, None)]);
+    manifest.budget.max_elapsed_seconds = Some(elapsed_limit_secs);
     let run_dir = temp_run_dir("elapsed-backoff");
     let _temp_guard = TempGuard(run_dir.clone());
     let contract = test_contract(&run_dir, manifest);
     let mut registry = StepRegistry::new();
     registry.register(flaky);
-    let started = std::time::Instant::now();
+    let started = tokio::time::Instant::now();
     let error = Engine::new(registry)
         .run_with_id(
             "elapsed-backoff".into(),
@@ -3874,9 +3876,10 @@ async fn elapsed_deadline_wins_over_retry_backoff() {
         matches!(error, EngineError::Step(StepError::ElapsedExceeded { .. })),
         "the deadline must classify as elapsed, got: {error}"
     );
+    let elapsed = started.elapsed();
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(15),
-        "the deadline must interrupt backoff instead of waiting it out"
+        (deadline..backoff).contains(&elapsed),
+        "the virtual deadline should interrupt backoff after {deadline:?} but before {backoff:?}; elapsed {elapsed:?}"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
