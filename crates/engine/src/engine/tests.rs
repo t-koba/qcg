@@ -3534,7 +3534,7 @@ async fn elapsed_node_overrun_settles_and_skips_failure_hooks() {
     let _ = std::fs::remove_dir_all(&run_dir);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn elapsed_overrun_skips_failure_hooks_without_hook_failures() {
     let hook_calls = Arc::new(AtomicUsize::new(0));
     let notify_calls = Arc::new(AtomicUsize::new(0));
@@ -3838,7 +3838,7 @@ async fn cancel_wins_over_retry_backoff() {
     let _ = std::fs::remove_dir_all(&run_dir);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn elapsed_deadline_wins_over_retry_backoff() {
     // E11: the hard elapsed deadline must interrupt a retry backoff
     // instead of sleeping it out, and classify as ElapsedExceeded
