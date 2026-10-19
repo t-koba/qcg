@@ -151,7 +151,22 @@ impl StepExecutor for LlmFillStep {
                 last_error = Some(message);
                 continue;
             }
-            return Ok(StepOutcome::success(Some(value)));
+            let mut files = Vec::new();
+            if let Some(output_file) = &params.output_file {
+                let output_file = ctx.render_inline(node, output_file)?;
+                let path = ctx.run.fs.resolve_write(&output_file).step_err(&node.id)?;
+                let content = serde_json::to_vec(&value)?;
+                ctx.run
+                    .fs
+                    .write_file_atomic(&path, &content)
+                    .await
+                    .map_err(|error| StepError::from_gateway(&node.id, error))?;
+                files.push(path);
+            }
+            return Ok(StepOutcome::Success {
+                output: Some(value),
+                files,
+            });
         }
         Err(StepError::failed(
             &node.id,

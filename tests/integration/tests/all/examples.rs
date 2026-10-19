@@ -207,7 +207,7 @@ async fn logical_tool_host_records_backend_resolution() {
 }
 
 #[tokio::test]
-async fn llm_fill_retry_persists_retried_json() {
+async fn llm_fill_output_file_writes_retried_json() {
     let run = run_fixture("llm-fill-retry", inputs([]), answers([]))
         .await
         .expect("llm-fill-retry should run");

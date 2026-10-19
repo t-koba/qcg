@@ -713,7 +713,8 @@ compare equal.
 : Produce text, optionally writing it to `output_file`.
 
 `llm.fill`
-: Produce JSON and validate it against `schema`. Invalid JSON/schema responses
+: Produce JSON and validate it against `schema`. On success, optionally write
+  the validated JSON value to `output_file`. Invalid JSON/schema responses
   retry up to `max_iterations` attempts. Close object schemas with
   `additionalProperties: false`: an open schema accepts undeclared extra
   fields, so a passing validation proves field values only, not the absence
