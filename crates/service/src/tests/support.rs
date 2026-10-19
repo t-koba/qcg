@@ -133,9 +133,15 @@ pub(crate) async fn run_interrupted_agent_command(
 ) -> (RunStatus, String, Utf8PathBuf) {
     let root = temp_run_dir(name);
     let _ = std::fs::remove_dir_all(&root);
+    let _temp = TempGuard(root.clone());
     let generator = root.join("generator");
     let runs = root.join("runs");
     std::fs::create_dir_all(generator.join("prompts")).expect("generator dirs");
+    // The marker is written by the parent only AFTER spawning and probing the
+    // long-lived child. `ran` alone is pre-spawn and cannot synchronize a timeout.
+    // Keep the real shell, 60s sleep, and the second-attempt branch unchanged.
+    let script = r#"if [ ! -f ran ]; then : > ran; sleep 60 & child=$!; if kill -0 "$child"; then printf '%s %s\n' "$$" "$child" > ready; fi; wait "$child"; else echo done; fi"#;
+    let script_toml = serde_json::to_string(script).expect("quote shell script");
     std::fs::write(
             generator.join(contract::MANIFEST_FILE),
             format!(
@@ -149,10 +155,8 @@ version = "0.1.0"
 id = "agent"
 output = "agent_result"
 type = "llm.agent"
-# 15s covers the whole agent attempt (LLM/checkpoint/guard plus shell
-# spawn) on slow Windows runners so the marker lands before the kill;
-# the 60s sleep still guarantees the interrupt, so attempt 2 always
-# observes `ran`.
+# Keep the real 15s deadline and 60s side effect. The test holds Tokio's
+# clock until the real child is ready, including on slow Windows runners.
 retry = {{ max_attempts = 2, backoff_ms = 0, timeout_secs = 15, on_indeterminate = "{on_indeterminate}" }}
 
 [flow.params]
@@ -163,7 +167,7 @@ prompt = "prompts/agent.j2"
 [[flow.params.tools]]
 kind = "command"
 name = "long_task"
-command = ["sh", "-c", "if [ ! -f ran ]; then : > ran; sleep 60; else echo done; fi"]
+command = ["sh", "-c", {script_toml}]
 
 [llm]
 max_tokens = 256
@@ -179,7 +183,7 @@ fs_write = []
 network = []
 side_effects_scope = "invocation"
 side_effects = "allowed"
-commands = [{{ bin = "sh", args = ["-c", "if [ ! -f ran ]; then : > ran; sleep 60; else echo done; fi"], purpose = "interrupted side effect", isolation = "trusted_host" }}]
+commands = [{{ bin = "sh", args = ["-c", {script_toml}], purpose = "interrupted side effect", isolation = "trusted_host" }}]
 
 [permissions.containers]
 enabled = false"#
@@ -197,21 +201,106 @@ done
     )
     .expect("prompt");
     let service = test_service(vec![root.clone()], runs.clone());
-    let id = service
-        .start_run(StartRun {
-            generator_id: "generator".into(),
-            inputs: BTreeMap::new(),
-            ..Default::default()
-        })
-        .await
-        .expect("agent run should start");
-    let snapshot = wait_for_terminal_snapshot(&service, &id).await;
-    let run_dir = service.run_dir_for(&id).await.expect("run dir");
+    let clock = tokio::time::Instant::now();
+    let (id, run_dir, pids) = with_fixed_clock("agent child readiness", async {
+        let id = service
+            .start_run(StartRun {
+                generator_id: "generator".into(),
+                inputs: BTreeMap::new(),
+                ..Default::default()
+            })
+            .await
+            .expect("agent run should start");
+        let run_dir = service.run_dir_for(&id).await.expect("run dir");
+        let ready = run_workspace_dir(&run_dir).join("ready");
+        // A new UUID root/run workspace makes this acknowledgement fresh.
+        // No Tokio sleeps: neither readiness nor its watchdog may move time.
+        let pids = loop {
+            if let Ok(text) = std::fs::read_to_string(&ready) {
+                let pids: Vec<u32> = text
+                    .split_whitespace()
+                    .filter_map(|pid| pid.parse().ok())
+                    .collect();
+                if pids.len() == 2 && pids.iter().all(|pid| *pid > 0) {
+                    break pids;
+                }
+            }
+            tokio::task::yield_now().await;
+        };
+        assert!(
+            pids.iter().all(|pid| agent_process_exists(*pid)),
+            "ready child must still be alive"
+        );
+        (id, run_dir, pids)
+    })
+    .await;
+    assert_eq!(tokio::time::Instant::now(), clock);
+    tokio::time::advance(std::time::Duration::from_secs(15)).await;
+    assert_eq!(
+        tokio::time::Instant::now() - clock,
+        std::time::Duration::from_secs(15)
+    );
+    // The retry has its own 15s timer. Keep time held while real process I/O,
+    // cancellation, journal writes and the repeat/fail attempt settle; ordinary
+    // polling helpers use Tokio sleeps and would auto-advance that timer.
+    let snapshot = with_fixed_clock("agent terminal/cleanup", async {
+        let snapshot = loop {
+            let snapshot = service.snapshot(id.clone()).await.expect("snapshot");
+            if snapshot.state.is_terminal() {
+                break snapshot;
+            }
+            tokio::task::yield_now().await;
+        };
+        while pids.iter().any(|pid| agent_process_exists(*pid)) {
+            tokio::task::yield_now().await;
+        }
+        snapshot
+    })
+    .await;
     let journal =
         std::fs::read_to_string(run_meta_dir(&run_dir).join("journal.jsonl")).unwrap_or_default();
     drop(service);
-    let _ = std::fs::remove_dir_all(&root);
     (snapshot.state, journal, run_dir)
+}
+
+/// Poll a test phase without letting Tokio become idle and auto-advance paused
+/// time. The always-runnable yield branch also bounds missing readiness and
+/// stuck real I/O by WALL time, not by the very clock this helper must hold.
+async fn with_fixed_clock<T>(phase: &str, future: impl std::future::Future<Output = T>) -> T {
+    let clock = tokio::time::Instant::now();
+    let watchdog = std::time::Instant::now();
+    tokio::pin!(future);
+    loop {
+        assert_eq!(
+            tokio::time::Instant::now(),
+            clock,
+            "clock moved during {phase}"
+        );
+        assert!(
+            watchdog.elapsed() < std::time::Duration::from_secs(60),
+            "wall-clock watchdog expired during {phase}"
+        );
+        tokio::select! {
+            biased;
+            result = &mut future => {
+                assert_eq!(tokio::time::Instant::now(), clock, "clock moved during {phase}");
+                return result;
+            }
+            _ = tokio::task::yield_now() => {}
+        }
+    }
+}
+
+// Use the same shell PID namespace as the command on Unix and Windows (Git sh).
+// Signal zero observes only; the production ProcessTreeGuard must kill/reap the
+// real process tree. Probe both the parent and child, including zombies.
+fn agent_process_exists(pid: u32) -> bool {
+    std::process::Command::new("sh")
+        .args(["-c", "kill -0 \"$1\" 2>/dev/null", "probe"])
+        .arg(pid.to_string())
+        .status()
+        .expect("probe agent process tree")
+        .success()
 }
 
 pub(crate) async fn wait_for_snapshot(

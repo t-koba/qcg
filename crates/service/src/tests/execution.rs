@@ -1392,7 +1392,7 @@ async fn mcp_pending_continuation_roundtrips_through_journal() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn e07_8_repeat_and_fail_policies_via_real_agent_entry() {
     // E07-8: Repeat and Fail policies for indeterminate agent side
     // effects, driven through the real LlmAgentStep entry via the
