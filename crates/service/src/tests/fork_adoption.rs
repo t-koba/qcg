@@ -10,6 +10,80 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
+async fn failed_engine_terminal_is_reconciled_before_fork() {
+    let root = temp_run_dir("failed-run-fork-without-restart");
+    let _guard = TempGuard(root.clone());
+    let generators =
+        Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+    let runs = root.join("runs");
+    let service = test_service(vec![generators], runs.clone());
+    let source_id = service
+        .start_run(StartRun {
+            generator_id: "out-of-contract-reject".into(),
+            inputs: BTreeMap::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("failing source should start");
+    assert_eq!(
+        wait_for_terminal_snapshot(&service, &source_id).await.state,
+        RunStatus::Failed
+    );
+    let mut task_finished = false;
+    for _ in 0..200 {
+        task_finished = service
+            .inner
+            .runs
+            .read()
+            .await
+            .get(&source_id)
+            .is_some_and(|record| !crate::types::task_slot_is_live(&record.task));
+        if task_finished {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(task_finished, "failed source task should have exited");
+    let events = crate::summaries::read_journal_events(&runs.join(&source_id))
+        .expect("source journal should be readable");
+    let terminal_events = events
+        .iter()
+        .filter(|event| {
+            event
+                .get("t")
+                .and_then(Value::as_str)
+                .is_some_and(api::is_terminal_event_kind)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminal_events.len(),
+        1,
+        "source should have one terminal event"
+    );
+    assert_eq!(terminal_events[0]["t"], "run_finished");
+    let run_started_seq = events
+        .iter()
+        .find(|event| event.get("t").and_then(Value::as_str) == Some("run_started"))
+        .and_then(|event| event.get("seq").and_then(Value::as_u64))
+        .expect("source should have started the engine");
+    let fork_id = service
+        .fork_run(
+            &source_id,
+            ForkRun {
+                at_seq: run_started_seq,
+                state_patch: ForkStatePatch::default(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("failed run should be forkable without restarting the service");
+    assert_eq!(
+        wait_for_terminal_snapshot(&service, &fork_id).await.state,
+        RunStatus::Failed
+    );
+}
+
+#[tokio::test]
 async fn journal_order_wins_restart_and_fork_continue_v2() {
     // E06 end to end: z_first writes v1, a_second overwrites v2 (same
     // path), then a question suspends. Answering, restarting, and

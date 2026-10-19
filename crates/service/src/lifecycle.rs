@@ -2190,18 +2190,31 @@ impl LocalService {
                         .push(("confirm_request", json!({ "confirm": confirm })));
                 }
                 Progress::Failed(error) => {
-                    transition.state = Some(if error.kind == RunFailureKind::Canceled {
-                        RunStatus::Canceled
+                    let terminal = match self.authoritative_state(&record.run_dir).await {
+                        Ok(state) => state.terminal,
+                        Err(error) => {
+                            tracing::error!(%error, %run_id, "failed to read journal before failure settlement");
+                            return;
+                        }
+                    };
+                    if let Some(terminal) = terminal {
+                        // The engine may have already sealed this failure as
+                        // run_finished; never append a second terminal event.
+                        transition.state = Some(terminal_status(&terminal));
                     } else {
-                        RunStatus::Failed
-                    });
-                    transition.writes.push((
-                        "run_error",
-                        json!({
-                            "error": error.message,
-                            "reason": FailureDetail::new(error.code, error.message.clone()),
-                        }),
-                    ));
+                        transition.state = Some(if error.kind == RunFailureKind::Canceled {
+                            RunStatus::Canceled
+                        } else {
+                            RunStatus::Failed
+                        });
+                        transition.writes.push((
+                            "run_error",
+                            json!({
+                                "error": error.message,
+                                "reason": FailureDetail::new(error.code, error.message.clone()),
+                            }),
+                        ));
+                    }
                 }
                 Progress::Advanced | Progress::Yielded => {}
             }
