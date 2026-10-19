@@ -1,5 +1,7 @@
 name: CI
 
+# Coverage inventory (docs only, no behavior): .github/CI-COVERAGE.md
+
 on:
   push:
     branches: [main, mizu]
