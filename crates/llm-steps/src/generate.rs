@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use contract::{Contract, NodeDef};
 use engine::{StepContext, StepError, StepExecutor, StepOutcome, validate_json_schema_step};
 use llm::LlmRuntime;
-use policy::params_schema;
+use policy::{params_schema, string_schema};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -71,6 +71,7 @@ impl StepExecutor for LlmFillStep {
         Some(params_schema(
             &["prompt", "max_iterations", "max_tokens_total"],
             llm_common_properties(json!({
+                "schema": string_schema(),
                 "max_iterations": { "type": "integer", "minimum": 1 },
                 "max_tokens_total": { "type": "integer", "minimum": 1 },
             })),

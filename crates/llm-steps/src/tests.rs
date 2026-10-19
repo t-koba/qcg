@@ -165,6 +165,78 @@ fn validate_generate_node(contract: &Contract, registry: &StepRegistry) -> Resul
 }
 
 #[test]
+fn response_schema_is_limited_to_structured_llm_steps() {
+    let root = std::env::temp_dir().join(format!(
+        "llm-response-schema-scope-{}-{}",
+        std::process::id(),
+        uuid_suffix()
+    ));
+    let contract = contract_with_llm_generate(&root, "fake");
+    std::fs::write(root.join("schema.json"), r#"{"type":"object"}"#)
+        .expect("schema should be written");
+    let mut registry = StepRegistry::new();
+    register_llm_steps(&mut registry, Arc::new(LlmRuntime::builtins()));
+
+    for (kind, params) in [
+        (
+            "llm.generate",
+            json!({ "prompt": "prompt.j2", "schema": "schema.json" }),
+        ),
+        (
+            "llm.choose",
+            json!({
+                "prompt": "prompt.j2",
+                "schema": "schema.json",
+                "options": ["yes"],
+                "max_iterations": 1,
+                "max_tokens_total": 128
+            }),
+        ),
+        (
+            "llm.repair",
+            json!({
+                "prompt": "prompt.j2",
+                "schema": "schema.json",
+                "source": "source.txt",
+                "target": "target.txt"
+            }),
+        ),
+    ] {
+        let mut node = contract.manifest.flow[0].clone();
+        node.kind = StepType::literal(kind);
+        node.params = serde_json::from_value(params).expect("step params should parse");
+        let executor = registry
+            .get(&node.kind)
+            .expect("LLM step should be registered");
+        let error = executor
+            .validate(&node, &contract)
+            .expect_err("unsupported response schema should fail validation");
+        assert!(
+            error
+                .to_string()
+                .contains("response `schema` is supported only by llm.fill and llm.agent"),
+            "unexpected error for {kind}: {error}"
+        );
+    }
+
+    let schemas = registry.params_schemas();
+    for kind in ["llm.generate", "llm.choose", "llm.repair"] {
+        assert!(
+            schemas[kind]["properties"].get("schema").is_none(),
+            "{kind} must not advertise an unsupported response schema"
+        );
+    }
+    for kind in ["llm.fill", "llm.agent"] {
+        assert_eq!(
+            schemas[kind]["properties"]["schema"]["type"], "string",
+            "{kind} should advertise its supported response schema"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn request_policy_layers_global_node_and_specialist_settings() {
     let root = std::env::temp_dir().join(format!(
         "llm-request-policy-{}-{}",
@@ -357,21 +429,29 @@ fn llm_response_schema_is_compiled_during_step_validation() {
         std::process::id(),
         uuid_suffix()
     ));
-    let mut contract = contract_with_llm_generate(&root, "fake");
+    let contract = contract_with_llm_generate(&root, "fake");
     std::fs::write(
         root.join("response.schema.json"),
         r#"{"type":"object","required":"answer"}"#,
     )
     .expect("schema should be written");
-    contract.manifest.flow[0].params = serde_json::from_value(json!({
+    let mut node = contract.manifest.flow[0].clone();
+    node.kind = StepType::literal("llm.fill");
+    node.params = serde_json::from_value(json!({
         "prompt": "prompt.j2",
-        "schema": "response.schema.json"
+        "schema": "response.schema.json",
+        "max_iterations": 1,
+        "max_tokens_total": 128
     }))
     .expect("LLM params should parse");
     let mut registry = StepRegistry::new();
     register_llm_steps(&mut registry, Arc::new(LlmRuntime::builtins()));
+    let executor = registry
+        .get(&node.kind)
+        .expect("llm.fill should be registered");
 
-    let error = validate_generate_node(&contract, &registry)
+    let error = executor
+        .validate(&node, &contract)
         .expect_err("invalid response schema must fail before provider transport");
     assert!(error.to_string().contains("response schema"), "{error}");
     assert!(error.to_string().contains("invalid"), "{error}");

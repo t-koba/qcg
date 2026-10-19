@@ -32,6 +32,12 @@ pub(crate) fn validate_llm_node(
     if let Some(prompt) = params.prompt.as_deref() {
         resolve_prompt_path(contract, node, prompt)?;
     }
+    if params.schema.is_some() && !has_response_schema {
+        return Err(StepError::failed(
+            &node.id,
+            "response `schema` is supported only by llm.fill and llm.agent",
+        ));
+    }
     if let Some(schema) = params.schema.as_deref() {
         load_response_schema(contract, node, schema)?;
     }

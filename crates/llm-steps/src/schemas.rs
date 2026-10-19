@@ -158,7 +158,6 @@ pub(crate) fn llm_common_properties(extra: Value) -> Value {
     let mut properties = serde_json::Map::new();
     properties.insert("prompt".into(), string_schema());
     properties.insert("output_file".into(), string_schema());
-    properties.insert("schema".into(), string_schema());
     properties.insert("context".into(), context_array_schema());
     properties.insert(
         "media".into(),

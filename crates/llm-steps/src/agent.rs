@@ -345,6 +345,7 @@ impl StepExecutor for LlmAgentStep {
         Some(params_schema(
             &["prompt", "max_iterations", "max_tokens_total"],
             llm_common_properties(json!({
+                "schema": string_schema(),
                 "max_iterations": { "type": "integer", "minimum": 1 },
                 "max_tokens_total": { "type": "integer", "minimum": 1 },
                 "max_tool_calls_total": { "type": "integer", "minimum": 1 },

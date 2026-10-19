@@ -741,8 +741,12 @@ compare equal.
 
 `llm.agent`
 : Run a bounded tool loop. Requires `max_iterations`,
-  `max_tokens_total`, and declared `tools`. When `output_file` is set, the
-  successful result is written as compact JSON and reported as an output file.
+  `max_tokens_total`, and declared `tools`. Optional `schema` validates final
+  JSON responses; when `output_file` is set, the successful result is written
+  as compact JSON and reported as an output file.
+
+The response `schema` parameter is available only on `llm.fill` and
+`llm.agent`; the other LLM steps reject it rather than silently ignoring it.
 
 `foreach`
 : Iterate over an array or object at `items` and execute the named `subflow`
@@ -2518,9 +2522,6 @@ metadata. Update it with `qcg docs step-schemas`.
         }
       },
       "type": "object"
-    },
-    "schema": {
-      "type": "string"
     }
   },
   "required": [
@@ -3420,9 +3421,6 @@ metadata. Update it with `qcg docs step-schemas`.
         }
       },
       "type": "object"
-    },
-    "schema": {
-      "type": "string"
     }
   },
   "required": [
@@ -3758,9 +3756,6 @@ metadata. Update it with `qcg docs step-schemas`.
         }
       },
       "type": "object"
-    },
-    "schema": {
-      "type": "string"
     },
     "source": {
       "type": "string"
