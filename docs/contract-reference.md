@@ -194,7 +194,7 @@ evaluates true.
 
 Fields:
 
-- `type`: `file`, `dir`, `url`, `skill`, `skill_library`, `openapi`, or `exec`
+- `type`: `file`, `dir`, `url`, `skill`, `skill_library`, `openapi`, `exec`, or `run_ref`
 - `path`: local package-relative path
 - `url`: remote URL, fetched through the network allowlist
 - `trust`: `trusted` or `untrusted`
