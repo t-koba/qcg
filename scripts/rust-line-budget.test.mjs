@@ -11,7 +11,7 @@ function write(root, path, text) {
   writeFileSync(file, text);
 }
 
-test("test paths and the inline cfg(test) module split physical lines", () => {
+test("test paths and inline test-only cfg modules split physical lines", () => {
   assert.equal(isTestPath("crates/demo/src/tests/mod.rs"), true);
   assert.equal(isTestPath("crates/demo/src/test_support.rs"), true);
   assert.equal(isTestPath("crates/demo/src/lib.rs"), false);
@@ -21,7 +21,9 @@ test("test paths and the inline cfg(test) module split physical lines", () => {
     "    /* { /* } */ */", "    let brace = '}';", "}", "fn after() {}", "",
   ].join("\n");
   assert.deepEqual(splitSrcFile(source, "crates/demo/src/lib.rs"), { product: 2, test: 7 });
-  assert.deepEqual(splitSrcFile("#[cfg(all(test, unix))]\nmod tests {\n}\n", "crates/demo/src/lib.rs"), { product: 3, test: 0 });
+  assert.deepEqual(splitSrcFile("#[cfg(all(test, unix))]\nmod tests {\n}\n", "crates/demo/src/lib.rs"), { product: 0, test: 3 });
+  assert.deepEqual(splitSrcFile("#[cfg(all(unix, test))]\nmod tests {\n}\n", "crates/demo/src/lib.rs"), { product: 0, test: 3 });
+  assert.deepEqual(splitSrcFile("#[cfg(all(not(test), unix))]\nmod production {\n}\n", "crates/demo/src/lib.rs"), { product: 3, test: 0 });
   assert.deepEqual(splitSrcFile("#[cfg(test)]\nfn helper() {}\n", "crates/demo/src/lib.rs"), { product: 2, test: 0 });
 });
 

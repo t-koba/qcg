@@ -1,4 +1,4 @@
-// Test paths/files and inline #[cfg(test)] modules are uncapped; other src lines are product.
+// Test paths/files and inline test-only cfg modules are uncapped; other src lines are product.
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,7 +29,7 @@ export function splitSrcFile(s, path) {
   if (isTestPath(path)) return { product: 0, test: physical };
   let test = 0;
   for (let i = 0; i < a.length; i++) {
-    if (!/^\s*#\[cfg\(test\)\]\s*$/.test(a[i])) continue;
+    if (!/^\s*#\[cfg\((?:test|all\((?:[^()]*,\s*)?test(?:\s*,[^()]*)?\))\)\]\s*$/.test(a[i])) continue;
     let m = i + 1;
     while (m < a.length && (!a[m].trim() || /^\s*(?:#\s*\[|\/\/|\/\*|\*)/.test(a[m]))) m++;
     if (!/^(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\b/.test(a[m] || "")) continue;

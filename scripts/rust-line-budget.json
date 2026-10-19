@@ -1,13 +1,13 @@
 {
-  "_comment": "Physical Rust lines under crates/<crate>/src: tests/ paths, tests.rs, test_support and inline #[cfg(test)] modules are uncapped tests; every other source line is capped product. Per-crate caps match current product counts. The HTTP preflight timeout fix raises engine and totalMax by 57 lines, justified by deterministic timeout, cancellation and remaining-budget regressions; sharing check.command/check.container text expectations reduces steps and totalMax by 8 lines; sharing their ExpectDef schema reduces both by 3 more lines; totalMax ratchets down after each behavior-preserving deduplication slice. The skill-resource discovery fix replaces the duplicate unrestricted tool loader with the engine bounded reader (+54 engine lines, -40 llm-steps lines, +14 net), covering configured byte/entry limits and no-follow behavior in validation/catalog tests.",
+  "_comment": "Physical Rust lines under crates/<crate>/src: tests/ paths, tests.rs, test_support, inline #[cfg(test)] modules and test-only #[cfg(all(..., test, ...))] modules are uncapped tests; every other source line is capped product. Per-crate caps match current product counts. The HTTP preflight timeout fix raises engine and totalMax by 57 lines, justified by deterministic timeout, cancellation and remaining-budget regressions; sharing check.command/check.container text expectations reduces steps and totalMax by 8 lines; sharing their ExpectDef schema reduces both by 3 more lines; totalMax ratchets down after each behavior-preserving deduplication slice. The skill-resource discovery fix replaces the duplicate unrestricted tool loader with the engine bounded reader (+54 engine lines, -40 llm-steps lines, +14 net), covering configured byte/entry limits and no-follow behavior in validation/catalog tests. Correcting the test-only cfg(all(..., test, ...)) classification ratchets cli/container/engine caps down by 44/141/1484 lines and totalMax by 1669; the 35-line gateway cancellation-test seam remains in uncapped test code.",
   "version": 1,
-  "totalMax": 95846,
+  "totalMax": 94177,
   "crates": {
     "api": 2927,
-    "cli": 7661,
-    "container": 1832,
+    "cli": 7617,
+    "container": 1691,
     "contract": 6557,
-    "engine": 20835,
+    "engine": 19351,
     "expr-wasm": 175,
     "files": 1224,
     "llm": 7267,

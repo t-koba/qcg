@@ -1975,6 +1975,19 @@ mod unix_staging_tests {
     use super::*;
     use contract::Permissions;
 
+    /// Completion token dropped after the stage worker's post-producer fence
+    /// check, giving cancellation tests a deterministic join edge.
+    #[derive(Debug)]
+    struct StageWorkerFinished(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for StageWorkerFinished {
+        fn drop(&mut self) {
+            if let Some(ready) = self.0.take() {
+                let _ = ready.send(());
+            }
+        }
+    }
+
     #[tokio::test]
     async fn h03_cancelled_stream_never_commits_stale_result() {
         // H03-01/H03-02 (Unix analogue): a stream whose outer future is
@@ -2079,18 +2092,33 @@ mod unix_staging_tests {
             .expect("first write should succeed");
         let gateway_clone = FsGateway::new(workspace.clone(), &permissions);
         let target_clone = target.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
             gateway_clone
-                .write_file_atomic_stream(&target_clone, None, |file| -> std::io::Result<()> {
-                    use std::io::Write as _;
-                    file.write_all(b"partial")?;
-                    std::thread::sleep(std::time::Duration::from_millis(1500));
-                    file.write_all(b"-more")?;
-                    Ok(())
-                })
+                .write_file_atomic_stream(
+                    &target_clone,
+                    None,
+                    move |file| -> std::io::Result<StageWorkerFinished> {
+                        use std::io::Write as _;
+                        file.write_all(b"partial")?;
+                        entered_tx.send(()).map_err(|_| {
+                            std::io::Error::other("producer start receiver dropped")
+                        })?;
+                        release_rx.recv().map_err(|_| {
+                            std::io::Error::other("producer release sender dropped")
+                        })?;
+                        file.write_all(b"-more")?;
+                        Ok(StageWorkerFinished(Some(finished_tx)))
+                    },
+                )
                 .await
         });
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx)
+            .await
+            .expect("blocking producer should enter before cancellation")
+            .expect("producer start signal should be delivered");
         handle.abort();
         let aborted = handle
             .await
@@ -2099,11 +2127,18 @@ mod unix_staging_tests {
             aborted.is_cancelled(),
             "the aborted write must report cancellation"
         );
-        // The guard owns the stage/commit tasks and aborts them on drop,
-        // then reclaims staging handle-relative: no detached continuation
-        // can commit afterwards (E13). The outer abort above drops the
-        // guard, so no settle delay is needed before asserting.
-        tokio::time::sleep(std::time::Duration::from_millis(1800)).await;
+        // spawn_blocking cannot stop a started producer. Release it only after
+        // the outer guard has revoked the fence and unlinked staging, then
+        // wait for its result token, dropped after the worker's fence check.
+        // This proves cleanup and prevents a late commit without wall-clock
+        // settling sleeps.
+        release_tx
+            .send(())
+            .expect("producer should still be waiting for release");
+        tokio::time::timeout(std::time::Duration::from_secs(2), finished_rx)
+            .await
+            .expect("stage worker should finish after cancellation")
+            .expect("stage worker completion signal should be delivered");
         let leaked: Vec<String> = std::fs::read_dir(workspace.join("out"))
             .expect("out dir should read")
             .filter_map(|entry| entry.ok())
