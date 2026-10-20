@@ -222,16 +222,15 @@ pub struct RawPatchEdit {
 
 /// Apply validated edits to a snapshot.
 /// `expected_base` binds the snapshot when set; `None` checks anchors only.
-/// Returns the new text with remaps on stale anchors.
-pub fn apply_anchored_patch(
-    base_text: &str,
-    expected_base: Option<&str>,
+/// Checks the call's own size against the mechanism's limits.
+///
+/// The edit count and the patch payload are known before the patch is
+/// applied, so a caller can refuse an oversized call before it asks for
+/// anything. The result size is not: it depends on the file's contents.
+pub fn check_patch_limits(
     edits: &[PatchEdit],
-    limits: PatchLimits,
-) -> Result<PatchOutcome, AnchoredPatchError> {
-    if edits.is_empty() {
-        return Err(AnchoredPatchError::EmptyEdits);
-    }
+    limits: &PatchLimits,
+) -> Result<(), AnchoredPatchError> {
     if edits.len() > limits.max_edits {
         return Err(AnchoredPatchError::TooManyEdits {
             count: edits.len(),
@@ -248,6 +247,20 @@ pub fn apply_anchored_patch(
             limit: limits.max_patch_bytes,
         });
     }
+    Ok(())
+}
+
+/// Returns the new text with remaps on stale anchors.
+pub fn apply_anchored_patch(
+    base_text: &str,
+    expected_base: Option<&str>,
+    edits: &[PatchEdit],
+    limits: PatchLimits,
+) -> Result<PatchOutcome, AnchoredPatchError> {
+    if edits.is_empty() {
+        return Err(AnchoredPatchError::EmptyEdits);
+    }
+    check_patch_limits(edits, &limits)?;
     let actual_base = base_sha256(base_text);
     if let Some(expected) = expected_base
         && expected.to_ascii_lowercase() != actual_base

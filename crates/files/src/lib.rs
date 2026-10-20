@@ -7,7 +7,7 @@ mod anchored;
 pub use anchored::{
     ANCHOR_HASH_LEN, AnchorRemap, AnchoredLine, AnchoredPatchError, PatchEdit, PatchLimits,
     PatchOp, PatchOutcome, RawPatchEdit, anchor_for, annotate, apply_anchored_patch, base_sha256,
-    line_hash, parse_anchor, parse_edits, read_window, split_lines,
+    check_patch_limits, line_hash, parse_anchor, parse_edits, read_window, split_lines,
 };
 
 use camino::{Utf8Path, Utf8PathBuf};

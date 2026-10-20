@@ -431,27 +431,17 @@ pub(crate) fn restore_pending_call_from_sidecar(
 }
 
 /// Canonical `edits` array for `fs.patch` approval binding.
-/// Sorts object keys by serializing through `serde_json::Value` (which uses
-/// `BTreeMap` ordering) so key order never forks the digest. Returns `None`
-/// when the shape is not a valid patch call.
-pub(crate) fn canonical_patch_edits(args: &Value) -> Option<Value> {
-    let edits = args.get("edits")?.as_array()?;
-    let mut canonical = Vec::with_capacity(edits.len());
-    for edit in edits {
-        let object = edit.as_object()?;
-        let op = object.get("op")?.as_str()?;
-        if !matches!(op, "replace" | "append" | "prepend") {
-            return None;
-        }
-        let anchor = object.get("anchor")?.as_str()?;
-        let lines = object.get("lines")?.as_array()?;
-        let mut text = Vec::with_capacity(lines.len());
-        for line in lines {
-            text.push(line.as_str()?.to_string());
-        }
-        canonical.push(json!({"anchor": anchor, "lines": text, "op": op}));
-    }
-    Some(Value::Array(canonical))
+///
+/// Built from the validated edits, so the call's shape is checked in one
+/// place, and the keys are sorted by serializing through `serde_json::Value`
+/// (which uses `BTreeMap` ordering) so key order never forks the digest.
+pub(crate) fn canonical_patch_edits(edits: &[files::RawPatchEdit]) -> Value {
+    Value::Array(
+        edits
+            .iter()
+            .map(|edit| json!({"anchor": edit.anchor, "lines": edit.lines, "op": edit.op}))
+            .collect(),
+    )
 }
 
 /// Resolves anchored patch limits from contract policy with defaults.
@@ -557,6 +547,26 @@ fn raw_patch_edits(edits: &[Value]) -> Result<Vec<files::RawPatchEdit>, (&'stati
     Ok(raw)
 }
 
+/// The tool result the model reads for its own mistake in a patch call.
+///
+/// The call's pending payload is released with it: the operation never
+/// started, and a retrying agent must not accumulate one unredacted
+/// sidecar per attempt.
+fn agent_fs_patch_rejection_result(
+    ctx: &StepContext<'_>,
+    node: &NodeDef,
+    call_id: &str,
+    value: Value,
+) -> AgentToolOutcome {
+    ctx.run
+        .clear_pending_tool_payload(&engine::operation_id_for(
+            &ctx.run.run_id,
+            &node.id,
+            call_id,
+        ));
+    AgentToolOutcome::Result(value)
+}
+
 /// The tool result the model reads when its own patch call has the wrong
 /// shape.
 fn patch_call_rejection(path: &str, code: &str, detail: &str) -> Value {
@@ -657,7 +667,8 @@ fn pending_call_digest(
         ToolDecl::FsPatch { path_prefix, .. } => {
             let path = call.args.get("path")?.as_str()?;
             let base = call.args.get("expected_base_sha256")?.as_str()?;
-            let canonical = canonical_patch_edits(&call.args)?;
+            let raw = raw_patch_edits(call.args.get("edits")?.as_array()?).ok()?;
+            let canonical = canonical_patch_edits(&raw);
             let bytes = serde_json::to_vec(&canonical).ok()?;
             let details = Some(json!({
                 "path_prefix": path_prefix,
@@ -884,6 +895,170 @@ pub(crate) async fn execute_agent_http_request(
     }
 }
 
+/// Executes a verified `fs.patch` call.
+///
+/// Everything the call itself determines is checked before the approval, so a
+/// call that cannot apply never spends the user's confirmation, and every
+/// failure path releases the pending payload the call was given.
+async fn execute_agent_fs_patch_call(
+    ctx: &mut StepContext<'_>,
+    node: &NodeDef,
+    name: &str,
+    call_id: &str,
+    args: &Value,
+    path_prefix: &str,
+) -> Result<AgentToolOutcome, StepError> {
+    let path = args
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| StepError::failed(&node.id, "fs.patch tool requires path"))?;
+    let expected_base = args
+        .get("expected_base_sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            StepError::failed(&node.id, "fs.patch tool requires expected_base_sha256")
+        })?;
+    let raw_edits = args
+        .get("edits")
+        .and_then(Value::as_array)
+        .ok_or_else(|| StepError::failed(&node.id, "fs.patch tool requires edits"))?;
+    ensure_path_within_prefix(node, name, path, path_prefix)?;
+    let salt = ctx.run.run_id.clone();
+    // The model's own call shape is checked first: a call the agent
+    // can correct comes back to it instead of failing the node, and
+    // it never reaches the approval.
+    let raw_edits = match raw_patch_edits(raw_edits) {
+        Ok(raw) => raw,
+        Err((code, detail)) => {
+            return Ok(agent_fs_patch_rejection_result(
+                ctx,
+                node,
+                call_id,
+                patch_call_rejection(path, code, &detail),
+            ));
+        }
+    };
+    // The anchor's format and the edit list are the model's own mistakes
+    // too, so they are checked here rather than after the confirmation.
+    let edits = match files::parse_edits(&raw_edits) {
+        Ok(edits) => edits,
+        Err(error) => {
+            return Ok(agent_fs_patch_rejection_result(
+                ctx,
+                node,
+                call_id,
+                agent_fs_patch_rejection(path, &error).unwrap_or_else(
+                    || json!({ "file": path, "ok": false, "error": "patch_rejected" }),
+                ),
+            ));
+        }
+    };
+    // The limits are static contract facts and the call's own size is known
+    // here, so a call that cannot apply never spends the confirmation.
+    let limits = resolve_patch_limits(ctx, node)?;
+    files::check_patch_limits(&edits, &limits)
+        .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
+    let canonical = canonical_patch_edits(&raw_edits);
+    let canonical_bytes = serde_json::to_vec(&canonical).map_err(|error| {
+        StepError::failed(
+            &node.id,
+            format!("fs.patch edits are not serializable: {error}"),
+        )
+    })?;
+    let details = Some(json!({
+        "path_prefix": path_prefix,
+        "expected_base_sha256": expected_base,
+        "edits_sha256": engine::salted_binding_digest(
+            "fspatch-edits-v1",
+            &salt,
+            &canonical_bytes
+        ),
+    }));
+    if args_contain_redaction_marker(args) {
+        let operation_id = engine::operation_id_for(&ctx.run.run_id, &node.id, call_id);
+        let state = ctx.journal.state();
+        let record = state.operation_records.get(&operation_id).cloned();
+        if let Some(result) = redacted_success_resend(record.as_ref()) {
+            return Ok(AgentToolOutcome::Result(result));
+        }
+        let had_record = record.is_some();
+        match ctx.run.guard_external_operation(
+            ctx.journal,
+            node,
+            "fs.patch",
+            path,
+            &details,
+            call_id,
+        )? {
+            engine::GuardDecision::Resend { result, .. } => {
+                return Ok(AgentToolOutcome::Result(result));
+            }
+            engine::GuardDecision::Proceed { operation_id } => {
+                if !had_record {
+                    ctx.run.finish_external_operation_with_warn(
+                            ctx.journal,
+                            node,
+                            &operation_id,
+                            engine::OperationOutcome::Indeterminate {
+                                reason: format!(
+                                    "operation `{operation_id}` holds redacted patch content; refusing to re-execute without the original bytes"
+                                ),
+                            },
+                        );
+                    return Err(StepError::Refused {
+                        node: node.id.clone(),
+                        message: format!(
+                            "operation `{operation_id}` holds redacted patch content; refusing to re-execute without the original bytes"
+                        ),
+                    });
+                }
+            }
+        }
+        let operation_id = engine::operation_id_for(&ctx.run.run_id, &node.id, call_id);
+        ctx.run.finish_external_operation_with_warn(
+                ctx.journal,
+                node,
+                &operation_id,
+                engine::OperationOutcome::Indeterminate {
+                    reason: format!(
+                        "operation `{operation_id}` holds redacted patch content; refusing to re-execute without the original bytes"
+                    ),
+                },
+            );
+        return Err(StepError::Refused {
+            node: node.id.clone(),
+            message: format!(
+                "operation `{operation_id}` holds redacted patch content; refusing to re-execute without the original bytes"
+            ),
+        });
+    }
+    if let Some(confirm) = ctx.run.require_side_effect(
+        ctx.journal,
+        node,
+        "fs.patch",
+        path,
+        details.clone(),
+        call_id,
+    )? {
+        return Ok(AgentToolOutcome::NeedsConfirm(confirm));
+    }
+    let operation_id = match ctx.run.guard_external_operation(
+        ctx.journal,
+        node,
+        "fs.patch",
+        path,
+        &details,
+        call_id,
+    )? {
+        engine::GuardDecision::Proceed { operation_id } => operation_id,
+        engine::GuardDecision::Resend { result, .. } => {
+            return Ok(AgentToolOutcome::Result(result));
+        }
+    };
+    return execute_agent_fs_patch(ctx, node, path, expected_base, edits, limits, &operation_id)
+        .await;
+}
+
 pub(crate) async fn execute_agent_tool(
     ctx: &mut StepContext<'_>,
     node: &NodeDef,
@@ -1100,175 +1275,20 @@ pub(crate) async fn execute_agent_tool(
             })))
         }
         ToolDecl::FsPatch { path_prefix, .. } => {
-            let path = args
-                .get("path")
-                .and_then(Value::as_str)
-                .ok_or_else(|| StepError::failed(&node.id, "fs.patch tool requires path"))?;
-            let expected_base = args
-                .get("expected_base_sha256")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    StepError::failed(&node.id, "fs.patch tool requires expected_base_sha256")
-                })?;
-            let raw_edits = args
-                .get("edits")
-                .and_then(Value::as_array)
-                .ok_or_else(|| StepError::failed(&node.id, "fs.patch tool requires edits"))?;
-            ensure_path_within_prefix(node, name, path, path_prefix)?;
-            let salt = ctx.run.run_id.clone();
-            // The model's own call shape is checked first: a call the agent
-            // can correct comes back to it instead of failing the node, and
-            // it never reaches the approval.
-            let raw_edits = match raw_patch_edits(raw_edits) {
-                Ok(raw) => raw,
-                Err((code, detail)) => {
-                    // The call still holds a pending payload: release it so a
-                    // retrying agent does not accumulate one unredacted
-                    // sidecar per attempt.
-                    ctx.run
-                        .clear_pending_tool_payload(&engine::operation_id_for(
-                            &ctx.run.run_id,
-                            &node.id,
-                            call_id,
-                        ));
-                    return Ok(AgentToolOutcome::Result(patch_call_rejection(
-                        path, code, &detail,
-                    )));
-                }
-            };
-            let canonical = canonical_patch_edits(args).ok_or_else(|| {
-                StepError::failed(&node.id, "fs.patch edits are not canonicalizable")
-            })?;
-            let canonical_bytes = serde_json::to_vec(&canonical).map_err(|error| {
-                StepError::failed(
-                    &node.id,
-                    format!("fs.patch edits are not serializable: {error}"),
-                )
-            })?;
-            let details = Some(json!({
-                "path_prefix": path_prefix,
-                "expected_base_sha256": expected_base,
-                "edits_sha256": engine::salted_binding_digest(
-                    "fspatch-edits-v1",
-                    &salt,
-                    &canonical_bytes
-                ),
-            }));
-            if args_contain_redaction_marker(args) {
-                let operation_id = engine::operation_id_for(&ctx.run.run_id, &node.id, call_id);
-                let state = ctx.journal.state();
-                let record = state.operation_records.get(&operation_id).cloned();
-                if let Some(result) = redacted_success_resend(record.as_ref()) {
-                    return Ok(AgentToolOutcome::Result(result));
-                }
-                let had_record = record.is_some();
-                match ctx.run.guard_external_operation(
-                    ctx.journal,
-                    node,
-                    "fs.patch",
-                    path,
-                    &details,
-                    call_id,
-                )? {
-                    engine::GuardDecision::Resend { result, .. } => {
-                        return Ok(AgentToolOutcome::Result(result));
-                    }
-                    engine::GuardDecision::Proceed { operation_id } => {
-                        if !had_record {
-                            ctx.run.finish_external_operation_with_warn(
-                                ctx.journal,
-                                node,
-                                &operation_id,
-                                engine::OperationOutcome::Indeterminate {
-                                    reason: format!(
-                                        "operation `{operation_id}` holds redacted patch content; refusing to re-execute without the original bytes"
-                                    ),
-                                },
-                            );
-                            return Err(StepError::Refused {
-                                node: node.id.clone(),
-                                message: format!(
-                                    "operation `{operation_id}` holds redacted patch content; refusing to re-execute without the original bytes"
-                                ),
-                            });
-                        }
-                    }
-                }
-                let operation_id = engine::operation_id_for(&ctx.run.run_id, &node.id, call_id);
-                ctx.run.finish_external_operation_with_warn(
-                    ctx.journal,
-                    node,
-                    &operation_id,
-                    engine::OperationOutcome::Indeterminate {
-                        reason: format!(
-                            "operation `{operation_id}` holds redacted patch content; refusing to re-execute without the original bytes"
-                        ),
-                    },
-                );
-                return Err(StepError::Refused {
-                    node: node.id.clone(),
-                    message: format!(
-                        "operation `{operation_id}` holds redacted patch content; refusing to re-execute without the original bytes"
-                    ),
-                });
-            }
-            // The model's own edit content is checked before the approval:
-            // a call that cannot apply must not spend the user's
-            // confirmation, and the failure belongs to the model, which can
-            // correct it by re-reading the file.
-            let edits = match files::parse_edits(&raw_edits) {
-                Ok(edits) => edits,
-                Err(error) => {
-                    // The operation never started, but the call still holds a
-                    // pending payload: release it so a retrying agent does
-                    // not accumulate one unredacted sidecar per attempt.
-                    ctx.run
-                        .clear_pending_tool_payload(&engine::operation_id_for(
-                            &ctx.run.run_id,
-                            &node.id,
-                            call_id,
-                        ));
-                    return Ok(AgentToolOutcome::Result(
-                        agent_fs_patch_rejection(path, &error).unwrap_or_else(
-                            || json!({ "file": path, "ok": false, "error": "patch_rejected" }),
-                        ),
+            let outcome =
+                execute_agent_fs_patch_call(ctx, node, name, call_id, args, path_prefix).await;
+            if outcome.is_err() {
+                // A call that never started must not leave its pending payload
+                // behind: a retrying agent would accumulate one unredacted
+                // sidecar per attempt.
+                ctx.run
+                    .clear_pending_tool_payload(&engine::operation_id_for(
+                        &ctx.run.run_id,
+                        &node.id,
+                        call_id,
                     ));
-                }
-            };
-            if let Some(confirm) = ctx.run.require_side_effect(
-                ctx.journal,
-                node,
-                "fs.patch",
-                path,
-                details.clone(),
-                call_id,
-            )? {
-                return Ok(AgentToolOutcome::NeedsConfirm(confirm));
             }
-            let operation_id = match ctx.run.guard_external_operation(
-                ctx.journal,
-                node,
-                "fs.patch",
-                path,
-                &details,
-                call_id,
-            )? {
-                engine::GuardDecision::Proceed { operation_id } => operation_id,
-                engine::GuardDecision::Resend { result, .. } => {
-                    return Ok(AgentToolOutcome::Result(result));
-                }
-            };
-            let limits = resolve_patch_limits(ctx, node)?;
-            return execute_agent_fs_patch(
-                ctx,
-                node,
-                path,
-                expected_base,
-                edits,
-                limits,
-                &operation_id,
-            )
-            .await;
+            outcome
         }
         ToolDecl::Command { command, .. } => {
             command::execute_command(ctx, node, call_id, command).await
@@ -3312,33 +3332,62 @@ mod approval_e2e {
                 "a rejected call must release its pending payload"
             );
         }
+        // A call the contract's limits refuse is fatal, but it is refused
+        // before the approval and it releases its payload too.
+        let too_many = json!({
+            "path": "notes/n.txt",
+            "expected_base_sha256": "abc",
+            "edits": (1..41)
+                .map(|index| json!({"op": "replace", "anchor": format!("{index}:015cadfe"), "lines": ["x"]}))
+                .collect::<Vec<_>>(),
+        });
+        run.store_pending_tool_payload(&node, &operation_id, &too_many)
+            .expect("pending payload should store");
+        let outcome = execute_agent_tool(
+            &mut ctx,
+            &node,
+            AgentToolServices {
+                runtime: &runtime,
+                guardrails: &[],
+            },
+            AgentToolInvocation {
+                mcp: &mcp,
+                tools: &tools,
+                name: "patch",
+                call_id: "call-1",
+                call_number: 0,
+                args: &too_many,
+                activated_skills: &mut activated,
+            },
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "a call the limits refuse must fail the node"
+        );
+        assert!(
+            run.load_pending_tool_payload(&node, &operation_id)
+                .expect("pending payload should read")
+                .is_none(),
+            "a refused call must release its pending payload"
+        );
     }
 
     #[test]
     fn patch_edits_canonicalize_independently_of_key_order() {
-        let first = json!({
-            "path": "notes.txt",
-            "expected_base_sha256": "abc",
-            "edits": [{"op": "replace", "anchor": "2:015cadfe", "lines": ["BETA"]}],
-        });
-        let second = json!({
-            "edits": [{"lines": ["BETA"], "anchor": "2:015cadfe", "op": "replace"}],
-            "expected_base_sha256": "abc",
-            "path": "notes.txt",
-        });
+        let first = json!([{"op": "replace", "anchor": "2:015cadfe", "lines": ["BETA"]}]);
+        let second = json!([{"lines": ["BETA"], "anchor": "2:015cadfe", "op": "replace"}]);
+        let first = raw_patch_edits(first.as_array().unwrap()).expect("first must validate");
+        let second = raw_patch_edits(second.as_array().unwrap()).expect("second must validate");
         assert_eq!(
             canonical_patch_edits(&first),
             canonical_patch_edits(&second),
             "key order must not fork the approval digest"
         );
-        let unknown = json!({
-            "path": "notes.txt",
-            "expected_base_sha256": "abc",
-            "edits": [{"op": "swap", "anchor": "2:015cadfe", "lines": ["x"]}],
-        });
+        let unknown = json!([{"op": "swap", "anchor": "2:015cadfe", "lines": ["x"]}]);
         assert!(
-            canonical_patch_edits(&unknown).is_none(),
-            "unknown ops must not canonicalize"
+            raw_patch_edits(unknown.as_array().unwrap()).is_err(),
+            "unknown ops must be refused"
         );
     }
 

@@ -4026,9 +4026,11 @@ against the current file contents.
   shape (a missing or unknown op, a missing anchor, missing or non-string
   lines), a malformed anchor, an empty edit list, two edits on one line, a
   stale anchor (with remaps), an anchor that names a missing line, and a
-  file that changed under the model. A call with the wrong shape is checked
-  before the approval, so it never spends the user's confirmation; the
-  failures only the patch itself can show are found when it applies. Limit
+  file that changed under the model. Everything the call itself determines
+  is checked before the approval — its shape, its anchors, its edit list,
+  and the contract's limits — so a call that cannot apply never spends the
+  user's confirmation; only the failures that need the file itself, such as
+  a stale anchor or a changed file, are found when the patch applies. Limit
   violations stay fatal, because no correction satisfies them.
 - `command`: a fixed `command`, plus an optional `input_schema`.
 - `http`: fixed `methods` and `hosts`, plus an optional `input_schema`.
