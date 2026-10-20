@@ -5,6 +5,19 @@ use api::{RunStatus, StartRun};
 use camino::Utf8Path;
 use std::time::{Duration, Instant};
 
+/// The elapsed budget the timing tests declare.
+///
+/// It must exceed the run's own queue and startup: a loaded runner spent
+/// 1.04 s there, so a one-second budget expired before the run reached the
+/// state under test.
+const ELAPSED_BUDGET_SECS: u64 = 3;
+
+/// The dwell that lets the wall-clock budget expire before the resume.
+///
+/// It must exceed the budget, or the wall-clock case would not prove that
+/// the expired budget is what stops the run.
+const ELAPSED_BUDGET_DWELL: Duration = Duration::from_millis(3500);
+
 fn generator(root: &Utf8Path, id: &str, delay: &str) {
     let dir = root.join(id);
     std::fs::create_dir_all(&dir).unwrap();
@@ -632,8 +645,6 @@ async fn elapsed_hitl_question_confirmation_restart_and_deployment_change() {
 id = "hitl"
 name = "Elapsed HITL"
 version = "0.1.0"
-[budget]
-max_elapsed_seconds = 1
 [[flow]]
 id = "ask"
 type = "ask_user"
@@ -655,7 +666,15 @@ side_effects_scope = "invocation"
 commands = [{ bin = "sh", args = ["-c", "echo effect > effect"], purpose = "probe", isolation = "trusted_host" }]
 [permissions.containers]
 enabled = false
-"#).unwrap();
+"#)
+        .unwrap();
+        let manifest = dir.join(contract::MANIFEST_FILE);
+        let text = std::fs::read_to_string(&manifest).unwrap();
+        std::fs::write(
+            manifest,
+            format!("{text}\n[budget]\nmax_elapsed_seconds = {ELAPSED_BUDGET_SECS}\n"),
+        )
+        .unwrap();
         let first = service(
             &root,
             ServiceDeploymentPolicy {
@@ -682,7 +701,7 @@ enabled = false
         }
         first.mark_shutting_down();
         drop(first);
-        tokio::time::sleep(Duration::from_millis(1150)).await;
+        tokio::time::sleep(ELAPSED_BUDGET_DWELL).await;
         // Restart with the opposite configuration: journal truth must win.
         let service = service(
             &root,
@@ -766,7 +785,7 @@ enabled = false
                 state.budget.elapsed.as_ref().unwrap().active_nanoseconds
                     >= before.budget.elapsed.unwrap().active_nanoseconds
             );
-            tokio::time::sleep(Duration::from_millis(1150)).await;
+            tokio::time::sleep(ELAPSED_BUDGET_DWELL).await;
             service
                 .confirm(
                     id.clone(),
@@ -906,7 +925,7 @@ async fn wall_clock_confirmation_dwell_counts_before_effects() {
         .replace("side_effects = \"allowed\"", "side_effects = \"confirm\"");
     std::fs::write(
         manifest,
-        format!("{text}\n[budget]\nmax_elapsed_seconds = 1\n"),
+        format!("{text}\n[budget]\nmax_elapsed_seconds = {ELAPSED_BUDGET_SECS}\n"),
     )
     .unwrap();
     let service = service(&root, ServiceDeploymentPolicy::default());
@@ -915,7 +934,7 @@ async fn wall_clock_confirmation_dwell_counts_before_effects() {
         .await
         .confirm
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(1150)).await;
+    tokio::time::sleep(ELAPSED_BUDGET_DWELL).await;
     service
         .confirm(
             id.clone(),

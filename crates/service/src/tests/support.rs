@@ -308,7 +308,10 @@ pub(crate) async fn wait_for_snapshot(
     id: &str,
     state: RunStatus,
 ) -> RunSnapshot {
-    for _ in 0..200 {
+    // A loaded runner can spend a second in the run's own startup, so the
+    // window has to outlast it: the state under test is reached after the
+    // run starts, not before.
+    for _ in 0..500 {
         let snapshot = service
             .snapshot(id.to_string())
             .await
