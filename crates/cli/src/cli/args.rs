@@ -400,8 +400,9 @@ pub(crate) enum RunsCommand {
         #[arg(long)]
         keep: Option<usize>,
         /// Retain up to this many newest failed runs, separate from --keep;
-        /// defaults to GC_KEEP_FAILED. The retention window recorded in a
-        /// run's journal overrides both count budgets.
+        /// defaults to GC_KEEP_FAILED. A retention window recorded in a run's
+        /// journal expires that run on its own: a run past its window is
+        /// collected even when the count budget would keep it.
         #[arg(long = "keep-failed")]
         keep_failed: Option<usize>,
         #[arg(long)]

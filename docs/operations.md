@@ -265,7 +265,8 @@ qcg runs gc --runs-dir /var/lib/qcg/runs --keep 50 --keep-failed 10 --delete
 
 GC never removes a non-terminal run. The first command is a dry run.
 
-Retention is count-based only; there is no byte or disk-usage ceiling in
+Retention is bounded by the count budgets and, when the contract declared
+one, the recorded retention window; there is no byte or disk-usage ceiling in
 mechanism. Size the `runs-dir` volume externally and export a run bundle
 (`qcg runs export`) before GC when audit evidence must survive deletion:
 deletion removes journals, FileValue content, and artifacts together.
