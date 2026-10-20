@@ -46,6 +46,11 @@ JSON event output go to stdout.
   `--input-file field=path`, optionally combined with extra `--input` values
   for re-editing. See `fixtures/generators/package-reinput` for the
   file-plus-command expansion pattern.
+  A retention sweep runs before the run starts and may delete run directories
+  from `.data/runs` that fall outside the retention budget, so it removes
+  data without asking. It prints nothing on stdout (stdout carries the run's
+  output) and a one-line summary on stderr when it removes something.
+  `AUTO_GC=0` skips it. See [run retention](operations.md#run-retention).
 - `qcg list [--generators-dir dir]` lists available packages from the installed
   directory and the bundled generator directory. Installed IDs take precedence.
 - `qcg models [--json] [--refresh]` lists the selectable LLM providers, models,
@@ -164,13 +169,15 @@ JSON event output go to stdout.
 - `qcg runs trace <id> [--runs-dir dir] [--output trace.json]
   [--otlp-endpoint URL]` builds hierarchical run/step/event spans and writes or
   exports an OTLP JSON trace.
-- `qcg runs gc [--runs-dir dir] [--keep 50] [--keep-failed 10] [--delete]`
+- `qcg runs gc [--runs-dir dir] [--keep N] [--keep-failed N] [--delete]`
 
 GC is a dry run without `--delete` and never removes a non-terminal run.
-`--keep` (default `50`) retains the newest nonfailed terminal runs (success,
-canceled, or interrupted). Failed runs do not consume that budget and are
-governed only by the separate `--keep-failed` budget (default `10`). Contract
-retention expiry overrides either count budget. A sweep with
+`--keep` retains the newest nonfailed terminal runs (success, canceled, or
+interrupted). Failed runs do not consume that budget and are governed only by
+the separate `--keep-failed` budget. Both default to the deployment policy
+(`GC_KEEP`, default `50`, and `GC_KEEP_FAILED`, default `10`); an explicit
+count overrides the policy for that sweep. The retention window recorded in a
+run's journal overrides either count budget. A sweep with
 `--keep 50 --keep-failed 10` may retain up to 50 nonfailed terminal runs plus
 10 failed runs.
 
@@ -229,7 +236,9 @@ use of the same output directory.
 ## Environment variables
 
 - `RUST_LOG`: tracing filter, for example `qcg=debug,engine=trace`.
-- `AUTO_GC=0|false|off`: disable serve's periodic retention task.
+- `AUTO_GC=0|false|off`: disable every automatic retention sweep — `qcg
+  serve`'s periodic task and the sweep that precedes `qcg run`. The manual
+  `qcg runs gc` sweep is not automatic and still runs.
 - `MAX_ACTIVE_RUNS`: maximum concurrently executing API runs for `qcg serve`
   (default `8`).
 - `RUN_STORE`: `exclusive` or `shared-filesystem`.
@@ -295,12 +304,14 @@ use of the same output directory.
   `--api-token` / `API_TOKEN` wins when set; an unreadable or empty file
   refuses boot instead of starting unauthenticated.
 - `GC_KEEP` (default `50`), `GC_KEEP_FAILED` (default `10`), and
-  `GC_INTERVAL_SECS` (default `86400`, minimum `60`): automatic retention
-  counts and cadence for `qcg serve`. `GC_KEEP` counts newest nonfailed
-  terminal runs (success, canceled, interrupted); failed runs do not consume
-  it and are governed only by the separate `GC_KEEP_FAILED` count. Contract
-  retention expiry overrides either count budget. Invalid or zero values
-  refuse boot.
+  `GC_INTERVAL_SECS` (default `86400`, minimum `60`): retention counts and
+  the cadence of `qcg serve`'s retention task. The counts apply to every
+  sweep — the periodic task, the sweep that precedes `qcg run`, and the
+  manual `qcg runs gc` (whose `--keep`/`--keep-failed` override them).
+  `GC_KEEP` counts newest nonfailed terminal runs (success, canceled,
+  interrupted); failed runs do not consume it and are governed only by the
+  separate `GC_KEEP_FAILED` count. The retention window recorded in a run's
+  journal overrides either count budget. Invalid or zero values refuse boot.
 - `AUDIT_FLOOR=minimal|standard`: deployment audit floor. `standard`
   restores full observation-record persistence for every run regardless of the
   contract's `[audit]` policy; a floor can only raise persistence.

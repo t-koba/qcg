@@ -395,12 +395,15 @@ pub(crate) enum RunsCommand {
     Gc {
         #[arg(long = "runs-dir", default_value = ".data/runs")]
         runs_dir: Utf8PathBuf,
-        #[arg(long, default_value_t = 50)]
-        keep: usize,
+        /// Retain up to this many newest terminal runs; defaults to GC_KEEP.
+        /// An explicit count overrides the deployment policy.
+        #[arg(long)]
+        keep: Option<usize>,
         /// Retain up to this many newest failed runs, separate from --keep;
-        /// contract retention expiry overrides both count budgets.
-        #[arg(long = "keep-failed", default_value_t = 10)]
-        keep_failed: usize,
+        /// defaults to GC_KEEP_FAILED. The retention window recorded in a
+        /// run's journal overrides both count budgets.
+        #[arg(long = "keep-failed")]
+        keep_failed: Option<usize>,
         #[arg(long)]
         delete: bool,
     },

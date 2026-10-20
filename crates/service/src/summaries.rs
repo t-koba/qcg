@@ -6,7 +6,8 @@ mod runs;
 mod state;
 mod summary;
 
-pub(crate) use gc::*;
+pub use gc::gc_run_directories;
+pub(crate) use gc::run_identity_event;
 pub use lists::*;
 pub use metrics::*;
 pub use reads::*;

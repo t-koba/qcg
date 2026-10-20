@@ -241,6 +241,34 @@ pub fn parse_bool_env(name: &str, default: bool) -> Result<bool, String> {
     }
 }
 
+/// Strict bounded-integer env parse: out-of-range and unparseable values
+/// refuse boot with the variable name, its bounds, and the actual value.
+pub fn parse_bounded_env(name: &str, default: u64, min: u64, max: u64) -> Result<u64, String> {
+    match std::env::var(name) {
+        Err(_) => Ok(default),
+        Ok(value) => match value.parse::<u64>() {
+            Ok(parsed) if (min..=max).contains(&parsed) => Ok(parsed),
+            _ => Err(format!(
+                "invalid {name} `{value}`: must be an integer between {min} and {max}"
+            )),
+        },
+    }
+}
+
+/// Strict positive-integer env parse: invalid, zero, and negative values
+/// refuse boot with an error naming the variable (E04).
+pub fn parse_positive_env(name: &str, default: usize) -> Result<usize, String> {
+    match std::env::var(name) {
+        Err(_) => Ok(default),
+        Ok(value) => match value.parse::<usize>() {
+            Ok(parsed) if parsed >= 1 => Ok(parsed),
+            _ => Err(format!(
+                "invalid {name} `{value}`: must be an integer of at least 1"
+            )),
+        },
+    }
+}
+
 #[cfg(test)]
 mod bool_env_tests {
     use super::env_process;

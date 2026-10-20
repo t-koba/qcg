@@ -35,15 +35,20 @@ const MAIN_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) struct CliDeployment {
     providers_path: Option<Utf8PathBuf>,
     container_timeouts: policy::ContainerTimeouts,
+    /// Retention budget every sweep path applies, resolved once.
+    retention: policy::RetentionPolicy,
 }
 
 impl CliDeployment {
     fn from_env(providers_path: Option<Utf8PathBuf>) -> Result<Self> {
         let container_timeouts =
             policy::ContainerTimeouts::from_env().map_err(anyhow::Error::msg)?;
+        let retention = policy::RetentionPolicy::from_env()
+            .map_err(|detail| anyhow::anyhow!("invalid GC configuration: {detail}"))?;
         Ok(Self {
             providers_path,
             container_timeouts,
+            retention,
         })
     }
 
@@ -51,6 +56,7 @@ impl CliDeployment {
         Self {
             providers_path,
             container_timeouts: policy::ContainerTimeouts::default(),
+            retention: policy::RetentionPolicy::default(),
         }
     }
 }
@@ -72,6 +78,9 @@ pub(crate) fn local_cli_service(
         service::RunStoreMode::Exclusive,
         service::ServiceDeploymentPolicy {
             container_timeouts: deployment.container_timeouts,
+            gc_keep: deployment.retention.keep,
+            gc_keep_failed: deployment.retention.keep_failed,
+            max_directory_scan_entries: deployment.retention.max_scan_entries,
             ..service::ServiceDeploymentPolicy::default()
         }
         .with_scheduling_env()
@@ -207,8 +216,9 @@ async fn run_async() -> Result<std::process::ExitCode> {
             }
             let runs_dir = Utf8PathBuf::from(".data/runs");
             let deployment = CliDeployment::from_env(providers_path.clone())?;
-            let service = local_cli_service(Utf8PathBuf::new(), runs_dir.clone(), deployment)?;
-            auto_gc_runs(&runs_dir)?;
+            let service =
+                local_cli_service(Utf8PathBuf::new(), runs_dir.clone(), deployment.clone())?;
+            auto_gc_runs(&runs_dir, &deployment.retention)?;
             let run = DirectRun {
                 generator_path: generator,
                 inputs,
@@ -424,7 +434,13 @@ async fn run_async() -> Result<std::process::ExitCode> {
                 keep,
                 keep_failed,
                 delete,
-            } => gc_runs(&runs_dir, keep, keep_failed, delete)?,
+            } => {
+                // The manual sweep resolves the same policy the deployment
+                // uses; an explicit count overrides it.
+                let policy = policy::RetentionPolicy::from_env()
+                    .map_err(|detail| anyhow::anyhow!("invalid GC configuration: {detail}"))?;
+                gc_runs(&runs_dir, &policy, keep, keep_failed, delete)?
+            }
             RunsCommand::Invalidate {
                 id,
                 runs_dir,
@@ -688,6 +704,8 @@ async fn run_async() -> Result<std::process::ExitCode> {
         } => {
             let container_timeouts =
                 policy::ContainerTimeouts::from_env().map_err(anyhow::Error::msg)?;
+            let retention = policy::RetentionPolicy::from_env()
+                .map_err(|detail| anyhow::anyhow!("invalid GC configuration: {detail}"))?;
             let config = server::ServerConfig {
                 providers_path,
                 extra_generators_dirs: bundled_generators_root()
@@ -714,6 +732,7 @@ async fn run_async() -> Result<std::process::ExitCode> {
                 watch_interval_ms,
                 eval,
                 container_timeouts,
+                retention,
             )
             .await?;
         }
@@ -798,7 +817,6 @@ mod tests {
     use crate::cli::eval::{
         EvalCase, EvalCaseReport, EvalSuite, percentile_u64, summarize_eval_cases,
     };
-    use crate::cli::gc::gc_runs_impl;
     use crate::cli::install::{CleanupPaths, commit_install, verify_package_bytes};
     use crate::cli::plan::{plan_command_allowed, read_bounded_confirmation};
     use crate::cli::replay::replay_seed_from_journal;
@@ -811,6 +829,14 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs::File;
     use uuid::Uuid;
+
+    #[cfg(test)]
+    mod env_process {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/test-support/environment.rs"
+        ));
+    }
 
     #[test]
     fn usd_formatting_and_pricing_lookup_cover_display_cases() {
@@ -922,75 +948,16 @@ params = { content = "x", output_file = "x.txt" }
     }
 
     #[test]
-    fn silent_gc_honors_retention_days_without_reporting() {
-        let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
-            .expect("temporary directory should be UTF-8")
-            .join(format!("cli-gc-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let runs_dir = root.join("runs");
-        let run_dir = runs_dir.join("old-run");
-        let generator_dir = root.join("generator");
-        std::fs::create_dir_all(run_meta_dir(&run_dir))
-            .expect("run metadata directory should be created");
-        std::fs::create_dir_all(&generator_dir).expect("generator directory should be created");
-        std::fs::write(
-            generator_dir.join(contract::MANIFEST_FILE),
-            r#"
-[generator]
-id = "gc-fixture"
-name = "GC Fixture"
-version = "0.1.0"
+    fn automatic_sweep_honors_the_journal_recorded_expiry_and_the_resolved_counts() {
+        if env_process::isolated() {
+            return;
+        }
+        // SAFETY: the isolated child process owns this environment.
+        unsafe {
+            std::env::set_var("AUTO_GC", "true");
+        }
 
-[[flow]]
-id = "noop"
-type = "write"
-
-[flow.params]
-output_file = "noop.txt"
-content = "noop"
-
-[retention]
-days = 0
-
-[outputs]
-extras = []
-"#,
-        )
-        .expect("generator manifest should be written");
-        let journal = engine::JournalWriter::create(
-            &run_meta_dir(&run_dir).join("journal.jsonl"),
-            "old-run",
-            false,
-            None,
-        )
-        .expect("journal should be created");
-        journal
-            .event(
-                "run_started",
-                json!({
-                    "generator": "gc-fixture",
-                    "generator_path": generator_dir,
-                    "contract_sha256": "fixture",
-                    "inputs": {},
-                    "resource_hashes": [],
-                    "schema_version": 1,
-                    "retention_days": 0,
-                }),
-            )
-            .expect("run should start");
-        journal
-            .event("run_finished", json!({ "status": "success" }))
-            .expect("run should finish");
-
-        gc_runs_impl(&runs_dir, 50, 10, true, false).expect("silent GC should run");
-
-        assert!(!run_dir.exists());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn gc_includes_interrupted_in_counts_and_expiry() {
-        fn write_success(run_dir: &Utf8PathBuf, retention_days: u64) {
+        fn write_run(run_dir: &Utf8PathBuf, retention_days: u64) {
             std::fs::create_dir_all(run_meta_dir(run_dir))
                 .expect("run metadata directory should be created");
             let run_id = run_dir.file_name().expect("run should have a name");
@@ -1020,75 +987,33 @@ extras = []
                 .expect("run should finish");
         }
 
-        fn write_interrupted(run_dir: &Utf8PathBuf, retention_days: u64) {
-            std::fs::create_dir_all(run_meta_dir(run_dir))
-                .expect("run metadata directory should be created");
-            let run_id = run_dir.file_name().expect("run should have a name");
-            let journal = engine::JournalWriter::create(
-                &run_meta_dir(run_dir).join("journal.jsonl"),
-                run_id,
-                false,
-                None,
-            )
-            .expect("journal should be created");
-            journal
-                .event(
-                    "run_started",
-                    json!({
-                        "generator": "gc-fixture",
-                        "generator_path": "gc-fixture",
-                        "contract_sha256": "fixture",
-                        "inputs": {},
-                        "resource_hashes": [],
-                        "schema_version": 1,
-                        "retention_days": retention_days,
-                    }),
-                )
-                .expect("run should start");
-            journal
-                .event(
-                    "run_interrupted",
-                    json!({
-                        "reason": {"code": "interrupted", "message": "service shutdown"},
-                    }),
-                )
-                .expect("run should interrupt");
-        }
-
         let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
             .expect("temporary directory should be UTF-8")
-            .join(format!("cli-gc-interrupted-test-{}", Uuid::now_v7()));
+            .join(format!("cli-gc-test-{}", Uuid::now_v7()));
         let _ = std::fs::remove_dir_all(&root);
+        let runs_dir = root.join("runs");
+        let expired = runs_dir.join("expired-run");
+        let fresh = runs_dir.join("fresh-run");
+        write_run(&expired, 0);
+        write_run(&fresh, 365);
+        // The journal decides expiry; the counts only decide what survives
+        // inside the budget.
+        let policy = policy::RetentionPolicy {
+            keep: 1,
+            keep_failed: 0,
+            max_scan_entries: 16,
+        };
 
-        // Counts: with no keep budget every terminal run goes, including
-        // interrupted ones that the server GC already collects.
-        let counted = root.join("counted");
-        write_success(&counted.join("success"), 365);
-        write_interrupted(&counted.join("interrupted"), 365);
-        gc_runs_impl(&counted, 0, 0, true, false).expect("counted GC should run");
-        assert!(
-            !counted.join("interrupted").exists(),
-            "interrupted runs count against keep like any other terminal run"
-        );
-        assert!(
-            !counted.join("success").exists(),
-            "success runs are deleted when keep is zero"
-        );
+        auto_gc_runs(&runs_dir, &policy).expect("the automatic sweep should run");
 
-        // Expiry: a run past its retention window goes even inside keep.
-        let expiring = root.join("expiring");
-        write_success(&expiring.join("success-new"), 365);
-        write_interrupted(&expiring.join("interrupted-expired"), 0);
-        gc_runs_impl(&expiring, 50, 10, true, false).expect("expiring GC should run");
         assert!(
-            !expiring.join("interrupted-expired").exists(),
-            "an expired interrupted run is deleted regardless of keep counts"
+            !expired.exists(),
+            "a run past its journal-recorded expiry is collected"
         );
         assert!(
-            expiring.join("success-new").is_dir(),
-            "a fresh success run stays inside keep"
+            fresh.is_dir(),
+            "a fresh run inside the keep budget survives"
         );
-
         let _ = std::fs::remove_dir_all(&root);
     }
 

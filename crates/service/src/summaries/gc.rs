@@ -15,14 +15,19 @@ pub(crate) fn run_identity_event<'a>(
         .ok_or_else(|| ServiceError::Invalid(format!("run `{run_dir}` has no run identity event")))
 }
 
-/// Deletes expired or over-retention terminal runs.
+/// Selects the terminal runs a retention sweep collects.
 ///
 /// Successful, canceled, and interrupted runs consume `keep`; failed runs
 /// consume only the separate `keep_failed` post-mortem budget, mirroring
-/// `runs gc`. A run past its contract `[retention].days` window is
-/// always deleted regardless of the counts. Unreadable or malformed
-/// candidates are logged and left untouched without stopping the sweep.
-pub(crate) fn gc_run_directories(
+/// `runs gc`. A run past its journal-recorded retention window is always
+/// selected regardless of the counts. Unreadable or malformed candidates
+/// are logged and left untouched without stopping the sweep.
+///
+/// The returned directories are the selected runs, and their meaning depends
+/// on the mode: in delete mode they are the directories removed successfully,
+/// in dry-run mode they are the candidates the sweep would remove. A removal
+/// that fails is an error, never a reported removal.
+pub fn gc_run_directories(
     runs_dir: &Utf8Path,
     keep: usize,
     keep_failed: usize,
@@ -118,7 +123,7 @@ pub(crate) fn gc_run_directories(
         candidates.push((started_at, path));
     }
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
-    let mut deleted = Vec::new();
+    let mut selected = Vec::new();
     let mut kept_non_failed = 0_usize;
     let mut kept_failed = 0_usize;
     for (started_at, path) in candidates {
@@ -181,10 +186,10 @@ pub(crate) fn gc_run_directories(
         }
         if delete {
             std::fs::remove_dir_all(&path)?;
-            deleted.push(path);
         }
+        selected.push(path);
     }
-    Ok(deleted)
+    Ok(selected)
 }
 
 #[cfg(test)]
@@ -230,6 +235,30 @@ mod tests {
         );
         assert!(admission_owned.exists());
         assert!(older.exists());
+    }
+
+    #[test]
+    fn dry_run_reports_candidates_without_removing_them() {
+        let root = crate::tests::support::temp_run_dir("gc-dry-run");
+        std::fs::create_dir_all(&root).expect("temp root should be created");
+        let _temp = crate::tests::support::TempGuard(root.clone());
+        let stamp =
+            |minutes| (chrono::Utc::now() - chrono::Duration::minutes(minutes)).to_rfc3339();
+        let expired = root.join("expired");
+        let kept = root.join("kept");
+        write_run(&expired, "success", &stamp(1), Some(0));
+        write_run(&kept, "success", &stamp(2), None);
+        let selected = gc_run_directories(&root, 1, 0, false, 16).unwrap();
+        assert_eq!(
+            selected,
+            vec![expired.clone()],
+            "a dry run reports the candidate it would remove"
+        );
+        assert!(
+            expired.is_dir(),
+            "a dry run must not remove the candidate it reports"
+        );
+        assert!(kept.is_dir(), "a kept run stays in the store");
     }
 
     #[test]

@@ -108,6 +108,7 @@ pub(crate) async fn run_dev(
     watch_interval_ms: u64,
     eval_generator: Option<String>,
     container_timeouts: policy::ContainerTimeouts,
+    retention: policy::RetentionPolicy,
 ) -> Result<()> {
     if watch_interval_ms == 0 {
         anyhow::bail!("watch interval must be greater than zero");
@@ -120,6 +121,7 @@ pub(crate) async fn run_dev(
             crate::CliDeployment {
                 providers_path: config.providers_path.clone(),
                 container_timeouts,
+                retention,
             },
             generator_id,
         )

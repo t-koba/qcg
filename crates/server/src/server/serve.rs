@@ -186,46 +186,42 @@ pub fn resolve_server_policy_with_container_timeouts(
     let metrics_policy = super::middleware::resolve_metrics_policy()
         .map_err(|detail| format!("invalid metrics configuration: {detail}"))?;
     let otlp = super::otlp::resolve_otlp_config()?;
-    // Retention sweep policy: strict positive integers, resolved once.
-    let live_event_channel_capacity = usize::try_from(parse_bounded_env(
+    // Bounded store knobs: strict positive integers, resolved once.
+    let live_event_channel_capacity = usize::try_from(policy::parse_bounded_env(
         "LIVE_EVENT_CHANNEL_CAPACITY",
         policy::LIVE_EVENT_CHANNEL_CAPACITY as u64,
         policy::MIN_LIVE_EVENT_CHANNEL_CAPACITY as u64,
         policy::MAX_LIVE_EVENT_CHANNEL_CAPACITY as u64,
     )?)
     .map_err(|_| "LIVE_EVENT_CHANNEL_CAPACITY is not representable".to_string())?;
-    let journal_poll_interval_millis = parse_bounded_env(
+    let journal_poll_interval_millis = policy::parse_bounded_env(
         "JOURNAL_POLL_INTERVAL_MS",
         policy::JOURNAL_POLL_INTERVAL_MILLIS,
         policy::MIN_JOURNAL_POLL_INTERVAL_MILLIS,
         policy::MAX_JOURNAL_POLL_INTERVAL_MILLIS,
     )?;
-    let max_directory_scan_entries = usize::try_from(parse_bounded_env(
-        "MAX_DIRECTORY_SCAN_ENTRIES",
-        policy::DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES as u64,
-        policy::MIN_DIRECTORY_SCAN_ENTRIES as u64,
-        policy::MAX_DIRECTORY_SCAN_ENTRIES as u64,
-    )?)
-    .map_err(|_| "MAX_DIRECTORY_SCAN_ENTRIES is not representable".to_string())?;
-    let shared_store_rescan_secs = parse_bounded_env(
+    // Retention sweep policy: one budget resolved from one place, so every
+    // sweep path keeps the same counts and the same store scan bound.
+    let retention = policy::RetentionPolicy::from_env()?;
+    let shared_store_rescan_secs = policy::parse_bounded_env(
         "SHARED_RESCAN_SECS",
         5,
         policy::MIN_STORE_RESCAN_SECS,
         policy::MAX_STORE_RESCAN_SECS,
     )?;
-    let queued_resumer_secs = parse_bounded_env(
+    let queued_resumer_secs = policy::parse_bounded_env(
         "QUEUED_RESUMER_SECS",
         5,
         policy::MIN_STORE_RESCAN_SECS,
         policy::MAX_STORE_RESCAN_SECS,
     )?;
-    let shutdown_drain = std::time::Duration::from_secs(parse_bounded_env(
+    let shutdown_drain = std::time::Duration::from_secs(policy::parse_bounded_env(
         "SHUTDOWN_DRAIN_SECS",
         30,
         policy::MIN_SHUTDOWN_PHASE_SECS,
         policy::MAX_SHUTDOWN_PHASE_SECS,
     )?);
-    let shutdown_settle = std::time::Duration::from_secs(parse_bounded_env(
+    let shutdown_settle = std::time::Duration::from_secs(policy::parse_bounded_env(
         "SHUTDOWN_SETTLE_SECS",
         150,
         policy::MIN_SHUTDOWN_PHASE_SECS,
@@ -246,9 +242,7 @@ pub fn resolve_server_policy_with_container_timeouts(
         },
     };
     let read_cache_max_bytes =
-        parse_positive_env("READ_CACHE_MAX_BYTES", policy::DEFAULT_READ_CACHE_BYTES)?;
-    let gc_keep = parse_positive_env("GC_KEEP", policy::DEFAULT_GC_KEEP)?;
-    let gc_keep_failed = parse_positive_env("GC_KEEP_FAILED", policy::DEFAULT_GC_KEEP_FAILED)?;
+        policy::parse_positive_env("READ_CACHE_MAX_BYTES", policy::DEFAULT_READ_CACHE_BYTES)?;
     let gc_interval_secs = match std::env::var("GC_INTERVAL_SECS") {
         Err(_) => policy::DEFAULT_GC_INTERVAL_SECS,
         Ok(value) => match value.parse::<u64>() {
@@ -359,46 +353,18 @@ pub fn resolve_server_policy_with_container_timeouts(
         rate_limit,
         audit_floor,
         otlp,
-        gc_keep,
-        gc_keep_failed,
+        gc_keep: retention.keep,
+        gc_keep_failed: retention.keep_failed,
         gc_interval_secs,
         max_parallel_steps,
         live_event_channel_capacity,
         journal_poll_interval_millis,
-        max_directory_scan_entries,
+        max_directory_scan_entries: retention.max_scan_entries,
         shared_store_rescan_secs,
         queued_resumer_secs,
         shutdown_drain,
         shutdown_settle,
     })
-}
-
-/// Strict bounded-integer env parse: out-of-range and unparseable values
-/// refuse boot with the variable name, its bounds, and the actual value.
-fn parse_bounded_env(name: &str, default: u64, min: u64, max: u64) -> Result<u64, String> {
-    match std::env::var(name) {
-        Err(_) => Ok(default),
-        Ok(value) => match value.parse::<u64>() {
-            Ok(parsed) if (min..=max).contains(&parsed) => Ok(parsed),
-            _ => Err(format!(
-                "invalid {name} `{value}`: must be an integer between {min} and {max}"
-            )),
-        },
-    }
-}
-
-/// Strict positive-integer env parse: invalid, zero, and negative values
-/// refuse boot with an error naming the variable (E04).
-fn parse_positive_env(name: &str, default: usize) -> Result<usize, String> {
-    match std::env::var(name) {
-        Err(_) => Ok(default),
-        Ok(value) => match value.parse::<usize>() {
-            Ok(parsed) if parsed >= 1 => Ok(parsed),
-            _ => Err(format!(
-                "invalid {name} `{value}`: must be an integer of at least 1"
-            )),
-        },
-    }
 }
 
 pub(crate) async fn serve_with_resolved_policy_and_deadline(

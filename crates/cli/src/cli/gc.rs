@@ -1,30 +1,28 @@
 use anyhow::{Context, Result};
-use camino::{Utf8Path, Utf8PathBuf};
-use contract::Contract;
-use policy::MAX_DIRECTORY_SCAN_ENTRIES;
-use service::{run_meta_dir, run_summary};
+use camino::Utf8Path;
 
+/// Manual retention sweep behind `qcg runs gc`.
+///
+/// The sweep mechanism belongs to the service: this adapter resolves the
+/// budget, serializes a destructive pass against the store maintenance
+/// lock, and reports the runs the sweep selected.
 pub(crate) fn gc_runs(
     runs_dir: &Utf8Path,
-    keep: usize,
-    keep_failed: usize,
+    policy: &policy::RetentionPolicy,
+    keep: Option<usize>,
+    keep_failed: Option<usize>,
     delete: bool,
 ) -> Result<()> {
-    gc_runs_impl(runs_dir, keep, keep_failed, delete, true)
-}
-
-pub(crate) fn gc_runs_impl(
-    runs_dir: &Utf8Path,
-    keep: usize,
-    keep_failed: usize,
-    delete: bool,
-    report: bool,
-) -> Result<()> {
-    // Store lease first, held through scan and removal. Missing stores are
-    // not created by cleanup.
+    // An explicit count overrides the resolved policy; an unset count keeps
+    // the value the deployment resolved.
+    let policy = policy.with_counts(keep, keep_failed);
+    // Cleanup never creates a store that is not there.
     if !runs_dir.exists() {
         return Ok(());
     }
+    // A destructive pass holds the store maintenance lock so two sweeps
+    // never collect the same run. A dry run removes nothing, so it needs no
+    // lock.
     let _maintenance = if delete {
         Some(
             service::try_lock_store_maintenance(runs_dir)?
@@ -33,188 +31,90 @@ pub(crate) fn gc_runs_impl(
     } else {
         None
     };
-    let entries = match std::fs::read_dir(runs_dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    let now = chrono::Utc::now();
-    let mut runs: Vec<RunGcCandidate> = Vec::new();
-    let mut scanned = 0_usize;
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                scanned = scanned.saturating_add(1);
-                if scanned > MAX_DIRECTORY_SCAN_ENTRIES {
-                    anyhow::bail!(
-                        "runs directory contains more than {MAX_DIRECTORY_SCAN_ENTRIES} entries"
-                    );
-                }
-                eprintln!("warning: skipping unreadable runs-directory entry during GC: {error}");
-                continue;
-            }
-        };
-        if entry
-            .file_name()
-            .to_str()
-            .is_some_and(|name| name == ".maintenance.lock")
-        {
-            continue;
-        }
-        scanned = scanned.saturating_add(1);
-        if scanned > MAX_DIRECTORY_SCAN_ENTRIES {
-            anyhow::bail!("runs directory contains more than {MAX_DIRECTORY_SCAN_ENTRIES} entries");
-        }
-        let path = match Utf8PathBuf::from_path_buf(entry.path()) {
-            Ok(path) => path,
-            Err(path) => {
-                eprintln!(
-                    "warning: skipping run with non-UTF-8 path during GC: {}",
-                    path.display()
-                );
-                continue;
-            }
-        };
-        let metadata = match std::fs::metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                eprintln!("warning: skipping unreadable run candidate `{path}` during GC: {error}");
-                continue;
-            }
-        };
-        if !metadata.is_dir() {
-            continue;
-        }
-        let journal_path = run_meta_dir(&path).join("journal.jsonl");
-        match std::fs::metadata(&journal_path) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                eprintln!(
-                    "warning: skipping run with unreadable journal `{journal_path}` during GC: {error}"
-                );
-                continue;
-            }
-        }
-        let summary = match run_summary(&path) {
-            Ok(summary) => summary,
-            Err(error) => {
-                eprintln!(
-                    "warning: skipping run with unreadable or corrupt journal/summary `{path}` during GC: {error}"
-                );
-                continue;
-            }
-        };
-        if !matches!(
-            summary.status.as_str(),
-            "success" | "failed" | "canceled" | "interrupted"
-        ) {
-            continue;
-        }
-        let retention_days = match run_retention_days(&summary) {
-            Ok(retention_days) => retention_days,
-            Err(error) => {
-                eprintln!(
-                    "warning: skipping run with invalid retention metadata `{path}` during GC: {error:#}"
-                );
-                continue;
-            }
-        };
-        let started_at = match chrono::DateTime::parse_from_rfc3339(&summary.started_at) {
-            Ok(started_at) => started_at.with_timezone(&chrono::Utc),
-            Err(error) => {
-                eprintln!(
-                    "warning: skipping run with invalid timestamp `{path}` during GC: {error}"
-                );
-                continue;
-            }
-        };
-        let expired_by_retain = retention_days.is_some_and(|days| {
-            chrono::Duration::try_days(i64::from(days))
-                .and_then(|duration| now.checked_sub_signed(duration))
-                .is_some_and(|cutoff| started_at < cutoff)
-        });
-        runs.push(RunGcCandidate {
-            started_at,
-            status: summary.status,
-            path,
-            expired_by_retain,
-        });
-    }
-    runs.sort_by_key(|run| std::cmp::Reverse(run.started_at));
-    let mut kept_non_failed = 0_usize;
-    let mut kept_failed = 0_usize;
-    for run in runs {
-        let is_failed = run.status == "failed";
-        let keep_candidate = if !run.expired_by_retain && is_failed && kept_failed < keep_failed {
-            kept_failed += 1;
-            true
-        } else if !run.expired_by_retain && !is_failed && kept_non_failed < keep {
-            kept_non_failed += 1;
-            true
-        } else {
-            false
-        };
-        if keep_candidate {
-            continue;
-        }
+    let selected = service::gc_run_directories(
+        runs_dir,
+        policy.keep,
+        policy.keep_failed,
+        delete,
+        policy.max_scan_entries,
+    )?;
+    for path in selected {
         if delete {
-            std::fs::remove_dir_all(&run.path)
-                .with_context(|| format!("failed to remove run directory `{}`", run.path))?;
-            if report {
-                println!("deleted {}", run.path);
-            }
-        } else if report {
-            println!("would_delete {}", run.path);
+            println!("deleted {path}");
+        } else {
+            println!("would_delete {path}");
         }
     }
     Ok(())
 }
 
-pub(crate) fn auto_gc_runs(runs_dir: &Utf8Path) -> Result<()> {
+/// Automatic retention sweep that precedes `qcg run`.
+///
+/// It stays silent on stdout because stdout carries the run's JSON output;
+/// removals are summarized on stderr.
+pub(crate) fn auto_gc_runs(runs_dir: &Utf8Path, policy: &policy::RetentionPolicy) -> Result<()> {
     let enabled = policy::parse_bool_env("AUTO_GC", true)
         .map_err(|detail| anyhow::anyhow!("invalid GC configuration: {detail}"))?;
-    if enabled {
-        gc_runs_impl(runs_dir, 50, 10, true, false)?;
+    if !enabled {
+        return Ok(());
+    }
+    // Cleanup never creates a store that is not there.
+    if !runs_dir.exists() {
+        return Ok(());
+    }
+    // A busy store means another holder is already maintaining it. The
+    // automatic sweep skips instead of failing the run it precedes.
+    let _maintenance = match service::try_lock_store_maintenance(runs_dir)? {
+        Some(lock) => lock,
+        None => return Ok(()),
+    };
+    let removed = service::gc_run_directories(
+        runs_dir,
+        policy.keep,
+        policy.keep_failed,
+        true,
+        policy.max_scan_entries,
+    )?;
+    if !removed.is_empty() {
+        eprintln!(
+            "retention: removed {} run(s) from {runs_dir}",
+            removed.len()
+        );
     }
     Ok(())
-}
-
-struct RunGcCandidate {
-    started_at: chrono::DateTime<chrono::Utc>,
-    status: String,
-    path: Utf8PathBuf,
-    expired_by_retain: bool,
-}
-
-fn run_retention_days(summary: &service::RunSummary) -> Result<Option<u32>> {
-    if summary.retention_days.is_some() {
-        return Ok(summary.retention_days);
-    }
-    let contract =
-        Contract::load(Utf8PathBuf::from(&summary.generator_path)).with_context(|| {
-            format!(
-                "failed to load generator contract `{}` for run `{}` retention",
-                summary.generator_path, summary.run_id
-            )
-        })?;
-    Ok(contract.manifest.retention.days)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use camino::Utf8PathBuf;
+    use service::run_meta_dir;
 
-    fn write_run(run_dir: &Utf8Path, status: &str, started_at: &str, retention_days: u32) {
+    fn write_run(run_dir: &Utf8Path, status: &str, started_at: &str, retention_days: Option<u32>) {
         std::fs::create_dir_all(run_meta_dir(run_dir)).expect("meta dir should be created");
         let trace = "ab".repeat(16);
         let run_id = run_dir.file_name().unwrap_or("run");
-        let lines = format!(
-            "{{\"t\":\"run_started\",\"seq\":1,\"ts\":\"{started_at}\",\"run_id\":\"{run_id}\",\"trace_id\":\"{trace}\",\"span_id\":\"cd01\",\"generator\":\"gc@0.1.0\",\"generator_path\":\"gc\",\"contract_sha256\":\"abc\",\"inputs\":{{}},\"resource_hashes\":[],\"schema_version\":1,\"retention_days\":{retention_days}}}\n{{\"t\":\"run_finished\",\"seq\":2,\"ts\":\"{started_at}\",\"run_id\":\"{run_id}\",\"trace_id\":\"{trace}\",\"span_id\":\"cd02\",\"status\":\"{status}\",\"failures\":[],\"metrics\":{{}}}}\n"
+        let retain = retention_days
+            .map(|days| format!(",\"retention_days\":{days}"))
+            .unwrap_or_default();
+        let started = format!(
+            "{{\"t\":\"run_started\",\"seq\":1,\"ts\":\"{started_at}\",\"run_id\":\"{run_id}\",\"trace_id\":\"{trace}\",\"span_id\":\"cd01\",\"generator\":\"gc@0.1.0\",\"generator_path\":\"gc\",\"contract_sha256\":\"abc\",\"inputs\":{{}},\"resource_hashes\":[],\"schema_version\":1{retain}}}"
         );
-        std::fs::write(run_meta_dir(run_dir).join("journal.jsonl"), lines)
-            .expect("journal should be written");
+        // An interrupted run is a terminal event of its own, not a failure.
+        let terminal = if status == "interrupted" {
+            format!(
+                "{{\"t\":\"run_interrupted\",\"seq\":2,\"ts\":\"{started_at}\",\"run_id\":\"{run_id}\",\"trace_id\":\"{trace}\",\"span_id\":\"cd02\",\"reason\":{{\"code\":\"interrupted\",\"message\":\"service shutdown\"}}}}"
+            )
+        } else {
+            format!(
+                "{{\"t\":\"run_finished\",\"seq\":2,\"ts\":\"{started_at}\",\"run_id\":\"{run_id}\",\"trace_id\":\"{trace}\",\"span_id\":\"cd02\",\"status\":\"{status}\",\"failures\":[],\"metrics\":{{}}}}"
+            )
+        };
+        std::fs::write(
+            run_meta_dir(run_dir).join("journal.jsonl"),
+            format!("{started}\n{terminal}\n"),
+        )
+        .expect("journal should be written");
     }
 
     fn temp_runs_dir(label: &str) -> (std::path::PathBuf, Utf8PathBuf) {
@@ -224,80 +124,147 @@ mod tests {
         (root, runs)
     }
 
-    #[test]
-    fn failed_runs_use_separate_retention_budget_from_successful_runs() {
-        let (root, runs) = temp_runs_dir("budgets");
-        let now = chrono::Utc::now();
-        let stamp = |minutes: i64| {
-            (now - chrono::Duration::minutes(minutes))
-                .to_rfc3339()
-                .replace("+00:00", "Z")
-        };
-        write_run(&runs.join("failed-new"), "failed", &stamp(1), 10);
-        write_run(&runs.join("success"), "success", &stamp(2), 10);
-        write_run(&runs.join("failed-middle"), "failed", &stamp(3), 10);
-        write_run(&runs.join("success-old"), "success", &stamp(4), 10);
-        write_run(&runs.join("failed-old"), "failed", &stamp(5), 10);
+    fn stamp(minutes: i64) -> String {
+        (chrono::Utc::now() - chrono::Duration::minutes(minutes))
+            .to_rfc3339()
+            .replace("+00:00", "Z")
+    }
 
-        gc_runs_impl(&runs, 1, 1, true, false).expect("GC should succeed");
-        assert!(runs.join("failed-new").is_dir(), "newest failure is kept");
-        assert!(runs.join("success").is_dir(), "newest success is kept");
+    fn policy(keep: usize, keep_failed: usize) -> policy::RetentionPolicy {
+        policy::RetentionPolicy {
+            keep,
+            keep_failed,
+            max_scan_entries: 16,
+        }
+    }
+
+    #[test]
+    fn explicit_counts_override_the_resolved_policy() {
+        let (root, runs) = temp_runs_dir("override");
+        write_run(&runs.join("success-new"), "success", &stamp(1), None);
+        write_run(&runs.join("success-old"), "success", &stamp(2), None);
+
+        gc_runs(&runs, &policy(1, 0), Some(0), None, true).expect("the sweep should run");
+
         assert!(
-            !runs.join("failed-middle").exists(),
-            "over-budget failure is deleted"
-        );
-        assert!(
-            !runs.join("failed-old").exists(),
-            "over-budget failure is deleted"
+            !runs.join("success-new").exists(),
+            "an explicit keep of zero collects every run"
         );
         assert!(
             !runs.join("success-old").exists(),
-            "over-budget success is deleted"
+            "an explicit keep of zero collects every run"
         );
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn unrepresentably_long_retention_does_not_expire_a_run() {
-        let (root, runs) = temp_runs_dir("long-retention");
-        let started_at = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
-        write_run(
-            &runs.join("long-retention"),
-            "success",
-            &started_at,
-            u32::MAX,
-        );
+    fn resolved_policy_applies_when_no_count_is_given() {
+        if env_process::isolated() {
+            return;
+        }
+        // SAFETY: the isolated child process owns this environment.
+        unsafe {
+            std::env::set_var("GC_KEEP", "1");
+            std::env::set_var("GC_KEEP_FAILED", "1");
+        }
+        let (root, runs) = temp_runs_dir("resolved");
+        write_run(&runs.join("success-new"), "success", &stamp(1), None);
+        write_run(&runs.join("success-old"), "success", &stamp(2), None);
+        let resolved = policy::RetentionPolicy::from_env().expect("the policy should resolve");
+        assert_eq!(resolved.keep, 1, "the environment resolves the keep budget");
 
-        gc_runs_impl(&runs, 1, 0, true, false)
-            .expect("a representable run with huge retention should not panic");
+        gc_runs(&runs, &resolved, None, None, true).expect("the sweep should run");
+
         assert!(
-            runs.join("long-retention").is_dir(),
-            "an out-of-range retention interval is not treated as expired"
+            runs.join("success-new").is_dir(),
+            "the newest run stays inside the resolved keep budget"
+        );
+        assert!(
+            !runs.join("success-old").exists(),
+            "a run beyond the resolved budget is collected"
         );
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn corrupt_candidate_is_skipped_while_valid_over_budget_run_is_collected() {
-        let (root, runs) = temp_runs_dir("corrupt");
-        let corrupt = runs.join("corrupt");
-        std::fs::create_dir_all(run_meta_dir(&corrupt)).expect("meta dir should be created");
-        std::fs::write(run_meta_dir(&corrupt).join("journal.jsonl"), "not-json\n")
-            .expect("corrupt journal should be written");
-        write_run(
-            &runs.join("valid"),
-            "success",
-            &chrono::Utc::now().to_rfc3339(),
-            10,
-        );
+    fn automatic_sweep_removes_an_expired_run_and_keeps_a_fresh_one() {
+        if env_process::isolated() {
+            return;
+        }
+        // SAFETY: the isolated child process owns this environment.
+        unsafe {
+            std::env::set_var("AUTO_GC", "true");
+        }
+        let (root, runs) = temp_runs_dir("auto");
+        write_run(&runs.join("expired"), "success", &stamp(1), Some(0));
+        write_run(&runs.join("fresh"), "success", &stamp(2), Some(365));
 
-        gc_runs_impl(&runs, 0, 0, true, false)
-            .expect("corrupt candidate should not abort the sweep");
-        assert!(corrupt.is_dir(), "corrupt run remains untouched");
+        auto_gc_runs(&runs, &policy(1, 0)).expect("the automatic sweep should run");
+
         assert!(
-            !runs.join("valid").exists(),
-            "valid over-budget run is collected"
+            !runs.join("expired").exists(),
+            "a run past its journal-recorded expiry is collected"
+        );
+        assert!(
+            runs.join("fresh").is_dir(),
+            "a fresh run inside the keep budget survives"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn manual_dry_run_leaves_run_directories_on_disk() {
+        let (root, runs) = temp_runs_dir("dry-run");
+        write_run(&runs.join("over-budget"), "success", &stamp(1), None);
+
+        gc_runs(&runs, &policy(0, 0), None, None, false).expect("the dry run should succeed");
+
+        assert!(
+            runs.join("over-budget").is_dir(),
+            "a dry run reports its candidates without removing them"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn interrupted_runs_consume_the_keep_budget() {
+        let (root, runs) = temp_runs_dir("interrupted");
+        write_run(
+            &runs.join("interrupted-new"),
+            "interrupted",
+            &stamp(1),
+            None,
+        );
+        write_run(&runs.join("success-old"), "success", &stamp(2), None);
+        write_run(
+            &runs.join("interrupted-expired"),
+            "interrupted",
+            &stamp(3),
+            Some(0),
+        );
+
+        gc_runs(&runs, &policy(1, 0), None, None, true).expect("the sweep should run");
+
+        assert!(
+            runs.join("interrupted-new").is_dir(),
+            "an interrupted run consumes the keep budget like any other terminal run"
+        );
+        assert!(
+            !runs.join("success-old").exists(),
+            "a run beyond the keep budget is collected"
+        );
+        assert!(
+            !runs.join("interrupted-expired").exists(),
+            "an expired run is collected regardless of the keep budget"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(test)]
+    mod env_process {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/test-support/environment.rs"
+        ));
     }
 }
