@@ -508,6 +508,13 @@ pub(crate) fn parse_patch_edits(
     node: &NodeDef,
     edits: &[Value],
 ) -> Result<Vec<files::PatchEdit>, StepError> {
+    files::parse_edits(&raw_patch_edits(node, edits)?)
+        .map_err(|error| StepError::failed(&node.id, error.to_string()))
+}
+
+/// Converts a tool call's `edits` array into the mechanism's raw edits.
+/// Fails closed on a malformed call shape.
+fn raw_patch_edits(node: &NodeDef, edits: &[Value]) -> Result<Vec<files::RawPatchEdit>, StepError> {
     let mut raw = Vec::with_capacity(edits.len());
     for edit in edits {
         let object = edit
@@ -541,7 +548,67 @@ pub(crate) fn parse_patch_edits(
             lines: text,
         });
     }
-    files::parse_edits(&raw).map_err(|error| StepError::failed(&node.id, error.to_string()))
+    Ok(raw)
+}
+
+/// The tool result the model reads when its own `fs.patch` edit cannot be
+/// applied as sent.
+///
+/// A malformed anchor, an anchor that names a missing line, a stale anchor,
+/// a file that changed under the model, an empty edit list, and two edits on
+/// one line are the model's own mistakes: the agent can correct them by
+/// re-reading the file, so they come back as tool results instead of
+/// failing the node. Limit violations stay fatal, because no correction
+/// satisfies them.
+fn agent_fs_patch_rejection(path: &str, error: &files::AnchoredPatchError) -> Option<Value> {
+    match error {
+        files::AnchoredPatchError::AnchorStale {
+            anchor,
+            remaps,
+            current_base,
+        } => Some(json!({
+            "file": path,
+            "ok": false,
+            "error": "anchor_stale",
+            "stale_anchor": anchor,
+            "current_base_sha256": current_base,
+            "remaps": remaps.iter().map(|remap| json!({
+                "stale_anchor": remap.stale_anchor,
+                "current_anchor": remap.current_anchor,
+            })).collect::<Vec<_>>(),
+        })),
+        files::AnchoredPatchError::BaseMismatch { expected, actual } => Some(json!({
+            "file": path,
+            "ok": false,
+            "error": "base_mismatch",
+            "expected_base_sha256": expected,
+            "current_base_sha256": actual,
+        })),
+        files::AnchoredPatchError::AnchorInvalid { anchor } => Some(json!({
+            "file": path,
+            "ok": false,
+            "error": "anchor_invalid",
+            "invalid_anchor": anchor,
+        })),
+        files::AnchoredPatchError::AnchorNotFound { anchor } => Some(json!({
+            "file": path,
+            "ok": false,
+            "error": "anchor_not_found",
+            "missing_anchor": anchor,
+        })),
+        files::AnchoredPatchError::EmptyEdits => Some(json!({
+            "file": path,
+            "ok": false,
+            "error": "empty_edits",
+        })),
+        files::AnchoredPatchError::OverlappingEdits { line_no } => Some(json!({
+            "file": path,
+            "ok": false,
+            "error": "overlapping_edits",
+            "line_no": line_no,
+        })),
+        _ => None,
+    }
 }
 
 /// Recomputes the approval digest for a pending call (F02). Returns `None`
@@ -695,39 +762,11 @@ pub(crate) async fn execute_agent_fs_patch(
                 );
             }
             // Mechanism errors stay typed through the gateway; translate the
-            // recoverable stale/base cases into model-readable tool errors
-            // with remaps instead of failing the node.
-            if let engine::GatewayError::AnchoredPatch(files::AnchoredPatchError::AnchorStale {
-                anchor,
-                remaps,
-                current_base,
-            }) = &error
+            // failures the model can correct into model-readable tool
+            // results instead of failing the node.
+            if let engine::GatewayError::AnchoredPatch(error) = &error
+                && let Some(value) = agent_fs_patch_rejection(path, error)
             {
-                let value = json!({
-                    "file": path,
-                    "ok": false,
-                    "error": "anchor_stale",
-                    "stale_anchor": anchor,
-                    "current_base_sha256": current_base,
-                    "remaps": remaps.iter().map(|remap| json!({
-                        "stale_anchor": remap.stale_anchor,
-                        "current_anchor": remap.current_anchor,
-                    })).collect::<Vec<_>>(),
-                });
-                return Ok(AgentToolOutcome::Result(value));
-            }
-            if let engine::GatewayError::AnchoredPatch(files::AnchoredPatchError::BaseMismatch {
-                expected,
-                actual,
-            }) = &error
-            {
-                let value = json!({
-                    "file": path,
-                    "ok": false,
-                    "error": "base_mismatch",
-                    "expected_base_sha256": expected,
-                    "current_base_sha256": actual,
-                });
                 return Ok(AgentToolOutcome::Result(value));
             }
             Err(StepError::from_gateway(&node.id, error))
@@ -1132,6 +1171,20 @@ pub(crate) async fn execute_agent_tool(
                     ),
                 });
             }
+            // The model's own edit content is checked before the approval:
+            // a call that cannot apply must not spend the user's
+            // confirmation, and the failure belongs to the model, which can
+            // correct it by re-reading the file.
+            let edits = match files::parse_edits(&raw_patch_edits(node, raw_edits)?) {
+                Ok(edits) => edits,
+                Err(error) => {
+                    return Ok(AgentToolOutcome::Result(
+                        agent_fs_patch_rejection(path, &error).unwrap_or_else(
+                            || json!({ "file": path, "ok": false, "error": "patch_rejected" }),
+                        ),
+                    ));
+                }
+            };
             if let Some(confirm) = ctx.run.require_side_effect(
                 ctx.journal,
                 node,
@@ -1155,7 +1208,6 @@ pub(crate) async fn execute_agent_tool(
                     return Ok(AgentToolOutcome::Result(result));
                 }
             };
-            let edits = parse_patch_edits(node, raw_edits)?;
             let limits = resolve_patch_limits(ctx, node)?;
             return execute_agent_fs_patch(
                 ctx,
@@ -3163,5 +3215,84 @@ mod approval_e2e {
             redacted_str.contains("2:015cadfe"),
             "journaled patch must keep anchors for review: {redacted_str}"
         );
+    }
+
+    /// A bad anchor is the model's own mistake, so it comes back as a tool
+    /// result the agent can act on instead of failing the node. The limit
+    /// violations stay fatal, because no correction satisfies them.
+    #[test]
+    fn the_models_own_patch_failures_come_back_as_tool_results() {
+        let cases = [
+            (
+                files::AnchoredPatchError::AnchorInvalid {
+                    anchor: "not-an-anchor".into(),
+                },
+                "anchor_invalid",
+            ),
+            (
+                files::AnchoredPatchError::AnchorNotFound {
+                    anchor: "9:015cadfe".into(),
+                },
+                "anchor_not_found",
+            ),
+            (
+                files::AnchoredPatchError::AnchorStale {
+                    anchor: "2:015cadfe".into(),
+                    remaps: vec![files::AnchorRemap {
+                        stale_anchor: "2:015cadfe".into(),
+                        current_anchor: "2:abc12345".into(),
+                    }],
+                    current_base: "base2".into(),
+                },
+                "anchor_stale",
+            ),
+            (
+                files::AnchoredPatchError::BaseMismatch {
+                    expected: "base1".into(),
+                    actual: "base2".into(),
+                },
+                "base_mismatch",
+            ),
+            (files::AnchoredPatchError::EmptyEdits, "empty_edits"),
+            (
+                files::AnchoredPatchError::OverlappingEdits { line_no: 4 },
+                "overlapping_edits",
+            ),
+        ];
+        for (error, code) in cases {
+            let value = agent_fs_patch_rejection("notes.txt", &error)
+                .expect("the model's own failure must come back as a tool result");
+            assert_eq!(
+                value.get("error").and_then(|error| error.as_str()),
+                Some(code),
+                "the tool result must name the failure: {value}"
+            );
+            assert_eq!(
+                value.get("ok").and_then(|ok| ok.as_bool()),
+                Some(false),
+                "the tool result must report the failure: {value}"
+            );
+            assert_eq!(
+                value.get("file").and_then(|file| file.as_str()),
+                Some("notes.txt"),
+                "the tool result must name the file: {value}"
+            );
+        }
+        for error in [
+            files::AnchoredPatchError::TooManyEdits { count: 9, limit: 3 },
+            files::AnchoredPatchError::PatchTooLarge {
+                bytes: 99,
+                limit: 10,
+            },
+            files::AnchoredPatchError::ResultTooLarge {
+                bytes: 99,
+                limit: 10,
+            },
+        ] {
+            assert!(
+                agent_fs_patch_rejection("notes.txt", &error).is_none(),
+                "a limit violation stays fatal: {error}"
+            );
+        }
     }
 }
