@@ -578,7 +578,22 @@ async fn elapsed_modes_initial_queue_and_exhausted_admission_start_no_effects() 
         generator(&root, "victim", "0.01");
         let path = root.join("victim").join(contract::MANIFEST_FILE);
         let text = std::fs::read_to_string(&path).unwrap();
-        std::fs::write(path, format!("{text}\n[budget]\nmax_elapsed_seconds = 1\n")).unwrap();
+        // The two branches need different budgets. The wall-clock branch
+        // needs the small one: it proves that a backlogged run expires
+        // before it executes a step. The active branch's budget is incidental
+        // there, so it uses the same named budget as the other elapsed
+        // tests, which has to outlast the run's own startup, and a dwell
+        // that exceeds it, which is what makes the two modes differ.
+        let (budget_secs, dwell) = if mode == ElapsedBudgetMode::WallClock {
+            (1, Duration::from_millis(1150))
+        } else {
+            (ELAPSED_BUDGET_SECS, ELAPSED_BUDGET_DWELL)
+        };
+        std::fs::write(
+            path,
+            format!("{text}\n[budget]\nmax_elapsed_seconds = {budget_secs}\n"),
+        )
+        .unwrap();
         let service = service(
             &root,
             ServiceDeploymentPolicy {
@@ -606,7 +621,7 @@ async fn elapsed_modes_initial_queue_and_exhausted_admission_start_no_effects() 
         } else {
             assert!(queued.budget.elapsed.is_none());
         }
-        tokio::time::sleep(Duration::from_millis(1150)).await;
+        tokio::time::sleep(dwell).await;
         service.cancel(blocker).await.unwrap();
         let terminal = wait_for_terminal_snapshot(&service, &victim).await;
         let workspace = run_workspace_dir(&root.join("runs").join(&victim));
@@ -624,7 +639,12 @@ async fn elapsed_modes_initial_queue_and_exhausted_admission_start_no_effects() 
                 &crate::summaries::read_journal_events(&root.join("runs").join(&victim)).unwrap(),
             )
             .unwrap();
-            assert!(state.budget.elapsed.unwrap().active_nanoseconds < 1_000_000_000);
+            // The queue is not charged: the victim's active time stays
+            // inside its budget, far below the blocker's wait.
+            assert!(
+                state.budget.elapsed.unwrap().active_nanoseconds
+                    < ELAPSED_BUDGET_SECS * 1_000_000_000
+            );
         }
         service.shutdown_active_runs().await.unwrap();
     }
