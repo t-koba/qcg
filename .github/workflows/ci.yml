@@ -65,6 +65,15 @@ jobs:
         shell: bash
         run: bash scripts/check-dist-bundle.sh --dependencies-installed
 
+      # The evidence reader can fetch artifacts, but not step-summary files.
+      - name: Upload core test timing summary
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: qcg-test-time-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/qcg-test-time-${{ github.run_id }}-${{ github.run_attempt }}.md
+          if-no-files-found: ignore
+
   demo-frontend:
     name: Demo frontend
     runs-on: ubuntu-latest

@@ -7,6 +7,8 @@ cd "$(dirname "$0")/.."
 # Uses only the portable Bash builtin SECONDS (whole-second resolution);
 # stdout/stderr of the wrapped command pass through unchanged.
 _qcg_test_time_header_written=0
+_qcg_test_time_artifact="target/qcg-test-time-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}.md"
+rm -f "$_qcg_test_time_artifact"
 qcg_test_time() {
   local label="$1"
   shift
@@ -29,6 +31,12 @@ qcg_test_time() {
       _qcg_test_time_header_written=1
     fi
     printf '| %s | %s | %s |\n' "$label" "$result" "$elapsed" >>"$GITHUB_STEP_SUMMARY" || printf 'warning: qcg-test-time: failed to append to GITHUB_STEP_SUMMARY\n' >&2
+    # Keep a machine-readable copy because the CI evidence reader can fetch
+    # artifacts, but not GitHub's per-step summary files.
+    if ! mkdir -p "$(dirname "$_qcg_test_time_artifact")" ||
+      ! cp "$GITHUB_STEP_SUMMARY" "$_qcg_test_time_artifact"; then
+      printf 'warning: qcg-test-time: failed to copy summary artifact\n' >&2
+    fi
   fi
   return $status
 }
