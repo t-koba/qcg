@@ -1151,10 +1151,10 @@ struct ModelsDevLimit {
 
 #[derive(Debug, Deserialize)]
 struct ModelsDevCost {
-    #[serde(default)]
     input: Option<f64>,
-    #[serde(default)]
     output: Option<f64>,
+    cache_read: Option<f64>,
+    cache_write: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1163,9 +1163,8 @@ struct ModelsDevProvider {
     models: BTreeMap<String, ModelsDevModel>,
 }
 
-/// Maps a models.dev `api.json` document onto model metadata. Unknown
-/// fields are ignored by the model/dev shapes; malformed JSON fails closed
-/// so a broken catalog never silently empties the selection list.
+/// Maps models.dev `api.json` to metadata; unknown fields are ignored and
+/// malformed JSON fails closed instead of silently emptying the model list.
 pub(crate) fn map_models_dev(text: &str) -> Result<ExternalCatalog, String> {
     let providers: BTreeMap<String, ModelsDevProvider> = serde_json::from_str(text)
         .map_err(|error| format!("models.dev catalog is not valid JSON: {error}"))?;
@@ -1200,6 +1199,7 @@ pub(crate) fn map_models_dev(text: &str) -> Result<ExternalCatalog, String> {
             } else {
                 Vec::new()
             };
+            let cost = model.cost.as_ref();
             let enabled = match model.status.as_deref() {
                 Some("deprecated") => Some(false),
                 _ => None,
@@ -1211,10 +1211,10 @@ pub(crate) fn map_models_dev(text: &str) -> Result<ExternalCatalog, String> {
                     label: model.name,
                     capabilities: Some(capabilities),
                     reasoning_effort: Some(reasoning_effort),
-                    input_cost_per_million_usd: model.cost.as_ref().and_then(|cost| cost.input),
-                    cache_creation_input_cost_per_million_usd: None,
-                    cache_read_input_cost_per_million_usd: None,
-                    output_cost_per_million_usd: model.cost.as_ref().and_then(|cost| cost.output),
+                    input_cost_per_million_usd: cost.and_then(|c| c.input),
+                    cache_creation_input_cost_per_million_usd: cost.and_then(|c| c.cache_write),
+                    cache_read_input_cost_per_million_usd: cost.and_then(|c| c.cache_read),
+                    output_cost_per_million_usd: cost.and_then(|c| c.output),
                     context_tokens: model.limit.as_ref().and_then(|limit| limit.context),
                     max_output_tokens: model.limit.as_ref().and_then(|limit| limit.output),
                     enabled,
@@ -1249,10 +1249,10 @@ mod tests {
         "attachment": true,
         "modalities": { "input": ["text", "image"], "output": ["text"] },
         "limit": { "context": 400000, "output": 128000 },
-        "cost": { "input": 1.75, "output": 14 },
+        "cost": { "input": 1.75, "output": 14, "cache_read": 0.175, "cache_write": 2.5 },
         "status": "deprecated"
       },
-      "plain": { "tool_call": false }
+      "plain": { "tool_call": false, "cost": { "input": 1.0, "output": 2.0 } }
     }
   }
 }
@@ -1279,6 +1279,8 @@ mod tests {
         assert!(capabilities.image_input);
         assert!(capabilities.file_input);
         assert_eq!(gpt.input_cost_per_million_usd, Some(1.75));
+        assert_eq!(gpt.cache_read_input_cost_per_million_usd, Some(0.175));
+        assert_eq!(gpt.cache_creation_input_cost_per_million_usd, Some(2.5));
         assert_eq!(gpt.output_cost_per_million_usd, Some(14.0));
         assert_eq!(gpt.context_tokens, Some(400_000));
         assert_eq!(gpt.max_output_tokens, Some(128_000));
@@ -1287,6 +1289,37 @@ mod tests {
         let plain = models.get("plain").expect("plain model");
         assert!(!plain.capabilities.as_ref().expect("caps").tool_use);
         assert_eq!(plain.reasoning_effort, Some(Vec::new()));
+        assert_eq!(plain.input_cost_per_million_usd, Some(1.0));
+        assert_eq!(plain.cache_read_input_cost_per_million_usd, None);
+        assert_eq!(plain.cache_creation_input_cost_per_million_usd, None);
+        assert_eq!(plain.output_cost_per_million_usd, Some(2.0));
+    }
+
+    #[test]
+    fn models_dev_cache_rates_yield_to_explicit_override() {
+        let catalog = map_models_dev(MODELS_DEV_FIXTURE).expect("fixture must map");
+        let base = catalog.providers["openai"]["gpt-5.2"].clone();
+        let pricing = base.pricing().expect("mapped pricing");
+        assert_eq!(pricing.cache_read_input_cost_per_million_usd, Some(0.175));
+        assert_eq!(pricing.cache_creation_input_cost_per_million_usd, Some(2.5));
+        let over = ModelSpec {
+            id: base.id.clone(),
+            label: None,
+            capabilities: None,
+            reasoning_effort: None,
+            input_cost_per_million_usd: None,
+            cache_creation_input_cost_per_million_usd: Some(3.0),
+            cache_read_input_cost_per_million_usd: Some(0.0),
+            output_cost_per_million_usd: None,
+            context_tokens: None,
+            max_output_tokens: None,
+            enabled: None,
+        };
+        let merged = merge_model(&base, &over);
+        assert_eq!(merged.cache_read_input_cost_per_million_usd, Some(0.0));
+        assert_eq!(merged.cache_creation_input_cost_per_million_usd, Some(3.0));
+        assert_eq!(merged.input_cost_per_million_usd, Some(1.75));
+        assert_eq!(merged.output_cost_per_million_usd, Some(14.0));
     }
 
     #[test]
