@@ -795,6 +795,7 @@ enabled = false
 async fn active_open_prompt_crash_recovers_before_publishing_waiting() {
     let root = temp_run_dir("elapsed-prompt-crash");
     let _temp = TempGuard(root.clone());
+    let runs = root.join("runs");
     generator(&root, "victim", "0.01");
     let manifest = root.join("victim").join(contract::MANIFEST_FILE);
     let text = std::fs::read_to_string(&manifest).unwrap();
@@ -826,7 +827,8 @@ options = ["yes"]
     wait_for_snapshot(&first, &id, RunStatus::Waiting).await;
     first.mark_shutting_down();
     drop(first);
-    let journal_path = run_meta_dir(&root.join("runs").join(&id)).join("journal.jsonl");
+    wait_for_runs_store_release(&runs).await;
+    let journal_path = run_meta_dir(&runs.join(&id)).join("journal.jsonl");
     let writer = engine::JournalWriter::create(&journal_path, &id, false, None).unwrap();
     let total = writer
         .state()
@@ -879,6 +881,7 @@ options = ["yes"]
     );
     restored.mark_shutting_down();
     drop(restored);
+    wait_for_runs_store_release(&runs).await;
     let again = service(&root, ServiceDeploymentPolicy::default());
     let seq = recovered.last_seq;
     again.resume_recovered_runs().await;
