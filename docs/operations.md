@@ -238,11 +238,18 @@ under.
 
 The store scan is bounded by `MAX_DIRECTORY_SCAN_ENTRIES` (default `100000`);
 a store with more entries refuses the sweep instead of scanning without
-bound.
+bound. A refused sweep is a failure, not a skip: it ends `qcg serve`'s
+retention task for the rest of the process and is reported as a failure when
+the server shuts down, and it fails the run that `qcg run` precedes. A store
+another process is already maintaining is skipped instead, because that
+holder is doing the same work.
 
 `GC_KEEP`, `GC_KEEP_FAILED`, and `GC_INTERVAL_SECS` (default `86400`, minimum
-`60`) retune the sweep; invalid or zero values refuse boot. The retention
-task of `qcg serve` sweeps once when the task starts, then once per
+`60`) retune the sweep; invalid or zero values refuse boot. The environment
+refuses zero because a deployment that keeps nothing is more likely a
+misconfiguration than an intent, while an explicit `--keep 0` is a direct
+instruction and keeps nothing of that budget. The retention task of
+`qcg serve` sweeps once when the task starts, then once per
 `GC_INTERVAL_SECS`. Set `AUTO_GC=0` to disable automatic retention — the
 periodic task and the sweep that precedes `qcg run` — and use:
 

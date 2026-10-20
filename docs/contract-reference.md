@@ -4379,7 +4379,11 @@ fields are rejected when their structs define a closed schema.
    LLM responses are journaled before the selected policy is applied.
 
 `[retention].days`
-:: Retention window in days used by `qcg runs gc` in addition to `--keep`.
+:: Retention window in days. The run records the window in its journal when it
+   starts, and every retention sweep — `qcg serve`'s periodic task, the sweep
+   that precedes `qcg run`, and `qcg runs gc` — applies the recorded window in
+   addition to the count budgets, so a run past its window is collected
+   regardless of the counts.
 
 `[audit]`
 :: Observation-stream policy (ADR 0001). Durable records are never filtered;

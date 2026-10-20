@@ -51,7 +51,9 @@ pub(crate) fn gc_runs(
 /// Automatic retention sweep that precedes `qcg run`.
 ///
 /// It stays silent on stdout because stdout carries the run's JSON output;
-/// removals are summarized on stderr.
+/// removals are summarized on stderr. A store another holder is already
+/// maintaining is skipped; a sweep that fails fails the run, because the
+/// store it could not inspect is the store the run would use.
 pub(crate) fn auto_gc_runs(runs_dir: &Utf8Path, policy: &policy::RetentionPolicy) -> Result<()> {
     let enabled = policy::parse_bool_env("AUTO_GC", true)
         .map_err(|detail| anyhow::anyhow!("invalid GC configuration: {detail}"))?;
@@ -62,8 +64,8 @@ pub(crate) fn auto_gc_runs(runs_dir: &Utf8Path, policy: &policy::RetentionPolicy
     if !runs_dir.exists() {
         return Ok(());
     }
-    // A busy store means another holder is already maintaining it. The
-    // automatic sweep skips instead of failing the run it precedes.
+    // A busy store means another holder is already maintaining it, so the
+    // automatic sweep skips rather than doing the same work twice.
     let _maintenance = match service::try_lock_store_maintenance(runs_dir)? {
         Some(lock) => lock,
         None => return Ok(()),
@@ -182,6 +184,32 @@ mod tests {
         assert!(
             !runs.join("success-old").exists(),
             "a run beyond the resolved budget is collected"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_refused_automatic_sweep_fails_the_run_it_precedes() {
+        if env_process::isolated() {
+            return;
+        }
+        // SAFETY: the isolated child process owns this environment.
+        unsafe {
+            std::env::set_var("AUTO_GC", "true");
+        }
+        let (root, runs) = temp_runs_dir("refused");
+        // More entries than the scan bound allows: the sweep refuses instead
+        // of scanning without bound, and the run it precedes fails with it.
+        for index in 0..17 {
+            std::fs::write(runs.join(format!("entry-{index}")), b"x")
+                .expect("entry should be written");
+        }
+
+        let error = auto_gc_runs(&runs, &policy(1, 0)).expect_err("a refused sweep must fail");
+
+        assert!(
+            error.to_string().contains("more than 16 entries"),
+            "the error must name the scan bound: {error}"
         );
         let _ = std::fs::remove_dir_all(root);
     }

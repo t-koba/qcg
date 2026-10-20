@@ -50,7 +50,10 @@ JSON event output go to stdout.
   from `.data/runs` that fall outside the retention budget, so it removes
   data without asking. It prints nothing on stdout (stdout carries the run's
   output) and a one-line summary on stderr when it removes something.
-  `AUTO_GC=0` skips it. See [run retention](operations.md#run-retention).
+  `AUTO_GC=0` skips it. A store another process is already maintaining is
+  skipped as well, but a sweep that fails fails the run: the store it could
+  not inspect is the store the run would use. See
+  [run retention](operations.md#run-retention).
 - `qcg list [--generators-dir dir]` lists available packages from the installed
   directory and the bundled generator directory. Installed IDs take precedence.
 - `qcg models [--json] [--refresh]` lists the selectable LLM providers, models,
@@ -176,10 +179,11 @@ GC is a dry run without `--delete` and never removes a non-terminal run.
 interrupted). Failed runs do not consume that budget and are governed only by
 the separate `--keep-failed` budget. Both default to the deployment policy
 (`GC_KEEP`, default `50`, and `GC_KEEP_FAILED`, default `10`); an explicit
-count overrides the policy for that sweep. The retention window recorded in a
-run's journal overrides either count budget. A sweep with
-`--keep 50 --keep-failed 10` may retain up to 50 nonfailed terminal runs plus
-10 failed runs.
+count overrides the policy for that sweep, and a count of zero keeps nothing
+of that budget, so `--keep 0` collects every nonfailed terminal run. The
+retention window recorded in a run's journal overrides either count budget. A
+sweep with `--keep 50 --keep-failed 10` may retain up to 50 nonfailed terminal
+runs plus 10 failed runs.
 
 ## Server and generated documentation
 
