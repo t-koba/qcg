@@ -283,7 +283,7 @@ content = "Continue?"
 options = ["yes"]"#,
     )
     .expect("generator manifest should be written");
-    let service = test_service(vec![root], runs);
+    let service = test_service(vec![root], runs.clone());
     let request = || StartRun {
         generator_id: "generator".into(),
         inputs: BTreeMap::new(),
@@ -314,9 +314,9 @@ options = ["yes"]"#,
         "the adopted record must keep the same pending question"
     );
     // The suspended engine task releases the execution lease just after
-    // publishing Waiting; let that settle before answering so this test
-    // does not depend on the server-side queued resumer.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // publishing Waiting; wait for that release instead of for a fixed span
+    // of time, so the test does not depend on the machine's speed.
+    wait_for_run_execution_lease(&runs.join(&id)).await;
     service
         .answer(
             id.clone(),

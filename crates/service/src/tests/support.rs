@@ -328,6 +328,23 @@ pub(crate) async fn wait_for_snapshot(
     );
 }
 
+/// Waits until the run's execution lease is free again.
+///
+/// A suspended run's engine task releases the lease just after it publishes
+/// its prompt, so a test that acts on the run has to wait for that release
+/// rather than for a fixed span of time.
+pub(crate) async fn wait_for_run_execution_lease(run_dir: &Utf8Path) {
+    for _ in 0..600 {
+        match crate::run_dirs::try_lock_existing_run_execution(run_dir) {
+            Ok(Some(_lease)) => return,
+            Ok(None) => {}
+            Err(error) => panic!("the run execution lease could not be read: {error}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the run execution lease was still held");
+}
+
 /// Waits until the exclusive runs-directory lock is free again.
 ///
 /// A dropped `LocalService` releases the store only when the last
