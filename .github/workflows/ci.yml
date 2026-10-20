@@ -28,8 +28,29 @@ jobs:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
 
+      - name: Mark Cargo cache start
+        id: cargo-cache-start
+        shell: bash
+        run: echo "epoch_s=$(date +%s)" >>"$GITHUB_OUTPUT"
+
       - name: Cache cargo
+        id: cargo-cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Record Cargo cache restore observation
+        shell: bash
+        env:
+          CACHE_START_S: ${{ steps.cargo-cache-start.outputs.epoch_s }}
+          CACHE_EXACT_HIT: ${{ steps.cargo-cache.outputs.cache-hit }}
+        run: |
+          ended_s="$(date +%s)"
+          if [[ "$CACHE_START_S" =~ ^[0-9]+$ && "$ended_s" =~ ^[0-9]+$ ]]; then
+            elapsed_s=$((ended_s - CACHE_START_S))
+          else
+            elapsed_s=unknown
+          fi
+          printf 'QCG_RUST_CACHE_EXACT_HIT=%s\n' "$CACHE_EXACT_HIT" >>"$GITHUB_ENV"
+          printf 'QCG_RUST_CACHE_RESTORE_BRACKET_ELAPSED_S=%s\n' "$elapsed_s" >>"$GITHUB_ENV"
 
       - name: Setup Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0

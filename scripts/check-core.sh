@@ -23,6 +23,7 @@ qcg_test_time() {
       {
         printf '### qcg test invocation wall time\n\n'
         printf 'context: RUNNER_OS=%s rustc=%s\n\n' "${RUNNER_OS:-$(uname -s)}" "$(rustc --version)"
+        printf 'cargo_cache_exact_hit=%s restore_bracket_elapsed_s=%s (whole-second pre-test bracket; runner overhead included, cache post-save excluded)\n\n' "${QCG_RUST_CACHE_EXACT_HIT:-unknown}" "${QCG_RUST_CACHE_RESTORE_BRACKET_ELAPSED_S:-unknown}"
         printf 'Values use Bash SECONDS (whole-second resolution; a displayed 0 may mean <1s) and are whole-command invocation wall time, including Cargo/build overhead. '
         printf "Cargo's normal \`test result ... finished in\` lines remain target-harness timing, not per-test timing.\n\n"
         printf '| invocation | result | elapsed_s |\n'
