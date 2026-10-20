@@ -21,12 +21,20 @@ const CLIENT_START_BUDGET: Duration = Duration::from_secs(2);
 /// that the deadline is global.
 const DEADLINE_OVERSHOOT_SLACK: Duration = Duration::from_secs(1);
 
+/// How long the fixture client stays alive after it publishes its pid.
+///
+/// The client sleeps for this long, so an observation bound must stay below
+/// it: the pid can only appear while the client is alive.
+const CLIENT_LIFETIME: Duration = Duration::from_secs(8);
+
 /// Bound for observing the fixture client's published pid.
 ///
-/// The observation must finish while the client is still alive and the
-/// operation still in flight, so it stays below the client's lifetime and
-/// below the operation's stage timeout.
-const CHILD_OBSERVATION_BOUND: Duration = Duration::from_secs(5);
+/// The child is killed at the operation's own deadline, so its pid can only
+/// appear before that deadline: the bound is derived from the operation's
+/// stage timeout, capped by the client's lifetime.
+fn child_observation_bound(stage_timeout: Duration) -> Duration {
+    stage_timeout.min(CLIENT_LIFETIME)
+}
 
 struct Client {
     root: PathBuf,
@@ -53,7 +61,7 @@ case "{mode}:$1" in
     exit 1 ;;
   running:*)
     echo "$$" >> "$root/direct-pids"
-    exec /bin/sleep 8 ;;
+    exec /bin/sleep {} ;;
   absent:*)
     echo 'Error: no such instance owned-id' >&2
     exit 1 ;;
@@ -67,7 +75,8 @@ case "{mode}:$1" in
 esac
 exit 0
 "#,
-            root.display()
+            root.display(),
+            CLIENT_LIFETIME.as_secs()
         );
         // Concurrent test forks can briefly inherit a writable executable
         // descriptor even with CLOEXEC, causing ETXTBSY in another thread.
@@ -612,7 +621,7 @@ fn canceled_admin_retains_reaping_ownership_after_runtime_destruction() {
             )
             .await
         });
-        tokio::time::timeout(CHILD_OBSERVATION_BOUND, async {
+        tokio::time::timeout(child_observation_bound(Duration::from_secs(10)), async {
             while !client.root.join("direct-pids").exists() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -682,7 +691,8 @@ fn check_async_child_handoff(probe: bool) {
                         .map(|_| ())
                 }
             });
-            let pid = tokio::time::timeout(CHILD_OBSERVATION_BOUND, async {
+            let observation_bound = child_observation_bound(timeout);
+            let pid = tokio::time::timeout(observation_bound, async {
                 loop {
                     if let Ok(pid) = std::fs::read_to_string(client.root.join("direct-pids"))
                         && let Ok(pid) = pid.trim().parse::<u32>()
@@ -693,7 +703,9 @@ fn check_async_child_handoff(probe: bool) {
                 }
             })
             .await
-            .expect("must observe a direct child before ending its future");
+            .unwrap_or_else(|_| {
+                panic!("must observe a direct child before the {timeout:?} deadline ends it")
+            });
             let start = std::time::Instant::now();
             match end {
                 "abort" => {
