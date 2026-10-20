@@ -241,9 +241,10 @@ a store with more entries refuses the sweep instead of scanning without
 bound.
 
 `GC_KEEP`, `GC_KEEP_FAILED`, and `GC_INTERVAL_SECS` (default `86400`, minimum
-`60`) retune the sweep; invalid or zero values refuse boot. Set `AUTO_GC=0` to
-disable automatic retention — the periodic task and the sweep that precedes
-`qcg run` — and use:
+`60`) retune the sweep; invalid or zero values refuse boot. The retention
+task of `qcg serve` sweeps once when the task starts, then once per
+`GC_INTERVAL_SECS`. Set `AUTO_GC=0` to disable automatic retention — the
+periodic task and the sweep that precedes `qcg run` — and use:
 
 ```bash
 qcg runs gc --runs-dir /var/lib/qcg/runs --keep 50
@@ -775,8 +776,9 @@ Unattended limits:
   governed only by the separate `keep_failed` budget (default 10). The
   retention window recorded in a run's journal overrides either count budget.
   With defaults, a sweep may retain up to 50 nonfailed terminal runs plus 10
-  failed runs. It sweeps every 24 hours; size the `runs-dir` volume and
-  retention for the schedule above.
+  failed runs. The retention task sweeps once when it starts and then once
+  per `GC_INTERVAL_SECS` (default 24 hours); size the `runs-dir` volume and
+  retention for that schedule.
 - `Waiting` and `Confirming` runs release their execution slot but have no
   TTL in mechanism; an unanswered run stays paused until answered, confirmed,
   or canceled. Expire it from the orchestrator with `cancel` when policy

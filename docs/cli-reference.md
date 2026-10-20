@@ -305,7 +305,8 @@ use of the same output directory.
   refuses boot instead of starting unauthenticated.
 - `GC_KEEP` (default `50`), `GC_KEEP_FAILED` (default `10`), and
   `GC_INTERVAL_SECS` (default `86400`, minimum `60`): retention counts and
-  the cadence of `qcg serve`'s retention task. The counts apply to every
+  the cadence of `qcg serve`'s retention task, which sweeps once when the
+  task starts and then once per interval. The counts apply to every
   sweep — the periodic task, the sweep that precedes `qcg run`, and the
   manual `qcg runs gc` (whose `--keep`/`--keep-failed` override them).
   `GC_KEEP` counts newest nonfailed terminal runs (success, canceled,
