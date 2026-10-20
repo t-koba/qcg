@@ -682,6 +682,11 @@ fn check_async_child_handoff(probe: bool) {
             } else {
                 Duration::from_secs(10)
             };
+            // The deadline is armed when the task starts, so the timeout
+            // path's elapsed time is measured from here: a bound taken
+            // after the observation would be vacuous exactly when the
+            // deadline was missed.
+            let operation_start = std::time::Instant::now();
             let task = tokio::spawn(async move {
                 if probe {
                     wait_ready(&argv, timeout, &task_cancel, "owned-id").await
@@ -706,7 +711,9 @@ fn check_async_child_handoff(probe: bool) {
             .unwrap_or_else(|_| {
                 panic!("must observe a direct child before the {timeout:?} deadline ends it")
             });
-            let start = std::time::Instant::now();
+            // The abort and cancel paths answer the signal, so their bound
+            // is measured from the signal rather than from the start.
+            let signal_start = std::time::Instant::now();
             match end {
                 "abort" => {
                     task.abort();
@@ -723,15 +730,14 @@ fn check_async_child_handoff(probe: bool) {
                 )),
             }
             if end == "timeout" {
-                // The timeout path returns at its own deadline, so its bound
-                // is that deadline; the abort and cancel paths must react to
-                // the signal immediately.
+                // The timeout path returns at its own deadline, measured
+                // from the operation's start.
                 assert!(
-                    start.elapsed() < CLIENT_START_BUDGET + Duration::from_secs(1),
+                    operation_start.elapsed() < timeout + DEADLINE_OVERSHOOT_SLACK,
                     "{end}"
                 );
             } else {
-                assert!(start.elapsed() < Duration::from_secs(1), "{end}");
+                assert!(signal_start.elapsed() < Duration::from_secs(1), "{end}");
             }
             pid
         });

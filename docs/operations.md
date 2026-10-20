@@ -231,18 +231,23 @@ runs do not consume that budget and are governed only by the separate
 overrides the resolved count for that sweep. With defaults, a sweep may retain
 up to 50 nonfailed terminal runs plus 10 failed runs.
 
-Expiry comes from the run's journal: the retention window recorded when the
-run started overrides either count budget. A sweep never consults today's
-contract, because it cannot reconstruct the policy the run originally ran
-under.
+Expiry comes from the run's journal: when the contract declared a retention
+window, the run recorded it when it started, and a sweep expires that run on
+the recorded window — a run past its window is collected even when the count
+budget would keep it, while a run inside its window is still governed by the
+count budgets. Without a declared window only the count budgets apply. A
+sweep never consults today's contract, because it cannot reconstruct the
+policy the run originally ran under.
 
 The store scan is bounded by `MAX_DIRECTORY_SCAN_ENTRIES` (default `100000`);
 a store with more entries refuses the sweep instead of scanning without
 bound. A refused sweep is a failure, not a skip: it ends `qcg serve`'s
 retention task for the rest of the process and is reported as a failure when
-the server shuts down, and it fails the run that `qcg run` precedes. A store
-another process is already maintaining is skipped instead, because that
-holder is doing the same work.
+the server shuts down, and it fails the run that `qcg run` precedes. The
+automatic sweeps — `qcg serve`'s periodic task and the sweep that precedes
+`qcg run` — skip a store another holder is already maintaining, because that
+holder is doing the same work; the manual destructive sweep refuses it with
+`run store maintenance is busy; retry`.
 
 `GC_KEEP`, `GC_KEEP_FAILED`, and `GC_INTERVAL_SECS` (default `86400`, minimum
 `60`) retune the sweep; invalid or zero values refuse boot. The environment
@@ -780,9 +785,12 @@ Unattended limits:
   notifications are the orchestrator's job, not qcg's.
 - `keep` (default 50) retains the newest nonfailed terminal runs (success,
   canceled, or interrupted); failed runs do not consume that budget and are
-  governed only by the separate `keep_failed` budget (default 10). The
-  retention window recorded in a run's journal overrides either count budget.
-  With defaults, a sweep may retain up to 50 nonfailed terminal runs plus 10
+  governed only by the separate `keep_failed` budget (default 10). A
+  retention window recorded in a run's journal expires that run independently
+  of the counts: a run past its window is collected even when the count
+  budget would keep it, while a run inside its window is still governed by
+  the count budgets. With defaults, a sweep may retain up to 50 nonfailed
+  terminal runs plus 10
   failed runs. The retention task sweeps once when it starts and then once
   per `GC_INTERVAL_SECS` (default 24 hours); size the `runs-dir` volume and
   retention for that schedule.

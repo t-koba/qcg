@@ -180,10 +180,14 @@ interrupted). Failed runs do not consume that budget and are governed only by
 the separate `--keep-failed` budget. Both default to the deployment policy
 (`GC_KEEP`, default `50`, and `GC_KEEP_FAILED`, default `10`); an explicit
 count overrides the policy for that sweep, and a count of zero keeps nothing
-of that budget, so `--keep 0` collects every nonfailed terminal run. The
-retention window recorded in a run's journal overrides either count budget. A
-sweep with `--keep 50 --keep-failed 10` may retain up to 50 nonfailed terminal
-runs plus 10 failed runs.
+of that budget, so `--keep 0` collects every nonfailed terminal run. A
+retention window recorded in a run's journal expires that run independently of
+the counts: a run past its window is collected even when the count budget
+would keep it, while a run inside its window is still governed by the count
+budgets. A sweep with `--keep 50 --keep-failed 10` may retain up to 50
+nonfailed terminal runs plus 10 failed runs. A destructive sweep refuses a
+store another holder is maintaining (`run store maintenance is busy; retry`);
+the automatic sweeps skip such a store instead.
 
 ## Server and generated documentation
 
@@ -315,8 +319,11 @@ use of the same output directory.
   manual `qcg runs gc` (whose `--keep`/`--keep-failed` override them).
   `GC_KEEP` counts newest nonfailed terminal runs (success, canceled,
   interrupted); failed runs do not consume it and are governed only by the
-  separate `GC_KEEP_FAILED` count. The retention window recorded in a run's
-  journal overrides either count budget. Invalid or zero values refuse boot.
+  separate `GC_KEEP_FAILED` count. A retention window recorded in a run's
+  journal expires that run independently of the counts: a run past its window
+  is collected even when the count budget would keep it, while a run inside
+  its window is still governed by the count budgets. Invalid or zero values
+  refuse boot.
 - `AUDIT_FLOOR=minimal|standard`: deployment audit floor. `standard`
   restores full observation-record persistence for every run regardless of the
   contract's `[audit]` policy; a floor can only raise persistence.
