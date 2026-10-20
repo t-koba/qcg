@@ -4,6 +4,7 @@ use api::{RunEvent, RunStatus};
 use camino::{Utf8Path, Utf8PathBuf};
 use engine::{Interaction, RunState, read_output_manifest};
 use model::OutputManifest;
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
@@ -63,20 +64,14 @@ pub(crate) fn read_last_queued_at_from_values(
         .next()
 }
 
-/// H02: journaled per-run audit raise from already-read journal values.
-///
-/// The admission writes `audit_raise` ("standard" or null) on its
-/// `run_queued` event. Scan only after the latest `run_forked` boundary so
-/// copied source admissions cannot raise the fork's policy. Within that run,
-/// skip null/missing values: same-run requeues do not repeat the admission's
-/// raise. Unknown values never resolve to a foreign level.
+/// H02: resolve this run's journaled audit raise, fencing copied source
+/// values at `run_forked`. Null requeues retain admission policy; unknown
+/// levels do not add a raise.
 pub(crate) fn audit_raise_from_values(events: &[serde_json::Value]) -> Option<policy::AuditLevel> {
     events
         .iter()
         .rev()
-        .take_while(|event| {
-            event.get("t").and_then(serde_json::Value::as_str) != Some("run_forked")
-        })
+        .take_while(|event| event.get("t").and_then(Value::as_str) != Some("run_forked"))
         .filter(|event| event.get("t").and_then(serde_json::Value::as_str) == Some("run_queued"))
         .find_map(|event| match event.get("audit_raise") {
             Some(serde_json::Value::String(level)) => match level.as_str() {
