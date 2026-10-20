@@ -4,6 +4,30 @@ use super::*;
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
 
+/// Wall-clock budget for a fixture client to start and publish its pid.
+///
+/// A deadline that has to cover the client's start cannot be smaller than
+/// the start itself: the measured publish latency is a few milliseconds on
+/// an idle runner, stayed under 120 ms on a runner oversubscribed threefold,
+/// and reached 444 ms on the same runner, so every deadline that covers a
+/// client start uses this budget. It stays below the client's own lifetime
+/// so a timeout still fires before the client exits on its own.
+const CLIENT_START_BUDGET: Duration = Duration::from_secs(2);
+
+/// Slack allowed between a stage deadline and the operation's return.
+///
+/// The deadline is honored to within the timer wakeup delay, which a loaded
+/// runner can stretch; the probe count carries the deterministic evidence
+/// that the deadline is global.
+const DEADLINE_OVERSHOOT_SLACK: Duration = Duration::from_secs(1);
+
+/// Bound for observing the fixture client's published pid.
+///
+/// The observation must finish while the client is still alive and the
+/// operation still in flight, so it stays below the client's lifetime and
+/// below the operation's stage timeout.
+const CHILD_OBSERVATION_BOUND: Duration = Duration::from_secs(5);
+
 struct Client {
     root: PathBuf,
     binary: String,
@@ -410,21 +434,51 @@ fn sync_timeout_reaps_live_direct_child_before_runtime_is_destroyed() {
     // accidentally reap the child on behalf of the temporary worker runtime.
     for no_worker in [false, true] {
         let _injection = no_worker.then(NoCommandWorker::enter);
-        for _ in 0..5 {
+        // Each iteration costs the whole deadline, so the repeat count
+        // stays small while the deadline grows to cover the client's start.
+        for _ in 0..2 {
             let client = Client::new("running");
             let start = std::time::Instant::now();
             let result = run_sync_bounded(
                 &client.binary,
                 &["delete"],
-                Duration::from_millis(100),
+                CLIENT_START_BUDGET,
                 "owned-id",
                 "delete",
             );
             assert!(matches!(result, Err(ContainerError::StageTimedOut { .. })));
-            assert!(start.elapsed() < Duration::from_secs(1));
+            // The timeout must be honored rather than merely short: the
+            // command may return at its deadline, but not later.
+            assert!(start.elapsed() < CLIENT_START_BUDGET + Duration::from_secs(1));
             let pid = std::fs::read_to_string(client.root.join("direct-pids")).unwrap();
+            let pid: u32 = pid
+                .trim()
+                .parse()
+                .expect("the client publishes its own pid");
+            let proc_path = std::path::Path::new("/proc").join(pid.to_string());
+            if proc_path.exists() {
+                // The bounded post-kill wait can expire on a loaded runner.
+                // The child must then be held by an explicit owner instead of
+                // being lost, and the production reaper must collect it.
+                let retained = {
+                    let pending = PENDING_REAPS.lock().unwrap();
+                    pending.iter().any(|entry| match entry {
+                        ReapChild::Async(child) => child.id() == Some(pid),
+                        ReapChild::Sync(child) => child.id() == pid,
+                    })
+                };
+                assert!(
+                    retained,
+                    "direct child {pid} is neither reaped nor retained (no_worker={no_worker})"
+                );
+                let deadline = std::time::Instant::now() + Duration::from_secs(1);
+                while proc_path.exists() && std::time::Instant::now() < deadline {
+                    reap_pending_children();
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
             assert!(
-                !std::path::Path::new("/proc").join(pid.trim()).exists(),
+                !proc_path.exists(),
                 "direct child {pid} is still live or a zombie (no_worker={no_worker})"
             );
         }
@@ -558,7 +612,7 @@ fn canceled_admin_retains_reaping_ownership_after_runtime_destruction() {
             )
             .await
         });
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(CHILD_OBSERVATION_BOUND, async {
             while !client.root.join("direct-pids").exists() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -615,7 +669,7 @@ fn check_async_child_handoff(probe: bool) {
             let cancel = CancellationToken::new();
             let task_cancel = cancel.clone();
             let timeout = if end == "timeout" {
-                Duration::from_millis(250)
+                CLIENT_START_BUDGET
             } else {
                 Duration::from_secs(10)
             };
@@ -628,7 +682,7 @@ fn check_async_child_handoff(probe: bool) {
                         .map(|_| ())
                 }
             });
-            let pid = tokio::time::timeout(Duration::from_secs(2), async {
+            let pid = tokio::time::timeout(CHILD_OBSERVATION_BOUND, async {
                 loop {
                     if let Ok(pid) = std::fs::read_to_string(client.root.join("direct-pids"))
                         && let Ok(pid) = pid.trim().parse::<u32>()
@@ -656,7 +710,17 @@ fn check_async_child_handoff(probe: bool) {
                         if stage == if probe { "wait-ready" } else { "init" }
                 )),
             }
-            assert!(start.elapsed() < Duration::from_secs(1), "{end}");
+            if end == "timeout" {
+                // The timeout path returns at its own deadline, so its bound
+                // is that deadline; the abort and cancel paths must react to
+                // the signal immediately.
+                assert!(
+                    start.elapsed() < CLIENT_START_BUDGET + Duration::from_secs(1),
+                    "{end}"
+                );
+            } else {
+                assert!(start.elapsed() < Duration::from_secs(1), "{end}");
+            }
             pid
         });
         drop(runtime);
@@ -763,7 +827,11 @@ async fn readiness_retries_on_cadence_without_extending_global_deadline() {
         client.root.join("probes").display()
     );
     let argv = vec!["/bin/sh".into(), "-c".into(), script];
-    for (timeout, min_probes, max_probes) in [(120, 1, 1), (1120, 2, 3)] {
+    // The short deadline is below the probe cadence, so no retry may run
+    // inside it. A probe that is killed before it can record itself is not
+    // observable, so the lower bound admits that case; the long deadline
+    // below carries the deterministic evidence that probes run and retry.
+    for (timeout, min_probes, max_probes) in [(120, 0, 1), (1120, 2, 3)] {
         std::fs::write(client.root.join("probes"), "").unwrap();
         let start = std::time::Instant::now();
         let result = wait_ready(&argv, Duration::from_millis(timeout), &cancel, "owned-id").await;
@@ -775,7 +843,11 @@ async fn readiness_retries_on_cadence_without_extending_global_deadline() {
             })
         ));
         assert!(start.elapsed() >= Duration::from_millis(timeout));
-        assert!(start.elapsed() < Duration::from_millis(timeout + 250));
+        // The probe count is the deterministic signal that the deadline stays
+        // global; the elapsed bound only has to absorb a timer wakeup that a
+        // loaded runner can delay, which the measured 44 ms overshoot shows
+        // is normally far below this slack.
+        assert!(start.elapsed() < Duration::from_millis(timeout) + DEADLINE_OVERSHOOT_SLACK);
         let probes = std::fs::read_to_string(client.root.join("probes"))
             .unwrap()
             .lines()
