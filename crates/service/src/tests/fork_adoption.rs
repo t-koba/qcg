@@ -2166,3 +2166,150 @@ async fn shared_fork_adoption_converges_after_source_settles() {
     );
     drop(held_source_lease);
 }
+
+#[tokio::test]
+async fn fork_does_not_inherit_source_audit_raise_after_recovery() {
+    let root = temp_run_dir("fork-audit-raise-recovery");
+    let _guard = TempGuard(root.clone());
+    let generators = root.join("generators");
+    let generator = generators.join("ask-user");
+    let runs = root.join("runs");
+    std::fs::create_dir_all(&generator).expect("generator directory");
+    // Keep a real HITL checkpoint so both source and fork remain recoverable.
+    std::fs::write(
+        generator.join(contract::MANIFEST_FILE),
+        concat!(
+            include_str!("../../../../fixtures/generators/ask-user/qcg.toml"),
+            "\n[audit]\nlevel = \"minimal\"\n"
+        ),
+    )
+    .expect("Minimal generator manifest");
+    let build_service = || {
+        LocalService::with_generator_roots_policy_and_store_mode(
+            vec![generators.clone()],
+            runs.clone(),
+            None,
+            policy::DEFAULT_MAX_ACTIVE_RUNS,
+            DEFAULT_MAX_TRACKED_RUNS,
+            RunStoreMode::Exclusive,
+            ServiceDeploymentPolicy {
+                audit_floor: policy::AuditFloor::Minimal,
+                ..Default::default()
+            },
+        )
+        .expect("service should initialize")
+    };
+    let service = build_service();
+    let source = service
+        .start_run(StartRun {
+            generator_id: "ask-user".into(),
+            audit_level: Some(policy::AuditLevel::Standard),
+            ..Default::default()
+        })
+        .await
+        .expect("raised source should start");
+    wait_for_snapshot(&service, &source, RunStatus::Waiting).await;
+    let source_events = crate::summaries::read_journal_events(&runs.join(&source))
+        .expect("source journal should read");
+    assert_eq!(
+        crate::summaries::audit_raise_from_values(&source_events),
+        Some(policy::AuditLevel::Standard)
+    );
+    let at_seq = source_events
+        .iter()
+        .find(|event| event["t"] == "run_waiting")
+        .expect("source waiting checkpoint")["seq"]
+        .as_u64()
+        .expect("checkpoint sequence");
+    let fork = service
+        .fork_run(
+            &source,
+            ForkRun {
+                at_seq,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("fork should start");
+    wait_for_snapshot(&service, &fork, RunStatus::Waiting).await;
+    let fork_dir = runs.join(&fork);
+    let events = crate::summaries::read_journal_events(&fork_dir).expect("fork journal");
+    let boundary = events
+        .iter()
+        .rposition(|event| event["t"] == "run_forked")
+        .expect("fork boundary");
+    assert!(
+        events[..boundary]
+            .iter()
+            .any(|event| { event["t"] == "run_queued" && event["audit_raise"] == "standard" })
+    );
+    assert!(
+        events[boundary + 1..]
+            .iter()
+            .any(|event| { event["t"] == "run_queued" && event["audit_raise"].is_null() })
+    );
+    assert_eq!(crate::summaries::audit_raise_from_values(&events), None);
+    let fork_seq = events[boundary]["seq"].as_u64().unwrap();
+    let assert_minimal_observations =
+        || {
+            let events = crate::summaries::read_events_with_audit(&fork_dir).expect("fork events");
+            assert!(
+                events.iter().any(|event| event["t"] == "graph_resolved"
+                    && event["seq"].as_u64().unwrap() < fork_seq),
+                "Standard source observations must still be copied"
+            );
+            assert!(
+                events.iter().all(|event| {
+                    event["seq"].as_u64().unwrap() <= fork_seq
+                        || policy::event_class(event["t"].as_str().unwrap())
+                            != policy::EventClass::Observation
+                }),
+                "Minimal fork must not persist its own observations: {events:#?}"
+            );
+        };
+    assert_minimal_observations();
+    drop(service);
+    wait_for_runs_store_release(&runs).await;
+
+    let recovered = build_service();
+    {
+        let records = recovered.inner.runs.read().await;
+        assert_eq!(
+            records
+                .get(&source)
+                .expect("recovered source")
+                .contract
+                .manifest
+                .audit
+                .level,
+            policy::AuditLevel::Standard,
+            "source must retain its legitimate per-run raise"
+        );
+        assert_eq!(
+            records
+                .get(&fork)
+                .expect("recovered fork")
+                .contract
+                .manifest
+                .audit
+                .level,
+            policy::AuditLevel::Minimal,
+            "recovery must not apply the copied source raise to the fork"
+        );
+    }
+    let waiting = wait_for_snapshot(&recovered, &fork, RunStatus::Waiting).await;
+    recovered
+        .answer(
+            fork.clone(),
+            waiting.question.expect("fork question").id,
+            AnswerPayload {
+                values: BTreeMap::from([("answer".into(), json!("brief"))]),
+            },
+        )
+        .await
+        .expect("fork answer should be accepted");
+    wait_for_snapshot(&recovered, &fork, RunStatus::Succeeded).await;
+    assert_minimal_observations();
+    drop(recovered);
+    wait_for_runs_store_release(&runs).await;
+}

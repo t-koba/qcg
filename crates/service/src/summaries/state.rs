@@ -66,14 +66,17 @@ pub(crate) fn read_last_queued_at_from_values(
 /// H02: journaled per-run audit raise from already-read journal values.
 ///
 /// The admission writes `audit_raise` ("standard" or null) on its
-/// `run_queued` event. The last `run_queued` wins (fork-aware: a fork's own
-/// admission carries no raise, so a forked run correctly resolves to no
-/// raise). Unknown/missing values read as no raise, never as a foreign
-/// level.
+/// `run_queued` event. Scan only after the latest `run_forked` boundary so
+/// copied source admissions cannot raise the fork's policy. Within that run,
+/// skip null/missing values: same-run requeues do not repeat the admission's
+/// raise. Unknown values never resolve to a foreign level.
 pub(crate) fn audit_raise_from_values(events: &[serde_json::Value]) -> Option<policy::AuditLevel> {
     events
         .iter()
         .rev()
+        .take_while(|event| {
+            event.get("t").and_then(serde_json::Value::as_str) != Some("run_forked")
+        })
         .filter(|event| event.get("t").and_then(serde_json::Value::as_str) == Some("run_queued"))
         .find_map(|event| match event.get("audit_raise") {
             Some(serde_json::Value::String(level)) => match level.as_str() {
@@ -277,4 +280,39 @@ fn rehydrate_run(
             ephemeral: false,
         },
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::audit_raise_from_values;
+    use policy::AuditLevel;
+    use serde_json::json;
+
+    #[test]
+    fn audit_raise_respects_fork_boundary_and_same_run_requeues() {
+        assert_eq!(audit_raise_from_values(&[]), None);
+        assert_eq!(
+            audit_raise_from_values(&[json!({"t": "run_queued", "audit_raise": null})]),
+            None
+        );
+        let raised = json!({"t": "run_queued", "audit_raise": "standard"});
+        assert_eq!(
+            audit_raise_from_values(&[
+                raised.clone(),
+                json!({"t": "run_forked"}),
+                json!({"t": "run_queued", "audit_raise": null}),
+            ]),
+            None,
+            "a fork must not inherit its source's per-run raise"
+        );
+        assert_eq!(
+            audit_raise_from_values(&[
+                raised,
+                json!({"t": "run_queued", "audit_raise": null}),
+                json!({"t": "run_queued"}),
+            ]),
+            Some(AuditLevel::Standard),
+            "same-run requeues must preserve the admission's raise"
+        );
+    }
 }
