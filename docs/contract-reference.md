@@ -4022,12 +4022,14 @@ against the current file contents.
   input is `{path, expected_base_sha256, edits}` with `edits` as
   `{op, anchor, lines}` items. Approval binds `path`, the expected base,
   and the canonical edits (`fspatch-v1`). The model's own edit mistakes come
-  back as tool results instead of failing the node: a stale anchor (with
-  remaps), a malformed anchor, an anchor that names a missing line, a file
-  that changed under the model, an empty edit list, and two edits on one
-  line. Such a call is checked before the approval, so it never spends the
-  user's confirmation. Limit violations stay fatal, because no correction
-  satisfies them.
+  back as tool results instead of failing the node: a call with the wrong
+  shape (a missing or unknown op, a missing anchor, missing or non-string
+  lines), a malformed anchor, an empty edit list, two edits on one line, a
+  stale anchor (with remaps), an anchor that names a missing line, and a
+  file that changed under the model. A call with the wrong shape is checked
+  before the approval, so it never spends the user's confirmation; the
+  failures only the patch itself can show are found when it applies. Limit
+  violations stay fatal, because no correction satisfies them.
 - `command`: a fixed `command`, plus an optional `input_schema`.
 - `http`: fixed `methods` and `hosts`, plus an optional `input_schema`.
 - `ask_user`: an optional `input_schema` for a runtime-generated form.

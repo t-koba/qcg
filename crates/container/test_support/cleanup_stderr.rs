@@ -24,16 +24,26 @@ const DEADLINE_OVERSHOOT_SLACK: Duration = Duration::from_secs(1);
 /// How long the fixture client stays alive after it publishes its pid.
 ///
 /// The client sleeps for this long, so an observation bound must stay below
-/// it: the pid can only appear while the client is alive.
+/// it: the client exiting would end the operation before the test could act
+/// on it.
 const CLIENT_LIFETIME: Duration = Duration::from_secs(8);
+
+/// How long the held fixture's background child holds the stderr pipe.
+///
+/// A separate lifetime from the client's own: this child only has to
+/// outlive the command that spawned it.
+const HELD_CHILD_LIFETIME: Duration = Duration::from_secs(8);
+
+/// Margin kept between the observation bound and the client's lifetime.
+const CLIENT_EXIT_MARGIN: Duration = Duration::from_secs(1);
 
 /// Bound for observing the fixture client's published pid.
 ///
 /// The child is killed at the operation's own deadline, so its pid can only
 /// appear before that deadline: the bound is derived from the operation's
-/// stage timeout, capped by the client's lifetime.
+/// stage timeout and kept below the client's lifetime.
 fn child_observation_bound(stage_timeout: Duration) -> Duration {
-    stage_timeout.min(CLIENT_LIFETIME)
+    stage_timeout.min(CLIENT_LIFETIME.saturating_sub(CLIENT_EXIT_MARGIN))
 }
 
 struct Client {
@@ -49,7 +59,7 @@ impl Client {
         let binary = root.join("client");
         let script = format!(
             r#"#!/bin/sh
-root='{}'
+root='{0}'
 printf '%s\n' "$1" >> "$root/log"
 if [ '{mode}' = home ]; then printf '%s\n' "$HOME" >> "$root/home-seen"; fi
 case "{mode}:$1" in
@@ -61,12 +71,12 @@ case "{mode}:$1" in
     exit 1 ;;
   running:*)
     echo "$$" >> "$root/direct-pids"
-    exec /bin/sleep {} ;;
+    exec /bin/sleep {1} ;;
   absent:*)
     echo 'Error: no such instance owned-id' >&2
     exit 1 ;;
   held-stop:stop|held-stop:kill|held-success:stop|held-success:kill|held-delete:delete|held-delete:rm)
-    /bin/sleep 8 >&2 &
+    /bin/sleep {2} >&2 &
     echo "$!" >> "$root/pids"
     echo 'Error: no such instance owned-id' >&2
     echo "$1" >> "$root/exited"
@@ -76,7 +86,8 @@ esac
 exit 0
 "#,
             root.display(),
-            CLIENT_LIFETIME.as_secs()
+            CLIENT_LIFETIME.as_secs(),
+            HELD_CHILD_LIFETIME.as_secs()
         );
         // Concurrent test forks can briefly inherit a writable executable
         // descriptor even with CLOEXEC, causing ETXTBSY in another thread.

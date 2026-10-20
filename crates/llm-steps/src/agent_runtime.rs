@@ -508,39 +508,45 @@ pub(crate) fn parse_patch_edits(
     node: &NodeDef,
     edits: &[Value],
 ) -> Result<Vec<files::PatchEdit>, StepError> {
-    files::parse_edits(&raw_patch_edits(node, edits)?)
-        .map_err(|error| StepError::failed(&node.id, error.to_string()))
+    let raw =
+        raw_patch_edits(edits).map_err(|(_code, detail)| StepError::failed(&node.id, detail))?;
+    files::parse_edits(&raw).map_err(|error| StepError::failed(&node.id, error.to_string()))
 }
 
 /// Converts a tool call's `edits` array into the mechanism's raw edits.
-/// Fails closed on a malformed call shape.
-fn raw_patch_edits(node: &NodeDef, edits: &[Value]) -> Result<Vec<files::RawPatchEdit>, StepError> {
+///
+/// A call shape the model got wrong is reported with a code and a detail,
+/// so the agent can correct the call instead of failing the node.
+fn raw_patch_edits(edits: &[Value]) -> Result<Vec<files::RawPatchEdit>, (&'static str, String)> {
     let mut raw = Vec::with_capacity(edits.len());
     for edit in edits {
-        let object = edit
-            .as_object()
-            .ok_or_else(|| StepError::failed(&node.id, "fs.patch edit must be an object"))?;
-        let op = object
-            .get("op")
-            .and_then(Value::as_str)
-            .ok_or_else(|| StepError::failed(&node.id, "fs.patch edit requires op"))?;
-        let anchor = object
-            .get("anchor")
-            .and_then(Value::as_str)
-            .ok_or_else(|| StepError::failed(&node.id, "fs.patch edit requires anchor"))?;
-        let lines = object
-            .get("lines")
-            .and_then(Value::as_array)
-            .ok_or_else(|| StepError::failed(&node.id, "fs.patch edit requires lines"))?;
+        let Some(object) = edit.as_object() else {
+            return Err(("edit_invalid", "fs.patch edit must be an object".into()));
+        };
+        let Some(op) = object.get("op").and_then(Value::as_str) else {
+            return Err(("op_missing", "fs.patch edit requires op".into()));
+        };
+        if !matches!(op, "replace" | "append" | "prepend") {
+            return Err((
+                "op_invalid",
+                "fs.patch edit op must be replace, append, or prepend".into(),
+            ));
+        }
+        let Some(anchor) = object.get("anchor").and_then(Value::as_str) else {
+            return Err(("anchor_missing", "fs.patch edit requires anchor".into()));
+        };
+        let Some(lines) = object.get("lines").and_then(Value::as_array) else {
+            return Err(("lines_missing", "fs.patch edit requires lines".into()));
+        };
         let mut text = Vec::with_capacity(lines.len());
         for line in lines {
-            text.push(
-                line.as_str()
-                    .ok_or_else(|| {
-                        StepError::failed(&node.id, "fs.patch edit lines must be strings")
-                    })?
-                    .to_string(),
-            );
+            let Some(line) = line.as_str() else {
+                return Err((
+                    "lines_invalid",
+                    "fs.patch edit lines must be strings".into(),
+                ));
+            };
+            text.push(line.to_string());
         }
         raw.push(files::RawPatchEdit {
             op: op.to_string(),
@@ -549,6 +555,17 @@ fn raw_patch_edits(node: &NodeDef, edits: &[Value]) -> Result<Vec<files::RawPatc
         });
     }
     Ok(raw)
+}
+
+/// The tool result the model reads when its own patch call has the wrong
+/// shape.
+fn patch_call_rejection(path: &str, code: &str, detail: &str) -> Value {
+    json!({
+        "file": path,
+        "ok": false,
+        "error": code,
+        "detail": detail,
+    })
 }
 
 /// The tool result the model reads when its own `fs.patch` edit cannot be
@@ -767,6 +784,10 @@ pub(crate) async fn execute_agent_fs_patch(
             if let engine::GatewayError::AnchoredPatch(error) = &error
                 && let Some(value) = agent_fs_patch_rejection(path, error)
             {
+                // The operation is settled above; the payload it was given
+                // must go with it, so a retrying agent does not accumulate
+                // one unredacted sidecar per attempt.
+                ctx.run.clear_pending_tool_payload(operation_id);
                 return Ok(AgentToolOutcome::Result(value));
             }
             Err(StepError::from_gateway(&node.id, error))
@@ -1095,6 +1116,26 @@ pub(crate) async fn execute_agent_tool(
                 .ok_or_else(|| StepError::failed(&node.id, "fs.patch tool requires edits"))?;
             ensure_path_within_prefix(node, name, path, path_prefix)?;
             let salt = ctx.run.run_id.clone();
+            // The model's own call shape is checked first: a call the agent
+            // can correct comes back to it instead of failing the node, and
+            // it never reaches the approval.
+            let raw_edits = match raw_patch_edits(raw_edits) {
+                Ok(raw) => raw,
+                Err((code, detail)) => {
+                    // The call still holds a pending payload: release it so a
+                    // retrying agent does not accumulate one unredacted
+                    // sidecar per attempt.
+                    ctx.run
+                        .clear_pending_tool_payload(&engine::operation_id_for(
+                            &ctx.run.run_id,
+                            &node.id,
+                            call_id,
+                        ));
+                    return Ok(AgentToolOutcome::Result(patch_call_rejection(
+                        path, code, &detail,
+                    )));
+                }
+            };
             let canonical = canonical_patch_edits(args).ok_or_else(|| {
                 StepError::failed(&node.id, "fs.patch edits are not canonicalizable")
             })?;
@@ -1175,9 +1216,18 @@ pub(crate) async fn execute_agent_tool(
             // a call that cannot apply must not spend the user's
             // confirmation, and the failure belongs to the model, which can
             // correct it by re-reading the file.
-            let edits = match files::parse_edits(&raw_patch_edits(node, raw_edits)?) {
+            let edits = match files::parse_edits(&raw_edits) {
                 Ok(edits) => edits,
                 Err(error) => {
+                    // The operation never started, but the call still holds a
+                    // pending payload: release it so a retrying agent does
+                    // not accumulate one unredacted sidecar per attempt.
+                    ctx.run
+                        .clear_pending_tool_payload(&engine::operation_id_for(
+                            &ctx.run.run_id,
+                            &node.id,
+                            call_id,
+                        ));
                     return Ok(AgentToolOutcome::Result(
                         agent_fs_patch_rejection(path, &error).unwrap_or_else(
                             || json!({ "file": path, "ok": false, "error": "patch_rejected" }),
@@ -3162,6 +3212,106 @@ mod approval_e2e {
             !harness.root.join("workspace/drafts/note.txt").exists(),
             "nothing executes without its own approval"
         );
+    }
+
+    /// A patch call the model got wrong comes back as a tool result, never
+    /// as a failed node, and it never spends the user's confirmation.
+    #[tokio::test]
+    async fn a_patch_call_the_model_got_wrong_never_reaches_the_approval() {
+        let harness = ApprovalHarness::setup("fs-patch-reject");
+        let node = ApprovalHarness::node();
+        let tools = vec![ToolDecl::FsPatch {
+            name: "patch".into(),
+            description: None,
+            input_schema: None,
+            path_prefix: "notes".into(),
+        }];
+        let runtime = test_runtime();
+        let run = RunContext::for_tests(
+            harness.run_id.clone(),
+            harness.root.join("workspace"),
+            harness.root.join("meta"),
+            harness.contract(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .expect("test context should build");
+        let journal = JournalWriter::create(&harness.journal_path(), &harness.run_id, false, None)
+            .expect("journal should open");
+        let mut vars = contract::ValueBag::with_inputs(BTreeMap::new());
+        let mut ctx = StepContext {
+            run: &run,
+            journal: &journal,
+            vars: &mut vars,
+            llm: None,
+        };
+        let mcp = McpAgentTools::prepare(&ctx, &node, &runtime, &tools)
+            .await
+            .expect("prepare should succeed");
+        let mut activated = BTreeSet::new();
+        let operation_id = engine::operation_id_for(&harness.run_id, &node.id, "call-1");
+        for (args, code) in [
+            (
+                json!({"path": "notes/n.txt", "expected_base_sha256": "abc", "edits": [{"op": "replace", "anchor": "not-an-anchor", "lines": ["x"]}]}),
+                "anchor_invalid",
+            ),
+            (
+                json!({"path": "notes/n.txt", "expected_base_sha256": "abc", "edits": [{"op": "swap", "anchor": "2:015cadfe", "lines": ["x"]}]}),
+                "op_invalid",
+            ),
+            (
+                json!({"path": "notes/n.txt", "expected_base_sha256": "abc", "edits": [{"op": "replace", "lines": ["x"]}]}),
+                "anchor_missing",
+            ),
+        ] {
+            // The checkpoint stores the call's exact bytes in a run-private
+            // sidecar before the tool runs; a rejected call must release it.
+            run.store_pending_tool_payload(&node, &operation_id, &args)
+                .expect("pending payload should store");
+            let outcome = execute_agent_tool(
+                &mut ctx,
+                &node,
+                AgentToolServices {
+                    runtime: &runtime,
+                    guardrails: &[],
+                },
+                AgentToolInvocation {
+                    mcp: &mcp,
+                    tools: &tools,
+                    name: "patch",
+                    call_id: "call-1",
+                    call_number: 0,
+                    args: &args,
+                    activated_skills: &mut activated,
+                },
+            )
+            .await
+            .expect("a call the model got wrong must not fail the node");
+            match outcome {
+                AgentToolOutcome::Result(value) => {
+                    assert_eq!(
+                        value.get("ok").and_then(|ok| ok.as_bool()),
+                        Some(false),
+                        "the tool result must report the failure: {value}"
+                    );
+                    assert_eq!(
+                        value.get("error").and_then(|error| error.as_str()),
+                        Some(code),
+                        "the tool result must name the failure: {value}"
+                    );
+                }
+                AgentToolOutcome::NeedsConfirm(_) => {
+                    panic!("a call the model got wrong must not spend the confirmation")
+                }
+                _ => panic!("a rejected call must come back as a tool result"),
+            }
+            assert!(
+                run.load_pending_tool_payload(&node, &operation_id)
+                    .expect("pending payload should read")
+                    .is_none(),
+                "a rejected call must release its pending payload"
+            );
+        }
     }
 
     #[test]
