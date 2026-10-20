@@ -798,7 +798,10 @@ Unattended limits:
 - `Waiting` and `Confirming` runs release their execution slot but have no
   TTL in mechanism; an unanswered run stays paused until answered, confirmed,
   or canceled. Expire it from the orchestrator with `cancel` when policy
-  requires. By default `budget.max_elapsed_seconds` covers queue plus HITL dwell;
+  requires. By default `budget.max_elapsed_seconds` covers queue plus HITL dwell,
+  and the wall-clock it measures starts when the run is enqueued: a run that
+  waits behind a backlog can exhaust its budget before it executes a step, so
+  size the budget for the queue the deployment actually produces.
   `ELAPSED_BUDGET_MODE=active_execution` excludes ordinary waits (see below).
 
 ## Observability

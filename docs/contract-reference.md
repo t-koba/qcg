@@ -4365,9 +4365,12 @@ fields are rejected when their structs define a closed schema.
    Guarantee strengths differ: `max_elapsed_seconds` is a hard deadline
    enforced monotonically (a running node is stopped and the finalization
    re-checks it before settling success). Deployment `ELAPSED_BUDGET_MODE`
-   defaults to total wall-clock age including queued/HITL waits; the
-   `active_execution` alternative excludes normal waits, but conservatively
-   charges downtime for an unclosed crashed episode. The mode is pinned at
+   defaults to total wall-clock age measured from the run's enqueue, so the
+   queue and HITL waits are charged: a run that waits behind a backlog can
+   exhaust its budget before it executes a step, and a small budget on a
+   loaded runner expires it that way. The `active_execution` alternative
+   excludes normal waits, but conservatively charges downtime for an
+   unclosed crashed episode. The mode is pinned at
    admission and inherited by forks; it is not a contract override (see
    [operations](operations.md#elapsed-budget-waiting-policy)). `max_tokens` and
    `max_cost_usd` are enforced at attempt entry (`StepContext::step_checkpoint`)
