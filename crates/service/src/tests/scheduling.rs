@@ -578,20 +578,15 @@ async fn elapsed_modes_initial_queue_and_exhausted_admission_start_no_effects() 
         generator(&root, "victim", "0.01");
         let path = root.join("victim").join(contract::MANIFEST_FILE);
         let text = std::fs::read_to_string(&path).unwrap();
-        // The two branches need different budgets. The wall-clock branch
-        // needs the small one: it proves that a backlogged run expires
-        // before it executes a step. The active branch's budget is incidental
-        // there, so it uses the same named budget as the other elapsed
-        // tests, which has to outlast the run's own startup, and a dwell
-        // that exceeds it, which is what makes the two modes differ.
-        let (budget_secs, dwell) = if mode == ElapsedBudgetMode::WallClock {
-            (1, Duration::from_millis(1150))
-        } else {
-            (ELAPSED_BUDGET_SECS, ELAPSED_BUDGET_DWELL)
-        };
+        // One named pair for both modes, so the difference between the
+        // branches is attributable to the elapsed-budget mode alone. The
+        // wall-clock branch needs the budget to expire while the victim is
+        // still queued, and the shared pair satisfies that: the budget is
+        // shorter than the dwell, and the blocker holds the execution slot
+        // for 30 s.
         std::fs::write(
             path,
-            format!("{text}\n[budget]\nmax_elapsed_seconds = {budget_secs}\n"),
+            format!("{text}\n[budget]\nmax_elapsed_seconds = {ELAPSED_BUDGET_SECS}\n"),
         )
         .unwrap();
         let service = service(
@@ -621,7 +616,7 @@ async fn elapsed_modes_initial_queue_and_exhausted_admission_start_no_effects() 
         } else {
             assert!(queued.budget.elapsed.is_none());
         }
-        tokio::time::sleep(dwell).await;
+        tokio::time::sleep(ELAPSED_BUDGET_DWELL).await;
         service.cancel(blocker).await.unwrap();
         let terminal = wait_for_terminal_snapshot(&service, &victim).await;
         let workspace = run_workspace_dir(&root.join("runs").join(&victim));
