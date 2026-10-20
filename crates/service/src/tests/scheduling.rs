@@ -302,7 +302,11 @@ async fn boundary_drain_does_not_abort_after_five_seconds() {
     .await
     .unwrap();
     // The external command remains gated beyond the interrupt stop deadline.
-    tokio::time::sleep(Duration::from_millis(5100)).await;
+    // Advance paused Tokio time instead of wall-sleeping: the live gated
+    // command stays blocked on `release` while virtual time passes the
+    // interrupt stop deadline.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_millis(5100)).await;
     assert!(
         !arriving.is_finished(),
         "boundary admission must still be draining"
@@ -314,6 +318,7 @@ async fn boundary_drain_does_not_abort_after_five_seconds() {
     let journal = read_journal_string(&service, victim.clone()).await;
     assert!(!journal.contains("run_canceled"));
     assert!(!journal.contains("run_yielded"));
+    tokio::time::resume();
     std::fs::write(
         run_workspace_dir(&root.join("runs").join(&victim)).join("release"),
         "go",
