@@ -24,6 +24,18 @@ pub use summaries::*;
 pub use types::*;
 
 #[cfg(test)]
+pub(crate) mod retention_gc_test_hooks {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub(crate) static PASSES: AtomicUsize = AtomicUsize::new(0);
+    pub(crate) static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    pub(crate) fn record_pass() {
+        PASSES.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
 #[path = "tests/mod.rs"]
 mod tests;
 

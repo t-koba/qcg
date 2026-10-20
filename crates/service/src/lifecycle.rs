@@ -296,6 +296,7 @@ impl LocalService {
             }
             let interval_secs = service.inner.deployment_policy.gc_interval_secs.max(1);
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            interval.tick().await; // Drop the immediate first tick; the startup sweep already ran.
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => return Ok(()),
@@ -310,12 +311,11 @@ impl LocalService {
         }))
     }
 
-    /// One GC pass with bounded retries for transient lease and sweep
-    /// failures. Contended maintenance locks (another process owns the
-    /// sweep) are a normal skip, not a failure. Persistent errors return
-    /// Err so the owning task ends visibly instead of looping silently
-    /// (E05).
+    /// A GC pass retries failures boundedly; lock contention skips normally.
+    /// Exhausted errors return Err so the task ends visibly instead of looping as Ok (E05).
     async fn collect_retained_runs_with_retry(&self) -> Result<(), ServiceError> {
+        #[cfg(test)]
+        crate::retention_gc_test_hooks::record_pass();
         let mut last_error = None;
         for _ in 0..3 {
             match self.collect_retained_runs().await {
