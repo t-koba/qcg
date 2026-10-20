@@ -12,6 +12,7 @@ use std::os::unix::fs::PermissionsExt;
 /// and reached 444 ms on the same runner, so every deadline that covers a
 /// client start uses this budget. It stays below the client's own lifetime
 /// so a timeout still fires before the client exits on its own.
+#[cfg(target_os = "linux")]
 const CLIENT_START_BUDGET: Duration = Duration::from_secs(2);
 
 /// Slack allowed between a stage deadline and the operation's return.
@@ -35,6 +36,7 @@ const CLIENT_LIFETIME: Duration = Duration::from_secs(8);
 const HELD_CHILD_LIFETIME: Duration = Duration::from_secs(8);
 
 /// Margin kept between the observation bound and the client's lifetime.
+#[cfg(target_os = "linux")]
 const CLIENT_EXIT_MARGIN: Duration = Duration::from_secs(1);
 
 /// Bound for observing the fixture client's published pid.
@@ -42,6 +44,7 @@ const CLIENT_EXIT_MARGIN: Duration = Duration::from_secs(1);
 /// The child is killed at the operation's own deadline, so its pid can only
 /// appear before that deadline: the bound is derived from the operation's
 /// stage timeout and kept below the client's lifetime.
+#[cfg(target_os = "linux")]
 fn child_observation_bound(stage_timeout: Duration) -> Duration {
     stage_timeout.min(CLIENT_LIFETIME.saturating_sub(CLIENT_EXIT_MARGIN))
 }
