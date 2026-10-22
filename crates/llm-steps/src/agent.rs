@@ -398,7 +398,7 @@ impl StepExecutor for LlmAgentStep {
                                 json!({
                                     "provider": string_schema(),
                                     "max_results": { "type": "integer", "minimum": 1, "maximum": policy::MAX_WEB_SEARCH_RESULTS },
-                                    "max_calls": { "type": "integer", "minimum": 1, "maximum": 10 }
+                                    "max_calls": { "type": "integer", "minimum": 1, "maximum": policy::MAX_AGENT_TOOL_CALLS }
                                 })
                             ),
                             agent_tool_params_schema(
