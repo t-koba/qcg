@@ -7,7 +7,13 @@ use std::{path::PathBuf, time::Duration};
 /// The cleanup itself is bounded by the container timeout, but it starts on a
 /// worker that a loaded runner can starve, so the wait has to outlast the
 /// starvation rather than only the cleanup.
-pub(crate) const CLEANUP_JOIN_BOUND: Duration = Duration::from_secs(30);
+///
+/// The value is measured rather than chosen to keep a test green: joining
+/// the outstanding cleanups took 1.0 s to 2.1 s and 4.06 s at worst, over
+/// 72 joins measured with the whole container suite running in parallel on
+/// one CPU. The bound sits at 10 s, more than twice that worst case and
+/// above the fake daemon's eight-second hang.
+pub(crate) const CLEANUP_JOIN_BOUND: Duration = Duration::from_secs(10);
 
 /// The largest gap the fake daemon may show between a container's stop
 /// attempt and the removal that follows it.
@@ -22,10 +28,14 @@ pub(crate) const CLEANUP_JOIN_BOUND: Duration = Duration::from_secs(30);
 /// The gap is measured from the daemon's own arrival stamps, so a loaded
 /// runner's starvation of the cleanup worker lands directly in it: the
 /// product can honor the frozen timeout exactly and still show a wide gap.
-/// The bound therefore has to outlast the starvation a loaded runner
-/// inflicts, the same way `CLEANUP_JOIN_BOUND` does for the same cleanup
-/// window, rather than sit just above the timeout it measures.
-pub(crate) const STOP_TIMEOUT_GAP_BOUND: Duration = Duration::from_secs(6);
+///
+/// The value is measured rather than chosen to keep a test green: the gap
+/// was 2 s at worst and 1 s in the usual case, over 122 observations taken
+/// on an unpinned runner, on one pinned CPU, on one CPU with eight
+/// competing processes, and with the whole container and MCP suites running
+/// in parallel on one CPU. The bound sits at 4 s, twice the worst observed
+/// gap and below the eight-second hang it has to separate.
+pub(crate) const STOP_TIMEOUT_GAP_BOUND: Duration = Duration::from_secs(4);
 
 pub struct Daemon {
     pub root: PathBuf,

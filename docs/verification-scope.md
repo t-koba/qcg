@@ -73,3 +73,27 @@ packaging builds these inputs by default. Rust OS CI forwards
 installation; API/WASM generation and frontend building still run there.
 End-to-end CI builds the frontend
 inside its browser runner once, after generating API/WASM inputs.
+
+## Measured timing bounds
+
+The container tests' wall-clock bounds are sized from measurements. On
+2026-10-21 the daemon-policy test's stop-to-removal gap was measured from
+the fake daemon's own arrival stamps, over the four teardown paths of both
+backends: the worst observed gap was 2 s and the usual one 1 s, over 122
+observations taken on an unpinned runner, on one pinned CPU, on one CPU
+with eight competing processes, and with the whole container and MCP suites
+running in parallel on one CPU. `STOP_TIMEOUT_GAP_BOUND` is 4 s, twice the
+worst observed gap and below the fake daemon's eight-second hang, which it
+separates from the teardown that honors the frozen stop timeout.
+
+Joining the container's outstanding cleanups was measured the same way:
+1.0 s to 2.1 s in the same runs and 4.06 s at worst, over 72 joins taken
+with the whole container suite running in parallel on one CPU.
+`CLEANUP_JOIN_BOUND` is 10 s, more than twice that worst case and above the
+fake daemon's eight-second hang.
+
+A bound that no longer fits its measurement is a defect in either
+direction: raising one to keep a test green hides the regression it exists
+to catch, and lowering one below the measured window turns a slow runner
+into a red build. Re-measure after a change to the container's cleanup path,
+and record the observation beside the bound it sizes.
