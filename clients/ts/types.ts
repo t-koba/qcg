@@ -3296,11 +3296,18 @@ export interface components {
             code: components["schemas"]["ToolCallErrorCode"];
             message: string;
         };
-        ToolCallErrorCode: ("invalid_arguments" | "guardrail_rejected" | "execution_failed" | "output_rejected" | "cancelled" | "budget_exceeded" | "tool_reported_error") | "timed_out" | "elapsed_exceeded";
+        ToolCallErrorCode: ("invalid_arguments" | "guardrail_rejected" | "execution_failed" | "output_rejected" | "cancelled" | "budget_exceeded" | "tool_reported_error") | "timed_out" | "elapsed_exceeded" | "cleanup_failed";
         ToolCallEventData: {
             /** @default null */
             agent: string | null;
             arguments: unknown;
+            /**
+             * @description The session cleanup that followed the tool call failed. The
+             *     execution outcome stands on its own; the cleanup failure is
+             *     retained here so it can be settled separately.
+             * @default null
+             */
+            cleanup_error: components["schemas"]["ToolCallError"] | null;
             /** Format: uint64 */
             duration_ms: number;
             /** @default null */
