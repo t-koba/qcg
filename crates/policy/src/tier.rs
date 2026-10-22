@@ -38,27 +38,13 @@ impl CostTier {
     /// The first rate that is not finite and non-negative, named by its
     /// field. `None` when every configured rate is valid.
     pub fn invalid_rate(&self) -> Option<&'static str> {
-        [
-            (
-                "input_cost_per_million_usd",
-                self.input_cost_per_million_usd,
-            ),
-            (
-                "cache_read_input_cost_per_million_usd",
-                self.cache_read_input_cost_per_million_usd,
-            ),
-            (
-                "cache_creation_input_cost_per_million_usd",
-                self.cache_creation_input_cost_per_million_usd,
-            ),
-            (
-                "output_cost_per_million_usd",
-                self.output_cost_per_million_usd,
-            ),
-        ]
-        .into_iter()
-        .find(|(_, value)| value.is_some_and(|value| !value.is_finite() || value < 0.0))
-        .map(|(name, _)| name)
+        CostRates {
+            input: self.input_cost_per_million_usd,
+            cache_read: self.cache_read_input_cost_per_million_usd,
+            cache_creation: self.cache_creation_input_cost_per_million_usd,
+            output: self.output_cost_per_million_usd,
+        }
+        .invalid_rate()
     }
 }
 
@@ -141,6 +127,25 @@ pub fn select_cost_tier(tiers: &[CostTier], prompt_input_tokens: u64) -> Option<
         .iter()
         .filter(|tier| tier.threshold_tokens <= prompt_input_tokens)
         .max_by_key(|tier| tier.threshold_tokens)
+}
+
+/// Carries pinned rates into every tier: a pinned rate prices every tier,
+/// and a tier contributes only the rates the pin left open.
+pub fn carry_pinned_rates(tiers: &[CostTier], pinned: &CostRates) -> Vec<CostTier> {
+    tiers
+        .iter()
+        .map(|tier| CostTier {
+            threshold_tokens: tier.threshold_tokens,
+            input_cost_per_million_usd: pinned.input.or(tier.input_cost_per_million_usd),
+            cache_read_input_cost_per_million_usd: pinned
+                .cache_read
+                .or(tier.cache_read_input_cost_per_million_usd),
+            cache_creation_input_cost_per_million_usd: pinned
+                .cache_creation
+                .or(tier.cache_creation_input_cost_per_million_usd),
+            output_cost_per_million_usd: pinned.output.or(tier.output_cost_per_million_usd),
+        })
+        .collect()
 }
 
 /// The dearest rates a request can be billed at: the base row and every tier
@@ -356,6 +361,34 @@ mod tests {
         let rates = max_cost_rates(&base(), &tiers);
         assert_eq!(rates.max_input_rate(), Some(4.0));
         assert_eq!(rates.output, Some(2.0));
+    }
+
+    #[test]
+    fn a_pinned_rate_prices_every_tier_and_the_tier_keeps_the_rest() {
+        let pinned = CostRates {
+            input: Some(0.5),
+            cache_read: None,
+            cache_creation: None,
+            output: None,
+        };
+        let tiers = [CostTier {
+            threshold_tokens: 200_001,
+            input_cost_per_million_usd: Some(2.0),
+            cache_read_input_cost_per_million_usd: Some(0.2),
+            cache_creation_input_cost_per_million_usd: Some(2.5),
+            output_cost_per_million_usd: Some(4.0),
+        }];
+        let carried = carry_pinned_rates(&tiers, &pinned);
+        assert_eq!(carried[0].threshold_tokens, 200_001);
+        // The pinned rate prices the tier.
+        assert_eq!(carried[0].input_cost_per_million_usd, Some(0.5));
+        // The tier contributes the categories the pin left open.
+        assert_eq!(carried[0].cache_read_input_cost_per_million_usd, Some(0.2));
+        assert_eq!(
+            carried[0].cache_creation_input_cost_per_million_usd,
+            Some(2.5)
+        );
+        assert_eq!(carried[0].output_cost_per_million_usd, Some(4.0));
     }
 
     #[test]

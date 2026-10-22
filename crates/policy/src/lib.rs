@@ -72,5 +72,6 @@ pub use schema::{
 };
 pub use service::{binary_stem, default_service_name};
 pub use tier::{
-    CostRates, CostTier, CostTierError, max_cost_rates, select_cost_tier, validate_cost_tiers,
+    CostRates, CostTier, CostTierError, carry_pinned_rates, max_cost_rates, select_cost_tier,
+    validate_cost_tiers,
 };

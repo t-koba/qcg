@@ -288,6 +288,11 @@ Fields:
   registry tier list replaces the external catalog's tier list for the same
   model instead of merging with it, so an operator can state the exact
   schedule.
+- A rate the registry row pins prices every tier it inherits, exactly as a
+  contract pin does: the pinned rate is carried into each inherited external
+  tier, so it prices that tier, and the tier contributes only the rates the
+  pin leaves open. A registry row that declares its own tier list still
+  replaces the external list outright.
 - `context_tokens` / `max_output_tokens`: selection metadata.
 - `enabled`: `false` hides the model from `qcg models` and the catalog API.
 
@@ -331,6 +336,16 @@ model's flat rates in place: qcg prices a request at a rate it read, never at
 one it guessed, and a third-party payload never removes a usable model. The
 dropped schedule is reported with the model it belongs to in the catalog
 view, so tier pricing being off is never silent.
+
+The `models_dev` source publishes a context band as `tier: {type, size}`:
+the kind of band and the size the band starts above. qcg reads the
+`context` kind, and the published size is the size the band starts above, so
+qcg's threshold is one token past it: a request of exactly the published size
+stays in the shorter band, and the next token reaches the band. The size is
+the model's own, and each band keeps the cache and output rates the source
+published for it. A row that names another kind of band prices no request,
+and a model the source gives no context band for keeps its flat rates and is
+reported with the model in the catalog view.
 
 ```toml
 [catalog]

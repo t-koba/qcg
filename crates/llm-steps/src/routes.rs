@@ -132,30 +132,7 @@ fn priced_tiers(
     let Some(catalog) = catalog else {
         return Vec::new();
     };
-    let rate = |declared: Option<f64>, tier: Option<f64>| declared.or(tier);
-    catalog
-        .cost_tiers
-        .iter()
-        .map(|tier| policy::CostTier {
-            threshold_tokens: tier.threshold_tokens,
-            input_cost_per_million_usd: rate(
-                contract.input_cost_per_million_usd,
-                tier.input_cost_per_million_usd,
-            ),
-            cache_read_input_cost_per_million_usd: rate(
-                contract.cache_read_input_cost_per_million_usd,
-                tier.cache_read_input_cost_per_million_usd,
-            ),
-            cache_creation_input_cost_per_million_usd: rate(
-                contract.cache_creation_input_cost_per_million_usd,
-                tier.cache_creation_input_cost_per_million_usd,
-            ),
-            output_cost_per_million_usd: rate(
-                contract.output_cost_per_million_usd,
-                tier.output_cost_per_million_usd,
-            ),
-        })
-        .collect()
+    policy::carry_pinned_rates(&catalog.cost_tiers, &contract.rates())
 }
 
 #[cfg(test)]

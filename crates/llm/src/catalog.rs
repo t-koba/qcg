@@ -943,10 +943,20 @@ fn merge_model(base: &ModelSpec, over: &ModelSpec) -> ModelSpec {
         output_cost_per_million_usd: over
             .output_cost_per_million_usd
             .or(base.output_cost_per_million_usd),
-        // A tier list is a whole price schedule: an explicit registry
-        // declaration replaces the external one instead of merging with it.
+        // A tier list is a whole price schedule: a registry row that
+        // declares its own tiers replaces the external one outright;
+        // otherwise the external tiers are inherited, with the registry's
+        // pinned rates carried into them as a contract pin does.
         cost_tiers: if over.cost_tiers.is_empty() {
-            base.cost_tiers.clone()
+            policy::carry_pinned_rates(
+                &base.cost_tiers,
+                &policy::CostRates {
+                    input: over.input_cost_per_million_usd,
+                    cache_read: over.cache_read_input_cost_per_million_usd,
+                    cache_creation: over.cache_creation_input_cost_per_million_usd,
+                    output: over.output_cost_per_million_usd,
+                },
+            )
         } else {
             over.cost_tiers.clone()
         },
@@ -1192,45 +1202,52 @@ struct ModelsDevCost {
     tiers: Vec<Value>,
 }
 
-/// One context tier as the source publishes it: the threshold from which
-/// the row's rates apply, and the rates in the same fields the base cost
-/// row uses.
+/// One context tier as the source publishes it: the band it names, and the
+/// rates in the same fields the base cost row uses.
 #[derive(Debug, Deserialize)]
 struct ModelsDevCostTier {
-    threshold_tokens: u64,
-    #[serde(default)]
-    input: Option<f64>,
-    #[serde(default)]
-    output: Option<f64>,
-    #[serde(default)]
-    cache_read: Option<f64>,
-    #[serde(default)]
-    cache_write: Option<f64>,
+    #[serde(flatten)]
+    rates: ModelsDevCost,
+    tier: ModelsDevCostBand,
 }
 
-/// Maps the source's tiers onto the shared tier type. A tier qcg cannot
-/// read, or a schedule qcg cannot validate, leaves the model's flat rates
-/// in place: qcg prices a request at a rate it read, never at one it
-/// guessed. The provider registry can declare the tiers exactly. The
-/// reason the schedule could not be used is returned, so the caller can
-/// report it with the model it belongs to.
+/// The band a tier row names: its kind, and the size the band starts above.
+#[derive(Debug, Deserialize)]
+struct ModelsDevCostBand {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    size: Option<u64>,
+}
+
+/// Maps the source's tiers onto the shared tier type. The source names a
+/// band by its kind and the size the band starts above, so qcg's threshold
+/// is one token past that size. A tier qcg cannot read or validate leaves
+/// the model's flat rates in place and is reported with the model.
 fn map_models_dev_tiers(cost: Option<&ModelsDevCost>) -> Result<Vec<policy::CostTier>, String> {
-    let Some(cost) = cost else {
-        return Ok(Vec::new());
-    };
     let mut mapped = Vec::new();
-    for tier in &cost.tiers {
-        let Ok(tier) = serde_json::from_value::<ModelsDevCostTier>(tier.clone()) else {
+    for row in cost.into_iter().flat_map(|cost| cost.tiers.iter()) {
+        let Ok(row) = serde_json::from_value::<ModelsDevCostTier>(row.clone()) else {
             return Err("a tier qcg cannot read".to_string());
         };
+        // A row that names another kind of band prices no request.
+        if row.tier.kind.as_deref() != Some("context") {
+            continue;
+        }
+        let size = row.tier.size.ok_or("a tier qcg cannot read")?;
         mapped.push(policy::CostTier {
-            threshold_tokens: tier.threshold_tokens,
-            input_cost_per_million_usd: tier.input,
-            cache_read_input_cost_per_million_usd: tier.cache_read,
-            cache_creation_input_cost_per_million_usd: tier.cache_write,
-            output_cost_per_million_usd: tier.output,
+            threshold_tokens: size.checked_add(1).ok_or("a tier qcg cannot read")?,
+            input_cost_per_million_usd: row.rates.input,
+            cache_read_input_cost_per_million_usd: row.rates.cache_read,
+            cache_creation_input_cost_per_million_usd: row.rates.cache_write,
+            output_cost_per_million_usd: row.rates.output,
         });
     }
+    if mapped.is_empty() && cost.is_some_and(|cost| !cost.tiers.is_empty()) {
+        return Err("the source names no context tier band".to_string());
+    }
+    // The source's order is not guaranteed; the rules assume increasing
+    // thresholds.
+    mapped.sort_by_key(|tier| tier.threshold_tokens);
     policy::validate_cost_tiers(&mapped).map_err(|error| error.to_string())?;
     Ok(mapped)
 }
@@ -1427,9 +1444,11 @@ mod tests {
         "cost": {
           "input": 1.0,
           "output": 2.0,
+          "cache_read": 0.1,
+          "cache_write": 1.25,
           "tiers": [
             {
-              "threshold_tokens": 200000,
+              "tier": { "type": "context", "size": 272000 },
               "input": 2.0,
               "output": 4.0,
               "cache_read": 0.2,
@@ -1438,11 +1457,41 @@ mod tests {
           ]
         }
       },
+      "short-band": {
+        "cost": {
+          "input": 3.0,
+          "output": 6.0,
+          "tiers": [
+            {
+              "tier": { "type": "context", "size": 128000 },
+              "input": 6.0,
+              "output": 12.0
+            }
+          ]
+        }
+      },
+      "unordered": {
+        "cost": {
+          "input": 1.0,
+          "output": 2.0,
+          "tiers": [
+            { "tier": { "type": "context", "size": 400000 }, "input": 4.0 },
+            { "tier": { "type": "context", "size": 200000 }, "input": 2.0 }
+          ]
+        }
+      },
+      "other-band": {
+        "cost": {
+          "input": 1.0,
+          "output": 2.0,
+          "tiers": [ { "tier": { "type": "batch", "size": 1000 }, "input": 0.5 } ]
+        }
+      },
       "unreadable": {
         "cost": {
           "input": 1.0,
           "output": 2.0,
-          "tiers": [ { "from": 200000, "input": 2.0 } ]
+          "tiers": [ { "tier": { "type": "context" }, "input": 2.0 } ]
         }
       }
     }
@@ -1451,13 +1500,16 @@ mod tests {
 "#;
 
     #[test]
-    fn models_dev_tiers_are_read_and_an_unreadable_tier_keeps_the_flat_rates() {
+    fn models_dev_tiers_are_read_from_the_published_band() {
         let catalog = map_models_dev(MODELS_DEV_TIER_FIXTURE).expect("fixture must map");
         let tiered = &catalog.providers["openai"]["tiered"];
         assert_eq!(tiered.cost_tiers.len(), 1);
-        assert_eq!(tiered.cost_tiers[0].threshold_tokens, 200_000);
+        // The published size is the size the band starts above, so qcg's
+        // inclusive-from threshold is one token past it.
+        assert_eq!(tiered.cost_tiers[0].threshold_tokens, 272_001);
         assert_eq!(tiered.cost_tiers[0].input_cost_per_million_usd, Some(2.0));
         assert_eq!(tiered.cost_tiers[0].output_cost_per_million_usd, Some(4.0));
+        // The tier keeps the cache rates the source published for it.
         assert_eq!(
             tiered.cost_tiers[0].cache_read_input_cost_per_million_usd,
             Some(0.2)
@@ -1466,23 +1518,147 @@ mod tests {
             tiered.cost_tiers[0].cache_creation_input_cost_per_million_usd,
             Some(2.5)
         );
-        // A tier qcg cannot read leaves the model's flat rates in place:
-        // qcg never prices a request at a rate it could not read.
+        // The band size is the model's own: another model publishes
+        // another size.
+        let short = &catalog.providers["openai"]["short-band"];
+        assert_eq!(short.cost_tiers[0].threshold_tokens, 128_001);
+        assert_eq!(short.cost_tiers[0].input_cost_per_million_usd, Some(6.0));
+    }
+
+    #[test]
+    fn a_request_of_the_published_size_stays_in_the_shorter_band() {
+        let catalog = map_models_dev(MODELS_DEV_TIER_FIXTURE).expect("fixture must map");
+        let tiered = &catalog.providers["openai"]["tiered"];
+        let base = policy::CostRates {
+            input: tiered.input_cost_per_million_usd,
+            cache_read: tiered.cache_read_input_cost_per_million_usd,
+            cache_creation: tiered.cache_creation_input_cost_per_million_usd,
+            output: tiered.output_cost_per_million_usd,
+        };
+        let at_size = base.resolve(policy::select_cost_tier(&tiered.cost_tiers, 272_000));
+        assert_eq!(
+            at_size.input,
+            Some(1.0),
+            "a request of exactly the published size is priced by the base row"
+        );
+        let above = base.resolve(policy::select_cost_tier(&tiered.cost_tiers, 272_001));
+        assert_eq!(above.input, Some(2.0));
+        assert_eq!(above.cache_read, Some(0.2));
+    }
+
+    #[test]
+    fn tiers_published_out_of_order_are_sorted_before_they_are_validated() {
+        let catalog = map_models_dev(MODELS_DEV_TIER_FIXTURE).expect("fixture must map");
+        let unordered = &catalog.providers["openai"]["unordered"];
+        let thresholds = unordered
+            .cost_tiers
+            .iter()
+            .map(|tier| tier.threshold_tokens)
+            .collect::<Vec<_>>();
+        assert_eq!(thresholds, vec![200_001, 400_001]);
+    }
+
+    #[test]
+    fn a_row_that_is_not_a_context_band_prices_no_request() {
+        let catalog = map_models_dev(MODELS_DEV_TIER_FIXTURE).expect("fixture must map");
+        let other = &catalog.providers["openai"]["other-band"];
+        assert!(other.cost_tiers.is_empty());
+        // The model's flat rates stay in place.
+        assert_eq!(other.input_cost_per_million_usd, Some(1.0));
+        assert_eq!(other.output_cost_per_million_usd, Some(2.0));
+        // A model the source gives no context band for is reported, so
+        // tier pricing being off is never silent.
+        let errors = &catalog.model_errors["openai"];
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("model `other-band`")),
+            "the error names the model: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_tier_keeps_the_flat_rates_and_is_reported() {
+        let catalog = map_models_dev(MODELS_DEV_TIER_FIXTURE).expect("fixture must map");
         let unreadable = &catalog.providers["openai"]["unreadable"];
         assert!(unreadable.cost_tiers.is_empty());
         assert_eq!(unreadable.input_cost_per_million_usd, Some(1.0));
         assert_eq!(unreadable.output_cost_per_million_usd, Some(2.0));
-        // The dropped schedule is recorded with the model it belongs to,
-        // so tier pricing being off is never silent.
         let errors = &catalog.model_errors["openai"];
-        assert_eq!(errors.len(), 1);
         assert!(
-            errors[0].contains("model `unreadable`"),
-            "the error names the model: {}",
-            errors[0]
+            errors
+                .iter()
+                .any(|error| error.contains("model `unreadable`")),
+            "the error names the model: {errors:?}"
         );
         // A model whose schedule qcg could read carries no error.
         assert!(!catalog.model_errors.contains_key("anthropic"));
+    }
+
+    #[test]
+    fn a_registry_pinned_rate_prices_every_inherited_tier() {
+        let catalog = map_models_dev(MODELS_DEV_TIER_FIXTURE).expect("fixture must map");
+        let external = catalog.providers["openai"]["tiered"].clone();
+        let registry = ModelSpec {
+            id: external.id.clone(),
+            label: None,
+            capabilities: None,
+            reasoning_effort: None,
+            input_cost_per_million_usd: Some(0.5),
+            cache_creation_input_cost_per_million_usd: None,
+            cache_read_input_cost_per_million_usd: None,
+            output_cost_per_million_usd: None,
+            cost_tiers: Vec::new(),
+            context_tokens: None,
+            max_output_tokens: None,
+            enabled: None,
+        };
+        let merged = merge_model(&external, &registry);
+        assert_eq!(merged.input_cost_per_million_usd, Some(0.5));
+        assert_eq!(merged.cost_tiers.len(), 1);
+        // The pinned rate prices the tier, exactly as a contract pin does.
+        assert_eq!(merged.cost_tiers[0].input_cost_per_million_usd, Some(0.5));
+        // The tier contributes the categories the pin leaves open.
+        assert_eq!(
+            merged.cost_tiers[0].cache_read_input_cost_per_million_usd,
+            Some(0.2)
+        );
+        assert_eq!(
+            merged.cost_tiers[0].cache_creation_input_cost_per_million_usd,
+            Some(2.5)
+        );
+        assert_eq!(merged.cost_tiers[0].output_cost_per_million_usd, Some(4.0));
+        assert_eq!(merged.cost_tiers[0].threshold_tokens, 272_001);
+    }
+
+    #[test]
+    fn a_registry_tier_list_replaces_the_external_one() {
+        let catalog = map_models_dev(MODELS_DEV_TIER_FIXTURE).expect("fixture must map");
+        let external = catalog.providers["openai"]["tiered"].clone();
+        let registry = ModelSpec {
+            id: external.id.clone(),
+            label: None,
+            capabilities: None,
+            reasoning_effort: None,
+            input_cost_per_million_usd: None,
+            cache_creation_input_cost_per_million_usd: None,
+            cache_read_input_cost_per_million_usd: None,
+            output_cost_per_million_usd: None,
+            cost_tiers: vec![policy::CostTier {
+                threshold_tokens: 100_000,
+                input_cost_per_million_usd: Some(3.0),
+                cache_read_input_cost_per_million_usd: None,
+                cache_creation_input_cost_per_million_usd: None,
+                output_cost_per_million_usd: None,
+            }],
+            context_tokens: None,
+            max_output_tokens: None,
+            enabled: None,
+        };
+        let merged = merge_model(&external, &registry);
+        assert_eq!(merged.cost_tiers.len(), 1);
+        assert_eq!(merged.cost_tiers[0].threshold_tokens, 100_000);
+        assert_eq!(merged.cost_tiers[0].input_cost_per_million_usd, Some(3.0));
     }
 
     #[tokio::test]
