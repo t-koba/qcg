@@ -205,31 +205,37 @@ impl StepExecutor for HttpStep {
         }
         let has_explicit_idempotency_key = rendered_idempotency_header(&method, &headers)
             .map_err(|error| StepError::failed(&node.id, error))?;
+        // One limit for every body source: the contract's explicit bound
+        // when it declares one, the policy default otherwise.
+        let body_limit = ctx
+            .run
+            .contract
+            .manifest
+            .runtime
+            .effective_http_body_limit_bytes();
         let (body, inferred_content_type) = match (
             params.body_text.as_deref(),
             params.body_json.as_ref(),
             params.body_base64.as_deref(),
             params.body_file.as_deref(),
         ) {
-            (Some(text), None, None, None) => (
-                Some(ctx.render_inline(node, text)?.into_bytes()),
-                Some("text/plain; charset=utf-8".to_owned()),
-            ),
-            (None, Some(value), None, None) => {
-                let value = render_json_templates(
-                    ctx,
-                    node,
-                    value,
-                    ctx.run.contract.manifest.runtime.http_body_limit_bytes,
-                )?;
-                let body = serde_json::to_vec(&value)?;
-                let limit = ctx.run.contract.manifest.runtime.http_body_limit_bytes;
-                if let Some(limit) = limit
-                    && body.len() > limit
-                {
+            (Some(text), None, None, None) => {
+                let body = ctx.render_inline(node, text)?.into_bytes();
+                if body.len() > body_limit {
                     return Err(StepError::failed(
                         &node.id,
-                        format!("http JSON request body exceeds {limit} bytes"),
+                        format!("http text request body exceeds {body_limit} bytes"),
+                    ));
+                }
+                (Some(body), Some("text/plain; charset=utf-8".to_owned()))
+            }
+            (None, Some(value), None, None) => {
+                let value = render_json_templates(ctx, node, value, Some(body_limit))?;
+                let body = serde_json::to_vec(&value)?;
+                if body.len() > body_limit {
+                    return Err(StepError::failed(
+                        &node.id,
+                        format!("http JSON request body exceeds {body_limit} bytes"),
                     ));
                 }
                 (Some(body), Some("application/json".to_owned()))
@@ -239,13 +245,10 @@ impl StepExecutor for HttpStep {
                 let decoded = strict_base64_decode(&encoded).map_err(|error| {
                     StepError::failed(&node.id, format!("http body_base64 is invalid: {error}"))
                 })?;
-                let limit = ctx.run.contract.manifest.runtime.http_body_limit_bytes;
-                if let Some(limit) = limit
-                    && decoded.len() > limit
-                {
+                if decoded.len() > body_limit {
                     return Err(StepError::failed(
                         &node.id,
-                        format!("http base64 request body exceeds {limit} bytes"),
+                        format!("http base64 request body exceeds {body_limit} bytes"),
                     ));
                 }
                 (Some(decoded), Some("application/octet-stream".to_owned()))
@@ -273,15 +276,14 @@ impl StepExecutor for HttpStep {
                         None,
                     ),
                 };
-                let limit = ctx.run.contract.manifest.runtime.http_body_limit_bytes;
                 let bytes = match opened {
-                    Some(file) => read_opened_bounded(file, limit, "http body_file")
+                    Some(file) => read_opened_bounded(file, Some(body_limit), "http body_file")
                         .map_err(|error| StepError::failed(&node.id, error))?,
                     // Package scope opens through the same O_NOFOLLOW +
                     // handle boundary as snapshot reads (E13).
                     None => {
                         let file = open_package_read(node, &path, "http body")?;
-                        read_opened_bounded(file, limit, "http body_file")
+                        read_opened_bounded(file, Some(body_limit), "http body_file")
                             .map_err(|error| StepError::failed(&node.id, error))?
                     }
                 };

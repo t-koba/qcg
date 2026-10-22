@@ -20,7 +20,9 @@ pub struct HttpGateway {
     permissions: Permissions,
     client: Client,
     timeout: Duration,
-    body_limit_bytes: Option<usize>,
+    /// The bound on one request or response body. It is never unbounded:
+    /// an omitted caller limit falls back to the policy default.
+    body_limit_bytes: usize,
     redirect_limit: Option<usize>,
     cancellation: CancellationToken,
     stub_resolver: Option<StubDnsResolver>,
@@ -169,7 +171,9 @@ impl HttpGateway {
             permissions,
             client,
             timeout,
-            body_limit_bytes,
+            // The body is read into memory, so an omitted limit must not
+            // mean an unbounded read.
+            body_limit_bytes: body_limit_bytes.unwrap_or(policy::DEFAULT_HTTP_BODY_LIMIT_BYTES),
             redirect_limit,
             cancellation: CancellationToken::new(),
             stub_resolver: None,
@@ -327,10 +331,11 @@ impl HttpGateway {
                 url: "requests with credential headers cannot follow redirects".into(),
             });
         }
-        if request.body.as_ref().is_some_and(|body| {
-            self.body_limit_bytes
-                .is_some_and(|limit| body.len() > limit)
-        }) {
+        if request
+            .body
+            .as_ref()
+            .is_some_and(|body| body.len() > self.body_limit_bytes)
+        {
             return Err(GatewayError::HttpRequestBodyTooLarge {
                 // Never echo the raw URL: query values are redacted (E09).
                 url: policy::redact_all_query_values(&request.url),
@@ -519,7 +524,7 @@ impl HttpGateway {
                 .content_length()
                 .and_then(|length| usize::try_from(length).ok())
                 .unwrap_or_default()
-                .min(self.body_limit_bytes.unwrap_or(1024 * 1024));
+                .min(self.body_limit_bytes);
             let mut body = Vec::with_capacity(initial_capacity);
             loop {
                 let chunk = tokio::select! {
@@ -529,10 +534,7 @@ impl HttpGateway {
                 let Some(chunk) = chunk else {
                     break;
                 };
-                if self
-                    .body_limit_bytes
-                    .is_some_and(|limit| body.len().saturating_add(chunk.len()) > limit)
-                {
+                if body.len().saturating_add(chunk.len()) > self.body_limit_bytes {
                     return Err(GatewayError::HttpBodyTooLarge {
                         url: public_final_url.clone(),
                     });
@@ -1032,6 +1034,95 @@ mod tests {
             follow_redirects: true,
             idempotency_key: None,
         }
+    }
+
+    #[tokio::test]
+    async fn an_omitted_body_limit_bounds_the_response_body() {
+        // The body is read into memory, so an omitted limit must not mean
+        // an unbounded read: the policy default bounds it.
+        let (port, server) = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello".into(),
+        )
+        .await;
+        let gateway = gateway();
+        assert_eq!(
+            gateway.body_limit_bytes,
+            policy::DEFAULT_HTTP_BODY_LIMIT_BYTES,
+            "an omitted limit must fall back to the policy default"
+        );
+        let output = gateway
+            .request(request(
+                "GET",
+                format!("http://127.0.0.1:{port}/body"),
+                None,
+            ))
+            .await
+            .expect("a body under the default is read");
+        assert_eq!(output.body, b"hello");
+        let _ = server.await.expect("local server should finish");
+    }
+
+    #[tokio::test]
+    async fn a_body_over_the_limit_is_refused() {
+        let body = "x".repeat(64);
+        let (port, server) = serve_once(format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ))
+        .await;
+        let gateway = HttpGateway::new(
+            Permissions {
+                network: vec!["127.0.0.1".into()],
+                ..Permissions::default()
+            },
+            Duration::from_secs(10),
+            Some(8),
+            Some(4),
+        )
+        .expect("test gateway should build");
+        let error = gateway
+            .request(request(
+                "GET",
+                format!("http://127.0.0.1:{port}/body"),
+                None,
+            ))
+            .await
+            .expect_err("a response body over the limit must be refused");
+        assert!(
+            matches!(error, GatewayError::HttpBodyTooLarge { .. }),
+            "the refusal must name the body limit: {error:?}"
+        );
+        let _ = server.await.expect("local server should finish");
+    }
+
+    #[tokio::test]
+    async fn a_request_body_over_the_limit_is_refused_before_it_is_sent() {
+        let (port, server) =
+            serve_once("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into())
+                .await;
+        let gateway = HttpGateway::new(
+            Permissions {
+                network: vec!["127.0.0.1".into()],
+                ..Permissions::default()
+            },
+            Duration::from_secs(10),
+            Some(8),
+            Some(4),
+        )
+        .expect("test gateway should build");
+        let error = gateway
+            .request(request(
+                "POST",
+                format!("http://127.0.0.1:{port}/apply"),
+                Some(b"x".repeat(64)),
+            ))
+            .await
+            .expect_err("a request body over the limit must be refused");
+        assert!(
+            matches!(error, GatewayError::HttpRequestBodyTooLarge { .. }),
+            "the refusal must name the body limit: {error:?}"
+        );
+        server.abort();
     }
 
     #[tokio::test]

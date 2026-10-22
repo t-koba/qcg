@@ -50,6 +50,12 @@ pub const DEFAULT_READ_CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// bounded before any contract or FileValue check.
 pub const DEFAULT_MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 
+/// Default cap, in bytes, for one HTTP request or response body when the
+/// contract's `runtime.http_body_limit_bytes` is omitted. The body is read
+/// into memory, so an omitted limit must not mean an unbounded read: the
+/// default bounds both directions of one HTTP exchange.
+pub const DEFAULT_HTTP_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+
 /// Hard cap for one run's observation stream when `[audit].max_bytes` is
 /// unset. The writer degrades instead of exceeding it, and every reader
 /// refuses a stream that already did, so an audit trail can never become the

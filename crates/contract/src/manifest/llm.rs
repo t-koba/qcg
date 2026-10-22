@@ -281,7 +281,8 @@ pub struct RuntimeLimits {
     pub command_output_limit_bytes: Option<usize>,
     #[serde(default = "default_timeout_seconds")]
     pub http_timeout_seconds: u64,
-    /// Explicit max only. `None` means no mechanistic limit.
+    /// Explicit max only. Omitted (`None`) uses the 16 MiB policy default
+    /// for one HTTP request or response body.
     #[serde(default)]
     pub http_body_limit_bytes: Option<usize>,
     /// Explicit max only. `None` means no mechanistic limit.
@@ -341,6 +342,16 @@ pub struct RuntimeLimits {
     pub template_fuel: u64,
 }
 
+impl RuntimeLimits {
+    /// The effective HTTP body limit: the contract's explicit value when
+    /// set, otherwise `policy::DEFAULT_HTTP_BODY_LIMIT_BYTES`. Omitted
+    /// never means an unbounded body.
+    pub fn effective_http_body_limit_bytes(&self) -> usize {
+        self.http_body_limit_bytes
+            .unwrap_or(policy::DEFAULT_HTTP_BODY_LIMIT_BYTES)
+    }
+}
+
 impl Default for RuntimeLimits {
     fn default() -> Self {
         Self {
@@ -398,6 +409,22 @@ impl Default for RunBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_http_body_limit_has_a_default() {
+        // The body is read into memory, so an omitted limit must not mean
+        // an unbounded read: the policy default bounds one exchange.
+        let unset = RuntimeLimits::default();
+        assert_eq!(
+            unset.effective_http_body_limit_bytes(),
+            policy::DEFAULT_HTTP_BODY_LIMIT_BYTES
+        );
+        let explicit = RuntimeLimits {
+            http_body_limit_bytes: Some(1024),
+            ..RuntimeLimits::default()
+        };
+        assert_eq!(explicit.effective_http_body_limit_bytes(), 1024);
+    }
 
     #[test]
     fn prompt_cache_policy_requires_an_explicit_value() {

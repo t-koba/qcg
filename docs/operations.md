@@ -282,8 +282,9 @@ SHA-256 instead of printing base64.
 ## Required limits for production
 
 Runtime, LLM, and resource byte/count limits are explicit-only: `None`
-(omitted) means no mechanistic limit. Package entry count and expanded
-bytes are the exception: they default to 1000 entries and 10 MiB.
+(omitted) means no mechanistic limit. The HTTP body limit, the package
+entry count, and the package expanded bytes are the exceptions: they
+default to 16 MiB per body, 1000 entries, and 10 MiB.
 Defaults favor local development; production operators must set bounds
 or a single oversized input, artifact, or LLM context can exhaust
 memory or disk. Minimum set:

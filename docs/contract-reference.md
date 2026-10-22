@@ -4679,6 +4679,8 @@ fields are rejected when their structs define a closed schema.
    `journal_event_limit_bytes`, `journal_total_limit_bytes`,
    `journal_event_count_limit`,
    `state_limit_bytes`, `template_output_limit_bytes`, and `template_fuel`.
+   `http_body_limit_bytes` bounds one HTTP request body and one HTTP response
+   body; omitted means the 16 MiB default, never an unbounded body.
    Template output is streamed through a bounded writer and each render gets a
    fresh fuel budget; exceeding either limit fails the render explicitly.
    Hash-anchored patch and repair targets larger than 8 MiB
