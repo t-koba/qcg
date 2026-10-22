@@ -557,6 +557,50 @@ version = "0.1.0"
             .expect("structured output with tools is a declared provider capability");
     }
     #[test]
+    fn llm_pricing_validation_is_identical_for_primary_and_model_list() {
+        for field in [
+            "input_cost_per_million_usd",
+            "cache_read_input_cost_per_million_usd",
+            "cache_creation_input_cost_per_million_usd",
+            "output_cost_per_million_usd",
+            "web_search_call_cost_usd",
+        ] {
+            for value in [
+                None,
+                Some("0.0"),
+                Some("-0.0"),
+                Some("1.25"),
+                Some("1e300"),
+                Some("-0.01"),
+                Some("nan"),
+                Some("inf"),
+                Some("-inf"),
+            ] {
+                let price = value
+                    .map(|value| format!(", {field} = {value}"))
+                    .unwrap_or_default();
+                let model = format!("{{ provider = \"p\", model = \"m\"{price} }}");
+                for settings in [format!("model = {model}"), format!("models = [{model}]")] {
+                    let mut manifest = manifest_with_llm_settings(&settings);
+                    // The catalog may supply missing rates even with a cost cap.
+                    manifest.budget.max_cost_usd = Some(0.1);
+                    let result = manifest.validate();
+                    if matches!(value, Some("-0.01" | "nan" | "inf" | "-inf")) {
+                        let error = result.expect_err("invalid price must fail").to_string();
+                        assert!(
+                            error.contains(&format!(
+                                "model `p/m` {field} must be finite and non-negative"
+                            )),
+                            "{settings}: {error}"
+                        );
+                    } else {
+                        result.unwrap_or_else(|error| panic!("{settings}: {error}"));
+                    }
+                }
+            }
+        }
+    }
+    #[test]
     fn llm_model_names_must_not_be_empty() {
         for model in [
             "model = { provider = \"\", model = \"gpt\" }",

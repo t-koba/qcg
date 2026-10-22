@@ -294,32 +294,7 @@ impl GeneratorMetadataRule {
                         "[llm].model provider and model must not be empty".into(),
                     ));
                 }
-                for (name, value) in [
-                    (
-                        "input_cost_per_million_usd",
-                        model.input_cost_per_million_usd,
-                    ),
-                    (
-                        "cache_read_input_cost_per_million_usd",
-                        model.cache_read_input_cost_per_million_usd,
-                    ),
-                    (
-                        "cache_creation_input_cost_per_million_usd",
-                        model.cache_creation_input_cost_per_million_usd,
-                    ),
-                    (
-                        "output_cost_per_million_usd",
-                        model.output_cost_per_million_usd,
-                    ),
-                    ("web_search_call_cost_usd", model.web_search_call_cost_usd),
-                ] {
-                    if value.is_some_and(|value| !value.is_finite() || value < 0.0) {
-                        return Err(ContractError::Invalid(format!(
-                            "model `{}/{}` {name} must be finite and non-negative",
-                            model.provider, model.model
-                        )));
-                    }
-                }
+                model.validate_pricing()?;
                 // Pricing may also come from the model catalog at request
                 // time, so the manifest only rejects impossible values here.
                 // `invocation_routes` fails closed when a cost budget is set
@@ -338,32 +313,7 @@ impl GeneratorMetadataRule {
                         model.provider, model.model
                     )));
                 }
-                for (name, value) in [
-                    (
-                        "input_cost_per_million_usd",
-                        model.input_cost_per_million_usd,
-                    ),
-                    (
-                        "cache_read_input_cost_per_million_usd",
-                        model.cache_read_input_cost_per_million_usd,
-                    ),
-                    (
-                        "cache_creation_input_cost_per_million_usd",
-                        model.cache_creation_input_cost_per_million_usd,
-                    ),
-                    (
-                        "output_cost_per_million_usd",
-                        model.output_cost_per_million_usd,
-                    ),
-                    ("web_search_call_cost_usd", model.web_search_call_cost_usd),
-                ] {
-                    if value.is_some_and(|value| !value.is_finite() || value < 0.0) {
-                        return Err(ContractError::Invalid(format!(
-                            "model `{}/{}` {name} must be finite and non-negative",
-                            model.provider, model.model
-                        )));
-                    }
-                }
+                model.validate_pricing()?;
             }
             let mut requires = BTreeSet::new();
             for capability in &llm.requires {

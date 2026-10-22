@@ -197,6 +197,39 @@ pub struct ModelRef {
     pub web_search_call_cost_usd: Option<f64>,
 }
 
+impl ModelRef {
+    // Missing prices are allowed: catalog prices may fill the gaps at dispatch.
+    pub(super) fn validate_pricing(&self) -> Result<(), super::ContractError> {
+        for (name, value) in [
+            (
+                "input_cost_per_million_usd",
+                self.input_cost_per_million_usd,
+            ),
+            (
+                "cache_read_input_cost_per_million_usd",
+                self.cache_read_input_cost_per_million_usd,
+            ),
+            (
+                "cache_creation_input_cost_per_million_usd",
+                self.cache_creation_input_cost_per_million_usd,
+            ),
+            (
+                "output_cost_per_million_usd",
+                self.output_cost_per_million_usd,
+            ),
+            ("web_search_call_cost_usd", self.web_search_call_cost_usd),
+        ] {
+            if value.is_some_and(|value| !value.is_finite() || value < 0.0) {
+                return Err(super::ContractError::Invalid(format!(
+                    "model `{}/{}` {name} must be finite and non-negative",
+                    self.provider, self.model
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeLimits {
