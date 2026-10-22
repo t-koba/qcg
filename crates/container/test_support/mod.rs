@@ -9,6 +9,17 @@ use std::{path::PathBuf, time::Duration};
 /// starvation rather than only the cleanup.
 pub(crate) const CLEANUP_JOIN_BOUND: Duration = Duration::from_secs(30);
 
+/// The largest gap the fake daemon may show between a container's stop
+/// attempt and the removal that follows it.
+///
+/// The fake daemon hangs for eight seconds on the stop stage while these
+/// tests freeze the stop timeout at one second, so a teardown that honors
+/// the captured timeout removes the instance within a second or two and one
+/// that ignores it waits out the whole hang. The bound sits above the
+/// frozen timeout plus the log's one-second granularity, and below the hang,
+/// so it separates the two without being tight enough to flake.
+pub(crate) const STOP_TIMEOUT_GAP_BOUND: Duration = Duration::from_secs(4);
+
 pub struct Daemon {
     pub root: PathBuf,
 }
@@ -25,7 +36,7 @@ impl Daemon {
         let script = format!(
             r##"#!/bin/sh
 root='{}'
-printf '%s\n' "$*" >> "$root/log"
+printf '%s %s\n' "$(/bin/date +%s)" "$*" >> "$root/log"
 mode=$(/bin/cat "$root/mode")
 case "$1:$mode" in
   init:hang-init|profile:hang-admin|start:hang-start|stop:hang-stop|kill:hang-stop|delete:hang-delete|rm:hang-delete) exec /bin/sleep 8 ;;
@@ -88,6 +99,34 @@ exit 0
 
     pub fn log(&self) -> String {
         std::fs::read_to_string(self.root.join("log")).unwrap_or_default()
+    }
+
+    /// The seconds between the first logged command containing `first` and
+    /// the first later command containing `second`.
+    ///
+    /// The fake daemon stamps every command with the second it arrived, so a
+    /// caller can measure how long the product waited between two daemon
+    /// stages without depending on the caller's own scheduling.
+    pub fn gap_between(&self, first: &str, second: &str) -> Option<Duration> {
+        let mut first_at = None;
+        for line in self.log().lines() {
+            let Some((stamp, command)) = line.split_once(' ') else {
+                continue;
+            };
+            let Ok(stamp) = stamp.parse::<u64>() else {
+                continue;
+            };
+            let Some(first_at) = first_at else {
+                if command.contains(first) {
+                    first_at = Some(stamp);
+                }
+                continue;
+            };
+            if command.contains(second) {
+                return Some(Duration::from_secs(stamp.saturating_sub(first_at)));
+            }
+        }
+        None
     }
 
     pub async fn wait_for(&self, text: &str) {

@@ -1570,12 +1570,35 @@ mod daemon_policy_tests {
                     },
                     id,
                 };
-                let started = std::time::Instant::now();
                 match path {
-                    "async" => teardown(&session).await.unwrap(),
-                    "sync" => teardown_sync(&session).unwrap(),
+                    "async" => {
+                        let started = std::time::Instant::now();
+                        teardown(&session).await.unwrap();
+                        assert!(
+                            started.elapsed() < Duration::from_secs(4),
+                            "{path} ignored frozen stop timeout"
+                        );
+                    }
+                    "sync" => {
+                        let started = std::time::Instant::now();
+                        teardown_sync(&session).unwrap();
+                        assert!(
+                            started.elapsed() < Duration::from_secs(4),
+                            "{path} ignored frozen stop timeout"
+                        );
+                    }
                     "drop" => {
+                        // The guard never blocks the dropping thread, so this
+                        // measures the spawn, not the cleanup it started.
+                        let dropped = std::time::Instant::now();
                         drop(SessionGuard::new(session));
+                        assert!(
+                            dropped.elapsed() < Duration::from_secs(4),
+                            "drop blocked the dropping thread"
+                        );
+                        // The cleanup runs on a worker a loaded runner can
+                        // starve, so its completion is bounded by the join
+                        // alone, never by the wall clock around the join.
                         assert_eq!(
                             await_outstanding_cleanups(
                                 daemon_policy_test_support::CLEANUP_JOIN_BOUND,
@@ -1585,12 +1608,31 @@ mod daemon_policy_tests {
                             0
                         );
                     }
-                    "spawn-failure" => spawn_cleanup_with(session, None, |_| false),
+                    "spawn-failure" => {
+                        let started = std::time::Instant::now();
+                        spawn_cleanup_with(session, None, |_| false);
+                        assert!(
+                            started.elapsed() < Duration::from_secs(4),
+                            "{path} ignored frozen stop timeout"
+                        );
+                    }
                     _ => unreachable!(),
                 }
+                // The captured stop timeout must reach every cleanup path: the
+                // daemon hangs for eight seconds on stop, so a removal that
+                // follows the stop attempt promptly proves the path used the
+                // frozen timeout instead of waiting out the hang.
+                let (stop, removal) = if docker {
+                    ("kill ", "rm -f")
+                } else {
+                    ("stop -f", "delete -f")
+                };
+                let gap = daemon
+                    .gap_between(stop, removal)
+                    .unwrap_or_else(|| panic!("{path} never reached {removal}"));
                 assert!(
-                    started.elapsed() < Duration::from_secs(4),
-                    "{path} ignored frozen stop timeout"
+                    gap < daemon_policy_test_support::STOP_TIMEOUT_GAP_BOUND,
+                    "{path} ignored frozen stop timeout: {gap:?}"
                 );
                 assert!(daemon.log().contains(if docker {
                     "rm -f owned-id"
@@ -1664,15 +1706,29 @@ mod daemon_policy_tests {
             _ = daemon.wait_for("init ") => {}
         }
         daemon.mode("hang-stop");
-        let start = std::time::Instant::now();
+        // Dropping the provision future must not block: the guard hands the
+        // cleanup to a worker.
+        let dropped = std::time::Instant::now();
         drop(pending);
+        assert!(dropped.elapsed() < Duration::from_secs(4));
+        // The cleanup runs on a worker a loaded runner can starve, so its
+        // completion is bounded by the join alone.
         assert_eq!(
             await_outstanding_cleanups(daemon_policy_test_support::CLEANUP_JOIN_BOUND)
                 .await
                 .outstanding,
             0
         );
-        assert!(start.elapsed() < Duration::from_secs(4));
+        // The captured stop timeout must reach the aborted provision's
+        // cleanup: the daemon hangs for eight seconds on stop, so a prompt
+        // removal proves the frozen timeout was used.
+        let gap = daemon
+            .gap_between("stop", "delete -f")
+            .expect("the aborted provision never reached the removal");
+        assert!(
+            gap < daemon_policy_test_support::STOP_TIMEOUT_GAP_BOUND,
+            "the aborted provision ignored the frozen stop timeout: {gap:?}"
+        );
         assert!(daemon.log().contains("delete -f"));
     }
 }

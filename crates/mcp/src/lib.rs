@@ -111,13 +111,33 @@ mod tests {
                     .await
                     .is_err()
             );
+            // The connect's own failure is bounded by the stage timeouts; the
+            // cleanup it started is bounded by the join, so the two windows
+            // are measured separately.
+            assert!(start.elapsed() < Duration::from_secs(4));
             assert_eq!(
-                container::await_outstanding_cleanups(Duration::from_secs(4))
-                    .await
-                    .outstanding,
+                container::await_outstanding_cleanups(
+                    crate::daemon_policy_test_support::CLEANUP_JOIN_BOUND
+                )
+                .await
+                .outstanding,
                 0
             );
-            assert!(start.elapsed() < Duration::from_secs(4));
+            // The captured stop timeout must reach the failed connection's
+            // cleanup: the daemon hangs for eight seconds on stop, so a
+            // prompt removal proves the frozen timeout was used.
+            let (stop, removal) = if docker {
+                ("kill ", "rm -f")
+            } else {
+                ("stop -f", "delete -f")
+            };
+            let gap = daemon
+                .gap_between(stop, removal)
+                .unwrap_or_else(|| panic!("the failed connection never reached {removal}"));
+            assert!(
+                gap < crate::daemon_policy_test_support::STOP_TIMEOUT_GAP_BOUND,
+                "the failed connection ignored the frozen stop timeout: {gap:?}"
+            );
             let log = daemon.log();
             assert!(
                 log.contains(if docker { "rm -f test-id" } else { "delete -f" }),
