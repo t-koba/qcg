@@ -1016,12 +1016,17 @@ impl LlmProvider for FakeLlmProvider {
                         .unwrap_or_default()
                         .to_string();
                     let args = value.get("args").cloned().unwrap_or_else(|| json!({}));
+                    // A scripted call may name its own id, so a script can
+                    // repeat a call id the way a model replay does. Without
+                    // one the id follows the turn, which is what a script
+                    // that never repeats a call id expects.
+                    let id = value
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("fake-tool-{}", completed_tools + 1));
                     return Ok(ChatResponse {
-                        content: vec![ChatContent::ToolCall {
-                            id: format!("fake-tool-{}", completed_tools + 1),
-                            name,
-                            args,
-                        }],
+                        content: vec![ChatContent::ToolCall { id, name, args }],
                         usage: TokenUsage {
                             input: first_prompt.len() as u64,
                             output: 0,
@@ -1091,12 +1096,15 @@ impl LlmProvider for FakeLlmProvider {
                 .unwrap_or_default()
                 .to_string();
             let args = value.get("args").cloned().unwrap_or_else(|| json!({}));
+            // A scripted call may name its own id, so a script can repeat
+            // a call id the way a model replay does.
+            let id = value
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| "fake-tool-1".to_string());
             return Ok(ChatResponse {
-                content: vec![ChatContent::ToolCall {
-                    id: "fake-tool-1".into(),
-                    name,
-                    args,
-                }],
+                content: vec![ChatContent::ToolCall { id, name, args }],
                 usage: TokenUsage {
                     input: prompt.len() as u64,
                     output: 0,

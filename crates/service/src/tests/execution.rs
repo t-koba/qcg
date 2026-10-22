@@ -815,6 +815,155 @@ done
 }
 
 #[tokio::test]
+async fn a_removal_survives_the_resume_so_a_replayed_write_is_not_reported() {
+    // The agent writes a file, removes it with its own command, asks the
+    // user, and after the answer repeats the write with the same call id.
+    // The guard replays that write, so the file is not written again, and
+    // the removal the earlier attempt recorded must still exclude it from
+    // the step's outputs. Without the removal crossing the checkpoint the
+    // run fails at the pin step with a file the workspace does not hold.
+    let root = temp_run_dir("agent-removed-file-resume");
+    let _ = std::fs::remove_dir_all(&root);
+    let generator = root.join("generator");
+    let runs = root.join("runs");
+    std::fs::create_dir_all(generator.join("prompts")).expect("generator dirs");
+    std::fs::write(
+        generator.join(contract::MANIFEST_FILE),
+        r#"
+[generator]
+id = "generator"
+name = "Generator"
+version = "0.1.0"
+
+[[flow]]
+id = "agent"
+output = "agent_result"
+type = "llm.agent"
+
+[flow.params]
+max_iterations = 6
+max_tokens_total = 4096
+prompt = "prompts/agent.j2"
+
+[[flow.params.tools]]
+kind = "fs.write"
+name = "write_note"
+path_prefix = "out/"
+
+[[flow.params.tools]]
+kind = "command"
+name = "remove_note"
+command = ["sh", "-c", "rm -f out/note.txt"]
+
+[[flow.params.tools]]
+kind = "ask_user"
+name = "ask_ok"
+
+[llm]
+max_tokens = 256
+temperature = 0.0
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[permissions]
+fs_read = []
+network = []
+commands = [{ bin = "sh", args = ["-c", "rm -f out/note.txt"], isolation = "trusted_host" }]
+side_effects = "allowed"
+side_effects_scope = "invocation"
+fs_write = ["workspace"]
+
+[permissions.containers]
+enabled = false"#,
+    )
+    .expect("generator manifest");
+    // The last entry repeats the first call id, the way a model replay
+    // does: the guard replays the recorded write instead of writing the
+    // file again.
+    std::fs::write(
+        generator.join("prompts/agent.j2"),
+        r#"Write the note, remove it, ask me, then write it again.
+
+FAKE_TOOL_SEQUENCE: [{"name":"write_note","args":{"path":"out/note.txt","content":"scratch"},"id":"call-1"},{"name":"remove_note","args":{},"id":"call-2"},{"name":"ask_ok","args":{"question":"Continue?","options":["yes"]},"id":"call-3"},{"name":"write_note","args":{"path":"out/note.txt","content":"scratch"},"id":"call-1"}]
+FAKE_AGENT_FINAL:
+done
+"#,
+    )
+    .expect("prompt");
+    let service = test_service(vec![root.clone()], runs.clone());
+    let id = service
+        .start_run(StartRun {
+            generator_id: "generator".into(),
+            inputs: BTreeMap::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("agent run should start");
+    let waiting = wait_for_snapshot(&service, &id, RunStatus::Waiting).await;
+    let question = waiting.question.expect("the agent must ask the user");
+    service
+        .answer(
+            id.clone(),
+            question.id.clone(),
+            AnswerPayload {
+                values: BTreeMap::from([("answer".into(), json!("yes"))]),
+            },
+        )
+        .await
+        .expect("the answer should be accepted");
+    let terminal = wait_for_terminal_snapshot(&service, &id).await;
+    let run_dir = service.run_dir_for(&id).await.expect("run dir");
+    // The merged view: a tool call is an observation record, so it lives
+    // in the audit stream beside the durable one.
+    let events =
+        crate::summaries::read_merged_events_from_meta(&run_meta_dir(&run_dir)).expect("journal");
+    assert_eq!(
+        terminal.state,
+        RunStatus::Succeeded,
+        "the run must succeed: {terminal:?}"
+    );
+    // The write was attempted twice under one call id, so the guard
+    // replayed it: the file was written once and removed once.
+    let writes: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| {
+            event.get("t").and_then(Value::as_str) == Some("tool_call")
+                && event.get("tool").and_then(Value::as_str) == Some("write_note")
+        })
+        .collect();
+    assert_eq!(
+        writes.len(),
+        2,
+        "the write must be attempted again under the same call id: {writes:?}"
+    );
+    // The step finishes twice: once when it suspends for the answer and
+    // once when the resumed attempt ends. Only the last one carries the
+    // step's outputs.
+    let finished = events
+        .iter()
+        .rfind(|event| {
+            event.get("t").and_then(Value::as_str) == Some("step_finished")
+                && event.get("node").and_then(Value::as_str) == Some("agent")
+        })
+        .expect("the agent step must finish");
+    let files = finished
+        .get("files")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !files
+            .iter()
+            .any(|file| file.get("path").and_then(Value::as_str) == Some("out/note.txt")),
+        "a file the agent removed is not an output of the step, even when a later attempt replays its write: {files:?}"
+    );
+    drop(service);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn resume_does_not_restore_updated_file_inputs() {
     // E06: a completed step may legitimately update a file input; the
     // resume must not overwrite it with the original upload bytes.
