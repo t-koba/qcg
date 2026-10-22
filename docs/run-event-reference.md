@@ -9,6 +9,20 @@ schema for legacy/direct journals; the service refuses recovery or fork when it
 is absent. `generator_path` remains the original source path, not the derived
 per-run snapshot location. See [operations](operations.md#per-run-generator-package-snapshots).
 
+Parallel waves also emit the internal, state-free `parallel_task_joined` record at
+each actual join (including cancellation drains). It uses the stable `node`, not
+Tokio's process-local task ID. `classification` distinguishes `completed_success`,
+`completed_terminal`, `task_error`, `task_canceled`, `interaction_pending`, `task_panic`, `task_join_error`,
+`scheduler_abort`, and `parent_canceled`. `drain_cause` is `none`, `fail_fast`, or
+`parent_cancellation`; `cancellation_cause` records the abort request responsible
+(or `reported_by_task` for a task-returned cancellation). Completed terminal
+reports include `outcome` and, for interactions, only `question_id` or `confirm_id`.
+Task errors carry a failure `code`; an explicit resumable-agent error additionally
+references `continuation_owner: agent`. No prompt, answer, output, or raw error
+text is copied. Existing child/operation/agent journal records remain the evidence
+for effects, accounting, and continuation safety. These facts neither change
+settlement nor authorize replay.
+
 <!-- run-events:start -->
 ## RunEvent Reference
 

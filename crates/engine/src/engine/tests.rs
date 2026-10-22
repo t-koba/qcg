@@ -7357,3 +7357,6 @@ async fn active_parallel_wave_has_one_elapsed_interval_not_one_per_node() {
     assert!(accounting.last().unwrap()["active_started_at"].is_null());
     let _ = std::fs::remove_dir_all(run_dir);
 }
+
+#[path = "tests/parallel_facts.rs"]
+mod parallel_facts;

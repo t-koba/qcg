@@ -7,10 +7,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::task::JoinSet;
 
-/// Grace period for a timed-out node to settle cooperatively after its
-/// node-scoped stop signal before the future is abandoned. Matches the
-/// service shutdown and cancel deadlines so every layer converges on the
-/// same bound (A09).
+/// Cooperative timeout grace; matches service shutdown/cancel bounds (A09).
 const NODE_TIMEOUT_GRACE_SECS: u64 = 5;
 
 use super::checkpoint::pin_attempt_files;
@@ -19,11 +16,7 @@ use super::replay::BudgetTracker;
 use super::run_context::elapsed_limit_secs;
 use super::types::{Engine, EngineError, RunContext, failure_code_for_error, with_failed_evidence};
 
-/// Per-attempt bounds read once per admission and shared by the
-/// backoff arm and every attempt arm, so all branches report one
-/// configured limit instead of re-reading it per branch (E10).
-/// `None` means no budget is configured. The backoff is read once here
-/// and passed down, never re-read per retry (E10).
+/// Admission-time bounds shared by backoff and attempts; None means unconfigured (E10).
 #[derive(Clone, Copy)]
 struct AttemptBounds {
     timeout_secs: Option<u64>,
@@ -31,43 +24,26 @@ struct AttemptBounds {
     backoff_ms: u64,
 }
 
-/// Classifies a spawned parallel task that never returned an outcome.
-/// Panic payloads keep their detail (downcast to string forms, with an
-/// explicit unknown-payload case) instead of collapsing to a bare
-/// "task failed"; cancellations never reach here (E10).
+/// Preserve panic detail (including unknown payloads); callers handle cancellation (E10).
 pub(crate) fn join_task_error(error: tokio::task::JoinError) -> EngineError {
     debug_assert!(!error.is_cancelled());
-    match error.try_into_panic() {
+    let message = match error.try_into_panic() {
         Ok(payload) => {
-            if let Some(message) = payload.downcast_ref::<&str>() {
-                EngineError::Step(StepError::failed(
-                    "scheduler",
-                    format!("parallel task panicked: {message}"),
-                ))
-            } else if let Some(message) = payload.downcast_ref::<String>() {
-                EngineError::Step(StepError::failed(
-                    "scheduler",
-                    format!("parallel task panicked: {message}"),
-                ))
-            } else {
-                EngineError::Step(StepError::failed(
-                    "scheduler",
-                    "parallel task panicked with a non-string payload",
-                ))
+            let message = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
+            match message {
+                Some(message) => format!("parallel task panicked: {message}"),
+                None => "parallel task panicked with a non-string payload".into(),
             }
         }
-        Err(error) => EngineError::Step(StepError::failed(
-            "scheduler",
-            format!("parallel task failed: {error}"),
-        )),
-    }
+        Err(error) => format!("parallel task failed: {error}"),
+    };
+    EngineError::Step(StepError::failed("scheduler", message))
 }
 
-/// Combines every terminal failure of a parallel wave into one error.
-/// Interactions (questions, confirmations) cannot join into a message, so
-/// the first one wins while every failure is still journaled per node;
-/// plain failures report joined so no sibling failure is silently
-/// discarded (E10).
+/// Join all failures, but return the first interaction; each node still journals its outcome (E10).
 fn combine_terminal_errors(errors: Vec<EngineError>) -> Result<(), EngineError> {
     if errors.is_empty() {
         return Ok(());
@@ -101,14 +77,7 @@ fn combine_terminal_errors(errors: Vec<EngineError>) -> Result<(), EngineError> 
     })
 }
 
-/// Bounded cooperative grace after a fired deadline, shared by the
-/// per-attempt node timeout and the run-wide elapsed deadline so the grace
-/// bound can never diverge between them (E10). Returns the settled outcome
-/// when the attempt finishes inside the window, else `None` (the caller
-/// records the deadline error). Parent cancellation is classified by the
-/// caller so every path agrees on who wins a race. Generic over the pinned
-/// future so both the inner node future and the outer attempt future share
-/// it without trait-object lifetime friction.
+/// Shared deadline grace returns cooperative outcomes or None; callers classify cancellation and expiry (E10/E11).
 async fn await_grace_settlement<Fut>(
     execution: &mut std::pin::Pin<Box<Fut>>,
 ) -> Option<Result<StepOutcome, EngineError>>
@@ -121,13 +90,88 @@ where
     }
 }
 
-/// Single shared cancel-race entry for both deadline paths (E11): a parent
-/// cancel racing a fired deadline wins, so both the node-timeout and the
-/// elapsed arms consult this one helper at grace entry (before awaiting
-/// cooperative settlement) instead of diverging pre-checks. Returns true
-/// when the parent cancellation already fired.
+/// Parent cancellation wins at grace entry for both node and elapsed deadlines (E11).
 fn grace_entry_parent_cancelled(context: &RunContext) -> bool {
     context.cancellation.is_cancelled()
+}
+
+// Tokio IDs only correlate joins in memory; persisted facts use node and never copy payload or authorize replay.
+type WaveJoin =
+    Result<(tokio::task::Id, (NodeDef, Result<StepOutcome, EngineError>)), tokio::task::JoinError>;
+
+fn record_wave_join(
+    journal: &JournalWriter,
+    task_nodes: &mut BTreeMap<tokio::task::Id, String>,
+    result: &WaveJoin,
+    drain_cause: &str,
+    abort_cause: &str,
+) -> Result<(), EngineError> {
+    let id = match result {
+        Ok((id, _)) => *id,
+        Err(error) => error.id(),
+    };
+    let node = task_nodes
+        .remove(&id)
+        .expect("registered parallel wave task");
+    let mut record = json!({ "node": node, "drain_cause": drain_cause });
+    let classification = match result {
+        Ok((_, (_, Ok(outcome)))) => {
+            let (kind, interaction) = match outcome {
+                StepOutcome::Success { .. } => ("success", None),
+                StepOutcome::CheckFailed { .. } => ("check_failed", None),
+                StepOutcome::NeedsUser { question, .. } => {
+                    ("needs_user", Some(("question_id", &question.id)))
+                }
+                StepOutcome::NeedsConfirm { confirm, .. } => {
+                    ("needs_confirm", Some(("confirm_id", &confirm.id)))
+                }
+            };
+            record["outcome"] = json!(kind);
+            if let Some((key, id)) = interaction {
+                record[key] = json!(id);
+            }
+            if matches!(outcome, StepOutcome::Success { .. }) {
+                "completed_success"
+            } else {
+                "completed_terminal"
+            }
+        }
+        Ok((_, (_, Err(error)))) => match error {
+            EngineError::NeedsUser { question_id, .. } => {
+                record["question_id"] = json!(question_id);
+                "interaction_pending"
+            }
+            EngineError::NeedsConfirm { confirm_id, .. } => {
+                record["confirm_id"] = json!(confirm_id);
+                "interaction_pending"
+            }
+            error => {
+                record["code"] = json!(failure_code_for_error(error));
+                if error.is_resumable_agent() {
+                    record["continuation_owner"] = json!("agent");
+                }
+                if error.is_canceled() {
+                    record["cancellation_cause"] = json!("reported_by_task");
+                    "task_canceled"
+                } else {
+                    "task_error"
+                }
+            }
+        },
+        Err(error) if error.is_cancelled() => {
+            record["cancellation_cause"] = json!(abort_cause);
+            match abort_cause {
+                "parent_cancellation" => "parent_canceled",
+                "none" => "task_canceled",
+                _ => "scheduler_abort",
+            }
+        }
+        Err(error) if error.is_panic() => "task_panic",
+        Err(_) => "task_join_error",
+    };
+    record["classification"] = json!(classification);
+    journal.event("parallel_task_joined", record)?;
+    Ok(())
 }
 
 impl Engine {
@@ -143,23 +187,47 @@ impl Engine {
         let context = Arc::new(context.clone());
         let journal = Arc::new(journal.clone_for_parallel()?);
         let mut tasks = JoinSet::new();
+        let mut task_nodes = BTreeMap::new();
+        // Defer journal errors until all writers are quiescent.
+        let mut fact_result = Ok(());
         for node in &nodes {
-            // Check the run-wide deadline before journaling start, matching
-            // the sequential loop (E11). Budget is charged per attempt
-            // inside the retry wrapper (unified rule, E10), not here.
-            context.run_checkpoint()?;
-            states.insert(node.id.clone(), NodeState::Running);
-            journal.event(
-                "step_started",
-                json!({ "node": node.id, "type": node.kind.to_string(), "attempt": 1, "parallel": true }),
-            )?;
+            // Check elapsed before start (E11); charge attempts in the retry wrapper (E10).
+            let started = context.run_checkpoint().and_then(|()| {
+                states.insert(node.id.clone(), NodeState::Running);
+                journal
+                    .event(
+                        "step_started",
+                        json!({ "node": node.id, "type": node.kind.to_string(), "attempt": 1, "parallel": true }),
+                    )
+                    .map_err(EngineError::from)
+            });
+            if let Err(error) = started {
+                let cause = if error.is_canceled() {
+                    "parent_cancellation"
+                } else {
+                    "wave_start_failure"
+                };
+                tasks.abort_all();
+                while let Some(result) = tasks.join_next_with_id().await {
+                    fact_result = fact_result.and(record_wave_join(
+                        &journal,
+                        &mut task_nodes,
+                        &result,
+                        cause,
+                        cause,
+                    ));
+                }
+                fact_result?;
+                return Err(error);
+            }
             let engine = self.clone();
             let context = Arc::clone(&context);
             let journal = Arc::clone(&journal);
             let node = node.clone();
             let mut vars_snapshot = vars.clone();
             let mut task_budget = budget.clone();
-            tasks.spawn(async move {
+            let node_id = node.id.clone();
+            let task = tasks.spawn(async move {
                 let outcome = engine
                     .execute_node_with_retry(
                         &context,
@@ -171,27 +239,17 @@ impl Engine {
                     .await;
                 (node, outcome)
             });
+            task_nodes.insert(task.id(), node_id);
         }
 
         let mut outcomes = BTreeMap::new();
-        // Every terminal failure is collected and reported joined: keeping
-        // only the first (via get_or_insert) would silently discard sibling
-        // failures, and a panic payload must keep its detail instead of a
-        // bare "task failed" (E10).
+        // Collect all failures and panic detail, not just the first (E10).
         let mut join_errors: Vec<EngineError> = Vec::new();
-        // Fail-fast with deterministic settlement: the first terminal
-        // failure or HITL suspension aborts siblings promptly instead of
-        // letting side effects continue in the background. Aborted tasks
-        // report cancellation and are ignored; completed steps replay on
-        // resume. External cancellation aborts the whole wave.
+        // Abort siblings on the first terminal outcome; external cancellation aborts all.
+        // Join facts are diagnostic only: existing settlement below remains authoritative.
         let mut abort_on_settle = false;
-        // Full-quiescence invariant: this loop never exits while tasks
-        // remain, on any path. Settlement below assumes no live writer can
-        // still append, so a break-on-timeout here would let a wedged
-        // sibling race settlement. Aborted tasks are drained to resolution;
-        // late completions win explicitly through the outcome map, and a
-        // missing outcome journals a scheduler failure instead of silently
-        // dropping the node.
+        // Drain to full quiescence before settlement: no writer may outlive this loop.
+        // Late outcomes win; missing outcomes settle as scheduler failures.
         loop {
             if tasks.is_empty() {
                 break;
@@ -200,8 +258,11 @@ impl Engine {
                 biased;
                 _ = context.cancellation.cancelled() => {
                     tasks.abort_all();
-                    while let Some(result) = tasks.join_next().await {
-                        if let Ok((node, _)) = result {
+                    while let Some(result) = tasks.join_next_with_id().await {
+                        let fact = record_wave_join(&journal, &mut task_nodes, &result, "parent_cancellation",
+                            if abort_on_settle { "fail_fast" } else { "parent_cancellation" });
+                        fact_result = fact_result.and(fact);
+                        if let Ok((_, (node, _))) = result {
                             states.insert(
                                 node.id.clone(),
                                 NodeState::Failed(FailureDetail::new(
@@ -211,12 +272,17 @@ impl Engine {
                             );
                         }
                     }
+                    fact_result?;
                     return Err(EngineError::Canceled);
                 }
-                result = tasks.join_next(), if !tasks.is_empty() => {
+                result = tasks.join_next_with_id(), if !tasks.is_empty() => {
                     let Some(result) = result else { break };
+                    let fact = record_wave_join(&journal, &mut task_nodes, &result,
+                        if abort_on_settle { "fail_fast" } else { "none" },
+                        if abort_on_settle { "fail_fast" } else { "none" });
+                    fact_result = fact_result.and(fact);
                     match result {
-                        Ok((node, outcome)) => {
+                        Ok((_, (node, outcome))) => {
                             let terminal = !matches!(&outcome, Ok(StepOutcome::Success { .. }));
                             outcomes.insert(node.id.clone(), (node, outcome));
                             if terminal && !abort_on_settle {
@@ -241,18 +307,10 @@ impl Engine {
             }
         }
 
+        fact_result?;
         let had_join_errors = !join_errors.is_empty();
         let mut terminal_errors: Vec<EngineError> = join_errors;
-        // HITL-aware settlement (F12): when a sibling suspended for user
-        // input/confirmation, outcome-less siblings were aborted by the
-        // scheduler, not failed by their own logic. They journal a resumable
-        // `step_interrupted` marker (fold-ignored, node stays Pending) so
-        // the post-answer resume re-executes them under the same invocation
-        // instead of restoring a permanent failure. True panics (join
-        // errors present) stay fail-closed as scheduler failures so a real
-        // crash is never mistaken for a HITL interruption (F12-02).
-        // NOTE: HITL outcomes still sit in `outcomes` (not yet in
-        // `terminal_errors`), so scan both.
+        // Keep HITL-aborted siblings Pending; panics remain scheduler failures (F12-02). Scan outcomes too.
         let hitl_pending = terminal_errors.iter().any(|error| {
             matches!(
                 error,
@@ -298,9 +356,7 @@ impl Engine {
             let outcome = match outcome {
                 Ok(outcome) => outcome,
                 Err(error) => {
-                    // A scheduler-aborted sibling that surfaces as Canceled
-                    // while HITL is pending is an interruption, not a
-                    // failure (F12): it resumes with the wave.
+                    // A scheduler-aborted sibling is an interruption, not a failure (F12).
                     if hitl_pending && error.is_canceled() {
                         states.insert(node.id.clone(), NodeState::Pending);
                         journal.event(
@@ -309,13 +365,7 @@ impl Engine {
                         )?;
                         continue;
                     }
-                    // Agent errors defer to the sequential loop (same rule
-                    // as there): the agent owns durable continuations whose
-                    // replay-safety verdict only its operation guard can
-                    // make on re-entry. Settle as interrupted-pending so
-                    // the loop re-executes it sequentially instead of
-                    // stranding a terminal failure that resume would
-                    // report as a stale error.
+                    // Agent operation guards own replay safety; defer their continuations to sequential re-entry.
                     if node.kind.as_str() == "llm.agent" || error.is_resumable_agent() {
                         states.insert(node.id.clone(), NodeState::Pending);
                         journal.event(
@@ -355,21 +405,14 @@ impl Engine {
                     let reason = failure_from_findings(&findings, FailureCode::CheckFailed);
                     let file_pins = pin_attempt_files(context.as_ref(), &files)?;
                     states.insert(node.id.clone(), NodeState::Failed(reason.clone()));
-                    // Parallel check failures share the single failed-evidence
-                    // helper with the sequential loop, so the journal keeps
-                    // one `failed_output` / `failed_files` notation on every
-                    // path instead of drifting to `output` / `files` (E06).
+                    // Use the same failed_output/failed_files notation as sequential settlement (E06).
                     journal.event(
                         "step_finished",
                         with_failed_evidence(json!({ "node": node.id, "status": "check_failed", "findings": findings, "reason": reason, "parallel": true }), &output, &file_pins)?,
                     )?;
                 }
                 StepOutcome::NeedsUser { question, files } => {
-                    // Parallel suspensions without a failed attempt still
-                    // carry the unified keys (null plus an empty list) so the
-                    // notation matches the failure paths (E06). The files
-                    // the attempt produced are pinned and journaled under
-                    // `files`, like the success path (E06).
+                    // Suspensions carry null/empty failed evidence; produced files are pinned (E06).
                     const NO_OUTPUT: Option<serde_json::Value> = None;
                     let file_pins = pin_attempt_files(context.as_ref(), &files)?;
                     journal.event(
@@ -382,14 +425,7 @@ impl Engine {
                     });
                 }
                 StepOutcome::NeedsConfirm { confirm, files } => {
-                    // `confirm_request` keeps its strict FOREIGN schema
-                    // (`api::ConfirmRequestEventData` allows only
-                    // `confirm` plus `parallel` plus the files it carries):
-                    // failed-evidence keys would be rejected at journal
-                    // validation, so they are not attached here. See
-                    // `with_failed_evidence`. The files the attempt
-                    // produced are pinned here, so the writes before the
-                    // confirmation are journaled like the success path's.
+                    // The strict confirm_request schema excludes failed evidence. Pin produced files.
                     let file_pins = pin_attempt_files(context.as_ref(), &files)?;
                     journal.event(
                         "confirm_request",
@@ -405,9 +441,7 @@ impl Engine {
         combine_terminal_errors(terminal_errors)
     }
 
-    /// Execute a node honoring its declared retry policy. Only execution
-    /// failures are retried; contract, budget, and cancellation errors fail
-    /// fast. Cancellation during backoff aborts the wait immediately.
+    /// Run a node under its retry policy: only execution failures retry; other classes fail fast, and cancellation interrupts backoff.
     pub(crate) async fn execute_node_with_retry<'a>(
         &'a self,
         context: &'a RunContext,
@@ -420,13 +454,7 @@ impl Engine {
             .await
     }
 
-    /// Retry wrapper with an explicit budget-charge switch (E10). Top-level
-    /// nodes, parallel-wave nodes, and repair/regenerate attempts charge
-    /// every attempt (unified rule: no free retries). Foreach children pass
-    /// `charge = false` so the outer foreach node is charged once total and
-    /// children share that budget without per-child consume (single-charge
-    /// rule). Retry, timeout, and elapsed handling are identical in both
-    /// cases; only budget accounting differs.
+    /// Shared retry/deadline wrapper; foreach children share their parent's single charge (E10).
     pub(crate) async fn execute_node_with_retry_charged<'a>(
         &'a self,
         context: &'a RunContext,
@@ -437,9 +465,7 @@ impl Engine {
         charge: bool,
     ) -> Result<StepOutcome, EngineError> {
         let retry: RetryPolicy = node.retry.clone().unwrap_or_default();
-        // Contract validation rejects 0; a programmatically built node that
-        // bypasses validation fails closed here instead of being silently
-        // rewritten to 1 (E10).
+        // Reject invalid programmatic bounds; never rewrite zero to one (E10).
         if retry.max_attempts == 0 || retry.max_attempts > policy::MAX_RETRY_ATTEMPTS {
             return Err(EngineError::Failed(format!(
                 "node `{}` retry.max_attempts must be between 1 and {}",
@@ -448,9 +474,7 @@ impl Engine {
             )));
         }
         let max_attempts = retry.max_attempts as usize;
-        // Read once per admission: the backoff arm and every attempt arm
-        // below report this same configured limit instead of re-reading
-        // it per branch (E10). `None` means no budget is configured.
+        // Read limits once per admission; every arm uses them and None means unconfigured (E10).
         let elapsed_limit = elapsed_limit_secs(&context.contract);
         let bounds = AttemptBounds {
             timeout_secs: retry.timeout_secs,
@@ -460,13 +484,7 @@ impl Engine {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            // Unified budget rule (E10): every charged attempt consumes the
-            // run-wide step budget, including ordinary retries. Foreach
-            // children pass charge=false (single-charge outer only), all
-            // other paths pass true so no path gets a free retry.
-            // Durable delta (F13): the consumption is journaled so live
-            // and recovery apply the same rule; observational step counts
-            // stay separate from the budget counter.
+            // Persist each charged attempt; foreach children share the outer charge, not step counts (F13).
             if charge {
                 budget.consume(&node.id)?;
                 journal.event("budget_charged", json!({ "node": node.id, "amount": 1 }))?;
@@ -474,10 +492,7 @@ impl Engine {
             let result = self
                 .execute_attempt(context, journal, vars, budget, node, bounds)
                 .await;
-            // Retry ordinary failures and timeouts; the operation guard
-            // on the next attempt enforces the indeterminate policy
-            // (refuse without opt-in) and invocation separation. Refusals
-            // never retry: re-guarding would refuse identically.
+            // Retry failures/timeouts only; indeterminate effects need opt-in and refusals never retry (E10).
             match &result {
                 Err(EngineError::Step(
                     error @ (StepError::Failed { .. } | StepError::TimedOut { .. }),
@@ -491,14 +506,7 @@ impl Engine {
                             "error": error.to_string(),
                         }),
                     )?;
-                    // Uniform wait path (E10): even a zero backoff awaits
-                    // the elapsed deadline and the cancellation signal
-                    // before the next attempt, so `backoff_ms = 0` can
-                    // neither sleep past a fired deadline nor spin past a
-                    // cancel. `biased` makes a simultaneous cancel or
-                    // deadline deterministic instead of dependent on poll
-                    // order (E11). The backoff below is the single
-                    // admission-time read in `bounds`, never re-read (E10).
+                    // Check elapsed/cancel even for zero backoff; biased polling resolves races (E10/E11).
                     let backoff =
                         tokio::time::sleep(std::time::Duration::from_millis(bounds.backoff_ms));
                     tokio::pin!(backoff);
@@ -539,17 +547,8 @@ impl Engine {
         }
     }
 
-    /// One execution attempt with its node scope, optional per-attempt
-    /// timeout, and the run-wide elapsed deadline. The retry wrapper and
-    /// repair/regenerate runs share it, so every entry applies the same
-    /// NodeDef constraints (E10/E11).
-    ///
-    /// Enforcement uses the monotonic clock only: the run-wide deadline is
-    /// a `tokio::time::Instant` captured at run start and the per-attempt
-    /// timeout is a monotonic sleep. Wall-clock time appears solely in
-    /// durable records (`budget.started_at`) and diagnostic messages, never
-    /// in an enforcement decision, so an NTP step cannot stretch or shrink
-    /// a timeout (E11).
+    /// One attempt applies node scope, optional timeout and run elapsed deadline; retries and repair/regeneration share it (E10/E11).
+    /// Deadlines use monotonic `tokio::time::Instant`/sleep; wall-clock records are diagnostic only and cannot alter expiry (E11).
     async fn execute_attempt<'a>(
         &'a self,
         context: &'a RunContext,
@@ -559,22 +558,13 @@ impl Engine {
         node: &'a NodeDef,
         bounds: AttemptBounds,
     ) -> Result<StepOutcome, EngineError> {
-        // Node-scoped execution context, rebuilt every attempt: the
-        // stop signal is always a child of the run token, so parent
-        // cancellation reaches every path uniformly, while a node
-        // timeout cancels only this attempt's scope and never the run
-        // (B11). Gateways observe the same scope, so command, HTTP,
-        // LLM, and MCP paths stop under identical semantics.
+        // Rebuild a child token per attempt: parent cancel reaches every gateway; a node timeout cancels only this attempt (B11).
         let node_stop = context.cancellation.child_token();
         let mut node_context = context.clone();
         node_context.cancellation = node_stop.clone();
         node_context.cmd = context.cmd.clone().with_cancellation(node_stop.clone());
         node_context.http = context.http.clone().with_cancellation(node_stop.clone());
-        // Evaluated once per admission by the caller: every deadline arm
-        // below reports the same configured limit instead of re-reading
-        // it per branch (E10). `None` means no budget is configured; arms
-        // that fired a deadline handle it explicitly instead of
-        // misreading 0 (E11).
+        // Deadline arms share the admission-time limit; None is unconfigured and 0 is never inferred (E10/E11).
         let attempt_execution = async {
             let mut execution =
                 self.execute_node_after_budget(&node_context, journal, vars, budget, node);
@@ -837,4 +827,9 @@ mod tests {
         assert!(error.to_string().contains("agent error"));
         assert!(error.to_string().contains("sibling error"));
     }
+}
+
+#[cfg(test)]
+mod parallel_fact_payloads {
+    include!("tests/parallel_fact_payloads.rs");
 }

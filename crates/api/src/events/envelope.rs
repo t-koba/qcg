@@ -38,6 +38,7 @@ pub const INTERNAL_RUN_EVENT_KINDS: &[&str] = &[
     "mcp_input_pending",
     "operation_finished",
     "operation_repeated",
+    "parallel_task_joined",
     "operation_started",
     "run_forked",
     "run_yielded",
@@ -49,8 +50,7 @@ pub const INTERNAL_RUN_EVENT_KINDS: &[&str] = &[
     "user_confirmed",
 ];
 
-/// Kinds the events endpoint synthesizes for the transport itself rather than
-/// from a journal record. They carry an opaque payload, and
+/// Transport-only kinds (not journal records). They carry an opaque payload, and
 /// [`STREAM_ERROR_KIND`] ends the stream as a failure close rather than a
 /// normal outcome.
 pub const TRANSPORT_RUN_EVENT_KINDS: &[&str] = &["shutdown", STREAM_ERROR_KIND];

@@ -9,9 +9,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const RUN_STATE_SCHEMA_VERSION: u32 = 3;
 
-/// Durable diagnostics that the journal keeps for operators but that carry no
-/// folded state. They are listed as explicit arms so the fold never depends on
-/// a silent catch-all to accept them.
 /// Durable diagnostics the journal keeps for operators but that carry no folded
 /// state. `internal_journal_kinds_pass_the_fold_gate` pins that every entry is
 /// declared in `api::INTERNAL_RUN_EVENT_KINDS`.
@@ -23,6 +20,7 @@ const STATE_FREE_JOURNAL_EVENT_KINDS: &[&str] = &[
     "hook_replayed",
     "mcp_destination_decision",
     "operation_repeated",
+    "parallel_task_joined",
     "step_interrupted",
     "step_timeout",
 ];
