@@ -1252,3 +1252,81 @@ fn snapshot_tree_copies_with_explicit_modes() {
     );
     // Best-effort test cleanup documented here: temp removal cannot propagate from test tails (E13).
 }
+
+#[test]
+fn workspace_relative_key_survives_gateway_spellings_and_removal() {
+    let root = Utf8PathBuf::from_path_buf(
+        std::env::temp_dir().join(format!("gateway-relative-key-{}", uuid::Uuid::now_v7())),
+    )
+    .expect("temporary path must be UTF-8");
+    let physical = root.join("workspace");
+    std::fs::create_dir_all(physical.join("out")).expect("workspace tree");
+    let mut workspaces = vec![physical.clone()];
+    #[cfg(unix)]
+    {
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&physical, &alias).expect("workspace alias");
+        workspaces.push(alias);
+    }
+    // Both the configured root and the resolver's canonical root are accepted.
+    for workspace in workspaces.drain(..) {
+        let mut permissions = Permissions::default();
+        permissions.fs_read.push("workspace".into());
+        permissions.fs_write.push("workspace".into());
+        let gateway = FsGateway::new(workspace.clone(), &permissions);
+        let target = gateway.resolve_write("out/note.txt").expect("resolve");
+        let canonical =
+            Utf8PathBuf::from_path_buf(dunce::canonicalize(&physical).unwrap()).unwrap();
+        assert_eq!(target, canonical.join("out/note.txt"));
+        let spellings = [
+            target.clone(),
+            workspace.join("out/note.txt"),
+            workspace.join("out//note.txt"),
+        ];
+        // A missing leaf, an existing leaf, and a deleted leaf have one identity.
+        for present in [false, true, false] {
+            if present {
+                std::fs::write(&target, b"written").expect("write leaf");
+            } else if target.exists() {
+                std::fs::remove_file(&target).expect("remove leaf");
+            }
+            for spelling in &spellings {
+                assert_eq!(
+                    gateway.workspace_relative_key(spelling).unwrap(),
+                    "out/note.txt"
+                );
+                #[cfg(unix)]
+                if spelling.as_str().contains("//") {
+                    assert!(gateway.open_read_resolved(spelling).is_err());
+                } else {
+                    assert_eq!(gateway.open_read_resolved(spelling).is_ok(), present);
+                }
+            }
+        }
+        for denied in [root.join("outside.txt"), workspace.join("../outside.txt")] {
+            assert!(matches!(
+                gateway.workspace_relative_key(&denied),
+                Err(GatewayError::PathDenied { .. })
+            ));
+            #[cfg(unix)]
+            assert!(gateway.open_read_resolved(&denied).is_err());
+        }
+        #[cfg(unix)]
+        {
+            // Identity belongs to the resolved path, not a new pathname lookup.
+            // A swapped leaf cannot change the pin; handle reads still fail closed.
+            let outside = root.join("outside.txt");
+            std::fs::write(&outside, b"outside").unwrap();
+            std::os::unix::fs::symlink(&outside, &target).unwrap();
+            for spelling in &spellings {
+                assert_eq!(
+                    gateway.workspace_relative_key(spelling).unwrap(),
+                    "out/note.txt"
+                );
+                assert!(gateway.open_read_resolved(spelling).is_err());
+            }
+            std::fs::remove_file(&target).unwrap();
+        }
+    }
+    std::fs::remove_dir_all(&root).expect("clean up workspace");
+}

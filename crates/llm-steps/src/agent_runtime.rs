@@ -118,35 +118,14 @@ fn record_agent_file_changes(
         .step_err(&node.id)
 }
 
-fn workspace_relative_file_key(
-    workspace: &Utf8Path,
-    resolved: &Utf8Path,
-) -> std::io::Result<String> {
-    let (raw, workspace) = (workspace.as_std_path(), dunce::canonicalize(workspace)?);
-    let path = match dunce::canonicalize(resolved.as_std_path()) {
-        Ok(path) => path,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => workspace.join(
-            resolved
-                .as_std_path()
-                .strip_prefix(&workspace)
-                .or_else(|_| resolved.as_std_path().strip_prefix(raw))
-                .map_err(|_| error)?,
-        ),
-        Err(error) => return Err(error),
-    };
-    let rel = path
-        .strip_prefix(&workspace)
-        .map_err(std::io::Error::other)?;
-    let rel = rel.to_str().ok_or(std::io::ErrorKind::InvalidData)?;
-    Ok(policy::portable_relative_path(Utf8Path::new(rel)))
-}
-
 fn agent_output_file_key(
     ctx: &StepContext<'_>,
     node: &NodeDef,
     resolved: &Utf8Path,
 ) -> Result<String, StepError> {
-    workspace_relative_file_key(&ctx.run.workspace, resolved)
+    ctx.run
+        .fs
+        .workspace_relative_key(resolved)
         .map_err(|error| StepError::failed(&node.id, format!("cannot key `{resolved}`: {error}")))
 }
 
@@ -1921,11 +1900,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let workspace = Utf8PathBuf::from_path_buf(root.join("workspace")).expect("UTF-8 path");
         std::fs::create_dir_all(workspace.join("out")).expect("create workspace");
-        let canonical = workspace.join("out/note.txt");
+        let mut permissions = contract::Permissions::default();
+        permissions.fs_read.push("workspace".into());
+        permissions.fs_write.push("workspace".into());
+        let gateway = engine::FsGateway::new(workspace.clone(), &permissions);
+        let canonical = gateway.resolve_write("out/note.txt").expect("resolve");
         std::fs::write(&canonical, "written").expect("create note");
         let alternate = workspace.join("out//note.txt");
-        let removed = workspace_relative_file_key(&workspace, &alternate).expect("removal key");
-        let written = workspace_relative_file_key(&workspace, &canonical).expect("write key");
+        let removed = gateway
+            .workspace_relative_key(&alternate)
+            .expect("removal key");
+        let written = gateway
+            .workspace_relative_key(&canonical)
+            .expect("write key");
         assert_eq!(removed, "out/note.txt");
         assert_eq!(removed, written, "both spellings match the pinned path");
 
@@ -1937,17 +1924,14 @@ mod tests {
             "the later write supersedes the removal"
         );
         writes.restore_removals(BTreeSet::from([removed.clone()]));
-        writes.record_replay(&written, canonical);
+        writes.record_replay(&written, canonical.clone());
         assert_eq!(writes.removed(), &BTreeSet::from([removed.clone()]));
         assert!(
             writes.reported().is_empty(),
             "a replayed write cannot undo a later removal"
         );
-        std::fs::remove_file(workspace.join("out/note.txt")).expect("remove note");
-        assert_eq!(
-            workspace_relative_file_key(&workspace, &alternate).unwrap(),
-            removed
-        );
+        std::fs::remove_file(&canonical).expect("remove note");
+        assert_eq!(gateway.workspace_relative_key(&alternate).unwrap(), removed);
         std::fs::remove_dir_all(root).expect("remove test workspace");
     }
 
@@ -1960,16 +1944,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let workspace = Utf8PathBuf::from_path_buf(root.join("workspace")).expect("UTF-8 path");
         std::fs::create_dir_all(workspace.join("out")).expect("create workspace");
-        let file = workspace.join("out/note.txt");
-        std::fs::write(&file, "written").expect("create note");
-        // The filesystem gateway returns dunce-canonicalized resolved paths.
-        let resolved = Utf8PathBuf::from_path_buf(
-            dunce::canonicalize(&file).expect("canonicalize gateway target"),
-        )
-        .expect("UTF-8 path");
-        let existing = workspace_relative_file_key(&workspace, &resolved).expect("existing key");
-        std::fs::remove_file(&file).expect("remove note");
-        let removed = workspace_relative_file_key(&workspace, &resolved).expect("missing key");
+        let mut permissions = contract::Permissions::default();
+        permissions.fs_read.push("workspace".into());
+        permissions.fs_write.push("workspace".into());
+        let gateway = engine::FsGateway::new(workspace.clone(), &permissions);
+        let resolved = gateway.resolve_write("out/note.txt").expect("resolve");
+        std::fs::write(&resolved, "written").expect("create note");
+        let existing = gateway
+            .workspace_relative_key(&resolved)
+            .expect("existing key");
+        std::fs::remove_file(&resolved).expect("remove note");
+        let removed = gateway
+            .workspace_relative_key(&resolved)
+            .expect("missing key");
         assert_eq!(existing, "out/note.txt");
         assert_eq!(removed, existing);
         std::fs::remove_dir_all(root).expect("remove test workspace");
@@ -1990,16 +1977,19 @@ mod tests {
             .expect("create alias parent");
         symlink(&physical, &alias).expect("link workspace alias");
         let workspace = Utf8PathBuf::from_path_buf(alias).expect("UTF-8 path");
-        let file = physical.join("out/note.txt");
-        std::fs::write(&file, "written").expect("create note");
-        let resolved = Utf8PathBuf::from_path_buf(
-            dunce::canonicalize(&file).expect("canonicalize gateway target"),
-        )
-        .expect("UTF-8 path");
-
-        let existing = workspace_relative_file_key(&workspace, &resolved).expect("existing key");
-        std::fs::remove_file(&file).expect("remove note");
-        let removed = workspace_relative_file_key(&workspace, &resolved).expect("missing key");
+        let mut permissions = contract::Permissions::default();
+        permissions.fs_read.push("workspace".into());
+        permissions.fs_write.push("workspace".into());
+        let gateway = engine::FsGateway::new(workspace.clone(), &permissions);
+        let resolved = gateway.resolve_write("out/note.txt").expect("resolve");
+        std::fs::write(&resolved, "written").expect("create note");
+        let existing = gateway
+            .workspace_relative_key(&resolved)
+            .expect("existing key");
+        std::fs::remove_file(&resolved).expect("remove note");
+        let removed = gateway
+            .workspace_relative_key(&resolved)
+            .expect("missing key");
         assert_eq!(existing, "out/note.txt");
         assert_eq!(removed, existing);
         std::fs::remove_dir_all(root).expect("remove test workspace");

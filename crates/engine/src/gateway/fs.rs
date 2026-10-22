@@ -362,11 +362,8 @@ impl FsGateway {
     #[cfg(unix)]
     pub fn open_read(&self, path: &str) -> Result<std::fs::File, GatewayError> {
         self.resolve_read(path)?;
-        // Canonicalize the base before the handle walk: on macOS the
-        // configured workspace may contain a symlinked component
-        // (`/var` -> `/private/var`) and opening it with `O_NOFOLLOW`
-        // fails with `ELOOP`. The canonical root denotes the same
-        // directory without symlink components (E13).
+        // Canonicalize for symlinked workspaces (`/var` -> `/private/var`);
+        // `O_NOFOLLOW` needs the canonical root (E13).
         let workspace = dunce::canonicalize(&self.workspace).map_err(GatewayError::Io)?;
         let workspace =
             Utf8PathBuf::from_path_buf(workspace).map_err(|_| GatewayError::PathDenied {
@@ -391,19 +388,7 @@ impl FsGateway {
     /// redirect the open (E13a).
     #[cfg(unix)]
     pub fn open_read_resolved(&self, target: &Utf8Path) -> Result<std::fs::File, GatewayError> {
-        let denied = || GatewayError::PathDenied {
-            path: target.to_path_buf(),
-            workspace: self.workspace.clone(),
-        };
-        let workspace = dunce::canonicalize(&self.workspace).map_err(|_| denied())?;
-        let workspace = Utf8PathBuf::from_path_buf(workspace).map_err(|_| denied())?;
-        // Accept targets anchored at either the canonical or the configured
-        // (possibly symlinked, e.g. `/var` -> `/private/var`) workspace
-        // prefix, then re-anchor on the canonical root for the handle walk.
-        let relative = target
-            .strip_prefix(&workspace)
-            .or_else(|_| target.strip_prefix(&self.workspace))
-            .map_err(|_| denied())?;
+        let (workspace, relative) = self.resolved_workspace_path(target)?;
         super::handle::open_read(&workspace, relative.as_str()).map_err(GatewayError::Io)
     }
 
@@ -807,9 +792,41 @@ impl FsGateway {
         &self.workspace
     }
 
-    /// Whether a resolved path names an existing regular file. The agent
-    /// compares presence across one of its own tool calls, to tell a file
-    /// the agent removed from one the workspace lost.
+    /// Portable identity for a gateway-resolved target, including a missing leaf.
+    /// This does not resolve or authorize untrusted input; use `resolve_write` first.
+    pub fn workspace_relative_key(&self, target: &Utf8Path) -> Result<String, GatewayError> {
+        let (_, relative) = self.resolved_workspace_path(target)?;
+        Ok(policy::portable_relative_path(relative))
+    }
+
+    // Keep the resolver's target spelling: canonicalizing it again can change
+    // its identity. Accept either gateway root spelling, as for handle reads.
+    fn resolved_workspace_path<'a>(
+        &self,
+        target: &'a Utf8Path,
+    ) -> Result<(Utf8PathBuf, &'a Utf8Path), GatewayError> {
+        let denied = || GatewayError::PathDenied {
+            path: target.to_path_buf(),
+            workspace: self.workspace.clone(),
+        };
+        let workspace = dunce::canonicalize(&self.workspace).map_err(|_| denied())?;
+        let workspace = Utf8PathBuf::from_path_buf(workspace).map_err(|_| denied())?;
+        // Accept canonical or configured prefixes; re-anchor on canonical (E13).
+        let relative = target
+            .strip_prefix(&workspace)
+            .or_else(|_| target.strip_prefix(&self.workspace))
+            .map_err(|_| denied())?;
+        if relative
+            .components()
+            .any(|c| !matches!(c, camino::Utf8Component::Normal(_)))
+        {
+            return Err(denied());
+        }
+        Ok((workspace, relative))
+    }
+
+    /// Whether a resolved path names an existing regular file; the agent
+    /// compares presence across its calls to tell removals apart.
     pub fn file_present(&self, target: &Utf8Path) -> bool {
         std::fs::symlink_metadata(target)
             .map(|metadata| metadata.file_type().is_file())
@@ -1523,31 +1540,13 @@ impl FsGateway {
         &self,
         target: &Utf8Path,
     ) -> Result<(Utf8PathBuf, Utf8PathBuf), GatewayError> {
-        let workspace = dunce::canonicalize(&self.workspace)?;
-        let workspace =
-            Utf8PathBuf::from_path_buf(workspace).map_err(|_| GatewayError::PathDenied {
-                path: target.to_path_buf(),
-                workspace: self.workspace.clone(),
-            })?;
+        let (workspace, relative) = self.resolved_workspace_path(target)?;
         let denied = || GatewayError::PathDenied {
             path: target.to_path_buf(),
             workspace: self.workspace.clone(),
         };
-        // The target may be built from either the canonical workspace or
-        // the configured (possibly symlinked, e.g. /var -> /private/var)
-        // workspace prefix. Accept both, then re-anchor on the canonical
-        // root so the handle walk below sees one root.
-        let relative = target
-            .strip_prefix(&workspace)
-            .or_else(|_| target.strip_prefix(&self.workspace))
-            .map_err(|_| denied())?;
         if relative.as_str().is_empty() {
             return Err(denied());
-        }
-        for component in relative.components() {
-            if !matches!(component, camino::Utf8Component::Normal(_)) {
-                return Err(denied());
-            }
         }
         #[cfg(unix)]
         {
