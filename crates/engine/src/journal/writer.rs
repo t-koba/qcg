@@ -29,20 +29,39 @@ fn resync_durable_state(
     limits: JournalLimits,
     durable_seq: u64,
 ) -> Result<crate::RunState, JournalError> {
-    if let Ok(bytes) = std::fs::read(state_path)
-        && let Ok(persisted) = serde_json::from_slice::<crate::RunState>(&bytes)
-        && persisted.last_seq == durable_seq
-    {
-        if persisted.schema_version != crate::RUN_STATE_SCHEMA_VERSION {
+    if let Ok(bytes) = std::fs::read(state_path) {
+        // The persisted state is a cache of the journal fold, so its
+        // schema version decides how it is read: a state written by a
+        // NEWER runtime is refused rather than silently downgraded, and
+        // a state this runtime cannot read is not adopted at all but
+        // recomputed from the journal, which is the durable truth.
+        if let Some(version) = persisted_schema_version(&bytes)
+            && version > crate::RUN_STATE_SCHEMA_VERSION
+        {
             return Err(JournalError::InvalidEvent(format!(
-                "unsupported state schema_version {}; this runtime implements {}",
-                persisted.schema_version,
+                "unsupported state schema_version {version}; this runtime implements {}",
                 crate::RUN_STATE_SCHEMA_VERSION
             )));
         }
-        return Ok(persisted);
+        if let Ok(persisted) = serde_json::from_slice::<crate::RunState>(&bytes)
+            && persisted.schema_version == crate::RUN_STATE_SCHEMA_VERSION
+            && persisted.last_seq == durable_seq
+        {
+            return Ok(persisted);
+        }
     }
     crate::RunState::fold_journal_with_limits(journal_path, limits)
+}
+
+/// The schema version a persisted state file declares, read from the raw
+/// bytes so a version this runtime does not implement is seen before the
+/// file is parsed as a state of this runtime.
+fn persisted_schema_version(bytes: &[u8]) -> Option<u32> {
+    serde_json::from_slice::<Value>(bytes)
+        .ok()?
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
 }
 
 /// Sibling lock file serializing all journal writers for one run across
@@ -443,13 +462,10 @@ impl JournalWriter {
             })?;
             state.apply(event)?;
         }
-        if state.schema_version != crate::RUN_STATE_SCHEMA_VERSION {
-            return Err(JournalError::InvalidEvent(format!(
-                "unsupported state schema_version {}; this runtime implements {}",
-                state.schema_version,
-                crate::RUN_STATE_SCHEMA_VERSION
-            )));
-        }
+        // The folded state's schema version is the constant it was built
+        // from, so it carries no information here: the journal's own
+        // schema version is checked by the fold, and a persisted state
+        // file's version is checked where the file is read.
         if let Some(existing) = state.run_id.as_deref()
             && existing != run_id
         {
@@ -1378,6 +1394,76 @@ mod tests {
         let path = camino::Utf8PathBuf::from_path_buf(dir.join("journal.jsonl"))
             .expect("temporary path must be UTF-8");
         (dir, path)
+    }
+
+    fn persisted_state_with_schema_version(
+        dir: &std::path::Path,
+        version: u32,
+    ) -> camino::Utf8PathBuf {
+        let path = dir.join("state.json");
+        let mut value =
+            serde_json::to_value(crate::RunState::default()).expect("default state serializes");
+        value["schema_version"] = json!(version);
+        value["last_seq"] = json!(1);
+        value["removed_files"] = json!({"agent": ["out/stale.txt"]});
+        std::fs::write(&path, serde_json::to_vec(&value).expect("state serializes"))
+            .expect("state file should be written");
+        camino::Utf8PathBuf::from_path_buf(path).expect("temporary path must be UTF-8")
+    }
+
+    #[test]
+    fn a_persisted_state_from_another_schema_is_not_adopted() {
+        // The persisted state is a cache of the journal fold, so its
+        // schema version decides how it is read: a state that declares
+        // another schema version is never adopted, an older one is
+        // recomputed from the journal (the durable truth) and a newer
+        // one is refused rather than silently downgraded.
+        let (dir, path) = marker_fail_dir("state-schema");
+        {
+            let journal = JournalWriter::create(&path, "schema-run", false, None)
+                .expect("journal should open");
+            journal
+                .event(
+                    "run_started",
+                    json!({
+                        "generator": "schema-run@1.0.0",
+                        "generator_path": "schema-run",
+                        "contract_sha256": "abc",
+                        "inputs": {},
+                        "resource_hashes": [],
+
+                        "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                        "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
+                    }),
+                )
+                .expect("run_started should append");
+        }
+        let current = persisted_state_with_schema_version(&dir, crate::RUN_STATE_SCHEMA_VERSION);
+        let adopted = super::resync_durable_state(&path, &current, JournalLimits::default(), 1)
+            .expect("a state of this runtime's schema must be adopted");
+        assert_eq!(
+            adopted.removed_files.get(&model::NodePath::root("agent")),
+            Some(&std::collections::BTreeSet::from([
+                "out/stale.txt".to_string()
+            ])),
+            "a state of this runtime's schema is adopted as it stands"
+        );
+        let older = persisted_state_with_schema_version(&dir, crate::RUN_STATE_SCHEMA_VERSION - 1);
+        let recomputed = super::resync_durable_state(&path, &older, JournalLimits::default(), 1)
+            .expect("an older state must be recomputed from the journal");
+        assert!(
+            recomputed.removed_files.is_empty(),
+            "an older state is not adopted, the journal decides: {recomputed:?}"
+        );
+        let newer = persisted_state_with_schema_version(&dir, crate::RUN_STATE_SCHEMA_VERSION + 1);
+        let error = super::resync_durable_state(&path, &newer, JournalLimits::default(), 1)
+            .expect_err("a newer state must be refused");
+        assert!(
+            matches!(&error, crate::JournalError::InvalidEvent(message)
+                if message.contains("unsupported state schema_version")),
+            "the refusal must name the version: {error}"
+        );
+        std::fs::remove_dir_all(&dir).expect("test dir should be removed");
     }
 
     #[test]
