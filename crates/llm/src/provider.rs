@@ -981,6 +981,10 @@ impl LlmProvider for FakeLlmProvider {
             .last()
             .map(|message| message.content.as_str())
             .unwrap_or_default();
+        // A delegated specialist is scripted by its instructions, which
+        // reach the model as the system prompt rather than as a message,
+        // so the markers are looked up in both places.
+        let system = req.system.as_deref().unwrap_or_default();
         if req.messages.last().map(|message| message.role.as_str()) == Some("tool") {
             let first_prompt = req
                 .messages
@@ -989,6 +993,7 @@ impl LlmProvider for FakeLlmProvider {
                 .map(|message| message.content.as_str())
                 .unwrap_or_default();
             if let Some(sequence) = marker_line(first_prompt, "FAKE_TOOL_SEQUENCE:")
+                .or_else(|| marker_line(system, "FAKE_TOOL_SEQUENCE:"))
                 && let Ok(values) = serde_json::from_str::<Vec<Value>>(&sequence)
             {
                 let completed_tools = req
@@ -1022,6 +1027,7 @@ impl LlmProvider for FakeLlmProvider {
                 }
             }
             let text = marker_block(first_prompt, "FAKE_AGENT_FINAL:")
+                .or_else(|| marker_block(system, "FAKE_AGENT_FINAL:"))
                 .unwrap_or_else(|| "agent finished".into());
             return Ok(ChatResponse {
                 content: vec![ChatContent::Text(text)],
@@ -1036,7 +1042,8 @@ impl LlmProvider for FakeLlmProvider {
                 provider_state: None,
             });
         }
-        if let Some(tool) = marker_line(prompt, "FAKE_TOOL:")
+        if let Some(tool) =
+            marker_line(prompt, "FAKE_TOOL:").or_else(|| marker_line(system, "FAKE_TOOL:"))
             && let Ok(value) = serde_json::from_str::<Value>(&tool)
         {
             let name = value
@@ -1063,6 +1070,7 @@ impl LlmProvider for FakeLlmProvider {
             });
         }
         if let Some(sequence) = marker_line(prompt, "FAKE_TOOL_SEQUENCE:")
+            .or_else(|| marker_line(system, "FAKE_TOOL_SEQUENCE:"))
             && let Ok(values) = serde_json::from_str::<Vec<Value>>(&sequence)
             && let Some(value) = values.first()
         {

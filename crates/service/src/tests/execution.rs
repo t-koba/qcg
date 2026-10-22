@@ -525,6 +525,253 @@ done
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The delegated path reaches the step's outputs through a different
+/// call site than the parent's own tools, so it needs its own regression:
+/// the specialist's file must be journaled as a step output with its
+/// digest, exactly like the parent's write is.
+#[tokio::test]
+async fn a_delegated_specialists_write_is_journaled_as_a_step_output() {
+    let root = temp_run_dir("specialist-write-journaled");
+    let _ = std::fs::remove_dir_all(&root);
+    let generator = root.join("generator");
+    let runs = root.join("runs");
+    std::fs::create_dir_all(generator.join("prompts")).expect("generator dirs");
+    std::fs::write(
+        generator.join(contract::MANIFEST_FILE),
+        r#"
+[generator]
+id = "generator"
+name = "Generator"
+version = "0.1.0"
+
+[[flow]]
+id = "agent"
+output = "agent_result"
+type = "llm.agent"
+
+[flow.params]
+max_iterations = 4
+max_tokens_total = 4096
+prompt = "prompts/agent.j2"
+
+[[flow.params.tools]]
+kind = "fs.write"
+name = "write_note"
+path_prefix = "out/"
+
+[[flow.params.tools]]
+kind = "agent"
+name = "helper"
+instructions = """
+FAKE_TOOL_SEQUENCE: [{"name":"write_note","args":{"path":"out/note.txt","content":"written by the specialist"}}]
+FAKE_AGENT_FINAL:
+done
+"""
+tools = ["write_note"]
+max_iterations = 4
+max_tokens_total = 4096
+max_tool_calls_total = 4
+
+[llm]
+max_tokens = 256
+temperature = 0.0
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[permissions]
+fs_read = []
+network = []
+commands = []
+side_effects = "allowed"
+side_effects_scope = "invocation"
+fs_write = ["workspace"]
+
+[permissions.containers]
+enabled = false"#,
+    )
+    .expect("generator manifest");
+    // The parent delegates to the specialist, and the specialist writes the
+    // file with the parent's own write tool. The specialist is scripted
+    // through its instructions, which reach the model as the system prompt.
+    std::fs::write(
+        generator.join("prompts/agent.j2"),
+        r#"Delegate the write to the helper, then finish.
+
+FAKE_TOOL_SEQUENCE: [{"name":"helper","args":{"task":"write the note"}}]
+FAKE_AGENT_FINAL:
+done
+"#,
+    )
+    .expect("prompt");
+    let service = test_service(vec![root.clone()], runs.clone());
+    let id = service
+        .start_run(StartRun {
+            generator_id: "generator".into(),
+            inputs: BTreeMap::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("agent run should start");
+    let terminal = wait_for_terminal_snapshot(&service, &id).await;
+    let run_dir = service.run_dir_for(&id).await.expect("run dir");
+    let events = read_events_from_meta(&run_meta_dir(&run_dir)).expect("journal");
+    let failure = events
+        .iter()
+        .find(|event| {
+            event.get("t").and_then(Value::as_str) == Some("step_finished")
+                && event.get("status").and_then(Value::as_str) == Some("failed")
+        })
+        .map(|event| event.get("reason").cloned().unwrap_or(Value::Null));
+    let all: Vec<Value> = events.clone();
+    assert_eq!(
+        terminal.state,
+        RunStatus::Succeeded,
+        "the delegated run must succeed: {terminal:?} {failure:?} {all:?}"
+    );
+    let finished = events
+        .iter()
+        .find(|event| {
+            event.get("t").and_then(Value::as_str) == Some("step_finished")
+                && event.get("node").and_then(Value::as_str) == Some("agent")
+        })
+        .expect("the agent step must finish");
+    let files = finished
+        .get("files")
+        .and_then(Value::as_array)
+        .expect("the agent step must journal its files");
+    let pinned = files
+        .iter()
+        .find(|file| file.get("path").and_then(Value::as_str) == Some("out/note.txt"))
+        .expect("the file the specialist wrote must be journaled as a step output");
+    assert!(
+        pinned
+            .get("sha256")
+            .and_then(Value::as_str)
+            .is_some_and(|digest| {
+                digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit())
+            }),
+        "the journaled pin must carry the file's digest: {pinned}"
+    );
+    assert_eq!(
+        files.len(),
+        1,
+        "the specialist wrote exactly one file: {files:?}"
+    );
+    drop(service);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The agent wrote a scratch file and then removed it again with its own
+/// command tool. The file is not an output of the step: the agent deleted
+/// it, so the step left nothing behind for the engine to pin, and the run
+/// succeeds instead of failing the pin step on a file the agent
+/// deliberately cleaned up.
+#[tokio::test]
+async fn a_file_the_agents_own_command_removed_is_not_a_step_output() {
+    let root = temp_run_dir("agent-removed-file");
+    let _ = std::fs::remove_dir_all(&root);
+    let generator = root.join("generator");
+    let runs = root.join("runs");
+    std::fs::create_dir_all(generator.join("prompts")).expect("generator dirs");
+    std::fs::write(
+        generator.join(contract::MANIFEST_FILE),
+        r#"
+[generator]
+id = "generator"
+name = "Generator"
+version = "0.1.0"
+
+[[flow]]
+id = "agent"
+output = "agent_result"
+type = "llm.agent"
+
+[flow.params]
+max_iterations = 4
+max_tokens_total = 4096
+prompt = "prompts/agent.j2"
+
+[[flow.params.tools]]
+kind = "fs.write"
+name = "write_note"
+path_prefix = "out/"
+
+[[flow.params.tools]]
+kind = "command"
+name = "remove_note"
+command = ["sh", "-c", "rm -f out/note.txt"]
+
+[llm]
+max_tokens = 256
+temperature = 0.0
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[permissions]
+fs_read = []
+network = []
+commands = [{ bin = "sh", args = ["-c", "rm -f out/note.txt"], isolation = "trusted_host" }]
+side_effects = "allowed"
+side_effects_scope = "invocation"
+fs_write = ["workspace"]
+
+[permissions.containers]
+enabled = false"#,
+    )
+    .expect("generator manifest");
+    // The agent writes the file, then removes it with its own command.
+    std::fs::write(
+        generator.join("prompts/agent.j2"),
+        r#"Write the note, then remove it again.
+
+FAKE_TOOL_SEQUENCE: [{"name":"write_note","args":{"path":"out/note.txt","content":"scratch"}},{"name":"remove_note","args":{}}]
+FAKE_AGENT_FINAL:
+done
+"#,
+    )
+    .expect("prompt");
+    let service = test_service(vec![root.clone()], runs.clone());
+    let id = service
+        .start_run(StartRun {
+            generator_id: "generator".into(),
+            inputs: BTreeMap::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("agent run should start");
+    let terminal = wait_for_terminal_snapshot(&service, &id).await;
+    let run_dir = service.run_dir_for(&id).await.expect("run dir");
+    let events = read_events_from_meta(&run_meta_dir(&run_dir)).expect("journal");
+    assert_eq!(
+        terminal.state,
+        RunStatus::Succeeded,
+        "the run must succeed: {terminal:?}"
+    );
+    let finished = events
+        .iter()
+        .find(|event| {
+            event.get("t").and_then(Value::as_str) == Some("step_finished")
+                && event.get("node").and_then(Value::as_str) == Some("agent")
+        })
+        .expect("the agent step must finish");
+    let files = finished
+        .get("files")
+        .and_then(Value::as_array)
+        .expect("the agent step must journal its files");
+    assert!(
+        !files
+            .iter()
+            .any(|file| file.get("path").and_then(Value::as_str) == Some("out/note.txt")),
+        "a file the agent removed is not an output of the step: {files:?}"
+    );
+    drop(service);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[tokio::test]
 async fn resume_does_not_restore_updated_file_inputs() {
     // E06: a completed step may legitimately update a file input; the
