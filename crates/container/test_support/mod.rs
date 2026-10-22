@@ -18,7 +18,14 @@ pub(crate) const CLEANUP_JOIN_BOUND: Duration = Duration::from_secs(30);
 /// that ignores it waits out the whole hang. The bound sits above the
 /// frozen timeout plus the log's one-second granularity, and below the hang,
 /// so it separates the two without being tight enough to flake.
-pub(crate) const STOP_TIMEOUT_GAP_BOUND: Duration = Duration::from_secs(4);
+///
+/// The gap is measured from the daemon's own arrival stamps, so a loaded
+/// runner's starvation of the cleanup worker lands directly in it: the
+/// product can honor the frozen timeout exactly and still show a wide gap.
+/// The bound therefore has to outlast the starvation a loaded runner
+/// inflicts, the same way `CLEANUP_JOIN_BOUND` does for the same cleanup
+/// window, rather than sit just above the timeout it measures.
+pub(crate) const STOP_TIMEOUT_GAP_BOUND: Duration = Duration::from_secs(6);
 
 pub struct Daemon {
     pub root: PathBuf,
