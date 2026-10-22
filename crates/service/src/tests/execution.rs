@@ -705,6 +705,42 @@ done
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The premise every removal test depends on: the agent wrote the file
+/// and its own command removed it. A test that only asserts the file is
+/// absent would otherwise pass even when no removal ever happened.
+fn assert_the_agent_wrote_and_removed_the_note(events: &[Value]) {
+    let statuses = |tool: &str| -> Vec<String> {
+        events
+            .iter()
+            .filter(|event| {
+                event.get("t").and_then(Value::as_str) == Some("tool_call")
+                    && event.get("tool").and_then(Value::as_str) == Some(tool)
+            })
+            .map(|event| {
+                event
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
+    };
+    let kinds: Vec<&str> = events
+        .iter()
+        .filter_map(|event| event.get("t").and_then(Value::as_str))
+        .collect();
+    let writes = statuses("write_note");
+    assert!(
+        !writes.is_empty() && writes.iter().all(|status| status == "succeeded"),
+        "the agent must write the file it removes: {writes:?} kinds={kinds:?}"
+    );
+    let removals = statuses("remove_note");
+    assert!(
+        !removals.is_empty() && removals.iter().all(|status| status == "succeeded"),
+        "the agent's own command must remove the file: {removals:?} kinds={kinds:?}"
+    );
+}
+
 /// The agent wrote a scratch file and then removed it again with its own
 /// command tool. The file is not an output of the step: the agent deleted
 /// it, so the step left nothing behind for the engine to pin, and the run
@@ -787,7 +823,10 @@ done
         .expect("agent run should start");
     let terminal = wait_for_terminal_snapshot(&service, &id).await;
     let run_dir = service.run_dir_for(&id).await.expect("run dir");
-    let events = read_events_from_meta(&run_meta_dir(&run_dir)).expect("journal");
+    // The merged view: a tool call is an observation record, so it lives
+    // in the audit stream beside the durable one.
+    let events =
+        crate::summaries::read_merged_events_from_meta(&run_meta_dir(&run_dir)).expect("journal");
     assert_eq!(
         terminal.state,
         RunStatus::Succeeded,
@@ -809,6 +848,14 @@ done
             .iter()
             .any(|file| file.get("path").and_then(Value::as_str) == Some("out/note.txt")),
         "a file the agent removed is not an output of the step: {files:?}"
+    );
+    // The premise: the agent wrote the file and its own command removed
+    // it, so the absence above is the agent's deliberate cleanup and not
+    // a write that never landed.
+    assert_the_agent_wrote_and_removed_the_note(&events);
+    assert!(
+        !run_workspace_dir(&run_dir).join("out/note.txt").exists(),
+        "the workspace must not hold the file the agent removed"
     );
     drop(service);
     let _ = std::fs::remove_dir_all(&root);
@@ -958,6 +1005,13 @@ done
             .iter()
             .any(|file| file.get("path").and_then(Value::as_str) == Some("out/note.txt")),
         "a file the agent removed is not an output of the step, even when a later attempt replays its write: {files:?}"
+    );
+    // The premise: the write landed and the agent's own command removed
+    // the file, so the absence above is the agent's deliberate cleanup.
+    assert_the_agent_wrote_and_removed_the_note(&events);
+    assert!(
+        !run_workspace_dir(&run_dir).join("out/note.txt").exists(),
+        "the workspace must not hold the file the agent removed"
     );
     drop(service);
     let _ = std::fs::remove_dir_all(&root);
@@ -1245,6 +1299,11 @@ done
         removals.is_empty(),
         "a write supersedes the removal the agent made earlier: {state:?}"
     );
+    // The premise: the agent really removed the file between the two
+    // writes, so the record had a removal to supersede.
+    let events =
+        crate::summaries::read_merged_events_from_meta(&run_meta_dir(&run_dir)).expect("journal");
+    assert_the_agent_wrote_and_removed_the_note(&events);
     drop(service);
     let _ = std::fs::remove_dir_all(&root);
 }
