@@ -45,7 +45,8 @@ impl ExpressionNode {
                         // different number before any comparison sees it.
                         if let Value::Number(number) = &value
                             && let Some(exact) = exact_integer(number)
-                            && let Ok(negated) = i64::try_from(-exact)
+                            && let Some(negated) = exact.checked_neg()
+                            && let Ok(negated) = i64::try_from(negated)
                         {
                             return Ok(Value::Number(negated.into()));
                         }

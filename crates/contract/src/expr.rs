@@ -382,6 +382,27 @@ mod tests {
     }
 
     #[test]
+    fn the_unary_minus_does_not_overflow_on_the_largest_negative_number() {
+        // The largest magnitude a double holds exactly as an integer is
+        // -2^127, which has no positive counterpart in the exact integer
+        // path; negating it must fall back to the double path instead of
+        // overflowing.
+        let mut inputs = BTreeMap::new();
+        inputs.insert(
+            "huge".into(),
+            serde_json::Number::from_f64(-1.7014118346046923e38)
+                .expect("the magnitude is a finite double")
+                .into(),
+        );
+        let bag = ValueBag::with_inputs(inputs);
+        assert_eq!(
+            bag.eval_value("-inputs.huge")
+                .expect("negating the largest negative double must not fail"),
+            json!(1.7014118346046923e38)
+        );
+    }
+
+    #[test]
     fn an_integer_literal_the_json_number_cannot_hold_is_refused() {
         // A literal above the JSON number type's integer range would
         // arrive as a rounded double, so it is refused rather than stated
