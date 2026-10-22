@@ -18,6 +18,7 @@ pub const RUN_STATE_SCHEMA_VERSION: u32 = 3;
 const STATE_FREE_JOURNAL_EVENT_KINDS: &[&str] = &[
     "audit_degraded",
     "elapsed_exceeded",
+    "foreach_sibling_drained",
     "foreach_sibling_ignored",
     "hook_replayed",
     "mcp_destination_decision",
@@ -1406,6 +1407,19 @@ fn failure_detail(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn internal_journal_kinds_pass_the_fold_gate() {
+        for kind in STATE_FREE_JOURNAL_EVENT_KINDS {
+            assert!(api::INTERNAL_RUN_EVENT_KINDS.contains(kind), "{kind}");
+            let mut state = RunState::default();
+            let before = serde_json::to_value(&state).unwrap();
+            state
+                .apply(&json!({"t": kind}))
+                .expect("known state-free kind");
+            assert_eq!(serde_json::to_value(state).unwrap(), before, "{kind}");
+        }
+    }
 
     fn operation_event(seq: u64, kind: &str, id: &str, status: Option<&str>) -> Value {
         let mut event = json!({

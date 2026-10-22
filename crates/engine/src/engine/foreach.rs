@@ -4,8 +4,9 @@ use contract::NodeDef;
 use contract::ValueBag;
 use model::{FailureCode, FailureDetail, NodePath};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::task::JoinSet;
+use tokio::task::{Id, JoinSet};
 
 use super::checkpoint::{existing_regular_files, pin_attempt_files};
 use super::repair_support::failure_from_findings;
@@ -96,24 +97,9 @@ impl Engine {
             .blocks
             .get(subflow)
             .ok_or_else(|| StepError::failed(&node.id, format!("unknown subflow `{subflow}`")))?;
-        // Parallel iterations share the workspace, the journal, and the
-        // run-wide budget atomics (shared-budget/shared-journal, E10): there
-        // is no per-iteration isolation for side effects, only for the
-        // variable scope cloned per iteration. Parallel-unsafe leaf children
-        // are therefore refused here exactly like top-level parallel waves
-        // refuse them: every current executor is parallel-safe, so this gate
-        // changes nothing today and future-proofs against executors that opt
-        // out (E10). Fail-closed for unknown kinds (E10): an unregistered
-        // step type has no traits to prove safety, so it forces sequential
-        // exactly like the top-level wave gate does.
-        // Sequential iterations need no gate: one child runs at a time.
-        // Nested foreach children are exempt: they re-enter this same
-        // gated path for their own leaves, so gating them here would
-        // forbid all nesting instead of unsafe leaves. `on_fail` targets
-        // are part of this gate (E10): a child with repair/regenerate/route
-        // routing executes extra nodes whose parallel-safety must also
-        // hold; conservatively any `on_fail` forces sequential, matching
-        // the top-level `is_parallel_safe_node` rule (`on_fail.is_none()`).
+        // Parallel iterations isolate variables, but share workspace, journal
+        // and run-wide budget. Refuse unsafe/unknown leaves and on_fail routing,
+        // just like top-level waves. Nested control flow gates its own leaves.
         if params.parallel > 1 && item_count > 1 {
             for child in block.iter() {
                 let traits = self.registry.traits(&child.kind);
@@ -149,13 +135,6 @@ impl Engine {
         let mut files = Vec::new();
         if params.parallel == 1 || item_count <= 1 {
             for (index, item) in items.into_iter().enumerate() {
-                // The sequential path clones and absorbs exactly like the
-                // parallel path: each iteration runs in an isolated variable
-                // scope (ValueBag clone) while sharing the workspace, the
-                // journal, and the run-wide budget with all siblings (E10).
-                // Only successful iterations contribute their outputs to the
-                // parent scope, so the two paths can never diverge through
-                // shared-mutation ordering (E10).
                 let mut iteration_vars = vars.clone();
                 iteration_vars.clear_step_outcome_subtree(&node.id);
                 let (iteration_files, outcome) = self
@@ -172,13 +151,7 @@ impl Engine {
                         },
                     )
                     .await?;
-                // Only successful iterations contribute outputs to the
-                // parent scope; a failed or suspended child must not pollute
-                // it (E10). Early returns preserve accumulated and failed
-                // files in the returned `CheckFailed` (E10): dropping them
-                // would lose the failed revision for exhaustion evidence.
-                // Per-iteration file pins already journaled as
-                // `step_finished` events persist for resume verification.
+                // Keep accumulated/failed files as exhaustion evidence.
                 if outcome.is_none() {
                     vars.absorb_outputs(&iteration_vars);
                 }
@@ -190,14 +163,6 @@ impl Engine {
                             output,
                             files: failed_files,
                         } => {
-                            // `iteration_files` were already extended above;
-                            // `failed_files` from the iteration already
-                            // contains its own accumulated files (see the
-                            // iteration return below), so union without
-                            // duplication: outer `files` is authoritative. The
-                            // per-iteration binding is intentionally dropped (not
-                            // silently ignored) to keep the outer accumulator
-                            // authoritative (E10).
                             drop(failed_files);
                             StepOutcome::CheckFailed {
                                 findings,
@@ -215,6 +180,7 @@ impl Engine {
             let journal = Arc::new(journal.clone_for_parallel()?);
             let block = Arc::new(block.clone());
             let mut tasks = JoinSet::new();
+            let mut task_indices = HashMap::new();
             let mut pending = items.into_iter().enumerate();
             loop {
                 while tasks.len() < params.parallel {
@@ -232,7 +198,7 @@ impl Engine {
                     // charges the same budget (E10).
                     let mut iteration_budget = budget.clone();
                     let foreach_node = node.clone();
-                    tasks.spawn(async move {
+                    let task = tasks.spawn(async move {
                         let outcome = engine
                             .execute_foreach_iteration(
                                 &context,
@@ -247,30 +213,33 @@ impl Engine {
                                 },
                             )
                             .await;
-                        (iteration_vars, outcome)
+                        (index, iteration_vars, outcome)
                     });
+                    task_indices.insert(task.id(), index);
                 }
-                let Some(result) = tasks.join_next().await else {
+                let Some(result) = tasks.join_next_with_id().await else {
                     break;
                 };
+                let task_id = match &result {
+                    Ok((id, _)) => *id,
+                    Err(error) => error.id(),
+                };
+                task_indices.remove(&task_id);
                 match result {
-                    // A failed or suspended iteration fails the loop fast:
-                    // remaining iterations are aborted and drained before the
-                    // outcome is returned (E10). Already-completed sibling
-                    // results are still absorbed first: the budget they
-                    // consumed stays consumed and their outputs are
-                    // preserved instead of silently discarded (E10).
-                    Ok((iteration_vars, Ok((iteration_files, Some(outcome))))) => {
-                        // Match the sequential path: a failed or suspended
-                        // iteration drops its scope instead of polluting the
-                        // parent; only completed sibling outputs merged by
-                        // the drain below are preserved (E10). Early returns
-                        // preserve accumulated and failed files in the
-                        // returned `CheckFailed` (E10).
+                    // Abort/drain on the first terminal result; absorb completed successes.
+                    Ok((_, (_, iteration_vars, Ok((iteration_files, Some(outcome)))))) => {
                         drop(iteration_vars);
                         files.extend(iteration_files);
-                        drain_foreach_tasks(&mut tasks, vars, &mut files, &journal, &node.id)
-                            .await?;
+                        drain_foreach_tasks(
+                            &mut tasks,
+                            &mut task_indices,
+                            vars,
+                            &mut files,
+                            &journal,
+                            &node.id,
+                            false,
+                        )
+                        .await?;
                         let outcome = match outcome {
                             StepOutcome::CheckFailed {
                                 findings,
@@ -285,26 +254,40 @@ impl Engine {
                         };
                         return Ok(outcome);
                     }
-                    // Only successful iterations contribute outputs to the
-                    // parent scope; a failed child must not pollute it (E10).
-                    Ok((iteration_vars, Ok((iteration_files, None)))) => {
+                    Ok((_, (_, iteration_vars, Ok((iteration_files, None))))) => {
                         vars.absorb_outputs(&iteration_vars);
                         files.extend(iteration_files);
                     }
-                    Ok((_iteration_vars, Err(error))) => {
-                        drain_foreach_tasks(&mut tasks, vars, &mut files, &journal, &node.id)
-                            .await?;
+                    Ok((_, (_, _iteration_vars, Err(error)))) => {
+                        let parent_cancelled = error.is_canceled();
+                        drain_foreach_tasks(
+                            &mut tasks,
+                            &mut task_indices,
+                            vars,
+                            &mut files,
+                            &journal,
+                            &node.id,
+                            parent_cancelled,
+                        )
+                        .await?;
                         return Err(error);
                     }
                     Err(error) => {
-                        drain_foreach_tasks(&mut tasks, vars, &mut files, &journal, &node.id)
-                            .await?;
+                        let parent_cancelled = error.is_cancelled();
+                        drain_foreach_tasks(
+                            &mut tasks,
+                            &mut task_indices,
+                            vars,
+                            &mut files,
+                            &journal,
+                            &node.id,
+                            parent_cancelled,
+                        )
+                        .await?;
                         let classified = if error.is_cancelled() {
                             EngineError::Canceled
                         } else {
-                            // Preserve the panic payload like the wave path
-                            // instead of collapsing it to a bare message
-                            // (E10).
+                            // Preserve panic details from join failures.
                             super::execute::join_task_error(error)
                         };
                         return Err(classified);
@@ -341,9 +324,7 @@ impl Engine {
         context.run_checkpoint()?;
         let parent_item = vars.item().cloned();
         vars.set_item(Some(item));
-        // Checkpoint events name the node block id (the static block child
-        // id), not a runtime display name: resume addresses each iteration
-        // by its per-iteration path derived from the block id (E10).
+        // Runtime paths use stable parent/index/child IDs for replay.
         journal.event(
             "foreach_iteration",
             json!({ "node": node.id, "index": index }),
@@ -355,14 +336,7 @@ impl Engine {
             context.run_checkpoint()?;
             let block_path = foreach_path.foreach_child(index, &block_node.id);
             let mut addressed_node = block_node.clone();
-            // Specified iteration namespacing (E10): the block node's id is
-            // rewritten to its per-iteration path (`foreach[i].child`), so
-            // step outputs from different iterations never collide in the
-            // parent scope and resume can address each iteration's output
-            // independently. Clearing `output` pins the step output under
-            // that rewritten id: the block author's output alias (if any)
-            // must not leak iteration outputs into the shared namespace
-            // under a stable name that later iterations would overwrite.
+            // Per-iteration IDs isolate replay/output; clear aliases to avoid sibling collisions.
             addressed_node.id = block_path.to_string();
             addressed_node.output = None;
             if !vars
@@ -397,32 +371,12 @@ impl Engine {
                 vars.sync_step_outcome_subtree(&journal.state().vars, &iteration_scope);
                 continue;
             }
-            // Single attempt counter per logical node (E10): `attempt: 1`
-            // names the journal start marker for this iteration's retry
-            // sequence, and the wrapper's `step_retry` events count the same
-            // logical attempts (failed attempt N, next is N+1), never a
-            // second overlapping counter.
+            // One retry sequence and attempt counter per logical child.
             journal.event(
                 "step_started",
                 json!({ "node": block_id, "type": addressed_node.kind.to_string(), "attempt": 1 }),
             )?;
-            // Single-charge rule (E10): the outer foreach node is charged
-            // once total via the top-level wrapper; children share that
-            // budget without per-child consume. The retry wrapper is still
-            // shared for retry/timeout/elapsed semantics, called here with
-            // charge=false so attempts do not double-count.
-            // Attempt limit and budget limit are separate axes (E10): retry
-            // max_attempts (1 through 16) bounds executions, while
-            // charge=false bounds budget to the single outer charge. A child
-            // with max_attempts=16 therefore executes up to 16 times for one
-            // budget consume; budget exhaustion and attempt exhaustion stay
-            // distinct.
-            // Children run through the same retry wrapper as top-level
-            // nodes so `retry.max_attempts`, `backoff_ms`, `timeout_secs`,
-            // and `on_indeterminate` all apply identically in sequential,
-            // parallel, and nested foreach (E10). The bound is
-            // multiplicative: a child with max_attempts=2 inside a foreach
-            // with max_attempts=2 runs at most 4 attempts total.
+            // Charge the foreach once; child retries/timeouts still apply, and nested attempt bounds multiply.
             let child_outcome = self
                 .execute_node_with_retry_charged(
                     context,
@@ -450,8 +404,7 @@ impl Engine {
                         || addressed_node.kind.as_str() == "llm.agent" =>
                 {
                     vars.set_item(parent_item);
-                    // Carry the agent's continuation ownership through every
-                    // enclosing foreach and scheduler settlement boundary.
+                    // Preserve agent continuation ownership through enclosing scheduler boundaries.
                     return Err(if error.is_resumable_agent() {
                         error
                     } else {
@@ -480,9 +433,7 @@ impl Engine {
                         vars.set_step_output(&block_id, value);
                     }
                     files.extend(block_files);
-                    // Single shared output-name helper (E10): the addressed
-                    // node has no declared output (cleared above), so the
-                    // helper resolves to the per-iteration block id.
+                    // Resolve the output name to the addressed per-iteration block id.
                     let output_name = super::types::output_name_for(&addressed_node);
                     journal.event(
                         "step_finished",
@@ -495,11 +446,7 @@ impl Engine {
                     output,
                     files: failed_files,
                 } => {
-                    // Journal every child outcome with its block id (E10),
-                    // matching the wave path which records all outcomes.
-                    // The failed revision is pinned so its blob verifies as
-                    // historical; the unified `failed_output` / `failed_files`
-                    // notation matches top-level failures (E06).
+                    // Preserve the child's failed revision using the top-level evidence keys.
                     let failed_pins = pin_attempt_files(context, &failed_files)?;
                     let reason = failure_from_findings(&findings, FailureCode::CheckFailed);
                     journal.event(
@@ -527,11 +474,7 @@ impl Engine {
                     question,
                     files: child_files,
                 } => {
-                    // Journal the suspension with its block id and unified
-                    // failed-evidence keys (null plus empty list) so the
-                    // notation matches failure paths (E06). The files the
-                    // child produced are pinned and journaled under
-                    // `files`, like the success path (E06).
+                    // Journal the suspension and its pinned files under the child block id.
                     const NO_OUTPUT: Option<serde_json::Value> = None;
                     let file_pins = pin_attempt_files(context, &child_files)?;
                     journal.event(
@@ -556,10 +499,6 @@ impl Engine {
                     confirm,
                     files: child_files,
                 } => {
-                    // `confirm_request` keeps its strict FOREIGN schema
-                    // (allows only `confirm` plus the files it carries):
-                    // no failed-evidence keys here. Still journaled with
-                    // the block id (E10).
                     let file_pins = pin_attempt_files(context, &child_files)?;
                     journal.event(
                         "confirm_request",
@@ -582,61 +521,122 @@ impl Engine {
     }
 }
 
-/// Outcome of one spawned iteration task: its isolated variable scope plus
-/// its result. Successful completions carry their files and no onward
-/// outcome; fail-fast outcomes carry the outcome to return.
 type ForeachTaskOutcome = (
+    usize,
     ValueBag,
     Result<(Vec<Utf8PathBuf>, Option<StepOutcome>), EngineError>,
 );
 
-/// Drains remaining iteration tasks after fail-fast, aborting the
-/// in-flight ones first. Siblings that already completed successfully are
-/// still absorbed (outputs preserved, budget stays consumed). Failures,
-/// suspensions, and aborts found during the drain do not change the already
-/// reported first terminal outcome (fail-fast), but they are journaled as
-/// `foreach_sibling_ignored` diagnostics so no failure detail disappears
-/// from the journal, and a count is warned for operators (E10).
-/// Monitoring note: the returned outcome carries only the first terminal
-/// result; operators must alert on `foreach_sibling_ignored` events,
-/// otherwise later sibling failures are invisible in the parent result.
-pub(crate) async fn drain_foreach_tasks(
+/// Record drained sibling facts by iteration; child events retain effects and prompts.
+/// Unknown interrupted effects remain unsettled; this diagnostic authorizes no replay.
+async fn drain_foreach_tasks(
     tasks: &mut JoinSet<ForeachTaskOutcome>,
+    task_indices: &mut HashMap<Id, usize>,
     vars: &mut ValueBag,
     files: &mut Vec<Utf8PathBuf>,
     journal: &JournalWriter,
     node_id: &str,
+    parent_cancelled: bool,
 ) -> Result<(), EngineError> {
     tasks.abort_all();
     let mut ignored: usize = 0;
-    while let Some(result) = tasks.join_next().await {
-        let Ok((iteration_vars, Ok((iteration_files, None)))) = result else {
-            ignored += 1;
-            let detail = match &result {
-                Ok((_, Err(error))) => error.to_string(),
-                Ok((_, Ok((_, Some(_))))) => "sibling terminal outcome after fail-fast".to_string(),
-                Err(error) => {
-                    if error.is_cancelled() {
-                        "sibling aborted during drain".to_string()
-                    } else {
-                        format!("sibling join error during drain: {error}")
-                    }
-                }
-                _ => "sibling non-success during drain".to_string(),
-            };
-            journal
-                .event(
-                    "foreach_sibling_ignored",
-                    serde_json::json!({ "node": node_id, "detail": detail }),
-                )
-                .map_err(EngineError::Journal)?;
-            continue;
+    while let Some(result) = tasks.join_next_with_id().await {
+        let task_id = match &result {
+            Ok((id, _)) => *id,
+            Err(error) => error.id(),
         };
-        vars.absorb_outputs(&iteration_vars);
-        files.extend(iteration_files);
+        let index = task_indices
+            .remove(&task_id)
+            .expect("registered foreach task");
+        let mut record = json!({
+            "node": node_id,
+            "index": index,
+            "iteration": format!("{node_id}[{index}]"),
+            "drain_cause": if parent_cancelled { "parent_cancellation" } else { "fail_fast" },
+        });
+        match result {
+            Ok((_, (reported_index, iteration_vars, Ok((iteration_files, None))))) => {
+                debug_assert_eq!(index, reported_index);
+                vars.absorb_outputs(&iteration_vars);
+                files.extend(iteration_files);
+                record["classification"] = json!("completed_success");
+            }
+            Ok((_, (reported_index, _, Ok((_, Some(outcome)))))) => {
+                debug_assert_eq!(index, reported_index);
+                record["classification"] = json!("completed_terminal");
+                let (outcome, interaction) = match &outcome {
+                    StepOutcome::CheckFailed { .. } => ("check_failed", None),
+                    StepOutcome::NeedsUser { question, .. } => {
+                        ("needs_user", Some(("question_id", question.id.as_str())))
+                    }
+                    StepOutcome::NeedsConfirm { confirm, .. } => {
+                        ("needs_confirm", Some(("confirm_id", confirm.id.as_str())))
+                    }
+                    StepOutcome::Success { .. } => ("success", None),
+                };
+                record["outcome"] = json!(outcome);
+                if let Some((key, id)) = interaction {
+                    record[key] = json!(id);
+                }
+                ignored += 1;
+            }
+            Ok((_, (reported_index, _, Err(error)))) => {
+                debug_assert_eq!(index, reported_index);
+                let (classification, code, interaction) = match &error {
+                    EngineError::NeedsUser { question_id, .. } => (
+                        "interaction_pending",
+                        None,
+                        Some(("question_id", question_id.as_str())),
+                    ),
+                    EngineError::NeedsConfirm { confirm_id, .. } => (
+                        "interaction_pending",
+                        None,
+                        Some(("confirm_id", confirm_id.as_str())),
+                    ),
+                    _ if error.is_resumable_agent() => {
+                        record["continuation_owner"] = json!("agent");
+                        ("agent_continuation", None, None)
+                    }
+                    _ if error.is_canceled() => {
+                        record["cancellation_cause"] = json!("reported_by_task");
+                        ("task_canceled", None, None)
+                    }
+                    _ => ("task_error", Some(failure_code_for_error(&error)), None),
+                };
+                record["classification"] = json!(classification);
+                if let Some(code) = code {
+                    record["code"] = json!(code);
+                }
+                if let Some((key, id)) = interaction {
+                    record[key] = json!(id);
+                }
+                record["detail"] = json!(error.to_string());
+                ignored += 1;
+            }
+            Err(error) => {
+                let classification = if error.is_cancelled() {
+                    record["cancellation_cause"] = json!(if parent_cancelled {
+                        "parent_cancellation"
+                    } else {
+                        "fail_fast"
+                    });
+                    if parent_cancelled {
+                        "parent_canceled"
+                    } else {
+                        "scheduler_abort"
+                    }
+                } else {
+                    "task_join_error"
+                };
+                record["classification"] = json!(classification);
+                record["detail"] = json!(error.to_string());
+                ignored += 1;
+            }
+        }
+        journal.event("foreach_sibling_drained", record)?;
     }
     if ignored > 0 {
-        tracing::warn!(node = %node_id, ignored, "drain_foreach_tasks ignored sibling outcomes after fail-fast; see foreach_sibling_ignored journal events");
+        tracing::warn!(node = %node_id, ignored, "drain_foreach_tasks ignored sibling outcomes after fail-fast; see foreach_sibling_drained journal events");
     }
     Ok(())
 }
@@ -644,63 +644,312 @@ pub(crate) async fn drain_foreach_tasks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{JournalLimits, RunState, read_journal_values};
+
+    async fn completed(task: &tokio::task::AbortHandle) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("immediate test task must finish before drain");
+    }
 
     #[tokio::test]
-    async fn drain_absorbs_completed_siblings_and_ignores_the_rest() {
-        // E10: after fail-fast, already-completed sibling results are
-        // absorbed (not silently discarded) while failures, suspensions,
-        // and aborted tasks are journaled as `foreach_sibling_ignored`
-        // diagnostics and contribute nothing more to the outcome.
+    async fn drain_records_stable_sibling_facts_and_replays_child_history() {
         let dir = std::env::temp_dir().join(format!("foreach-drain-{}", uuid::Uuid::now_v7()));
-        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
-        let journal_path = camino::Utf8PathBuf::from_path_buf(dir.join("journal.jsonl"))
-            .expect("temp path must be UTF-8");
-        let journal = JournalWriter::create(&journal_path, "drain-test", false, None)
-            .expect("journal must open");
+        let path = Utf8PathBuf::from_path_buf(dir.join("journal.jsonl")).expect("UTF-8 path");
+        let journal = JournalWriter::create(&path, "drain-test", false, None).expect("journal");
         let mut vars = ValueBag::default();
-        let mut files: Vec<Utf8PathBuf> = Vec::new();
+        let mut files = Vec::new();
         let mut tasks: JoinSet<ForeachTaskOutcome> = JoinSet::new();
-        tasks.spawn(async {
-            let mut scope = ValueBag::default();
-            scope.set_step_output("each[0]/child", json!({"value": "ok"}));
-            (scope, Ok((vec![Utf8PathBuf::from("out0.txt")], None)))
-        });
-        tasks.spawn(async {
+        let mut indices = HashMap::new();
+
+        // Consume the first terminal report before the drain, just as the
+        // scheduler does. The other reports must not replace this outcome.
+        let first = tasks.spawn(async {
             (
+                0,
                 ValueBag::default(),
-                Err(EngineError::Failed("sibling already failed".into())),
+                Ok((vec![], Some(StepOutcome::check_failed(vec![])))),
             )
         });
-        tasks.spawn(async {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            (ValueBag::default(), Ok((Vec::new(), None)))
+        indices.insert(first.id(), 0);
+        completed(&first).await;
+        let (first_id, (_, _, first_outcome)) = tasks.join_next_with_id().await.unwrap().unwrap();
+        indices.remove(&first_id);
+
+        let question = api::FormSpec {
+            id: "each[7]/ask.question".into(),
+            title: "Child prompt must not be copied".into(),
+            title_i18n: Default::default(),
+            fields: vec![],
+        };
+        // Underlying child records remain authoritative. Drain references
+        // the iteration/interaction, not copies of prompts or outputs.
+        journal
+            .event(
+                "step_finished",
+                json!({
+                    "node": "each[2]/child", "status": "success", "output": {"value": "ok"},
+                    "output_name": "each[2]/child", "files": [],
+                }),
+            )
+            .unwrap();
+        journal
+            .event(
+                "step_finished",
+                json!({
+                    "node": "each[7]/ask", "status": "needs_user", "question": question,
+                    "files": [], "failed_output": null, "failed_files": [],
+                }),
+            )
+            .unwrap();
+        let mut before = RunState::fold_journal(&path).expect("child history before drain");
+
+        let mut scope = ValueBag::default();
+        scope.set_item(Some(json!("identical user item")));
+        scope.set_step_output("each[2]/child", json!({"value": "ok"}));
+        let success =
+            tasks.spawn(async move { (2, scope, Ok((vec![Utf8PathBuf::from("out.txt")], None))) });
+        indices.insert(success.id(), 2);
+        let terminal = tasks.spawn(async move {
+            let mut scope = ValueBag::default();
+            scope.set_item(Some(json!("identical user item")));
+            scope.set_step_output("must_not_merge", json!(true));
+            (
+                7,
+                scope,
+                Ok((
+                    vec![],
+                    Some(StepOutcome::NeedsUser {
+                        question,
+                        files: vec![],
+                    }),
+                )),
+            )
         });
-        // Let the two immediate tasks finish; the sleeper stays in flight.
-        // A short settle is enough for spawned immediates, and the drain
-        // below aborts anything still running, so this cannot hang.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        drain_foreach_tasks(&mut tasks, &mut vars, &mut files, &journal, "foreach-test")
-            .await
-            .expect("drain journaling must succeed");
-        assert!(
-            vars.get_path("steps.each[0]/child.output.value")
-                .and_then(Value::as_str)
-                == Some("ok"),
-            "the completed sibling output must be absorbed"
-        );
+        indices.insert(terminal.id(), 7);
+        let error = tasks.spawn(async {
+            (
+                11,
+                ValueBag::default(),
+                Err(EngineError::ResumableAgent(Box::new(EngineError::Failed(
+                    "agent continuation retained".into(),
+                )))),
+            )
+        });
+        indices.insert(error.id(), 11);
+        let panic = tasks.spawn(async { panic!("sibling panic diagnostic") });
+        indices.insert(panic.id(), 13);
+        for task in [&success, &terminal, &error, &panic] {
+            completed(task).await;
+        }
+        let aborted = tasks.spawn(std::future::pending());
+        indices.insert(aborted.id(), 19);
+
+        drain_foreach_tasks(
+            &mut tasks,
+            &mut indices,
+            &mut vars,
+            &mut files,
+            &journal,
+            "each",
+            false,
+        )
+        .await
+        .expect("drain");
+        assert!(matches!(
+            first_outcome,
+            Ok((_, Some(StepOutcome::CheckFailed { .. })))
+        ));
         assert_eq!(
-            files,
-            vec![Utf8PathBuf::from("out0.txt")],
-            "the completed sibling files must be preserved"
+            vars.get_path("steps.each[2]/child.output.value"),
+            Some(&json!("ok"))
         );
-        assert!(tasks.is_empty(), "the drain must leave no live task");
-        drop(journal);
-        let journal_bytes = std::fs::read_to_string(&journal_path).expect("journal must read");
+        assert!(vars.get_path("steps.must_not_merge.output").is_none());
+        assert_eq!(files, vec![Utf8PathBuf::from("out.txt")]);
+        assert!(tasks.is_empty());
+        assert!(indices.is_empty());
+
+        let events = read_journal_values(&path, JournalLimits::default())
+            .unwrap()
+            .events;
+        let records: HashMap<_, _> = events
+            .iter()
+            .filter(|event| event["t"] == "foreach_sibling_drained")
+            .map(|event| (event["index"].as_u64().unwrap(), event))
+            .collect();
+        assert_eq!(records.len(), 5);
+        for (index, event) in &records {
+            assert_eq!(event["node"], "each");
+            assert_eq!(event["iteration"], format!("each[{index}]"));
+            let public =
+                api::RunEvent::from_flat(event).expect("internal event stays stream-compatible");
+            assert_eq!(public.path.unwrap().to_string(), "each");
+            assert!(!event.to_string().contains("Child prompt"));
+            assert!(!event.to_string().contains("identical user item"));
+        }
+        assert_eq!(records[&2]["classification"], "completed_success");
+        assert_eq!(records[&7]["classification"], "completed_terminal");
+        assert_eq!(records[&7]["outcome"], "needs_user");
+        assert_eq!(records[&7]["question_id"], "each[7]/ask.question");
+        assert_eq!(records[&11]["classification"], "agent_continuation");
+        assert_eq!(records[&11]["continuation_owner"], "agent");
+        assert_eq!(
+            records[&11]["detail"],
+            "run failed: agent continuation retained"
+        );
+        assert_eq!(records[&13]["classification"], "task_join_error");
         assert!(
-            journal_bytes.contains("foreach_sibling_ignored"),
-            "sibling failures during drain must leave journal diagnostics"
+            records[&13]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("sibling panic diagnostic")
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(records[&19]["classification"], "scheduler_abort");
+        assert_eq!(records[&19]["cancellation_cause"], "fail_fast");
+        assert_eq!(records[&19]["drain_cause"], "fail_fast");
+        assert!(records[&19].get("outcome").is_none());
+        assert!(records[&19].get("code").is_none());
+
+        // Real journal replay: typed API validation plus fold. The new kind
+        // is state-free, preserving child state without inventing failures.
+        let replayed = RunState::fold_journal(&path).expect("journal replay");
+        before.last_seq = replayed.last_seq;
+        assert_eq!(
+            serde_json::to_value(before).unwrap(),
+            serde_json::to_value(&replayed).unwrap()
+        );
+        assert!(
+            replayed
+                .vars
+                .get_path("steps.each[19]/child.status")
+                .is_none()
+        );
+        drop(journal);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn drain_records_parent_cancellation_separately_from_fail_fast_abort() {
+        let dir = std::env::temp_dir().join(format!("foreach-cancel-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.join("journal.jsonl")).unwrap();
+        let journal = JournalWriter::create(&path, "cancel-test", false, None).unwrap();
+        let mut tasks = JoinSet::new();
+        let mut indices = HashMap::new();
+        let task = tasks.spawn(std::future::pending::<ForeachTaskOutcome>());
+        indices.insert(task.id(), 4);
+        drain_foreach_tasks(
+            &mut tasks,
+            &mut indices,
+            &mut ValueBag::default(),
+            &mut vec![],
+            &journal,
+            "outer",
+            true,
+        )
+        .await
+        .unwrap();
+        let event = read_journal_values(&path, JournalLimits::default())
+            .unwrap()
+            .events
+            .remove(0);
+        assert_eq!(event["classification"], "parent_canceled");
+        assert_eq!(event["drain_cause"], "parent_cancellation");
+        assert_eq!(event["cancellation_cause"], "parent_cancellation");
+        RunState::fold_journal(&path).expect("cancellation fact replays");
+        drop(journal);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn drain_records_confirm_and_error_interaction_references() {
+        let dir = std::env::temp_dir().join(format!("foreach-refs-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.join("journal.jsonl")).unwrap();
+        let journal = JournalWriter::create(&path, "refs-test", false, None).unwrap();
+        let confirm = api::ConfirmSpec {
+            id: "confirm-id".into(),
+            title: "Do not copy this prompt".into(),
+            kind: "command".into(),
+            target: "private target".into(),
+            dry_run: false,
+            details: None,
+            operation_digest: "a".repeat(64),
+            scope: contract::SideEffectScope::Invocation,
+        };
+        let question = api::FormSpec {
+            id: "question-id".into(),
+            title: "Do not copy this prompt".into(),
+            title_i18n: Default::default(),
+            fields: vec![],
+        };
+        let outcomes = [
+            Ok((
+                vec![],
+                Some(StepOutcome::NeedsConfirm {
+                    confirm: confirm.clone(),
+                    files: vec![],
+                }),
+            )),
+            Ok((vec![], Some(StepOutcome::check_failed(vec![])))),
+            Err(EngineError::NeedsUser {
+                question_id: question.id.clone(),
+                question: Box::new(question),
+            }),
+            Err(EngineError::NeedsConfirm {
+                confirm_id: confirm.id.clone(),
+                confirm: Box::new(confirm),
+            }),
+        ];
+        let mut tasks = JoinSet::new();
+        let mut indices = HashMap::new();
+        for (index, outcome) in outcomes.into_iter().enumerate() {
+            let task = tasks.spawn(async move { (index, ValueBag::default(), outcome) });
+            indices.insert(task.id(), index);
+            completed(&task).await;
+        }
+        drain_foreach_tasks(
+            &mut tasks,
+            &mut indices,
+            &mut ValueBag::default(),
+            &mut vec![],
+            &journal,
+            "outer[3]/inner",
+            false,
+        )
+        .await
+        .unwrap();
+        let events = read_journal_values(&path, JournalLimits::default())
+            .unwrap()
+            .events;
+        let records: HashMap<_, _> = events
+            .iter()
+            .map(|event| (event["index"].as_u64().unwrap(), event))
+            .collect();
+        assert_eq!(records[&0]["classification"], "completed_terminal");
+        assert_eq!(records[&0]["outcome"], "needs_confirm");
+        assert_eq!(records[&0]["confirm_id"], "confirm-id");
+        assert_eq!(records[&1]["outcome"], "check_failed");
+        assert_eq!(records[&2]["classification"], "interaction_pending");
+        assert_eq!(records[&2]["question_id"], "question-id");
+        assert_eq!(records[&3]["classification"], "interaction_pending");
+        assert_eq!(records[&3]["confirm_id"], "confirm-id");
+        for event in &events {
+            assert!(!event.to_string().contains("Do not copy this prompt"));
+            assert!(!event.to_string().contains("private target"));
+            assert!(
+                event["iteration"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("outer[3]/inner[")
+            );
+        }
+        RunState::fold_journal(&path).expect("interaction reference records replay");
+        drop(journal);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -2678,6 +2678,7 @@
               "elapsed_exceeded",
               "foreach_budget_exhausted",
               "foreach_iteration",
+              "foreach_sibling_drained",
               "foreach_sibling_ignored",
               "graph_resolved",
               "guardrail_error",

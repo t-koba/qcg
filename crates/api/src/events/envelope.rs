@@ -27,6 +27,7 @@ pub const INTERNAL_RUN_EVENT_KINDS: &[&str] = &[
     "audit_degraded",
     "budget_charged",
     "elapsed_exceeded",
+    "foreach_sibling_drained",
     "foreach_sibling_ignored",
     "hook_failed",
     "hook_replayed",

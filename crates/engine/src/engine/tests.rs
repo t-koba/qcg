@@ -1321,10 +1321,7 @@ impl StepExecutor for TestFailOnItemStep {
         if ctx.vars.item().and_then(Value::as_str) == Some("a") {
             return Err(StepError::failed(&node.id, "item a must fail"));
         }
-        Ok(StepOutcome::Success {
-            output: None,
-            files: vec![],
-        })
+        std::future::pending::<Result<StepOutcome, StepError>>().await
     }
 }
 
@@ -1917,9 +1914,8 @@ async fn repair_node_interaction_suspends_the_cycle() {
 
 #[tokio::test]
 async fn foreach_fails_fast_and_drains_remaining_iterations() {
-    // E10: the first failed iteration aborts the rest and drains them
-    // before the loop returns, instead of buffering every outcome. The
-    // run reports the first-arrived failure.
+    // E10: an immediate failure aborts a sibling held pending, so drain
+    // records the deterministic scheduler abort before returning the failure.
     let manifest = manifest(vec![foreach_node(
         "each",
         "each_body",
@@ -1986,6 +1982,27 @@ async fn foreach_fails_fast_and_drains_remaining_iterations() {
         started < 4,
         "fail-fast must abort remaining iterations, started {started} of 4"
     );
+    let drained: Vec<_> = events
+        .iter()
+        .filter(|event| event["t"] == "foreach_sibling_drained")
+        .collect();
+    assert_eq!(
+        drained.len(),
+        1,
+        "only the other spawned iteration is drained"
+    );
+    let index = drained[0]["index"]
+        .as_u64()
+        .expect("captured iteration index");
+    assert!(
+        (1..4).contains(&index),
+        "not the first failure or an unscheduled item"
+    );
+    assert_eq!(drained[0]["iteration"], format!("each[{index}]"));
+    assert!(matches!(
+        drained[0]["classification"].as_str(),
+        Some("completed_success" | "scheduler_abort")
+    ));
     let _ = std::fs::remove_dir_all(&run_dir);
 }
 
