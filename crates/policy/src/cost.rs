@@ -29,23 +29,20 @@ pub struct PricingRow<'a> {
 }
 
 /// Selects the row to bill: among provider/model matches, entries with
-/// complete pricing win; otherwise the first match applies. Returns `None`
-/// when nothing matches.
-pub fn select_pricing<'a>(
-    rows: &[PricingRow<'a>],
-    provider: &str,
-    model: &str,
-) -> Option<PricingRow<'a>> {
+/// complete pricing win; otherwise the first match applies. Returns the
+/// index of the selected row, so the caller keeps its own record for it,
+/// or `None` when nothing matches.
+pub fn select_pricing(rows: &[PricingRow<'_>], provider: &str, model: &str) -> Option<usize> {
     let mut first = None;
-    for row in rows {
+    for (index, row) in rows.iter().enumerate() {
         if row.provider != provider || row.model != model {
             continue;
         }
         if first.is_none() {
-            first = Some(*row);
+            first = Some(index);
         }
         if row.input_cost_per_million_usd.is_some() && row.output_cost_per_million_usd.is_some() {
-            return Some(*row);
+            return Some(index);
         }
     }
     first
@@ -78,15 +75,17 @@ mod tests {
             row("openai", "gpt", None, None),
             row("openai", "gpt", Some(1.0), Some(2.0)),
         ];
-        let selected = select_pricing(&rows, "openai", "gpt").expect("should match");
-        assert_eq!(selected.input_cost_per_million_usd, Some(1.0));
+        let index = select_pricing(&rows, "openai", "gpt").expect("should match");
+        assert_eq!(index, 1);
+        assert_eq!(rows[index].input_cost_per_million_usd, Some(1.0));
     }
 
     #[test]
     fn falls_back_to_first_match_without_pricing() {
         let rows = [row("openai", "gpt", None, None)];
-        let selected = select_pricing(&rows, "openai", "gpt").expect("should match");
-        assert_eq!(selected.input_cost_per_million_usd, None);
+        let index = select_pricing(&rows, "openai", "gpt").expect("should match");
+        assert_eq!(index, 0);
+        assert_eq!(rows[index].input_cost_per_million_usd, None);
     }
 
     #[test]

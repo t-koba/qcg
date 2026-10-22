@@ -198,33 +198,50 @@ pub struct ModelRef {
 }
 
 impl ModelRef {
-    // Missing prices are allowed: catalog prices may fill the gaps at dispatch.
-    pub(super) fn validate_pricing(&self) -> Result<(), super::ContractError> {
-        for (name, value) in [
+    /// The first configured price that is not finite and non-negative, named
+    /// by its field. `None` when every configured price is valid. This is the
+    /// one definition of the price rule: the manifest check, the runtime cost
+    /// meter and the decision path all ask this method.
+    pub fn invalid_price(&self) -> Option<&'static str> {
+        let read = self.cache_read_input_cost_per_million_usd;
+        let creation = self.cache_creation_input_cost_per_million_usd;
+        [
             (
                 "input_cost_per_million_usd",
                 self.input_cost_per_million_usd,
             ),
-            (
-                "cache_read_input_cost_per_million_usd",
-                self.cache_read_input_cost_per_million_usd,
-            ),
-            (
-                "cache_creation_input_cost_per_million_usd",
-                self.cache_creation_input_cost_per_million_usd,
-            ),
+            ("cache_read_input_cost_per_million_usd", read),
+            ("cache_creation_input_cost_per_million_usd", creation),
             (
                 "output_cost_per_million_usd",
                 self.output_cost_per_million_usd,
             ),
             ("web_search_call_cost_usd", self.web_search_call_cost_usd),
-        ] {
-            if value.is_some_and(|value| !value.is_finite() || value < 0.0) {
-                return Err(super::ContractError::Invalid(format!(
-                    "model `{}/{}` {name} must be finite and non-negative",
-                    self.provider, self.model
-                )));
-            }
+        ]
+        .into_iter()
+        .find(|(_, value)| value.is_some_and(|value| !value.is_finite() || value < 0.0))
+        .map(|(name, _)| name)
+    }
+
+    /// The cache-read rate: an absent rate bills at the ordinary input rate.
+    pub fn cache_read_rate(&self) -> Option<f64> {
+        self.cache_read_input_cost_per_million_usd
+            .or(self.input_cost_per_million_usd)
+    }
+
+    /// The cache-creation rate: an absent rate bills at the ordinary input rate.
+    pub fn cache_creation_rate(&self) -> Option<f64> {
+        self.cache_creation_input_cost_per_million_usd
+            .or(self.input_cost_per_million_usd)
+    }
+
+    // Missing prices are allowed: catalog prices may fill the gaps at dispatch.
+    pub(super) fn validate_pricing(&self) -> Result<(), super::ContractError> {
+        if let Some(name) = self.invalid_price() {
+            return Err(super::ContractError::Invalid(format!(
+                "model `{}/{}` {name} must be finite and non-negative",
+                self.provider, self.model
+            )));
         }
         Ok(())
     }

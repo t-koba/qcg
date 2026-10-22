@@ -557,6 +557,29 @@ version = "0.1.0"
             .expect("structured output with tools is a declared provider capability");
     }
     #[test]
+    fn model_price_rules_are_defined_once_for_every_caller() {
+        let model = ModelRef {
+            provider: "p".into(),
+            model: "m".into(),
+            input_cost_per_million_usd: Some(2.0),
+            cache_creation_input_cost_per_million_usd: None,
+            cache_read_input_cost_per_million_usd: Some(0.5),
+            output_cost_per_million_usd: Some(4.0),
+            web_search_call_cost_usd: None,
+        };
+        assert_eq!(model.invalid_price(), None);
+        // An absent cache rate bills at the ordinary input rate, and an
+        // explicit zero stays zero.
+        assert_eq!(model.cache_read_rate(), Some(0.5));
+        assert_eq!(model.cache_creation_rate(), Some(2.0));
+        let mut zero = model.clone();
+        zero.cache_read_input_cost_per_million_usd = Some(0.0);
+        assert_eq!(zero.cache_read_rate(), Some(0.0));
+        let mut invalid = model.clone();
+        invalid.output_cost_per_million_usd = Some(f64::NAN);
+        assert_eq!(invalid.invalid_price(), Some("output_cost_per_million_usd"));
+    }
+    #[test]
     fn llm_pricing_validation_is_identical_for_primary_and_model_list() {
         for field in [
             "input_cost_per_million_usd",

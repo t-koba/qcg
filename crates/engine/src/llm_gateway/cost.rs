@@ -5,15 +5,18 @@ use llm::TokenUsage;
 use super::types::LlmGateway;
 
 impl<'a> LlmGateway<'a> {
-    pub(super) fn selected_pricing<'b>(
+    /// The route that bills this call: the contract's routes first, then
+    /// the gateway's priced models. The selection rule lives in the policy
+    /// crate, so the meter and the pre-call reservation pick the same row.
+    pub(super) fn selected_route<'b>(
         &'b self,
         routes: &'b [ModelRef],
         provider: &str,
         model: &str,
-    ) -> Option<policy::PricingRow<'b>> {
-        let rows: Vec<policy::PricingRow<'_>> = routes
+    ) -> Option<&'b ModelRef> {
+        let entries: Vec<&ModelRef> = routes.iter().chain(&self.pricing).collect();
+        let rows: Vec<policy::PricingRow<'_>> = entries
             .iter()
-            .chain(&self.pricing)
             .map(|entry| policy::PricingRow {
                 provider: entry.provider.as_str(),
                 model: entry.model.as_str(),
@@ -25,7 +28,8 @@ impl<'a> LlmGateway<'a> {
                 web_search_call_cost_usd: entry.web_search_call_cost_usd,
             })
             .collect();
-        policy::select_pricing(&rows, provider, model)
+        let index = policy::select_pricing(&rows, provider, model)?;
+        entries.get(index).copied()
     }
 
     /// The hosted search charge of one response, in microusd. `None` means
@@ -40,8 +44,8 @@ impl<'a> LlmGateway<'a> {
     ) -> Option<u64> {
         let calls = calls.filter(|calls| *calls > 0)?;
         let price = self
-            .selected_pricing(routes, provider, model)
-            .and_then(|pricing| pricing.web_search_call_cost_usd)?;
+            .selected_route(routes, provider, model)
+            .and_then(|route| route.web_search_call_cost_usd)?;
         Some(
             (calls as f64 * price * 1_000_000.0)
                 .round()
@@ -61,7 +65,7 @@ impl<'a> LlmGateway<'a> {
         let ordinary_input = usage
             .ordinary_input()
             .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
-        let Some(pricing) = self.selected_pricing(routes, provider, model) else {
+        let Some(route) = self.selected_route(routes, provider, model) else {
             if self.budget.require_pricing {
                 return Err(StepError::failed(
                     &node.id,
@@ -70,9 +74,10 @@ impl<'a> LlmGateway<'a> {
             }
             return Ok(0);
         };
-        let input = pricing.input_cost_per_million_usd;
-        let output = pricing.output_cost_per_million_usd;
-        if self.budget.require_pricing && (input.is_none() || output.is_none()) {
+        if self.budget.require_pricing
+            && (route.input_cost_per_million_usd.is_none()
+                || route.output_cost_per_million_usd.is_none())
+        {
             return Err(StepError::failed(
                 &node.id,
                 format!(
@@ -80,14 +85,14 @@ impl<'a> LlmGateway<'a> {
                 ),
             ));
         }
-        let input = input.unwrap_or_default();
-        let read = pricing
-            .cache_read_input_cost_per_million_usd
-            .unwrap_or(input);
-        let creation = pricing
-            .cache_creation_input_cost_per_million_usd
-            .unwrap_or(input);
-        if [input, output.unwrap_or_default(), read, creation]
+        // The contract owns the cache-rate fallback, so an absent cache
+        // rate bills at the ordinary input rate. The metered rates
+        // themselves must be finite and non-negative.
+        let input = route.input_cost_per_million_usd.unwrap_or_default();
+        let output = route.output_cost_per_million_usd.unwrap_or_default();
+        let read = route.cache_read_rate().unwrap_or_default();
+        let creation = route.cache_creation_rate().unwrap_or_default();
+        if [input, output, read, creation]
             .into_iter()
             .any(|rate| !rate.is_finite() || rate < 0.0)
         {
@@ -96,12 +101,12 @@ impl<'a> LlmGateway<'a> {
         let mut microusd = ordinary_input as f64 * input
             + usage.cached_input as f64 * read
             + usage.cache_creation_input as f64 * creation
-            + usage.output as f64 * output.unwrap_or_default();
+            + usage.output as f64 * output;
         // The provider bills its hosted search per call. The count comes
         // from the response, and a run that requires pricing refuses a
         // reported call it cannot price.
         if let Some(calls) = web_search_calls.filter(|calls| *calls > 0) {
-            match pricing.web_search_call_cost_usd {
+            match route.web_search_call_cost_usd {
                 Some(price) => {
                     if !price.is_finite() || price < 0.0 {
                         return Err(StepError::failed(&node.id, "invalid model pricing"));

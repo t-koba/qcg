@@ -589,10 +589,8 @@ pub(crate) fn find_pricing(
         ) {
             (Some(input), Some(output)) => Some((
                 input,
-                entry.cache_read_input_cost_per_million_usd.unwrap_or(input),
-                entry
-                    .cache_creation_input_cost_per_million_usd
-                    .unwrap_or(input),
+                entry.cache_read_rate().unwrap_or(input),
+                entry.cache_creation_rate().unwrap_or(input),
                 output,
             )),
             _ => None,

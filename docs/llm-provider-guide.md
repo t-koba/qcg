@@ -311,6 +311,13 @@ row applies. It never mixes rates between those candidate rows. Missing cache
 rates fall back to ordinary input from that selected row; explicit zero is
 preserved.
 
+The rate rules live with the contract's model reference, so every caller
+resolves prices the same way: a configured price must be finite and
+non-negative (the manifest rejects it, and the runtime refuses to bill it),
+and an absent cache rate bills at the ordinary input rate. The manifest
+check, the cost meter, the pre-call reservation and the CLI's rate display all
+ask that one definition.
+
 ```toml
 [catalog]
 cache = "~/.data/cache/llm-catalog.json"   # default under $DATA_HOME

@@ -94,25 +94,21 @@ impl<'a> LlmGateway<'a> {
         max_tokens: u32,
     ) -> Result<llm::DecisionResponse, StepError> {
         request.validate().step_err(&node.id)?;
-        if request.provider != model.provider
-            || request.model != model.model
-            || max_tokens == 0
-            || model
-                .input_cost_per_million_usd
-                .is_some_and(|price| !price.is_finite() || price < 0.0)
-            || model
-                .cache_read_input_cost_per_million_usd
-                .is_some_and(|price| !price.is_finite() || price < 0.0)
-            || model
-                .cache_creation_input_cost_per_million_usd
-                .is_some_and(|price| !price.is_finite() || price < 0.0)
-            || model
-                .output_cost_per_million_usd
-                .is_some_and(|price| !price.is_finite() || price < 0.0)
-        {
+        if request.provider != model.provider || request.model != model.model || max_tokens == 0 {
             return Err(StepError::failed(
                 &node.id,
                 "invalid decision model or token budget",
+            ));
+        }
+        // The contract owns the price rule, so the decision path rejects
+        // exactly the prices the manifest rejects.
+        if let Some(field) = model.invalid_price() {
+            return Err(StepError::failed(
+                &node.id,
+                format!(
+                    "model `{}/{}` {field} must be finite and non-negative",
+                    model.provider, model.model
+                ),
             ));
         }
         self.assert_value_absent(node, &serde_json::to_value(&request)?)?;
@@ -255,20 +251,19 @@ impl<'a> LlmGateway<'a> {
         let tokens = input_est.saturating_add(max_output);
         let mut cost_microusd = 0_u64;
         if self.budget.max_cost_microusd.is_some() {
-            let pricing = self.selected_pricing(routes, &request.provider, &request.model);
-            match pricing {
-                Some(pricing) => {
+            let route = self.selected_route(routes, &request.provider, &request.model);
+            match route {
+                Some(route) => {
                     match (
-                        pricing.input_cost_per_million_usd,
-                        pricing.output_cost_per_million_usd,
+                        route.input_cost_per_million_usd,
+                        route.output_cost_per_million_usd,
                     ) {
                         (Some(input), Some(output)) => {
-                            let read = pricing
-                                .cache_read_input_cost_per_million_usd
-                                .unwrap_or(input);
-                            let creation = pricing
-                                .cache_creation_input_cost_per_million_usd
-                                .unwrap_or(input);
+                            // The reservation cannot know how the prompt
+                            // splits into cached and uncached input, so it
+                            // reserves at the dearest rate the row names.
+                            let read = route.cache_read_rate().unwrap_or(input);
+                            let creation = route.cache_creation_rate().unwrap_or(input);
                             if [input, output, read, creation]
                                 .into_iter()
                                 .any(|rate| !rate.is_finite() || rate < 0.0)
@@ -926,8 +921,15 @@ api_key_env = "{credential_env}"
                     .decide(&fixture.node, fixture.request(), &model, 16)
                     .await
                     .unwrap_err();
+                let field = if input {
+                    "input_cost_per_million_usd"
+                } else {
+                    "output_cost_per_million_usd"
+                };
                 assert!(
-                    matches!(error, StepError::Failed { message, .. } if !message.contains(&fixture.credential_env))
+                    matches!(error, StepError::Failed { message, .. } if !message.contains(&fixture.credential_env)
+                        && message.contains(field)
+                        && message.contains("must be finite and non-negative"))
                 );
                 fixture.assert_released();
                 fixture.assert_no_events();
