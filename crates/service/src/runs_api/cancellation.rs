@@ -10,11 +10,7 @@ impl LocalService {
         // reports success without journaling (E05).
         if self.is_shutting_down()
             && let Ok(run_dir) = self.run_dir_for(&id).await
-            && self
-                .authoritative_state(&run_dir)
-                .await
-                .map(|state| state.terminal.is_some())
-                .unwrap_or(false)
+            && self.authoritative_state(&run_dir).await?.terminal.is_some()
         {
             return Ok(());
         }

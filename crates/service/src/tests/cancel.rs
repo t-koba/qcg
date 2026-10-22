@@ -211,6 +211,53 @@ async fn shutting_down_service_refuses_new_admissions() {
 }
 
 #[tokio::test]
+async fn shutdown_cancel_preserves_authoritative_journal_read_error() {
+    let root = temp_run_dir("shutdown-cancel-unreadable-journal");
+    let _guard = TempGuard(root.clone());
+    let generators =
+        Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+    let service = test_service(vec![generators], root.join("runs"));
+    let id = start_ask_user_and_answer(&service, "brief").await;
+    wait_for_snapshot(&service, &id, RunStatus::Succeeded).await;
+    let run_dir = service
+        .run_dir_for(&id)
+        .await
+        .expect("run directory should resolve");
+    let journal_path = run_meta_dir(&run_dir).join("journal.jsonl");
+    let journal = std::fs::read_to_string(&journal_path).expect("journal should be readable");
+    std::fs::write(&journal_path, format!("{journal}\nnot-json\n"))
+        .expect("journal should be made unreadable");
+    service.mark_shutting_down();
+
+    let error = service.cancel(id.clone()).await.expect_err(
+        "an unreadable authoritative state must not be mistaken for a normal shutdown refusal",
+    );
+    assert!(
+        matches!(&error, ApiError::Internal { .. }),
+        "the journal read failure must be returned with its cause, not collapsed to shutdown: {error}"
+    );
+    assert!(
+        error.to_string().contains("invalid journal JSON"),
+        "the error must retain the journal parsing cause: {error}"
+    );
+    assert!(
+        !crate::run_dirs::has_pending_cancel_control(&run_dir),
+        "a failed authoritative read must not publish a cancellation control"
+    );
+    let runs = service.inner.runs.read().await;
+    let record = runs.get(&id).expect("terminal run remains tracked");
+    assert_eq!(
+        record.state,
+        RunStatus::Succeeded,
+        "unreadable journal observation must not rewrite the terminal projection"
+    );
+    assert!(
+        !record.cancellation.is_cancelled(),
+        "an unreadable journal observation must not signal cancellation"
+    );
+}
+
+#[tokio::test]
 async fn completion_racing_with_cancel_commits_exactly_one_terminal_state() {
     let root = temp_run_dir("completion-cancel-race");
     let _ = std::fs::remove_dir_all(&root);
