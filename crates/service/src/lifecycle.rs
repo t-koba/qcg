@@ -2183,11 +2183,9 @@ impl LocalService {
                     {
                         return;
                     }
+                    // The engine's confirmation event already carries its file pins.
                     transition.state = Some(RunStatus::Confirming);
                     transition.confirm = Some(confirm.clone());
-                    transition
-                        .writes
-                        .push(("confirm_request", json!({ "confirm": confirm })));
                 }
                 Progress::Failed(error) => {
                     let terminal = match self.authoritative_state(&record.run_dir).await {

@@ -925,6 +925,12 @@ impl RunState {
                 }
             }
             "confirm_request" => {
+                // A confirmation's pins fold like a suspended step's.
+                if event.get("files").is_some() && event.get("node").is_some() {
+                    let mut suspended_step = event.clone();
+                    suspended_step["status"] = Value::String("needs_confirm".into());
+                    self.apply_step_finished(&suspended_step)?;
+                }
                 if let Some(value) = event.get("confirm").cloned() {
                     let confirm = serde_json::from_value(value).map_err(|error| {
                         crate::JournalError::InvalidEvent(format!(
@@ -1249,16 +1255,7 @@ impl RunState {
         let status = event.get("status").and_then(Value::as_str).ok_or_else(|| {
             crate::JournalError::InvalidEvent("step_finished status is required".into())
         })?;
-        // Every finished revision is retained for immutable-blob
-        // verification on resume, independent of which outcome later
-        // overwrites the node (E06). Both `files` and `failed_files`
-        // are retained: a failed revision's blob must still verify when
-        // named, otherwise it orphans and escapes tamper detection (E06).
-        // Absent pin lists default to empty as a FOREIGN-journal boundary
-        // (E06): journals written before `failed_files` existed omit the key
-        // entirely. Only absence defaults; present-but-invalid pins fail the
-        // fold above. Journals written by the current version always carry
-        // both keys, so this default never masks a current-version write.
+        // Retain every revision for resume verification; absent lists default empty.
         let files: Vec<crate::FilePin> = event
             .get("files")
             .cloned()
@@ -1283,10 +1280,15 @@ impl RunState {
                 .or_default()
                 .insert(pin.sha256.clone());
         }
-        if matches!(
+        let succeeded = matches!(
             status,
             "success" | "repaired" | "routed" | "answered_on_fail" | "regenerated"
-        ) {
+        );
+        let suspended = matches!(status, "needs_user" | "needs_confirm");
+        if succeeded || suspended {
+            self.apply_workspace_file_pins(path, &files);
+        }
+        if succeeded {
             self.budget.steps_succeeded =
                 self.budget.steps_succeeded.checked_add(1).ok_or_else(|| {
                     crate::JournalError::InvalidEvent("succeeded step count overflowed".into())
@@ -1303,31 +1305,13 @@ impl RunState {
                 self.vars.set_step_output(output_name, output);
             }
             self.vars.set_step_outcome(path, "success", None);
-            for pin in &files {
-                self.latest_file_pins
-                    .insert(pin.path.to_string(), pin.sha256.clone());
-            }
-            // A file the step reports as an output was written, and a
-            // write supersedes an earlier removal of it: the removal
-            // record must not keep a path the run now holds.
-            let node = NodePath::root(path);
-            let mut superseded = false;
-            if let Some(removals) = self.removed_files.get_mut(&node) {
-                for pin in &files {
-                    removals.remove(pin.path.as_str());
-                }
-                superseded = removals.is_empty();
-            }
-            if superseded {
-                self.removed_files.remove(&node);
-            }
             self.nodes
                 .insert(NodePath::root(path), NodeOutcome::Success { output, files });
             self.checkpoints.remove(&NodePath::root(path));
             self.pending = None;
             self.pending_seq = None;
             self.record_node_execution(path)?;
-        } else if !matches!(status, "needs_user" | "needs_confirm") {
+        } else if !suspended {
             self.budget.steps_failed =
                 self.budget.steps_failed.checked_add(1).ok_or_else(|| {
                     crate::JournalError::InvalidEvent("failed step count overflowed".into())
@@ -1346,6 +1330,24 @@ impl RunState {
             self.record_node_execution(path)?;
         }
         Ok(())
+    }
+
+    /// Makes the attempt's revisions the workspace's latest ones.
+    fn apply_workspace_file_pins(&mut self, path: &str, files: &[crate::FilePin]) {
+        for pin in files {
+            self.latest_file_pins
+                .insert(pin.path.to_string(), pin.sha256.clone());
+        }
+        let node = NodePath::root(path);
+        let Some(removals) = self.removed_files.get_mut(&node) else {
+            return;
+        };
+        for pin in files {
+            removals.remove(pin.path.as_str());
+        }
+        if removals.is_empty() {
+            self.removed_files.remove(&node);
+        }
     }
 
     /// Counts one finished node execution. Interactions that suspend the
@@ -1481,6 +1483,68 @@ mod tests {
                 .is_some_and(|revisions| revisions.contains("v1") && revisions.contains("v2")),
             "both revisions must remain verifiable as blobs"
         );
+    }
+
+    #[test]
+    fn suspended_step_files_are_historical_and_latest_workspace_pins() {
+        for (seq, status, digest) in [
+            (1, "needs_user", "question-revision"),
+            (2, "needs_confirm", "confirm-revision"),
+        ] {
+            let mut state = RunState::default();
+            state
+                .apply(&json!({
+                    "t": "step_finished",
+                    "seq": seq,
+                    "node": "suspended",
+                    "status": status,
+                    "files": [{"path": "before-prompt.txt", "sha256": digest}],
+                }))
+                .expect("suspended step should fold");
+            assert_eq!(
+                state
+                    .latest_file_pins
+                    .get("before-prompt.txt")
+                    .map(String::as_str),
+                Some(digest),
+                "suspended attempt must become the workspace's latest revision"
+            );
+            assert!(state.historical_file_pins["before-prompt.txt"].contains(digest));
+            assert_eq!(state.budget.steps_succeeded, 0);
+            assert_eq!(state.budget.steps_failed, 0);
+            assert!(!state.node_executions.contains_key("suspended"));
+        }
+    }
+
+    #[test]
+    fn confirmation_file_pins_fold_into_workspace_and_history() {
+        let mut state = RunState::default();
+        state
+            .apply(&json!({
+                "t": "confirm_request",
+                "seq": 7,
+                "node": "publish",
+                "confirm": {
+                    "id": "c1",
+                    "title": "publish",
+                    "kind": "publish",
+                    "target": "artifact",
+                    "dry_run": false,
+                    "operation_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "scope": "invocation"
+                },
+                "files": [{"path": "artifact.txt", "sha256": "before-confirmation"}]
+            }))
+            .expect("confirmation and file pins should fold");
+        assert_eq!(state.pending_seq, Some(7));
+        assert_eq!(
+            state
+                .latest_file_pins
+                .get("artifact.txt")
+                .map(String::as_str),
+            Some("before-confirmation")
+        );
+        assert!(state.historical_file_pins["artifact.txt"].contains("before-confirmation"));
     }
 
     #[test]

@@ -25,6 +25,23 @@ async fn resume_after_confirmation_replays_prior_steps_and_runs_side_effect_once
         .expect("run should start");
     let snapshot = wait_for_snapshot(&service, &id, RunStatus::Confirming).await;
     let confirm = snapshot.confirm.expect("run should request confirmation");
+    let confirmation_events = read_journal_string(&service, id.clone())
+        .await
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event.get("t").and_then(Value::as_str) == Some("confirm_request"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        confirmation_events.len(),
+        1,
+        "the engine's file-bearing confirmation event must not be duplicated by lifecycle settlement"
+    );
+    assert!(
+        confirmation_events[0]
+            .get("files")
+            .and_then(Value::as_array)
+            .is_some()
+    );
     service
         .confirm(
             id.clone(),

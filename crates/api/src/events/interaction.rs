@@ -31,12 +31,9 @@ pub struct ConfirmRequestEventData {
     pub confirm: ConfirmSpec,
     #[serde(default)]
     pub parallel: bool,
-    /// The files the step produced before it asked for confirmation. A
-    /// confirmation suspends the run, so the writes the attempt made are
-    /// journaled here: they are the run's record of what the step
-    /// produced, and a resume verifies them like any other revision.
+    /// Suspended-step file revisions retained for resume and fork.
     #[serde(default)]
-    pub files: Vec<Value>,
+    pub files: Vec<crate::FilePinEventData>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, serde::Deserialize, JsonSchema)]

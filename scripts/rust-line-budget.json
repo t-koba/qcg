@@ -3,11 +3,11 @@
   "version": 1,
   "totalMax": 96274,
   "crates": {
-    "api": 2969,
+    "api": 2974,
     "cli": 7568,
     "container": 1691,
     "contract": 6772,
-    "engine": 19602,
+    "engine": 19604,
     "expr-wasm": 175,
     "files": 1237,
     "llm": 7823,
@@ -16,7 +16,7 @@
     "model": 893,
     "policy": 2078,
     "server": 7349,
-    "service": 14978,
+    "service": 14971,
     "steps": 6573
   }
 }

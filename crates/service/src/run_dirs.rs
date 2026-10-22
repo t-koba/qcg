@@ -557,23 +557,23 @@ fn populate_checkpoint_fork(
                 .and_then(Value::as_u64)
                 .is_some_and(|seq| seq <= at_seq)
         })
-        // Fork copies the completed prefix only: terminal outcomes and the
-        // pending prompt at the checkpoint are not carried over. The fork
-        // resumes execution from the checkpoint with its own answers and
-        // state patch; inheriting the source's pending question or terminal
-        // state would fork the journal instead of continuing it (E06).
-        .filter(|event| {
-            !matches!(
-                event.get("t").and_then(Value::as_str),
-                Some(
-                    "run_finished"
-                        | "run_error"
-                        | "run_canceled"
-                        | "run_interrupted"
-                        | "run_waiting"
-                        | "confirm_request"
-                )
-            )
+        // Project confirmation pins without carrying the source's pending interaction.
+        .filter_map(|mut event| {
+            let kind = event.get("t").and_then(Value::as_str).unwrap_or_default();
+            if matches!(
+                kind,
+                "run_finished" | "run_error" | "run_canceled" | "run_interrupted" | "run_waiting"
+            ) {
+                return None;
+            }
+            if kind == "confirm_request" {
+                event.get("node").and_then(Value::as_str)?;
+                let object = event.as_object_mut()?;
+                object.remove("confirm");
+                object.insert("t".into(), "step_finished".into());
+                object.insert("status".into(), "needs_confirm".into());
+            }
+            Some(event)
         })
         .collect::<Vec<_>>();
     if !selected.iter().any(|event| {
@@ -593,10 +593,7 @@ fn populate_checkpoint_fork(
     std::fs::create_dir_all(target_meta.join("checkpoint-blobs"))?;
 
     let mut latest_files = BTreeMap::<Utf8PathBuf, String>::new();
-    // Every distinct revision any successful step pinned must have its blob
-    // in the fork: resume verifies historical pins against those blobs, so
-    // copying only the latest revision would make a valid fork unresumable
-    // (E06).
+    // Retain all historical blobs: resume verifies every pin on fork. (E06)
     // Blob digests name store paths: validate hex shape before any stat so
     // a malformed journal pin cannot probe arbitrary paths (E06).
     fn validate_blob_digest(path: &Utf8PathBuf, digest: &str) -> Result<(), ServiceError> {
@@ -626,13 +623,11 @@ fn populate_checkpoint_fork(
         if pins.is_empty() {
             continue;
         }
-        // Only a successful step projects the workspace; a failed or
-        // suspended step still pins revisions that resume must verify
-        // (E06), matching the engine's historical/latest split.
-        let successful = matches!(
-            event.get("status").and_then(Value::as_str),
+        let status = event.get("status").and_then(Value::as_str);
+        let projects_workspace = matches!(
+            status,
             Some("success" | "repaired" | "routed" | "answered_on_fail" | "regenerated")
-        );
+        ) || matches!(status, Some("needs_user" | "needs_confirm"));
         for file in pins {
             let path = file
                 .get("path")
@@ -651,7 +646,7 @@ fn populate_checkpoint_fork(
             required_blobs
                 .entry(digest.to_string())
                 .or_insert_with(|| path.clone());
-            if successful {
+            if projects_workspace {
                 latest_files.insert(path, digest.to_string());
             }
         }

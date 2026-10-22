@@ -2065,13 +2065,10 @@ export interface components {
         ConfirmRequestEventData: {
             confirm: components["schemas"]["ConfirmSpec"];
             /**
-             * @description The files the step produced before it asked for confirmation. A
-             *     confirmation suspends the run, so the writes the attempt made are
-             *     journaled here: they are the run's record of what the step
-             *     produced, and a resume verifies them like any other revision.
+             * @description Suspended-step file revisions retained for resume and fork.
              * @default []
              */
-            files: unknown[];
+            files: components["schemas"]["FilePinEventData"][];
             /** @default false */
             parallel: boolean;
         };
@@ -2179,6 +2176,10 @@ export interface components {
             code: components["schemas"]["FailureCode"];
             dependencies?: components["schemas"]["DependencyFailure"][];
             message: string;
+        };
+        FilePinEventData: {
+            path: string;
+            sha256: string;
         };
         /**
          * FileValue
@@ -3214,11 +3215,14 @@ export interface components {
             /** @default null */
             answer: unknown;
             /** @default [] */
-            failed_files: unknown[];
+            failed_files: components["schemas"]["FilePinEventData"][];
             /** @default null */
             failed_output: unknown;
-            /** @default [] */
-            files: unknown[];
+            /**
+             * @description File revisions produced by this step, retained across suspension.
+             * @default []
+             */
+            files: components["schemas"]["FilePinEventData"][];
             /** @default [] */
             findings: unknown[];
             /** @default null */

@@ -80,6 +80,57 @@ mod tests {
     }
 
     #[test]
+    fn step_and_confirmation_file_pins_decode_as_typed_pins() {
+        let step = json!({
+            "t": "step_finished",
+            "seq": 8,
+            "ts": "2026-07-05T00:00:00Z",
+            "run_id": "run-1",
+            "trace_id": "trace-1",
+            "span_id": "span-8",
+            "node": "write_config",
+            "status": "needs_user",
+            "files": [{"path": "out.txt", "sha256": "abc"}]
+        });
+        let event = RunEvent::from_flat(&step).expect("step should decode");
+        match event.data {
+            RunEventData::StepFinished(data) => {
+                assert_eq!(data.files.len(), 1);
+                assert_eq!(data.files[0].path, "out.txt");
+                assert_eq!(data.files[0].sha256, "abc");
+            }
+            other => panic!("expected typed step_finished, got {other:?}"),
+        }
+        let confirmation = json!({
+            "t": "confirm_request",
+            "seq": 9,
+            "ts": "2026-07-05T00:00:00Z",
+            "run_id": "run-1",
+            "trace_id": "trace-1",
+            "span_id": "span-9",
+            "node": "publish",
+            "confirm": {
+                "id": "c1",
+                "title": "publish",
+                "kind": "publish",
+                "target": "artifact",
+                "dry_run": false,
+                "operation_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "scope": "invocation"
+            },
+            "files": [{"path": "artifact.txt", "sha256": "def"}]
+        });
+        let event = RunEvent::from_flat(&confirmation).expect("confirmation should decode");
+        match event.data {
+            RunEventData::ConfirmRequest(data) => {
+                assert_eq!(data.files.len(), 1);
+                assert_eq!(data.files[0].path, "artifact.txt");
+            }
+            other => panic!("expected typed confirm_request, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn command_resource_events_decode_as_a_typed_source() {
         let value = json!({
             "t": "resource",

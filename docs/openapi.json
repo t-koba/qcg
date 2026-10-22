@@ -422,8 +422,10 @@
           },
           "files": {
             "default": [],
-            "description": "The files the step produced before it asked for confirmation. A\nconfirmation suspends the run, so the writes the attempt made are\njournaled here: they are the run's record of what the step\nproduced, and a resume verifies them like any other revision.",
-            "items": true,
+            "description": "Suspended-step file revisions retained for resume and fork.",
+            "items": {
+              "$ref": "#/components/schemas/FilePinEventData"
+            },
             "type": "array"
           },
           "parallel": {
@@ -759,6 +761,22 @@
         "required": [
           "code",
           "message"
+        ],
+        "type": "object"
+      },
+      "FilePinEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "sha256": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "sha256"
         ],
         "type": "object"
       },
@@ -3582,7 +3600,9 @@
           },
           "failed_files": {
             "default": [],
-            "items": true,
+            "items": {
+              "$ref": "#/components/schemas/FilePinEventData"
+            },
             "type": "array"
           },
           "failed_output": {
@@ -3590,7 +3610,10 @@
           },
           "files": {
             "default": [],
-            "items": true,
+            "description": "File revisions produced by this step, retained across suspension.",
+            "items": {
+              "$ref": "#/components/schemas/FilePinEventData"
+            },
             "type": "array"
           },
           "findings": {

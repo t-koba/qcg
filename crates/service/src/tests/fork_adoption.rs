@@ -1263,6 +1263,130 @@ async fn fork_reverse_name_order_projects_journal_later_revision() {
     );
 }
 
+#[test]
+fn confirmation_file_revision_is_restored_in_fork_without_pending_prompt() {
+    use sha2::{Digest as _, Sha256};
+
+    let runs = temp_run_dir("fork-confirmation-file-pin");
+    let _ = std::fs::remove_dir_all(&runs);
+    let source_dir = runs.join("source");
+    let source_meta = run_meta_dir(&source_dir);
+    std::fs::create_dir_all(source_meta.join("checkpoint-blobs")).expect("source meta");
+    let bytes = b"written before confirmation";
+    let digest = hex::encode(Sha256::digest(bytes));
+    std::fs::write(source_meta.join("checkpoint-blobs").join(&digest), bytes)
+        .expect("confirmation blob");
+    let asked = b"written before the question";
+    let asked_digest = hex::encode(Sha256::digest(asked));
+    std::fs::write(
+        source_meta.join("checkpoint-blobs").join(&asked_digest),
+        asked,
+    )
+    .expect("question blob");
+    let events = [
+        json!({
+            "t": "run_queued",
+            "ts": "2026-01-01T00:00:00Z",
+            "seq": 1,
+            "run_id": "source",
+            "generator": "g@1.0.0",
+            "generator_path": "/tmp/g",
+            "contract_sha256": "sha",
+            "inputs": {},
+            "answers": {},
+            "confirmations": {},
+            "schema_version": api::JOURNAL_SCHEMA_VERSION,
+            "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
+            "retention_days": 0,
+            "priority": 0,
+            "parent_run_id": null,
+            "effective_max_total_steps": 64,
+            "effective_policy_origin": "unit-test",
+        }),
+        json!({
+            "t": "step_finished",
+            "ts": "2026-01-01T00:00:01Z",
+            "seq": 2,
+            "run_id": "source",
+            "node": "ask",
+            "status": "needs_user",
+            "files": [{"path": "asked.txt", "sha256": asked_digest}],
+        }),
+        json!({
+            "t": "confirm_request",
+            "ts": "2026-01-01T00:00:02Z",
+            "seq": 3,
+            "run_id": "source",
+            "node": "publish",
+            "confirm": {
+                "id": "confirm-1",
+                "title": "publish",
+                "kind": "publish",
+                "target": "artifact",
+                "dry_run": false,
+                "operation_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "scope": "invocation"
+            },
+            "files": [{"path": "artifact.txt", "sha256": digest}]
+        }),
+    ];
+    let mut journal = String::new();
+    for event in &events {
+        journal.push_str(&event.to_string());
+        journal.push('\n');
+    }
+    std::fs::write(source_meta.join("journal.jsonl"), journal).expect("source journal");
+
+    let fork_id = "fork-confirmation";
+    let fork_dir = runs.join(fork_id);
+    crate::run_dirs::prepare_checkpoint_fork(
+        &source_dir,
+        "source",
+        &fork_dir,
+        fork_id,
+        3,
+        &ForkStatePatch::default(),
+    )
+    .expect("fork should project the suspended file revision");
+    assert_eq!(
+        std::fs::read(run_workspace_dir(&fork_dir).join("artifact.txt"))
+            .expect("fork workspace file"),
+        bytes
+    );
+    assert_eq!(
+        std::fs::read(run_workspace_dir(&fork_dir).join("asked.txt"))
+            .expect("fork workspace file of the suspended question"),
+        asked
+    );
+    let fork_journal = engine::read_journal_values(
+        &run_meta_dir(&fork_dir).join("journal.jsonl"),
+        engine::JournalLimits::default(),
+    )
+    .expect("fork journal should read")
+    .events;
+    assert!(
+        !fork_journal
+            .iter()
+            .any(|event| { event.get("t").and_then(Value::as_str) == Some("confirm_request") })
+    );
+    assert!(fork_journal.iter().any(|event| {
+        event.get("t").and_then(Value::as_str) == Some("step_finished")
+            && event.get("status").and_then(Value::as_str) == Some("needs_confirm")
+            && event
+                .get("files")
+                .and_then(Value::as_array)
+                .is_some_and(|files| !files.is_empty())
+    }));
+    let state = engine::RunState::fold_journal(&run_meta_dir(&fork_dir).join("journal.jsonl"))
+        .expect("fork state should fold");
+    assert!(
+        state.pending.is_none(),
+        "source confirmation must not cross the fork"
+    );
+    assert_eq!(state.latest_file_pins.get("artifact.txt"), Some(&digest));
+    assert_eq!(state.latest_file_pins.get("asked.txt"), Some(&asked_digest));
+}
+
 #[tokio::test]
 async fn partial_fork_is_not_mistaken_for_completed_admission() {
     // A03: a crash between checkpoint copy and the fork's own

@@ -6,6 +6,13 @@ use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct FilePinEventData {
+    pub path: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StepStartedEventData {
     #[serde(rename = "type")]
     pub step_type: String,
@@ -34,8 +41,9 @@ pub enum StepStatus {
 #[serde(deny_unknown_fields)]
 pub struct StepFinishedEventData {
     pub status: StepStatus,
+    /// File revisions produced by this step, retained across suspension.
     #[serde(default)]
-    pub files: Vec<Value>,
+    pub files: Vec<FilePinEventData>,
     #[serde(default)]
     pub output: Option<Value>,
     #[serde(default)]
@@ -43,7 +51,7 @@ pub struct StepFinishedEventData {
     #[serde(default)]
     pub output_name: Option<String>,
     #[serde(default)]
-    pub failed_files: Vec<Value>,
+    pub failed_files: Vec<FilePinEventData>,
     #[serde(default)]
     pub to: Option<String>,
     #[serde(default)]
