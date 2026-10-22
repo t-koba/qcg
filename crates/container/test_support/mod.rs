@@ -2,6 +2,13 @@
 //! environment mutation can race unrelated tests.
 use std::{path::PathBuf, time::Duration};
 
+/// How long a test waits for the container's outstanding cleanups to join.
+///
+/// The cleanup itself is bounded by the container timeout, but it starts on a
+/// worker that a loaded runner can starve, so the wait has to outlast the
+/// starvation rather than only the cleanup.
+pub(crate) const CLEANUP_JOIN_BOUND: Duration = Duration::from_secs(30);
+
 pub struct Daemon {
     pub root: PathBuf,
 }

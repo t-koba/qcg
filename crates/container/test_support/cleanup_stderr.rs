@@ -547,7 +547,9 @@ fn retained_reaping_responsibility_survives_temporary_runtime_destruction() {
             .unwrap()
             .success()
     );
-    runtime.block_on(await_outstanding_cleanups(Duration::from_secs(1)));
+    runtime.block_on(await_outstanding_cleanups(
+        super::daemon_policy_test_support::CLEANUP_JOIN_BOUND,
+    ));
     assert!(
         !std::path::Path::new("/proc").join(pid.to_string()).exists(),
         "shutdown join must reap the retained client after its runtime was destroyed"
@@ -667,7 +669,9 @@ fn canceled_admin_retains_reaping_ownership_after_runtime_destruction() {
         .enable_all()
         .build()
         .unwrap();
-    let joined = runtime.block_on(await_outstanding_cleanups(Duration::from_secs(1)));
+    let joined = runtime.block_on(await_outstanding_cleanups(
+        super::daemon_policy_test_support::CLEANUP_JOIN_BOUND,
+    ));
     assert_eq!(joined.outstanding, 0);
     assert_eq!(joined.failed, 0);
     assert!(PENDING_REAPS.lock().unwrap().is_empty());
@@ -777,7 +781,9 @@ fn check_async_child_handoff(probe: bool) {
             .enable_all()
             .build()
             .unwrap();
-        let joined = runtime.block_on(await_outstanding_cleanups(Duration::from_secs(1)));
+        let joined = runtime.block_on(await_outstanding_cleanups(
+            super::daemon_policy_test_support::CLEANUP_JOIN_BOUND,
+        ));
         assert_eq!(
             joined,
             CleanupWaitOutcome {

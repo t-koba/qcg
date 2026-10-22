@@ -1577,9 +1577,11 @@ mod daemon_policy_tests {
                     "drop" => {
                         drop(SessionGuard::new(session));
                         assert_eq!(
-                            await_outstanding_cleanups(Duration::from_secs(4))
-                                .await
-                                .outstanding,
+                            await_outstanding_cleanups(
+                                daemon_policy_test_support::CLEANUP_JOIN_BOUND,
+                            )
+                            .await
+                            .outstanding,
                             0
                         );
                     }
@@ -1665,7 +1667,7 @@ mod daemon_policy_tests {
         let start = std::time::Instant::now();
         drop(pending);
         assert_eq!(
-            await_outstanding_cleanups(Duration::from_secs(4))
+            await_outstanding_cleanups(daemon_policy_test_support::CLEANUP_JOIN_BOUND)
                 .await
                 .outstanding,
             0
