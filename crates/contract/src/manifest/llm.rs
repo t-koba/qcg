@@ -195,6 +195,11 @@ pub struct ModelRef {
     /// unmetered, never free.
     #[serde(default)]
     pub web_search_call_cost_usd: Option<f64>,
+    /// Context tiers: the rates that apply to a whole request once its
+    /// prompt input reaches a tier's threshold. Absent keeps the flat
+    /// rates above for every request.
+    #[serde(default)]
+    pub cost_tiers: Vec<policy::CostTier>,
 }
 
 impl ModelRef {
@@ -235,11 +240,27 @@ impl ModelRef {
             .or(self.input_cost_per_million_usd)
     }
 
+    /// The base row's rates, before any context tier applies.
+    pub fn rates(&self) -> policy::CostRates {
+        policy::CostRates {
+            input: self.input_cost_per_million_usd,
+            cache_read: self.cache_read_input_cost_per_million_usd,
+            cache_creation: self.cache_creation_input_cost_per_million_usd,
+            output: self.output_cost_per_million_usd,
+        }
+    }
+
     // Missing prices are allowed: catalog prices may fill the gaps at dispatch.
     pub(super) fn validate_pricing(&self) -> Result<(), super::ContractError> {
         if let Some(name) = self.invalid_price() {
             return Err(super::ContractError::Invalid(format!(
                 "model `{}/{}` {name} must be finite and non-negative",
+                self.provider, self.model
+            )));
+        }
+        if let Err(error) = policy::validate_cost_tiers(&self.cost_tiers) {
+            return Err(super::ContractError::Invalid(format!(
+                "model `{}/{}` {error}",
                 self.provider, self.model
             )));
         }

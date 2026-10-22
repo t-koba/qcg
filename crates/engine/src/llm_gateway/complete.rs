@@ -254,23 +254,21 @@ impl<'a> LlmGateway<'a> {
             let route = self.selected_route(routes, &request.provider, &request.model);
             match route {
                 Some(route) => {
-                    match (
-                        route.input_cost_per_million_usd,
-                        route.output_cost_per_million_usd,
-                    ) {
-                        (Some(input), Some(output)) => {
+                    // The estimate cannot know which tier the request
+                    // reaches, so it reserves at the dearest rate any tier
+                    // names instead of at a tier it cannot prove.
+                    let rates = policy::max_cost_rates(&route.rates(), &route.cost_tiers);
+                    match (rates.max_input_rate(), rates.output) {
+                        (Some(input_rate), Some(output)) => {
                             // The reservation cannot know how the prompt
                             // splits into cached and uncached input, so it
                             // reserves at the dearest rate the row names.
-                            let read = route.cache_read_rate().unwrap_or(input);
-                            let creation = route.cache_creation_rate().unwrap_or(input);
-                            if [input, output, read, creation]
+                            if [input_rate, output]
                                 .into_iter()
                                 .any(|rate| !rate.is_finite() || rate < 0.0)
                             {
                                 return Err(StepError::failed(&node.id, "invalid model pricing"));
                             }
-                            let input_rate = input.max(read).max(creation);
                             cost_microusd = ((input_est as f64 * input_rate)
                                 + (max_output as f64 * output))
                                 .ceil() as u64;
@@ -797,6 +795,7 @@ api_key_env = "{credential_env}"
                     cache_read_input_cost_per_million_usd: None,
                     output_cost_per_million_usd: Some(1.0),
                     web_search_call_cost_usd: None,
+                    cost_tiers: Vec::new(),
                 },
             }
         }

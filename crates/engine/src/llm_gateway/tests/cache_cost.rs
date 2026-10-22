@@ -36,6 +36,7 @@ fn cache_pricing(read: Option<f64>, creation: Option<f64>) -> ModelRef {
         cache_read_input_cost_per_million_usd: read,
         cache_creation_input_cost_per_million_usd: creation,
         web_search_call_cost_usd: None,
+        cost_tiers: Vec::new(),
     }
 }
 

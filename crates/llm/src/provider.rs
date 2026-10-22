@@ -258,6 +258,10 @@ pub struct ModelPricing {
     #[serde(default)]
     pub cache_read_input_cost_per_million_usd: Option<f64>,
     pub output_cost_per_million_usd: Option<f64>,
+    /// Context tiers: the rates that apply to a whole request once its
+    /// prompt input reaches a tier's threshold.
+    #[serde(default)]
+    pub cost_tiers: Vec<policy::CostTier>,
 }
 
 impl ModelPricing {
@@ -266,6 +270,7 @@ impl ModelPricing {
             && self.output_cost_per_million_usd.is_none()
             && self.cache_read_input_cost_per_million_usd.is_none()
             && self.cache_creation_input_cost_per_million_usd.is_none()
+            && self.cost_tiers.is_empty()
     }
 }
 
@@ -292,6 +297,10 @@ pub struct ModelSpec {
     pub cache_read_input_cost_per_million_usd: Option<f64>,
     #[serde(default)]
     pub output_cost_per_million_usd: Option<f64>,
+    /// Context tiers: the rates that apply to a whole request once its
+    /// prompt input reaches a tier's threshold.
+    #[serde(default)]
+    pub cost_tiers: Vec<policy::CostTier>,
     #[serde(default)]
     pub context_tokens: Option<u64>,
     #[serde(default)]
@@ -325,6 +334,7 @@ impl ModelSpec {
                 .cache_creation_input_cost_per_million_usd,
             cache_read_input_cost_per_million_usd: self.cache_read_input_cost_per_million_usd,
             output_cost_per_million_usd: self.output_cost_per_million_usd,
+            cost_tiers: self.cost_tiers.clone(),
         };
         (!pricing.is_empty()).then_some(pricing)
     }
@@ -363,6 +373,9 @@ impl ModelSpec {
                     self.id
                 ));
             }
+        }
+        if let Err(error) = policy::validate_cost_tiers(&self.cost_tiers) {
+            return Err(format!("provider `{provider}` model `{}` {error}", self.id));
         }
         for (field, value) in [
             ("context_tokens", self.context_tokens),

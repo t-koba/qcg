@@ -566,6 +566,7 @@ version = "0.1.0"
             cache_read_input_cost_per_million_usd: Some(0.5),
             output_cost_per_million_usd: Some(4.0),
             web_search_call_cost_usd: None,
+            cost_tiers: Vec::new(),
         };
         assert_eq!(model.invalid_price(), None);
         // An absent cache rate bills at the ordinary input rate, and an
@@ -578,6 +579,67 @@ version = "0.1.0"
         let mut invalid = model.clone();
         invalid.output_cost_per_million_usd = Some(f64::NAN);
         assert_eq!(invalid.invalid_price(), Some("output_cost_per_million_usd"));
+    }
+    #[test]
+    fn model_cost_tiers_must_be_valid_and_ordered() {
+        let manifest = |tiers: &str| {
+            toml::from_str::<Manifest>(&format!(
+                r#"
+[generator]
+id = "llm-settings"
+name = "LLM Settings"
+version = "0.1.0"
+[llm]
+max_tokens = 2048
+[llm.model]
+provider = "p"
+model = "m"
+input_cost_per_million_usd = 2.0
+output_cost_per_million_usd = 4.0
+{tiers}
+"#
+            ))
+            .expect("manifest should parse")
+        };
+        manifest(
+            r#"
+[[llm.model.cost_tiers]]
+threshold_tokens = 200000
+input_cost_per_million_usd = 3.0
+[[llm.model.cost_tiers]]
+threshold_tokens = 400000
+input_cost_per_million_usd = 5.0
+"#,
+        )
+        .validate()
+        .expect("ordered tiers must validate");
+        let unordered = manifest(
+            r#"
+[[llm.model.cost_tiers]]
+threshold_tokens = 400000
+input_cost_per_million_usd = 3.0
+[[llm.model.cost_tiers]]
+threshold_tokens = 200000
+input_cost_per_million_usd = 5.0
+"#,
+        )
+        .validate()
+        .expect_err("unordered tiers must fail");
+        assert!(unordered.to_string().contains("cost tier 1"));
+        let invalid = manifest(
+            r#"
+[[llm.model.cost_tiers]]
+threshold_tokens = 200000
+input_cost_per_million_usd = -1.0
+"#,
+        )
+        .validate()
+        .expect_err("a negative tier rate must fail");
+        assert!(
+            invalid
+                .to_string()
+                .contains("invalid input_cost_per_million_usd")
+        );
     }
     #[test]
     fn llm_pricing_validation_is_identical_for_primary_and_model_list() {

@@ -74,10 +74,16 @@ impl<'a> LlmGateway<'a> {
             }
             return Ok(0);
         };
-        if self.budget.require_pricing
-            && (route.input_cost_per_million_usd.is_none()
-                || route.output_cost_per_million_usd.is_none())
-        {
+        // The tier a request reaches is decided by its whole prompt input:
+        // ordinary input plus the disjoint cache read and cache creation
+        // subsets, so every token is counted once. The selected tier
+        // prices the whole request; no token is split across two tiers.
+        let prompt_input = ordinary_input
+            .saturating_add(usage.cached_input)
+            .saturating_add(usage.cache_creation_input);
+        let tier = policy::select_cost_tier(&route.cost_tiers, prompt_input);
+        let rates = route.rates().resolve(tier);
+        if self.budget.require_pricing && (rates.input.is_none() || rates.output.is_none()) {
             return Err(StepError::failed(
                 &node.id,
                 format!(
@@ -88,10 +94,10 @@ impl<'a> LlmGateway<'a> {
         // The contract owns the cache-rate fallback, so an absent cache
         // rate bills at the ordinary input rate. The metered rates
         // themselves must be finite and non-negative.
-        let input = route.input_cost_per_million_usd.unwrap_or_default();
-        let output = route.output_cost_per_million_usd.unwrap_or_default();
-        let read = route.cache_read_rate().unwrap_or_default();
-        let creation = route.cache_creation_rate().unwrap_or_default();
+        let input = rates.input.unwrap_or_default();
+        let output = rates.output.unwrap_or_default();
+        let read = rates.cache_read.unwrap_or_default();
+        let creation = rates.cache_creation.unwrap_or_default();
         if [input, output, read, creation]
             .into_iter()
             .any(|rate| !rate.is_finite() || rate < 0.0)

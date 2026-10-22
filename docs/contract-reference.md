@@ -81,6 +81,19 @@ Fields:
   input/output prices only. Budgets are estimates, not invoices, especially
   when rates for actual token categories are unset. No vendor discounts or
   TTL-specific prices are inferred. See [usage and cost accounting](run-event-reference.md).
+- `cost_tiers` on `model`: optional context tiers. Each tier names
+  `threshold_tokens` (the prompt input from which the tier applies) and the
+  rates that price a request at that tier:
+  `input_cost_per_million_usd`,
+  `cache_read_input_cost_per_million_usd`,
+  `cache_creation_input_cost_per_million_usd`, and
+  `output_cost_per_million_usd`. The tier whose threshold the request's whole
+  prompt input reaches prices the whole request; the thresholds must strictly
+  increase and every rate must be finite and non-negative. A tier rate that is
+  omitted inherits the base row's rate for that category, except a cache rate,
+  which inherits the tier's own ordinary input rate. A contract that declares
+  tiers owns the whole schedule; otherwise the catalog's tiers apply, and a
+  rate the contract pinned prices every tier.
 - `max_context_bytes`
 - `max_context_tokens`
 - `max_media_bytes`: required aggregate byte limit when an LLM node declares

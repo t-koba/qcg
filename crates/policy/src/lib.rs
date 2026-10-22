@@ -15,6 +15,7 @@ pub mod retention;
 pub mod scheduling;
 pub mod schema;
 pub mod service;
+pub mod tier;
 
 pub use audit::{
     AuditConfig, AuditFloor, AuditLevel, AuditLimits, AuditMode, AuditPolicy, EventClass,
@@ -69,3 +70,6 @@ pub use schema::{
     compile_bounded_validator, validate_bounded_json_schema,
 };
 pub use service::{binary_stem, default_service_name};
+pub use tier::{
+    CostRates, CostTier, CostTierError, max_cost_rates, select_cost_tier, validate_cost_tiers,
+};

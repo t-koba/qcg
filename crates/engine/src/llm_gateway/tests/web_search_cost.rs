@@ -51,6 +51,7 @@ fn search_pricing(price: Option<f64>) -> ModelRef {
         cache_read_input_cost_per_million_usd: None,
         cache_creation_input_cost_per_million_usd: None,
         web_search_call_cost_usd: price,
+        cost_tiers: Vec::new(),
     }
 }
 

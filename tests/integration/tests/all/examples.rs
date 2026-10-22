@@ -1225,6 +1225,7 @@ fn generator_research_nodes_deserialize_typed_bounded_mcp_contracts() {
         cache_creation_input_cost_per_million_usd: None,
         output_cost_per_million_usd: None,
         web_search_call_cost_usd: None,
+        cost_tiers: Vec::new(),
     };
 
     let both = typed_agent_params(&contract, "research_both");

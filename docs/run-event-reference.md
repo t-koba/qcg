@@ -110,5 +110,18 @@ use prompt bytes/4, the maximum requested output, and the highest configured
 input-category rate on the selected row; they remain heuristic because token
 count and fallback usage are not known before the request. Reported usage drives
 the post-call budget check.
+
+A selected row may declare context tiers (`cost_tiers`). The tier is chosen by
+the request's whole prompt input, that is `ordinary_input + cached_input +
+cache_creation_input`, and the tier with the greatest threshold the request
+reaches prices the whole request: no token is split across two tiers and no
+token is counted twice. A tier rate wins over the base row's rate for the same
+category; a cache rate the tier does not name falls back to the tier's own
+ordinary input rate, and an output rate the tier does not name falls back to
+the base row's output rate. A request that stays below every threshold is
+priced at the base row. Admission reservations cannot prove which tier a
+request reaches, so they reserve at the dearest rate any tier on the row
+names.
+
 Calls without resolvable pricing contribute `0` unless a cost budget forces an
 error, so totals mixing priced and unpriced calls may understate spend.

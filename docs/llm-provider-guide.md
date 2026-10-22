@@ -280,6 +280,11 @@ Fields:
   No vendor prices or cache TTL tiers are built in. `require_pricing` continues
   to require ordinary input/output rates only; costs remain estimates, not
   invoices, particularly unless all actual categories have configured rates.
+- `cost_tiers`: optional context tiers, the same shape the contract's
+  `model.cost_tiers` uses. A tier names `threshold_tokens` and the rates that
+  price a request whose whole prompt input reaches that threshold. A registry
+  tier list replaces the external catalog's tier list for the same model
+  instead of merging with it, so an operator can state the exact schedule.
 - `context_tokens` / `max_output_tokens`: selection metadata.
 - `enabled`: `false` hides the model from `qcg models` and the catalog API.
 

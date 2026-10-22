@@ -10,6 +10,8 @@ pub use types::*;
 mod tests {
     #[path = "cache_cost.rs"]
     mod cache_cost;
+    #[path = "tier_cost.rs"]
+    mod tier_cost;
     #[path = "web_search_cost.rs"]
     mod web_search_cost;
     use super::*;
@@ -663,6 +665,7 @@ mod tests {
                 cache_read_input_cost_per_million_usd: None,
                 output_cost_per_million_usd: Some(1.0),
                 web_search_call_cost_usd: None,
+                cost_tiers: Vec::new(),
             }],
         );
         let node = test_node();
@@ -807,6 +810,7 @@ mod tests {
                 cache_read_input_cost_per_million_usd: None,
                 output_cost_per_million_usd: None,
                 web_search_call_cost_usd: None,
+                cost_tiers: Vec::new(),
             })
             .collect()
     }

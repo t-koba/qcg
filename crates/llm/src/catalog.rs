@@ -922,6 +922,13 @@ fn merge_model(base: &ModelSpec, over: &ModelSpec) -> ModelSpec {
         output_cost_per_million_usd: over
             .output_cost_per_million_usd
             .or(base.output_cost_per_million_usd),
+        // A tier list is a whole price schedule: an explicit registry
+        // declaration replaces the external one instead of merging with it.
+        cost_tiers: if over.cost_tiers.is_empty() {
+            base.cost_tiers.clone()
+        } else {
+            over.cost_tiers.clone()
+        },
         context_tokens: over.context_tokens.or(base.context_tokens),
         max_output_tokens: over.max_output_tokens.or(base.max_output_tokens),
         enabled: over.enabled.or(base.enabled),
@@ -1155,6 +1162,49 @@ struct ModelsDevCost {
     output: Option<f64>,
     cache_read: Option<f64>,
     cache_write: Option<f64>,
+    /// Context tiers: the rates that apply to a whole request once its
+    /// prompt input reaches a tier's threshold. The source's shape is not
+    /// pinned, so every tier is read on its own.
+    #[serde(default)]
+    tiers: Vec<Value>,
+}
+
+/// One context tier as the source publishes it: the threshold from which
+/// the row's rates apply, and the rates in the same fields the base cost
+/// row uses.
+#[derive(Debug, Deserialize)]
+struct ModelsDevCostTier {
+    threshold_tokens: u64,
+    #[serde(default)]
+    input: Option<f64>,
+    #[serde(default)]
+    output: Option<f64>,
+    #[serde(default)]
+    cache_read: Option<f64>,
+    #[serde(default)]
+    cache_write: Option<f64>,
+}
+
+/// Maps the source's tiers onto the shared tier type. A tier qcg cannot
+/// read, or a schedule qcg cannot validate, leaves the model's flat rates
+/// in place: qcg prices a request at a rate it read, never at one it
+/// guessed. The provider registry can declare the tiers exactly.
+fn map_models_dev_tiers(tiers: &[Value]) -> Option<Vec<policy::CostTier>> {
+    let mut mapped = Vec::new();
+    for tier in tiers {
+        let Ok(tier) = serde_json::from_value::<ModelsDevCostTier>(tier.clone()) else {
+            return None;
+        };
+        mapped.push(policy::CostTier {
+            threshold_tokens: tier.threshold_tokens,
+            input_cost_per_million_usd: tier.input,
+            cache_read_input_cost_per_million_usd: tier.cache_read,
+            cache_creation_input_cost_per_million_usd: tier.cache_write,
+            output_cost_per_million_usd: tier.output,
+        });
+    }
+    policy::validate_cost_tiers(&mapped).ok()?;
+    Some(mapped)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1200,6 +1250,9 @@ pub(crate) fn map_models_dev(text: &str) -> Result<ExternalCatalog, String> {
                 Vec::new()
             };
             let cost = model.cost.as_ref();
+            let cost_tiers = cost
+                .and_then(|cost| map_models_dev_tiers(&cost.tiers))
+                .unwrap_or_default();
             let enabled = match model.status.as_deref() {
                 Some("deprecated") => Some(false),
                 _ => None,
@@ -1215,6 +1268,7 @@ pub(crate) fn map_models_dev(text: &str) -> Result<ExternalCatalog, String> {
                     cache_creation_input_cost_per_million_usd: cost.and_then(|c| c.cache_write),
                     cache_read_input_cost_per_million_usd: cost.and_then(|c| c.cache_read),
                     output_cost_per_million_usd: cost.and_then(|c| c.output),
+                    cost_tiers,
                     context_tokens: model.limit.as_ref().and_then(|limit| limit.context),
                     max_output_tokens: model.limit.as_ref().and_then(|limit| limit.output),
                     enabled,
@@ -1311,6 +1365,7 @@ mod tests {
             cache_creation_input_cost_per_million_usd: Some(3.0),
             cache_read_input_cost_per_million_usd: Some(0.0),
             output_cost_per_million_usd: None,
+            cost_tiers: Vec::new(),
             context_tokens: None,
             max_output_tokens: None,
             enabled: None,
@@ -1320,6 +1375,61 @@ mod tests {
         assert_eq!(merged.cache_creation_input_cost_per_million_usd, Some(3.0));
         assert_eq!(merged.input_cost_per_million_usd, Some(1.75));
         assert_eq!(merged.output_cost_per_million_usd, Some(14.0));
+    }
+
+    const MODELS_DEV_TIER_FIXTURE: &str = r#"
+{
+  "openai": {
+    "models": {
+      "tiered": {
+        "cost": {
+          "input": 1.0,
+          "output": 2.0,
+          "tiers": [
+            {
+              "threshold_tokens": 200000,
+              "input": 2.0,
+              "output": 4.0,
+              "cache_read": 0.2,
+              "cache_write": 2.5
+            }
+          ]
+        }
+      },
+      "unreadable": {
+        "cost": {
+          "input": 1.0,
+          "output": 2.0,
+          "tiers": [ { "from": 200000, "input": 2.0 } ]
+        }
+      }
+    }
+  }
+}
+"#;
+
+    #[test]
+    fn models_dev_tiers_are_read_and_an_unreadable_tier_keeps_the_flat_rates() {
+        let catalog = map_models_dev(MODELS_DEV_TIER_FIXTURE).expect("fixture must map");
+        let tiered = &catalog.providers["openai"]["tiered"];
+        assert_eq!(tiered.cost_tiers.len(), 1);
+        assert_eq!(tiered.cost_tiers[0].threshold_tokens, 200_000);
+        assert_eq!(tiered.cost_tiers[0].input_cost_per_million_usd, Some(2.0));
+        assert_eq!(tiered.cost_tiers[0].output_cost_per_million_usd, Some(4.0));
+        assert_eq!(
+            tiered.cost_tiers[0].cache_read_input_cost_per_million_usd,
+            Some(0.2)
+        );
+        assert_eq!(
+            tiered.cost_tiers[0].cache_creation_input_cost_per_million_usd,
+            Some(2.5)
+        );
+        // A tier qcg cannot read leaves the model's flat rates in place:
+        // qcg never prices a request at a rate it could not read.
+        let unreadable = &catalog.providers["openai"]["unreadable"];
+        assert!(unreadable.cost_tiers.is_empty());
+        assert_eq!(unreadable.input_cost_per_million_usd, Some(1.0));
+        assert_eq!(unreadable.output_cost_per_million_usd, Some(2.0));
     }
 
     #[test]
@@ -1333,6 +1443,7 @@ mod tests {
             cache_creation_input_cost_per_million_usd: None,
             cache_read_input_cost_per_million_usd: None,
             output_cost_per_million_usd: Some(2.0),
+            cost_tiers: Vec::new(),
             context_tokens: Some(1000),
             max_output_tokens: Some(500),
             enabled: None,
@@ -1346,6 +1457,7 @@ mod tests {
             cache_creation_input_cost_per_million_usd: None,
             cache_read_input_cost_per_million_usd: None,
             output_cost_per_million_usd: None,
+            cost_tiers: Vec::new(),
             context_tokens: None,
             max_output_tokens: None,
             enabled: Some(false),
@@ -1712,6 +1824,7 @@ label = "Explicit label"
                     cache_creation_input_cost_per_million_usd: Some(3.0),
                     cache_read_input_cost_per_million_usd: Some(0.0),
                     output_cost_per_million_usd: Some(2.0),
+                    cost_tiers: Vec::new(),
                     context_tokens: Some(1000),
                     max_output_tokens: Some(500),
                     enabled: None,

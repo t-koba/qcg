@@ -75,6 +75,7 @@ fn priced_route(
     contract: Option<&contract::ModelRef>,
     catalog: Option<llm::ModelPricing>,
 ) -> contract::ModelRef {
+    let cost_tiers = priced_tiers(contract, catalog.as_ref());
     contract::ModelRef {
         provider: provider.to_owned(),
         model: model.to_owned(),
@@ -107,7 +108,54 @@ fn priced_route(
                     .and_then(|pricing| pricing.output_cost_per_million_usd)
             }),
         web_search_call_cost_usd: None,
+        cost_tiers,
     }
+}
+
+/// The context tiers that price this route. A contract that declares its
+/// own tiers owns the whole schedule; otherwise the catalog's tiers apply.
+/// A rate the contract pinned is never overridden by a catalog tier: the
+/// pinned rate is carried into every tier, so it prices every tier, and
+/// the tier contributes only the rates the contract left open.
+fn priced_tiers(
+    contract: Option<&contract::ModelRef>,
+    catalog: Option<&llm::ModelPricing>,
+) -> Vec<policy::CostTier> {
+    let Some(contract) = contract else {
+        return catalog
+            .map(|pricing| pricing.cost_tiers.clone())
+            .unwrap_or_default();
+    };
+    if !contract.cost_tiers.is_empty() {
+        return contract.cost_tiers.clone();
+    }
+    let Some(catalog) = catalog else {
+        return Vec::new();
+    };
+    let rate = |declared: Option<f64>, tier: Option<f64>| declared.or(tier);
+    catalog
+        .cost_tiers
+        .iter()
+        .map(|tier| policy::CostTier {
+            threshold_tokens: tier.threshold_tokens,
+            input_cost_per_million_usd: rate(
+                contract.input_cost_per_million_usd,
+                tier.input_cost_per_million_usd,
+            ),
+            cache_read_input_cost_per_million_usd: rate(
+                contract.cache_read_input_cost_per_million_usd,
+                tier.cache_read_input_cost_per_million_usd,
+            ),
+            cache_creation_input_cost_per_million_usd: rate(
+                contract.cache_creation_input_cost_per_million_usd,
+                tier.cache_creation_input_cost_per_million_usd,
+            ),
+            output_cost_per_million_usd: rate(
+                contract.output_cost_per_million_usd,
+                tier.output_cost_per_million_usd,
+            ),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -124,12 +172,14 @@ mod tests {
             cache_creation_input_cost_per_million_usd: Some(0.0),
             output_cost_per_million_usd: None,
             web_search_call_cost_usd: None,
+            cost_tiers: Vec::new(),
         };
         let catalog = llm::ModelPricing {
             input_cost_per_million_usd: Some(1.0),
             cache_creation_input_cost_per_million_usd: Some(1.5),
             cache_read_input_cost_per_million_usd: Some(0.2),
             output_cost_per_million_usd: Some(3.0),
+            cost_tiers: Vec::new(),
         };
         let resolved = priced_route("p", "m", Some(&contract), Some(catalog));
         assert_eq!(resolved.input_cost_per_million_usd, Some(9.0));
@@ -139,5 +189,89 @@ mod tests {
             Some(0.0)
         );
         assert_eq!(resolved.output_cost_per_million_usd, Some(3.0));
+    }
+
+    #[test]
+    fn a_pinned_rate_prices_every_tier_and_a_contract_schedule_owns_the_route() {
+        let catalog_tier = policy::CostTier {
+            threshold_tokens: 200_000,
+            input_cost_per_million_usd: Some(2.0),
+            cache_read_input_cost_per_million_usd: Some(0.2),
+            cache_creation_input_cost_per_million_usd: None,
+            output_cost_per_million_usd: Some(4.0),
+        };
+        let catalog = llm::ModelPricing {
+            input_cost_per_million_usd: Some(1.0),
+            cache_creation_input_cost_per_million_usd: Some(1.5),
+            cache_read_input_cost_per_million_usd: Some(0.2),
+            output_cost_per_million_usd: Some(3.0),
+            cost_tiers: vec![catalog_tier.clone()],
+        };
+        let contract = contract::ModelRef {
+            provider: "p".into(),
+            model: "m".into(),
+            input_cost_per_million_usd: Some(9.0),
+            cache_read_input_cost_per_million_usd: None,
+            cache_creation_input_cost_per_million_usd: None,
+            output_cost_per_million_usd: None,
+            web_search_call_cost_usd: None,
+            cost_tiers: Vec::new(),
+        };
+        let resolved = priced_route("p", "m", Some(&contract), Some(catalog.clone()));
+        assert_eq!(resolved.cost_tiers.len(), 1);
+        assert_eq!(resolved.cost_tiers[0].threshold_tokens, 200_000);
+        // The pinned rate prices every tier, and the catalog tier fills
+        // only the rates the contract left open: the pinned input rate
+        // is carried into the tier, so the catalog's tier rate for that
+        // category never overrides it.
+        assert_eq!(resolved.cost_tiers[0].input_cost_per_million_usd, Some(9.0));
+        assert_eq!(
+            resolved.cost_tiers[0].cache_read_input_cost_per_million_usd,
+            Some(0.2)
+        );
+        // A contract that declares its own schedule owns the whole
+        // schedule.
+        let mut own = contract.clone();
+        own.cost_tiers = vec![policy::CostTier {
+            threshold_tokens: 100_000,
+            input_cost_per_million_usd: Some(5.0),
+            ..catalog_tier
+        }];
+        let resolved = priced_route("p", "m", Some(&own), Some(catalog));
+        assert_eq!(resolved.cost_tiers, own.cost_tiers);
+    }
+
+    #[test]
+    fn a_pinned_cache_rate_is_never_overridden_by_a_catalog_tier() {
+        let catalog = llm::ModelPricing {
+            input_cost_per_million_usd: Some(1.0),
+            cache_creation_input_cost_per_million_usd: Some(1.5),
+            cache_read_input_cost_per_million_usd: Some(0.2),
+            output_cost_per_million_usd: Some(3.0),
+            cost_tiers: vec![policy::CostTier {
+                threshold_tokens: 200_000,
+                input_cost_per_million_usd: Some(2.0),
+                cache_read_input_cost_per_million_usd: Some(0.2),
+                cache_creation_input_cost_per_million_usd: None,
+                output_cost_per_million_usd: Some(4.0),
+            }],
+        };
+        let contract = contract::ModelRef {
+            provider: "p".into(),
+            model: "m".into(),
+            input_cost_per_million_usd: None,
+            cache_read_input_cost_per_million_usd: Some(0.1),
+            cache_creation_input_cost_per_million_usd: None,
+            output_cost_per_million_usd: None,
+            web_search_call_cost_usd: None,
+            cost_tiers: Vec::new(),
+        };
+        let resolved = priced_route("p", "m", Some(&contract), Some(catalog));
+        // The contract pinned the cache read rate, so the catalog tier's
+        // own rate for that category never overrides it.
+        assert_eq!(
+            resolved.cost_tiers[0].cache_read_input_cost_per_million_usd,
+            Some(0.1)
+        );
     }
 }
