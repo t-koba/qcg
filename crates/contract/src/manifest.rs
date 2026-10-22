@@ -967,6 +967,44 @@ files = ["ui/index.html"]
         assert!(error.to_string().contains("invalid MIME type"));
     }
     #[test]
+    fn output_glob_may_hold_wildcards_but_not_a_windows_forbidden_character() {
+        let mut manifest = manifest_with_field(InputField {
+            id: "name".into(),
+            label: None,
+            label_i18n: BTreeMap::new(),
+            kind: FieldType::String,
+            required: false,
+            default: None,
+            pattern: None,
+            options: vec![],
+            option_labels_i18n: BTreeMap::new(),
+            min_items: None,
+            item_type: None,
+            ..input_field_defaults()
+        });
+        // A glob may hold the `*` and `?` wildcards.
+        manifest.outputs.extras.push(OutputExtraDef {
+            glob: "reports/**/*.json".into(),
+            label: "Reports".into(),
+            required: false,
+            mime: None,
+            description: String::new(),
+            preview: ArtifactPreview::Auto,
+        });
+        manifest
+            .validate()
+            .expect("a glob with wildcards must be accepted");
+        // A character Win32 forbids in a file name is refused.
+        manifest.outputs.extras[0].glob = "reports/bad|name.json".into();
+        let error = manifest
+            .validate()
+            .expect_err("a glob naming a forbidden character must be rejected");
+        assert!(
+            error.to_string().contains("safe relative glob pattern"),
+            "{error}"
+        );
+    }
+    #[test]
     fn resolve_inputs_rejects_missing_required_values() {
         let manifest = manifest_with_field(InputField {
             id: "name".into(),

@@ -1,10 +1,16 @@
 //! Platform-independent path safety predicates. Paths are persisted in
 //! contracts and journals and may be consumed on another host, so these
 //! checks never depend on the local filesystem.
+//!
+//! A safe relative path is non-empty, relative, slash-separated, and names
+//! no form a Windows host cannot represent: no ADS or drive colon, no
+//! backslash, no control byte, no trailing dot or space, no reserved device
+//! stem, and none of the characters Win32 forbids in a file name (`<`, `>`,
+//! `"`, `|`, `?`, `*`). A glob pattern is the same shape, except that a
+//! component may hold the `*` and `?` wildcards.
 
 use camino::Utf8Path;
 
-/// Returns whether `path` is a safe, non-empty, relative slash-separated path.
 /// Device names Windows cannot represent as files. Matching is
 /// case-insensitive against the stem before the first `.`, because
 /// `NUL.txt` is the `NUL` device on Windows.
@@ -13,6 +19,13 @@ const WINDOWS_RESERVED_STEMS: [&str; 24] = [
     "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8",
     "LPT9",
 ];
+
+/// Characters Win32 forbids in a file name, apart from the colon and
+/// the backslash that are refused separately. A path that names one
+/// cannot exist on a Windows host, so a contract, journal or archive
+/// entry carrying it is not portable. The `?` and `*` wildcards are
+/// forbidden in a file name too, but only a glob pattern may hold them.
+const WIN32_FORBIDDEN_CHARS: [char; 4] = ['<', '>', '"', '|'];
 
 fn equals_ignore_ascii_case(left: &str, right: &str) -> bool {
     left.len() == right.len()
@@ -24,8 +37,10 @@ fn equals_ignore_ascii_case(left: &str, right: &str) -> bool {
 
 /// Returns whether a single `/`-separated component survives Win32
 /// normalization unchanged: no ADS/drive colon, no stripped trailing
-/// dot/space, no reserved device stem, no control bytes.
-fn is_portable_component(part: &str) -> bool {
+/// dot/space, no reserved device stem, no control bytes, and no
+/// character Win32 forbids in a file name. A glob pattern may hold
+/// the `*` and `?` wildcards; a concrete path may not.
+fn is_portable_component(part: &str, wildcards_allowed: bool) -> bool {
     if part.is_empty() || part == "." || part == ".." {
         return false;
     }
@@ -38,6 +53,9 @@ fn is_portable_component(part: &str) -> bool {
     if part.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
         return false;
     }
+    if part.contains(WIN32_FORBIDDEN_CHARS) || (!wildcards_allowed && part.contains(['?', '*'])) {
+        return false;
+    }
     let stem = part.split('.').next().unwrap_or(part);
     if WINDOWS_RESERVED_STEMS
         .iter()
@@ -48,14 +66,33 @@ fn is_portable_component(part: &str) -> bool {
     true
 }
 
-pub fn is_safe_relative_path(path: &str) -> bool {
+/// The shared shape of a safe relative path: non-empty, relative,
+/// slash-separated, and free of the forms a Windows host cannot hold.
+fn is_safe_relative(path: &str, wildcards_allowed: bool) -> bool {
     let bytes = path.as_bytes();
     !path.is_empty()
         && !path.starts_with('/')
         && !(bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
         && !path.contains('\\')
         && !path.contains('\0')
-        && !path.split('/').any(|part| !is_portable_component(part))
+        && !path
+            .split('/')
+            .any(|part| !is_portable_component(part, wildcards_allowed))
+}
+
+/// Returns whether `path` is a safe, non-empty, relative slash-separated
+/// path that names a file every host can hold.
+pub fn is_safe_relative_path(path: &str) -> bool {
+    is_safe_relative(path, false)
+}
+
+/// Returns whether `pattern` is a safe relative glob pattern: the rules
+/// of a safe relative path, except that a component may hold the `*` and
+/// `?` wildcards. The characters Win32 forbids in a file name stay
+/// forbidden, so a pattern cannot name a file a Windows host cannot
+/// hold.
+pub fn is_safe_glob_pattern(pattern: &str) -> bool {
+    is_safe_relative(pattern, true)
 }
 
 pub fn is_safe_path_component(path: &str) -> bool {
@@ -173,6 +210,13 @@ mod tests {
             "a/bad\u{7}name",
             "CON",
             "nul.txt",
+            // Characters Win32 forbids in a file name.
+            "a/file<name",
+            "a/file>name",
+            "a/file\"name",
+            "a/file|name",
+            "a/file?name",
+            "a/file*name",
         ] {
             assert!(!is_safe_relative_path(bad), "{bad:?}");
             if !bad.contains('/') {
@@ -181,6 +225,32 @@ mod tests {
         }
         for good in ["a/normal.txt", "a.b", "console.log", "auxiliary/data.txt"] {
             assert!(is_safe_relative_path(good), "{good:?}");
+        }
+    }
+
+    #[test]
+    fn a_glob_pattern_may_hold_the_wildcards_only() {
+        // A pattern is the only place the `*` and `?` wildcards may appear.
+        for good in [
+            "reports/*.json",
+            "reports/**/*.json",
+            "reports/?.json",
+            "reports/report-*.json",
+        ] {
+            assert!(is_safe_glob_pattern(good), "{good:?}");
+        }
+        for bad in [
+            "../escape",
+            "/absolute",
+            "a\\b",
+            "a/bad<name",
+            "a/bad>name",
+            "a/bad\"name",
+            "a/bad|name",
+            "a/file:evil",
+            "a/NUL",
+        ] {
+            assert!(!is_safe_glob_pattern(bad), "{bad:?}");
         }
     }
 }

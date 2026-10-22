@@ -2,7 +2,7 @@ use policy::is_safe_relative_path;
 use serde::Deserialize;
 use std::collections::BTreeSet;
 
-use super::assets::{validate_artifact_pattern, validate_tool};
+use super::assets::{validate_artifact_glob, validate_artifact_pattern, validate_tool};
 use super::contract::{ContractError, stripped_error_message};
 use super::nodes::{ContextRef, NodeDef};
 use super::resources::CommandIsolation;
@@ -556,7 +556,7 @@ impl OutputArtifactRule {
             }
         }
         for extra in &manifest.outputs.extras {
-            validate_artifact_pattern(&extra.glob, "output glob")?;
+            validate_artifact_glob(&extra.glob, "output glob")?;
             validate_artifact_mime(extra.mime.as_deref(), &format!("glob `{}`", extra.glob))?;
         }
         Ok(())

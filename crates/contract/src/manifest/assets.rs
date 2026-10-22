@@ -1,6 +1,6 @@
 use crate::{FieldType, InputField};
 use model::{FileValue, FileValueError};
-use policy::is_safe_relative_path;
+use policy::{is_safe_glob_pattern, is_safe_relative_path};
 use serde_json::Value;
 use std::collections::BTreeSet;
 
@@ -80,6 +80,17 @@ pub(crate) fn validate_artifact_pattern(pattern: &str, kind: &str) -> Result<(),
     if !is_safe_relative_path(pattern) {
         return Err(ContractError::Invalid(format!(
             "{kind} `{pattern}` is not a safe relative path"
+        )));
+    }
+    Ok(())
+}
+
+/// Validates an output glob: a safe relative path whose components may
+/// hold the `*` and `?` wildcards.
+pub(crate) fn validate_artifact_glob(pattern: &str, kind: &str) -> Result<(), ContractError> {
+    if !is_safe_glob_pattern(pattern) {
+        return Err(ContractError::Invalid(format!(
+            "{kind} `{pattern}` is not a safe relative glob pattern"
         )));
     }
     Ok(())

@@ -59,8 +59,8 @@ pub use limits::{
 };
 pub use params::{params_schema, string_array_schema, string_schema};
 pub use path::{
-    is_safe_path_component, is_safe_relative_path, normalize_path_prefix, path_is_within_prefix,
-    portable_relative_path,
+    is_safe_glob_pattern, is_safe_path_component, is_safe_relative_path, normalize_path_prefix,
+    path_is_within_prefix, portable_relative_path,
 };
 pub use retention::RetentionPolicy;
 pub use scheduling::{ElapsedBudgetMode, PreemptionMode, PreemptionQueuePosition};
