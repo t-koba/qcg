@@ -5,7 +5,7 @@ pub(crate) use identity::*;
 
 use api::FormSpec;
 use api::{ToolCallErrorCode, ToolCallPhase, ToolCallStatus};
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use contract::{AgentFailureAction, NodeDef, ToolDecl, validate_form_values};
 use contract::{AgentFailureCode, FieldType, InputField};
 use engine::{HttpRequest, ResultExt, StepContext, StepError};
@@ -31,57 +31,31 @@ pub(crate) struct AgentToolServices<'a> {
     pub(crate) guardrails: &'a [GuardrailDecl],
 }
 
-/// The files an agent's tools wrote, and the ones they removed again.
-///
-/// The executors report what they wrote, because a replayed write carries
-/// the same result shape as a fresh one and only the executor knows which
-/// it was. The command tool is the only path that removes a file today, so
-/// a file the agent wrote that was present before a command call and absent
-/// after it was removed by that call.
-///
-/// The two absences are not the same fact. A file the agent removed is not
-/// an output of the step, whether the write was fresh or replayed: the
-/// agent deleted it. A file the workspace lost is an output, and the pin
-/// step fails loudly for it rather than letting the run finish green with
-/// a hole in its workspace.
+/// Tracks outputs and removals; deliberate removals persist across attempts.
 #[derive(Default)]
 pub(crate) struct AgentWrites {
-    /// The files this attempt's tools wrote: the path the tool was given
-    /// and where it landed.
     outputs: Vec<(String, Utf8PathBuf)>,
-    /// The paths the agent's own tools removed. A removal outlives the
-    /// attempt that made it, so it is journaled with the step's checkpoint
-    /// rather than kept only in memory.
     removed: BTreeSet<String>,
 }
 
 impl AgentWrites {
-    /// Records a file a tool wrote now. The write puts the file back, so
-    /// it supersedes an earlier removal of it.
     pub(crate) fn record_write(&mut self, path: &str, resolved: Utf8PathBuf) {
         self.removed.remove(path);
         self.outputs.push((path.to_string(), resolved));
     }
 
-    /// Records a file whose write the guard replayed from an earlier
-    /// attempt. Nothing was written now, so an earlier removal of the file
-    /// still stands.
     pub(crate) fn record_replay(&mut self, path: &str, resolved: Utf8PathBuf) {
         self.outputs.push((path.to_string(), resolved));
     }
 
-    /// The paths the agent's own tools removed.
     pub(crate) fn removed(&self) -> &BTreeSet<String> {
         &self.removed
     }
 
-    /// Restores the removals an earlier attempt of this step recorded.
     pub(crate) fn restore_removals(&mut self, removed: BTreeSet<String>) {
         self.removed = removed;
     }
 
-    /// The files the step reports as its outputs: every file a tool wrote
-    /// that the agent's own tools did not remove.
     pub(crate) fn reported(&self) -> Vec<Utf8PathBuf> {
         self.outputs
             .iter()
@@ -90,9 +64,6 @@ impl AgentWrites {
             .collect()
     }
 
-    /// The files the step reports as its outputs that the workspace
-    /// still holds. A pin names a file the workspace must hold, so a
-    /// file the workspace lost is not reported (E06).
     pub(crate) fn reported_present(&self, ctx: &StepContext<'_>) -> Vec<Utf8PathBuf> {
         let present = self.present(ctx);
         self.outputs
@@ -102,7 +73,6 @@ impl AgentWrites {
             .collect()
     }
 
-    /// The files the agent wrote that the workspace holds now.
     fn present(&self, ctx: &StepContext<'_>) -> BTreeSet<String> {
         self.outputs
             .iter()
@@ -111,9 +81,6 @@ impl AgentWrites {
             .collect()
     }
 
-    /// Records the files a command call removed: those the agent wrote
-    /// that were present before the call and are absent after it. The
-    /// agent removed them deliberately, so they are not outputs.
     fn record_removals(&mut self, ctx: &StepContext<'_>, present_before: &BTreeSet<String>) {
         let removed: Vec<String> = self
             .outputs
@@ -127,6 +94,35 @@ impl AgentWrites {
     }
 }
 
+fn workspace_relative_file_key(
+    workspace: &Utf8Path,
+    resolved: &Utf8Path,
+) -> std::io::Result<String> {
+    let (workspace, path) = match std::fs::canonicalize(resolved) {
+        Ok(path) => (std::fs::canonicalize(workspace)?, path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
+            workspace.as_std_path().to_path_buf(),
+            resolved.as_std_path().to_path_buf(),
+        ),
+        Err(error) => return Err(error),
+    };
+    let path = path
+        .strip_prefix(workspace)
+        .map_err(std::io::Error::other)?;
+    let path = Utf8PathBuf::from_path_buf(path.to_path_buf())
+        .map_err(|_| std::io::Error::other("output path is not valid UTF-8"))?;
+    Ok(policy::portable_relative_path(&path))
+}
+
+fn agent_output_file_key(
+    ctx: &StepContext<'_>,
+    node: &NodeDef,
+    resolved: &Utf8Path,
+) -> Result<String, StepError> {
+    workspace_relative_file_key(&ctx.run.workspace, resolved)
+        .map_err(|error| StepError::failed(&node.id, format!("cannot key `{resolved}`: {error}")))
+}
+
 pub(crate) struct AgentToolInvocation<'a> {
     pub(crate) mcp: &'a McpAgentTools,
     pub(crate) tools: &'a [ToolDecl],
@@ -137,8 +133,6 @@ pub(crate) struct AgentToolInvocation<'a> {
     /// Skills already activated in this agent run, keyed by
     /// `<resource>::<name>`; repeated activations skip re-injection.
     pub(crate) activated_skills: &'a mut std::collections::BTreeSet<String>,
-    /// The files the tool calls of this step attempt wrote, shared by the
-    /// parent agent and every delegated specialist it runs.
     pub(crate) writes: &'a mut AgentWrites,
 }
 
@@ -840,7 +834,8 @@ fn record_replayed_write(
     writes: &mut AgentWrites,
 ) -> Result<(), StepError> {
     let target = ctx.run.fs.resolve_write(path).step_err(&node.id)?;
-    writes.record_replay(path, target);
+    let file_key = agent_output_file_key(ctx, node, &target)?;
+    writes.record_replay(&file_key, target);
     Ok(())
 }
 
@@ -853,12 +848,13 @@ pub(crate) async fn execute_agent_fs_write(
     writes: &mut AgentWrites,
 ) -> Result<AgentToolOutcome, StepError> {
     let target = ctx.run.fs.resolve_write(path).step_err(&node.id)?;
+    let file_key = agent_output_file_key(ctx, node, &target)?;
     ctx.run
         .fs
         .write_file_atomic(&target, content.as_bytes())
         .await
         .map_err(|error| ctx.side_effecting_gateway_error(node, operation_id, error))?;
-    writes.record_write(path, target.clone());
+    writes.record_write(&file_key, target.clone());
     let value = json!({ "file": path });
     ctx.run
         .finish_external_operation(ctx.journal, node, operation_id, Some(value.clone()))?;
@@ -882,6 +878,7 @@ pub(crate) async fn execute_agent_fs_patch(
     writes: &mut AgentWrites,
 ) -> Result<AgentToolOutcome, StepError> {
     let target = ctx.run.fs.resolve_write(path).step_err(&node.id)?;
+    let file_key = agent_output_file_key(ctx, node, &target)?;
     match ctx
         .run
         .fs
@@ -901,7 +898,7 @@ pub(crate) async fn execute_agent_fs_patch(
                 Some(value.clone()),
             )?;
             ctx.run.clear_pending_tool_payload(operation_id);
-            writes.record_write(path, target.clone());
+            writes.record_write(&file_key, target.clone());
             Ok(AgentToolOutcome::Result(value))
         }
         Err(error) => {
@@ -1903,6 +1900,35 @@ pub(crate) fn record_agent_failure_event(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn alternate_resolved_spellings_share_the_pinned_removal_key() {
+        let root = std::env::temp_dir().join(format!("qcg-agent-path-key-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let workspace = Utf8PathBuf::from_path_buf(root.join("workspace")).expect("UTF-8 path");
+        std::fs::create_dir_all(workspace.join("out")).expect("create workspace");
+        let canonical = workspace.join("out/note.txt");
+        std::fs::write(&canonical, "written").expect("create note");
+        let alternate = workspace.join("out//note.txt");
+        let removed = workspace_relative_file_key(&workspace, &alternate).expect("removal key");
+        let written = workspace_relative_file_key(&workspace, &canonical).expect("write key");
+        assert_eq!(removed, "out/note.txt");
+        assert_eq!(removed, written, "both spellings match the pinned path");
+
+        let mut writes = AgentWrites::default();
+        writes.restore_removals(BTreeSet::from([removed.clone()]));
+        writes.record_write(&written, canonical);
+        assert!(
+            writes.removed().is_empty(),
+            "the later write supersedes the removal"
+        );
+        std::fs::remove_file(workspace.join("out/note.txt")).expect("remove note");
+        assert_eq!(
+            workspace_relative_file_key(&workspace, &alternate).unwrap(),
+            removed
+        );
+        std::fs::remove_dir_all(root).expect("remove test workspace");
+    }
 
     #[test]
     fn malformed_sensitive_query_declaration_fails_closed() {
