@@ -5920,6 +5920,80 @@ async fn a_parallel_suspension_journals_the_files_the_attempt_wrote() {
 }
 
 #[tokio::test]
+async fn a_foreach_child_suspension_journals_the_files_the_attempt_wrote() {
+    // E06: the foreach child is a suspension site too. A child that writes
+    // a file and then asks must journal the write, so the loop's
+    // suspension keeps what the child produced.
+    // The child writes into the workspace, so the block runs serially.
+    let mut manifest = manifest(vec![foreach_node(
+        "each",
+        "each_body",
+        "inputs.items",
+        1,
+        10,
+    )]);
+    manifest.inputs = foreach_items_input();
+    manifest.blocks.insert(
+        "each_body".into(),
+        vec![node("child", "test.write_then_ask")],
+    );
+    let run_dir = temp_run_dir("foreach-suspension-files");
+    let mut registry = StepRegistry::new();
+    registry.register(TestForeachStep);
+    registry.register(WriteThenAskStep);
+    let error = run_engine_with(
+        manifest,
+        registry,
+        BTreeMap::from([("items".into(), json!(["a", "b"]))]),
+        run_dir.clone(),
+        100,
+    )
+    .await
+    .expect_err("the child question must suspend the loop");
+    assert!(
+        matches!(error, EngineError::NeedsUser { .. }),
+        "the suspension must surface as NeedsUser: {error}"
+    );
+    let events = journal_events(&run_dir);
+    assert_suspension_pins_written_file(&events, &run_dir, "each[0]/child");
+    let _ = std::fs::remove_dir_all(&run_dir);
+}
+
+#[tokio::test]
+async fn a_named_repair_suspension_journals_the_files_the_attempt_wrote() {
+    // E06: the named repair node is a suspension site too. A repair node
+    // that writes a file and then asks must journal the write, so the
+    // repair cycle's suspension keeps what the attempt produced.
+    let mut broken = node("broken", "test.check_fail");
+    broken.on_fail = Some(OnFail::Repair {
+        repair: "fixer".into(),
+        recheck: "recheck".into(),
+        max_attempts: 1,
+        on_exhausted: ExhaustedAction::Fail,
+    });
+    let manifest = manifest(vec![
+        broken,
+        node("fixer", "test.write_then_ask"),
+        node("recheck", "test.pass"),
+    ]);
+    let run_dir = temp_run_dir("repair-suspension-files");
+    let mut registry = StepRegistry::new();
+    registry.register(TestCheckFailStep);
+    registry.register(WriteThenAskStep);
+    registry.register(TestPassStep);
+    let error = run_engine_with(manifest, registry, BTreeMap::new(), run_dir.clone(), 100)
+        .await
+        .expect_err("the repair question must suspend the cycle");
+    assert!(
+        matches!(error, EngineError::NeedsUser { .. }),
+        "the suspension must surface as NeedsUser: {error}"
+    );
+    let events = journal_events(&run_dir);
+    assert_suspension_pins_written_file(&events, &run_dir, "broken@repair.1/fixer");
+    let _ = std::fs::remove_dir_all(&run_dir);
+}
+
+#[tokio::test]
 async fn elapsed_cap_binds_failed_finalization_too() {
     // E11: the same exceed-check precedes failed determination as success.
     // A run whose only node fails slowly past a 1 s elapsed cap settles
