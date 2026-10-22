@@ -382,6 +382,32 @@ mod tests {
     }
 
     #[test]
+    fn min_and_max_refuse_an_element_they_cannot_order() {
+        // Every element's type is checked on its own, so a singleton of an
+        // unsupported type is refused like the same element in a longer
+        // array. Only an empty array yields null.
+        for case in [
+            "min([null])",
+            "max([null])",
+            "min([[1]])",
+            "max([[1, 2]])",
+            "min([1, null])",
+            "max([1, 'a'])",
+        ] {
+            assert!(
+                value_bag().eval_value(case).is_err(),
+                "expression `{case}` should fail"
+            );
+        }
+        // The types the ordering functions accept are ordered among
+        // themselves.
+        assert_eq!(eval_value("min(['b', 'a'])"), json!("a"));
+        assert_eq!(eval_value("max(['b', 'a'])"), json!("b"));
+        assert_eq!(eval_value("min([true, false])"), json!(false));
+        assert_eq!(eval_value("max([true, false])"), json!(true));
+    }
+
+    #[test]
     fn the_unary_minus_does_not_overflow_on_the_largest_negative_number() {
         // The largest magnitude a double holds exactly as an integer is
         // -2^127, which has no positive counterpart in the exact integer

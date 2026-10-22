@@ -617,7 +617,8 @@ array indices (`inputs.sites.0`). Missing paths read as `null`. Operators are
 - strings: `upper`, `lower`, `trim`, `split`, `join`, `replace`
 - collections: `first`, `last`, `keys`, `values`, `reverse`, `flatten`,
   `unique`, `sort` (numbers, strings, or booleans only)
-- numbers: `sum`, `min`, `max` (empty arrays yield `null` for `min`/`max`)
+- numbers: `sum`, `min`, `max` (empty arrays yield `null` for `min`/`max`;
+  `min` and `max` accept numbers, strings, or booleans, like `sort`)
 
 `foreach.items` accepts a plain dotted path or any value-producing
 expression such as `sort(inputs.tags)`. Unknown functions and type mismatches

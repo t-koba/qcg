@@ -257,22 +257,18 @@ pub(crate) fn evaluate_call(name: &str, arguments: &[Value]) -> Result<Value, St
         ("sort", [value]) => match value {
             Value::Array(items) => {
                 let mut sorted = items.clone();
-                // Every element's type is checked, so a singleton of an
-                // unsupported type is refused like the same element in a
-                // longer array: the pairwise scan below only sees elements
-                // that have a neighbour.
-                for item in &sorted {
-                    if !matches!(item, Value::Number(_) | Value::String(_) | Value::Bool(_)) {
-                        return Err(
-                            "sort() requires an array of numbers, strings, or booleans".into()
-                        );
+                // One pass over the elements: every element's type is
+                // checked on its own, so a singleton of an unsupported type
+                // is refused like the same element in a longer array, and
+                // every neighbour pair is checked for a common type.
+                for index in 0..sorted.len() {
+                    if !is_orderable_scalar(&sorted[index]) {
+                        return Err(unordered_array_error("sort"));
                     }
-                }
-                for window in sorted.windows(2) {
-                    if compare_json_scalar(&window[0], &window[1]).is_none() {
-                        return Err(
-                            "sort() requires an array of numbers, strings, or booleans".into()
-                        );
+                    if index > 0
+                        && compare_json_scalar(&sorted[index - 1], &sorted[index]).is_none()
+                    {
+                        return Err(unordered_array_error("sort"));
                     }
                 }
                 sorted.sort_by(|left, right| {
@@ -336,20 +332,36 @@ pub(crate) fn evaluate_call(name: &str, arguments: &[Value]) -> Result<Value, St
 fn extreme(items: &[Value], name: &str, wanted: std::cmp::Ordering) -> Result<Value, String> {
     let mut selected: Option<&Value> = None;
     for item in items {
+        // Every element's type is checked on its own, so a singleton of an
+        // unsupported type is refused like the same element in a longer
+        // array.
+        if !is_orderable_scalar(item) {
+            return Err(unordered_array_error(name));
+        }
         let Some(current) = selected else {
             selected = Some(item);
             continue;
         };
         let Some(ordering) = compare_json_scalar(item, current) else {
-            return Err(format!(
-                "{name}() requires an array of numbers, strings, or booleans"
-            ));
+            return Err(unordered_array_error(name));
         };
         if ordering == wanted {
             selected = Some(item);
         }
     }
     Ok(selected.cloned().unwrap_or(Value::Null))
+}
+
+/// The scalar types the ordering functions accept: a value of another type
+/// has no order, so it is refused explicitly. The rule lives here so
+/// `sort`, `min` and `max` cannot drift apart.
+fn is_orderable_scalar(value: &Value) -> bool {
+    matches!(value, Value::Number(_) | Value::String(_) | Value::Bool(_))
+}
+
+/// The error the ordering functions refuse an array with.
+fn unordered_array_error(name: &str) -> String {
+    format!("{name}() requires an array of numbers, strings, or booleans")
 }
 
 fn join_values(value: &Value, separator: &str) -> Result<Value, String> {
