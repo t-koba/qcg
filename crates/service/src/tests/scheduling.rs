@@ -634,8 +634,10 @@ async fn elapsed_modes_initial_queue_and_exhausted_admission_start_no_effects() 
                 &crate::summaries::read_journal_events(&root.join("runs").join(&victim)).unwrap(),
             )
             .unwrap();
-            // The queue is not charged: the victim's active time stays
-            // inside its budget, far below the blocker's wait.
+            // The victim's charged time stays inside its own budget. The
+            // engine-level test in crates/engine/src/engine/elapsed.rs
+            // asserts the stronger property that the queue is not charged
+            // at all; this checks the charge against the budget.
             assert!(
                 state.budget.elapsed.unwrap().active_nanoseconds
                     < ELAPSED_BUDGET_SECS * 1_000_000_000
