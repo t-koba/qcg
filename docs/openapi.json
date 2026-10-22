@@ -766,6 +766,7 @@
       },
       "FilePinEventData": {
         "additionalProperties": false,
+        "description": "A retained workspace file revision: its path and the digest of its bytes.",
         "properties": {
           "path": {
             "type": "string"

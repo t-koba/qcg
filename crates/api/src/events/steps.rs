@@ -4,6 +4,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::Value;
 
+/// A retained workspace file revision: its path and the digest of its bytes.
 #[derive(Debug, Clone, Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FilePinEventData {

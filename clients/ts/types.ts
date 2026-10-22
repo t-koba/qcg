@@ -2177,6 +2177,7 @@ export interface components {
             dependencies?: components["schemas"]["DependencyFailure"][];
             message: string;
         };
+        /** @description A retained workspace file revision: its path and the digest of its bytes. */
         FilePinEventData: {
             path: string;
             sha256: string;

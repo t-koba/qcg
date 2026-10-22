@@ -131,6 +131,38 @@ mod tests {
     }
 
     #[test]
+    fn file_pins_are_closed_and_the_published_schema_says_so() {
+        // The pin is the one nested event-data object, so it must be closed
+        // like every other one: a pin carrying an unknown field is refused
+        // instead of silently dropping it.
+        let value = json!({
+            "t": "step_finished",
+            "seq": 8,
+            "ts": "2026-07-05T00:00:00Z",
+            "run_id": "run-1",
+            "trace_id": "trace-1",
+            "span_id": "span-8",
+            "node": "write_config",
+            "status": "success",
+            "files": [{"path": "out.txt", "sha256": "abc", "extra": true}]
+        });
+        let error =
+            RunEvent::from_flat(&value).expect_err("a pin with an unknown field must be refused");
+        assert!(error.contains("unknown field"), "{error}");
+
+        let document = crate::openapi_document("test");
+        let pin = &document["components"]["schemas"]["FilePinEventData"];
+        assert_eq!(pin["additionalProperties"], Value::Bool(false));
+        assert_eq!(pin["required"], json!(["path", "sha256"]));
+        assert!(
+            pin["description"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty()),
+            "the published pin schema must say what a pin is"
+        );
+    }
+
+    #[test]
     fn command_resource_events_decode_as_a_typed_source() {
         let value = json!({
             "t": "resource",

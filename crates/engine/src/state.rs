@@ -1339,15 +1339,12 @@ impl RunState {
                 .insert(pin.path.to_string(), pin.sha256.clone());
         }
         let node = NodePath::root(path);
-        let Some(removals) = self.removed_files.get_mut(&node) else {
-            return;
-        };
         for pin in files {
-            removals.remove(pin.path.as_str());
+            if let Some(removals) = self.removed_files.get_mut(&node) {
+                removals.remove(pin.path.as_str());
+            }
         }
-        if removals.is_empty() {
-            self.removed_files.remove(&node);
-        }
+        self.removed_files.retain(|_, set| !set.is_empty());
     }
 
     /// Counts one finished node execution. Interactions that suspend the
