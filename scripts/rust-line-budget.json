@@ -1,9 +1,9 @@
 {
   "_comment": "Caps measure physical Rust product lines in crates/*/src. Test files and directories (tests/, test_support/, tests.rs, test_support.rs, workspace tests/, and scripts/test-support/) and inline test-only #[cfg(test)] and #[cfg(all(..., test, ...))] modules are uncapped; every other crate src line counts against its per-crate cap and totalMax.",
   "version": 1,
-  "totalMax": 96189,
+  "totalMax": 96215,
   "crates": {
-    "api": 2954,
+    "api": 2963,
     "cli": 7568,
     "container": 1691,
     "contract": 6772,
@@ -11,12 +11,12 @@
     "expr-wasm": 175,
     "files": 1237,
     "llm": 7823,
-    "llm-steps": 12894,
+    "llm-steps": 12896,
     "mcp": 3644,
     "model": 893,
     "policy": 2078,
     "server": 7349,
     "service": 14978,
-    "steps": 6544
+    "steps": 6559
   }
 }

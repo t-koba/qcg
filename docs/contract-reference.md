@@ -770,7 +770,10 @@ hold exactly is refused rather than stated approximately - and `min` and
 : Call a tool on a configured MCP server. Transport failures (connect and
   call) fail the run unless `optional = true`, which degrades to a null
   output and records a `degraded` tool call. Validation, elicitation, and
-  confirmation paths still fail.
+  confirmation paths still fail. A session cleanup that fails after the
+  call does not change the call's outcome: the returned result and a
+  pending question both stand, and the cleanup failure is recorded beside
+  the call in the `tool_call` event's `cleanup_error` field.
 
 `llm.generate`
 : Produce text, optionally writing it to `output_file`.

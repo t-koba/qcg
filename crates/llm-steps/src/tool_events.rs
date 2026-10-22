@@ -104,6 +104,8 @@ pub(crate) fn tool_call_event(
         phase: outcome.phase,
         agent: agent.map(str::to_owned),
         error: outcome.error,
+        // An agent tool call has no session to clean up.
+        cleanup_error: None,
         duration_ms: outcome.duration.as_millis().min(u128::from(u64::MAX)) as u64,
         arguments,
         result,

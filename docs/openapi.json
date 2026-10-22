@@ -3866,6 +3866,11 @@
             "const": "elapsed_exceeded",
             "description": "The run-wide elapsed budget stopped this call (E11). Distinct from\nnode timeout and cancellation.",
             "type": "string"
+          },
+          {
+            "const": "cleanup_failed",
+            "description": "The session cleanup that followed the tool call failed. The call's\nown outcome is reported separately and stands.",
+            "type": "string"
           }
         ]
       },
@@ -3880,6 +3885,18 @@
             ]
           },
           "arguments": true,
+          "cleanup_error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ToolCallError"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "The session cleanup that followed the tool call failed. The\nexecution outcome stands on its own; the cleanup failure is\nretained here so it can be settled separately."
+          },
           "duration_ms": {
             "format": "uint64",
             "minimum": 0,

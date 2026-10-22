@@ -661,6 +661,9 @@ pub(crate) struct DirectMcpToolEvent<'a> {
     pub(crate) arguments: &'a Value,
     pub(crate) result: Option<&'a Value>,
     pub(crate) error: Option<&'a StepError>,
+    /// The session cleanup that followed the tool call failed. Retained
+    /// beside the execution fact: it never replaces the call's outcome.
+    pub(crate) cleanup_error: Option<&'a StepError>,
     pub(crate) duration_ms: u64,
     pub(crate) degraded: bool,
 }
@@ -676,6 +679,7 @@ pub(crate) fn record_direct_mcp_tool_event(
         arguments,
         result,
         error,
+        cleanup_error,
         duration_ms,
         degraded,
     } = details;
@@ -714,6 +718,12 @@ pub(crate) fn record_direct_mcp_tool_event(
         None if result.is_none() => (ToolCallStatus::NeedsUser, ToolCallPhase::Execution, None),
         None => (ToolCallStatus::Succeeded, ToolCallPhase::Completed, None),
     };
+    // The cleanup failure is a fact of its own: it is recorded next to
+    // the execution outcome, never in place of it.
+    let cleanup_error = cleanup_error.map(|error| ToolCallError {
+        code: ToolCallErrorCode::CleanupFailed,
+        message: error.to_string(),
+    });
     let sources = result
         .map(tool_call_sources)
         .unwrap_or_default()
@@ -742,6 +752,7 @@ pub(crate) fn record_direct_mcp_tool_event(
         phase,
         agent: None,
         error: error_value,
+        cleanup_error,
         duration_ms,
         arguments,
         result: result_summary,
