@@ -22,7 +22,7 @@ async fn stream_chat(usage: Value) -> Result<ChatResponse, LlmError> {
 }
 async fn stream_responses(usage: Value) -> Result<ChatResponse, LlmError> {
     let (events, _receiver) = mpsc::channel(4);
-    HttpStreamAccumulator::new(ApiFlavor::Responses)?
+    HttpStreamAccumulator::new(ApiFlavor::Responses, false)?
         .ingest(
             json!({"type":"response.completed","response":responses(usage)}),
             &events,
@@ -101,7 +101,7 @@ async fn inclusive_and_split_cache_usage_stream_parity() {
             usage["input_tokens_details"] = details;
         }
         assert_usage(
-            &parse_responses_response(responses(usage.clone()))
+            &parse_responses_response(responses(usage.clone()), false)
                 .unwrap()
                 .usage,
             100,
@@ -183,7 +183,7 @@ async fn malformed_or_inconsistent_cache_counts_fail_closed_in_all_parsers() {
                 "input_tokens_details":details
             });
             assert!(
-                parse_responses_response(responses(usage.clone())).is_err(),
+                parse_responses_response(responses(usage.clone()), false).is_err(),
                 "{usage}"
             );
             assert!(stream_responses(usage).await.is_err());
@@ -202,7 +202,7 @@ async fn malformed_or_inconsistent_cache_counts_fail_closed_in_all_parsers() {
             "output_tokens":10,
             "input_tokens_details":{"cached_tokens":read,"cache_write_tokens":creation}
         });
-        assert!(parse_responses_response(responses(usage.clone())).is_err());
+        assert!(parse_responses_response(responses(usage.clone()), false).is_err());
         assert!(stream_responses(usage).await.is_err());
     }
     for field in ["cache_read_input_tokens", "cache_creation_input_tokens"] {
@@ -307,7 +307,7 @@ async fn malformed_usage_details_and_start_output_cannot_be_overwritten() {
         assert!(parse_chat_completions_response(chat(usage.clone())).is_err());
         assert!(stream_chat(usage).await.is_err());
         let usage = json!({"input_tokens":100,"output_tokens":10,"input_tokens_details":details});
-        assert!(parse_responses_response(responses(usage.clone())).is_err());
+        assert!(parse_responses_response(responses(usage.clone()), false).is_err());
         assert!(stream_responses(usage).await.is_err());
     }
     assert!(

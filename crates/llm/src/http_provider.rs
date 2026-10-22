@@ -259,6 +259,32 @@ impl HttpProvider {
         })
     }
 
+    /// Refuses a hosted web search the endpoint or the model cannot honor.
+    /// The check runs before the network call, and the message names the
+    /// provider, the model and what to change.
+    fn check_provider_web_search(
+        &self,
+        req: &ChatRequest,
+        capabilities: &Capabilities,
+    ) -> Result<(), LlmError> {
+        if req.provider_web_search.is_none() {
+            return Ok(());
+        }
+        if self.api != ApiFlavor::Responses {
+            return Err(LlmError::new(format!(
+                "provider `{}` model `{}` cannot use provider web search: the hosted search tool exists only on the Responses API; use a Responses endpoint or remove `provider_web_search`",
+                self.id, req.model
+            )));
+        }
+        if !capabilities.web_search {
+            return Err(LlmError::new(format!(
+                "provider `{}` model `{}` does not support provider web search: select a model whose registry row advertises the `web_search` capability or remove `provider_web_search`",
+                self.id, req.model
+            )));
+        }
+        Ok(())
+    }
+
     fn default_path(api: ApiFlavor) -> &'static str {
         match api {
             ApiFlavor::ChatCompletions => "chat/completions",
@@ -436,11 +462,16 @@ impl HttpProvider {
         }
     }
 
-    async fn send(&self, payload: Value, model: &str) -> Result<ChatResponse, LlmError> {
+    async fn send(
+        &self,
+        payload: Value,
+        model: &str,
+        provider_web_search: bool,
+    ) -> Result<ChatResponse, LlmError> {
         let value = self.send_json(payload, model).await?;
         match self.api {
             ApiFlavor::ChatCompletions => parse_chat_completions_response(value),
-            ApiFlavor::Responses => parse_responses_response(value),
+            ApiFlavor::Responses => parse_responses_response(value, provider_web_search),
             ApiFlavor::AnthropicMessages => parse_anthropic_response(value),
             ApiFlavor::SystemOne => Err(LlmError::new("system_one requires typed decisions")),
         }
@@ -537,6 +568,7 @@ impl HttpProvider {
         &self,
         payload: Value,
         model: &str,
+        provider_web_search: bool,
         events: mpsc::Sender<ChatStreamEvent>,
     ) -> Result<(), LlmError> {
         if let Some(error) = self.configuration_error_for(&self.id) {
@@ -599,7 +631,7 @@ impl HttpProvider {
             },
         );
         let mut stream = SseStream::from_bytes_stream(body);
-        let mut accumulator = HttpStreamAccumulator::new(self.api)?;
+        let mut accumulator = HttpStreamAccumulator::new(self.api, provider_web_search)?;
         // Pre-publication gate for the provider credential (B04): text
         // deltas pass through it, and only prefixes proven free of the
         // credential are released downstream. A metadata-mixed window can
@@ -922,6 +954,7 @@ impl LlmProvider for HttpProvider {
                 )));
             }
         }
+        self.check_provider_web_search(&req, &capabilities)?;
         let prompt_cache = self.prompt_cache_field_for(&req, &capabilities)?;
         let payload = match self.api {
             ApiFlavor::ChatCompletions => chat_completions_payload(
@@ -937,7 +970,9 @@ impl LlmProvider for HttpProvider {
             }
         };
         let _slot = self.acquire_request_slot().await?;
-        let result = self.send(payload, &req.model).await;
+        let result = self
+            .send(payload, &req.model, req.provider_web_search.is_some())
+            .await;
         self.record_request_result(&result);
         result
     }
@@ -957,6 +992,7 @@ impl LlmProvider for HttpProvider {
                 self.id
             )));
         }
+        self.check_provider_web_search(&req, &capabilities)?;
         let prompt_cache = self.prompt_cache_field_for(&req, &capabilities)?;
         let mut payload = match self.api {
             ApiFlavor::ChatCompletions => chat_completions_payload(
@@ -976,7 +1012,14 @@ impl LlmProvider for HttpProvider {
             payload["stream_options"] = json!({ "include_usage": true });
         }
         let _slot = self.acquire_request_slot().await?;
-        let result = self.send_stream(payload, &req.model, events).await;
+        let result = self
+            .send_stream(
+                payload,
+                &req.model,
+                req.provider_web_search.is_some(),
+                events,
+            )
+            .await;
         self.record_request_result(&result);
         result
     }
@@ -1217,6 +1260,7 @@ mod loopback_stream_tests {
             verbosity: None,
             stream: true,
             prompt_cache: PromptCache::Off,
+            provider_web_search: None,
         }
     }
 

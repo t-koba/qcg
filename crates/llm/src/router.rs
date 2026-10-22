@@ -244,6 +244,9 @@ impl LlmProvider for LlmRouter {
             parallel_tool_calls: true,
             verbosity: true,
             prompt_cache: false,
+            // The hosted search exists only on the Responses endpoint, and
+            // neither of these rows is a Responses endpoint.
+            web_search: false,
             reasoning_effort: vec![
                 ReasoningEffort::None,
                 ReasoningEffort::Minimal,

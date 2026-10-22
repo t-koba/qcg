@@ -550,6 +550,38 @@ Step-specific fields such as `prompt`, `output_file`, `command`, or `expect`
 must appear under `[flow.params]`. Unknown fields and invalid types are rejected
 during contract loading with a source line.
 
+### Provider web search
+
+An `llm.*` node can ask the provider to run its own hosted web search. The
+opt-in is closed and off by default: a node that does not name it never
+asks the provider to search, and naming an OpenAI model does not enable
+it.
+
+```toml
+[[flow]]
+id = "research"
+type = "llm.generate"
+
+[flow.params]
+prompt = "research.j2"
+provider_web_search = { search_context_size = "medium", allowed_domains = ["example.com"], max_calls = 3 }
+```
+
+- `allowed_domains`, `blocked_domains`: at most 100 entries each, and a
+  contract states one list or the other, never both.
+- `search_context_size`: `low`, `medium` or `high`.
+- `user_location`: an approximate `country`, `region`, `city` and
+  `timezone`.
+- `max_calls`: the bound on the hosted calls one request may make, 3 by
+  default and 1 at least.
+
+The search runs at the provider, so it is not a local HTTP tool and the
+contract's network permissions do not govern it. The provider bills the
+calls apart from the tokens, so a run that wants the charge metered prices
+it with `web_search_call_cost_usd` on the model's pricing row. See the
+[provider guide](llm-provider-guide.md#provider-native-web-search) for the
+capability matrix and the usage semantics.
+
 ### Expressions
 
 `when` accepts a boolean expression over `inputs.*`,
@@ -1292,6 +1324,10 @@ metadata. Update it with `qcg docs step-schemas`.
           "provider": {
             "minLength": 1,
             "type": "string"
+          },
+          "web_search_call_cost_usd": {
+            "minimum": 0,
+            "type": "number"
           }
         },
         "required": [
@@ -1438,6 +1474,10 @@ metadata. Update it with `qcg docs step-schemas`.
         "provider": {
           "minLength": 1,
           "type": "string"
+        },
+        "web_search_call_cost_usd": {
+          "minimum": 0,
+          "type": "number"
         }
       },
       "required": [
@@ -1451,6 +1491,55 @@ metadata. Update it with `qcg docs step-schemas`.
     },
     "prompt": {
       "type": "string"
+    },
+    "provider_web_search": {
+      "additionalProperties": false,
+      "properties": {
+        "allowed_domains": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 100,
+          "type": "array"
+        },
+        "blocked_domains": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 100,
+          "type": "array"
+        },
+        "max_calls": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "search_context_size": {
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        "user_location": {
+          "additionalProperties": false,
+          "properties": {
+            "city": {
+              "type": "string"
+            },
+            "country": {
+              "type": "string"
+            },
+            "region": {
+              "type": "string"
+            },
+            "timezone": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "type": "object"
     },
     "request": {
       "additionalProperties": false,
@@ -1830,6 +1919,10 @@ metadata. Update it with `qcg docs step-schemas`.
                     "provider": {
                       "minLength": 1,
                       "type": "string"
+                    },
+                    "web_search_call_cost_usd": {
+                      "minimum": 0,
+                      "type": "number"
                     }
                   },
                   "required": [
@@ -1913,6 +2006,10 @@ metadata. Update it with `qcg docs step-schemas`.
                   "provider": {
                     "minLength": 1,
                     "type": "string"
+                  },
+                  "web_search_call_cost_usd": {
+                    "minimum": 0,
+                    "type": "number"
                   }
                 },
                 "required": [
@@ -2269,6 +2366,10 @@ metadata. Update it with `qcg docs step-schemas`.
           "provider": {
             "minLength": 1,
             "type": "string"
+          },
+          "web_search_call_cost_usd": {
+            "minimum": 0,
+            "type": "number"
           }
         },
         "required": [
@@ -2366,6 +2467,10 @@ metadata. Update it with `qcg docs step-schemas`.
         "provider": {
           "minLength": 1,
           "type": "string"
+        },
+        "web_search_call_cost_usd": {
+          "minimum": 0,
+          "type": "number"
         }
       },
       "required": [
@@ -2385,6 +2490,55 @@ metadata. Update it with `qcg docs step-schemas`.
     },
     "prompt": {
       "type": "string"
+    },
+    "provider_web_search": {
+      "additionalProperties": false,
+      "properties": {
+        "allowed_domains": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 100,
+          "type": "array"
+        },
+        "blocked_domains": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 100,
+          "type": "array"
+        },
+        "max_calls": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "search_context_size": {
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        "user_location": {
+          "additionalProperties": false,
+          "properties": {
+            "city": {
+              "type": "string"
+            },
+            "country": {
+              "type": "string"
+            },
+            "region": {
+              "type": "string"
+            },
+            "timezone": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "type": "object"
     },
     "request": {
       "additionalProperties": false,
@@ -2841,6 +2995,10 @@ metadata. Update it with `qcg docs step-schemas`.
           "provider": {
             "minLength": 1,
             "type": "string"
+          },
+          "web_search_call_cost_usd": {
+            "minimum": 0,
+            "type": "number"
           }
         },
         "required": [
@@ -2938,6 +3096,10 @@ metadata. Update it with `qcg docs step-schemas`.
         "provider": {
           "minLength": 1,
           "type": "string"
+        },
+        "web_search_call_cost_usd": {
+          "minimum": 0,
+          "type": "number"
         }
       },
       "required": [
@@ -2951,6 +3113,55 @@ metadata. Update it with `qcg docs step-schemas`.
     },
     "prompt": {
       "type": "string"
+    },
+    "provider_web_search": {
+      "additionalProperties": false,
+      "properties": {
+        "allowed_domains": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 100,
+          "type": "array"
+        },
+        "blocked_domains": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 100,
+          "type": "array"
+        },
+        "max_calls": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "search_context_size": {
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        "user_location": {
+          "additionalProperties": false,
+          "properties": {
+            "city": {
+              "type": "string"
+            },
+            "country": {
+              "type": "string"
+            },
+            "region": {
+              "type": "string"
+            },
+            "timezone": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "type": "object"
     },
     "request": {
       "additionalProperties": false,
@@ -3182,6 +3393,10 @@ metadata. Update it with `qcg docs step-schemas`.
           "provider": {
             "minLength": 1,
             "type": "string"
+          },
+          "web_search_call_cost_usd": {
+            "minimum": 0,
+            "type": "number"
           }
         },
         "required": [
@@ -3271,6 +3486,10 @@ metadata. Update it with `qcg docs step-schemas`.
         "provider": {
           "minLength": 1,
           "type": "string"
+        },
+        "web_search_call_cost_usd": {
+          "minimum": 0,
+          "type": "number"
         }
       },
       "required": [
@@ -3284,6 +3503,55 @@ metadata. Update it with `qcg docs step-schemas`.
     },
     "prompt": {
       "type": "string"
+    },
+    "provider_web_search": {
+      "additionalProperties": false,
+      "properties": {
+        "allowed_domains": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 100,
+          "type": "array"
+        },
+        "blocked_domains": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 100,
+          "type": "array"
+        },
+        "max_calls": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "search_context_size": {
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        "user_location": {
+          "additionalProperties": false,
+          "properties": {
+            "city": {
+              "type": "string"
+            },
+            "country": {
+              "type": "string"
+            },
+            "region": {
+              "type": "string"
+            },
+            "timezone": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "type": "object"
     },
     "request": {
       "additionalProperties": false,
@@ -3510,6 +3778,10 @@ metadata. Update it with `qcg docs step-schemas`.
           "provider": {
             "minLength": 1,
             "type": "string"
+          },
+          "web_search_call_cost_usd": {
+            "minimum": 0,
+            "type": "number"
           }
         },
         "required": [
@@ -3606,6 +3878,10 @@ metadata. Update it with `qcg docs step-schemas`.
         "provider": {
           "minLength": 1,
           "type": "string"
+        },
+        "web_search_call_cost_usd": {
+          "minimum": 0,
+          "type": "number"
         }
       },
       "required": [
@@ -3619,6 +3895,55 @@ metadata. Update it with `qcg docs step-schemas`.
     },
     "prompt": {
       "type": "string"
+    },
+    "provider_web_search": {
+      "additionalProperties": false,
+      "properties": {
+        "allowed_domains": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 100,
+          "type": "array"
+        },
+        "blocked_domains": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 100,
+          "type": "array"
+        },
+        "max_calls": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "search_context_size": {
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        "user_location": {
+          "additionalProperties": false,
+          "properties": {
+            "city": {
+              "type": "string"
+            },
+            "country": {
+              "type": "string"
+            },
+            "region": {
+              "type": "string"
+            },
+            "timezone": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "type": "object"
     },
     "request": {
       "additionalProperties": false,

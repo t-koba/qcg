@@ -4,7 +4,7 @@ use contract::{
 };
 use engine::{StepContext, StepError, require_field as require};
 use llm::ImageDetail;
-use model::{ResponseVerbosity, StructuredOutputMode, ToolChoice};
+use model::{ProviderWebSearch, ResponseVerbosity, StructuredOutputMode, ToolChoice};
 use serde::Deserialize;
 use std::collections::BTreeSet;
 
@@ -51,6 +51,10 @@ pub(crate) struct LlmParams {
     pub(crate) fallback_models: Vec<contract::ModelRef>,
     #[serde(default)]
     pub(crate) request: LlmRequestPolicy,
+    /// The provider's own hosted web search. Absent by default: selecting a
+    /// model never enables the provider's search.
+    #[serde(default)]
+    pub(crate) provider_web_search: Option<ProviderWebSearch>,
 }
 
 #[derive(Debug, Clone)]
@@ -431,6 +435,7 @@ pub(crate) fn validate_capability_names(
                 | "tool_choice"
                 | "parallel_tool_calls"
                 | "verbosity"
+                | "web_search"
         ) {
             return Err(StepError::failed(
                 &node.id,

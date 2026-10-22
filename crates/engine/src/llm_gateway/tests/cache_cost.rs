@@ -22,6 +22,7 @@ impl LlmProvider for CacheMeteredProvider {
             },
             stop: StopReason::EndTurn,
             provider_state: None,
+            web_search: None,
         })
     }
 }
@@ -34,6 +35,7 @@ fn cache_pricing(read: Option<f64>, creation: Option<f64>) -> ModelRef {
         output_cost_per_million_usd: Some(3.0),
         cache_read_input_cost_per_million_usd: read,
         cache_creation_input_cost_per_million_usd: creation,
+        web_search_call_cost_usd: None,
     }
 }
 
@@ -153,7 +155,7 @@ fn cache_cost_validates_counts_and_does_not_mix_pricing_rows() {
         reasoning: 0,
     };
     let cost = |routes: &[ModelRef], usage: &TokenUsage| {
-        gateway.cost_microusd(&test_node(), routes, "cache-metered", "test", usage)
+        gateway.cost_microusd(&test_node(), routes, "cache-metered", "test", usage, None)
     };
     // A complete invocation row wins as a whole: its omitted cache rates
     // fall back to its own input rate, not the discounted registry row.
@@ -189,7 +191,14 @@ fn cache_cost_validates_counts_and_does_not_mix_pricing_rows() {
     );
     assert!(
         no_defaults
-            .cost_microusd(&test_node(), &[incomplete], "cache-metered", "test", &usage)
+            .cost_microusd(
+                &test_node(),
+                &[incomplete],
+                "cache-metered",
+                "test",
+                &usage,
+                None
+            )
             .is_err()
     );
     // Missing pricing must not bypass validation of malformed provider usage.
@@ -205,7 +214,8 @@ fn cache_cost_validates_counts_and_does_not_mix_pricing_rows() {
                     input: 1,
                     cached_input: 2,
                     ..Default::default()
-                }
+                },
+                None,
             )
             .is_err()
     );

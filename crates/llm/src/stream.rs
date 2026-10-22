@@ -1,8 +1,11 @@
+use model::{ProviderSearchEvent, UrlCitation};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use tokio::sync::mpsc;
 
-use crate::parse::parse_responses_response;
+use crate::parse::{
+    is_web_search_call, parse_message_citations, parse_responses_response, parse_web_search_event,
+};
 use crate::provider::ApiFlavor;
 use crate::types::{ChatContent, ChatResponse, ChatStreamEvent, LlmError, StopReason, TokenUsage};
 
@@ -26,18 +29,21 @@ fn send_ingest_event(
 
 pub(crate) enum HttpStreamAccumulator {
     Chat(ChatCompletionAccumulator),
-    Responses,
+    Responses(ResponsesAccumulator),
     Anthropic(AnthropicAccumulator),
 }
 
 impl HttpStreamAccumulator {
-    pub(crate) fn new(api: ApiFlavor) -> Result<Self, LlmError> {
+    pub(crate) fn new(api: ApiFlavor, provider_web_search: bool) -> Result<Self, LlmError> {
         Ok(match api {
             ApiFlavor::SystemOne => {
                 return Err(LlmError::new("system_one does not support streaming"));
             }
             ApiFlavor::ChatCompletions => Self::Chat(ChatCompletionAccumulator::default()),
-            ApiFlavor::Responses => Self::Responses,
+            ApiFlavor::Responses => Self::Responses(ResponsesAccumulator {
+                provider_web_search,
+                ..ResponsesAccumulator::default()
+            }),
             ApiFlavor::AnthropicMessages => Self::Anthropic(AnthropicAccumulator::default()),
         })
     }
@@ -52,7 +58,7 @@ impl HttpStreamAccumulator {
                 accumulator.ingest(&value, events).await?;
                 Ok(None)
             }
-            Self::Responses => ingest_responses_stream(value, events).await,
+            Self::Responses(accumulator) => accumulator.ingest(value, events).await,
             Self::Anthropic(accumulator) => {
                 accumulator.ingest(&value, events).await?;
                 Ok(None)
@@ -63,7 +69,7 @@ impl HttpStreamAccumulator {
     pub(crate) fn finish(self) -> Result<ChatResponse, LlmError> {
         match self {
             Self::Chat(accumulator) => accumulator.finish(),
-            Self::Responses => Err(LlmError::invalid_response(
+            Self::Responses(_) => Err(LlmError::invalid_response(
                 "Responses API stream ended without terminal response",
             )),
             Self::Anthropic(accumulator) => accumulator.finish(),
@@ -203,6 +209,7 @@ impl ChatCompletionAccumulator {
             })?,
             stop,
             provider_state: None,
+            web_search: None,
         })
     }
 }
@@ -219,39 +226,93 @@ fn parse_openai_stop_reason(reason: &str) -> Result<StopReason, LlmError> {
     }
 }
 
-async fn ingest_responses_stream(
-    value: Value,
-    events: &mpsc::Sender<ChatStreamEvent>,
-) -> Result<Option<ChatResponse>, LlmError> {
-    match value.get("type").and_then(Value::as_str) {
-        Some("response.output_text.delta") | Some("response.refusal.delta") => {
-            if let Some(text) = value.get("delta").and_then(Value::as_str)
-                && !text.is_empty()
-            {
-                send_ingest_event(
-                    events,
-                    ChatStreamEvent::TextDelta {
-                        text: text.to_string(),
-                    },
-                )?;
+/// The Responses stream accumulator. It keeps the hosted search items the
+/// stream reported so a terminal response without an output array still
+/// yields the same outcome as the direct parse.
+#[derive(Default)]
+pub(crate) struct ResponsesAccumulator {
+    provider_web_search: bool,
+    events: Vec<ProviderSearchEvent>,
+    citations: Vec<UrlCitation>,
+    calls: Option<u64>,
+}
+
+impl ResponsesAccumulator {
+    async fn ingest(
+        &mut self,
+        value: Value,
+        events: &mpsc::Sender<ChatStreamEvent>,
+    ) -> Result<Option<ChatResponse>, LlmError> {
+        match value.get("type").and_then(Value::as_str) {
+            Some("response.output_text.delta") | Some("response.refusal.delta") => {
+                if let Some(text) = value.get("delta").and_then(Value::as_str)
+                    && !text.is_empty()
+                {
+                    send_ingest_event(
+                        events,
+                        ChatStreamEvent::TextDelta {
+                            text: text.to_string(),
+                        },
+                    )?;
+                }
+                Ok(None)
             }
-            Ok(None)
+            Some("response.output_item.done") => {
+                self.ingest_output_item(&value)?;
+                Ok(None)
+            }
+            Some("response.completed") | Some("response.incomplete") => {
+                let kind = value
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("response.completed");
+                let response = value
+                    .get("response")
+                    .cloned()
+                    .ok_or_else(|| {
+                        LlmError::invalid_response(format!("{kind} did not include response"))
+                    })
+                    .and_then(|response| {
+                        parse_responses_response(response, self.provider_web_search)
+                    })?;
+                Ok(Some(self.merge(response)))
+            }
+            _ => Ok(None),
         }
-        Some("response.completed") | Some("response.incomplete") => {
-            let kind = value
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or("response.completed");
-            value
-                .get("response")
-                .cloned()
-                .ok_or_else(|| {
-                    LlmError::invalid_response(format!("{kind} did not include response"))
-                })
-                .and_then(parse_responses_response)
-                .map(Some)
+    }
+
+    /// Reads one finished output item. The items are the same ones the
+    /// terminal response carries, so the outcome does not depend on which
+    /// of the two the provider sent.
+    fn ingest_output_item(&mut self, value: &Value) -> Result<(), LlmError> {
+        if !self.provider_web_search {
+            return Ok(());
         }
-        _ => Ok(None),
+        let Some(item) = value.get("item") else {
+            return Ok(());
+        };
+        if is_web_search_call(item) {
+            self.events.push(parse_web_search_event(item)?);
+            self.calls = Some(self.calls.unwrap_or_default().saturating_add(1));
+        }
+        if item.get("type").and_then(Value::as_str) == Some("message") {
+            self.citations.extend(parse_message_citations(item)?);
+        }
+        Ok(())
+    }
+
+    /// The terminal response is authoritative when it carries the output
+    /// array. Without one, the items the stream reported are the outcome.
+    fn merge(&self, mut response: ChatResponse) -> ChatResponse {
+        if let Some(outcome) = response.web_search.as_mut()
+            && outcome.calls.is_none()
+            && let Some(calls) = self.calls
+        {
+            outcome.calls = Some(calls);
+            outcome.events = self.events.clone();
+            outcome.citations = self.citations.clone();
+        }
+        response
     }
 }
 
@@ -426,6 +487,7 @@ impl AnthropicAccumulator {
             },
             stop,
             provider_state: None,
+            web_search: None,
         })
     }
 }

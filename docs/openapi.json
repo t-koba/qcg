@@ -1534,6 +1534,18 @@
               }
             ],
             "default": null
+          },
+          "web_search": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WebSearchUsage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "What the provider's hosted web search did in this call. Absent when\nthe request did not enable the hosted search."
           }
         },
         "required": [
@@ -2166,6 +2178,50 @@
           "field",
           "reason"
         ],
+        "type": "object"
+      },
+      "ProviderSearchAction": {
+        "description": "What one hosted search call did.",
+        "enum": [
+          "search",
+          "open_page",
+          "find_in_page"
+        ],
+        "type": "string"
+      },
+      "ProviderSearchEvent": {
+        "additionalProperties": false,
+        "description": "One hosted search call reported by the provider.",
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/ProviderSearchAction",
+            "default": "search"
+          },
+          "id": {
+            "default": null,
+            "description": "The provider's identifier for the call, when it reports one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "queries": {
+            "default": [],
+            "description": "The queries a search action ran. Empty for page actions.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "url": {
+            "default": null,
+            "description": "The page a page action opened. Absent for a search action.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "QueuePositionQuality": {
@@ -3949,6 +4005,43 @@
         ],
         "type": "string"
       },
+      "UrlCitation": {
+        "additionalProperties": false,
+        "description": "One citation the provider attached to its answer.",
+        "properties": {
+          "end_index": {
+            "default": null,
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "start_index": {
+            "default": null,
+            "description": "The cited range inside the answer text, when the provider reports one.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "title": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "url": {
+            "default": "",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "UserInteractionEventData": {
         "additionalProperties": false,
         "properties": {
@@ -3958,6 +4051,47 @@
               "string",
               "null"
             ]
+          }
+        },
+        "type": "object"
+      },
+      "WebSearchUsage": {
+        "additionalProperties": false,
+        "description": "What the provider's hosted web search did in one call, and what it cost.",
+        "properties": {
+          "calls": {
+            "default": null,
+            "description": "The hosted calls the provider reported. Absent means unknown, which\nis never zero.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "citations": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/UrlCitation"
+            },
+            "type": "array"
+          },
+          "cost_microusd": {
+            "default": null,
+            "description": "The hosted search charge in microusd. Absent means the run does not\nprice the search: unmetered, never free.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "events": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ProviderSearchEvent"
+            },
+            "type": "array"
           }
         },
         "type": "object"

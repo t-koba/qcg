@@ -2132,3 +2132,164 @@ mod env_process {
         "/../../scripts/test-support/environment.rs"
     ));
 }
+
+/// A contract whose `llm.generate` node opts into the provider's own
+/// hosted web search.
+fn contract_with_provider_web_search(root: &std::path::Path, provider: &str) -> Contract {
+    std::fs::create_dir_all(root).expect("fixture dir should be created");
+    std::fs::write(
+        root.join(contract::MANIFEST_FILE),
+        format!(
+            r#"
+[generator]
+id = "schema-test"
+name = "Schema Test"
+version = "0.1.0"
+
+[llm]
+model = {{ provider = "{provider}", model = "test" }}
+max_tokens = 2048
+
+[[flow]]
+id = "gen"
+type = "llm.generate"
+
+[flow.params]
+prompt = "prompt.j2"
+provider_web_search = {{ search_context_size = "medium", max_calls = 2 }}
+"#
+        ),
+    )
+    .expect("manifest should be written");
+    std::fs::write(root.join("prompt.j2"), "Generate a bounded result.")
+        .expect("prompt should be written");
+    Contract::load(
+        camino::Utf8PathBuf::from_path_buf(root.to_path_buf())
+            .ok()
+            .unwrap(),
+    )
+    .expect("contract should load")
+}
+
+/// A runtime whose registry row is a Responses endpoint that advertises the
+/// hosted search.
+fn provider_web_search_runtime() -> LlmRuntime {
+    llm::LlmRouter::parse_text(
+        r#"
+[[provider]]
+id = "responses"
+api = "responses"
+base_url = "https://example.invalid/v1"
+capabilities = { web_search = true }
+"#,
+    )
+    .expect("the registry should build")
+    .into_runtime()
+}
+
+/// The request a node builds, with the context the step executor would use.
+fn request_for(
+    contract: &Contract,
+    node: &NodeDef,
+    runtime: &LlmRuntime,
+    root: &std::path::Path,
+) -> Result<llm::ChatRequest, StepError> {
+    let run_id = format!("web-search-{}", std::process::id());
+    let run = engine::RunContext::for_tests(
+        run_id.clone(),
+        camino::Utf8PathBuf::from_path_buf(root.join("workspace"))
+            .ok()
+            .unwrap(),
+        camino::Utf8PathBuf::from_path_buf(root.join("meta"))
+            .ok()
+            .unwrap(),
+        contract.clone(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    )
+    .expect("the run context should build");
+    let journal = engine::JournalWriter::create(
+        &camino::Utf8PathBuf::from_path_buf(root.join("journal.jsonl"))
+            .ok()
+            .unwrap(),
+        &run_id,
+        false,
+        None,
+    )
+    .expect("the journal should open");
+    let mut vars = contract::ValueBag::with_inputs(BTreeMap::new());
+    let ctx = engine::StepContext {
+        run: &run,
+        journal: &journal,
+        vars: &mut vars,
+        llm: None,
+    };
+    crate::request::build_request(&ctx, node, runtime, "prompt".into(), None)
+}
+
+#[test]
+fn the_provider_web_search_opt_in_reaches_the_request() {
+    let root = std::env::temp_dir().join(format!("provider-web-search-{}", std::process::id()));
+    let contract = contract_with_provider_web_search(&root, "responses");
+    let node = contract
+        .manifest
+        .flow
+        .first()
+        .cloned()
+        .expect("flow should contain a node");
+    let runtime = provider_web_search_runtime();
+    let request = request_for(&contract, &node, &runtime, &root).expect("the request should build");
+    let search = request
+        .provider_web_search
+        .as_ref()
+        .expect("the contract opt-in must reach the request");
+    assert_eq!(search.max_calls, 2);
+    assert_eq!(
+        search.search_context_size,
+        Some(model::SearchContextSize::Medium)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_node_without_the_opt_in_asks_for_no_provider_search() {
+    let root = std::env::temp_dir().join(format!("provider-web-search-off-{}", std::process::id()));
+    let contract = contract_with_llm_generate(&root, "responses");
+    let node = contract
+        .manifest
+        .flow
+        .first()
+        .cloned()
+        .expect("flow should contain a node");
+    let runtime = provider_web_search_runtime();
+    let request = request_for(&contract, &node, &runtime, &root).expect("the request should build");
+    assert!(
+        request.provider_web_search.is_none(),
+        "a node that does not opt in must not ask the provider to search"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_model_without_the_capability_is_refused_before_the_request() {
+    let root = std::env::temp_dir().join(format!(
+        "provider-web-search-unsupported-{}",
+        std::process::id()
+    ));
+    let contract = contract_with_provider_web_search(&root, "fake");
+    let node = contract
+        .manifest
+        .flow
+        .first()
+        .cloned()
+        .expect("flow should contain a node");
+    let runtime = LlmRuntime::builtins();
+    let error = request_for(&contract, &node, &runtime, &root)
+        .expect_err("a model without the hosted search must be refused");
+    let message = error.to_string();
+    assert!(
+        message.contains("web_search"),
+        "the refusal must name the capability: {message}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -45,6 +45,28 @@ pub struct LlmCallEventData {
     pub max_tokens_total: Option<u64>,
     #[serde(default)]
     pub repair: Option<bool>,
+    /// What the provider's hosted web search did in this call. Absent when
+    /// the request did not enable the hosted search.
+    #[serde(default)]
+    pub web_search: Option<WebSearchUsage>,
+}
+
+/// What the provider's hosted web search did in one call, and what it cost.
+#[derive(Debug, Clone, Serialize, serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WebSearchUsage {
+    /// The hosted calls the provider reported. Absent means unknown, which
+    /// is never zero.
+    #[serde(default)]
+    pub calls: Option<u64>,
+    /// The hosted search charge in microusd. Absent means the run does not
+    /// price the search: unmetered, never free.
+    #[serde(default)]
+    pub cost_microusd: Option<u64>,
+    #[serde(default)]
+    pub events: Vec<model::ProviderSearchEvent>,
+    #[serde(default)]
+    pub citations: Vec<model::UrlCitation>,
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize, JsonSchema)]

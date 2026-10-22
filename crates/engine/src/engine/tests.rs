@@ -6272,6 +6272,7 @@ async fn duplicate_write_and_extra_effect_pass_shape_validation_with_wrong_readb
         verbosity: None,
         stream: false,
         prompt_cache: PromptCache::Off,
+        provider_web_search: None,
     };
     let first = FakeLlmProvider
         .complete(first_request)
@@ -6306,6 +6307,7 @@ async fn duplicate_write_and_extra_effect_pass_shape_validation_with_wrong_readb
         verbosity: None,
         stream: false,
         prompt_cache: PromptCache::Off,
+        provider_web_search: None,
     };
     let second = FakeLlmProvider
         .complete(second_request)
@@ -6462,6 +6464,7 @@ async fn acrfence_crash_after_commit_and_token_resurrection_replay_gap() {
             verbosity: None,
             stream: false,
             prompt_cache: PromptCache::Off,
+            provider_web_search: None,
         };
         let response = FakeLlmProvider
             .complete(request)

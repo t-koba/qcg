@@ -55,6 +55,13 @@ behind (ADR 0001: no inert promises).
 | G03-02 | Store scans skip coordination in lists and GC | `g03_store_scans_skip_coordination_in_lists_and_gc` |
 | G03-02b | Shared peer init and refresh recover despite legacy locks | `g03_shared_refresh_recovers_despite_legacy_locks` |
 | G03-03 | Concurrent same-run admission stays exclusive | `g03_concurrent_same_run_admission_stays_exclusive` |
+| F18a | Provider-hosted web search is off unless the contract opts in | `hosted_search_is_off_by_default` |
+| F18b | The Responses request carries the hosted tool and the call bound | `responses_payload_sends_the_hosted_search_tool` |
+| F18c | The provider's hosted calls and citations are parsed and counted | `hosted_search_count_is_derived_from_the_output_items` |
+| F18d | An endpoint or model that cannot host the search is refused before the request | `hosted_search_is_refused_on_a_non_responses_endpoint` `hosted_search_is_refused_without_the_capability` |
+| F18e | The hosted call is replayed so a resumed turn does not repeat the search | `hosted_search_carries_provider_state_for_the_replay` |
+| F18f | The contract opt-in reaches the request and an absent opt-in does not | `the_provider_web_search_opt_in_reaches_the_request` `a_node_without_the_opt_in_asks_for_no_provider_search` |
+| F18g | A priced hosted search is charged per call and an unpriced one is unmetered | `a_priced_hosted_search_is_charged_per_call` `an_unpriced_hosted_search_is_unmetered_not_free` |
 | G06-01 | Patch preserves the executable bit and the script still runs | `g06_patch_preserves_executable_bit_and_runs` |
 | G06-02 | Data mode kept; special bits sanitized; new files owner-only | `g06_data_mode_and_special_bits_are_sanitized` |
 | G06-03 | Rejected patch leaves content and mode untouched | `g06_rejected_patch_leaves_content_and_mode_untouched` |

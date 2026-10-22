@@ -123,8 +123,14 @@ impl<'a> LlmGateway<'a> {
             output: tokens,
             ..TokenUsage::default()
         };
-        let cost_microusd =
-            self.cost_microusd(node, routes, &model.provider, &model.model, &worst_usage)?;
+        let cost_microusd = self.cost_microusd(
+            node,
+            routes,
+            &model.provider,
+            &model.model,
+            &worst_usage,
+            None,
+        )?;
         let reservation = PendingReservation {
             tokens,
             cost_microusd,
@@ -148,7 +154,7 @@ impl<'a> LlmGateway<'a> {
         };
         let usage = response.token_usage();
         let cost_microusd =
-            self.cost_microusd(node, routes, &model.provider, &model.model, &usage)?;
+            self.cost_microusd(node, routes, &model.provider, &model.model, &usage, None)?;
         self.journal
             .event(
                 "llm_call",
@@ -444,7 +450,16 @@ impl<'a> LlmGateway<'a> {
         })?;
         self.scan_response(node, &response)?;
         let usage = response.usage.clone();
-        let cost_microusd = self.cost_microusd(node, routes, &provider_id, &model_id, &usage)?;
+        let web_search = response.web_search.clone();
+        let web_search_calls = web_search.as_ref().and_then(|outcome| outcome.calls);
+        let cost_microusd = self.cost_microusd(
+            node,
+            routes,
+            &provider_id,
+            &model_id,
+            &usage,
+            web_search_calls,
+        )?;
         let mut event = json!({
             "node": node.id,
             "provider": provider_id,
@@ -463,6 +478,21 @@ impl<'a> LlmGateway<'a> {
             "tokens": usage,
             "cost_microusd": cost_microusd,
         });
+        // The hosted search is reported with its own count and charge: an
+        // unpriced search is unmetered, never free.
+        if let Some(outcome) = &web_search {
+            event["web_search"] = json!({
+                "calls": outcome.calls,
+                "cost_microusd": self.web_search_cost_microusd(
+                    routes,
+                    &provider_id,
+                    &model_id,
+                    outcome.calls,
+                ),
+                "events": outcome.events,
+                "citations": outcome.citations,
+            });
+        }
         merge_event_extra(&mut event, event_extra(&response.usage));
         self.journal.event("llm_call", event).step_err(&node.id)?;
         let state = self.journal.state();
@@ -771,6 +801,7 @@ api_key_env = "{credential_env}"
                     cache_creation_input_cost_per_million_usd: None,
                     cache_read_input_cost_per_million_usd: None,
                     output_cost_per_million_usd: Some(1.0),
+                    web_search_call_cost_usd: None,
                 },
             }
         }

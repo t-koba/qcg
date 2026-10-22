@@ -77,6 +77,7 @@ pub(crate) fn build_request(
             PromptCachePolicy::Auto => llm::PromptCache::Auto,
             PromptCachePolicy::Off => llm::PromptCache::Off,
         },
+        provider_web_search: params.provider_web_search.clone(),
     })
 }
 
@@ -267,6 +268,7 @@ pub(crate) fn build_request_with_messages(
             PromptCachePolicy::Auto => llm::PromptCache::Auto,
             PromptCachePolicy::Off => llm::PromptCache::Off,
         },
+        provider_web_search: params.provider_web_search.clone(),
     })
 }
 

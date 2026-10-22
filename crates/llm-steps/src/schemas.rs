@@ -66,7 +66,8 @@ pub(crate) fn model_ref_schema() -> Value {
             "input_cost_per_million_usd": { "type": "number", "minimum": 0 },
             "cache_read_input_cost_per_million_usd": { "type": "number", "minimum": 0 },
             "cache_creation_input_cost_per_million_usd": { "type": "number", "minimum": 0 },
-            "output_cost_per_million_usd": { "type": "number", "minimum": 0 }
+            "output_cost_per_million_usd": { "type": "number", "minimum": 0 },
+            "web_search_call_cost_usd": { "type": "number", "minimum": 0 }
         }
     })
 }
@@ -154,6 +155,31 @@ pub(crate) fn agent_failure_policy_schema() -> Value {
     })
 }
 
+/// The hosted web search opt-in. It is absent by default, so a node that
+/// does not name it never asks the provider to search.
+pub(crate) fn provider_web_search_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "allowed_domains": { "type": "array", "maxItems": 100, "items": string_schema() },
+            "blocked_domains": { "type": "array", "maxItems": 100, "items": string_schema() },
+            "search_context_size": { "enum": ["low", "medium", "high"] },
+            "user_location": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "country": string_schema(),
+                    "region": string_schema(),
+                    "city": string_schema(),
+                    "timezone": string_schema()
+                }
+            },
+            "max_calls": { "type": "integer", "minimum": 1 }
+        }
+    })
+}
+
 pub(crate) fn llm_common_properties(extra: Value) -> Value {
     let mut properties = serde_json::Map::new();
     properties.insert("prompt".into(), string_schema());
@@ -183,6 +209,7 @@ pub(crate) fn llm_common_properties(extra: Value) -> Value {
         json!({ "type": "array", "items": model_ref_schema(), "maxItems": 8 }),
     );
     properties.insert("request".into(), request_policy_schema());
+    properties.insert("provider_web_search".into(), provider_web_search_schema());
     if let Value::Object(extra) = extra {
         for (key, value) in extra {
             properties.insert(key, value);

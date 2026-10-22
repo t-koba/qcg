@@ -828,6 +828,11 @@ fn validate_capabilities_for_api(
             "provider `{provider}` may only advertise `verbosity` for the Responses API"
         ));
     }
+    if capabilities.web_search && api != ApiFlavor::Responses {
+        return Err(format!(
+            "provider `{provider}` may only advertise `web_search` for the Responses API"
+        ));
+    }
     if (capabilities.tool_choice || capabilities.parallel_tool_calls) && !capabilities.tool_use {
         return Err(format!(
             "provider `{provider}` may not advertise tool selection controls without `tool_use`"
@@ -957,6 +962,9 @@ impl LlmProvider for FakeLlmProvider {
             parallel_tool_calls: true,
             verbosity: true,
             prompt_cache: false,
+            // The hosted search exists only on the Responses endpoint, and
+            // neither of these rows is a Responses endpoint.
+            web_search: false,
             reasoning_effort: vec![
                 ReasoningEffort::None,
                 ReasoningEffort::Minimal,
@@ -1023,6 +1031,7 @@ impl LlmProvider for FakeLlmProvider {
                         },
                         stop: StopReason::ToolUse,
                         provider_state: None,
+                        web_search: None,
                     });
                 }
             }
@@ -1040,6 +1049,7 @@ impl LlmProvider for FakeLlmProvider {
                 },
                 stop: StopReason::EndTurn,
                 provider_state: None,
+                web_search: None,
             });
         }
         if let Some(tool) =
@@ -1067,6 +1077,7 @@ impl LlmProvider for FakeLlmProvider {
                 },
                 stop: StopReason::ToolUse,
                 provider_state: None,
+                web_search: None,
             });
         }
         if let Some(sequence) = marker_line(prompt, "FAKE_TOOL_SEQUENCE:")
@@ -1095,6 +1106,7 @@ impl LlmProvider for FakeLlmProvider {
                 },
                 stop: StopReason::ToolUse,
                 provider_state: None,
+                web_search: None,
             });
         }
         let text = if let Some(sequence) = marker_line(prompt, "FAKE_JSON_SEQUENCE:")
@@ -1142,6 +1154,7 @@ impl LlmProvider for FakeLlmProvider {
             },
             stop: StopReason::EndTurn,
             provider_state: None,
+            web_search: None,
         })
     }
 }

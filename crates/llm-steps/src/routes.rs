@@ -106,6 +106,7 @@ fn priced_route(
                     .as_ref()
                     .and_then(|pricing| pricing.output_cost_per_million_usd)
             }),
+        web_search_call_cost_usd: None,
     }
 }
 
@@ -122,6 +123,7 @@ mod tests {
             cache_read_input_cost_per_million_usd: None,
             cache_creation_input_cost_per_million_usd: Some(0.0),
             output_cost_per_million_usd: None,
+            web_search_call_cost_usd: None,
         };
         let catalog = llm::ModelPricing {
             input_cost_per_million_usd: Some(1.0),

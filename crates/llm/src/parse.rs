@@ -1,3 +1,4 @@
+use model::{ProviderSearchAction, ProviderSearchEvent, ProviderWebSearchOutcome, UrlCitation};
 use serde_json::{Value, json};
 
 use crate::types::{ChatContent, ChatResponse, LlmError, LlmErrorKind, StopReason};
@@ -60,6 +61,7 @@ pub(crate) fn parse_chat_completions_response(value: Value) -> Result<ChatRespon
         usage,
         stop,
         provider_state: None,
+        web_search: None,
     })
 }
 
@@ -98,7 +100,10 @@ fn parse_openai_tool_call(call: &Value) -> Result<ChatContent, LlmError> {
     Ok(ChatContent::ToolCall { id, name, args })
 }
 
-pub(crate) fn parse_responses_response(value: Value) -> Result<ChatResponse, LlmError> {
+pub(crate) fn parse_responses_response(
+    value: Value,
+    provider_web_search: bool,
+) -> Result<ChatResponse, LlmError> {
     let mut content = Vec::new();
     let output_items = value.get("output").and_then(Value::as_array);
     let has_message_items = output_items.is_some_and(|items| {
@@ -228,14 +233,156 @@ pub(crate) fn parse_responses_response(value: Value) -> Result<ChatResponse, Llm
             )));
         }
     };
-    let provider_state = matches!(stop, StopReason::ToolUse)
+    // A hosted search call is provider state too: the replayed output array
+    // must carry it, so a resumed turn neither repeats the search nor its
+    // charge.
+    let hosted_call = output_items.into_iter().flatten().any(is_web_search_call);
+    let provider_state = (matches!(stop, StopReason::ToolUse) || hosted_call)
         .then(|| value.get("output").cloned())
         .flatten();
+    let web_search = provider_web_search_outcome(&value, provider_web_search)?;
     Ok(ChatResponse {
         content,
         usage,
         stop,
         provider_state,
+        web_search,
+    })
+}
+
+/// True when an output item is a hosted web search call.
+pub(crate) fn is_web_search_call(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("web_search_call")
+}
+
+/// Reads the citations one message output item carries.
+pub(crate) fn parse_message_citations(item: &Value) -> Result<Vec<UrlCitation>, LlmError> {
+    let mut citations = Vec::new();
+    for block in item
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for annotation in block
+            .get("annotations")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if annotation.get("type").and_then(Value::as_str) == Some("url_citation") {
+                citations.push(parse_url_citation(annotation)?);
+            }
+        }
+    }
+    Ok(citations)
+}
+
+/// Reads what the provider's hosted search did. The count is derived from
+/// the reported `web_search_call` items: a response without an output array
+/// did not report the count, which is unknown and never zero.
+fn provider_web_search_outcome(
+    value: &Value,
+    provider_web_search: bool,
+) -> Result<Option<ProviderWebSearchOutcome>, LlmError> {
+    if !provider_web_search {
+        return Ok(None);
+    }
+    let Some(output) = value.get("output").and_then(Value::as_array) else {
+        return Ok(Some(ProviderWebSearchOutcome::default()));
+    };
+    let mut outcome = ProviderWebSearchOutcome {
+        calls: Some(
+            output
+                .iter()
+                .filter(|item| is_web_search_call(item))
+                .count() as u64,
+        ),
+        ..ProviderWebSearchOutcome::default()
+    };
+    for item in output {
+        if is_web_search_call(item) {
+            outcome.events.push(parse_web_search_event(item)?);
+        }
+        if item.get("type").and_then(Value::as_str) == Some("message") {
+            outcome.citations.extend(parse_message_citations(item)?);
+        }
+    }
+    Ok(Some(outcome))
+}
+
+/// Reads one hosted search call. The action names its kind; a search action
+/// carries the queries it ran, a page action the page it opened.
+pub(crate) fn parse_web_search_event(item: &Value) -> Result<ProviderSearchEvent, LlmError> {
+    let reported = item.get("action").ok_or_else(|| {
+        LlmError::invalid_response("Responses API web_search_call did not include an action")
+    })?;
+    let kind = match reported {
+        Value::String(text) => text.as_str(),
+        other => other
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    };
+    let action = match kind {
+        "search" => ProviderSearchAction::Search,
+        "open_page" => ProviderSearchAction::OpenPage,
+        "find_in_page" => ProviderSearchAction::FindInPage,
+        other => {
+            return Err(LlmError::invalid_response(format!(
+                "Responses API web_search_call returned an unknown action `{other}`"
+            )));
+        }
+    };
+    let queries = web_search_field(reported, item, "queries")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .or_else(|| {
+            web_search_field(reported, item, "query")
+                .and_then(Value::as_str)
+                .map(|query| vec![query.to_string()])
+        })
+        .unwrap_or_default();
+    let url = web_search_field(reported, item, "url")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Ok(ProviderSearchEvent {
+        id: item.get("id").and_then(Value::as_str).map(str::to_string),
+        action,
+        queries,
+        url,
+    })
+}
+
+/// Reads a field of the action, falling back to the output item: the
+/// provider may report the action as an object or as a bare kind.
+fn web_search_field<'a>(action: &'a Value, item: &'a Value, name: &str) -> Option<&'a Value> {
+    action.get(name).or_else(|| item.get(name))
+}
+
+/// Reads one citation the provider attached to its answer.
+fn parse_url_citation(annotation: &Value) -> Result<UrlCitation, LlmError> {
+    let url = annotation
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            LlmError::invalid_response("Responses API url_citation did not include a url")
+        })?
+        .to_string();
+    Ok(UrlCitation {
+        url,
+        title: annotation
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        start_index: annotation.get("start_index").and_then(Value::as_u64),
+        end_index: annotation.get("end_index").and_then(Value::as_u64),
     })
 }
 
@@ -327,6 +474,7 @@ pub(crate) fn parse_anthropic_response(value: Value) -> Result<ChatResponse, Llm
         usage,
         stop,
         provider_state: None,
+        web_search: None,
     })
 }
 

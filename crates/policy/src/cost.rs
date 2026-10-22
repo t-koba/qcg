@@ -24,6 +24,8 @@ pub struct PricingRow<'a> {
     pub cache_creation_input_cost_per_million_usd: Option<f64>,
     pub cache_read_input_cost_per_million_usd: Option<f64>,
     pub output_cost_per_million_usd: Option<f64>,
+    /// Hosted web search USD per call. Absent means unmetered, not free.
+    pub web_search_call_cost_usd: Option<f64>,
 }
 
 /// Selects the row to bill: among provider/model matches, entries with
@@ -66,6 +68,7 @@ mod tests {
             cache_creation_input_cost_per_million_usd: None,
             cache_read_input_cost_per_million_usd: None,
             output_cost_per_million_usd: output,
+            web_search_call_cost_usd: None,
         }
     }
 

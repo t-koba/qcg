@@ -33,6 +33,7 @@ fn sample_request() -> ChatRequest {
         verbosity: None,
         stream: false,
         prompt_cache: PromptCache::Off,
+        provider_web_search: None,
     }
 }
 
@@ -969,14 +970,17 @@ fn responses_payload_maps_reasoning_effort() {
 
 #[test]
 fn parses_responses_text_response() {
-    let response = parse_responses_response(json!({
-        "status": "completed",
-        "output": [{
-            "type": "message",
-            "content": [{ "type": "output_text", "text": "hello" }]
-        }],
-        "usage": { "input_tokens": 7, "output_tokens": 2 }
-    }))
+    let response = parse_responses_response(
+        json!({
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "hello" }]
+            }],
+            "usage": { "input_tokens": 7, "output_tokens": 2 }
+        }),
+        false,
+    )
     .expect("response should parse");
 
     assert_eq!(response.usage.input, 7);
@@ -987,16 +991,19 @@ fn parses_responses_text_response() {
 
 #[test]
 fn parses_responses_function_call() {
-    let response = parse_responses_response(json!({
-        "status": "completed",
-        "output": [{
-            "type": "function_call",
-            "call_id": "call_1",
-            "name": "write_draft",
-            "arguments": "{\"path\":\"drafts/result.txt\",\"content\":\"ok\"}"
-        }],
-        "usage": { "input_tokens": 9, "output_tokens": 3 }
-    }))
+    let response = parse_responses_response(
+        json!({
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "write_draft",
+                "arguments": "{\"path\":\"drafts/result.txt\",\"content\":\"ok\"}"
+            }],
+            "usage": { "input_tokens": 9, "output_tokens": 3 }
+        }),
+        false,
+    )
     .expect("response should parse");
 
     assert!(matches!(response.stop, StopReason::ToolUse));
@@ -1025,18 +1032,21 @@ fn response_parsers_report_reasoning_tokens_as_output_detail() {
     assert_eq!(chat.usage.output, 11);
     assert_eq!(chat.usage.reasoning, 7);
 
-    let responses = parse_responses_response(json!({
-        "status": "completed",
-        "output": [{
-            "type": "message",
-            "content": [{ "type": "output_text", "text": "ok" }]
-        }],
-        "usage": {
-            "input_tokens": 3,
-            "output_tokens": 11,
-            "output_tokens_details": { "reasoning_tokens": 7 }
-        }
-    }))
+    let responses = parse_responses_response(
+        json!({
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "ok" }]
+            }],
+            "usage": {
+                "input_tokens": 3,
+                "output_tokens": 11,
+                "output_tokens_details": { "reasoning_tokens": 7 }
+            }
+        }),
+        false,
+    )
     .expect("Responses API response should parse");
     assert_eq!(responses.usage.output, 11);
     assert_eq!(responses.usage.reasoning, 7);
@@ -1056,18 +1066,21 @@ fn response_parsers_report_cached_input_tokens() {
     assert_eq!(chat.usage.input, 100);
     assert_eq!(chat.usage.cached_input, 40);
 
-    let responses = parse_responses_response(json!({
-        "status": "completed",
-        "output": [{
-            "type": "message",
-            "content": [{ "type": "output_text", "text": "ok" }]
-        }],
-        "usage": {
-            "input_tokens": 100,
-            "output_tokens": 10,
-            "input_tokens_details": { "cached_tokens": 25 }
-        }
-    }))
+    let responses = parse_responses_response(
+        json!({
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "ok" }]
+            }],
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "input_tokens_details": { "cached_tokens": 25 }
+            }
+        }),
+        false,
+    )
     .expect("Responses API response should parse");
     assert_eq!(responses.usage.input, 100);
     assert_eq!(responses.usage.cached_input, 25);
@@ -1225,11 +1238,11 @@ async fn responses_stream_treats_incomplete_as_terminal() {
             }],
             "usage": { "input_tokens": 10, "output_tokens": 5 }
         });
-        let direct =
-            parse_responses_response(terminal.clone()).expect("direct incomplete should parse");
+        let direct = parse_responses_response(terminal.clone(), false)
+            .expect("direct incomplete should parse");
         assert_eq!(direct.stop, expected);
         let (events, _receiver) = mpsc::channel(4);
-        let mut accumulator = HttpStreamAccumulator::new(ApiFlavor::Responses)
+        let mut accumulator = HttpStreamAccumulator::new(ApiFlavor::Responses, false)
             .expect("responses accumulator should build");
         let streamed = accumulator
             .ingest(
@@ -1261,7 +1274,7 @@ async fn responses_stream_rejects_unknown_incomplete_and_missing_terminal() {
     };
     let (events, _receiver) = mpsc::channel(4);
     // Unknown incomplete reasons stay rejected, even on the stream path.
-    let mut accumulator = HttpStreamAccumulator::new(ApiFlavor::Responses)
+    let mut accumulator = HttpStreamAccumulator::new(ApiFlavor::Responses, false)
         .expect("responses accumulator should build");
     assert!(
         accumulator
@@ -1274,7 +1287,7 @@ async fn responses_stream_rejects_unknown_incomplete_and_missing_terminal() {
         "unknown incomplete reason must fail"
     );
     // A terminal event without its response payload stays rejected.
-    let mut accumulator = HttpStreamAccumulator::new(ApiFlavor::Responses)
+    let mut accumulator = HttpStreamAccumulator::new(ApiFlavor::Responses, false)
         .expect("responses accumulator should build");
     let error = accumulator
         .ingest(json!({ "type": "response.incomplete" }), &events)
@@ -1286,7 +1299,7 @@ async fn responses_stream_rejects_unknown_incomplete_and_missing_terminal() {
     );
     // Failed events are never terminal: ignored, then finish reports the
     // missing terminal response.
-    let mut accumulator = HttpStreamAccumulator::new(ApiFlavor::Responses)
+    let mut accumulator = HttpStreamAccumulator::new(ApiFlavor::Responses, false)
         .expect("responses accumulator should build");
     assert!(
         accumulator
@@ -1314,16 +1327,19 @@ fn parses_responses_reasoning_only_incomplete_preserves_usage() {
         json!([{ "type": "reasoning", "encrypted_content": "opaque" }]),
         json!([]),
     ] {
-        let response = parse_responses_response(json!({
-            "status": "incomplete",
-            "incomplete_details": { "reason": "max_output_tokens" },
-            "output": output,
-            "usage": {
-                "input_tokens": 10,
-                "output_tokens": 5,
-                "output_tokens_details": { "reasoning_tokens": 5 }
-            }
-        }))
+        let response = parse_responses_response(
+            json!({
+                "status": "incomplete",
+                "incomplete_details": { "reason": "max_output_tokens" },
+                "output": output,
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "output_tokens_details": { "reasoning_tokens": 5 }
+                }
+            }),
+            false,
+        )
         .expect("reasoning-only exhaustion should parse");
         assert!(response.content.is_empty());
         assert_eq!(response.stop, StopReason::MaxTokens);
@@ -1347,7 +1363,7 @@ fn parses_responses_reasoning_only_incomplete_preserves_usage() {
         }),
     ] {
         assert!(
-            parse_responses_response(terminal).is_err(),
+            parse_responses_response(terminal, false).is_err(),
             "contentless responses outside max_output_tokens exhaustion must fail"
         );
     }
@@ -1365,10 +1381,10 @@ async fn responses_stream_preserves_reasoning_only_incomplete_usage() {
             "output_tokens_details": { "reasoning_tokens": 5 }
         }
     });
-    let direct = parse_responses_response(terminal.clone())
+    let direct = parse_responses_response(terminal.clone(), false)
         .expect("direct reasoning-only exhaustion should parse");
     let (events, _receiver) = mpsc::channel(4);
-    let mut accumulator = HttpStreamAccumulator::new(ApiFlavor::Responses)
+    let mut accumulator = HttpStreamAccumulator::new(ApiFlavor::Responses, false)
         .expect("responses accumulator should build");
     let streamed = accumulator
         .ingest(
@@ -2384,6 +2400,7 @@ impl LlmProvider for RetryProvider {
             },
             stop: StopReason::EndTurn,
             provider_state: None,
+            web_search: None,
         })
     }
 }
@@ -2456,6 +2473,7 @@ fn stream_request() -> ChatRequest {
         verbosity: None,
         stream: true,
         prompt_cache: PromptCache::Off,
+        provider_web_search: None,
     }
 }
 
@@ -2540,6 +2558,7 @@ async fn router_retries_retryable_provider_error() {
             verbosity: None,
             stream: false,
             prompt_cache: PromptCache::Off,
+            provider_web_search: None,
         })
         .await
         .expect("router should retry once and succeed");
@@ -2965,3 +2984,6 @@ fn bundled_anonymous_example_parses_without_credentials_or_discovery() {
 
 #[path = "tests/cache_usage.rs"]
 mod cache_usage;
+
+#[path = "tests/web_search.rs"]
+mod web_search;

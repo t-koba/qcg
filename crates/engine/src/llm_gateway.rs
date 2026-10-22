@@ -10,6 +10,8 @@ pub use types::*;
 mod tests {
     #[path = "cache_cost.rs"]
     mod cache_cost;
+    #[path = "web_search_cost.rs"]
+    mod web_search_cost;
     use super::*;
     use crate::{JournalWriter, SecretStore, StepError};
     use async_trait::async_trait;
@@ -107,6 +109,7 @@ mod tests {
                 },
                 stop: StopReason::EndTurn,
                 provider_state: None,
+                web_search: None,
             })
         }
     }
@@ -127,6 +130,7 @@ mod tests {
                 usage: TokenUsage::default(),
                 stop: StopReason::EndTurn,
                 provider_state: None,
+                web_search: None,
             })
         }
 
@@ -152,6 +156,7 @@ mod tests {
                         usage: TokenUsage::default(),
                         stop: StopReason::EndTurn,
                         provider_state: None,
+                        web_search: None,
                     },
                 })
                 .await
@@ -176,6 +181,7 @@ mod tests {
                 usage: TokenUsage::default(),
                 stop: StopReason::EndTurn,
                 provider_state: None,
+                web_search: None,
             })
         }
 
@@ -199,6 +205,7 @@ mod tests {
                         usage: TokenUsage::default(),
                         stop: StopReason::EndTurn,
                         provider_state: None,
+                        web_search: None,
                     },
                 })
                 .await
@@ -229,6 +236,7 @@ mod tests {
                 },
                 stop: StopReason::EndTurn,
                 provider_state: None,
+                web_search: None,
             })
         }
     }
@@ -259,6 +267,7 @@ mod tests {
                 },
                 stop: StopReason::ToolUse,
                 provider_state: None,
+                web_search: None,
             })
         }
     }
@@ -300,6 +309,7 @@ mod tests {
                 usage: TokenUsage::default(),
                 stop: StopReason::EndTurn,
                 provider_state: None,
+                web_search: None,
             })
         }
     }
@@ -332,6 +342,7 @@ mod tests {
                 },
                 stop: StopReason::EndTurn,
                 provider_state: None,
+                web_search: None,
             })
         }
     }
@@ -362,6 +373,7 @@ mod tests {
                 },
                 stop: StopReason::MaxTokens,
                 provider_state: None,
+                web_search: None,
             })
         }
     }
@@ -650,6 +662,7 @@ mod tests {
                 cache_creation_input_cost_per_million_usd: None,
                 cache_read_input_cost_per_million_usd: None,
                 output_cost_per_million_usd: Some(1.0),
+                web_search_call_cost_usd: None,
             }],
         );
         let node = test_node();
@@ -750,6 +763,7 @@ mod tests {
             verbosity: None,
             stream: false,
             prompt_cache: llm::PromptCache::Off,
+            provider_web_search: None,
         }
     }
 
@@ -792,6 +806,7 @@ mod tests {
                 cache_creation_input_cost_per_million_usd: None,
                 cache_read_input_cost_per_million_usd: None,
                 output_cost_per_million_usd: None,
+                web_search_call_cost_usd: None,
             })
             .collect()
     }

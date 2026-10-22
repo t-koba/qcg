@@ -1,7 +1,7 @@
 use contract::{Contract, LlmConfig, LlmRequestPolicy, NodeDef, ToolDecl};
 use engine::{StepContext, StepError};
 use llm::LlmRuntime;
-use model::{StructuredOutputMode, ToolChoice};
+use model::{ProviderWebSearch, StructuredOutputMode, ToolChoice};
 
 use crate::prompting::{load_response_schema, resolve_prompt_path};
 use crate::request::validate_media_input;
@@ -23,6 +23,9 @@ pub(crate) fn validate_llm_node(
         .as_ref()
         .ok_or_else(|| StepError::failed(&node.id, "[llm] is required"))?;
     let params = llm_params(node)?;
+    if let Some(search) = &params.provider_web_search {
+        validate_provider_web_search(node, search)?;
+    }
     let policy = effective_request_policy(node, llm, None)?;
     validate_effective_tool_policy(
         node,
@@ -130,6 +133,41 @@ pub(crate) fn validate_effort_templates(
     Ok(())
 }
 
+/// The provider's own domain lists hold at most this many entries, and a
+/// contract states either an allow list or a block list, never both.
+const MAX_PROVIDER_WEB_SEARCH_DOMAINS: usize = 100;
+
+/// Rejects a hosted search the provider could not honor. The message names
+/// the field and the bound to change.
+pub(crate) fn validate_provider_web_search(
+    node: &NodeDef,
+    search: &ProviderWebSearch,
+) -> Result<(), StepError> {
+    if search.max_calls == 0 {
+        return Err(StepError::failed(
+            &node.id,
+            "provider_web_search.max_calls must be at least 1",
+        ));
+    }
+    if search.allowed_domains.len() > MAX_PROVIDER_WEB_SEARCH_DOMAINS
+        || search.blocked_domains.len() > MAX_PROVIDER_WEB_SEARCH_DOMAINS
+    {
+        return Err(StepError::failed(
+            &node.id,
+            format!(
+                "provider_web_search domain lists must contain at most {MAX_PROVIDER_WEB_SEARCH_DOMAINS} entries"
+            ),
+        ));
+    }
+    if !search.allowed_domains.is_empty() && !search.blocked_domains.is_empty() {
+        return Err(StepError::failed(
+            &node.id,
+            "provider_web_search must not combine allowed_domains with blocked_domains",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn capabilities_for(
     runtime: &LlmRuntime,
     provider_id: &str,
@@ -173,6 +211,9 @@ pub(crate) fn required_capabilities(
     has_tools: bool,
 ) -> Result<Vec<String>, StepError> {
     let mut required = request_required_capabilities(policy, has_response_schema, has_tools);
+    if params.provider_web_search.is_some() {
+        required.push("web_search".into());
+    }
     if !params.media.is_empty() && policy.max_media_bytes.is_none() {
         return Err(StepError::failed(
             &node.id,
@@ -373,6 +414,7 @@ pub(crate) fn has_capability(capabilities: &llm::Capabilities, name: &str) -> bo
         "tool_choice" => capabilities.tool_choice,
         "parallel_tool_calls" => capabilities.parallel_tool_calls,
         "verbosity" => capabilities.verbosity,
+        "web_search" => capabilities.web_search,
         _ => false,
     }
 }

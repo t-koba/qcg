@@ -1,4 +1,4 @@
-use model::{StructuredOutputMode, ToolChoice, ToolChoiceMode};
+use model::{ProviderWebSearch, StructuredOutputMode, ToolChoice, ToolChoiceMode};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -98,10 +98,53 @@ pub(crate) fn responses_payload(
             payload["parallel_tool_calls"] = json!(parallel);
         }
     }
+    if let Some(search) = &req.provider_web_search {
+        // The hosted search is a provider-side tool, so it joins the same
+        // `tools` array as the local function tools. The request-level
+        // `max_tool_calls` bounds the hosted calls it may make.
+        let mut tools = payload["tools"].as_array().cloned().unwrap_or_default();
+        tools.push(provider_web_search_tool(search));
+        payload["tools"] = Value::Array(tools);
+        payload["max_tool_calls"] = json!(search.max_calls);
+    }
     if wants_prompt_cache(req, prompt_cache, PromptCacheField::PromptCacheKey) {
         payload["prompt_cache_key"] = json!(prompt_cache_key(req));
     }
     payload
+}
+
+/// The hosted web search tool object. Only the fields the contract declared
+/// are sent, so the provider's own defaults apply to the rest.
+fn provider_web_search_tool(search: &ProviderWebSearch) -> Value {
+    let mut tool = json!({ "type": "web_search" });
+    let mut filters = serde_json::Map::new();
+    if !search.allowed_domains.is_empty() {
+        filters.insert("allowed_domains".into(), json!(search.allowed_domains));
+    }
+    if !search.blocked_domains.is_empty() {
+        filters.insert("blocked_domains".into(), json!(search.blocked_domains));
+    }
+    if !filters.is_empty() {
+        tool["filters"] = Value::Object(filters);
+    }
+    if let Some(size) = search.search_context_size {
+        tool["search_context_size"] = json!(size);
+    }
+    if let Some(location) = &search.user_location {
+        let mut value = json!({ "type": "approximate" });
+        for (name, field) in [
+            ("country", &location.country),
+            ("region", &location.region),
+            ("city", &location.city),
+            ("timezone", &location.timezone),
+        ] {
+            if let Some(field) = field {
+                value[name] = json!(field);
+            }
+        }
+        tool["user_location"] = value;
+    }
+    tool
 }
 
 pub(crate) fn anthropic_payload(
@@ -818,6 +861,7 @@ mod tests {
             verbosity: None,
             stream: false,
             prompt_cache,
+            provider_web_search: None,
         }
     }
 

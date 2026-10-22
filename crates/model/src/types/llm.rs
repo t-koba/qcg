@@ -95,3 +95,106 @@ impl fmt::Display for ReasoningEffort {
         formatter.write_str(self.as_str())
     }
 }
+
+/// The provider's own hosted web search. It is a separate mechanism from the
+/// local `web.search` tool, from MCP tools and from the external search
+/// adapter: the provider performs the fetch, bills it per call, and the
+/// network egress happens on the provider's side.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProviderWebSearch {
+    /// Domains the hosted search may visit. Mutually exclusive with
+    /// `blocked_domains`.
+    pub allowed_domains: Vec<String>,
+    /// Domains the hosted search must not visit. Mutually exclusive with
+    /// `allowed_domains`.
+    pub blocked_domains: Vec<String>,
+    /// How much context the provider should retrieve per call. Absent leaves
+    /// the provider's own default in place.
+    pub search_context_size: Option<SearchContextSize>,
+    /// Approximate location used to localize the hosted search.
+    pub user_location: Option<UserLocation>,
+    /// Upper bound on the hosted calls one request may make.
+    pub max_calls: u32,
+}
+
+/// The hosted search budget when a contract does not state one: the local
+/// `web.search` tool uses the same default.
+pub const DEFAULT_PROVIDER_WEB_SEARCH_MAX_CALLS: u32 = 3;
+
+impl Default for ProviderWebSearch {
+    fn default() -> Self {
+        Self {
+            allowed_domains: Vec::new(),
+            blocked_domains: Vec::new(),
+            search_context_size: None,
+            user_location: None,
+            max_calls: DEFAULT_PROVIDER_WEB_SEARCH_MAX_CALLS,
+        }
+    }
+}
+
+/// How much context the provider should retrieve for one hosted search.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchContextSize {
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+/// An approximate location, used by the provider to localize a hosted search.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct UserLocation {
+    pub country: Option<String>,
+    pub region: Option<String>,
+    pub city: Option<String>,
+    pub timezone: Option<String>,
+}
+
+/// What one hosted search call did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderSearchAction {
+    #[default]
+    Search,
+    OpenPage,
+    FindInPage,
+}
+
+/// One hosted search call reported by the provider.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProviderSearchEvent {
+    /// The provider's identifier for the call, when it reports one.
+    pub id: Option<String>,
+    pub action: ProviderSearchAction,
+    /// The queries a search action ran. Empty for page actions.
+    pub queries: Vec<String>,
+    /// The page a page action opened. Absent for a search action.
+    pub url: Option<String>,
+}
+
+/// One citation the provider attached to its answer.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct UrlCitation {
+    pub url: String,
+    pub title: Option<String>,
+    /// The cited range inside the answer text, when the provider reports one.
+    pub start_index: Option<u64>,
+    pub end_index: Option<u64>,
+}
+
+/// What one response did with the provider's hosted search. `calls` is the
+/// number of hosted calls the provider reported; `None` means the provider
+/// did not report it, which is unknown and never zero.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProviderWebSearchOutcome {
+    pub calls: Option<u64>,
+    pub events: Vec<ProviderSearchEvent>,
+    pub citations: Vec<UrlCitation>,
+}

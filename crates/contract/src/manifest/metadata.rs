@@ -311,6 +311,7 @@ impl GeneratorMetadataRule {
                         "output_cost_per_million_usd",
                         model.output_cost_per_million_usd,
                     ),
+                    ("web_search_call_cost_usd", model.web_search_call_cost_usd),
                 ] {
                     if value.is_some_and(|value| !value.is_finite() || value < 0.0) {
                         return Err(ContractError::Invalid(format!(
@@ -354,6 +355,7 @@ impl GeneratorMetadataRule {
                         "output_cost_per_million_usd",
                         model.output_cost_per_million_usd,
                     ),
+                    ("web_search_call_cost_usd", model.web_search_call_cost_usd),
                 ] {
                     if value.is_some_and(|value| !value.is_finite() || value < 0.0) {
                         return Err(ContractError::Invalid(format!(
@@ -382,6 +384,7 @@ impl GeneratorMetadataRule {
                         | "tool_choice"
                         | "parallel_tool_calls"
                         | "verbosity"
+                        | "web_search"
                 ) {
                     return Err(ContractError::Invalid(format!(
                         "[llm].requires contains unknown capability `{capability}`"

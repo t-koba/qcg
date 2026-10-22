@@ -74,6 +74,8 @@
   "Permissions",
   "ProblemDetails",
   "ProblemFieldError",
+  "ProviderSearchAction",
+  "ProviderSearchEvent",
   "QueuePositionQuality",
   "ReasonEventData",
   "ReasoningEffort",
@@ -123,5 +125,7 @@
   "ToolCallStatus",
   "ToolChoice",
   "ToolChoiceMode",
-  "UserInteractionEventData"
+  "UrlCitation",
+  "UserInteractionEventData",
+  "WebSearchUsage"
 ]

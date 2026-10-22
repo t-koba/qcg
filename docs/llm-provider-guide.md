@@ -1136,3 +1136,58 @@ The current Anthropic payload uses ephemeral cache markers with the default
 five-minute lifetime; no TTL tiers or prices are inferred from that marker.
 Missing optional counters are zero; present invalid counts, subset overflow,
 and cache sums exceeding total input fail closed instead of being clamped.
+
+## Provider-native web search
+
+Some providers host their own web search: the model asks the provider to
+search, the provider fetches the pages, and the provider bills the calls.
+That is a different mechanism from qcg's own `web.search` tool, from MCP
+tools and from the external search adapters, and qcg never presents one as
+another.
+
+The capability is off unless a contract asks for it. Selecting an OpenAI
+model does not enable it, and a provider offers it only when the registry
+row advertises `web_search = true` in its capabilities.
+
+| Capability | Responses endpoint | Chat Completions endpoint | Anthropic Messages endpoint |
+|---|---|---|---|
+| Provider-hosted web search | supported on models whose row advertises `web_search` | not supported | not supported |
+
+A contract opts in per node:
+
+```toml
+[[flow]]
+id = "research"
+type = "llm.generate"
+
+[flow.params]
+prompt = "research.j2"
+provider_web_search = { search_context_size = "medium", allowed_domains = ["example.com"], max_calls = 3 }
+```
+
+- `allowed_domains`, `blocked_domains`: at most 100 entries each, and a
+  contract states one list or the other, never both.
+- `search_context_size`: `low`, `medium` or `high`. The provider's own
+  default applies when the field is absent.
+- `user_location`: an approximate `country`, `region`, `city` and
+  `timezone`.
+- `max_calls`: the bound on the hosted calls one request may make, 3 by
+  default. It travels as the request's `max_tool_calls`, so it bounds the
+  request's total tool calls, hosted and local alike.
+
+Permissions and networking: the search runs at the provider, so its egress
+is the provider's, not the generator's, and the contract's network
+permission allowlist does not govern it. qcg sends no request to the
+searched hosts.
+
+Usage and cost: the provider does not report how many hosted calls it made
+in its usage object. qcg derives the count from the `web_search_call` output
+items of the response and records it in the `llm_call` event, together with
+the search's actions and the URL citations the provider attached. A response
+that reports no output items leaves the count unknown, and unknown is never
+reported as zero. The provider bills the calls apart from the tokens, so a
+run that wants the whole bill metered prices them with
+`web_search_call_cost_usd` on the model's pricing row; without a price the
+search charge is recorded as unmetered rather than free, and a run whose
+cost budget requires pricing refuses the node instead of settling an
+unpriced search.

@@ -1,4 +1,7 @@
-use model::{ReasoningEffort, ResponseVerbosity, StructuredOutputMode, ToolChoice};
+use model::{
+    ProviderWebSearch, ProviderWebSearchOutcome, ReasoningEffort, ResponseVerbosity,
+    StructuredOutputMode, ToolChoice,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -20,6 +23,9 @@ pub struct Capabilities {
     pub parallel_tool_calls: bool,
     pub verbosity: bool,
     pub prompt_cache: bool,
+    /// The provider's own hosted web search is available on this model.
+    /// It is a separate mechanism from the local `web.search` tool.
+    pub web_search: bool,
     pub reasoning_effort: Vec<ReasoningEffort>,
 }
 
@@ -57,6 +63,10 @@ pub struct ChatRequest {
     pub stream: bool,
     #[serde(default)]
     pub prompt_cache: PromptCache,
+    /// The hosted web search this request opts into. Absent by default:
+    /// selecting a model never enables the provider's search.
+    #[serde(default)]
+    pub provider_web_search: Option<ProviderWebSearch>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,6 +191,10 @@ pub struct ChatResponse {
     pub usage: TokenUsage,
     pub stop: StopReason,
     pub provider_state: Option<Value>,
+    /// What the provider's hosted search did in this response. Absent when
+    /// the request did not enable the hosted search.
+    #[serde(default)]
+    pub web_search: Option<ProviderWebSearchOutcome>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
