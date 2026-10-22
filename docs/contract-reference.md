@@ -90,10 +90,11 @@ Fields:
   `output_cost_per_million_usd`. The tier whose threshold the request's whole
   prompt input reaches prices the whole request; the thresholds must strictly
   increase and every rate must be finite and non-negative. A tier rate that is
-  omitted inherits the base row's rate for that category, except a cache rate,
-  which inherits the tier's own ordinary input rate. A contract that declares
-  tiers owns the whole schedule; otherwise the catalog's tiers apply, and a
-  rate the contract pinned prices every tier.
+  omitted inherits the base row's rate for that category. A cache rate the tier
+  does not name therefore inherits the base row's cache rate, never the tier's
+  own ordinary input rate: an ordinary input price is not a cache price. A
+  contract that declares tiers owns the whole schedule; otherwise the catalog's
+  tiers apply, and a rate the contract pinned prices every tier.
 - `max_context_bytes`
 - `max_context_tokens`
 - `max_media_bytes`: required aggregate byte limit when an LLM node declares

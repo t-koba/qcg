@@ -2,10 +2,9 @@
 //! prompt input reaches a tier's threshold.
 //!
 //! A tier prices a request, not a slice of it: the selected tier's rates
-//! apply to every token of the request. The threshold is compared against
-//! the request's whole prompt input (ordinary input plus the disjoint cache
-//! read and cache creation subsets), so a token is never counted twice and
-//! never split across two tiers.
+//! apply to every token of the request, chosen by the request's whole prompt
+//! input (ordinary input plus the disjoint cache read and cache creation
+//! subsets), so no token is counted twice or split across two tiers.
 //!
 //! The rules live here so the manifest check, the catalog reader, the route
 //! selection and the cost meter all price the same way.
@@ -18,18 +17,16 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CostTier {
-    /// Prompt-input tokens from which this tier's rates apply. A request
-    /// whose prompt input reaches this threshold is priced entirely at this
-    /// tier's rates.
+    /// Prompt-input tokens from which this tier's rates apply: a request
+    /// that reaches this threshold is priced entirely at this tier's rates.
     pub threshold_tokens: u64,
     /// Ordinary input USD/1M. Absent inherits the base row's input rate.
     #[serde(default)]
     pub input_cost_per_million_usd: Option<f64>,
-    /// Cache read USD/1M. Absent inherits the tier's ordinary input rate.
+    /// Cache read USD/1M. Absent inherits the base row's cache rate.
     #[serde(default)]
     pub cache_read_input_cost_per_million_usd: Option<f64>,
-    /// Cache creation USD/1M. Absent inherits the tier's ordinary input
-    /// rate.
+    /// Cache creation USD/1M. Absent inherits the base row's cache rate.
     #[serde(default)]
     pub cache_creation_input_cost_per_million_usd: Option<f64>,
     /// Output USD/1M. Absent inherits the base row's output rate.
@@ -76,10 +73,10 @@ pub struct CostRates {
 
 impl CostRates {
     /// The rates that apply to a request, given the tier it reaches. A tier
-    /// is a whole price row: the rates it names win, a cache rate it does
-    /// not name inherits the tier's ordinary input rate, and an output
-    /// rate it does not name inherits the base row's output rate. The base
-    /// row prices an absent cache rate at its own ordinary input rate.
+    /// is a whole price row: the rates it names win, and a rate it does not
+    /// name inherits the base row's rate for that category. The base row
+    /// prices an absent cache rate at its own ordinary input rate, and a
+    /// tier's own input rate never prices cache tokens.
     pub fn resolve(&self, tier: Option<&CostTier>) -> CostRates {
         let input = tier
             .and_then(|tier| tier.input_cost_per_million_usd)
@@ -87,12 +84,16 @@ impl CostRates {
         let output = tier
             .and_then(|tier| tier.output_cost_per_million_usd)
             .or(self.output);
+        let base_cache_read = self.cache_read.or(self.input);
+        let base_cache_creation = self.cache_creation.or(self.input);
         let (cache_read, cache_creation) = match tier {
             Some(tier) => (
-                tier.cache_read_input_cost_per_million_usd.or(input),
-                tier.cache_creation_input_cost_per_million_usd.or(input),
+                tier.cache_read_input_cost_per_million_usd
+                    .or(base_cache_read),
+                tier.cache_creation_input_cost_per_million_usd
+                    .or(base_cache_creation),
             ),
-            None => (self.cache_read.or(input), self.cache_creation.or(input)),
+            None => (base_cache_read, base_cache_creation),
         };
         CostRates {
             input,
@@ -142,10 +143,9 @@ pub fn select_cost_tier(tiers: &[CostTier], prompt_input_tokens: u64) -> Option<
         .max_by_key(|tier| tier.threshold_tokens)
 }
 
-/// The dearest rates a request can be billed at: the base row and every
-/// tier it can reach. A pre-call estimate does not know which tier a
-/// request reaches, so it reserves at these rates rather than at a tier it
-/// cannot prove.
+/// The dearest rates a request can be billed at: the base row and every tier
+/// it can reach. A pre-call estimate cannot know which tier a request reaches,
+/// so it reserves at these rates rather than at a tier it cannot prove.
 pub fn max_cost_rates(base: &CostRates, tiers: &[CostTier]) -> CostRates {
     let mut rates = base.resolve(None);
     for tier in tiers {
@@ -275,11 +275,70 @@ mod tests {
             output_cost_per_million_usd: None,
         }));
         assert_eq!(rows.input, Some(5.0));
-        // The tier's own input rate prices its cache reads.
-        assert_eq!(rows.cache_read, Some(5.0));
-        assert_eq!(rows.cache_creation, Some(5.0));
+        // A cache rate the tier does not name inherits the base row's
+        // cache rate, never the tier's own input rate. The base row names
+        // no cache-creation rate, so it prices cache creation at its own
+        // ordinary input rate.
+        assert_eq!(rows.cache_read, Some(0.1));
+        assert_eq!(rows.cache_creation, Some(1.0));
         // An absent tier output rate keeps the base row's output rate.
         assert_eq!(rows.output, Some(2.0));
+    }
+
+    /// A base row that names its cache rates.
+    fn base_with_cache_rates() -> CostRates {
+        CostRates {
+            input: Some(2.0),
+            cache_read: Some(0.2),
+            cache_creation: Some(2.5),
+            output: Some(3.0),
+        }
+    }
+
+    /// A tier that names only its input and output rates.
+    fn tier_without_cache_rates() -> CostTier {
+        CostTier {
+            threshold_tokens: 200_000,
+            input_cost_per_million_usd: Some(5.0),
+            cache_read_input_cost_per_million_usd: None,
+            cache_creation_input_cost_per_million_usd: None,
+            output_cost_per_million_usd: Some(6.0),
+        }
+    }
+
+    #[test]
+    fn a_tier_that_names_no_cache_rate_inherits_the_base_row_cache_rate() {
+        let rows = base_with_cache_rates().resolve(Some(&tier_without_cache_rates()));
+        assert_eq!(rows.input, Some(5.0));
+        assert_eq!(rows.output, Some(6.0));
+        // The base row's cache rates price the cache tokens: the provider's
+        // cache price, not the tier's ordinary input price.
+        assert_eq!(rows.cache_read, Some(0.2));
+        assert_eq!(rows.cache_creation, Some(2.5));
+    }
+
+    #[test]
+    fn a_tier_never_prices_cache_tokens_at_its_own_input_rate() {
+        let base = CostRates {
+            input: Some(2.0),
+            cache_read: None,
+            cache_creation: None,
+            output: Some(3.0),
+        };
+        let rows = base.resolve(Some(&tier_without_cache_rates()));
+        // The base row names no cache rate, so it prices cache tokens at
+        // its own ordinary input rate; the tier's higher input rate does
+        // not price them.
+        assert_eq!(rows.cache_read, Some(2.0));
+        assert_eq!(rows.cache_creation, Some(2.0));
+    }
+
+    #[test]
+    fn the_reservation_does_not_price_cache_tokens_at_a_tier_input_rate() {
+        let rates = max_cost_rates(&base_with_cache_rates(), &[tier_without_cache_rates()]);
+        assert_eq!(rates.input, Some(5.0));
+        assert_eq!(rates.cache_read, Some(0.2));
+        assert_eq!(rates.cache_creation, Some(2.5));
     }
 
     #[test]

@@ -101,8 +101,9 @@ microUSD = ordinary_input * input_cost_per_million_usd
          + output * output_cost_per_million_usd
 ```
 
-Rates are USD per 1M tokens. Each omitted cache rate falls back to the same
-row's ordinary input rate; explicit zero is honored. `require_pricing` still
+Rates are USD per 1M tokens. On the base row, each omitted cache rate falls
+back to that row's ordinary input rate; explicit zero is honored. A tier row
+inherits the base row's cache rate instead (see below). `require_pricing` still
 requires ordinary input/output rates, not cache rates. Totals remain estimates,
 not provider invoices, especially unless all actual categories are configured.
 No vendor discounts or cache TTL tiers are inferred. Admission reservations
@@ -116,9 +117,11 @@ the request's whole prompt input, that is `ordinary_input + cached_input +
 cache_creation_input`, and the tier with the greatest threshold the request
 reaches prices the whole request: no token is split across two tiers and no
 token is counted twice. A tier rate wins over the base row's rate for the same
-category; a cache rate the tier does not name falls back to the tier's own
-ordinary input rate, and an output rate the tier does not name falls back to
-the base row's output rate. A request that stays below every threshold is
+category; a rate the tier does not name inherits the base row's rate for that
+category. A cache rate the tier does not name therefore inherits the base
+row's cache rate, never the tier's own ordinary input rate: an ordinary input
+price is not a cache price. An output rate the tier does not name falls back
+to the base row's output rate. A request that stays below every threshold is
 priced at the base row. Admission reservations cannot prove which tier a
 request reaches, so they reserve at the dearest rate any tier on the row
 names.

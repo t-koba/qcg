@@ -45,6 +45,27 @@ fn tier_pricing() -> ModelRef {
     }
 }
 
+/// A route whose base row names its cache rates and whose tier names
+/// only input and output rates.
+fn tier_pricing_without_cache_rates() -> ModelRef {
+    ModelRef {
+        provider: "tier".into(),
+        model: "test".into(),
+        input_cost_per_million_usd: Some(2.0),
+        cache_creation_input_cost_per_million_usd: Some(2.5),
+        cache_read_input_cost_per_million_usd: Some(0.25),
+        output_cost_per_million_usd: Some(3.0),
+        web_search_call_cost_usd: None,
+        cost_tiers: vec![policy::CostTier {
+            threshold_tokens: 1_000_000,
+            input_cost_per_million_usd: Some(5.0),
+            cache_read_input_cost_per_million_usd: None,
+            cache_creation_input_cost_per_million_usd: None,
+            output_cost_per_million_usd: Some(6.0),
+        }],
+    }
+}
+
 fn usage(input: u64, cached_input: u64, cache_creation_input: u64) -> TokenUsage {
     TokenUsage {
         input,
@@ -103,6 +124,32 @@ async fn the_tier_is_chosen_by_the_whole_prompt_input_counted_once() {
     // token is priced twice.
     let cost = metered_cost(usage(1_000_000, 400_000, 200_000), tier_pricing()).await;
     assert_eq!(cost, 400_000 * 5 + 400_000 * 5 / 10 + 200_000 * 4 + 10 * 6);
+}
+
+#[tokio::test]
+async fn a_tier_keeps_the_base_row_cache_rates_at_the_threshold() {
+    // 800,000 ordinary + 100,000 cached + 100,000 created reaches the
+    // one-million threshold exactly, so the tier prices the request.
+    let cost = metered_cost(
+        usage(1_000_000, 100_000, 100_000),
+        tier_pricing_without_cache_rates(),
+    )
+    .await;
+    // The tier's input and output rates price the request; the cache
+    // tokens keep the base row's cache rates, because the tier's own
+    // ordinary input rate is not a cache price.
+    assert_eq!(cost, 800_000 * 5 + 100_000 / 4 + 100_000 * 5 / 2 + 10 * 6);
+}
+
+#[tokio::test]
+async fn a_request_below_the_threshold_keeps_the_base_row_cache_rates() {
+    // One token short of the threshold: the base row prices the request.
+    let cost = metered_cost(
+        usage(999_999, 100_000, 100_000),
+        tier_pricing_without_cache_rates(),
+    )
+    .await;
+    assert_eq!(cost, 799_999 * 2 + 100_000 / 4 + 100_000 * 5 / 2 + 10 * 3);
 }
 
 #[tokio::test]
