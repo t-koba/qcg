@@ -274,4 +274,59 @@ mod tests {
             Some(0.1)
         );
     }
+
+    #[test]
+    fn a_pinned_input_rate_does_not_price_cache_tokens_at_the_tier_threshold() {
+        // The catalog's base row names a cache rate; its tier names none.
+        let catalog = llm::ModelPricing {
+            input_cost_per_million_usd: Some(1.0),
+            cache_creation_input_cost_per_million_usd: Some(1.5),
+            cache_read_input_cost_per_million_usd: Some(0.2),
+            output_cost_per_million_usd: Some(3.0),
+            cost_tiers: vec![policy::CostTier {
+                threshold_tokens: 200_000,
+                input_cost_per_million_usd: Some(2.0),
+                cache_read_input_cost_per_million_usd: None,
+                cache_creation_input_cost_per_million_usd: None,
+                output_cost_per_million_usd: Some(4.0),
+            }],
+        };
+        // The contract pins the input rate and no cache rate.
+        let contract = contract::ModelRef {
+            provider: "p".into(),
+            model: "m".into(),
+            input_cost_per_million_usd: Some(9.0),
+            cache_read_input_cost_per_million_usd: None,
+            cache_creation_input_cost_per_million_usd: None,
+            output_cost_per_million_usd: None,
+            web_search_call_cost_usd: None,
+            cost_tiers: Vec::new(),
+        };
+        let resolved = priced_route("p", "m", Some(&contract), Some(catalog));
+        // The tier names no cache rate, so its cache slots stay open.
+        assert_eq!(
+            resolved.cost_tiers[0].cache_read_input_cost_per_million_usd,
+            None
+        );
+        assert_eq!(
+            resolved.cost_tiers[0].cache_creation_input_cost_per_million_usd,
+            None
+        );
+        // Below the threshold the base row prices the request.
+        let below = resolved
+            .rates()
+            .resolve(policy::select_cost_tier(&resolved.cost_tiers, 199_999));
+        assert_eq!(below.cache_read, Some(0.2));
+        assert_eq!(below.cache_creation, Some(1.5));
+        // At the threshold the tier prices it. The pinned input rate
+        // prices the ordinary input, and the cache tokens are priced at
+        // the base row's cache rate - not at the pinned input rate the
+        // tier carries.
+        let at = resolved
+            .rates()
+            .resolve(policy::select_cost_tier(&resolved.cost_tiers, 200_000));
+        assert_eq!(at.input, Some(9.0));
+        assert_eq!(at.cache_read, Some(0.2));
+        assert_eq!(at.cache_creation, Some(1.5));
+    }
 }
