@@ -2446,6 +2446,12 @@ export interface components {
             turn: number | null;
             /** @default null */
             verbosity: components["schemas"]["ResponseVerbosity"] | null;
+            /**
+             * @description What the provider's hosted web search did in this call. Absent when
+             *     the request did not enable the hosted search.
+             * @default null
+             */
+            web_search: components["schemas"]["WebSearchUsage"] | null;
         };
         /** LlmCatalogCapabilities */
         LlmCatalogCapabilities: {
@@ -2658,6 +2664,31 @@ export interface components {
         ProblemFieldError: {
             field: string;
             reason: string;
+        };
+        /**
+         * @description What one hosted search call did.
+         * @enum {string}
+         */
+        ProviderSearchAction: "search" | "open_page" | "find_in_page";
+        /** @description One hosted search call reported by the provider. */
+        ProviderSearchEvent: {
+            /** @default search */
+            action: components["schemas"]["ProviderSearchAction"];
+            /**
+             * @description The provider's identifier for the call, when it reports one.
+             * @default null
+             */
+            id: string | null;
+            /**
+             * @description The queries a search action ran. Empty for page actions.
+             * @default []
+             */
+            queries: string[];
+            /**
+             * @description The page a page action opened. Absent for a search action.
+             * @default null
+             */
+            url: string | null;
         };
         /** @enum {string} */
         QueuePositionQuality: "exact" | "estimated" | "unavailable";
@@ -3299,9 +3330,48 @@ export interface components {
         };
         /** @enum {string} */
         ToolChoiceMode: "none" | "auto" | "required";
+        /** @description One citation the provider attached to its answer. */
+        UrlCitation: {
+            /**
+             * Format: uint64
+             * @default null
+             */
+            end_index: number | null;
+            /**
+             * Format: uint64
+             * @description The cited range inside the answer text, when the provider reports one.
+             * @default null
+             */
+            start_index: number | null;
+            /** @default null */
+            title: string | null;
+            /** @default  */
+            url: string;
+        };
         UserInteractionEventData: {
             /** @default null */
             source: string | null;
+        };
+        /** @description What the provider's hosted web search did in one call, and what it cost. */
+        WebSearchUsage: {
+            /**
+             * Format: uint64
+             * @description The hosted calls the provider reported. Absent means unknown, which
+             *     is never zero.
+             * @default null
+             */
+            calls: number | null;
+            /** @default [] */
+            citations: components["schemas"]["UrlCitation"][];
+            /**
+             * Format: uint64
+             * @description The hosted search charge in microusd. Absent means the run does not
+             *     price the search: unmetered, never free.
+             * @default null
+             */
+            cost_microusd: number | null;
+            /** @default [] */
+            events: components["schemas"]["ProviderSearchEvent"][];
         };
     };
     responses: {
