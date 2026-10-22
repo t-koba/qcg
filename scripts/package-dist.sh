@@ -70,6 +70,7 @@ for document in "${public_docs[@]}"; do
 done
 require_path "providers.toml"
 require_path "README.md"
+require_path "PROJECT.md"
 require_path "THIRD-PARTY-NOTICES"
 
 if [ "$dry_run" = "true" ]; then
@@ -120,6 +121,7 @@ rm -rf "$staging"
 mkdir -p "$staging/bin" "$staging/share/${product_id}"
 cp "target/${target_profile}/${source_binary}" "$staging/bin/${bin_name}"
 cp README.md "$staging/share/${product_id}/"
+cp PROJECT.md "$staging/share/${product_id}/"
 cp providers.toml "$staging/share/${product_id}/providers.toml"
 cp THIRD-PARTY-NOTICES "$staging/share/${product_id}/"
 node scripts/generate-sbom.mjs "$staging/share/${product_id}/SBOM.spdx.json"

@@ -4,6 +4,7 @@ import { resolve, dirname, join, relative, isAbsolute } from "node:path";
 const root = resolve(process.argv[2] ?? ".");
 for (const name of [
   "README.md",
+  "PROJECT.md",
   "THIRD-PARTY-NOTICES",
   "SBOM.spdx.json",
   "providers.toml",
