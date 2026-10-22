@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const RUN_STATE_SCHEMA_VERSION: u32 = 2;
+pub const RUN_STATE_SCHEMA_VERSION: u32 = 3;
 
 /// Durable diagnostics that the journal keeps for operators but that carry no
 /// folded state. They are listed as explicit arms so the fold never depends on
@@ -156,6 +156,11 @@ pub struct RunState {
     pub vars: ValueBag,
     pub nodes: BTreeMap<NodePath, NodeOutcome>,
     pub checkpoints: BTreeMap<NodePath, Value>,
+    /// The files each node's agent removed. A removal outlives the
+    /// attempt that made it, and it outlives the node's checkpoint: the
+    /// engine clears a checkpoint when the step finishes, so the record
+    /// that holds the removals cannot be the checkpoint itself.
+    pub removed_files: BTreeMap<NodePath, BTreeSet<String>>,
     pub budget: BudgetState,
     pub resource_pins: BTreeMap<String, String>,
     /// Latest pinned revision per workspace path. Values always reflect the
@@ -258,6 +263,7 @@ impl Default for RunState {
             vars: ValueBag::default(),
             nodes: BTreeMap::new(),
             checkpoints: BTreeMap::new(),
+            removed_files: BTreeMap::new(),
             budget: BudgetState::default(),
             resource_pins: BTreeMap::new(),
             latest_file_pins: BTreeMap::new(),
@@ -808,6 +814,29 @@ impl RunState {
                     event.get("node").and_then(Value::as_str),
                     event.get("checkpoint").cloned(),
                 ) {
+                    // The removals the agent's tools made outlive the
+                    // checkpoint they ride in: the engine clears a
+                    // checkpoint when the step finishes, and a removal
+                    // must still hold when the node runs again. The
+                    // checkpoint carries the attempt's complete removal
+                    // set, so the record follows it instead of growing:
+                    // a file the agent wrote again after removing it
+                    // supersedes the removal, exactly as the agent's own
+                    // rule says.
+                    if let Some(removed) = checkpoint.get("removed_files").and_then(Value::as_array)
+                    {
+                        let removals: BTreeSet<String> = removed
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect();
+                        let node = NodePath::root(path);
+                        if removals.is_empty() {
+                            self.removed_files.remove(&node);
+                        } else {
+                            self.removed_files.insert(node, removals);
+                        }
+                    }
                     self.checkpoints.insert(NodePath::root(path), checkpoint);
                 }
             }
@@ -1278,6 +1307,20 @@ impl RunState {
                 self.latest_file_pins
                     .insert(pin.path.to_string(), pin.sha256.clone());
             }
+            // A file the step reports as an output was written, and a
+            // write supersedes an earlier removal of it: the removal
+            // record must not keep a path the run now holds.
+            let node = NodePath::root(path);
+            let mut superseded = false;
+            if let Some(removals) = self.removed_files.get_mut(&node) {
+                for pin in &files {
+                    removals.remove(pin.path.as_str());
+                }
+                superseded = removals.is_empty();
+            }
+            if superseded {
+                self.removed_files.remove(&node);
+            }
             self.nodes
                 .insert(NodePath::root(path), NodeOutcome::Success { output, files });
             self.checkpoints.remove(&NodePath::root(path));
@@ -1604,6 +1647,62 @@ mod tests {
     }
 
     #[test]
+    fn a_removal_record_follows_the_agent_rule() {
+        // The record of what the agent removed follows the agent's own
+        // rule: a file it wrote again after removing it supersedes the
+        // removal, so the record must not keep a path the run holds.
+        let mut state = RunState::default();
+        let checkpoint = |seq: u64, removed: Value| {
+            json!({
+                "t": "agent_checkpoint",
+                "seq": seq,
+                "node": "agent",
+                "turn": 1,
+                "phase": "turn_completed",
+                "checkpoint": {"next_turn": 2, "removed_files": removed},
+            })
+        };
+        state
+            .apply(&checkpoint(1, json!(["out/note.txt"])))
+            .expect("the checkpoint should fold");
+        assert_eq!(
+            state.removed_files.get(&NodePath::root("agent")),
+            Some(&BTreeSet::from(["out/note.txt".to_string()])),
+            "the removal the agent made must be recorded"
+        );
+        // The checkpoint carries the attempt's complete removal set, so
+        // an empty set means the agent wrote the file again.
+        state
+            .apply(&checkpoint(2, json!([])))
+            .expect("the second checkpoint should fold");
+        assert_eq!(
+            state.removed_files.get(&NodePath::root("agent")),
+            None,
+            "a write supersedes the removal the agent made earlier"
+        );
+        // A step that reports the file as an output wrote it again, so
+        // the removal does not stand either.
+        state
+            .apply(&checkpoint(3, json!(["out/note.txt"])))
+            .expect("the third checkpoint should fold");
+        state
+            .apply(&json!({
+                "t": "step_finished",
+                "seq": 4,
+                "node": "agent",
+                "status": "success",
+                "files": [{"path": "out/note.txt", "sha256": "abc"}],
+                "failed_files": [],
+            }))
+            .expect("the finished step should fold");
+        assert_eq!(
+            state.removed_files.get(&NodePath::root("agent")),
+            None,
+            "a file the step reports as an output is not a removal"
+        );
+    }
+
+    #[test]
     fn persisted_state_requires_every_field() {
         // E07: no `#[serde(default)]` compat shims. A persisted state with
         // a missing field is corruption from an old or partial writer and
@@ -1628,6 +1727,7 @@ mod tests {
             "vars",
             "nodes",
             "checkpoints",
+            "removed_files",
             "budget",
             "resource_pins",
             "latest_file_pins",

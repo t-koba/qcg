@@ -16,6 +16,7 @@ mod tests {
     use super::*;
     use camino::{Utf8Path, Utf8PathBuf};
     use serde_json::{Value, json};
+    use std::collections::BTreeSet;
 
     /// A real state-free durable kind for the bookkeeping tests below. The
     /// fold gate refuses invented kinds, and seq assignment, event counts,
@@ -659,7 +660,7 @@ mod tests {
                     "node": "agent",
                     "turn": 1,
                     "phase": "turn_completed",
-                    "checkpoint": {"next_turn": 2}
+                    "checkpoint": {"next_turn": 2, "removed_files": ["out/note.txt"]}
                 }),
             )
             .unwrap();
@@ -676,6 +677,17 @@ mod tests {
             )
             .unwrap();
         assert!(journal.state().checkpoints.is_empty());
+        // The removal the agent's tools made outlives the checkpoint it
+        // rode in: the engine clears the checkpoint when the step
+        // finishes, and a file the agent removed stays removed.
+        assert_eq!(
+            journal
+                .state()
+                .removed_files
+                .get(&model::NodePath::root("agent")),
+            Some(&BTreeSet::from(["out/note.txt".to_string()])),
+            "the removal must outlive the checkpoint the engine cleared"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

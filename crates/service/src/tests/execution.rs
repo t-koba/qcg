@@ -963,6 +963,292 @@ done
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The engine clears a node's checkpoint when the step finishes, but a
+/// removal the agent's own tools made outlives that checkpoint: the run's
+/// own state holds the removal, so the record is still there after the
+/// engine deleted the checkpoint it rode in.
+#[tokio::test]
+async fn a_removal_outlives_the_checkpoint_the_engine_clears() {
+    let root = temp_run_dir("agent-removed-file-outlives-checkpoint");
+    let _ = std::fs::remove_dir_all(&root);
+    let generator = root.join("generator");
+    let runs = root.join("runs");
+    std::fs::create_dir_all(generator.join("prompts")).expect("generator dirs");
+    std::fs::write(
+        generator.join(contract::MANIFEST_FILE),
+        r#"
+[generator]
+id = "generator"
+name = "Generator"
+version = "0.1.0"
+
+[[flow]]
+id = "agent"
+output = "agent_result"
+type = "llm.agent"
+
+[flow.params]
+max_iterations = 4
+max_tokens_total = 4096
+prompt = "prompts/agent.j2"
+
+[[flow.params.tools]]
+kind = "fs.write"
+name = "write_note"
+path_prefix = "out/"
+
+[[flow.params.tools]]
+kind = "command"
+name = "remove_note"
+command = ["sh", "-c", "rm -f out/note.txt"]
+
+[llm]
+max_tokens = 256
+temperature = 0.0
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[permissions]
+fs_read = []
+network = []
+commands = [{ bin = "sh", args = ["-c", "rm -f out/note.txt"], isolation = "trusted_host" }]
+side_effects = "allowed"
+side_effects_scope = "invocation"
+fs_write = ["workspace"]
+
+[permissions.containers]
+enabled = false"#,
+    )
+    .expect("generator manifest");
+    // The agent writes the file, then removes it with its own command.
+    std::fs::write(
+        generator.join("prompts/agent.j2"),
+        r#"Write the note, then remove it again.
+
+FAKE_TOOL_SEQUENCE: [{"name":"write_note","args":{"path":"out/note.txt","content":"scratch"}},{"name":"remove_note","args":{}}]
+FAKE_AGENT_FINAL:
+done
+"#,
+    )
+    .expect("prompt");
+    let service = test_service(vec![root.clone()], runs.clone());
+    let id = service
+        .start_run(StartRun {
+            generator_id: "generator".into(),
+            inputs: BTreeMap::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("agent run should start");
+    let terminal = wait_for_terminal_snapshot(&service, &id).await;
+    assert_eq!(
+        terminal.state,
+        RunStatus::Succeeded,
+        "the run must succeed: {terminal:?}"
+    );
+    let run_dir = service.run_dir_for(&id).await.expect("run dir");
+    let state_path = run_meta_dir(&run_dir).join("state.json");
+    // The persisted state follows the journal by one append, so the run
+    // being terminal does not mean the state file already carries the
+    // last events. Wait for the state that holds both halves of the
+    // claim, then assert on it.
+    let mut state = Value::Null;
+    for _ in 0..200 {
+        state = std::fs::read(&state_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .unwrap_or(Value::Null);
+        let cleared = state
+            .get("checkpoints")
+            .and_then(Value::as_object)
+            .is_some_and(|checkpoints| checkpoints.is_empty());
+        let recorded = state
+            .get("removed_files")
+            .and_then(|value| value.get("agent"))
+            .and_then(Value::as_array)
+            .is_some_and(|removals| {
+                removals
+                    .iter()
+                    .any(|removal| removal.as_str() == Some("out/note.txt"))
+            });
+        if cleared && recorded {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        state
+            .get("checkpoints")
+            .and_then(Value::as_object)
+            .is_some_and(|checkpoints| checkpoints.is_empty()),
+        "the engine clears the node's checkpoint when the step finishes: {state:?}"
+    );
+    let removals: Vec<String> = state
+        .get("removed_files")
+        .and_then(|value| value.get("agent"))
+        .and_then(Value::as_array)
+        .map(|removals| {
+            removals
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        removals,
+        vec!["out/note.txt".to_string()],
+        "the removal must outlive the checkpoint the engine cleared: {state:?}"
+    );
+    drop(service);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A file the agent removed and then wrote again is not a removal: the
+/// write supersedes it, so the run's own record must not keep the path
+/// and the rewritten file must still be a pinned output.
+#[tokio::test]
+async fn a_write_after_a_removal_supersedes_the_removal() {
+    let root = temp_run_dir("agent-rewrote-removed-file");
+    let _ = std::fs::remove_dir_all(&root);
+    let generator = root.join("generator");
+    let runs = root.join("runs");
+    std::fs::create_dir_all(generator.join("prompts")).expect("generator dirs");
+    std::fs::write(
+        generator.join(contract::MANIFEST_FILE),
+        r#"
+[generator]
+id = "generator"
+name = "Generator"
+version = "0.1.0"
+
+[[flow]]
+id = "agent"
+output = "agent_result"
+type = "llm.agent"
+
+[flow.params]
+max_iterations = 6
+max_tokens_total = 4096
+prompt = "prompts/agent.j2"
+
+[[flow.params.tools]]
+kind = "fs.write"
+name = "write_note"
+path_prefix = "out/"
+
+[[flow.params.tools]]
+kind = "command"
+name = "remove_note"
+command = ["sh", "-c", "rm -f out/note.txt"]
+
+[llm]
+max_tokens = 256
+temperature = 0.0
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[permissions]
+fs_read = []
+network = []
+commands = [{ bin = "sh", args = ["-c", "rm -f out/note.txt"], isolation = "trusted_host" }]
+side_effects = "allowed"
+side_effects_scope = "invocation"
+fs_write = ["workspace"]
+
+[permissions.containers]
+enabled = false"#,
+    )
+    .expect("generator manifest");
+    // The agent writes the file, removes it, and writes it again: the
+    // last write supersedes the removal, exactly as the agent's own
+    // rule says.
+    std::fs::write(
+        generator.join("prompts/agent.j2"),
+        r#"Write the note, remove it, then write it again.
+
+FAKE_TOOL_SEQUENCE: [{"name":"write_note","args":{"path":"out/note.txt","content":"scratch"}},{"name":"remove_note","args":{}},{"name":"write_note","args":{"path":"out/note.txt","content":"scratch"}}]
+FAKE_AGENT_FINAL:
+done
+"#,
+    )
+    .expect("prompt");
+    let service = test_service(vec![root.clone()], runs.clone());
+    let id = service
+        .start_run(StartRun {
+            generator_id: "generator".into(),
+            inputs: BTreeMap::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("agent run should start");
+    let terminal = wait_for_terminal_snapshot(&service, &id).await;
+    assert_eq!(
+        terminal.state,
+        RunStatus::Succeeded,
+        "the run must succeed: {terminal:?}"
+    );
+    let run_dir = service.run_dir_for(&id).await.expect("run dir");
+    let state_path = run_meta_dir(&run_dir).join("state.json");
+    // The persisted state follows the journal by one append, so the run
+    // being terminal does not mean the state file already carries the
+    // last events. Wait for the state that holds both halves of the
+    // claim, then assert on it.
+    let mut state = Value::Null;
+    for _ in 0..200 {
+        state = std::fs::read(&state_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .unwrap_or(Value::Null);
+        let pinned = state
+            .get("latest_file_pins")
+            .and_then(|value| value.get("out/note.txt"))
+            .is_some();
+        let removed = state
+            .get("removed_files")
+            .and_then(|value| value.get("agent"))
+            .and_then(Value::as_array)
+            .is_some_and(|removals| {
+                removals
+                    .iter()
+                    .any(|removal| removal.as_str() == Some("out/note.txt"))
+            });
+        if pinned && !removed {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        state
+            .get("latest_file_pins")
+            .and_then(|value| value.get("out/note.txt"))
+            .is_some(),
+        "the file the agent wrote again is a pinned output: {state:?}"
+    );
+    let removals: Vec<String> = state
+        .get("removed_files")
+        .and_then(|value| value.get("agent"))
+        .and_then(Value::as_array)
+        .map(|removals| {
+            removals
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        removals.is_empty(),
+        "a write supersedes the removal the agent made earlier: {state:?}"
+    );
+    drop(service);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[tokio::test]
 async fn resume_does_not_restore_updated_file_inputs() {
     // E06: a completed step may legitimately update a file input; the

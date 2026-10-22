@@ -617,9 +617,21 @@ impl StepExecutor for LlmAgentStep {
         // because the agent removed those files whether it did so then
         // or now.
         let mut written_files = AgentWrites::default();
+        // The removals come from the run's own record as well as from the
+        // checkpoint: the engine clears a node's checkpoint when the step
+        // finishes, so the record that outlives it is what keeps a
+        // removal true when the node runs again.
+        let mut removed: BTreeSet<String> = ctx
+            .journal
+            .state()
+            .removed_files
+            .get(&NodePath::root(&node.id))
+            .cloned()
+            .unwrap_or_default();
         if let Some(checkpoint) = checkpoint.as_ref() {
-            written_files.restore_removals(checkpoint.removed_files.clone());
+            removed.extend(checkpoint.removed_files.iter().cloned());
         }
+        written_files.restore_removals(removed);
         // A stored side effect resumes without an LLM round-trip so the
         // exact operation is re-guarded: an approved call executes, an
         // interrupted call is settled by its durable record (E07).
