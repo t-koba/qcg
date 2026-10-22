@@ -257,6 +257,17 @@ pub(crate) fn evaluate_call(name: &str, arguments: &[Value]) -> Result<Value, St
         ("sort", [value]) => match value {
             Value::Array(items) => {
                 let mut sorted = items.clone();
+                // Every element's type is checked, so a singleton of an
+                // unsupported type is refused like the same element in a
+                // longer array: the pairwise scan below only sees elements
+                // that have a neighbour.
+                for item in &sorted {
+                    if !matches!(item, Value::Number(_) | Value::String(_) | Value::Bool(_)) {
+                        return Err(
+                            "sort() requires an array of numbers, strings, or booleans".into()
+                        );
+                    }
+                }
                 for window in sorted.windows(2) {
                     if compare_json_scalar(&window[0], &window[1]).is_none() {
                         return Err(

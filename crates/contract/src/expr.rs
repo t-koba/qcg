@@ -343,6 +343,21 @@ mod tests {
     }
 
     #[test]
+    fn sort_validates_every_element_type_whatever_the_array_length() {
+        // An element's type must not depend on the array's length: the
+        // pairwise scan only sees elements that have a neighbour, so a
+        // singleton of an unsupported type has to be refused on its own.
+        for case in ["sort([null])", "sort([[1]])", "sort([1, null])"] {
+            assert!(
+                value_bag().eval_value(case).is_err(),
+                "expression `{case}` should fail"
+            );
+        }
+        assert_eq!(eval_value("sort([1])"), json!([1]));
+        assert_eq!(eval_value("sort([true])"), json!([true]));
+    }
+
+    #[test]
     fn shared_expr_corpus_fixture_matches_expected_results() {
         let fixture = include_str!("../../../fixtures/expr-corpus.toml");
         let parsed =
