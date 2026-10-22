@@ -15,7 +15,7 @@ use mcp::{McpCallOutcome, McpError, McpInputRequired};
 use model::StructuredOutputMode;
 use policy::{TOOL_EVENT_VALUE_LIMIT_BYTES, path_is_within_prefix};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::sync::Arc;
 
@@ -1158,59 +1158,65 @@ fn mcp_input_required_rejects_url_mode_elicitation() {
 
 /// The agent reports the files its tools wrote, because the engine pins
 /// what a step produced and the pins are what a resume restores. The
-/// executors report what they wrote, so a replayed write is told apart
-/// from a fresh one by provenance rather than by a filesystem probe.
+/// executors report what they wrote, so the step never has to infer a
+/// write from the result's shape.
 #[test]
-fn a_written_file_is_reported_while_the_workspace_holds_it() {
-    let writes = vec![AgentWrite::Written(Utf8PathBuf::from("out/note.txt"))];
+fn a_written_file_is_reported() {
+    let mut writes = AgentWrites::default();
+    writes.record_write("out/note.txt", Utf8PathBuf::from("out/note.txt"));
     assert_eq!(
-        agent_written_files(&writes, |_| true),
+        writes.reported(),
         vec![Utf8PathBuf::from("out/note.txt")],
-        "a file the workspace still holds is an output of the step"
+        "a file the agent wrote is an output of the step"
     );
 }
 
-/// The agent may write a scratch file and remove it again; a file the
-/// workspace no longer holds is not an output of the step.
+/// The agent may write a scratch file and remove it again with a command
+/// tool. A file the agent removed is not an output of the step, and the
+/// removal is a fact the product records rather than one it infers from
+/// the disk.
 #[test]
 fn a_removed_written_file_is_not_reported() {
-    let writes = vec![AgentWrite::Written(Utf8PathBuf::from("out/scratch.txt"))];
+    let mut writes = AgentWrites::default();
+    writes.record_write("out/scratch.txt", Utf8PathBuf::from("out/scratch.txt"));
+    assert_eq!(
+        writes.reported(),
+        vec![Utf8PathBuf::from("out/scratch.txt")],
+        "the file is an output of the step until the agent removes it"
+    );
+    writes.restore_removals(BTreeSet::from(["out/scratch.txt".to_string()]));
     assert!(
-        agent_written_files(&writes, |_| false).is_empty(),
+        writes.reported().is_empty(),
         "a file the agent removed is not an output of the step"
     );
 }
 
-/// A write replayed from an earlier attempt of the step was produced by
-/// that step, so it is reported even when the workspace no longer holds
-/// it: a workspace that lost a produced file must fail the pin step
-/// loudly rather than drop the output silently.
+/// A write the guard replayed from an earlier attempt of the step was
+/// produced by that step, so it is an output of it: a workspace that lost
+/// a produced file must fail the pin step loudly rather than drop the
+/// output silently.
 #[test]
 fn a_replayed_write_is_reported_even_when_the_workspace_lost_it() {
-    let writes = vec![AgentWrite::Replayed(Utf8PathBuf::from("out/note.txt"))];
+    let mut writes = AgentWrites::default();
+    writes.record_replay("out/note.txt", Utf8PathBuf::from("out/note.txt"));
     assert_eq!(
-        agent_written_files(&writes, |_| false),
+        writes.reported(),
         vec![Utf8PathBuf::from("out/note.txt")],
         "a produced file the workspace lost is still reported"
     );
 }
 
-/// A rejection names the file it would have written, not a write: the
-/// model can correct itself and the step still produces nothing. The
-/// executor never records one, so the step never reports it. The
-/// executor's own rejection path is covered where it lives, in
-/// `a_patch_call_the_model_got_wrong_never_reaches_the_approval`.
+/// The removal the agent's own tools made outlives the attempt that made
+/// it: the agent removed the file whether it did so then or now, so a
+/// replay of that write in a later attempt is still not an output.
 #[test]
-fn a_rejected_write_is_not_a_write() {
-    let writes = vec![AgentWrite::Written(Utf8PathBuf::from("out/note.txt"))];
-    assert_eq!(
-        agent_written_files(&writes, |_| true),
-        vec![Utf8PathBuf::from("out/note.txt")],
-        "a write the executor recorded is reported"
-    );
+fn a_removal_from_an_earlier_attempt_still_excludes_the_write() {
+    let mut writes = AgentWrites::default();
+    writes.restore_removals(BTreeSet::from(["out/scratch.txt".to_string()]));
+    writes.record_replay("out/scratch.txt", Utf8PathBuf::from("out/scratch.txt"));
     assert!(
-        agent_written_files(&[], |_| true).is_empty(),
-        "a rejected call leaves the step with no write to report"
+        writes.reported().is_empty(),
+        "a file the agent removed is not an output, however it was written"
     );
 }
 

@@ -807,6 +807,15 @@ impl FsGateway {
         &self.workspace
     }
 
+    /// Whether a resolved path names an existing regular file. The agent
+    /// compares presence across one of its own tool calls, to tell a file
+    /// the agent removed from one the workspace lost.
+    pub fn file_present(&self, target: &Utf8Path) -> bool {
+        std::fs::symlink_metadata(target)
+            .map(|metadata| metadata.file_type().is_file())
+            .unwrap_or(false)
+    }
+
     /// Removal of orphaned staging files left by a killed process (E13b).
     /// Only regular files (and symlinks, which are removed as links, never
     /// followed) whose name contains `name_fragment` and whose mtime is

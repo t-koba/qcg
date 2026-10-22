@@ -12,7 +12,7 @@ use engine::{HttpRequest, ResultExt, StepContext, StepError};
 use llm::{ChatMessage, ChatToolCall, LlmRuntime};
 use policy::path_is_within_prefix;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 use crate::agent_tools::{dynamic_form_fields, validate_agent_tool_args};
@@ -31,17 +31,88 @@ pub(crate) struct AgentToolServices<'a> {
     pub(crate) guardrails: &'a [GuardrailDecl],
 }
 
-/// A file an agent tool wrote, and how the write happened.
+/// The files an agent's tools wrote, and the ones they removed again.
 ///
-/// The executor knows which of the two it was, and the parent loop that
-/// reports the step's outputs cannot learn it from the tool result: a
-/// replayed write carries the same `{"file": path}` shape as a fresh one.
-pub(crate) enum AgentWrite {
-    /// The tool wrote the file during this step attempt.
-    Written(Utf8PathBuf),
-    /// The tool's result replays a write from an earlier attempt of this
-    /// step, so the workspace may no longer hold the file.
-    Replayed(Utf8PathBuf),
+/// The executors report what they wrote, because a replayed write carries
+/// the same result shape as a fresh one and only the executor knows which
+/// it was. The command tool is the only path that removes a file today, so
+/// a file the agent wrote that was present before a command call and absent
+/// after it was removed by that call.
+///
+/// The two absences are not the same fact. A file the agent removed is not
+/// an output of the step, whether the write was fresh or replayed: the
+/// agent deleted it. A file the workspace lost is an output, and the pin
+/// step fails loudly for it rather than letting the run finish green with
+/// a hole in its workspace.
+#[derive(Default)]
+pub(crate) struct AgentWrites {
+    /// The files this attempt's tools wrote: the path the tool was given
+    /// and where it landed.
+    outputs: Vec<(String, Utf8PathBuf)>,
+    /// The paths the agent's own tools removed. A removal outlives the
+    /// attempt that made it, so it is journaled with the step's checkpoint
+    /// rather than kept only in memory.
+    removed: BTreeSet<String>,
+}
+
+impl AgentWrites {
+    /// Records a file a tool wrote now. The write puts the file back, so
+    /// it supersedes an earlier removal of it.
+    pub(crate) fn record_write(&mut self, path: &str, resolved: Utf8PathBuf) {
+        self.removed.remove(path);
+        self.outputs.push((path.to_string(), resolved));
+    }
+
+    /// Records a file whose write the guard replayed from an earlier
+    /// attempt. Nothing was written now, so an earlier removal of the file
+    /// still stands.
+    pub(crate) fn record_replay(&mut self, path: &str, resolved: Utf8PathBuf) {
+        self.outputs.push((path.to_string(), resolved));
+    }
+
+    /// The paths the agent's own tools removed.
+    pub(crate) fn removed(&self) -> &BTreeSet<String> {
+        &self.removed
+    }
+
+    /// Restores the removals an earlier attempt of this step recorded.
+    pub(crate) fn restore_removals(&mut self, removed: BTreeSet<String>) {
+        self.removed = removed;
+    }
+
+    /// The files the step reports as its outputs: every file a tool wrote
+    /// that the agent's own tools did not remove.
+    pub(crate) fn reported(&self) -> Vec<Utf8PathBuf> {
+        self.outputs
+            .iter()
+            .filter(|(path, _)| !self.removed.contains(path))
+            .map(|(_, resolved)| resolved.clone())
+            .collect()
+    }
+
+    /// The files the agent wrote that the workspace holds now.
+    fn present(&self, ctx: &StepContext<'_>) -> BTreeSet<String> {
+        self.outputs
+            .iter()
+            .filter(|(_, resolved)| ctx.run.fs.file_present(resolved))
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+
+    /// Records the files a command call removed: those the agent wrote
+    /// that were present before the call and are absent after it. The
+    /// agent removed them deliberately, so they are not outputs.
+    fn record_removals(&mut self, ctx: &StepContext<'_>, present_before: &BTreeSet<String>) {
+        let removed: Vec<String> = self
+            .outputs
+            .iter()
+            .filter(|(path, resolved)| {
+                present_before.contains(path) && !ctx.run.fs.file_present(resolved)
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
+        self.removed.extend(removed);
+    }
 }
 
 pub(crate) struct AgentToolInvocation<'a> {
@@ -56,7 +127,7 @@ pub(crate) struct AgentToolInvocation<'a> {
     pub(crate) activated_skills: &'a mut std::collections::BTreeSet<String>,
     /// The files the tool calls of this step attempt wrote, shared by the
     /// parent agent and every delegated specialist it runs.
-    pub(crate) writes: &'a mut Vec<AgentWrite>,
+    pub(crate) writes: &'a mut AgentWrites,
 }
 
 /// Maps an agent http tool's declared `sensitive_query` names through the
@@ -754,10 +825,10 @@ fn record_replayed_write(
     ctx: &mut StepContext<'_>,
     node: &NodeDef,
     path: &str,
-    writes: &mut Vec<AgentWrite>,
+    writes: &mut AgentWrites,
 ) -> Result<(), StepError> {
     let target = ctx.run.fs.resolve_write(path).step_err(&node.id)?;
-    writes.push(AgentWrite::Replayed(target));
+    writes.record_replay(path, target);
     Ok(())
 }
 
@@ -767,7 +838,7 @@ pub(crate) async fn execute_agent_fs_write(
     path: &str,
     content: &str,
     operation_id: &str,
-    writes: &mut Vec<AgentWrite>,
+    writes: &mut AgentWrites,
 ) -> Result<AgentToolOutcome, StepError> {
     let target = ctx.run.fs.resolve_write(path).step_err(&node.id)?;
     ctx.run
@@ -775,7 +846,7 @@ pub(crate) async fn execute_agent_fs_write(
         .write_file_atomic(&target, content.as_bytes())
         .await
         .map_err(|error| ctx.side_effecting_gateway_error(node, operation_id, error))?;
-    writes.push(AgentWrite::Written(target.clone()));
+    writes.record_write(path, target.clone());
     let value = json!({ "file": path });
     ctx.run
         .finish_external_operation(ctx.journal, node, operation_id, Some(value.clone()))?;
@@ -796,7 +867,7 @@ pub(crate) async fn execute_agent_fs_patch(
     expected_base: &str,
     inputs: PatchInputs,
     operation_id: &str,
-    writes: &mut Vec<AgentWrite>,
+    writes: &mut AgentWrites,
 ) -> Result<AgentToolOutcome, StepError> {
     let target = ctx.run.fs.resolve_write(path).step_err(&node.id)?;
     match ctx
@@ -818,7 +889,7 @@ pub(crate) async fn execute_agent_fs_patch(
                 Some(value.clone()),
             )?;
             ctx.run.clear_pending_tool_payload(operation_id);
-            writes.push(AgentWrite::Written(target.clone()));
+            writes.record_write(path, target.clone());
             Ok(AgentToolOutcome::Result(value))
         }
         Err(error) => {
@@ -948,7 +1019,7 @@ async fn execute_agent_fs_patch_call(
     call_id: &str,
     args: &Value,
     path_prefix: &str,
-    writes: &mut Vec<AgentWrite>,
+    writes: &mut AgentWrites,
 ) -> Result<AgentToolOutcome, StepError> {
     let path = args
         .get("path")
@@ -1350,7 +1421,15 @@ pub(crate) async fn execute_agent_tool(
             outcome
         }
         ToolDecl::Command { command, .. } => {
-            command::execute_command(ctx, node, call_id, command).await
+            // The command tool is the only path that removes a file
+            // today, so a file the agent wrote that was present before
+            // this call and absent after it was removed by this call.
+            // The agent removed it deliberately, so it is not an output
+            // of the step.
+            let present_before = writes.present(ctx);
+            let outcome = command::execute_command(ctx, node, call_id, command).await?;
+            writes.record_removals(ctx, &present_before);
+            Ok(outcome)
         }
         ToolDecl::Http { methods, hosts, .. } => {
             http::execute_http(ctx, node, name, call_id, args, methods, hosts).await
@@ -2739,7 +2818,7 @@ mod approval_e2e {
             .await
             .expect("no MCP tools should prepare cleanly");
         let mut activated = BTreeSet::new();
-        let mut writes = Vec::new();
+        let mut writes = AgentWrites::default();
         let outcome = execute_agent_tool(
             &mut ctx,
             node,
@@ -2782,6 +2861,7 @@ mod approval_e2e {
                 pending_confirm: Some(confirm.clone()),
                 pending_mcp_call: None,
                 used_calls: BTreeMap::new(),
+                removed_files: BTreeSet::new(),
             },
             tools,
         )
@@ -2910,7 +2990,7 @@ mod approval_e2e {
                 .await
                 .expect("prepare should succeed");
             let mut activated = BTreeSet::new();
-            let mut writes = Vec::new();
+            let mut writes = AgentWrites::default();
             let outcome = execute_agent_tool(
                 &mut ctx,
                 &node,
@@ -2936,13 +3016,9 @@ mod approval_e2e {
                 "fs.write finishes inline"
             );
             assert_eq!(
-                writes.len(),
+                writes.reported().len(),
                 1,
                 "the approved execution reports the file it wrote"
-            );
-            assert!(
-                matches!(writes.first(), Some(AgentWrite::Written(_))),
-                "a file written during this attempt is a fresh write"
             );
             // Duplicate resume resends the cached result instead of
             // executing a second time.
@@ -2971,13 +3047,9 @@ mod approval_e2e {
                 "duplicate resume must resend"
             );
             assert_eq!(
-                writes.len(),
+                writes.reported().len(),
                 2,
                 "the replayed call reports the write it replayed"
-            );
-            assert!(
-                matches!(writes.get(1), Some(AgentWrite::Replayed(_))),
-                "a resent result is a replayed write, not a fresh one"
             );
         }
         let written = std::fs::read_to_string(harness.root.join("workspace/drafts/note.txt"))
@@ -3139,7 +3211,7 @@ mod approval_e2e {
                 .await
                 .expect("prepare should succeed");
             let mut activated = BTreeSet::new();
-            let mut writes = Vec::new();
+            let mut writes = AgentWrites::default();
             // Finish the operation as the turn loop would after output
             // checks, then prove a duplicate resume resends from the cache
             // without touching the wire again.
@@ -3285,7 +3357,7 @@ mod approval_e2e {
             .await
             .expect("prepare should succeed");
         let mut activated = BTreeSet::new();
-        let mut writes = Vec::new();
+        let mut writes = AgentWrites::default();
         let tampered = json!({"path": "drafts/note.txt", "content": "forged"});
         let outcome = execute_agent_tool(
             &mut ctx,
@@ -3357,7 +3429,7 @@ mod approval_e2e {
             .await
             .expect("prepare should succeed");
         let mut activated = BTreeSet::new();
-        let mut writes = Vec::new();
+        let mut writes = AgentWrites::default();
         let operation_id = engine::operation_id_for(&harness.run_id, &node.id, "call-1");
         for (args, code) in [
             (
@@ -3422,7 +3494,7 @@ mod approval_e2e {
                 "a rejected call must release its pending payload"
             );
             assert!(
-                writes.is_empty(),
+                writes.reported().is_empty(),
                 "a rejected call is not a write, so the step reports no output for it"
             );
         }
@@ -3467,7 +3539,7 @@ mod approval_e2e {
             "a refused call must release its pending payload"
         );
         assert!(
-            writes.is_empty(),
+            writes.reported().is_empty(),
             "a refused call wrote nothing, so the step reports no output for it"
         );
     }

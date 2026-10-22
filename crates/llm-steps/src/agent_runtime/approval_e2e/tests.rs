@@ -190,6 +190,7 @@ fn checkpoint(call: llm::ChatToolCall) -> AgentCheckpoint {
         pending_confirm: None,
         pending_mcp_call: None,
         used_calls: BTreeMap::new(),
+        removed_files: BTreeSet::new(),
     }
 }
 
@@ -559,5 +560,42 @@ async fn redacted_clean_retry_preserves_record_and_verified_original_can_retry()
     assert_eq!(
         journal.state().operation_records[&operation_id].status,
         engine::OperationStatus::Succeeded
+    );
+}
+
+/// The agent's own tools removed a file it wrote: the file is not an
+/// output of the step, so the step reports no file and the pin step has
+/// nothing to fail on. The removal is detected where the removal
+/// happens, by the command tool, and it is a recorded fact rather than an
+/// inference from the disk.
+#[tokio::test]
+async fn a_file_the_agents_command_removed_is_not_reported() {
+    let harness = ApprovalHarness::setup("command-removal");
+    let run = run(&harness, BTreeMap::new());
+    let journal = journal(&harness);
+    let mut vars = contract::ValueBag::with_inputs(BTreeMap::new());
+    let mut ctx = context(&run, &journal, &mut vars, &llm::LlmRuntime::builtins());
+    let mut writes = AgentWrites::default();
+    // The agent wrote the file, and its command removed it again.
+    let target = run.fs.resolve_write("out/note.txt").unwrap();
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, b"written by the agent").unwrap();
+    writes.record_write("out/note.txt", target.clone());
+    assert_eq!(
+        writes.reported(),
+        vec![target.clone()],
+        "the file is an output of the step until the agent removes it"
+    );
+    let present_before = writes.present(&ctx);
+    assert!(
+        present_before.contains("out/note.txt"),
+        "the file is present before the command call"
+    );
+    // The command removes it, and the removal is recorded.
+    std::fs::remove_file(&target).unwrap();
+    writes.record_removals(&ctx, &present_before);
+    assert!(
+        writes.reported().is_empty(),
+        "a file the agent's own command removed is not an output of the step"
     );
 }

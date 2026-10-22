@@ -1,6 +1,5 @@
 use api::{GuardrailStage, ToolCallErrorCode, ToolCallPhase, ToolCallStatus};
 use async_trait::async_trait;
-use camino::Utf8PathBuf;
 use contract::AgentFailureCode;
 use contract::{Contract, NodeDef, ToolDecl};
 use engine::{ResultExt, StepContext, StepError, StepExecutor, StepOutcome};
@@ -14,7 +13,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::agent_runtime::{
-    AgentToolCallFailure, AgentToolInvocation, AgentToolServices, AgentWrite,
+    AgentToolCallFailure, AgentToolInvocation, AgentToolServices, AgentWrites,
     agent_call_identity_hash_for_tool, check_used_call_id, execute_agent_tool,
     finish_rejected_external_operation, recover_agent_tool_call_failure,
     validate_agent_tool_call_args,
@@ -74,6 +73,12 @@ pub(crate) struct AgentCheckpoint {
     /// a model replay cannot complete a new question with an old answer
     /// (E08-1, E07a). Only hashes are stored, never args.
     pub(crate) used_calls: BTreeMap<String, String>,
+    /// The paths the agent's own tools removed. A file the agent removed
+    /// is not an output of the step, and the removal outlives the attempt
+    /// that made it, so the set is recorded here rather than only in
+    /// memory.
+    #[serde(default)]
+    pub(crate) removed_files: BTreeSet<String>,
 }
 
 // Redacting Debug (E09h): messages and pending calls may carry URLs,
@@ -604,13 +609,17 @@ impl StepExecutor for LlmAgentStep {
         // node execution (not the checkpoint) so a repeated activation in a
         // later turn skips re-injecting identical instructions.
         let mut activated_skills = BTreeSet::new();
-        // The files the agent's tools wrote. The engine pins the files a
-        // step produced, and the pins are what the journal records and what a
-        // resume verifies, so a tool write the step does not report is a
-        // write the run cannot restore. The executors report what they
-        // wrote, because a replayed write carries the same result shape as
-        // a fresh one and only the executor knows which it was.
-        let mut written_files: Vec<AgentWrite> = Vec::new();
+        // The files the agent's tools wrote, and the ones they removed
+        // again. The engine pins the files a step produced, and the pins
+        // are what the journal records and what a resume verifies, so a
+        // tool write the step does not report is a write the run cannot
+        // restore. The removals an earlier attempt recorded are restored,
+        // because the agent removed those files whether it did so then
+        // or now.
+        let mut written_files = AgentWrites::default();
+        if let Some(checkpoint) = checkpoint.as_ref() {
+            written_files.restore_removals(checkpoint.removed_files.clone());
+        }
         // A stored side effect resumes without an LLM round-trip so the
         // exact operation is re-guarded: an approved call executes, an
         // interrupted call is settled by its durable record (E07).
@@ -749,6 +758,7 @@ impl StepExecutor for LlmAgentStep {
                         pending_confirm: None,
                         pending_mcp_call: resumed_mcp.clone(),
                         used_calls: used_calls.clone(),
+                        removed_files: written_files.removed().clone(),
                     },
                     &params.tools,
                 )?;
@@ -771,6 +781,7 @@ impl StepExecutor for LlmAgentStep {
                         pending_confirm: None,
                         pending_mcp_call: resumed_user.clone(),
                         used_calls: used_calls.clone(),
+                        removed_files: written_files.removed().clone(),
                     },
                     &params.tools,
                 )?;
@@ -915,6 +926,7 @@ impl StepExecutor for LlmAgentStep {
                                 pending_confirm: None,
                                 pending_mcp_call: None,
                                 used_calls: used_calls.clone(),
+                                removed_files: written_files.removed().clone(),
                             },
                             &params.tools,
                         )?;
@@ -939,7 +951,7 @@ impl StepExecutor for LlmAgentStep {
                 let content = serde_json::to_vec(&value)?;
                 let mut files =
                     write_output_file(ctx, node, params.output_file.as_deref(), &content).await?;
-                files.extend(agent_written_files(&written_files, |path| path.exists()));
+                files.extend(written_files.reported());
                 return Ok(StepOutcome::Success {
                     output: Some(value),
                     files,
@@ -1229,6 +1241,7 @@ impl StepExecutor for LlmAgentStep {
                             pending_confirm: None,
                             pending_mcp_call: None,
                             used_calls: used_calls.clone(),
+                            removed_files: written_files.removed().clone(),
                         },
                         &params.tools,
                     )
@@ -1370,7 +1383,7 @@ impl StepExecutor for LlmAgentStep {
                         let mut files =
                             write_output_file(ctx, node, params.output_file.as_deref(), &content)
                                 .await?;
-                        files.extend(agent_written_files(&written_files, |path| path.exists()));
+                        files.extend(written_files.reported());
                         return Ok(StepOutcome::Success {
                             output: Some(value),
                             files,
@@ -1449,6 +1462,7 @@ impl StepExecutor for LlmAgentStep {
                                 pending_confirm: None,
                                 pending_mcp_call,
                                 used_calls: used_calls.clone(),
+                                removed_files: written_files.removed().clone(),
                             },
                             &params.tools,
                         )?;
@@ -1487,6 +1501,7 @@ impl StepExecutor for LlmAgentStep {
                                 pending_confirm: Some(confirm.clone()),
                                 pending_mcp_call: None,
                                 used_calls: used_calls.clone(),
+                                removed_files: written_files.removed().clone(),
                             },
                             &params.tools,
                         )?;
@@ -1649,6 +1664,7 @@ impl StepExecutor for LlmAgentStep {
                     pending_confirm: None,
                     pending_mcp_call: None,
                     used_calls: used_calls.clone(),
+                    removed_files: written_files.removed().clone(),
                 },
                 &params.tools,
             )?;
@@ -1663,31 +1679,6 @@ impl StepExecutor for LlmAgentStep {
         );
         Err(StepError::failed(&node.id, message))
     }
-}
-
-/// The files a step reports for the writes its tools made.
-///
-/// The engine pins the files a step produced, and the pins are what the
-/// journal records and what a resume verifies, so a tool write the step
-/// does not report is a write the run cannot restore.
-///
-/// A file written during this attempt is reported only while the workspace
-/// still holds it: the agent may write a scratch file and then remove it
-/// again, and that is not an output of the step. A replayed write is always
-/// reported, so a workspace that lost a produced file fails the pin step
-/// loudly instead of dropping the output silently.
-pub(crate) fn agent_written_files(
-    writes: &[AgentWrite],
-    exists: impl Fn(&camino::Utf8Path) -> bool,
-) -> Vec<Utf8PathBuf> {
-    writes
-        .iter()
-        .filter_map(|write| match write {
-            AgentWrite::Written(path) => exists(path).then_some(path),
-            AgentWrite::Replayed(path) => Some(path),
-        })
-        .cloned()
-        .collect()
 }
 
 pub(crate) fn agent_tool_has_side_effects(tools: &[ToolDecl], name: &str) -> bool {
@@ -1889,6 +1880,7 @@ mod tests {
                 content_hash: String::new(),
             }),
             used_calls: BTreeMap::new(),
+            removed_files: BTreeSet::new(),
         }
     }
 
@@ -1977,6 +1969,7 @@ mod tests {
             }),
             pending_mcp_call: None,
             used_calls: BTreeMap::new(),
+            removed_files: BTreeSet::new(),
         };
         let error = validate_agent_checkpoint("agent", Some(&checkpoint))
             .expect_err("a corrupt checkpoint must fail closed");
@@ -1998,6 +1991,7 @@ mod tests {
                 content_hash: String::new(),
             }),
             used_calls: BTreeMap::new(),
+            removed_files: BTreeSet::new(),
         };
         let error = validate_agent_checkpoint("agent", Some(&missing_question))
             .expect_err("a question-less suspension must fail closed");
@@ -2145,6 +2139,7 @@ mod tests {
                 content_hash,
             }),
             used_calls: BTreeMap::new(),
+            removed_files: BTreeSet::new(),
         };
         (checkpoint, question_id)
     }
