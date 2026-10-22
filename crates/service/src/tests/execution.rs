@@ -469,15 +469,19 @@ fs_write = ["workspace"]
 enabled = false"#,
     )
     .expect("generator manifest");
-    // The patch names a file and an edit the model got wrong, so the
-    // call comes back to the model as a rejection. The rejection names
-    // the file it would have written, which is the case the old
-    // shape-based classification reported as a write.
+    // The patch names a file the agent never wrote and an edit the model
+    // got wrong, so the call comes back to the model as a rejection. The
+    // rejection names the file it would have written, which is the case
+    // the old shape-based classification reported as a write. The path is
+    // distinct from the write's, so the absence below is a statement
+    // about that file rather than a count over one path. The anchor is
+    // malformed, so the call is rejected before the file is opened and
+    // the file stays unwritten.
     std::fs::write(
         generator.join("prompts/agent.j2"),
         r#"Patch the note, then finish.
 
-FAKE_TOOL_SEQUENCE: [{"name":"write_note","args":{"path":"out/note.txt","content":"written by the agent"}},{"name":"patch_note","args":{"path":"out/note.txt","expected_base_sha256":"0000000000000000000000000000000000000000000000000000000000000000","edits":[{"op":"replace","anchor":"9:00000000","lines":["x"]}]}}]
+FAKE_TOOL_SEQUENCE: [{"name":"write_note","args":{"path":"out/note.txt","content":"written by the agent"}},{"name":"patch_note","args":{"path":"out/never-written.txt","expected_base_sha256":"0000000000000000000000000000000000000000000000000000000000000000","edits":[{"op":"replace","anchor":"not-an-anchor","lines":["x"]}]}}]
 FAKE_AGENT_FINAL:
 done
 "#,
@@ -499,7 +503,10 @@ done
         "a rejected call must not fail the run: {terminal:?}"
     );
     let run_dir = service.run_dir_for(&id).await.expect("run dir");
-    let events = read_events_from_meta(&run_meta_dir(&run_dir)).expect("journal");
+    // The merged view: the rejected call is an observation record, so it
+    // lives in the audit stream beside the durable one.
+    let events =
+        crate::summaries::read_merged_events_from_meta(&run_meta_dir(&run_dir)).expect("journal");
     let finished = events
         .iter()
         .find(|event| {
@@ -520,6 +527,41 @@ done
         files[0].get("path").and_then(Value::as_str),
         Some("out/note.txt"),
         "the journaled output is the file the write produced"
+    );
+    assert!(
+        !files
+            .iter()
+            .any(|file| file.get("path").and_then(Value::as_str) == Some("out/never-written.txt")),
+        "the rejected call's file must not be journaled as an output: {files:?}"
+    );
+    // The premise the negative case depends on: the rejected call
+    // happened and came back as a rejection. Without this the test would
+    // pass even if the agent never issued the patch at all.
+    let rejected = events
+        .iter()
+        .find(|event| {
+            event.get("t").and_then(Value::as_str) == Some("tool_call")
+                && event.get("tool").and_then(Value::as_str) == Some("patch_note")
+        })
+        .unwrap_or_else(|| {
+            let calls: Vec<Value> = events
+                .iter()
+                .filter(|event| event.get("t").and_then(Value::as_str) == Some("tool_call"))
+                .cloned()
+                .collect();
+            let kinds: Vec<&str> = events
+                .iter()
+                .filter_map(|event| event.get("t").and_then(Value::as_str))
+                .collect();
+            panic!("the rejected patch call must be journaled; calls={calls:?} kinds={kinds:?}");
+        });
+    assert_eq!(
+        rejected
+            .get("result")
+            .and_then(|result| result.get("ok"))
+            .and_then(Value::as_bool),
+        Some(false),
+        "the patch call must have been rejected: {rejected:?}"
     );
     drop(service);
     let _ = std::fs::remove_dir_all(&root);
