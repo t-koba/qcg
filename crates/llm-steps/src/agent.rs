@@ -1288,8 +1288,15 @@ impl StepExecutor for LlmAgentStep {
                             agent_tool_written_path(&params.tools, &call.name, &value)
                         {
                             // The tool resolved this path when it wrote the
-                            // file, so the same resolution names it.
-                            written_files.push(ctx.run.fs.resolve_write(path).step_err(&node.id)?);
+                            // file, so the same resolution names it. A file
+                            // that is not there was not produced here — a
+                            // replayed call in an isolated deployment
+                            // resumes without it — so the step does not
+                            // claim it.
+                            let resolved = ctx.run.fs.resolve_write(path).step_err(&node.id)?;
+                            if resolved.exists() {
+                                written_files.push(resolved);
+                            }
                         }
                         (value, false, None)
                     }
@@ -1683,6 +1690,11 @@ pub(crate) fn agent_tool_written_path<'a>(
     name: &str,
     value: &'a Value,
 ) -> Option<&'a str> {
+    // A rejection names the file it would have written, not a write: the
+    // model can correct itself and the step still produces nothing.
+    if value.get("ok").and_then(Value::as_bool) == Some(false) {
+        return None;
+    }
     let writes = tools.iter().any(|tool| {
         matches!(tool, ToolDecl::FsWrite { .. } | ToolDecl::FsPatch { .. }) && tool.name() == name
     });
