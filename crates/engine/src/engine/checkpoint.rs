@@ -210,6 +210,23 @@ pub(crate) fn pin_files(
         .collect()
 }
 
+/// Pins the files one attempt produced. Every site that journals an
+/// attempt's files - the success path and the suspension paths alike -
+/// goes through this one owner, so a pin means the same thing wherever
+/// it is recorded (E06).
+pub(crate) fn pin_attempt_files(
+    context: &super::types::RunContext,
+    files: &[Utf8PathBuf],
+) -> Result<Vec<FilePin>, EngineError> {
+    pin_files(
+        &context.workspace,
+        &context.metadata,
+        files,
+        &context.contract.manifest.runtime,
+        &context.checkpoint_accounting,
+    )
+}
+
 pub(crate) fn existing_regular_files(
     files: Vec<Utf8PathBuf>,
 ) -> Result<Vec<Utf8PathBuf>, EngineError> {

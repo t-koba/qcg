@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::task::JoinSet;
 
-use super::checkpoint::{existing_regular_files, pin_files};
+use super::checkpoint::{existing_regular_files, pin_attempt_files};
 use super::repair_support::failure_from_findings;
 use super::replay::BudgetTracker;
 use super::types::{
@@ -475,13 +475,7 @@ impl Engine {
                     output,
                     files: block_files,
                 } => {
-                    let file_pins = pin_files(
-                        &context.workspace,
-                        &context.metadata,
-                        &block_files,
-                        &context.contract.manifest.runtime,
-                        &context.checkpoint_accounting,
-                    )?;
+                    let file_pins = pin_attempt_files(context, &block_files)?;
                     if let Some(value) = output.clone() {
                         vars.set_step_output(&block_id, value);
                     }
@@ -506,13 +500,7 @@ impl Engine {
                     // The failed revision is pinned so its blob verifies as
                     // historical; the unified `failed_output` / `failed_files`
                     // notation matches top-level failures (E06).
-                    let failed_pins = pin_files(
-                        &context.workspace,
-                        &context.metadata,
-                        &failed_files,
-                        &context.contract.manifest.runtime,
-                        &context.checkpoint_accounting,
-                    )?;
+                    let failed_pins = pin_attempt_files(context, &failed_files)?;
                     let reason = failure_from_findings(&findings, FailureCode::CheckFailed);
                     journal.event(
                         "step_finished",
@@ -535,32 +523,57 @@ impl Engine {
                         }),
                     ));
                 }
-                StepOutcome::NeedsUser { question } => {
+                StepOutcome::NeedsUser {
+                    question,
+                    files: child_files,
+                } => {
                     // Journal the suspension with its block id and unified
                     // failed-evidence keys (null plus empty list) so the
-                    // notation matches failure paths (E06).
+                    // notation matches failure paths (E06). The files the
+                    // child produced are pinned and journaled under
+                    // `files`, like the success path (E06).
                     const NO_OUTPUT: Option<serde_json::Value> = None;
+                    let file_pins = pin_attempt_files(context, &child_files)?;
                     journal.event(
                         "step_finished",
                         with_failed_evidence(
-                            json!({ "node": block_id.clone(), "status": "needs_user", "question": question.clone() }),
+                            json!({ "node": block_id.clone(), "status": "needs_user", "question": question.clone(), "files": file_pins }),
                             &NO_OUTPUT,
                             &[],
                         )?,
                     )?;
                     vars.set_item(parent_item);
-                    return Ok((files, Some(StepOutcome::NeedsUser { question })));
+                    files.extend(child_files.clone());
+                    return Ok((
+                        files,
+                        Some(StepOutcome::NeedsUser {
+                            question,
+                            files: child_files,
+                        }),
+                    ));
                 }
-                StepOutcome::NeedsConfirm { confirm } => {
+                StepOutcome::NeedsConfirm {
+                    confirm,
+                    files: child_files,
+                } => {
                     // `confirm_request` keeps its strict FOREIGN schema
-                    // (allows only `confirm`): no failed-evidence keys here.
-                    // Still journaled with the block id (E10).
+                    // (allows only `confirm` plus the files it carries):
+                    // no failed-evidence keys here. Still journaled with
+                    // the block id (E10).
+                    let file_pins = pin_attempt_files(context, &child_files)?;
                     journal.event(
                         "confirm_request",
-                        json!({ "node": block_id.clone(), "confirm": confirm.clone() }),
+                        json!({ "node": block_id.clone(), "confirm": confirm.clone(), "files": file_pins }),
                     )?;
                     vars.set_item(parent_item);
-                    return Ok((files, Some(StepOutcome::NeedsConfirm { confirm })));
+                    files.extend(child_files.clone());
+                    return Ok((
+                        files,
+                        Some(StepOutcome::NeedsConfirm {
+                            confirm,
+                            files: child_files,
+                        }),
+                    ));
                 }
             }
         }

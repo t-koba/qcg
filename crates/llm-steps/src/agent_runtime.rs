@@ -90,6 +90,18 @@ impl AgentWrites {
             .collect()
     }
 
+    /// The files the step reports as its outputs that the workspace
+    /// still holds. A pin names a file the workspace must hold, so a
+    /// file the workspace lost is not reported (E06).
+    pub(crate) fn reported_present(&self, ctx: &StepContext<'_>) -> Vec<Utf8PathBuf> {
+        let present = self.present(ctx);
+        self.outputs
+            .iter()
+            .filter(|(path, _)| !self.removed.contains(path) && present.contains(path))
+            .map(|(_, resolved)| resolved.clone())
+            .collect()
+    }
+
     /// The files the agent wrote that the workspace holds now.
     fn present(&self, ctx: &StepContext<'_>) -> BTreeSet<String> {
         self.outputs

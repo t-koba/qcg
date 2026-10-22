@@ -16,7 +16,7 @@ use std::sync::Mutex;
 use uuid::Uuid;
 
 use super::checkpoint::{
-    CheckpointAccounting, default_metadata_dir, pin_files, verify_resource_pins,
+    CheckpointAccounting, default_metadata_dir, pin_attempt_files, verify_resource_pins,
 };
 use super::repair_support::{RepairCycleOutcome, exhausted_question, failure_from_findings};
 use super::replay::{BudgetTracker, ExecutionEnv, JournalReplay};
@@ -380,13 +380,7 @@ impl Engine {
             };
             let failure = match outcome {
                 StepOutcome::Success { output, files } => {
-                    let file_pins = pin_files(
-                        &context.workspace,
-                        &context.metadata,
-                        &files,
-                        &context.contract.manifest.runtime,
-                        &context.checkpoint_accounting,
-                    )?;
+                    let file_pins = pin_attempt_files(context, &files)?;
                     let output_name = super::types::output_name_for(&node);
                     journal.event(
                         "step_finished",
@@ -408,13 +402,7 @@ impl Engine {
                     files,
                 } => {
                     let reason = failure_from_findings(&findings, FailureCode::CheckFailed);
-                    let file_pins = pin_files(
-                        &context.workspace,
-                        &context.metadata,
-                        &files,
-                        &context.contract.manifest.runtime,
-                        &context.checkpoint_accounting,
-                    )?;
+                    let file_pins = pin_attempt_files(context, &files)?;
                     journal.event(
                         "step_finished",
                         with_failed_evidence(
@@ -948,13 +936,7 @@ impl Engine {
                 }
                 match outcome {
                     StepOutcome::Success { output, files } => {
-                        let file_pins = pin_files(
-                            &context.workspace,
-                            &context.metadata,
-                            &files,
-                            &context.contract.manifest.runtime,
-                            &context.checkpoint_accounting,
-                        )?;
+                        let file_pins = pin_attempt_files(&context, &files)?;
                         let output_name = super::types::output_name_for(node);
                         states.insert(id.clone(), NodeState::Success);
                         journal.event("step_finished", json!({ "node": id, "status": "success", "files": file_pins, "output": output, "output_name": output_name }))?;
@@ -967,13 +949,7 @@ impl Engine {
                         files,
                     } => {
                         let reason = failure_from_findings(&findings, FailureCode::CheckFailed);
-                        let failure_file_pins = pin_files(
-                            &context.workspace,
-                            &context.metadata,
-                            &files,
-                            &context.contract.manifest.runtime,
-                            &context.checkpoint_accounting,
-                        )?;
+                        let failure_file_pins = pin_attempt_files(&context, &files)?;
                         let failure_output = output.clone();
                         match &node.on_fail {
                             Some(OnFail::Repair { .. }) => {
@@ -1140,13 +1116,7 @@ impl Engine {
                                     .await?
                                 {
                                     StepOutcome::Success { output, files } => {
-                                        let file_pins = pin_files(
-                                            &context.workspace,
-                                            &context.metadata,
-                                            &files,
-                                            &context.contract.manifest.runtime,
-                                            &context.checkpoint_accounting,
-                                        )?;
+                                        let file_pins = pin_attempt_files(&context, &files)?;
                                         let output_name = super::types::output_name_for(node);
                                         // Single shared helper (E10): no
                                         // manual output-name branch.
@@ -1173,13 +1143,7 @@ impl Engine {
                                         // failure (E06): all exhaustion
                                         // paths include failed files via the
                                         // shared helper below.
-                                        let regen_failed_pins = pin_files(
-                                            &context.workspace,
-                                            &context.metadata,
-                                            &regen_files,
-                                            &context.contract.manifest.runtime,
-                                            &context.checkpoint_accounting,
-                                        )?;
+                                        let regen_failed_pins = pin_attempt_files(&context, &regen_files)?;
                                         match on_exhausted {
                                             ExhaustedAction::Fail => {
                                                 let reason = failure_from_findings(
@@ -1256,29 +1220,31 @@ impl Engine {
                                             }
                                         }
                                     }
-                                    StepOutcome::NeedsUser { question } => {
-                                        // Direct suspension without a failed attempt: still
-                                        // journal the unified failed-evidence keys (null
-                                        // plus an empty list) so every suspension shares
-                                        // one notation with the failure paths (E06).
+                                    StepOutcome::NeedsUser { question, files } => {
+                                        // The suspended attempt's own files are
+                                        // pinned and journaled under `files`,
+                                        // like the success path (E06): it
+                                        // produced them before it asked, so a
+                                        // resume restores them.
                                         const NO_OUTPUT: Option<serde_json::Value> = None;
+                                        let file_pins = pin_attempt_files(&context, &files)?;
                                         journal.event(
                                             "step_finished",
-                                            with_failed_evidence(json!({ "node": id, "status": "needs_user", "question": question }), &NO_OUTPUT, &[])?,
+                                            with_failed_evidence(json!({ "node": id, "status": "needs_user", "question": question, "files": file_pins }), &NO_OUTPUT, &[])?,
                                         )?;
                                         return Err(EngineError::NeedsUser {
                                             question_id: question.id.clone(),
                                             question: Box::new(question),
                                         });
                                     }
-                                    StepOutcome::NeedsConfirm { confirm } => {
-                                        // `confirm_request` keeps its strict FOREIGN schema
-                                        // (`api::ConfirmRequestEventData` allows only
-                                        // `confirm`): failed-evidence keys would be rejected
-                                        // at journal validation, so they stay off this event.
+                                    StepOutcome::NeedsConfirm { confirm, files } => {
+                                        // The suspended attempt's own files are
+                                        // pinned and journaled under `files`,
+                                        // like the success path (E06).
+                                        let file_pins = pin_attempt_files(&context, &files)?;
                                         journal.event(
                                             "confirm_request",
-                                            json!({ "node": id, "confirm": confirm }),
+                                            json!({ "node": id, "confirm": confirm, "files": file_pins }),
                                         )?;
                                         return Err(EngineError::NeedsConfirm {
                                             confirm_id: confirm.id.clone(),
@@ -1296,16 +1262,21 @@ impl Engine {
                             }
                         }
                     }
-                    StepOutcome::NeedsUser { question } => {
+                    StepOutcome::NeedsUser { question, files } => {
                         // Direct suspension without a failed attempt: still
                         // journal the unified failed-evidence keys (null plus
                         // an empty list) so every suspension shares one
-                        // notation with the failure paths (E06).
+                        // notation with the failure paths (E06). The files
+                        // the attempt produced are pinned and journaled
+                        // under `files`, like the success path: a resume
+                        // restores the writes the attempt made before it
+                        // asked instead of losing them with the attempt.
                         const NO_OUTPUT: Option<serde_json::Value> = None;
+                        let file_pins = pin_attempt_files(&context, &files)?;
                         journal.event(
                             "step_finished",
                             with_failed_evidence(
-                                json!({ "node": id, "status": "needs_user", "question": question }),
+                                json!({ "node": id, "status": "needs_user", "question": question, "files": file_pins }),
                                 &NO_OUTPUT,
                                 &[],
                             )?,
@@ -1315,13 +1286,20 @@ impl Engine {
                             question: Box::new(question),
                         });
                     }
-                    StepOutcome::NeedsConfirm { confirm } => {
+                    StepOutcome::NeedsConfirm { confirm, files } => {
                         // `confirm_request` keeps its strict FOREIGN schema
                         // (`api::ConfirmRequestEventData` allows only
-                        // `confirm`): failed-evidence keys would be rejected
-                        // at journal validation, so they stay off this event.
-                        journal
-                            .event("confirm_request", json!({ "node": id, "confirm": confirm }))?;
+                        // `confirm` plus the files it carries): the
+                        // failed-evidence keys would be rejected at journal
+                        // validation, so they stay off this event. The files
+                        // the attempt produced are pinned here, so the
+                        // writes before the confirmation are journaled like
+                        // the success path's.
+                        let file_pins = pin_attempt_files(&context, &files)?;
+                        journal.event(
+                            "confirm_request",
+                            json!({ "node": id, "confirm": confirm, "files": file_pins }),
+                        )?;
                         return Err(EngineError::NeedsConfirm {
                             confirm_id: confirm.id.clone(),
                             confirm: Box::new(confirm),

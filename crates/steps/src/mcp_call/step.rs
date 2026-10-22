@@ -130,7 +130,10 @@ impl StepExecutor for McpCallStep {
                 &confirm_invocation,
             )?
         {
-            return Ok(StepOutcome::NeedsConfirm { confirm });
+            return Ok(StepOutcome::NeedsConfirm {
+                confirm,
+                files: Vec::new(),
+            });
         }
 
         let runtime = self.runtime.clone();
@@ -187,7 +190,10 @@ impl StepExecutor for McpCallStep {
             DirectMcpSettlement::Suspend(question, cleanup_error) => {
                 event.cleanup_error = cleanup_error.as_ref();
                 record_direct_mcp_tool_event(ctx, node, event)?;
-                return Ok(StepOutcome::NeedsUser { question });
+                return Ok(StepOutcome::NeedsUser {
+                    question,
+                    files: Vec::new(),
+                });
             }
             DirectMcpSettlement::Complete(result, cleanup_error) => (result, cleanup_error),
             DirectMcpSettlement::Failed(error, cleanup_error) => {

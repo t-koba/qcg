@@ -171,6 +171,7 @@ impl StepExecutor for CheckToolStep {
                             operation_digest: digest,
                             scope: ctx.run.contract.manifest.permissions.side_effects_scope,
                         },
+                        files: Vec::new(),
                     });
                 }
             }

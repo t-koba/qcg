@@ -13,7 +13,7 @@ use tokio::task::JoinSet;
 /// same bound (A09).
 const NODE_TIMEOUT_GRACE_SECS: u64 = 5;
 
-use super::checkpoint::pin_files;
+use super::checkpoint::pin_attempt_files;
 use super::repair_support::failure_from_findings;
 use super::replay::BudgetTracker;
 use super::run_context::elapsed_limit_secs;
@@ -338,13 +338,7 @@ impl Engine {
             };
             match outcome {
                 StepOutcome::Success { output, files } => {
-                    let file_pins = pin_files(
-                        &context.workspace,
-                        &context.metadata,
-                        &files,
-                        &context.contract.manifest.runtime,
-                        &context.checkpoint_accounting,
-                    )?;
+                    let file_pins = pin_attempt_files(context.as_ref(), &files)?;
                     let output_name = super::types::output_name_for(&node);
                     vars.publish_step_output(&node.id, node.output.as_deref(), &output, None);
                     states.insert(node.id.clone(), NodeState::Success);
@@ -359,13 +353,7 @@ impl Engine {
                     files,
                 } => {
                     let reason = failure_from_findings(&findings, FailureCode::CheckFailed);
-                    let file_pins = pin_files(
-                        &context.workspace,
-                        &context.metadata,
-                        &files,
-                        &context.contract.manifest.runtime,
-                        &context.checkpoint_accounting,
-                    )?;
+                    let file_pins = pin_attempt_files(context.as_ref(), &files)?;
                     states.insert(node.id.clone(), NodeState::Failed(reason.clone()));
                     // Parallel check failures share the single failed-evidence
                     // helper with the sequential loop, so the journal keeps
@@ -376,29 +364,36 @@ impl Engine {
                         with_failed_evidence(json!({ "node": node.id, "status": "check_failed", "findings": findings, "reason": reason, "parallel": true }), &output, &file_pins)?,
                     )?;
                 }
-                StepOutcome::NeedsUser { question } => {
+                StepOutcome::NeedsUser { question, files } => {
                     // Parallel suspensions without a failed attempt still
                     // carry the unified keys (null plus an empty list) so the
-                    // notation matches the failure paths (E06).
+                    // notation matches the failure paths (E06). The files
+                    // the attempt produced are pinned and journaled under
+                    // `files`, like the success path (E06).
                     const NO_OUTPUT: Option<serde_json::Value> = None;
+                    let file_pins = pin_attempt_files(context.as_ref(), &files)?;
                     journal.event(
                         "step_finished",
-                        with_failed_evidence(json!({ "node": node.id, "status": "needs_user", "question": question, "parallel": true }), &NO_OUTPUT, &[])?,
+                        with_failed_evidence(json!({ "node": node.id, "status": "needs_user", "question": question, "files": file_pins, "parallel": true }), &NO_OUTPUT, &[])?,
                     )?;
                     terminal_errors.push(EngineError::NeedsUser {
                         question_id: question.id.clone(),
                         question: Box::new(question),
                     });
                 }
-                StepOutcome::NeedsConfirm { confirm } => {
+                StepOutcome::NeedsConfirm { confirm, files } => {
                     // `confirm_request` keeps its strict FOREIGN schema
                     // (`api::ConfirmRequestEventData` allows only
-                    // `confirm` plus `parallel`): failed-evidence keys would
-                    // be rejected at journal validation, so they are not
-                    // attached here. See `with_failed_evidence`.
+                    // `confirm` plus `parallel` plus the files it carries):
+                    // failed-evidence keys would be rejected at journal
+                    // validation, so they are not attached here. See
+                    // `with_failed_evidence`. The files the attempt
+                    // produced are pinned here, so the writes before the
+                    // confirmation are journaled like the success path's.
+                    let file_pins = pin_attempt_files(context.as_ref(), &files)?;
                     journal.event(
                         "confirm_request",
-                        json!({ "node": node.id, "confirm": confirm, "parallel": true }),
+                        json!({ "node": node.id, "confirm": confirm, "files": file_pins, "parallel": true }),
                     )?;
                     terminal_errors.push(EngineError::NeedsConfirm {
                         confirm_id: confirm.id.clone(),

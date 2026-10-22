@@ -127,9 +127,17 @@ pub enum StepOutcome {
     },
     NeedsUser {
         question: FormSpec,
+        /// The files this attempt produced before it suspended. The
+        /// suspension keeps them: the journal records what the attempt
+        /// wrote, so a resume restores those writes instead of losing
+        /// them with the attempt's outcome (E06).
+        files: Vec<Utf8PathBuf>,
     },
     NeedsConfirm {
         confirm: ConfirmSpec,
+        /// The files this attempt produced before it asked for
+        /// confirmation, with the same rule as the suspension above.
+        files: Vec<Utf8PathBuf>,
     },
 }
 

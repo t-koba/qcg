@@ -264,7 +264,10 @@ impl StepExecutor for CommandStep {
             details.clone(),
             &invocation,
         )? {
-            return Ok(StepOutcome::NeedsConfirm { confirm });
+            return Ok(StepOutcome::NeedsConfirm {
+                confirm,
+                files: Vec::new(),
+            });
         }
         // Same-invocation resends deserialize the cached native output and
         // continue through the identical tail below, so outputs, files, and

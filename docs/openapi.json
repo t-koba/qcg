@@ -420,6 +420,12 @@
           "confirm": {
             "$ref": "#/components/schemas/ConfirmSpec"
           },
+          "files": {
+            "default": [],
+            "description": "The files the step produced before it asked for confirmation. A\nconfirmation suspends the run, so the writes the attempt made are\njournaled here: they are the run's record of what the step\nproduced, and a resume verifies them like any other revision.",
+            "items": true,
+            "type": "array"
+          },
           "parallel": {
             "default": false,
             "type": "boolean"

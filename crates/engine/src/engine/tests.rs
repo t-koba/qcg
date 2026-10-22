@@ -1224,6 +1224,7 @@ impl StepExecutor for TestNeedsUserStep {
                 title_i18n: Default::default(),
                 fields: vec![],
             },
+            files: Vec::new(),
         })
     }
 }
@@ -1261,6 +1262,7 @@ impl StepExecutor for TestNeedsConfirmStep {
                 operation_digest: "a".repeat(64),
                 scope: contract::SideEffectScope::Invocation,
             },
+            files: Vec::new(),
         })
     }
 }
@@ -1437,6 +1439,7 @@ impl StepExecutor for TestDelayedUserStep {
                 title_i18n: Default::default(),
                 fields: vec![],
             },
+            files: Vec::new(),
         })
     }
 }
@@ -4883,6 +4886,7 @@ async fn parallel_hitl_interruption_resumes_siblings() {
                     title_i18n: Default::default(),
                     fields: vec![],
                 },
+                files: Vec::new(),
             })
         }
     }
@@ -5656,6 +5660,262 @@ async fn suspension_journal_carries_failed_evidence() {
             "parallel needs_user for `{node_id}` must carry failed_output evidence"
         );
     }
+    let _ = std::fs::remove_dir_all(&run_dir);
+}
+
+/// The suspension sites are one behavior, not five: a suspension carries
+/// the files the attempt produced, so the writes it made before asking
+/// survive the suspension. This step writes a file and only then asks,
+/// so a site that drops the pin loses the write.
+struct WriteThenAskStep;
+
+#[async_trait]
+impl StepExecutor for WriteThenAskStep {
+    fn type_id(&self) -> &'static str {
+        "test.write_then_ask"
+    }
+
+    async fn execute(
+        &self,
+        ctx: &mut StepContext<'_>,
+        node: &NodeDef,
+    ) -> Result<StepOutcome, StepError> {
+        // The step writes a file and only then asks the user: the writes
+        // the attempt made before the suspension must survive it.
+        let target = ctx
+            .run
+            .fs
+            .resolve_write("written.txt")
+            .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
+        std::fs::write(target.as_std_path(), b"written before the question")
+            .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
+        Ok(StepOutcome::NeedsUser {
+            question: api::FormSpec {
+                id: "write-then-ask".into(),
+                title: "The write happened before the question".into(),
+                title_i18n: Default::default(),
+                fields: vec![],
+            },
+            files: vec![target],
+        })
+    }
+}
+
+/// Asserts that the suspension journaled for `node` carries the pin of
+/// the file the attempt wrote: the path is workspace-relative, the
+/// digest names the content, and the digest's blob is kept under
+/// `meta/checkpoint-blobs` so a resume can restore it.
+fn assert_suspension_pins_written_file(events: &[Value], run_dir: &Utf8Path, node: &str) {
+    let event = events
+        .iter()
+        .find(|event| {
+            event.get("t").and_then(Value::as_str) == Some("step_finished")
+                && event.get("node").and_then(Value::as_str) == Some(node)
+                && event.get("status").and_then(Value::as_str) == Some("needs_user")
+        })
+        .unwrap_or_else(|| panic!("the suspension for `{node}` must journal step_finished"));
+    let files = event
+        .get("files")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("the suspension for `{node}` must journal the files it wrote"));
+    assert_eq!(files.len(), 1, "the attempt wrote exactly one file");
+    let pin = &files[0];
+    assert_eq!(
+        pin.get("path").and_then(Value::as_str),
+        Some("written.txt"),
+        "the pin names the file workspace-relative"
+    );
+    let sha256 = pin
+        .get("sha256")
+        .and_then(Value::as_str)
+        .expect("the pin names the file's digest");
+    let blob = run_dir.join("meta/checkpoint-blobs").join(sha256);
+    assert!(
+        blob.is_file(),
+        "the pinned digest must have its blob under meta/checkpoint-blobs: {blob}"
+    );
+}
+
+#[tokio::test]
+async fn a_suspension_journals_the_files_the_attempt_wrote() {
+    // E06: a suspension carries the files the attempt produced under the
+    // same `files` key the success path uses, so a resume restores the
+    // writes the attempt made before it asked instead of losing them with
+    // the attempt. The pin names the file workspace-relative and its
+    // digest, and the digest's blob is kept under `meta/checkpoint-blobs`.
+    let run_dir = temp_run_dir("suspension-files");
+    let mut registry = StepRegistry::new();
+    registry.register(WriteThenAskStep);
+    let error = run_engine_with(
+        manifest(vec![node("writer", "test.write_then_ask")]),
+        registry,
+        BTreeMap::new(),
+        run_dir.clone(),
+        10,
+    )
+    .await
+    .expect_err("the suspension must stop the run");
+    assert!(
+        matches!(error, EngineError::NeedsUser { .. }),
+        "the suspension must surface as NeedsUser: {error}"
+    );
+    let events = journal_events(&run_dir);
+    assert_suspension_pins_written_file(&events, &run_dir, "writer");
+    let _ = std::fs::remove_dir_all(&run_dir);
+}
+
+#[tokio::test]
+async fn a_regenerated_suspension_journals_the_files_the_attempt_wrote() {
+    // E06: the regenerate path is a suspension site too. A node that
+    // check-fails, is regenerated, and whose regenerated attempt writes a
+    // file before asking must journal that write: the attempt's files
+    // are the run's record of what it produced, whichever path suspended
+    // it.
+    struct CheckFailThenWriteThenAskStep {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl StepExecutor for CheckFailThenWriteThenAskStep {
+        fn type_id(&self) -> &'static str {
+            "test.check_fail_then_write_then_ask"
+        }
+
+        async fn execute(
+            &self,
+            ctx: &mut StepContext<'_>,
+            node: &NodeDef,
+        ) -> Result<StepOutcome, StepError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Ok(StepOutcome::CheckFailed {
+                    findings: vec![Finding {
+                        severity: model::Severity::Error,
+                        message: "check failed".into(),
+                        location: None,
+                        raw_output: None,
+                    }],
+                    output: None,
+                    files: vec![],
+                });
+            }
+            let target = ctx
+                .run
+                .fs
+                .resolve_write("written.txt")
+                .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
+            std::fs::write(target.as_std_path(), b"written before the question")
+                .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
+            Ok(StepOutcome::NeedsUser {
+                question: api::FormSpec {
+                    id: "write-then-ask".into(),
+                    title: "The write happened before the question".into(),
+                    title_i18n: Default::default(),
+                    fields: vec![],
+                },
+                files: vec![target],
+            })
+        }
+    }
+
+    let run_dir = temp_run_dir("regenerated-suspension-files");
+    let mut registry = StepRegistry::new();
+    registry.register(CheckFailThenWriteThenAskStep {
+        calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let mut unstable = node("unstable", "test.check_fail_then_write_then_ask");
+    unstable.on_fail = Some(OnFail::Regenerate {
+        max_attempts: 2,
+        on_exhausted: ExhaustedAction::Fail,
+    });
+    let error = run_engine_with(
+        manifest(vec![unstable]),
+        registry,
+        BTreeMap::new(),
+        run_dir.clone(),
+        10,
+    )
+    .await
+    .expect_err("the suspension must stop the run");
+    assert!(
+        matches!(error, EngineError::NeedsUser { .. }),
+        "the suspension must surface as NeedsUser: {error}"
+    );
+    let events = journal_events(&run_dir);
+    assert_suspension_pins_written_file(&events, &run_dir, "unstable");
+    let _ = std::fs::remove_dir_all(&run_dir);
+}
+
+#[tokio::test]
+async fn a_parallel_suspension_journals_the_files_the_attempt_wrote() {
+    // E06: the parallel wave is a suspension site too, and it shares the
+    // notation with the sequential path: a step that writes a file and
+    // then asks inside a wave must journal the write.
+    struct ParallelWriteThenAskStep;
+
+    #[async_trait]
+    impl StepExecutor for ParallelWriteThenAskStep {
+        fn type_id(&self) -> &'static str {
+            "test.parallel_write_then_ask"
+        }
+
+        fn traits(&self) -> StepTraits {
+            StepTraits::parallel()
+        }
+
+        async fn execute(
+            &self,
+            ctx: &mut StepContext<'_>,
+            node: &NodeDef,
+        ) -> Result<StepOutcome, StepError> {
+            let target = ctx
+                .run
+                .fs
+                .resolve_write("written.txt")
+                .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
+            std::fs::write(target.as_std_path(), b"written before the question")
+                .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
+            Ok(StepOutcome::NeedsUser {
+                question: api::FormSpec {
+                    id: "write-then-ask".into(),
+                    title: "The write happened before the question".into(),
+                    title_i18n: Default::default(),
+                    fields: vec![],
+                },
+                files: vec![target],
+            })
+        }
+    }
+
+    let run_dir = temp_run_dir("parallel-suspension-files");
+    let mut registry = StepRegistry::new();
+    registry.register(ParallelWriteThenAskStep);
+    registry.register(TestOutputStampStep);
+    let mut flow_manifest = manifest(vec![
+        node("writer", "test.parallel_write_then_ask"),
+        node("stamper", "test.output_stamp"),
+    ]);
+    flow_manifest.parallel = vec!["writer".into(), "stamper".into()];
+    let contract = test_contract(&run_dir, flow_manifest);
+    let error = Engine::new(registry)
+        .run_with_id(
+            "parallel-suspension-files".into(),
+            run_dir.join("meta"),
+            contract,
+            BTreeMap::new(),
+            RunOptions {
+                elapsed_budget_mode: policy::ElapsedBudgetMode::default(),
+                max_parallel_steps: 2,
+                ..run_options(run_dir.join("workspace"))
+            },
+        )
+        .await
+        .expect_err("the suspension must stop the run");
+    assert!(
+        matches!(error, EngineError::NeedsUser { .. }),
+        "the suspension must surface as NeedsUser: {error}"
+    );
+    let events = journal_events(&run_dir);
+    assert_suspension_pins_written_file(&events, &run_dir, "writer");
     let _ = std::fs::remove_dir_all(&run_dir);
 }
 
@@ -6889,6 +7149,7 @@ impl StepExecutor for EpisodeProbeStep {
                     title_i18n: Default::default(),
                     fields: vec![],
                 },
+                files: Vec::new(),
             });
         }
         Ok(StepOutcome::Success {

@@ -135,7 +135,10 @@ impl StepExecutor for LlmFillStep {
             let value = match enforce_out_of_contract_policy(ctx, node, value)? {
                 OutOfContractDecision::Continue(value) => value,
                 OutOfContractDecision::NeedsUser { question } => {
-                    return Ok(StepOutcome::NeedsUser { question });
+                    return Ok(StepOutcome::NeedsUser {
+                        question,
+                        files: Vec::new(),
+                    });
                 }
             };
             if let Some(schema) = &schema

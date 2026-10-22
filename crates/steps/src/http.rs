@@ -374,7 +374,10 @@ impl StepExecutor for HttpStep {
                 &http_invocation,
             )?
         {
-            return Ok(StepOutcome::NeedsConfirm { confirm });
+            return Ok(StepOutcome::NeedsConfirm {
+                confirm,
+                files: Vec::new(),
+            });
         }
         // The stable operation id remains qcg's local journal/result-cache
         // identity. It is also the default remote key for this HTTP step

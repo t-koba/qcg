@@ -2064,6 +2064,14 @@ export interface components {
         };
         ConfirmRequestEventData: {
             confirm: components["schemas"]["ConfirmSpec"];
+            /**
+             * @description The files the step produced before it asked for confirmation. A
+             *     confirmation suspends the run, so the writes the attempt made are
+             *     journaled here: they are the run's record of what the step
+             *     produced, and a resume verifies them like any other revision.
+             * @default []
+             */
+            files: unknown[];
             /** @default false */
             parallel: boolean;
         };

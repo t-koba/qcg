@@ -558,6 +558,10 @@ impl StepExecutor for LlmAgentStep {
                 None => {
                     return Ok(StepOutcome::NeedsConfirm {
                         confirm: confirm.clone(),
+                        // The stored side effect carries no write of this
+                        // attempt: the attempt that wrote has its own
+                        // suspension record.
+                        files: Vec::new(),
                     });
                 }
             }
@@ -948,7 +952,10 @@ impl StepExecutor for LlmAgentStep {
                 let value = match enforce_out_of_contract_policy(ctx, node, value)? {
                     OutOfContractDecision::Continue(value) => value,
                     OutOfContractDecision::NeedsUser { question } => {
-                        return Ok(StepOutcome::NeedsUser { question });
+                        return Ok(StepOutcome::NeedsUser {
+                            question,
+                            files: written_files.reported_present(ctx),
+                        });
                     }
                 };
                 apply_guardrails(
@@ -1479,7 +1486,10 @@ impl StepExecutor for LlmAgentStep {
                             &params.tools,
                         )?;
                         ctx.journal.event("tool_call", event).step_err(&node.id)?;
-                        return Ok(StepOutcome::NeedsUser { question });
+                        return Ok(StepOutcome::NeedsUser {
+                            question,
+                            files: written_files.reported_present(ctx),
+                        });
                     }
                     AgentToolOutcome::NeedsConfirm(confirm) => {
                         let event = tool_call_event(
@@ -1518,7 +1528,10 @@ impl StepExecutor for LlmAgentStep {
                             &params.tools,
                         )?;
                         ctx.journal.event("tool_call", event).step_err(&node.id)?;
-                        return Ok(StepOutcome::NeedsConfirm { confirm });
+                        return Ok(StepOutcome::NeedsConfirm {
+                            confirm,
+                            files: written_files.reported_present(ctx),
+                        });
                     }
                 };
                 if !returned_agent_error

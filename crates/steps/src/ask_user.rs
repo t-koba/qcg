@@ -231,6 +231,7 @@ impl StepExecutor for AskUserStep {
                     title_i18n,
                     fields: fields_for_id,
                 },
+                files: Vec::new(),
             });
         }
 

@@ -5,7 +5,7 @@ use model::{FailureCode, FailureDetail, Finding, NodePath};
 use serde_json::json;
 use std::collections::BTreeMap;
 
-use super::checkpoint::pin_files;
+use super::checkpoint::pin_attempt_files;
 use super::repair_support::{RepairCycleOutcome, exhausted_question, failure_from_findings};
 use super::replay::{BudgetTracker, ExecutionEnv};
 use super::types::{Engine, EngineError, NamedNodeTarget, with_failed_evidence};
@@ -77,7 +77,9 @@ impl Engine {
                 // cycle exactly like a top-level node: the user's answer
                 // must not be swallowed by the next repair attempt (E10).
                 match repair_output {
-                    StepOutcome::NeedsUser { question } => {
+                    StepOutcome::NeedsUser { question, .. } => {
+                        // The named node's own `step_finished` carries the
+                        // files the attempt produced (E06).
                         env.journal.event(
                             "repair_attempt_finished",
                             json!({ "node": failed_node.id, "attempt": attempt, "status": "needs_user", "question": question }),
@@ -87,7 +89,9 @@ impl Engine {
                             question: Box::new(question),
                         });
                     }
-                    StepOutcome::NeedsConfirm { confirm } => {
+                    StepOutcome::NeedsConfirm { confirm, .. } => {
+                        // The named node's own `step_finished` carries the
+                        // files the attempt produced (E06).
                         env.journal.event(
                             "repair_attempt_finished",
                             json!({ "node": failed_node.id, "attempt": attempt, "status": "needs_confirm", "confirm": confirm }),
@@ -150,7 +154,9 @@ impl Engine {
                         json!({ "node": failed_node.id, "attempt": attempt, "status": "recheck_failed", "findings": findings }),
                     )?;
                 }
-                StepOutcome::NeedsUser { question } => {
+                StepOutcome::NeedsUser { question, .. } => {
+                    // The named node's own `step_finished` carries the
+                    // files the attempt produced (E06).
                     env.journal.event(
                         "repair_attempt_finished",
                         json!({ "node": failed_node.id, "attempt": attempt, "status": "needs_user", "question": question }),
@@ -160,7 +166,9 @@ impl Engine {
                         question: Box::new(question),
                     });
                 }
-                StepOutcome::NeedsConfirm { confirm } => {
+                StepOutcome::NeedsConfirm { confirm, .. } => {
+                    // The named node's own `step_finished` carries the
+                    // files the attempt produced (E06).
                     env.journal.event(
                         "repair_attempt_finished",
                         json!({ "node": failed_node.id, "attempt": attempt, "status": "needs_confirm", "confirm": confirm }),
@@ -393,13 +401,7 @@ impl Engine {
         };
         match &outcome {
             StepOutcome::Success { output, files } => {
-                let file_pins = pin_files(
-                    &env.context.workspace,
-                    &env.context.metadata,
-                    files,
-                    &env.context.contract.manifest.runtime,
-                    &env.context.checkpoint_accounting,
-                )?;
+                let file_pins = pin_attempt_files(env.context, files)?;
                 let output_name = super::types::output_name_for(&node);
                 states.insert(graph_node_id.clone(), NodeState::Success);
                 env.journal.event(
@@ -420,13 +422,7 @@ impl Engine {
                 files,
             } => {
                 let reason = failure_from_findings(findings, FailureCode::CheckFailed);
-                let file_pins = pin_files(
-                    &env.context.workspace,
-                    &env.context.metadata,
-                    files,
-                    &env.context.contract.manifest.runtime,
-                    &env.context.checkpoint_accounting,
-                )?;
+                let file_pins = pin_attempt_files(env.context, files)?;
                 states.insert(graph_node_id.clone(), NodeState::Failed(reason.clone()));
                 // Unified failed-evidence notation (E06): every
                 // `step_finished` failure carries `failed_output` /
@@ -438,25 +434,29 @@ impl Engine {
                 )?;
                 vars.sync_step_outcome_subtree(&env.journal.state().vars, &node.id);
             }
-            StepOutcome::NeedsUser { question } => {
+            StepOutcome::NeedsUser { question, files } => {
                 // Unified notation for suspensions without a failed attempt:
                 // null plus an empty list via the shared helper (E06).
                 // `confirm_request` stays exempt (FOREIGN schema allows only
-                // `confirm`).
+                // `confirm` plus the files it carries). The files the
+                // attempt produced are pinned and journaled under `files`,
+                // like the success path (E06).
                 const NO_OUTPUT: Option<serde_json::Value> = None;
+                let file_pins = pin_attempt_files(env.context, files)?;
                 env.journal.event(
                     "step_finished",
                     with_failed_evidence(
-                        json!({ "node": node.id, "status": "needs_user", "question": question }),
+                        json!({ "node": node.id, "status": "needs_user", "question": question, "files": file_pins }),
                         &NO_OUTPUT,
                         &[],
                     )?,
                 )?;
             }
-            StepOutcome::NeedsConfirm { confirm } => {
+            StepOutcome::NeedsConfirm { confirm, files } => {
+                let file_pins = pin_attempt_files(env.context, files)?;
                 env.journal.event(
                     "confirm_request",
-                    json!({ "node": node.id, "confirm": confirm }),
+                    json!({ "node": node.id, "confirm": confirm, "files": file_pins }),
                 )?;
             }
         }
