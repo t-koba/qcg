@@ -638,8 +638,9 @@ to 2^64-1 - and an integer literal above that is refused rather than
 stated approximately. The binary arithmetic operators (`+`, `-`, `*`, `/`,
 `%`) and `sum` work in floating point, so their results are floats even
 when their operands were integers; the unary minus negates an exact
-integer exactly, and `min` and `max` return an element of the array they
-were given.
+integer exactly - an integer whose negation the JSON number type cannot
+hold exactly is refused rather than stated approximately - and `min` and
+`max` return an element of the array they were given.
 
 ## Step Types
 

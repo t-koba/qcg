@@ -429,6 +429,42 @@ mod tests {
     }
 
     #[test]
+    fn the_unary_minus_keeps_an_integer_exact_or_refuses_it() {
+        // The negation of an integer keeps its exact value while the JSON
+        // number type can hold it: the smallest signed integer negates
+        // into the unsigned range, and the largest unsigned integer has
+        // no exact negation, which is refused rather than rounded.
+        let mut inputs = BTreeMap::new();
+        inputs.insert(
+            "smallest_signed".into(),
+            serde_json::Number::from(i64::MIN).into(),
+        );
+        inputs.insert(
+            "two_to_the_63".into(),
+            serde_json::Number::from(1u64 << 63).into(),
+        );
+        inputs.insert(
+            "largest_unsigned".into(),
+            serde_json::Number::from(u64::MAX).into(),
+        );
+        let bag = ValueBag::with_inputs(inputs);
+        assert_eq!(
+            bag.eval_value("-inputs.smallest_signed")
+                .expect("negating the smallest signed integer must not fail"),
+            json!(9223372036854775808u64)
+        );
+        assert_eq!(
+            bag.eval_value("-inputs.two_to_the_63")
+                .expect("negating 2^63 must not fail"),
+            json!(-9223372036854775808i64)
+        );
+        assert!(
+            bag.eval_value("-inputs.largest_unsigned").is_err(),
+            "an integer whose negation has no exact form should fail"
+        );
+    }
+
+    #[test]
     fn an_integer_literal_the_json_number_cannot_hold_is_refused() {
         // A literal above the JSON number type's integer range would
         // arrive as a rounded double, so it is refused rather than stated

@@ -46,9 +46,24 @@ impl ExpressionNode {
                         if let Value::Number(number) = &value
                             && let Some(exact) = exact_integer(number)
                             && let Some(negated) = exact.checked_neg()
-                            && let Ok(negated) = i64::try_from(negated)
                         {
-                            return Ok(Value::Number(negated.into()));
+                            // The negated value keeps its exact integer
+                            // form while the JSON number type can hold it.
+                            if let Ok(negated) = i64::try_from(negated) {
+                                return Ok(Value::from(negated));
+                            }
+                            if let Ok(negated) = u64::try_from(negated) {
+                                return Ok(Value::from(negated));
+                            }
+                            // An integer whose negation the JSON number
+                            // type cannot hold exactly is refused rather
+                            // than rounded, as an integer literal above
+                            // that range is refused.
+                            if number.is_i64() || number.is_u64() {
+                                return Err(format!(
+                                    "unary - of `{number}` has no exact integer representation"
+                                ));
+                            }
                         }
                         number_value(-as_number(&value, "unary -")?)
                     }
