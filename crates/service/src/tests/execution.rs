@@ -291,6 +291,240 @@ done
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The step-level seam of the agent's write reporting: a file the agent's
+/// own fs.write tool wrote must reach the run's journal as a pin with its
+/// digest, because that pin is what a container-isolated workspace is
+/// rebuilt from and what a resume verifies. A file the step never produced
+/// must not be recorded, so the journal cannot claim an output the
+/// workspace does not hold.
+#[tokio::test]
+async fn an_agents_written_file_is_journaled_as_a_step_output() {
+    let root = temp_run_dir("agent-write-journaled");
+    let _ = std::fs::remove_dir_all(&root);
+    let generator = root.join("generator");
+    let runs = root.join("runs");
+    std::fs::create_dir_all(generator.join("prompts")).expect("generator dirs");
+    std::fs::write(
+        generator.join(contract::MANIFEST_FILE),
+        r#"
+[generator]
+id = "generator"
+name = "Generator"
+version = "0.1.0"
+
+[[flow]]
+id = "agent"
+output = "agent_result"
+type = "llm.agent"
+
+[flow.params]
+max_iterations = 4
+max_tokens_total = 4096
+prompt = "prompts/agent.j2"
+
+[[flow.params.tools]]
+kind = "fs.write"
+name = "write_note"
+path_prefix = "out/"
+
+[llm]
+max_tokens = 256
+temperature = 0.0
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[permissions]
+fs_read = []
+network = []
+commands = []
+side_effects = "allowed"
+side_effects_scope = "invocation"
+fs_write = ["workspace"]
+
+[permissions.containers]
+enabled = false"#,
+    )
+    .expect("generator manifest");
+    std::fs::write(
+        generator.join("prompts/agent.j2"),
+        r#"Write the note, then finish.
+
+FAKE_TOOL_SEQUENCE: [{"name":"write_note","args":{"path":"out/note.txt","content":"written by the agent"}}]
+FAKE_AGENT_FINAL:
+done
+"#,
+    )
+    .expect("prompt");
+    let service = test_service(vec![root.clone()], runs.clone());
+    let id = service
+        .start_run(StartRun {
+            generator_id: "generator".into(),
+            inputs: BTreeMap::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("agent run should start");
+    let terminal = wait_for_terminal_snapshot(&service, &id).await;
+    let run_dir = service.run_dir_for(&id).await.expect("run dir");
+    let events = read_events_from_meta(&run_meta_dir(&run_dir)).expect("journal");
+    assert_eq!(
+        terminal.state,
+        RunStatus::Succeeded,
+        "the agent run must succeed: {terminal:?}"
+    );
+    let finished = events
+        .iter()
+        .find(|event| {
+            event.get("t").and_then(Value::as_str) == Some("step_finished")
+                && event.get("node").and_then(Value::as_str) == Some("agent")
+        })
+        .expect("the agent step must finish");
+    let files = finished
+        .get("files")
+        .and_then(Value::as_array)
+        .expect("the agent step must journal its files");
+    let pinned = files
+        .iter()
+        .find(|file| file.get("path").and_then(Value::as_str) == Some("out/note.txt"))
+        .expect("the file the agent wrote must be journaled as a step output");
+    assert!(
+        pinned
+            .get("sha256")
+            .and_then(Value::as_str)
+            .is_some_and(|digest| {
+                digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit())
+            }),
+        "the journaled pin must carry the file's digest: {pinned}"
+    );
+    // The step produced exactly the file it wrote: a file it never produced
+    // must not appear among the journaled outputs.
+    assert_eq!(
+        files.len(),
+        1,
+        "only the file the agent wrote may be journaled: {files:?}"
+    );
+    drop(service);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The negative case of the write reporting: a call the model got wrong
+/// is not a write, so the file it names must not be journaled as the
+/// step's output. The journal must not claim an output the workspace
+/// does not hold, because that is what a resume would then fail to
+/// restore.
+#[tokio::test]
+async fn a_rejected_agent_call_files_no_step_output() {
+    let root = temp_run_dir("agent-write-rejected");
+    let _ = std::fs::remove_dir_all(&root);
+    let generator = root.join("generator");
+    let runs = root.join("runs");
+    std::fs::create_dir_all(generator.join("prompts")).expect("generator dirs");
+    std::fs::write(
+        generator.join(contract::MANIFEST_FILE),
+        r#"
+[generator]
+id = "generator"
+name = "Generator"
+version = "0.1.0"
+
+[[flow]]
+id = "agent"
+output = "agent_result"
+type = "llm.agent"
+
+[flow.params]
+max_iterations = 4
+max_tokens_total = 4096
+prompt = "prompts/agent.j2"
+
+[[flow.params.tools]]
+kind = "fs.write"
+name = "write_note"
+path_prefix = "out/"
+
+[[flow.params.tools]]
+kind = "fs.patch"
+name = "patch_note"
+path_prefix = "out/"
+
+[llm]
+max_tokens = 256
+temperature = 0.0
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[permissions]
+fs_read = ["workspace"]
+network = []
+commands = []
+side_effects = "allowed"
+side_effects_scope = "invocation"
+fs_write = ["workspace"]
+
+[permissions.containers]
+enabled = false"#,
+    )
+    .expect("generator manifest");
+    // The patch names a file and an edit the model got wrong, so the
+    // call comes back to the model as a rejection. The rejection names
+    // the file it would have written, which is the case the old
+    // shape-based classification reported as a write.
+    std::fs::write(
+        generator.join("prompts/agent.j2"),
+        r#"Patch the note, then finish.
+
+FAKE_TOOL_SEQUENCE: [{"name":"write_note","args":{"path":"out/note.txt","content":"written by the agent"}},{"name":"patch_note","args":{"path":"out/note.txt","expected_base_sha256":"0000000000000000000000000000000000000000000000000000000000000000","edits":[{"op":"replace","anchor":"9:00000000","lines":["x"]}]}}]
+FAKE_AGENT_FINAL:
+done
+"#,
+    )
+    .expect("prompt");
+    let service = test_service(vec![root.clone()], runs.clone());
+    let id = service
+        .start_run(StartRun {
+            generator_id: "generator".into(),
+            inputs: BTreeMap::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("agent run should start");
+    let terminal = wait_for_terminal_snapshot(&service, &id).await;
+    assert_eq!(
+        terminal.state,
+        RunStatus::Succeeded,
+        "a rejected call must not fail the run: {terminal:?}"
+    );
+    let run_dir = service.run_dir_for(&id).await.expect("run dir");
+    let events = read_events_from_meta(&run_meta_dir(&run_dir)).expect("journal");
+    let finished = events
+        .iter()
+        .find(|event| {
+            event.get("t").and_then(Value::as_str) == Some("step_finished")
+                && event.get("node").and_then(Value::as_str) == Some("agent")
+        })
+        .expect("the agent step must finish");
+    let files = finished
+        .get("files")
+        .and_then(Value::as_array)
+        .expect("the agent step must journal its files");
+    assert_eq!(
+        files.len(),
+        1,
+        "the write produced one file and the rejected patch none: {files:?}"
+    );
+    assert_eq!(
+        files[0].get("path").and_then(Value::as_str),
+        Some("out/note.txt"),
+        "the journaled output is the file the write produced"
+    );
+    drop(service);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[tokio::test]
 async fn resume_does_not_restore_updated_file_inputs() {
     // E06: a completed step may legitimately update a file input; the
