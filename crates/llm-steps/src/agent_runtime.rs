@@ -122,20 +122,23 @@ fn workspace_relative_file_key(
     workspace: &Utf8Path,
     resolved: &Utf8Path,
 ) -> std::io::Result<String> {
-    let (workspace, path) = match std::fs::canonicalize(resolved) {
-        Ok(path) => (std::fs::canonicalize(workspace)?, path),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
-            workspace.as_std_path().to_path_buf(),
-            resolved.as_std_path().to_path_buf(),
+    let (raw, workspace) = (workspace.as_std_path(), dunce::canonicalize(workspace)?);
+    let path = match dunce::canonicalize(resolved.as_std_path()) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => workspace.join(
+            resolved
+                .as_std_path()
+                .strip_prefix(&workspace)
+                .or_else(|_| resolved.as_std_path().strip_prefix(raw))
+                .map_err(|_| error)?,
         ),
         Err(error) => return Err(error),
     };
-    let path = path
-        .strip_prefix(workspace)
+    let rel = path
+        .strip_prefix(&workspace)
         .map_err(std::io::Error::other)?;
-    let path = Utf8PathBuf::from_path_buf(path.to_path_buf())
-        .map_err(|_| std::io::Error::other("output path is not valid UTF-8"))?;
-    Ok(policy::portable_relative_path(&path))
+    let rel = rel.to_str().ok_or(std::io::ErrorKind::InvalidData)?;
+    Ok(policy::portable_relative_path(Utf8Path::new(rel)))
 }
 
 fn agent_output_file_key(
@@ -1945,6 +1948,60 @@ mod tests {
             workspace_relative_file_key(&workspace, &alternate).unwrap(),
             removed
         );
+        std::fs::remove_dir_all(root).expect("remove test workspace");
+    }
+
+    #[test]
+    fn gateway_canonical_target_keeps_the_same_key_before_and_after_removal() {
+        let root = std::env::temp_dir().join(format!(
+            "qcg-agent-canonical-path-key-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let workspace = Utf8PathBuf::from_path_buf(root.join("workspace")).expect("UTF-8 path");
+        std::fs::create_dir_all(workspace.join("out")).expect("create workspace");
+        let file = workspace.join("out/note.txt");
+        std::fs::write(&file, "written").expect("create note");
+        // The filesystem gateway returns dunce-canonicalized resolved paths.
+        let resolved = Utf8PathBuf::from_path_buf(
+            dunce::canonicalize(&file).expect("canonicalize gateway target"),
+        )
+        .expect("UTF-8 path");
+        let existing = workspace_relative_file_key(&workspace, &resolved).expect("existing key");
+        std::fs::remove_file(&file).expect("remove note");
+        let removed = workspace_relative_file_key(&workspace, &resolved).expect("missing key");
+        assert_eq!(existing, "out/note.txt");
+        assert_eq!(removed, existing);
+        std::fs::remove_dir_all(root).expect("remove test workspace");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_workspace_matches_gateway_canonical_target_after_removal() {
+        use std::os::unix::fs::symlink;
+
+        let root =
+            std::env::temp_dir().join(format!("qcg-agent-symlink-path-key-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let physical = root.join("physical/workspace");
+        let alias = root.join("alias/workspace");
+        std::fs::create_dir_all(physical.join("out")).expect("create physical workspace");
+        std::fs::create_dir_all(alias.parent().expect("alias parent"))
+            .expect("create alias parent");
+        symlink(&physical, &alias).expect("link workspace alias");
+        let workspace = Utf8PathBuf::from_path_buf(alias).expect("UTF-8 path");
+        let file = physical.join("out/note.txt");
+        std::fs::write(&file, "written").expect("create note");
+        let resolved = Utf8PathBuf::from_path_buf(
+            dunce::canonicalize(&file).expect("canonicalize gateway target"),
+        )
+        .expect("UTF-8 path");
+
+        let existing = workspace_relative_file_key(&workspace, &resolved).expect("existing key");
+        std::fs::remove_file(&file).expect("remove note");
+        let removed = workspace_relative_file_key(&workspace, &resolved).expect("missing key");
+        assert_eq!(existing, "out/note.txt");
+        assert_eq!(removed, existing);
         std::fs::remove_dir_all(root).expect("remove test workspace");
     }
 
