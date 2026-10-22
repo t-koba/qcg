@@ -1155,6 +1155,45 @@ fn mcp_input_required_rejects_url_mode_elicitation() {
     }
 }
 
+/// The agent reports the files its own tools wrote, because the engine
+/// pins what a step produced and the pins are what a resume restores.
+#[test]
+fn an_agents_tool_write_is_reported_as_a_written_file() {
+    let tools = vec![
+        ToolDecl::FsWrite {
+            name: "writer".into(),
+            description: None,
+            input_schema: None,
+            path_prefix: "out/".into(),
+        },
+        ToolDecl::FsRead {
+            name: "reader".into(),
+            description: None,
+            input_schema: None,
+            path_prefix: "out/".into(),
+        },
+    ];
+    assert_eq!(
+        agent_tool_written_path(&tools, "writer", &json!({ "file": "out/note.txt" })),
+        Some("out/note.txt")
+    );
+    assert_eq!(
+        agent_tool_written_path(&tools, "patcher", &json!({ "file": "out/note.txt" })),
+        None,
+        "a tool that is not declared cannot have written"
+    );
+    assert_eq!(
+        agent_tool_written_path(&tools, "reader", &json!({ "file": "out/note.txt" })),
+        None,
+        "a read reports a file it did not write"
+    );
+    assert_eq!(
+        agent_tool_written_path(&tools, "writer", &json!({ "ok": true })),
+        None,
+        "a result without a file names no write"
+    );
+}
+
 #[test]
 fn specialist_agents_are_bounded_and_inherit_delegated_side_effects() {
     let node = agent_node();
