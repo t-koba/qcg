@@ -5,6 +5,7 @@ pub(crate) use identity::*;
 
 use api::FormSpec;
 use api::{ToolCallErrorCode, ToolCallPhase, ToolCallStatus};
+use camino::Utf8PathBuf;
 use contract::{AgentFailureAction, NodeDef, ToolDecl, validate_form_values};
 use contract::{AgentFailureCode, FieldType, InputField};
 use engine::{HttpRequest, ResultExt, StepContext, StepError};
@@ -30,6 +31,19 @@ pub(crate) struct AgentToolServices<'a> {
     pub(crate) guardrails: &'a [GuardrailDecl],
 }
 
+/// A file an agent tool wrote, and how the write happened.
+///
+/// The executor knows which of the two it was, and the parent loop that
+/// reports the step's outputs cannot learn it from the tool result: a
+/// replayed write carries the same `{"file": path}` shape as a fresh one.
+pub(crate) enum AgentWrite {
+    /// The tool wrote the file during this step attempt.
+    Written(Utf8PathBuf),
+    /// The tool's result replays a write from an earlier attempt of this
+    /// step, so the workspace may no longer hold the file.
+    Replayed(Utf8PathBuf),
+}
+
 pub(crate) struct AgentToolInvocation<'a> {
     pub(crate) mcp: &'a McpAgentTools,
     pub(crate) tools: &'a [ToolDecl],
@@ -40,6 +54,9 @@ pub(crate) struct AgentToolInvocation<'a> {
     /// Skills already activated in this agent run, keyed by
     /// `<resource>::<name>`; repeated activations skip re-injection.
     pub(crate) activated_skills: &'a mut std::collections::BTreeSet<String>,
+    /// The files the tool calls of this step attempt wrote, shared by the
+    /// parent agent and every delegated specialist it runs.
+    pub(crate) writes: &'a mut Vec<AgentWrite>,
 }
 
 /// Maps an agent http tool's declared `sensitive_query` names through the
@@ -723,12 +740,34 @@ fn pending_call_digest(
     }
 }
 
+/// The patch inputs of one fs.patch call.
+pub(crate) struct PatchInputs {
+    pub(crate) edits: Vec<files::PatchEdit>,
+    pub(crate) limits: files::PatchLimits,
+}
+
+/// Records a write the guard replayed from an earlier attempt of this
+/// step. The file was produced then, so it is an output of this step even
+/// when the workspace no longer holds it; a step that lost a produced file
+/// must fail the pin step loudly rather than drop the output silently.
+fn record_replayed_write(
+    ctx: &mut StepContext<'_>,
+    node: &NodeDef,
+    path: &str,
+    writes: &mut Vec<AgentWrite>,
+) -> Result<(), StepError> {
+    let target = ctx.run.fs.resolve_write(path).step_err(&node.id)?;
+    writes.push(AgentWrite::Replayed(target));
+    Ok(())
+}
+
 pub(crate) async fn execute_agent_fs_write(
     ctx: &mut StepContext<'_>,
     node: &NodeDef,
     path: &str,
     content: &str,
     operation_id: &str,
+    writes: &mut Vec<AgentWrite>,
 ) -> Result<AgentToolOutcome, StepError> {
     let target = ctx.run.fs.resolve_write(path).step_err(&node.id)?;
     ctx.run
@@ -736,6 +775,7 @@ pub(crate) async fn execute_agent_fs_write(
         .write_file_atomic(&target, content.as_bytes())
         .await
         .map_err(|error| ctx.side_effecting_gateway_error(node, operation_id, error))?;
+    writes.push(AgentWrite::Written(target.clone()));
     let value = json!({ "file": path });
     ctx.run
         .finish_external_operation(ctx.journal, node, operation_id, Some(value.clone()))?;
@@ -754,15 +794,15 @@ pub(crate) async fn execute_agent_fs_patch(
     node: &NodeDef,
     path: &str,
     expected_base: &str,
-    edits: Vec<files::PatchEdit>,
-    limits: files::PatchLimits,
+    inputs: PatchInputs,
     operation_id: &str,
+    writes: &mut Vec<AgentWrite>,
 ) -> Result<AgentToolOutcome, StepError> {
     let target = ctx.run.fs.resolve_write(path).step_err(&node.id)?;
     match ctx
         .run
         .fs
-        .apply_anchored_patch(&target, Some(expected_base), edits, limits)
+        .apply_anchored_patch(&target, Some(expected_base), inputs.edits, inputs.limits)
         .await
     {
         Ok(outcome) => {
@@ -778,6 +818,7 @@ pub(crate) async fn execute_agent_fs_patch(
                 Some(value.clone()),
             )?;
             ctx.run.clear_pending_tool_payload(operation_id);
+            writes.push(AgentWrite::Written(target.clone()));
             Ok(AgentToolOutcome::Result(value))
         }
         Err(error) => {
@@ -907,6 +948,7 @@ async fn execute_agent_fs_patch_call(
     call_id: &str,
     args: &Value,
     path_prefix: &str,
+    writes: &mut Vec<AgentWrite>,
 ) -> Result<AgentToolOutcome, StepError> {
     let path = args
         .get("path")
@@ -979,6 +1021,7 @@ async fn execute_agent_fs_patch_call(
         let state = ctx.journal.state();
         let record = state.operation_records.get(&operation_id).cloned();
         if let Some(result) = redacted_success_resend(record.as_ref()) {
+            record_replayed_write(ctx, node, path, writes)?;
             return Ok(AgentToolOutcome::Result(result));
         }
         let had_record = record.is_some();
@@ -991,6 +1034,7 @@ async fn execute_agent_fs_patch_call(
             call_id,
         )? {
             engine::GuardDecision::Resend { result, .. } => {
+                record_replayed_write(ctx, node, path, writes)?;
                 return Ok(AgentToolOutcome::Result(result));
             }
             engine::GuardDecision::Proceed { operation_id } => {
@@ -1052,11 +1096,20 @@ async fn execute_agent_fs_patch_call(
     )? {
         engine::GuardDecision::Proceed { operation_id } => operation_id,
         engine::GuardDecision::Resend { result, .. } => {
+            record_replayed_write(ctx, node, path, writes)?;
             return Ok(AgentToolOutcome::Result(result));
         }
     };
-    return execute_agent_fs_patch(ctx, node, path, expected_base, edits, limits, &operation_id)
-        .await;
+    return execute_agent_fs_patch(
+        ctx,
+        node,
+        path,
+        expected_base,
+        PatchInputs { edits, limits },
+        &operation_id,
+        writes,
+    )
+    .await;
 }
 
 pub(crate) async fn execute_agent_tool(
@@ -1073,6 +1126,7 @@ pub(crate) async fn execute_agent_tool(
         call_number,
         args,
         activated_skills,
+        writes,
     } = invocation;
     let tool = tools
         .iter()
@@ -1134,6 +1188,7 @@ pub(crate) async fn execute_agent_tool(
                     let state = ctx.journal.state();
                     let record = state.operation_records.get(&operation_id).cloned();
                     if let Some(result) = redacted_success_resend(record.as_ref()) {
+                        record_replayed_write(ctx, node, path, writes)?;
                         return Ok(AgentToolOutcome::Result(result));
                     }
                     let had_record = record.is_some();
@@ -1146,6 +1201,7 @@ pub(crate) async fn execute_agent_tool(
                         call_id,
                     )? {
                         engine::GuardDecision::Resend { result, .. } => {
+                            record_replayed_write(ctx, node, path, writes)?;
                             return Ok(AgentToolOutcome::Result(result));
                         }
                         engine::GuardDecision::Proceed { operation_id } => {
@@ -1222,11 +1278,13 @@ pub(crate) async fn execute_agent_tool(
                 )? {
                     engine::GuardDecision::Proceed { operation_id } => operation_id,
                     engine::GuardDecision::Resend { result, .. } => {
+                        record_replayed_write(ctx, node, path, writes)?;
                         return Ok(AgentToolOutcome::Result(result));
                     }
                 };
                 ctx.run.fs.resolve_write(path).step_err(&node.id)?;
-                return execute_agent_fs_write(ctx, node, path, content, &operation_id).await;
+                return execute_agent_fs_write(ctx, node, path, content, &operation_id, writes)
+                    .await;
             }
         }
         ToolDecl::FsRead { path_prefix, .. } => {
@@ -1276,7 +1334,8 @@ pub(crate) async fn execute_agent_tool(
         }
         ToolDecl::FsPatch { path_prefix, .. } => {
             let outcome =
-                execute_agent_fs_patch_call(ctx, node, name, call_id, args, path_prefix).await;
+                execute_agent_fs_patch_call(ctx, node, name, call_id, args, path_prefix, writes)
+                    .await;
             if outcome.is_err() {
                 // A call that never started must not leave its pending payload
                 // behind: a retrying agent would accumulate one unredacted
@@ -1453,6 +1512,7 @@ pub(crate) async fn execute_agent_tool(
                 services,
                 mcp,
                 tools,
+                writes,
                 SpecialistAgentSpec {
                     name,
                     invocation_id: call_id,
@@ -2679,6 +2739,7 @@ mod approval_e2e {
             .await
             .expect("no MCP tools should prepare cleanly");
         let mut activated = BTreeSet::new();
+        let mut writes = Vec::new();
         let outcome = execute_agent_tool(
             &mut ctx,
             node,
@@ -2694,6 +2755,7 @@ mod approval_e2e {
                 call_number: 0,
                 args,
                 activated_skills: &mut activated,
+                writes: &mut writes,
             },
         )
         .await
@@ -2848,6 +2910,7 @@ mod approval_e2e {
                 .await
                 .expect("prepare should succeed");
             let mut activated = BTreeSet::new();
+            let mut writes = Vec::new();
             let outcome = execute_agent_tool(
                 &mut ctx,
                 &node,
@@ -2863,6 +2926,7 @@ mod approval_e2e {
                     call_number: 0,
                     args: &restored.args,
                     activated_skills: &mut activated,
+                    writes: &mut writes,
                 },
             )
             .await
@@ -2870,6 +2934,15 @@ mod approval_e2e {
             assert!(
                 matches!(outcome, AgentToolOutcome::Result(_)),
                 "fs.write finishes inline"
+            );
+            assert_eq!(
+                writes.len(),
+                1,
+                "the approved execution reports the file it wrote"
+            );
+            assert!(
+                matches!(writes.first(), Some(AgentWrite::Written(_))),
+                "a file written during this attempt is a fresh write"
             );
             // Duplicate resume resends the cached result instead of
             // executing a second time.
@@ -2888,6 +2961,7 @@ mod approval_e2e {
                     call_number: 0,
                     args: &restored.args,
                     activated_skills: &mut activated,
+                    writes: &mut writes,
                 },
             )
             .await
@@ -2895,6 +2969,15 @@ mod approval_e2e {
             assert!(
                 matches!(again, AgentToolOutcome::Result(_)),
                 "duplicate resume must resend"
+            );
+            assert_eq!(
+                writes.len(),
+                2,
+                "the replayed call reports the write it replayed"
+            );
+            assert!(
+                matches!(writes.get(1), Some(AgentWrite::Replayed(_))),
+                "a resent result is a replayed write, not a fresh one"
             );
         }
         let written = std::fs::read_to_string(harness.root.join("workspace/drafts/note.txt"))
@@ -3056,6 +3139,7 @@ mod approval_e2e {
                 .await
                 .expect("prepare should succeed");
             let mut activated = BTreeSet::new();
+            let mut writes = Vec::new();
             // Finish the operation as the turn loop would after output
             // checks, then prove a duplicate resume resends from the cache
             // without touching the wire again.
@@ -3074,6 +3158,7 @@ mod approval_e2e {
                     call_number: 0,
                     args: &restored.args,
                     activated_skills: &mut activated,
+                    writes: &mut writes,
                 },
             )
             .await
@@ -3105,6 +3190,7 @@ mod approval_e2e {
                         call_number: 0,
                         args: &restored.args,
                         activated_skills: &mut activated,
+                        writes: &mut writes,
                     },
                 )
                 .await
@@ -3199,6 +3285,7 @@ mod approval_e2e {
             .await
             .expect("prepare should succeed");
         let mut activated = BTreeSet::new();
+        let mut writes = Vec::new();
         let tampered = json!({"path": "drafts/note.txt", "content": "forged"});
         let outcome = execute_agent_tool(
             &mut ctx,
@@ -3215,6 +3302,7 @@ mod approval_e2e {
                 call_number: 0,
                 args: &tampered,
                 activated_skills: &mut activated,
+                writes: &mut writes,
             },
         )
         .await
@@ -3269,6 +3357,7 @@ mod approval_e2e {
             .await
             .expect("prepare should succeed");
         let mut activated = BTreeSet::new();
+        let mut writes = Vec::new();
         let operation_id = engine::operation_id_for(&harness.run_id, &node.id, "call-1");
         for (args, code) in [
             (
@@ -3303,6 +3392,7 @@ mod approval_e2e {
                     call_number: 0,
                     args: &args,
                     activated_skills: &mut activated,
+                    writes: &mut writes,
                 },
             )
             .await
@@ -3331,6 +3421,10 @@ mod approval_e2e {
                     .is_none(),
                 "a rejected call must release its pending payload"
             );
+            assert!(
+                writes.is_empty(),
+                "a rejected call is not a write, so the step reports no output for it"
+            );
         }
         // A call the contract's limits refuse is fatal, but it is refused
         // before the approval and it releases its payload too.
@@ -3358,6 +3452,7 @@ mod approval_e2e {
                 call_number: 0,
                 args: &too_many,
                 activated_skills: &mut activated,
+                writes: &mut writes,
             },
         )
         .await;
@@ -3370,6 +3465,10 @@ mod approval_e2e {
                 .expect("pending payload should read")
                 .is_none(),
             "a refused call must release its pending payload"
+        );
+        assert!(
+            writes.is_empty(),
+            "a refused call wrote nothing, so the step reports no output for it"
         );
     }
 

@@ -1,5 +1,6 @@
 use super::*;
 use api::{GuardrailErrorKind, ToolCallError, ToolCallErrorCode, ToolCallPhase, ToolCallStatus};
+use camino::Utf8PathBuf;
 use contract::{
     AgentFailureAction, AgentFailureCode, Contract, LlmRequestControl, LlmRequestPolicy, NodeDef,
     ToolDecl,
@@ -1155,42 +1156,61 @@ fn mcp_input_required_rejects_url_mode_elicitation() {
     }
 }
 
-/// The agent reports the files its own tools wrote, because the engine
-/// pins what a step produced and the pins are what a resume restores.
+/// The agent reports the files its tools wrote, because the engine pins
+/// what a step produced and the pins are what a resume restores. The
+/// executors report what they wrote, so a replayed write is told apart
+/// from a fresh one by provenance rather than by a filesystem probe.
 #[test]
-fn an_agents_tool_write_is_reported_as_a_written_file() {
-    let tools = vec![
-        ToolDecl::FsWrite {
-            name: "writer".into(),
-            description: None,
-            input_schema: None,
-            path_prefix: "out/".into(),
-        },
-        ToolDecl::FsRead {
-            name: "reader".into(),
-            description: None,
-            input_schema: None,
-            path_prefix: "out/".into(),
-        },
-    ];
+fn a_written_file_is_reported_while_the_workspace_holds_it() {
+    let writes = vec![AgentWrite::Written(Utf8PathBuf::from("out/note.txt"))];
     assert_eq!(
-        agent_tool_written_path(&tools, "writer", &json!({ "file": "out/note.txt" })),
-        Some("out/note.txt")
+        agent_written_files(&writes, |_| true),
+        vec![Utf8PathBuf::from("out/note.txt")],
+        "a file the workspace still holds is an output of the step"
     );
-    assert_eq!(
-        agent_tool_written_path(&tools, "patcher", &json!({ "file": "out/note.txt" })),
-        None,
-        "a tool that is not declared cannot have written"
+}
+
+/// The agent may write a scratch file and remove it again; a file the
+/// workspace no longer holds is not an output of the step.
+#[test]
+fn a_removed_written_file_is_not_reported() {
+    let writes = vec![AgentWrite::Written(Utf8PathBuf::from("out/scratch.txt"))];
+    assert!(
+        agent_written_files(&writes, |_| false).is_empty(),
+        "a file the agent removed is not an output of the step"
     );
+}
+
+/// A write replayed from an earlier attempt of the step was produced by
+/// that step, so it is reported even when the workspace no longer holds
+/// it: a workspace that lost a produced file must fail the pin step
+/// loudly rather than drop the output silently.
+#[test]
+fn a_replayed_write_is_reported_even_when_the_workspace_lost_it() {
+    let writes = vec![AgentWrite::Replayed(Utf8PathBuf::from("out/note.txt"))];
     assert_eq!(
-        agent_tool_written_path(&tools, "reader", &json!({ "file": "out/note.txt" })),
-        None,
-        "a read reports a file it did not write"
+        agent_written_files(&writes, |_| false),
+        vec![Utf8PathBuf::from("out/note.txt")],
+        "a produced file the workspace lost is still reported"
     );
+}
+
+/// A rejection names the file it would have written, not a write: the
+/// model can correct itself and the step still produces nothing. The
+/// executor never records one, so the step never reports it. The
+/// executor's own rejection path is covered where it lives, in
+/// `a_patch_call_the_model_got_wrong_never_reaches_the_approval`.
+#[test]
+fn a_rejected_write_is_not_a_write() {
+    let writes = vec![AgentWrite::Written(Utf8PathBuf::from("out/note.txt"))];
     assert_eq!(
-        agent_tool_written_path(&tools, "writer", &json!({ "ok": true })),
-        None,
-        "a result without a file names no write"
+        agent_written_files(&writes, |_| true),
+        vec![Utf8PathBuf::from("out/note.txt")],
+        "a write the executor recorded is reported"
+    );
+    assert!(
+        agent_written_files(&[], |_| true).is_empty(),
+        "a rejected call leaves the step with no write to report"
     );
 }
 

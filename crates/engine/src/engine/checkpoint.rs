@@ -138,7 +138,15 @@ pub(crate) fn pin_files(
                     "step output `{path}` is a symbolic link"
                 )));
             }
-            let canonical_path = dunce::canonicalize(path)?;
+            // A reported output the workspace does not hold means the
+            // workspace lost a file the step produced. Fail loudly and
+            // name the file, so the operator sees which output is gone
+            // rather than a bare I/O error.
+            let canonical_path = dunce::canonicalize(path).map_err(|error| {
+                EngineError::Failed(format!(
+                    "step output `{path}` is not in the workspace: {error}"
+                ))
+            })?;
             let canonical_path = Utf8PathBuf::from_path_buf(canonical_path).map_err(|path| {
                 EngineError::Failed(format!(
                     "step output path is not valid UTF-8: {}",

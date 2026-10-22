@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::agent_runtime::{
-    AgentToolCallFailure, AgentToolInvocation, AgentToolServices,
+    AgentToolCallFailure, AgentToolInvocation, AgentToolServices, AgentWrite,
     agent_call_identity_hash_for_tool, check_used_call_id, execute_agent_tool,
     finish_rejected_external_operation, recover_agent_tool_call_failure,
     validate_agent_tool_call_args,
@@ -604,11 +604,13 @@ impl StepExecutor for LlmAgentStep {
         // node execution (not the checkpoint) so a repeated activation in a
         // later turn skips re-injecting identical instructions.
         let mut activated_skills = BTreeSet::new();
-        // The files the agent's own tools wrote. The engine pins the files a
+        // The files the agent's tools wrote. The engine pins the files a
         // step produced, and the pins are what the journal records and what a
         // resume verifies, so a tool write the step does not report is a
-        // write the run cannot restore.
-        let mut written_files: Vec<Utf8PathBuf> = Vec::new();
+        // write the run cannot restore. The executors report what they
+        // wrote, because a replayed write carries the same result shape as
+        // a fresh one and only the executor knows which it was.
+        let mut written_files: Vec<AgentWrite> = Vec::new();
         // A stored side effect resumes without an LLM round-trip so the
         // exact operation is re-guarded: an approved call executes, an
         // interrupted call is settled by its durable record (E07).
@@ -937,7 +939,7 @@ impl StepExecutor for LlmAgentStep {
                 let content = serde_json::to_vec(&value)?;
                 let mut files =
                     write_output_file(ctx, node, params.output_file.as_deref(), &content).await?;
-                files.extend(written_files.iter().cloned());
+                files.extend(agent_written_files(&written_files, |path| path.exists()));
                 return Ok(StepOutcome::Success {
                     output: Some(value),
                     files,
@@ -1261,6 +1263,7 @@ impl StepExecutor for LlmAgentStep {
                         call_number,
                         args: &call.args,
                         activated_skills: &mut activated_skills,
+                        writes: &mut written_files,
                     },
                 )
                 .await
@@ -1283,23 +1286,7 @@ impl StepExecutor for LlmAgentStep {
                     }
                 };
                 let (result, returned_agent_error, mut pending_operation) = match outcome {
-                    AgentToolOutcome::Result(value) => {
-                        if let Some(path) =
-                            agent_tool_written_path(&params.tools, &call.name, &value)
-                        {
-                            // The tool resolved this path when it wrote the
-                            // file, so the same resolution names it. A file
-                            // that is not there was not produced here — a
-                            // replayed call in an isolated deployment
-                            // resumes without it — so the step does not
-                            // claim it.
-                            let resolved = ctx.run.fs.resolve_write(path).step_err(&node.id)?;
-                            if resolved.exists() {
-                                written_files.push(resolved);
-                            }
-                        }
-                        (value, false, None)
-                    }
+                    AgentToolOutcome::Result(value) => (value, false, None),
                     AgentToolOutcome::OperationResult {
                         value,
                         operation_id,
@@ -1383,7 +1370,7 @@ impl StepExecutor for LlmAgentStep {
                         let mut files =
                             write_output_file(ctx, node, params.output_file.as_deref(), &content)
                                 .await?;
-                        files.extend(written_files.iter().cloned());
+                        files.extend(agent_written_files(&written_files, |path| path.exists()));
                         return Ok(StepOutcome::Success {
                             output: Some(value),
                             files,
@@ -1678,30 +1665,29 @@ impl StepExecutor for LlmAgentStep {
     }
 }
 
-/// The file an agent tool wrote, when the tool wrote one.
+/// The files a step reports for the writes its tools made.
 ///
-/// The agent's tools write through the same gateway the steps use, so the
-/// step has to report what they wrote: the engine pins the files a step
-/// produced, and the pins are what the journal records and what a resume
-/// verifies. A tool that writes without the step reporting it is a write the
-/// run cannot restore.
-pub(crate) fn agent_tool_written_path<'a>(
-    tools: &[ToolDecl],
-    name: &str,
-    value: &'a Value,
-) -> Option<&'a str> {
-    // A rejection names the file it would have written, not a write: the
-    // model can correct itself and the step still produces nothing.
-    if value.get("ok").and_then(Value::as_bool) == Some(false) {
-        return None;
-    }
-    let writes = tools.iter().any(|tool| {
-        matches!(tool, ToolDecl::FsWrite { .. } | ToolDecl::FsPatch { .. }) && tool.name() == name
-    });
-    if !writes {
-        return None;
-    }
-    value.get("file")?.as_str()
+/// The engine pins the files a step produced, and the pins are what the
+/// journal records and what a resume verifies, so a tool write the step
+/// does not report is a write the run cannot restore.
+///
+/// A file written during this attempt is reported only while the workspace
+/// still holds it: the agent may write a scratch file and then remove it
+/// again, and that is not an output of the step. A replayed write is always
+/// reported, so a workspace that lost a produced file fails the pin step
+/// loudly instead of dropping the output silently.
+pub(crate) fn agent_written_files(
+    writes: &[AgentWrite],
+    exists: impl Fn(&camino::Utf8Path) -> bool,
+) -> Vec<Utf8PathBuf> {
+    writes
+        .iter()
+        .filter_map(|write| match write {
+            AgentWrite::Written(path) => exists(path).then_some(path),
+            AgentWrite::Replayed(path) => Some(path),
+        })
+        .cloned()
+        .collect()
 }
 
 pub(crate) fn agent_tool_has_side_effects(tools: &[ToolDecl], name: &str) -> bool {

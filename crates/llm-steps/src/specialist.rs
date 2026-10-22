@@ -8,8 +8,8 @@ use std::time::Instant;
 
 use crate::agent::{agent_tool_requires_serial_execution, charge_agent_tool_call};
 use crate::agent_runtime::{
-    AgentToolInvocation, AgentToolServices, execute_agent_tool, finish_rejected_external_operation,
-    validate_agent_tool_call_args,
+    AgentToolInvocation, AgentToolServices, AgentWrite, execute_agent_tool,
+    finish_rejected_external_operation, validate_agent_tool_call_args,
 };
 use crate::agent_tools::load_agent_output_schema;
 use crate::completion::complete_llm_with_policy;
@@ -48,6 +48,7 @@ pub(crate) async fn execute_specialist_agent(
     services: AgentToolServices<'_>,
     mcp: &McpAgentTools,
     all_tools: &[ToolDecl],
+    writes: &mut Vec<AgentWrite>,
     spec: SpecialistAgentSpec<'_>,
 ) -> Result<AgentToolOutcome, StepError> {
     let SpecialistAgentSpec {
@@ -435,6 +436,7 @@ pub(crate) async fn execute_specialist_agent(
                     call_number: tool_call_counts[&call.name],
                     args: &call.args,
                     activated_skills: &mut activated_skills,
+                    writes,
                 },
             ))
             .await
