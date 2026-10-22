@@ -134,9 +134,8 @@ impl Parser {
                 Ok(ExpressionNode::Literal(Value::String(value)))
             }
             Token::Number(value) => {
-                let value = number_value(value).map_err(ExprError::Syntax)?;
                 self.reserve_node()?;
-                Ok(ExpressionNode::Literal(value))
+                Ok(ExpressionNode::Literal(Value::Number(value)))
             }
             Token::Identifier(identifier) => {
                 if matches!(self.peek(), Token::LeftParen) {

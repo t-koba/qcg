@@ -315,6 +315,34 @@ mod tests {
     }
 
     #[test]
+    fn numeric_comparison_keeps_distinct_large_integers_distinct() {
+        // Two exact integers above 2^53 are distinct values, so no
+        // comparison may round them into equality, and the one relation
+        // must hold for `==`/`!=`, `contains`, `unique` and ordering alike.
+        let mut inputs = BTreeMap::new();
+        inputs.insert("big".into(), json!(9007199254740993i64));
+        inputs.insert("smaller".into(), json!(9007199254740992i64));
+        let bag = ValueBag::with_inputs(inputs);
+        for (expr, expected) in [
+            ("inputs.big == inputs.smaller", false),
+            ("inputs.big != inputs.smaller", true),
+            ("contains([inputs.smaller], inputs.big)", false),
+            ("len(unique([inputs.big, inputs.smaller])) == 2", true),
+            ("inputs.big > inputs.smaller", true),
+            ("inputs.big < inputs.smaller", false),
+            ("inputs.big == 9007199254740993", true),
+            ("9007199254740993 == 9007199254740992", false),
+        ] {
+            assert_eq!(
+                bag.eval_bool(Some(&Expr(expr.into())))
+                    .expect("numeric comparison probe should evaluate"),
+                expected,
+                "exact numeric comparison must hold for `{expr}`"
+            );
+        }
+    }
+
+    #[test]
     fn shared_expr_corpus_fixture_matches_expected_results() {
         let fixture = include_str!("../../../fixtures/expr-corpus.toml");
         let parsed =

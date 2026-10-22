@@ -628,6 +628,12 @@ objects compare recursively element by element, so `==`/`!=`, `contains`,
 and `unique` always agree with each other. Values of distinct types never
 compare equal.
 
+Comparisons use the numbers' exact values: two integers are never rounded
+into equality, so two distinct integers above 2^53 stay distinct, and an
+integer equals a float only when the float denotes the same number. The
+arithmetic operators (`+`, `-`, `*`, `/`, `%`) work in floating point, so
+an arithmetic result is a float even when its operands were integers.
+
 ## Step Types
 
 `render`

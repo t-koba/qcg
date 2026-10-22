@@ -35,9 +35,46 @@ pub(crate) fn evaluate_binary(
 /// numeric value across integer and float representations, while arrays and
 /// objects compare recursively element by element. Values of distinct types
 /// never compare equal.
+/// Orders two JSON numbers by their exact numeric value.
+///
+/// Two integers compare as integers, so two distinct large integers never
+/// collapse into equality through f64 rounding, and an integer and a float
+/// compare by the float's exact integer value when it has one, which keeps
+/// `3 == 3.0` true. A float without a fractional part is an exact integer
+/// when it fits, so the comparison never loses a distinction the values
+/// carry.
+fn compare_numbers(
+    left: &serde_json::Number,
+    right: &serde_json::Number,
+) -> Option<std::cmp::Ordering> {
+    match (exact_integer(left), exact_integer(right)) {
+        (Some(left), Some(right)) => Some(left.cmp(&right)),
+        _ => left.as_f64()?.partial_cmp(&right.as_f64()?),
+    }
+}
+
+/// The exact integer value of a JSON number, when it has one.
+fn exact_integer(number: &serde_json::Number) -> Option<i128> {
+    if let Some(value) = number.as_i64() {
+        return Some(i128::from(value));
+    }
+    if let Some(value) = number.as_u64() {
+        return Some(i128::from(value));
+    }
+    let value = number.as_f64()?;
+    // 2^127 is the first magnitude an i128 cannot hold.
+    const I128_LIMIT: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
+    if !value.is_finite() || value.fract() != 0.0 || value < -I128_LIMIT || value >= I128_LIMIT {
+        return None;
+    }
+    Some(value as i128)
+}
+
 fn values_equal(left: &Value, right: &Value) -> bool {
     match (left, right) {
-        (Value::Number(left), Value::Number(right)) => left.as_f64() == right.as_f64(),
+        (Value::Number(left), Value::Number(right)) => {
+            compare_numbers(left, right) == Some(std::cmp::Ordering::Equal)
+        }
         (Value::Array(left), Value::Array(right)) => {
             left.len() == right.len()
                 && left
@@ -60,14 +97,16 @@ fn values_equal(left: &Value, right: &Value) -> bool {
 fn compare_order(left: &Value, operator: &str, right: &Value) -> Result<bool, String> {
     match (left, right) {
         (Value::String(left), Value::String(right)) => compare_ordered(left, operator, right),
-        (Value::Number(left), Value::Number(right)) => compare_ordered(
-            left.as_f64()
-                .ok_or_else(|| "invalid left number".to_string())?,
-            operator,
-            right
-                .as_f64()
-                .ok_or_else(|| "invalid right number".to_string())?,
-        ),
+        (Value::Number(left), Value::Number(right)) => {
+            let ordering = compare_numbers(left, right).ok_or_else(|| {
+                if left.as_f64().is_none() {
+                    "invalid left number".to_string()
+                } else {
+                    "invalid right number".to_string()
+                }
+            })?;
+            compare_ordered_by(ordering, operator)
+        }
         (Value::Bool(_), Value::Bool(_)) => {
             Err(format!("operator `{operator}` is not valid for booleans"))
         }
@@ -76,6 +115,17 @@ fn compare_order(left: &Value, operator: &str, right: &Value) -> Result<bool, St
             "type mismatch in expression with operator `{operator}`"
         )),
     }
+}
+
+fn compare_ordered_by(ordering: std::cmp::Ordering, operator: &str) -> Result<bool, String> {
+    use std::cmp::Ordering;
+    Ok(match operator {
+        ">" => ordering == Ordering::Greater,
+        "<" => ordering == Ordering::Less,
+        ">=" => ordering != Ordering::Less,
+        "<=" => ordering != Ordering::Greater,
+        _ => return Err(format!("unknown ordering operator `{operator}`")),
+    })
 }
 
 fn compare_ordered<T: PartialOrd>(left: T, operator: &str, right: T) -> Result<bool, String> {
@@ -296,7 +346,7 @@ fn join_values(value: &Value, separator: &str) -> Result<Value, String> {
 
 fn compare_json_scalar(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
     match (left, right) {
-        (Value::Number(left), Value::Number(right)) => left.as_f64()?.partial_cmp(&right.as_f64()?),
+        (Value::Number(left), Value::Number(right)) => compare_numbers(left, right),
         (Value::String(left), Value::String(right)) => Some(left.cmp(right)),
         (Value::Bool(left), Value::Bool(right)) => Some(left.cmp(right)),
         _ => None,

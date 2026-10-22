@@ -30,7 +30,7 @@ pub(crate) fn ensure_expression_bytes(source: &str) -> Result<(), ExprError> {
 pub(crate) enum Token {
     Identifier(String),
     String(String),
-    Number(f64),
+    Number(serde_json::Number),
     Bool(bool),
     Null,
     Operator(&'static str),
@@ -40,6 +40,27 @@ pub(crate) enum Token {
     RightBracket,
     Comma,
     End,
+}
+
+/// Parses a numeric literal into the exact JSON number it denotes.
+///
+/// An integer literal keeps its exact value, so a literal above 2^53 is not
+/// rounded into its neighbouring float before any comparison sees it; a
+/// literal with a fraction or an exponent stays a float, as it always was.
+fn parse_number_literal(literal: &str) -> Result<serde_json::Number, ExprError> {
+    if !literal.contains(['.', 'e', 'E'])
+        && let Ok(number) = serde_json::from_str::<serde_json::Number>(literal)
+    {
+        return Ok(number);
+    }
+    let value = literal
+        .parse::<f64>()
+        .map_err(|_| ExprError::Syntax(format!("invalid number literal `{literal}`")))?;
+    if !value.is_finite() {
+        return Err(ExprError::Syntax("number literal is not finite".into()));
+    }
+    serde_json::Number::from_f64(value)
+        .ok_or_else(|| ExprError::Syntax("number literal is not finite".into()))
 }
 
 pub(crate) fn tokenize(source: &str) -> Result<Vec<Token>, ExprError> {
@@ -116,13 +137,8 @@ pub(crate) fn tokenize(source: &str) -> Result<Vec<Token>, ExprError> {
                 index += 1;
             }
             let literal = chars[start..index].iter().collect::<String>();
-            let value = literal
-                .parse::<f64>()
-                .map_err(|_| ExprError::Syntax(format!("invalid number literal `{literal}`")))?;
-            if !value.is_finite() {
-                return Err(ExprError::Syntax("number literal is not finite".into()));
-            }
-            push_token(&mut tokens, Token::Number(value))?;
+            let number = parse_number_literal(&literal)?;
+            push_token(&mut tokens, Token::Number(number))?;
             continue;
         }
         if ch.is_ascii_alphabetic() || ch == '_' {
