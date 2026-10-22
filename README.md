@@ -101,6 +101,7 @@ bundled demo, with installed IDs taking precedence.
 
 ## Documentation
 
+- [Project charter](PROJECT.md)
 - [Contract reference](docs/contract-reference.md)
 - [Built-in generator](docs/built-in-generators.md)
 - [DAG flow guide](docs/dag-flow-guide.md)
