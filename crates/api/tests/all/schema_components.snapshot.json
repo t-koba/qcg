@@ -5,6 +5,7 @@
   "AgentFailedEventData",
   "AgentFailureAction",
   "AgentFailureCode",
+  "AgentFileChangesEventData",
   "AgentHandoffEventData",
   "AnswerPayload",
   "ArtifactPreview",

@@ -1177,6 +1177,157 @@ done
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[tokio::test]
+async fn removal_fact_survives_tool_output_guardrail_failure_before_checkpoint() {
+    let root = temp_run_dir("agent-removal-before-checkpoint");
+    let _ = std::fs::remove_dir_all(&root);
+    let generator = root.join("generator");
+    let runs = root.join("runs");
+    std::fs::create_dir_all(generator.join("prompts")).expect("generator dirs");
+    std::fs::write(
+        generator.join(contract::MANIFEST_FILE),
+        r#"
+[generator]
+id = "generator"
+name = "Generator"
+version = "0.1.0"
+
+[[flow]]
+id = "agent"
+type = "llm.agent"
+retry = { max_attempts = 2, backoff_ms = 0, timeout_secs = 15, on_indeterminate = "fail" }
+
+[flow.params]
+max_iterations = 4
+max_tokens_total = 4096
+prompt = "prompts/agent.j2"
+guardrails = [{ name = "reject_remove_result", stage = "tool_output", kind = "regex_deny", tool = "remove_note", params = { pattern = ".+" } }]
+
+[[flow.params.tools]]
+kind = "fs.write"
+name = "write_note"
+path_prefix = "out/"
+
+[[flow.params.tools]]
+kind = "command"
+name = "remove_note"
+command = ["sh", "-c", "rm -f out/note.txt"]
+
+[llm]
+max_tokens = 256
+temperature = 0.0
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[permissions]
+fs_read = []
+network = []
+commands = [{ bin = "sh", args = ["-c", "rm -f out/note.txt"], isolation = "trusted_host" }]
+side_effects = "allowed"
+side_effects_scope = "invocation"
+fs_write = ["workspace"]
+
+[permissions.containers]
+enabled = false"#,
+    )
+    .expect("generator manifest");
+    std::fs::write(
+        generator.join("prompts/agent.j2"),
+        r#"Write the note and remove it.
+
+FAKE_TOOL_SEQUENCE: [{"name":"write_note","args":{"path":"out/note.txt","content":"scratch"}},{"name":"remove_note","args":{}}]
+FAKE_AGENT_FINAL:
+done
+"#,
+    )
+    .expect("prompt");
+    let service = test_service(vec![root.clone()], runs.clone());
+    let id = service
+        .start_run(StartRun {
+            generator_id: "generator".into(),
+            inputs: BTreeMap::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("agent run should start");
+    let terminal = wait_for_terminal_snapshot(&service, &id).await;
+    assert_eq!(
+        terminal.state,
+        RunStatus::Failed,
+        "guardrail must fail the attempt: {terminal:?}"
+    );
+    let run_dir = service.run_dir_for(&id).await.expect("run dir");
+    let events =
+        crate::summaries::read_merged_events_from_meta(&run_meta_dir(&run_dir)).expect("journal");
+    let removal = events
+        .iter()
+        .position(|event| {
+            event.get("t").and_then(Value::as_str) == Some("agent_file_changes")
+                && event
+                    .get("removed_files")
+                    .and_then(Value::as_array)
+                    .is_some_and(|paths| {
+                        paths
+                            .iter()
+                            .any(|path| path.as_str() == Some("out/note.txt"))
+                    })
+        })
+        .expect("removal must be a durable run event");
+    let write = events
+        .iter()
+        .position(|event| {
+            event.get("t").and_then(Value::as_str) == Some("agent_file_changes")
+                && event
+                    .get("written_files")
+                    .and_then(Value::as_array)
+                    .is_some_and(|paths| {
+                        paths
+                            .iter()
+                            .any(|path| path.as_str() == Some("out/note.txt"))
+                    })
+        })
+        .expect("successful fs.write must be a durable file-change event");
+    assert!(
+        write < removal,
+        "write precedes the command removal: {events:?}"
+    );
+    let retry = events
+        .iter()
+        .position(|event| {
+            event.get("t").and_then(Value::as_str) == Some("step_retry")
+                && event.get("node").and_then(Value::as_str) == Some("agent")
+        })
+        .expect("the failed attempt must retry");
+    assert!(
+        removal < retry,
+        "the removal must be journaled before retry: {events:?}"
+    );
+    assert!(
+        !events[removal + 1..retry]
+            .iter()
+            .any(|event| { event.get("t").and_then(Value::as_str) == Some("agent_checkpoint") }),
+        "the first attempt must fail before its next agent checkpoint"
+    );
+    let state: Value = serde_json::from_slice(
+        &std::fs::read(run_meta_dir(&run_dir).join("state.json")).expect("state file"),
+    )
+    .expect("state should decode");
+    assert!(
+        state
+            .get("removed_files")
+            .and_then(|files| files.get("agent"))
+            .and_then(Value::as_array)
+            .is_some_and(|files| files
+                .iter()
+                .any(|path| path.as_str() == Some("out/note.txt"))),
+        "the removal must be folded into run state without waiting for a checkpoint: {state}"
+    );
+    drop(service);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A file the agent removed and then wrote again is not a removal: the
 /// write supersedes it, so the run's own record must not keep the path
 /// and the rewritten file must still be a pinned output.

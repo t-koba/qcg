@@ -60,6 +60,34 @@ mod tests {
     }
 
     #[test]
+    fn agent_file_changes_event_is_typed_and_node_scoped() {
+        let event = RunEvent::from_flat(&json!({
+            "t": "agent_file_changes",
+            "seq": 1,
+            "ts": "2026-07-05T00:00:00Z",
+            "run_id": "run-1",
+            "trace_id": "trace-1",
+            "span_id": "span-1",
+            "node": "agent",
+            "removed_files": ["out/old.txt"],
+            "written_files": ["out/new.txt"]
+        }))
+        .expect("file changes should decode");
+        assert_eq!(event.path.as_ref().map(NodePath::as_str), Some("agent"));
+        let RunEventData::AgentFileChanges(data) = event.data else {
+            panic!("expected typed agent_file_changes event");
+        };
+        assert_eq!(
+            data.removed_files.first().map(String::as_str),
+            Some("out/old.txt")
+        );
+        assert_eq!(
+            data.written_files.first().map(String::as_str),
+            Some("out/new.txt")
+        );
+    }
+
+    #[test]
     fn known_event_data_rejects_unknown_fields() {
         let value = json!({
             "t": "step_skipped",

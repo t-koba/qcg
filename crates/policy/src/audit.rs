@@ -316,6 +316,7 @@ mod tests {
             "step_skipped",
             "llm_call",
             "agent_checkpoint",
+            "agent_file_changes",
             "resource",
             "confirm_request",
             "run_waiting",

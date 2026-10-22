@@ -44,6 +44,7 @@ impl AgentWrites {
         self.outputs.push((path.to_string(), resolved));
     }
 
+    /// A replay returns a result without making a new workspace change.
     pub(crate) fn record_replay(&mut self, path: &str, resolved: Utf8PathBuf) {
         self.outputs.push((path.to_string(), resolved));
     }
@@ -81,7 +82,12 @@ impl AgentWrites {
             .collect()
     }
 
-    fn record_removals(&mut self, ctx: &StepContext<'_>, present_before: &BTreeSet<String>) {
+    fn record_removals(
+        &mut self,
+        ctx: &StepContext<'_>,
+        node: &NodeDef,
+        present_before: &BTreeSet<String>,
+    ) -> Result<(), StepError> {
         let removed: Vec<String> = self
             .outputs
             .iter()
@@ -90,8 +96,26 @@ impl AgentWrites {
             })
             .map(|(path, _)| path.clone())
             .collect();
-        self.removed.extend(removed);
+        if !removed.is_empty() {
+            record_agent_file_changes(ctx, node, &removed, &[])?;
+            self.removed.extend(removed);
+        }
+        Ok(())
     }
+}
+
+fn record_agent_file_changes(
+    ctx: &StepContext<'_>,
+    node: &NodeDef,
+    removed_files: &[String],
+    written_files: &[String],
+) -> Result<(), StepError> {
+    ctx.journal
+        .event(
+            "agent_file_changes",
+            json!({"node": node.id, "removed_files": removed_files, "written_files": written_files}),
+        )
+        .step_err(&node.id)
 }
 
 fn workspace_relative_file_key(
@@ -823,10 +847,7 @@ pub(crate) struct PatchInputs {
     pub(crate) limits: files::PatchLimits,
 }
 
-/// Records a write the guard replayed from an earlier attempt of this
-/// step. The file was produced then, so it is an output of this step even
-/// when the workspace no longer holds it; a step that lost a produced file
-/// must fail the pin step loudly rather than drop the output silently.
+/// Restores a guard-replayed output; missing produced files must fail the pin step.
 fn record_replayed_write(
     ctx: &mut StepContext<'_>,
     node: &NodeDef,
@@ -855,6 +876,7 @@ pub(crate) async fn execute_agent_fs_write(
         .await
         .map_err(|error| ctx.side_effecting_gateway_error(node, operation_id, error))?;
     writes.record_write(&file_key, target.clone());
+    record_agent_file_changes(ctx, node, &[], std::slice::from_ref(&file_key))?;
     let value = json!({ "file": path });
     ctx.run
         .finish_external_operation(ctx.journal, node, operation_id, Some(value.clone()))?;
@@ -864,10 +886,7 @@ pub(crate) async fn execute_agent_fs_write(
     Ok(AgentToolOutcome::Result(value))
 }
 
-/// Executes a verified `fs.patch` call. Policy (prefix, approval, guard,
-/// budgets) is already resolved; this function only drives the mechanism
-/// and settles the operation record. Stale anchors and base mismatches
-/// surface as typed tool errors with remaps so the model can self-correct.
+/// Applies policy-checked patches, settles operations, and preserves typed, correctable anchor/base errors.
 pub(crate) async fn execute_agent_fs_patch(
     ctx: &mut StepContext<'_>,
     node: &NodeDef,
@@ -891,6 +910,8 @@ pub(crate) async fn execute_agent_fs_patch(
                 "applied": outcome.applied,
                 "base_sha256": outcome.new_base_sha256,
             });
+            writes.record_write(&file_key, target.clone());
+            record_agent_file_changes(ctx, node, &[], std::slice::from_ref(&file_key))?;
             ctx.run.finish_external_operation(
                 ctx.journal,
                 node,
@@ -898,7 +919,6 @@ pub(crate) async fn execute_agent_fs_patch(
                 Some(value.clone()),
             )?;
             ctx.run.clear_pending_tool_payload(operation_id);
-            writes.record_write(&file_key, target.clone());
             Ok(AgentToolOutcome::Result(value))
         }
         Err(error) => {
@@ -1016,11 +1036,7 @@ pub(crate) async fn execute_agent_http_request(
     }
 }
 
-/// Executes a verified `fs.patch` call.
-///
-/// Everything the call itself determines is checked before the approval, so a
-/// call that cannot apply never spends the user's confirmation, and every
-/// failure path releases the pending payload the call was given.
+/// Executes `fs.patch`; validate before approval and release pending payloads when rejected.
 async fn execute_agent_fs_patch_call(
     ctx: &mut StepContext<'_>,
     node: &NodeDef,
@@ -1430,14 +1446,9 @@ pub(crate) async fn execute_agent_tool(
             outcome
         }
         ToolDecl::Command { command, .. } => {
-            // The command tool is the only path that removes a file
-            // today, so a file the agent wrote that was present before
-            // this call and absent after it was removed by this call.
-            // The agent removed it deliberately, so it is not an output
-            // of the step.
             let present_before = writes.present(ctx);
             let outcome = command::execute_command(ctx, node, call_id, command).await?;
-            writes.record_removals(ctx, &present_before);
+            writes.record_removals(ctx, node, &present_before)?;
             Ok(outcome)
         }
         ToolDecl::Http { methods, hosts, .. } => {
@@ -1917,10 +1928,17 @@ mod tests {
 
         let mut writes = AgentWrites::default();
         writes.restore_removals(BTreeSet::from([removed.clone()]));
-        writes.record_write(&written, canonical);
+        writes.record_write(&written, canonical.clone());
         assert!(
             writes.removed().is_empty(),
             "the later write supersedes the removal"
+        );
+        writes.restore_removals(BTreeSet::from([removed.clone()]));
+        writes.record_replay(&written, canonical);
+        assert_eq!(writes.removed(), &BTreeSet::from([removed.clone()]));
+        assert!(
+            writes.reported().is_empty(),
+            "a replayed write cannot undo a later removal"
         );
         std::fs::remove_file(workspace.join("out/note.txt")).expect("remove note");
         assert_eq!(

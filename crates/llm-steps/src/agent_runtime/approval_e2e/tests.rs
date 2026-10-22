@@ -575,6 +575,7 @@ async fn a_file_the_agents_command_removed_is_not_reported() {
     let journal = journal(&harness);
     let mut vars = contract::ValueBag::with_inputs(BTreeMap::new());
     let ctx = context(&run, &journal, &mut vars, &llm::LlmRuntime::builtins());
+    let node = ApprovalHarness::node();
     let mut writes = AgentWrites::default();
     // The agent wrote the file, and its command removed it again.
     let target = run.fs.resolve_write("out/note.txt").unwrap();
@@ -593,7 +594,9 @@ async fn a_file_the_agents_command_removed_is_not_reported() {
     );
     // The command removes it, and the removal is recorded.
     std::fs::remove_file(&target).unwrap();
-    writes.record_removals(&ctx, &present_before);
+    writes
+        .record_removals(&ctx, &node, &present_before)
+        .unwrap();
     assert!(
         writes.reported().is_empty(),
         "a file the agent's own command removed is not an output of the step"

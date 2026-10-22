@@ -613,29 +613,18 @@ impl StepExecutor for LlmAgentStep {
         // node execution (not the checkpoint) so a repeated activation in a
         // later turn skips re-injecting identical instructions.
         let mut activated_skills = BTreeSet::new();
-        // The files the agent's tools wrote, and the ones they removed
-        // again. The engine pins the files a step produced, and the pins
-        // are what the journal records and what a resume verifies, so a
-        // tool write the step does not report is a write the run cannot
-        // restore. The removals an earlier attempt recorded are restored,
-        // because the agent removed those files whether it did so then
-        // or now.
+        // Tracks attempt outputs; RunState carries removals across retries.
+        // Unreported writes cannot be restored from pins.
         let mut written_files = AgentWrites::default();
-        // The removals come from the run's own record as well as from the
-        // checkpoint: the engine clears a node's checkpoint when the step
-        // finishes, so the record that outlives it is what keeps a
-        // removal true when the node runs again.
-        let mut removed: BTreeSet<String> = ctx
-            .journal
-            .state()
-            .removed_files
-            .get(&NodePath::root(&node.id))
-            .cloned()
-            .unwrap_or_default();
-        if let Some(checkpoint) = checkpoint.as_ref() {
-            removed.extend(checkpoint.removed_files.iter().cloned());
-        }
-        written_files.restore_removals(removed);
+        // RunState folds checkpoint snapshots and per-call changes here.
+        written_files.restore_removals(
+            ctx.journal
+                .state()
+                .removed_files
+                .get(&NodePath::root(&node.id))
+                .cloned()
+                .unwrap_or_default(),
+        );
         // A stored side effect resumes without an LLM round-trip so the
         // exact operation is re-guarded: an approved call executes, an
         // interrupted call is settled by its durable record (E07).

@@ -36,6 +36,7 @@ Generated from the OpenAPI `RunEvent` schema. Every event uses the required enve
 | `llm_call` | `provider`, `model`, `max_tokens`, `tokens`, `cost_microusd` |
 | `llm_delta` | `provider`, `model`, `index`, `text` |
 | `agent_checkpoint` | `turn`, `phase`, `checkpoint` |
+| `agent_file_changes` | `removed_files`, `written_files` |
 | `agent_delegated` | `agent`, `tool_call_id`, `tools`, `max_calls`, `max_iterations`, `max_tokens_total`, `max_tool_calls_total` |
 | `agent_completed` | `agent`, `tool_call_id`, `turn`, `tokens_total` |
 | `agent_failed` | `agent`, `tool_call_id`, `code`, `action`, `message` |
@@ -63,6 +64,8 @@ Generated from the OpenAPI `RunEvent` schema. Every event uses the required enve
 <!-- run-events:end -->
 
 ## Durability records
+
+`agent_file_changes` is a typed durable event emitted after agent removals and writes. Its `removed_files` and `written_files` are workspace-relative per-call facts folded into per-node run state; it never carries pending side-effect payloads. `tool_call` remains observation-only and is not the durability carrier.
 
 The following journal records are not typed `RunEvent` variants; they travel
 as opaque `Unknown` kinds and exist so restarts and shared-store peers resume

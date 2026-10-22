@@ -197,6 +197,28 @@
           }
         ]
       },
+      "AgentFileChangesEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "removed_files": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "written_files": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "removed_files",
+          "written_files"
+        ],
+        "type": "object"
+      },
       "AgentHandoffEventData": {
         "additionalProperties": false,
         "properties": {
@@ -2644,6 +2666,7 @@
               "agent_completed",
               "agent_delegated",
               "agent_failed",
+              "agent_file_changes",
               "agent_handoff",
               "artifact",
               "audit_degraded",
@@ -2816,6 +2839,9 @@
           },
           {
             "$ref": "#/components/schemas/AgentCheckpointEventData"
+          },
+          {
+            "$ref": "#/components/schemas/AgentFileChangesEventData"
           },
           {
             "$ref": "#/components/schemas/AgentDelegatedEventData"

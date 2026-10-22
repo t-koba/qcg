@@ -80,6 +80,13 @@ pub struct LlmDeltaEventData {
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct AgentFileChangesEventData {
+    pub removed_files: Vec<String>,
+    pub written_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AgentCheckpointEventData {
     pub turn: usize,
     pub phase: String,

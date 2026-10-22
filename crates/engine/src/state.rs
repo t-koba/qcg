@@ -366,12 +366,7 @@ impl RunState {
         }
     }
 
-    /// Full journal fold without caller limits (recovery, fork, and resume
-    /// verification paths that must observe complete durable truth).
-    /// Kept only with this documented necessity and always bounded by the
-    /// journal's own configured limits via `JournalLimits::default`
-    /// (which the writer enforces on append); callers with explicit caps
-    /// use `fold_journal_with_limits` instead.
+    /// Full bounded fold for recovery, fork, and resume; capped callers use `fold_journal_with_limits`.
     pub fn fold_journal(path: &Utf8Path) -> Result<Self, crate::JournalError> {
         Self::fold_journal_through(path, None)
     }
@@ -408,10 +403,7 @@ impl RunState {
         Ok(state)
     }
 
-    /// Folds already-read journal values with the same validation as
-    /// [`Self::fold_journal`]: every event is type-checked before it
-    /// affects state, so readers that already hold the values never
-    /// re-read the file to fold.
+    /// Folds already-read values with the same typed validation as [`Self::fold_journal`].
     pub fn fold_values(events: &[Value]) -> Result<Self, crate::JournalError> {
         let mut state = Self::default();
         for event in events {
@@ -445,11 +437,8 @@ impl RunState {
             .get("t")
             .and_then(Value::as_str)
             .ok_or_else(|| crate::JournalError::InvalidEvent("event kind is required".into()))?;
-        // Identity is established by the admission records, so those are the
-        // only kinds allowed to name a run: a fork journal carries the
-        // source's `run_queued` before its own, and `run_forked` rebinds the
-        // journal to the fork. Every other record must match the identity the
-        // journal already folded, so a foreign or spliced event fails closed.
+        // Only admission records rebind identity; forks must name their source.
+        // Every other event must match folded identity or the journal is foreign or spliced.
         if !matches!(kind, "run_queued" | "run_started" | "run_forked")
             && let Some(expected) = self.run_id.as_deref()
             && let Some(actual) = event.get("run_id").and_then(Value::as_str)
@@ -464,13 +453,8 @@ impl RunState {
                 "unknown run event kind `{kind}`"
             )));
         }
-        // A final outcome can only be followed by an explicit lifecycle
-        // restart (`run_queued`/`run_started`/`run_resumed` re-arm the fold).
-        // Any other record after success, failure, or cancellation means the
-        // journal settled twice or was appended out of order, and it is
-        // refused instead of silently continuing the dead run. `run_interrupted`
-        // needs no exemption: it is not final, and a HITL resume appends
-        // straight after it.
+        // Final runs accept only explicit lifecycle restarts. `run_interrupted` is
+        // nonterminal and HITL resume appends after it; any other post-final event is invalid.
         if self.terminal.as_ref().is_some_and(|terminal| {
             matches!(
                 terminal,
@@ -482,9 +466,7 @@ impl RunState {
                 "final run cannot accept `{kind}`"
             )));
         }
-        // Journal format gate: the identity record declares the schema
-        // version. An unknown version is refused instead of being folded
-        // under current assumptions. Schema 1 has explicit historical wall-clock semantics.
+        // Identity records declare the schema; schema 1 alone omits wall-clock mode.
         if matches!(kind, "run_queued" | "run_started")
             && let Some(version) = event.get("schema_version").and_then(Value::as_u64)
             && version != 1
@@ -809,20 +791,39 @@ impl RunState {
                         crate::JournalError::InvalidEvent("cost counter overflowed".into())
                     })?;
             }
+            "agent_file_changes" => {
+                let parsed =
+                    api::RunEvent::from_flat(event).map_err(crate::JournalError::InvalidEvent)?;
+                let node = parsed.path.ok_or_else(|| {
+                    crate::JournalError::InvalidEvent("agent file changes require a node".into())
+                })?;
+                let api::RunEventData::AgentFileChanges(changes) = parsed.data else {
+                    return Err(crate::JournalError::InvalidEvent(
+                        "invalid agent file changes".into(),
+                    ));
+                };
+                if changes
+                    .removed_files
+                    .iter()
+                    .chain(&changes.written_files)
+                    .any(|path| !policy::is_safe_relative_path(path))
+                {
+                    return Err(crate::JournalError::InvalidEvent(
+                        "unsafe agent file-change path".into(),
+                    ));
+                }
+                let removals = self.removed_files.entry(node).or_default();
+                removals.extend(changes.removed_files);
+                for path in changes.written_files {
+                    removals.remove(&path);
+                }
+                self.removed_files.retain(|_, paths| !paths.is_empty());
+            }
             "agent_checkpoint" => {
                 if let (Some(path), Some(checkpoint)) = (
                     event.get("node").and_then(Value::as_str),
                     event.get("checkpoint").cloned(),
                 ) {
-                    // The removals the agent's tools made outlive the
-                    // checkpoint they ride in: the engine clears a
-                    // checkpoint when the step finishes, and a removal
-                    // must still hold when the node runs again. The
-                    // checkpoint carries the attempt's complete removal
-                    // set, so the record follows it instead of growing:
-                    // a file the agent wrote again after removing it
-                    // supersedes the removal, exactly as the agent's own
-                    // rule says.
                     if let Some(removed) = checkpoint.get("removed_files").and_then(Value::as_array)
                     {
                         let removals: BTreeSet<String> = removed
@@ -1334,12 +1335,10 @@ impl RunState {
 
     /// Makes the attempt's revisions the workspace's latest ones.
     fn apply_workspace_file_pins(&mut self, path: &str, files: &[crate::FilePin]) {
+        let node = NodePath::root(path);
         for pin in files {
             self.latest_file_pins
                 .insert(pin.path.to_string(), pin.sha256.clone());
-        }
-        let node = NodePath::root(path);
-        for pin in files {
             if let Some(removals) = self.removed_files.get_mut(&node) {
                 removals.remove(pin.path.as_str());
             }
@@ -1705,6 +1704,55 @@ mod tests {
             .apply(&json!({"t": "run_canceled", "seq": 5}))
             .expect("cancel should fold");
         assert_eq!(state.pending_seq, None);
+    }
+
+    #[test]
+    fn agent_file_changes_fold_removals_and_later_writes_before_resume() {
+        let mut state = RunState::default();
+        let change = |seq, removed_files: Vec<&str>, written_files: Vec<&str>| {
+            json!({
+                "t": "agent_file_changes", "seq": seq, "ts": "2026-07-05T00:00:00Z",
+                "run_id": "run-1", "trace_id": "trace-1", "span_id": format!("span-{seq}"),
+                "node": "agent", "removed_files": removed_files, "written_files": written_files
+            })
+        };
+        state
+            .apply(&json!({
+                "t": "agent_checkpoint", "seq": 1, "node": "agent",
+                "checkpoint": {"next_turn": 2, "removed_files": []}
+            }))
+            .expect("checkpoint should fold");
+        state
+            .apply(&change(2, vec!["out/note.txt"], vec![]))
+            .expect("removal should fold before another checkpoint");
+        assert_eq!(
+            state.removed_files[&NodePath::root("agent")],
+            BTreeSet::from(["out/note.txt".into()])
+        );
+        assert_eq!(
+            state.checkpoints[&NodePath::root("agent")]["removed_files"],
+            json!([])
+        );
+        state
+            .apply(&change(3, vec![], vec!["out/note.txt"]))
+            .expect("later write should supersede removal");
+        assert!(!state.removed_files.contains_key(&NodePath::root("agent")));
+        assert_eq!(
+            state.checkpoints[&NodePath::root("agent")]["removed_files"],
+            json!([])
+        );
+    }
+
+    #[test]
+    fn agent_file_changes_reject_unsafe_paths() {
+        let error = RunState::default()
+            .apply(&json!({
+                "t": "agent_file_changes", "seq": 1, "ts": "2026-07-05T00:00:00Z",
+                "run_id": "run-1", "trace_id": "trace-1", "span_id": "span-1", "node": "agent",
+                "removed_files": ["../outside"], "written_files": []
+            }))
+            .expect_err("unsafe file-change paths must fail closed");
+        assert!(error.to_string().contains("unsafe agent file-change path"));
     }
 
     #[test]

@@ -22,13 +22,7 @@ pub struct RunEvent {
     pub data: RunEventData,
 }
 
-/// Journal record kinds that are part of the run-event wire vocabulary without
-/// a public payload schema: engine bookkeeping, HITL markers, operation
-/// records, the fork marker, and the observation-stream degradation marker.
-///
-/// They live next to the public registry because the events endpoint streams
-/// them to clients, so this crate owns the run-event vocabulary and both the
-/// engine fold gate and the OpenAPI document read these lists.
+/// Internal streamed journal kinds without public payload schemas; engine folding and OpenAPI share this list.
 pub const INTERNAL_RUN_EVENT_KINDS: &[&str] = &[
     "audit_degraded",
     "budget_charged",

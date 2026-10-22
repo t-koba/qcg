@@ -14,8 +14,9 @@ use super::interaction::{
 };
 use super::llm::{
     AgentCheckpointEventData, AgentCompletedEventData, AgentDelegatedEventData,
-    AgentFailedEventData, AgentHandoffEventData, ContextCompactedEventData, LlmCallEventData,
-    LlmDeltaEventData, LlmRouteFailedEventData, LlmValidationFailedEventData,
+    AgentFailedEventData, AgentFileChangesEventData, AgentHandoffEventData,
+    ContextCompactedEventData, LlmCallEventData, LlmDeltaEventData, LlmRouteFailedEventData,
+    LlmValidationFailedEventData,
 };
 use super::resources::ResourceEventData;
 use super::run::{GraphResolvedEventData, RunStartedEventData};
@@ -31,9 +32,7 @@ macro_rules! run_event_data_registry {
         terminal: [$($terminal:literal),* $(,)?];
         $($kind:literal => $variant:ident : $data:ty),* $(,)?
     ) => {
-        /// Terminal run-event kinds shared by the service live tail, the SSE
-        /// wrapper, and the shared poller, so the three layers can never
-        /// disagree on what ends a stream (E12).
+        /// Terminal kinds shared by the service live tail and pollers (E12).
         pub const TERMINAL_EVENT_KINDS: &[&str] = &[$($terminal),*];
 
         #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -85,9 +84,7 @@ macro_rules! run_event_data_registry {
             matches!(kind, $($kind)|*)
         }
 
-        /// The closed set of kinds this build emits, with the schema each one
-        /// publishes. Single source for the OpenAPI document, the generated
-        /// event reference, and the client type generator.
+        /// The single source of event schemas for OpenAPI, docs, and clients.
         pub fn run_event_data_schemas() -> Vec<(&'static str, String)> {
             vec![$(($kind, <$data as JsonSchema>::schema_name().into_owned())),*]
         }
@@ -116,6 +113,7 @@ run_event_data_registry! {
     "llm_call" => LlmCall: LlmCallEventData,
     "llm_delta" => LlmDelta: LlmDeltaEventData,
     "agent_checkpoint" => AgentCheckpoint: AgentCheckpointEventData,
+    "agent_file_changes" => AgentFileChanges: AgentFileChangesEventData,
     "agent_delegated" => AgentDelegated: AgentDelegatedEventData,
     "agent_completed" => AgentCompleted: AgentCompletedEventData,
     "agent_failed" => AgentFailed: AgentFailedEventData,
