@@ -157,8 +157,11 @@ mod tests {
             json!("  Mixed Case  ")
         );
         assert_eq!(eval_value("sum(inputs.scores)"), json!(6.0));
-        assert_eq!(eval_value("min(inputs.scores)"), json!(1.0));
-        assert_eq!(eval_value("max(inputs.scores)"), json!(3.0));
+        // `min` and `max` return an element of the array, so an integer
+        // array yields an integer; the value compares equal to the float
+        // it would have been before.
+        assert_eq!(eval_value("min(inputs.scores)"), json!(1));
+        assert_eq!(eval_value("max(inputs.scores)"), json!(3));
         assert_eq!(eval_value("min([])"), Value::Null);
     }
 
@@ -332,6 +335,8 @@ mod tests {
             ("inputs.big < inputs.smaller", false),
             ("inputs.big == 9007199254740993", true),
             ("9007199254740993 == 9007199254740992", false),
+            ("-9007199254740993 == -9007199254740992", false),
+            ("-9007199254740993 != -9007199254740992", true),
         ] {
             assert_eq!(
                 bag.eval_bool(Some(&Expr(expr.into())))
@@ -355,6 +360,38 @@ mod tests {
         }
         assert_eq!(eval_value("sort([1])"), json!([1]));
         assert_eq!(eval_value("sort([true])"), json!([true]));
+    }
+
+    #[test]
+    fn min_and_max_choose_an_element_exactly() {
+        // The reduction compares the values as they are, so two distinct
+        // large integers are not rounded into one, and the result is an
+        // element the array holds.
+        assert_eq!(
+            eval_value("max([9007199254740992, 9007199254740993])"),
+            json!(9007199254740993u64)
+        );
+        assert_eq!(
+            eval_value("min([9007199254740993, 9007199254740994])"),
+            json!(9007199254740993u64)
+        );
+        assert_eq!(
+            eval_value("last(sort([9007199254740992, 9007199254740993]))"),
+            json!(9007199254740993u64)
+        );
+    }
+
+    #[test]
+    fn an_integer_literal_the_json_number_cannot_hold_is_refused() {
+        // A literal above the JSON number type's integer range would
+        // arrive as a rounded double, so it is refused rather than stated
+        // approximately.
+        assert!(
+            value_bag()
+                .eval_value("18446744073709551617 == 18446744073709551616")
+                .is_err(),
+            "an out-of-range integer literal should fail"
+        );
     }
 
     #[test]

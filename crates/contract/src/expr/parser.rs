@@ -2,7 +2,7 @@ use serde_json::Value;
 
 use super::bag::ValueBag;
 use super::error::{ExprError, MAX_EXPRESSION_DEPTH, MAX_EXPRESSION_NODES};
-use super::eval::{as_number, evaluate_binary, evaluate_call, number_value, truthy};
+use super::eval::{as_number, evaluate_binary, evaluate_call, exact_integer, number_value, truthy};
 use super::lexer::Token;
 
 #[derive(Debug, Clone)]
@@ -39,7 +39,18 @@ impl ExpressionNode {
                 let value = value.evaluate(bag)?;
                 match *operator {
                     "!" => Ok(Value::Bool(!truthy(&value))),
-                    "-" => number_value(-as_number(&value, "unary -")?),
+                    "-" => {
+                        // Negating an exact integer keeps it exact: the
+                        // double path would round a large literal into a
+                        // different number before any comparison sees it.
+                        if let Value::Number(number) = &value
+                            && let Some(exact) = exact_integer(number)
+                            && let Ok(negated) = i64::try_from(-exact)
+                        {
+                            return Ok(Value::Number(negated.into()));
+                        }
+                        number_value(-as_number(&value, "unary -")?)
+                    }
                     _ => Err(format!("unknown unary operator `{operator}`")),
                 }
             }

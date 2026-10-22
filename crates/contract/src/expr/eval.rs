@@ -30,11 +30,6 @@ pub(crate) fn evaluate_binary(
     }
 }
 
-/// The one expression equality relation, shared by `==`/`!=`, array
-/// `contains`, and `unique` so they can never disagree: numbers compare by
-/// numeric value across integer and float representations, while arrays and
-/// objects compare recursively element by element. Values of distinct types
-/// never compare equal.
 /// Orders two JSON numbers by their exact numeric value.
 ///
 /// Two integers compare as integers, so two distinct large integers never
@@ -42,7 +37,8 @@ pub(crate) fn evaluate_binary(
 /// compare by the float's exact integer value when it has one, which keeps
 /// `3 == 3.0` true. A float without a fractional part is an exact integer
 /// when it fits, so the comparison never loses a distinction the values
-/// carry.
+/// carry. The exactness holds while the value fits the JSON number type: an
+/// integer up to 2^64-1, and a float that denotes one exactly.
 fn compare_numbers(
     left: &serde_json::Number,
     right: &serde_json::Number,
@@ -54,7 +50,7 @@ fn compare_numbers(
 }
 
 /// The exact integer value of a JSON number, when it has one.
-fn exact_integer(number: &serde_json::Number) -> Option<i128> {
+pub(crate) fn exact_integer(number: &serde_json::Number) -> Option<i128> {
     if let Some(value) = number.as_i64() {
         return Some(i128::from(value));
     }
@@ -70,6 +66,10 @@ fn exact_integer(number: &serde_json::Number) -> Option<i128> {
     Some(value as i128)
 }
 
+/// The one expression equality relation, shared by `==`/`!=`, array
+/// `contains`, and `unique` so they can never disagree: numbers compare by
+/// their exact value, while arrays and objects compare recursively element
+/// by element. Values of distinct types never compare equal.
 fn values_equal(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Number(left), Value::Number(right)) => {
@@ -293,23 +293,11 @@ pub(crate) fn evaluate_call(name: &str, arguments: &[Value]) -> Result<Value, St
             _ => Err("sum() requires an array".into()),
         },
         ("min", [value]) => match value {
-            Value::Array(items) => items
-                .iter()
-                .map(|item| as_number(item, "min()"))
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .reduce(f64::min)
-                .map_or(Ok(Value::Null), number_value),
+            Value::Array(items) => extreme(items, "min", std::cmp::Ordering::Less),
             _ => Err("min() requires an array".into()),
         },
         ("max", [value]) => match value {
-            Value::Array(items) => items
-                .iter()
-                .map(|item| as_number(item, "max()"))
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .reduce(f64::max)
-                .map_or(Ok(Value::Null), number_value),
+            Value::Array(items) => extreme(items, "max", std::cmp::Ordering::Greater),
             _ => Err("max() requires an array".into()),
         },
         ("len", _) => Err("len() requires exactly one argument".into()),
@@ -337,6 +325,31 @@ pub(crate) fn evaluate_call(name: &str, arguments: &[Value]) -> Result<Value, St
         ("max", _) => Err("max() requires exactly one array".into()),
         _ => Err(format!("unknown expression function `{name}`")),
     }
+}
+
+/// The smallest or largest element of an array, chosen with the exact
+/// comparison and returned as the element itself.
+///
+/// The elements are compared as the values they are, so two distinct large
+/// integers are not rounded into one, and the result is an element the array
+/// holds rather than a number rebuilt from a double.
+fn extreme(items: &[Value], name: &str, wanted: std::cmp::Ordering) -> Result<Value, String> {
+    let mut selected: Option<&Value> = None;
+    for item in items {
+        let Some(current) = selected else {
+            selected = Some(item);
+            continue;
+        };
+        let Some(ordering) = compare_json_scalar(item, current) else {
+            return Err(format!(
+                "{name}() requires an array of numbers, strings, or booleans"
+            ));
+        };
+        if ordering == wanted {
+            selected = Some(item);
+        }
+    }
+    Ok(selected.cloned().unwrap_or(Value::Null))
 }
 
 fn join_values(value: &Value, separator: &str) -> Result<Value, String> {

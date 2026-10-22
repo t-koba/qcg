@@ -47,11 +47,22 @@ pub(crate) enum Token {
 /// An integer literal keeps its exact value, so a literal above 2^53 is not
 /// rounded into its neighbouring float before any comparison sees it; a
 /// literal with a fraction or an exponent stays a float, as it always was.
+/// An integer literal the JSON number type cannot hold exactly is refused
+/// rather than stated approximately.
 fn parse_number_literal(literal: &str) -> Result<serde_json::Number, ExprError> {
-    if !literal.contains(['.', 'e', 'E'])
-        && let Ok(number) = serde_json::from_str::<serde_json::Number>(literal)
-    {
-        return Ok(number);
+    if !literal.contains(['.', 'e', 'E']) {
+        match serde_json::from_str::<serde_json::Number>(literal) {
+            Ok(number) if number.is_i64() || number.is_u64() => return Ok(number),
+            // The JSON number type holds an integer only up to 2^64-1; a
+            // larger literal would arrive as a rounded double, so it is
+            // refused instead of stated approximately.
+            Ok(_) => {
+                return Err(ExprError::Syntax(format!(
+                    "integer literal `{literal}` is out of range"
+                )));
+            }
+            Err(_) => {}
+        }
     }
     let value = literal
         .parse::<f64>()
