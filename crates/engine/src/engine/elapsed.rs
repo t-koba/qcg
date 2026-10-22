@@ -96,11 +96,8 @@ pub(super) fn remaining(limit: u64, total: u64) -> Result<Duration, EngineError>
         .checked_sub(Duration::from_nanos(total))
         .filter(|duration| !duration.is_zero())
         .ok_or_else(|| {
-            StepError::ElapsedExceeded {
-                node: "run".into(),
-                limit_secs: limit,
-            }
-            .into()
+            // The allowance was exhausted before a step could start (E11).
+            StepError::ElapsedExpiredBeforeStart { limit_secs: limit }.into()
         })
 }
 

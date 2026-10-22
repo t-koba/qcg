@@ -120,7 +120,9 @@ pub(crate) fn tool_call_error(code: ToolCallErrorCode, error: &StepError) -> Too
         StepError::Cancelled => ToolCallErrorCode::Cancelled,
         StepError::BudgetExceeded { .. } => ToolCallErrorCode::BudgetExceeded,
         StepError::TimedOut { .. } => ToolCallErrorCode::TimedOut,
-        StepError::ElapsedExceeded { .. } => ToolCallErrorCode::ElapsedExceeded,
+        StepError::ElapsedExceeded { .. } | StepError::ElapsedExpiredBeforeStart { .. } => {
+            ToolCallErrorCode::ElapsedExceeded
+        }
         _ => code,
     };
     // E09-2: truncation is not redaction. URL secrets and credential

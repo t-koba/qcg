@@ -136,9 +136,10 @@ pub(crate) fn output_name_for(node: &contract::NodeDef) -> &str {
 pub(crate) fn failure_code_for_error(error: &EngineError) -> model::FailureCode {
     match error {
         EngineError::ResumableAgent(error) => failure_code_for_error(error),
-        EngineError::Step(crate::StepError::ElapsedExceeded { .. }) => {
-            model::FailureCode::ElapsedExceeded
-        }
+        EngineError::Step(
+            crate::StepError::ElapsedExceeded { .. }
+            | crate::StepError::ElapsedExpiredBeforeStart { .. },
+        ) => model::FailureCode::ElapsedExceeded,
         EngineError::Step(crate::StepError::TimedOut { .. }) => model::FailureCode::TimedOut,
         EngineError::Step(crate::StepError::BudgetExceeded { .. }) => {
             model::FailureCode::BudgetExceeded

@@ -803,6 +803,9 @@ Unattended limits:
   and the wall-clock it measures starts when the run is enqueued: a run that
   waits behind a backlog can exhaust its budget before it executes a step, so
   size the budget for the queue the deployment actually produces.
+  Such a run reports that the elapsed limit expired before the next step
+  could start, not that a step ran out of time while running; the
+  journal's `step_started` records show the steps that did run.
   `ELAPSED_BUDGET_MODE=active_execution` excludes ordinary waits (see below).
 
 ## Observability

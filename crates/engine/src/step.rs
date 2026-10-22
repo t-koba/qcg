@@ -44,6 +44,11 @@ pub enum StepError {
     /// (E11).
     #[error("step `{node}` exceeded the run elapsed limit of {limit_secs}s")]
     ElapsedExceeded { node: String, limit_secs: u64 },
+    /// The run-wide elapsed budget expired before the next step could start,
+    /// unlike `ElapsedExceeded`, which reports a step stopped while it ran
+    /// (E11).
+    #[error("run elapsed limit of {limit_secs}s expired before the next step could start")]
+    ElapsedExpiredBeforeStart { limit_secs: u64 },
 }
 
 impl StepError {
@@ -339,11 +344,9 @@ pub struct StepContext<'a> {
 
 impl StepContext<'_> {
     /// Node-scoped checkpoint: same shared `checkpoint_scope` as
-    /// `RunContext::run_checkpoint`, with the node id as scope (loop scopes
-    /// use the `"runtime"` sentinel there). The two methods differ only in
-    /// scope naming and error mapping, never in enforcement. Named
-    /// `step_checkpoint` (vs `run_checkpoint`) so the two scopes never share
-    /// one ambiguous `checkpoint` name (E11).
+    /// `RunContext::run_checkpoint`, with the node id as scope. The two
+    /// methods differ only in scope and error mapping, never in enforcement
+    /// (E11).
     pub async fn step_checkpoint(&self, node: &NodeDef) -> Result<(), StepError> {
         tokio::task::yield_now().await;
         // Shared scope check (E11): the monotonic `elapsed_deadline` is
@@ -354,7 +357,7 @@ impl StepContext<'_> {
             self.run
                 .elapsed_deadline
                 .zip(self.run.contract.manifest.budget.max_elapsed_seconds),
-            &node.id,
+            crate::engine::CheckpointScope::Node(&node.id),
         )?;
         let budget = &self.run.contract.manifest.budget;
         let state = self.journal.state();

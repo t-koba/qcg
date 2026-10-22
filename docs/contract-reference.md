@@ -559,6 +559,10 @@ cancel classification, a cooperative cancel normalizes to the fired deadline
 settlement inside the grace is adopted for node timeout but never for the
 hard elapsed deadline, which always reports `ElapsedExceeded` once fired
 (E11). Repair/regenerate cycles keep their own admission semantics.
+The failure code stays `ElapsedExceeded` in every case; the reason states
+which scope fired, so a limit that expired before the next step could
+start is reported as such and never as a step that ran out of time while
+running (E11).
 
 Step-specific fields such as `prompt`, `output_file`, `command`, or `expect`
 must appear under `[flow.params]`. Unknown fields and invalid types are rejected

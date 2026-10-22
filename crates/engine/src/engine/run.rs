@@ -1357,14 +1357,15 @@ impl Engine {
         // the elapsed breach is appended so settlement shows both (E11).
         // Only append when the terminal outcome isn't already determined:
         // a canceled checkpoint never appends an elapsed breach (E11), and
-        // only an `ElapsedExceeded` checkpoint appends (a `Canceled`
+        // only an elapsed checkpoint appends, in either scope (a `Canceled`
         // checkpoint means the run already settled as canceled).
         if !failed.is_empty() {
             match context.run_checkpoint() {
                 Ok(()) => {}
-                Err(EngineError::Step(crate::StepError::ElapsedExceeded {
-                    limit_secs, ..
-                })) => {
+                Err(EngineError::Step(
+                    crate::StepError::ElapsedExceeded { limit_secs, .. }
+                    | crate::StepError::ElapsedExpiredBeforeStart { limit_secs },
+                )) => {
                     failed.push(RunNodeFailureEventData {
                         path: NodePath::root("runtime"),
                         failure: FailureDetail::new(
@@ -1481,7 +1482,12 @@ fn is_budget_exhaustion(error: &EngineError) -> bool {
 }
 
 fn is_elapsed_exhaustion(error: &EngineError) -> bool {
-    matches!(error, EngineError::Step(StepError::ElapsedExceeded { .. }))
+    matches!(
+        error,
+        EngineError::Step(
+            StepError::ElapsedExceeded { .. } | StepError::ElapsedExpiredBeforeStart { .. }
+        )
+    )
 }
 
 fn is_failure_settlement_event(event: &str) -> bool {
@@ -1497,6 +1503,7 @@ fn is_distinct_execution_error(error: &EngineError) -> bool {
         EngineError::Step(
             StepError::TimedOut { .. }
             | StepError::ElapsedExceeded { .. }
+            | StepError::ElapsedExpiredBeforeStart { .. }
             | StepError::BudgetExceeded { .. },
         ) => true,
         _ => is_budget_exhaustion(error),

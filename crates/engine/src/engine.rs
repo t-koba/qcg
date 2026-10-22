@@ -15,7 +15,7 @@ pub(crate) use checkpoint::is_symlink_no_follow;
 pub(crate) use checkpoint::*;
 #[cfg(test)]
 pub(crate) use replay::*;
-pub(crate) use run_context::checkpoint_scope;
+pub(crate) use run_context::{CheckpointScope, checkpoint_scope};
 pub use run_context::{
     GuardDecision, OperationOutcome, bind_command_stdin, http_details_with_url,
     http_operation_details, safe_http_details, salted_binding_digest,

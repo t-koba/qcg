@@ -53,6 +53,23 @@ fn test_contract(root: &Utf8Path, manifest: Manifest) -> Contract {
     }
 }
 
+/// The elapsed classification, whichever scope fired (E11): the run scope
+/// reports that the limit expired before the next step could start, the
+/// node scope names the running step the limit stopped. Which of the two
+/// fires first is a matter of timing on a loaded runner, so a test that
+/// asserts "the elapsed limit fired" accepts both.
+fn is_elapsed_failure(error: &EngineError, limit_secs: u64) -> bool {
+    match error {
+        EngineError::Step(StepError::ElapsedExceeded {
+            limit_secs: limit, ..
+        })
+        | EngineError::Step(StepError::ElapsedExpiredBeforeStart { limit_secs: limit }) => {
+            *limit == limit_secs
+        }
+        _ => false,
+    }
+}
+
 #[test]
 fn budget_tracker_rejects_after_global_limit() {
     let budget = BudgetTracker::new(2, 0);
@@ -2000,7 +2017,7 @@ async fn foreach_child_elapsed_is_not_retried() {
     .await
     .expect_err("elapsed must stop the child");
     assert!(
-        matches!(error, EngineError::Step(StepError::ElapsedExceeded { .. })),
+        is_elapsed_failure(&error, 1),
         "the child must report elapsed, not a retryable failure: {error}"
     );
     let _ = std::fs::remove_dir_all(&run_dir);
@@ -2647,8 +2664,8 @@ async fn elapsed_deadline_stops_a_real_command_process() {
         .await
         .expect_err("a 10s sleep past the 1s elapsed deadline must fail");
     assert!(
-        matches!(error, EngineError::Step(StepError::ElapsedExceeded { .. })),
-        "a real command past the elapsed deadline must classify as ElapsedExceeded: {error}"
+        is_elapsed_failure(&error, 1),
+        "a real command past the elapsed deadline must classify as elapsed: {error}"
     );
     assert!(
         started.elapsed() < std::time::Duration::from_secs(8),
@@ -3423,10 +3440,7 @@ async fn elapsed_budget_is_a_hard_deadline() {
         .await
         .expect_err("the run must stop at the elapsed limit");
     assert!(
-        matches!(
-            error,
-            EngineError::Step(StepError::ElapsedExceeded { limit_secs: 1, .. })
-        ),
+        is_elapsed_failure(&error, 1),
         "elapsed must classify distinctly from node timeout and cancel, got: {error}"
     );
     // The 1s deadline may fire before the first attempt on slow runners
@@ -3504,10 +3518,7 @@ async fn elapsed_node_overrun_settles_and_skips_failure_hooks() {
         .await
         .expect_err("the elapsed node must fail and settle");
     assert!(
-        matches!(
-            error,
-            EngineError::Step(StepError::ElapsedExceeded { limit_secs: 3, .. })
-        ),
+        is_elapsed_failure(&error, 3),
         "the elapsed error must remain the run result: {error}"
     );
     assert_eq!(slow_calls.load(Ordering::SeqCst), 1);
@@ -3530,6 +3541,52 @@ async fn elapsed_node_overrun_settles_and_skips_failure_hooks() {
     assert!(
         journal.contains("\"t\":\"run_finished\"") && journal.contains("\"status\":\"failed\""),
         "the original run failure must settle durably: {journal}"
+    );
+    let _ = std::fs::remove_dir_all(&run_dir);
+}
+
+#[tokio::test]
+async fn elapsed_run_settlement_records_the_run_scope_breach() {
+    // E11: a run stopped by the elapsed deadline settles with the node
+    // failure and the run-scope breach. The run scope reports that the
+    // limit expired before the next step could start, but the settlement
+    // must still record the overrun it shows.
+    let mut manifest = manifest(vec![node("slow", "test.cooperative_wait")]);
+    manifest.budget.max_elapsed_seconds = Some(3);
+    let run_dir = temp_run_dir("elapsed-run-scope-breach");
+    let contract = test_contract(&run_dir, manifest);
+    let mut registry = StepRegistry::new();
+    registry.register(CooperativeWaitStep {
+        calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let error = Engine::new(registry)
+        .run_with_id(
+            "elapsed-run-scope-breach".into(),
+            run_dir.join("meta"),
+            contract,
+            BTreeMap::new(),
+            run_options(run_dir.join("workspace")),
+        )
+        .await
+        .expect_err("the elapsed limit must fail the run");
+    assert!(
+        is_elapsed_failure(&error, 3),
+        "the run must fail as elapsed: {error}"
+    );
+    let events = journal_events(&run_dir);
+    let finished = events
+        .iter()
+        .find(|event| event.get("t").and_then(Value::as_str) == Some("run_finished"))
+        .expect("the failed run must journal run_finished");
+    let failures = finished
+        .get("failures")
+        .and_then(Value::as_array)
+        .expect("the terminal event must carry the failure list");
+    assert!(
+        failures
+            .iter()
+            .any(|failure| failure.get("path").and_then(Value::as_str) == Some("runtime")),
+        "the settlement must record the run-scope breach: {failures:?}"
     );
     let _ = std::fs::remove_dir_all(&run_dir);
 }
@@ -3628,10 +3685,7 @@ async fn elapsed_overrun_in_run_succeeded_hook_does_not_commit_success() {
         .await
         .expect_err("a run_succeeded hook cannot downgrade the hard elapsed limit");
     assert!(
-        matches!(
-            error,
-            EngineError::Step(StepError::ElapsedExceeded { limit_secs: 3, .. })
-        ),
+        is_elapsed_failure(&error, 3),
         "the elapsed error must remain the run result: {error}"
     );
     assert_eq!(
@@ -3678,10 +3732,7 @@ async fn elapsed_deadline_binds_the_final_operation() {
         .await
         .expect_err("the final operation must not outlive the elapsed limit");
     assert!(
-        matches!(
-            error,
-            EngineError::Step(StepError::ElapsedExceeded { limit_secs: 1, .. })
-        ),
+        is_elapsed_failure(&error, 1),
         "the 1s elapsed limit must win over the 10s node bound, got: {error}"
     );
     let _ = std::fs::remove_dir_all(&run_dir);
@@ -3763,10 +3814,7 @@ async fn deadline_precedence_is_deterministic() {
     // Elapsed (1s) fires before the node timeout (10s).
     let error = run_case("deadline-elapsed-first", Some(1), Some(10), None).await;
     assert!(
-        matches!(
-            error,
-            EngineError::Step(StepError::ElapsedExceeded { limit_secs: 1, .. })
-        ),
+        is_elapsed_failure(&error, 1),
         "the elapsed deadline must win over a later node timeout: {error}"
     );
     // Node timeout (1s) fires before the elapsed deadline (10s).
@@ -3873,7 +3921,7 @@ async fn elapsed_deadline_wins_over_retry_backoff() {
         .await
         .expect_err("the elapsed deadline must stop the run");
     assert!(
-        matches!(error, EngineError::Step(StepError::ElapsedExceeded { .. })),
+        is_elapsed_failure(&error, elapsed_limit_secs),
         "the deadline must classify as elapsed, got: {error}"
     );
     let elapsed = started.elapsed();
@@ -3912,10 +3960,7 @@ async fn elapsed_grace_never_returns_success() {
         .await
         .expect_err("a post-deadline success must still be elapsed");
     assert!(
-        matches!(
-            error,
-            EngineError::Step(StepError::ElapsedExceeded { limit_secs: 1, .. })
-        ),
+        is_elapsed_failure(&error, 1),
         "the hard deadline must override a late success: {error}"
     );
     let _ = std::fs::remove_dir_all(&run_dir);
@@ -6156,7 +6201,7 @@ async fn queue_interrupt_resume_keeps_elapsed_budget_end_to_end() {
         .await
         .expect_err("queued 4 s of a 5 s budget must leave ~1 s, so the 2 s finalizer exceeds");
     assert!(
-        matches!(error, EngineError::Step(StepError::ElapsedExceeded { .. })),
+        is_elapsed_failure(&error, 5),
         "resumed budget must bind the finalizer, got: {error}"
     );
     let _ = std::fs::remove_dir_all(&run_dir);
@@ -6792,10 +6837,22 @@ async fn active_elapsed_exhausted_or_crashed_run_starts_no_side_effects() {
             )
             .await
             .unwrap_err();
-        assert!(matches!(
-            error,
-            EngineError::Step(StepError::ElapsedExceeded { .. })
-        ));
+        // The exhausted allowance left no time for a step, so the run
+        // reports that the limit expired before the next step could start
+        // instead of naming a step that ran out of time (E11).
+        assert!(
+            matches!(
+                error,
+                EngineError::Step(StepError::ElapsedExpiredBeforeStart { limit_secs: 1 })
+            ),
+            "an exhausted allowance must report the expiry before a step could start, got: {error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("expired before the next step could start"),
+            "the report must not read as a step that timed out while running: {error}"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         let state = crate::RunState::fold_journal(&meta.join("journal.jsonl")).unwrap();
         let ledger = state.budget.elapsed.unwrap();
