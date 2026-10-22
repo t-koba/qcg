@@ -143,6 +143,11 @@ pub struct ExternalCatalog {
     /// External provider key -> model id -> spec.
     #[serde(default)]
     providers: BTreeMap<String, BTreeMap<String, ModelSpec>>,
+    /// Provider key -> the models whose context tier schedule qcg could
+    /// not use, named by model. The model's flat rates stay in place and
+    /// the message stays visible, so tier pricing is never silently off.
+    #[serde(default)]
+    model_errors: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -153,6 +158,8 @@ struct CachedCatalog {
     fingerprint: Option<String>,
     #[serde(default)]
     providers: BTreeMap<String, BTreeMap<String, ModelSpec>>,
+    #[serde(default)]
+    model_errors: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -398,6 +405,13 @@ impl CatalogService {
                             entry.entry(model).or_insert(spec);
                         }
                     }
+                    for (provider, errors) in catalog.model_errors {
+                        merged
+                            .model_errors
+                            .entry(provider)
+                            .or_default()
+                            .extend(errors);
+                    }
                     statuses.push(CatalogSourceStatus {
                         kind: source.kind_name().to_string(),
                         location: source.location().to_string(),
@@ -565,7 +579,14 @@ impl CatalogService {
                         .or_insert_with(|| model_view(model, "external", &spec.capabilities));
                 }
             }
-            let mut provider_error = None;
+            // A model whose context tier schedule qcg could not use keeps
+            // its flat rates; the error names the model, so a request that
+            // a tier would have priced is never metered silently.
+            let mut errors = external
+                .model_errors
+                .get(catalog_id)
+                .cloned()
+                .unwrap_or_default();
             if spec.models_discovery.is_some() {
                 match self.discover(spec).await {
                     Ok(discovered) => {
@@ -593,7 +614,7 @@ impl CatalogService {
                             models.insert(id, view);
                         }
                     }
-                    Err(error) => provider_error = Some(error),
+                    Err(error) => errors.push(error),
                 }
             }
             providers.push(CatalogProviderView {
@@ -601,7 +622,7 @@ impl CatalogService {
                 label: None,
                 available: provider_available(spec),
                 discovery: spec.models_discovery.is_some(),
-                error: provider_error,
+                error: (!errors.is_empty()).then(|| errors.join("; ")),
                 models: models.into_values().collect(),
             });
         }
@@ -1027,6 +1048,7 @@ fn load_cached_external(config: &CatalogConfig) -> (ExternalCatalog, Option<Stri
                     fetched_at: cached.fetched_at,
                     fingerprint: cached.fingerprint,
                     providers: cached.providers,
+                    model_errors: cached.model_errors,
                 },
                 None,
             )
@@ -1071,6 +1093,7 @@ fn write_cache(config: &CatalogConfig, catalog: &ExternalCatalog) -> Result<(), 
             .clone()
             .or_else(|| Some(config_fingerprint(config))),
         providers: catalog.providers.clone(),
+        model_errors: catalog.model_errors.clone(),
     };
     let bytes = serde_json::to_vec_pretty(&cached)
         .map_err(|error| format!("catalog cache is not serializable: {error}"))?;
@@ -1188,12 +1211,17 @@ struct ModelsDevCostTier {
 /// Maps the source's tiers onto the shared tier type. A tier qcg cannot
 /// read, or a schedule qcg cannot validate, leaves the model's flat rates
 /// in place: qcg prices a request at a rate it read, never at one it
-/// guessed. The provider registry can declare the tiers exactly.
-fn map_models_dev_tiers(tiers: &[Value]) -> Option<Vec<policy::CostTier>> {
+/// guessed. The provider registry can declare the tiers exactly. The
+/// reason the schedule could not be used is returned, so the caller can
+/// report it with the model it belongs to.
+fn map_models_dev_tiers(cost: Option<&ModelsDevCost>) -> Result<Vec<policy::CostTier>, String> {
+    let Some(cost) = cost else {
+        return Ok(Vec::new());
+    };
     let mut mapped = Vec::new();
-    for tier in tiers {
+    for tier in &cost.tiers {
         let Ok(tier) = serde_json::from_value::<ModelsDevCostTier>(tier.clone()) else {
-            return None;
+            return Err("a tier qcg cannot read".to_string());
         };
         mapped.push(policy::CostTier {
             threshold_tokens: tier.threshold_tokens,
@@ -1203,8 +1231,8 @@ fn map_models_dev_tiers(tiers: &[Value]) -> Option<Vec<policy::CostTier>> {
             output_cost_per_million_usd: tier.output,
         });
     }
-    policy::validate_cost_tiers(&mapped).ok()?;
-    Some(mapped)
+    policy::validate_cost_tiers(&mapped).map_err(|error| error.to_string())?;
+    Ok(mapped)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1219,6 +1247,7 @@ pub(crate) fn map_models_dev(text: &str) -> Result<ExternalCatalog, String> {
     let providers: BTreeMap<String, ModelsDevProvider> = serde_json::from_str(text)
         .map_err(|error| format!("models.dev catalog is not valid JSON: {error}"))?;
     let mut mapped = ExternalCatalog::default();
+    let mut model_errors: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (provider_id, provider) in providers {
         let mut models = BTreeMap::new();
         for (model_id, model) in provider.models {
@@ -1250,9 +1279,21 @@ pub(crate) fn map_models_dev(text: &str) -> Result<ExternalCatalog, String> {
                 Vec::new()
             };
             let cost = model.cost.as_ref();
-            let cost_tiers = cost
-                .and_then(|cost| map_models_dev_tiers(&cost.tiers))
-                .unwrap_or_default();
+            // A schedule qcg cannot use leaves the model's flat rates in
+            // place and is reported with the model it belongs to, so tier
+            // pricing is never silently off.
+            let cost_tiers = match map_models_dev_tiers(cost) {
+                Ok(tiers) => tiers,
+                Err(reason) => {
+                    model_errors
+                        .entry(provider_id.clone())
+                        .or_default()
+                        .push(format!(
+                            "model `{model_id}`: its context tier schedule could not be used ({reason}), so its flat rates apply"
+                        ));
+                    Vec::new()
+                }
+            };
             let enabled = match model.status.as_deref() {
                 Some("deprecated") => Some(false),
                 _ => None,
@@ -1277,6 +1318,7 @@ pub(crate) fn map_models_dev(text: &str) -> Result<ExternalCatalog, String> {
         }
         mapped.providers.insert(provider_id, models);
     }
+    mapped.model_errors = model_errors;
     Ok(mapped)
 }
 
@@ -1430,6 +1472,55 @@ mod tests {
         assert!(unreadable.cost_tiers.is_empty());
         assert_eq!(unreadable.input_cost_per_million_usd, Some(1.0));
         assert_eq!(unreadable.output_cost_per_million_usd, Some(2.0));
+        // The dropped schedule is recorded with the model it belongs to,
+        // so tier pricing being off is never silent.
+        let errors = &catalog.model_errors["openai"];
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].contains("model `unreadable`"),
+            "the error names the model: {}",
+            errors[0]
+        );
+        // A model whose schedule qcg could read carries no error.
+        assert!(!catalog.model_errors.contains_key("anthropic"));
+    }
+
+    #[tokio::test]
+    async fn a_dropped_tier_schedule_is_reported_with_its_provider() {
+        use crate::provider::ProvidersFile;
+        let file = ProvidersFile::parse(
+            r#"
+[[provider]]
+id = "openai"
+api = "chat_completions"
+base_url = "https://example.test/v1"
+"#,
+        )
+        .expect("registry must parse");
+        let service = CatalogService::new(file.provider, None).expect("catalog service");
+        {
+            let mut snapshot = service
+                .snapshot
+                .write()
+                .unwrap_or_else(|error| error.into_inner());
+            let mut model_errors = BTreeMap::new();
+            model_errors.insert(
+                "openai".to_string(),
+                vec!["model `gpt-5`: its context tier schedule could not be used (a tier qcg cannot read), so its flat rates apply".to_string()],
+            );
+            snapshot.external.model_errors = model_errors;
+        }
+        let view = service.view(false).await;
+        let provider = view
+            .providers
+            .iter()
+            .find(|provider| provider.id == "openai")
+            .expect("provider view");
+        let error = provider.error.as_deref().expect("the error is visible");
+        assert!(
+            error.contains("model `gpt-5`"),
+            "the error names the model: {error}"
+        );
     }
 
     #[test]
@@ -1836,6 +1927,7 @@ label = "Explicit label"
                 fetched_at: Some(chrono::Utc::now().to_rfc3339()),
                 fingerprint: None,
                 providers,
+                model_errors: BTreeMap::new(),
             };
         }
         service.rebuild_models();

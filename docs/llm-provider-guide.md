@@ -282,9 +282,12 @@ Fields:
   invoices, particularly unless all actual categories have configured rates.
 - `cost_tiers`: optional context tiers, the same shape the contract's
   `model.cost_tiers` uses. A tier names `threshold_tokens` and the rates that
-  price a request whose whole prompt input reaches that threshold. A registry
-  tier list replaces the external catalog's tier list for the same model
-  instead of merging with it, so an operator can state the exact schedule.
+  price a request whose whole prompt input reaches that threshold. A rate the
+  tier does not name inherits the base row's rate for that category, so a
+  cache rate the tier does not name inherits the base row's cache rate. A
+  registry tier list replaces the external catalog's tier list for the same
+  model instead of merging with it, so an operator can state the exact
+  schedule.
 - `context_tokens` / `max_output_tokens`: selection metadata.
 - `enabled`: `false` hides the model from `qcg models` and the catalog API.
 
@@ -322,6 +325,12 @@ non-negative (the manifest rejects it, and the runtime refuses to bill it),
 and an absent cache rate bills at the ordinary input rate. The manifest
 check, the cost meter, the pre-call reservation and the CLI's rate display all
 ask that one definition.
+
+A context tier schedule the source publishes but qcg cannot read leaves the
+model's flat rates in place: qcg prices a request at a rate it read, never at
+one it guessed, and a third-party payload never removes a usable model. The
+dropped schedule is reported with the model it belongs to in the catalog
+view, so tier pricing being off is never silent.
 
 ```toml
 [catalog]
