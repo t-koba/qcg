@@ -574,7 +574,7 @@ async fn a_file_the_agents_command_removed_is_not_reported() {
     let run = run(&harness, BTreeMap::new());
     let journal = journal(&harness);
     let mut vars = contract::ValueBag::with_inputs(BTreeMap::new());
-    let mut ctx = context(&run, &journal, &mut vars, &llm::LlmRuntime::builtins());
+    let ctx = context(&run, &journal, &mut vars, &llm::LlmRuntime::builtins());
     let mut writes = AgentWrites::default();
     // The agent wrote the file, and its command removed it again.
     let target = run.fs.resolve_write("out/note.txt").unwrap();
