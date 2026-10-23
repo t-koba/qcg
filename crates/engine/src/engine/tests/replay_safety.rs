@@ -2,6 +2,37 @@ use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Semaphore;
 
+struct ReplaySafeForeachController;
+
+#[async_trait]
+impl StepExecutor for ReplaySafeForeachController {
+    fn type_id(&self) -> &'static str {
+        "test.foreach"
+    }
+    fn traits(&self) -> crate::StepTraits {
+        crate::StepTraits {
+            parallel_safe: false,
+            control_flow: crate::StepControlFlow::Foreach,
+        }
+    }
+    fn replay_safe_after_interruption(&self) -> bool {
+        true
+    }
+    fn validate(&self, _node: &NodeDef, _contract: &Contract) -> Result<(), StepError> {
+        Ok(())
+    }
+    async fn execute(
+        &self,
+        _ctx: &mut StepContext<'_>,
+        node: &NodeDef,
+    ) -> Result<StepOutcome, StepError> {
+        Err(StepError::failed(
+            &node.id,
+            "foreach control flow must not execute its body",
+        ))
+    }
+}
+
 struct InterruptedIteration {
     entered: Arc<Semaphore>,
     calls: Arc<AtomicUsize>,
@@ -38,7 +69,7 @@ impl StepExecutor for InterruptedIteration {
 }
 
 #[tokio::test]
-async fn foreach_unreported_iteration_blocks_parent_replay() {
+async fn foreach_unreported_iteration_blocks_even_when_parent_is_replay_safe() {
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
         foreach_unreported_iteration(),
@@ -59,7 +90,7 @@ async fn foreach_unreported_iteration() {
     let contract = test_contract(&dir, manifest);
     let calls = Arc::new(AtomicUsize::new(0));
     let mut registry = StepRegistry::new();
-    registry.register(TestForeachStep);
+    registry.register(ReplaySafeForeachController);
     registry.register(InterruptedIteration {
         entered: Arc::new(Semaphore::new(0)),
         calls: calls.clone(),
@@ -100,9 +131,19 @@ async fn foreach_unreported_iteration() {
         error.to_string().contains("unreported task `each[1]`"),
         "{error}"
     );
+    assert!(
+        error.to_string().contains("not attributable to this owner"),
+        "{error}"
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let events = journal_events(&dir);
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["t"] == "parallel_replay_authorized")
+    );
     assert_eq!(
-        journal_events(&dir)
+        events
             .iter()
             .filter(|e| e["t"] == "step_started" && e["node"] == "each")
             .count(),

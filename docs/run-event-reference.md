@@ -21,8 +21,11 @@ inventing a failed step. Resume first
 surfaces their saved interactions, then refuses to re-enter an unresolved owner
 unless its `StepExecutor` explicitly declares guarded replay. That admission emits
 `parallel_replay_authorized` with the executor, capability, owner, and original
-fact sequence; parallel safety alone does not authorize replay. These facts do
-not choose failure precedence or change fail-fast settlement.
+fact sequence; parallel safety alone does not authorize replay. An unresolved
+foreach iteration is currently refused: its drain fact names the parent and
+iteration, not the child executor whose effects are unknown, so the parent's
+capability cannot authorize it. These facts do not choose failure precedence or
+change fail-fast settlement.
 
 Direct `mcp.call` cleanup failures emit a durable `mcp_cleanup_settled` record
 before settlement, alongside the observation-only `tool_call`. Both retain the

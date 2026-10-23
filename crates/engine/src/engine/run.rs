@@ -738,15 +738,18 @@ impl Engine {
                 _ => {}
             }
         }
-        // Preflight every unresolved owner before replay or hooks.
+        // Only direct node owners are authorizable; foreach facts identify the parent, not its child.
         let mut authorized = Vec::new();
         for (owner, fact) in &replay.state.unresolved_tasks {
-            let node = fact["node"].as_str().and_then(|id| context.contract.graph.nodes.get(id));
+            let node = fact["node"]
+                .as_str()
+                .filter(|id| *id == owner.as_str())
+                .and_then(|id| context.contract.graph.nodes.get(id));
             let executor = node.and_then(|node| self.registry.get(&node.kind));
             if !executor.as_ref().is_some_and(|executor| executor.replay_safe_after_interruption()) {
                 return Err(StepError::Refused {
                     node: owner.clone(),
-                    message: format!("unreported task `{owner}` has unknown effects; guarded replay is not declared"),
+                    message: format!("unreported task `{owner}` has unknown effects; guarded replay is not attributable to this owner"),
                 }.into());
             }
             authorized.push((owner, fact, executor.unwrap()));
