@@ -45,6 +45,9 @@ the saved facts. Reuse retains spending and verified file evidence and grants no
 retry or continuation authority. Reports from retries in the current execution
 are not mistaken for saved resume results. State schema 7 requires this report
 map; older/incomplete state sidecars fail closed rather than defaulting it away.
+Legacy/incomplete terminal facts without a reusable `result` (and without a
+resumable interaction reference) are retained but fail closed as unresolved
+rather than re-executing the child.
 
 Explicit continuation rule: a generic `StepError` from any node kind,
 including `llm.agent`, settles as an ordinary failure and never synthesizes a

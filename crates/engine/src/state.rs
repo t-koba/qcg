@@ -866,6 +866,34 @@ impl RunState {
                         fact.as_object_mut().expect("journal object").remove(key);
                     }
                     self.foreach_reports.insert(owner.to_string(), fact);
+                    // Legacy rows predate `result`: a non-interaction terminal
+                    // without a reusable result must not re-execute. Retain the
+                    // fact but refuse guarded replay like an unreported owner.
+                    let incomplete = match class {
+                        "completed_terminal" => {
+                            if event.get("result").is_some() {
+                                false
+                            } else {
+                                match event.get("outcome").and_then(serde_json::Value::as_str) {
+                                    Some("needs_user") => event
+                                        .get("question_id")
+                                        .and_then(serde_json::Value::as_str)
+                                        .is_none(),
+                                    Some("needs_confirm") => event
+                                        .get("confirm_id")
+                                        .and_then(serde_json::Value::as_str)
+                                        .is_none(),
+                                    _ => true,
+                                }
+                            }
+                        }
+                        "task_error" => event.get("result").is_none(),
+                        _ => false,
+                    };
+                    if incomplete {
+                        self.unresolved_tasks
+                            .insert(owner.to_string(), event.clone());
+                    }
                 }
                 if unreported {
                     let owner = if kind != "parallel_task_joined" {

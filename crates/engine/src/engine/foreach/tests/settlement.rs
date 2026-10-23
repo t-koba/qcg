@@ -333,3 +333,110 @@ async fn mixed_case(
 async fn answered_nested_owner_reenters_without_repeating_the_completed_check() {
     mixed_case(false, 0, 1, true).await;
 }
+
+struct LegacyCountingChild {
+    calls: std::sync::Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl StepExecutor for LegacyCountingChild {
+    fn type_id(&self) -> &'static str {
+        "test.legacy_child"
+    }
+    crate::parallel_step_traits!();
+    async fn execute(
+        &self,
+        _ctx: &mut StepContext<'_>,
+        _node: &NodeDef,
+    ) -> Result<StepOutcome, StepError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(StepOutcome::success(None))
+    }
+}
+
+// Legacy rows predate `result`: check/error facts without a reusable result
+// must refuse guarded replay instead of re-executing the child, while a
+// resumable interaction reference stays replayable.
+#[tokio::test]
+async fn legacy_terminal_facts_without_result_refuse_replay() {
+    let dir = temp_run_dir("legacy-foreach-replay");
+    let _cleanup = TempCleanup(dir.clone());
+    let workspace = dir.join("workspace");
+    let metadata = dir.join("meta");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&metadata).unwrap();
+    let parent = foreach_node("each", "body", "inputs.items", 2, 10);
+    let child = node("child", "test.legacy_child");
+    let mut manifest = manifest(vec![parent.clone()]);
+    manifest.inputs = foreach_items_input();
+    manifest.blocks.insert("body".into(), vec![child]);
+    let contract = test_contract(&dir, manifest);
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let mut registry = StepRegistry::new();
+    registry.register(TestForeachStep);
+    registry.register(LegacyCountingChild {
+        calls: calls.clone(),
+    });
+    let engine = Engine::new(registry);
+    let journal =
+        JournalWriter::create(&metadata.join("journal.jsonl"), "legacy", false, None).unwrap();
+    let inputs = BTreeMap::from([("items".into(), json!(["a", "b", "c"]))]);
+    journal
+        .event(
+            "run_started",
+            json!({ "generator": "scheduler-test@0.1.0", "generator_path": contract.root, "contract_sha256": contract.sha256, "inputs": inputs, "resource_hashes": [], "schema_version": api::JOURNAL_SCHEMA_VERSION, "elapsed_budget_mode": "wall_clock", "retention_days": contract.manifest.retention.days }),
+        )
+        .unwrap();
+    journal
+        .event(
+            "step_started",
+            json!({"node": "each", "type": "test.foreach", "attempt": 1}),
+        )
+        .unwrap();
+    // Legacy drained check fact: no `result`, only the old outcome marker.
+    journal
+        .event(
+            "foreach_sibling_drained",
+            json!({"node": "each", "index": 0, "iteration": "each[0]", "drain_cause": "fail_fast", "classification": "completed_terminal", "outcome": "check_failed"}),
+        )
+        .unwrap();
+    // Malformed settled error fact: new kind, still no reusable `result`.
+    journal
+        .event(
+            "foreach_iteration_settled",
+            json!({"node": "each", "index": 1, "iteration": "each[1]", "drain_cause": "fail_fast", "classification": "task_error", "code": "execution_failed", "detail": "boom"}),
+        )
+        .unwrap();
+    // Legacy resumable interaction: no `result` by design, must stay usable.
+    journal
+        .event(
+            "foreach_sibling_drained",
+            json!({"node": "each", "index": 2, "iteration": "each[2]", "drain_cause": "fail_fast", "classification": "completed_terminal", "outcome": "needs_user", "question_id": "q-1"}),
+        )
+        .unwrap();
+    let state = RunState::fold_journal(&metadata.join("journal.jsonl")).unwrap();
+    assert_eq!(state.foreach_reports.len(), 3);
+    assert_eq!(state.unresolved_tasks.len(), 2);
+    assert!(state.unresolved_tasks.contains_key("each[0]"));
+    assert!(state.unresolved_tasks.contains_key("each[1]"));
+    assert!(!state.unresolved_tasks.contains_key("each[2]"));
+    let error = engine
+        .run_with_id(
+            "legacy".into(),
+            metadata,
+            contract,
+            inputs,
+            run_options(workspace),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("unreported task `each["),
+        "legacy terminal must refuse replay, got: {error}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "refused legacy terminal must not re-execute the child"
+    );
+}
