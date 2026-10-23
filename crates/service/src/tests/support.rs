@@ -547,3 +547,40 @@ pub(crate) fn pin_test_package(source: &Utf8Path, run_dir: &Utf8Path) -> String 
     crate::run_package::copy(source, run_dir, &sha).expect("pin test package");
     sha
 }
+
+// One-shot, path-scoped rendezvous at the suspension publication boundary.
+type SuspensionGate = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+static SUSPENSION_GATES: std::sync::LazyLock<Mutex<BTreeMap<Utf8PathBuf, SuspensionGate>>> =
+    std::sync::LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+pub(crate) fn gate_suspension_commit(
+    runs: Utf8PathBuf,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (reached, observed) = tokio::sync::oneshot::channel();
+    let (release, resume) = tokio::sync::oneshot::channel();
+    assert!(
+        SUSPENSION_GATES
+            .lock()
+            .unwrap()
+            .insert(runs, (reached, resume))
+            .is_none()
+    );
+    (observed, release)
+}
+
+pub(crate) async fn pause_suspension_commit(run_dir: &Utf8Path) {
+    let gate = SUSPENSION_GATES
+        .lock()
+        .unwrap()
+        .remove(run_dir.parent().unwrap());
+    if let Some((reached, resume)) = gate {
+        let _ = reached.send(());
+        let _ = resume.await;
+    }
+}

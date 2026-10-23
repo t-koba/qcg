@@ -924,6 +924,12 @@ with its recorded sequence, not a newly generated confirmation request. Merely
 observing a saved prompt through the engine neither dispatches its executor nor
 appends a request or resume event. Recorded answers remain intact.
 
+Suspension publication and its local waiting-state commit serialize with answer
+and confirmation acceptance. An answer accepted during suspension wins over the
+old waiting transition; a peer-accepted answer also prevents a late `run_waiting`
+append. The next engine pass consumes the recorded response under the execution
+lease, rather than leaving an answered run parked or granting replay permission.
+
 Folded-state schema 6 retains these per-owner sequences. Older caches are rebuilt
 from existing journal events, including the latest request generation an older
 runtime actually recorded. A missing sequence is never synthesized: projecting a

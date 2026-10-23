@@ -3227,3 +3227,99 @@ async fn saved_confirmation_survivor_is_answerable_at_its_original_generation() 
         assert!(!journal.contains("\"t\":\"step_started\""));
     }
 }
+
+#[tokio::test]
+async fn suspension_publication_cannot_overwrite_an_accepted_answer() {
+    // Freeze precisely after observing the unanswered durable prompt. This
+    // used to leave both the append and the memory commit open to an answer.
+    for peer_answer in [false, true] {
+        let root = temp_run_dir("suspension-answer-commit");
+        let runs = root.join("runs");
+        let generators =
+            Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+        let service = test_service(vec![generators], runs.clone());
+        let (reached, release) = gate_suspension_commit(runs.clone());
+        let id = service
+            .start_run(StartRun {
+                generator_id: "ask-user".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(60), reached)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            service.inner.runs.try_write().is_err(),
+            "suspension must serialize with local acceptance through its memory commit"
+        );
+        let run_dir = runs.join(&id);
+        let journal_path = run_meta_dir(&run_dir).join("journal.jsonl");
+        let state = engine::RunState::fold_journal(&journal_path).unwrap();
+        let engine::Interaction::Question { question } = state.pending.unwrap() else {
+            panic!("question expected")
+        };
+        let generation = state.pending_seq.unwrap();
+        if peer_answer {
+            // A different process does not share our map lock. Its acceptance
+            // wins under the journal lock, without changing the generation.
+            engine::JournalWriter::append_single_event_if(
+                &journal_path,
+                &id,
+                "user_answered",
+                json!({"question_id": question.id, "values": {"answer": "brief"}}),
+                engine::JournalLimits::default(),
+                None,
+                |state| {
+                    assert_eq!(state.pending_seq, Some(generation));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            release.send(()).unwrap();
+        } else {
+            let answering_service = service.clone();
+            let answering_id = id.clone();
+            let answer = tokio::spawn(async move {
+                answering_service
+                    .answer(
+                        answering_id,
+                        question.id,
+                        AnswerPayload {
+                            values: BTreeMap::from([("answer".into(), json!("brief"))]),
+                        },
+                    )
+                    .await
+            });
+            release.send(()).unwrap();
+            answer.await.unwrap().unwrap();
+        }
+        assert_eq!(
+            wait_for_terminal_snapshot(&service, &id).await.state,
+            RunStatus::Succeeded
+        );
+        let events = read_events_from_meta(&run_meta_dir(&run_dir)).unwrap();
+        let answered = events
+            .iter()
+            .position(|e| e["t"] == "user_answered")
+            .unwrap();
+        assert!(
+            !events[answered + 1..]
+                .iter()
+                .any(|e| e["t"] == "run_waiting"),
+            "an answered generation must never be republished"
+        );
+        assert_eq!(
+            events.iter().filter(|e| e["t"] == "user_answered").count(),
+            1
+        );
+        assert_eq!(
+            std::fs::read_to_string(run_workspace_dir(&run_dir).join("answer.txt")).unwrap(),
+            "mode=brief"
+        );
+        drop(service);
+        wait_for_runs_store_release(&runs).await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

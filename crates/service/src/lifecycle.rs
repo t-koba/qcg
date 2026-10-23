@@ -2008,64 +2008,89 @@ impl LocalService {
         })
     }
 
-    /// Re-drives a suspending run whose prompt was already answered (or
-    /// decided) in the journal. Returns true when it requeued, meaning the
-    /// caller must not publish the suspension. An answer that lands between
-    /// the engine's initial fold and its suspension would otherwise park
-    /// the run on a satisfied prompt with no driver (E03).
-    async fn suspend_lost_to_an_answer(
-        &self,
-        run_id: &str,
-        run_dir: &Utf8Path,
-        question: &api::FormSpec,
-    ) -> bool {
-        // An unreadable journal fails closed toward suspension: without
-        // evidence of an answer the run parks as waiting instead of
-        // requeueing on a guess (E03).
-        let answered = match self.authoritative_state(run_dir).await {
-            Ok(state) => state.answers.contains_key(&question.id),
-            Err(error) => {
-                tracing::warn!(run_id = %run_id, %error, "suspend race check failed; keeping suspension");
-                return false;
-            }
+    /// Publish suspension under the same map lock as answer/confirm acceptance.
+    /// Otherwise an accepted answer can requeue between the journal append and
+    /// the memory commit, then be overwritten by a stale Waiting transition.
+    async fn finish_suspension(&self, run_id: &str, interaction: &Interaction) -> bool {
+        let mut runs = self.inner.runs.write().await;
+        let Some(record) = runs.get_mut(run_id) else {
+            return true;
         };
-        if !answered {
+        if matches!(
+            record.state,
+            RunStatus::Canceled | RunStatus::CancelRequested
+        ) {
             return false;
         }
-        self.requeue_answered_suspension(run_id, run_dir).await
-    }
-
-    /// Confirmation half of [`Self::suspend_lost_to_an_answer`] (E03).
-    async fn suspend_lost_to_a_decision(
-        &self,
-        run_id: &str,
-        run_dir: &Utf8Path,
-        confirm: &api::ConfirmSpec,
-    ) -> bool {
-        let decided = match self.authoritative_state(run_dir).await {
-            Ok(state) => state.confirmations.contains_key(&confirm.id),
+        if record.state.is_terminal() {
+            return true;
+        }
+        let answered = match self.authoritative_state(&record.run_dir).await {
+            Ok(state) => match interaction {
+                Interaction::Question { question } => state.answers.contains_key(&question.id),
+                Interaction::Confirmation { confirm } => {
+                    state.confirmations.contains_key(&confirm.id)
+                }
+            },
             Err(error) => {
-                tracing::warn!(run_id = %run_id, %error, "suspend race check failed; keeping suspension");
-                return false;
+                // No evidence to requeue: preserve the suspension. A question's
+                // conditional append below rechecks under the journal lock.
+                tracing::warn!(%run_id, %error, "suspend race check failed; keeping suspension");
+                false
             }
         };
-        if !decided {
-            return false;
+        let publication = if answered {
+            Ok(())
+        } else {
+            #[cfg(test)]
+            crate::tests::support::pause_suspension_commit(&record.run_dir).await;
+            match interaction {
+                Interaction::Question { question } => crate::run_dirs::write_run_event_if(
+                    record,
+                    "run_waiting",
+                    json!({"question_id": question.id, "question": question}),
+                    |state| {
+                        if state.answers.contains_key(&question.id) {
+                            Err(engine::JournalError::PreconditionFailed(
+                                "question already answered".into(),
+                            ))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                ),
+                // The engine already journaled the confirmation and its pins.
+                Interaction::Confirmation { .. } => Ok(()),
+            }
+        };
+        if answered || matches!(publication, Err(ServiceError::PreconditionFailed(_))) {
+            let run_dir = record.run_dir.clone();
+            drop(runs);
+            self.requeue_answered_suspension(run_id, &run_dir).await;
+        } else if let Err(error) = publication {
+            tracing::error!(%run_id, %error, "suspension publication failed; memory stays unadvanced");
+        } else {
+            (record.state, record.question, record.confirm) = match interaction {
+                Interaction::Question { question } => {
+                    (RunStatus::Waiting, Some(question.clone()), None)
+                }
+                Interaction::Confirmation { confirm } => {
+                    (RunStatus::Confirming, None, Some(confirm.clone()))
+                }
+            };
+            record.artifacts = None;
+            self.inner.queue_notify.notify_waiters();
         }
-        self.requeue_answered_suspension(run_id, run_dir).await
+        true
     }
 
     /// Merges durable HITL maps into memory, requeues the run, and spawns
     /// a fresh engine pass that consumes the early answer. No suspension
     /// event is journaled: the prompt was never published as waiting.
-    /// Takes an owned service clone: this runs inside spawned engine
-    /// tasks, so borrowing `&self` across the awaits would demand `Sync`
-    /// instead of just `Send` (E03). Returns whether the requeue happened;
-    /// a failure leaves the suspension path to the caller instead of
-    /// reporting a parked run as requeued (E03).
+    /// Returns whether requeue succeeded; observation failure never invents
+    /// an answer or authorizes another execution (E03).
     async fn requeue_answered_suspension(&self, run_id: &str, run_dir: &Utf8Path) -> bool {
-        let service = self.clone();
-        if service.is_shutting_down() {
+        if self.is_shutting_down() {
             return false;
         }
         let (answers, confirmations) = match self.authoritative_state(run_dir).await {
@@ -2122,8 +2147,8 @@ impl LocalService {
         // up. The detached spawn waits out the holder's exit, then drives
         // (E03). Queue waiters are notified for the resumer backstop
         // either way.
-        tokio::spawn(service.clone().spawn_engine_run(request));
-        service.inner.queue_notify.notify_waiters();
+        tokio::spawn(self.clone().spawn_engine_run(request));
+        self.inner.queue_notify.notify_waiters();
         true
     }
 
@@ -2156,36 +2181,11 @@ impl LocalService {
                     transition.state = Some(RunStatus::Succeeded);
                     transition.artifacts = Some(outputs.clone());
                 }
-                Progress::Suspended(Interaction::Question { question }) => {
-                    // An answer may have landed (early accept) between the
-                    // engine's initial fold and this suspension: suspending
-                    // anyway would park the run on an already-answered
-                    // prompt. Requeue instead so the answer is consumed on
-                    // the next pass (E03).
-                    if self
-                        .suspend_lost_to_an_answer(&run_id, &record.run_dir, question)
-                        .await
-                    {
+                Progress::Suspended(interaction) => {
+                    if self.finish_suspension(&run_id, interaction).await {
                         return;
                     }
-                    transition.state = Some(RunStatus::Waiting);
-                    transition.question = Some(question.clone());
-                    transition.writes.push((
-                        "run_waiting",
-                        json!({ "question_id": question.id, "question": question }),
-                    ));
-                }
-                Progress::Suspended(Interaction::Confirmation { confirm }) => {
-                    // Same race as questions, for confirmations (E03).
-                    if self
-                        .suspend_lost_to_a_decision(&run_id, &record.run_dir, confirm)
-                        .await
-                    {
-                        return;
-                    }
-                    // The engine's confirmation event already carries its file pins.
-                    transition.state = Some(RunStatus::Confirming);
-                    transition.confirm = Some(confirm.clone());
+                    continue;
                 }
                 Progress::Failed(error) => {
                     let terminal = match self.authoritative_state(&record.run_dir).await {
