@@ -2437,8 +2437,8 @@ fn agent_failed_event_emits_typed_exhaustion_counts() {
 #[test]
 fn agent_iteration_exhaustion_is_a_typed_fact_not_a_message_substring() {
     // Pure max-iteration exhaustion carries resource/used/allowed as typed
-    // fields and classifies without the message-substring match the
-    // specialist path still relies on.
+    // fields and classifies without the message-substring match kept only
+    // for previously persisted untyped failures.
     let error = StepError::AgentIterationsExhausted {
         node: "agent".into(),
         message: "llm.agent reached max_iterations 3".into(),

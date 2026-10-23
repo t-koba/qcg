@@ -268,24 +268,19 @@ pub(crate) async fn execute_specialist_agent(
             return Err(error);
         }
         if let Some(state) = provider_state {
-            let items = match state.as_array().cloned() {
-                Some(items) => items,
-                None => {
-                    let error = StepError::failed(
-                        &node.id,
-                        "Responses API provider state must be an array",
-                    );
-                    record_tool_call_failures(
-                        ctx,
-                        node,
-                        &tool_calls,
-                        &error,
-                        Some(agent_name),
-                        ToolCallPhase::InputValidation,
-                        ToolCallErrorCode::InvalidArguments,
-                    )?;
-                    return Err(error);
-                }
+            let Some(items) = state.as_array().cloned() else {
+                let error =
+                    StepError::failed(&node.id, "Responses API provider state must be an array");
+                record_tool_call_failures(
+                    ctx,
+                    node,
+                    &tool_calls,
+                    &error,
+                    Some(agent_name),
+                    ToolCallPhase::InputValidation,
+                    ToolCallErrorCode::InvalidArguments,
+                )?;
+                return Err(error);
             };
             messages.push(ChatMessage::provider_state(items));
         } else {
@@ -599,17 +594,21 @@ pub(crate) async fn execute_specialist_agent(
         }
         enforce_agent_transcript_limit(ctx, node, &mut messages, Some(specialist_request))?;
     }
-    let message = last_validation_error.map_or_else(
-        || {
-            format!(
-                "specialist `{agent_name}` iteration budget exceeded: {max_iterations} turns"
-            )
-        },
+    let validation = last_validation_error;
+    let message = validation.as_ref().map_or_else(
+        || format!("specialist `{agent_name}` iteration budget exceeded: {max_iterations} turns"),
         |error| {
             format!(
                 "specialist `{agent_name}` failed final response validation after {max_iterations} iterations: {error}"
             )
         },
     );
-    Err(StepError::failed(&node.id, message))
+    Err(StepError::AgentIterationsExhausted {
+        node: node.id.clone(),
+        message,
+        resource: "iterations",
+        used: max_iterations as u64,
+        allowed: max_iterations as u64,
+        validation,
+    })
 }

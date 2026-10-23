@@ -695,6 +695,87 @@ async fn final_validation_at_the_iteration_boundary_keeps_both_facts() {
 }
 
 #[tokio::test]
+async fn specialist_iteration_exhaustion_keeps_validation_and_typed_facts() {
+    let harness = ApprovalHarness::setup("specialist-iteration-exhaustion");
+    let run = run(&harness, BTreeMap::new());
+    std::fs::write(
+        harness.root.join("prompt.md"),
+        "FAKE_TOOL: {\"name\":\"researcher\",\"args\":{\"question\":\"Research this.\"}}\n",
+    )
+    .unwrap();
+    // Fake's JSON markers only read user messages, not specialist instructions.
+    // Its schema default scripts the nested invalid final response instead.
+    std::fs::write(
+        harness.root.join("specialist.schema.json"),
+        json!({"type": "object", "properties": {"answer": {"type": "string"}},
+            "required": ["answer"], "default": {}})
+        .to_string(),
+    )
+    .unwrap();
+    let mut node = ApprovalHarness::node();
+    node.params = serde_json::from_value(json!({
+        "prompt": "prompt.md", "max_iterations": 1, "max_tokens_total": 10000,
+        "model": {"provider": "fake", "model": "test"},
+        "tools": [{
+            "kind": "agent", "name": "researcher", "instructions": "Research the question.",
+            "output_schema": "specialist.schema.json",
+            "tools": [], "max_calls": 1, "max_iterations": 1,
+            "max_tokens_total": 10000, "max_tool_calls_total": 1,
+            "on_failure": {"default": "fail"}
+        }]
+    }))
+    .unwrap();
+    let journal = journal(&harness);
+    let runtime = Arc::new(test_runtime());
+    let mut vars = contract::ValueBag::with_inputs(BTreeMap::new());
+    let mut ctx = context(&run, &journal, &mut vars, &runtime);
+    let error = LlmAgentStep {
+        runtime: runtime.clone(),
+    }
+    .execute(&mut ctx, &node)
+    .await
+    .unwrap_err();
+    let StepError::AgentIterationsExhausted {
+        resource: "iterations",
+        used: 1,
+        allowed: 1,
+        validation: Some(validation),
+        ..
+    } = &error
+    else {
+        panic!("expected delegated iteration and validation facts: {error:?}")
+    };
+    assert!(validation.contains("answer"), "{validation}");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "step `agent` failed: specialist `researcher` failed final response validation after 1 iterations: {validation}"
+        )
+    );
+    let audit = std::fs::read_to_string(harness.root.join("meta/audit.jsonl")).unwrap();
+    let events: Vec<Value> = audit
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let failures: Vec<_> = events
+        .iter()
+        .filter(|event| event["t"] == "agent_failed")
+        .collect();
+    assert_eq!(failures.len(), 1, "{events:?}");
+    assert_eq!(failures[0]["agent"], "researcher");
+    assert_eq!(failures[0]["tool_call_id"], "fake-tool-1");
+    assert_eq!(failures[0]["code"], "validation_failed");
+    assert_eq!(failures[0]["action"], "fail");
+    assert_eq!(failures[0]["message"], error.to_string());
+    assert_eq!(
+        failures[0]["resource_exhaustion"],
+        json!({
+            "resource": "iterations", "used": 1, "allowed": 1
+        })
+    );
+}
+
+#[tokio::test]
 async fn specialist_token_exhaustion_keeps_typed_facts_through_failure_policy() {
     let harness = ApprovalHarness::setup("specialist-token-exhaustion");
     let run = run(&harness, BTreeMap::new());
