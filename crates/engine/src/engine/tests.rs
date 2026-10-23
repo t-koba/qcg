@@ -4911,48 +4911,81 @@ async fn lifecycle_hooks_execute_once_and_replay_across_resume() {
 
 #[tokio::test]
 async fn ordinary_execution_errors_reach_failure_hooks() {
-    // F07-01: an ordinary step Err (not a CheckFailed outcome) must
-    // still run step_failed/run_failed hooks exactly once each.
-    let run_dir = temp_run_dir("hooks-ordinary-err");
-    let _ = std::fs::remove_dir_all(&run_dir);
-    let mut manifest = manifest(vec![node("broken", "test.parallel_fail")]);
-    manifest
-        .hooks
-        .step_failed
-        .push(hook("report", "test.pass", HookErrorPolicy::Warn));
-    manifest
-        .hooks
-        .run_failed
-        .push(hook("notify", "test.pass", HookErrorPolicy::Warn));
-    let graph = Graph::build(&manifest).expect("test graph should build");
-    let contract = Contract {
-        root: run_dir.clone(),
-        manifest,
-        graph,
-        sha256: "hooks-ordinary-err".into(),
-    };
-    Engine::new(test_registry())
-        .run_with_id(
-            "hooks-ordinary-err".into(),
-            run_dir.join("meta"),
-            contract,
-            BTreeMap::new(),
-            run_options(run_dir.join("workspace")),
-        )
-        .await
-        .expect_err("the broken node must still fail the run");
-    let journal =
-        std::fs::read_to_string(run_dir.join("meta/journal.jsonl")).expect("journal reads");
-    assert_eq!(
-        journal.matches("\"t\":\"step_started\"").count(),
-        3,
-        "broken node + step_failed hook + run_failed hook must each start once: {journal}"
-    );
-    assert!(
-        journal.contains("\"status\":\"failed\""),
-        "the failure must settle durably: {journal}"
-    );
-    let _ = std::fs::remove_dir_all(&run_dir);
+    struct IterationExhausted {
+        validation: bool,
+    }
+    #[async_trait]
+    impl StepExecutor for IterationExhausted {
+        crate::step_type_id!("test.iteration_exhausted");
+        async fn execute(
+            &self,
+            _ctx: &mut StepContext<'_>,
+            node: &NodeDef,
+        ) -> Result<StepOutcome, StepError> {
+            Err(StepError::AgentIterationsExhausted {
+                node: node.id.clone(),
+                message: "iteration boundary".into(),
+                resource: "iterations",
+                used: 3,
+                allowed: 3,
+                validation: self.validation.then(|| "invalid final response".into()),
+            })
+        }
+    }
+    for (kind, validation) in [
+        ("test.parallel_fail", false),
+        ("test.iteration_exhausted", false),
+        ("test.iteration_exhausted", true),
+    ] {
+        // F07-01: an ordinary step Err (not a CheckFailed outcome) must
+        // still run step_failed/run_failed hooks exactly once each.
+        let run_dir = temp_run_dir("hooks-ordinary-err");
+        let _ = std::fs::remove_dir_all(&run_dir);
+        let mut manifest = manifest(vec![node("broken", kind)]);
+        manifest
+            .hooks
+            .step_failed
+            .push(hook("report", "test.pass", HookErrorPolicy::Warn));
+        manifest
+            .hooks
+            .run_failed
+            .push(hook("notify", "test.pass", HookErrorPolicy::Warn));
+        let graph = Graph::build(&manifest).expect("test graph should build");
+        let contract = Contract {
+            root: run_dir.clone(),
+            manifest,
+            graph,
+            sha256: "hooks-ordinary-err".into(),
+        };
+        let mut registry = test_registry();
+        registry.register(IterationExhausted { validation });
+        let error = Engine::new(registry)
+            .run_with_id(
+                "hooks-ordinary-err".into(),
+                run_dir.join("meta"),
+                contract,
+                BTreeMap::new(),
+                run_options(run_dir.join("workspace")),
+            )
+            .await
+            .expect_err("the broken node must still fail the run");
+        assert!(
+            matches!(error, EngineError::Failed(_)),
+            "generic failure settlement: {error:?}"
+        );
+        let journal =
+            std::fs::read_to_string(run_dir.join("meta/journal.jsonl")).expect("journal reads");
+        assert_eq!(
+            journal.matches("\"t\":\"step_started\"").count(),
+            3,
+            "broken node + step_failed hook + run_failed hook must each start once: {journal}"
+        );
+        assert!(
+            journal.contains("\"status\":\"failed\""),
+            "the failure must settle durably: {journal}"
+        );
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
 }
 
 #[tokio::test]

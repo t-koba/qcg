@@ -2293,3 +2293,109 @@ fn a_model_without_the_capability_is_refused_before_the_request() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn agent_iteration_exhaustion_is_a_typed_fact_not_a_message_substring() {
+    // Pure max-iteration exhaustion carries resource/used/allowed as typed
+    // fields and classifies without the message-substring match the
+    // specialist path still relies on.
+    let error = StepError::AgentIterationsExhausted {
+        node: "agent".into(),
+        message: "llm.agent reached max_iterations 3".into(),
+        resource: "iterations",
+        used: 3,
+        allowed: 3,
+        validation: None,
+    };
+    assert_eq!(
+        agent_failure_code(&error),
+        AgentFailureCode::IterationBudgetExceeded
+    );
+    assert!(
+        !matches!(error, StepError::BudgetExceeded { .. }),
+        "iteration exhaustion must not read as run-wide budget exhaustion (failure hooks still settle)"
+    );
+    assert_eq!(
+        error.to_string(),
+        "step `agent` failed: llm.agent reached max_iterations 3"
+    );
+    // The same text without the typed fact does not classify as iteration
+    // exhaustion: the typed fields (not the message) carry the fact.
+    let untyped = StepError::failed("agent", "llm.agent reached max_iterations 3");
+    assert_eq!(agent_failure_code(&untyped), AgentFailureCode::ToolFailed);
+}
+
+#[test]
+fn agent_iteration_exhaustion_preserves_validation_fact_and_precedence() {
+    // An invalid final response at the iteration boundary keeps both facts
+    // while retaining the existing ValidationFailed classification/action.
+    let error = StepError::AgentIterationsExhausted {
+        node: "agent".into(),
+        message: "llm.agent failed final response validation after 3 iterations: bad json".into(),
+        resource: "iterations",
+        used: 3,
+        allowed: 3,
+        validation: Some("bad json".into()),
+    };
+    match &error {
+        StepError::AgentIterationsExhausted {
+            resource,
+            used,
+            allowed,
+            validation,
+            ..
+        } => {
+            assert_eq!(*resource, "iterations");
+            assert_eq!((*used, *allowed), (3, 3));
+            assert_eq!(validation.as_deref(), Some("bad json"));
+        }
+        _ => panic!("expected the typed iteration-exhaustion fact"),
+    }
+    assert_eq!(
+        agent_failure_code(&error),
+        AgentFailureCode::ValidationFailed
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("failed final response validation after 3 iterations")
+    );
+}
+
+#[test]
+fn agent_iteration_exhaustion_keeps_failure_disposition_and_hooks() {
+    // Typed exhaustion settles like an ordinary failure: never run-budget
+    // exhaustion (so failure hooks are not skipped), with the existing
+    // recoverable policy codes rather than the fatal run-boundary code.
+    for error in [
+        StepError::AgentIterationsExhausted {
+            node: "agent".into(),
+            message: "llm.agent reached max_iterations 3".into(),
+            resource: "iterations",
+            used: 3,
+            allowed: 3,
+            validation: None,
+        },
+        StepError::AgentIterationsExhausted {
+            node: "agent".into(),
+            message: "llm.agent failed final response validation after 3 iterations: bad json"
+                .into(),
+            resource: "iterations",
+            used: 3,
+            allowed: 3,
+            validation: Some("bad json".into()),
+        },
+    ] {
+        assert!(
+            !matches!(&error, StepError::BudgetExceeded { .. }),
+            "hooks must still settle: {error:?}"
+        );
+        assert_ne!(
+            agent_failure_code(&error),
+            AgentFailureCode::RunBudgetExceeded
+        );
+    }
+    assert!(AgentFailureCode::IterationBudgetExceeded.is_recoverable());
+    assert!(AgentFailureCode::ValidationFailed.is_recoverable());
+    assert!(!AgentFailureCode::RunBudgetExceeded.is_recoverable());
+}

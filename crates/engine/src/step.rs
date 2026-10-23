@@ -28,6 +28,16 @@ pub enum StepError {
         used: u64,
         limit: u64,
     },
+    /// Agent-local limit (not a run budget): settles like `Failed`, retaining validation errors.
+    #[error("step `{node}` failed: {message}")]
+    AgentIterationsExhausted {
+        node: String,
+        message: String,
+        resource: &'static str,
+        used: u64,
+        allowed: u64,
+        validation: Option<String>,
+    },
     /// The operation guard refused execution: resend of changed content,
     /// uncacheable prior success, or indeterminate outcome without an
     /// at-least-once opt-in. Never retried automatically; manual recovery

@@ -1708,6 +1708,10 @@ pub(crate) fn agent_failure_code(error: &StepError) -> AgentFailureCode {
             AgentFailureCode::ElapsedExceeded
         }
         StepError::BudgetExceeded { .. } => AgentFailureCode::RunBudgetExceeded,
+        StepError::AgentIterationsExhausted { validation, .. } if validation.is_some() => {
+            AgentFailureCode::ValidationFailed
+        }
+        StepError::AgentIterationsExhausted { .. } => AgentFailureCode::IterationBudgetExceeded,
         StepError::Failed { message, .. } if message.contains("token budget exceeded") => {
             AgentFailureCode::TokenBudgetExceeded
         }

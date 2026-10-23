@@ -1683,7 +1683,8 @@ impl StepExecutor for LlmAgentStep {
                 &params.tools,
             )?;
         }
-        let message = last_validation_error.map_or_else(
+        let validation = last_validation_error;
+        let message = validation.as_ref().map_or_else(
             || format!("llm.agent reached max_iterations {max_turns}"),
             |error| {
                 format!(
@@ -1691,7 +1692,14 @@ impl StepExecutor for LlmAgentStep {
                 )
             },
         );
-        Err(StepError::failed(&node.id, message))
+        Err(StepError::AgentIterationsExhausted {
+            node: node.id.clone(),
+            message,
+            resource: "iterations",
+            used: first_turn.max(max_turns) as u64,
+            allowed: max_turns as u64,
+            validation,
+        })
     }
 }
 

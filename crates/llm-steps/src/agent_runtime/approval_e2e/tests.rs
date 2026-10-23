@@ -334,7 +334,7 @@ async fn verified_mcp_sidecar_executes_original_bytes_and_redacted_success_resen
         .execute(&mut ctx, &node)
         .await;
         assert!(
-            matches!(result, Err(StepError::Failed { ref message, .. }) if message.contains("max_iterations")),
+            matches!(result, Err(StepError::AgentIterationsExhausted { ref message, resource: "iterations", used: 1, allowed: 1, validation: None, .. }) if message.contains("max_iterations")),
             "unexpected error: {:?}",
             result.err()
         );
@@ -365,7 +365,7 @@ async fn verified_mcp_sidecar_executes_original_bytes_and_redacted_success_resen
     .execute(&mut ctx, &node)
     .await;
     assert!(
-        matches!(result, Err(StepError::Failed { ref message, .. }) if message.contains("max_iterations")),
+        matches!(result, Err(StepError::AgentIterationsExhausted { ref message, resource: "iterations", used: 1, allowed: 1, validation: None, .. }) if message.contains("max_iterations")),
         "unexpected error: {:?}",
         result.err()
     );
@@ -551,7 +551,7 @@ async fn redacted_clean_retry_preserves_record_and_verified_original_can_retry()
     .execute(&mut ctx, &node)
     .await;
     assert!(
-        matches!(result, Err(StepError::Failed { ref message, .. }) if message.contains("max_iterations")),
+        matches!(result, Err(StepError::AgentIterationsExhausted { ref message, resource: "iterations", used: 1, allowed: 1, validation: None, .. }) if message.contains("max_iterations")),
         "unexpected error: {:?}",
         result.err()
     );
@@ -600,5 +600,123 @@ async fn a_file_the_agents_command_removed_is_not_reported() {
     assert!(
         writes.reported().is_empty(),
         "a file the agent's own command removed is not an output of the step"
+    );
+}
+
+// Drive real model turns and the final-response validation branch, not just
+// a constructed StepError. Both one-turn and multi-turn boundaries must keep
+// the last validation fact alongside the exhausted allowance and checkpoint.
+#[tokio::test]
+async fn final_validation_at_the_iteration_boundary_keeps_both_facts() {
+    for max_turns in [1, 3] {
+        let harness = ApprovalHarness::setup(&format!("iteration-validation-{max_turns}"));
+        let run = run(&harness, BTreeMap::new());
+        std::fs::write(harness.root.join("prompt.md"), "FAKE_JSON: {}\n").unwrap();
+        std::fs::write(
+            harness.root.join("response.schema.json"),
+            r#"{"type":"object","required":["answer"]}"#,
+        )
+        .unwrap();
+        let mut node = ApprovalHarness::node();
+        node.params = serde_json::from_value(json!({
+            "prompt": "prompt.md", "schema": "response.schema.json",
+            "model": {"provider": "fake", "model": "test"},
+            "max_iterations": max_turns, "max_tokens_total": 10000
+        }))
+        .unwrap();
+        let journal = journal(&harness);
+        let runtime = Arc::new(test_runtime());
+        let mut vars = contract::ValueBag::with_inputs(BTreeMap::new());
+        let mut ctx = context(&run, &journal, &mut vars, &runtime);
+        let error = LlmAgentStep {
+            runtime: runtime.clone(),
+        }
+        .execute(&mut ctx, &node)
+        .await
+        .expect_err("invalid final response");
+        let StepError::AgentIterationsExhausted {
+            resource,
+            used,
+            allowed,
+            validation: Some(validation),
+            ..
+        } = &error
+        else {
+            panic!("expected both boundary facts: {error:?}")
+        };
+        assert_eq!(*resource, "iterations");
+        assert_eq!((*used, *allowed), (max_turns, max_turns));
+        assert!(validation.contains("answer"), "{validation}");
+        assert!(error.to_string().contains(&format!(
+            "failed final response validation after {max_turns} iterations: {validation}"
+        )));
+        assert_eq!(
+            agent_failure_code(&error),
+            AgentFailureCode::ValidationFailed
+        );
+        assert!(agent_failure_code(&error).is_recoverable());
+        let checkpoint: AgentCheckpoint =
+            serde_json::from_value(journal.state().checkpoints[&NodePath::root(&node.id)].clone())
+                .unwrap();
+        assert_eq!(checkpoint.next_turn as u64, max_turns);
+        assert!(checkpoint.tokens_total > 0, "spent tokens must survive");
+        let audit = std::fs::read_to_string(harness.root.join("meta/audit.jsonl")).unwrap();
+        let failures = audit
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|event| event["t"] == "llm_validation_failed")
+            .collect::<Vec<_>>();
+        assert_eq!(failures.len() as u64, max_turns);
+        assert_eq!(failures.last().unwrap()["message"], *validation);
+    }
+}
+
+#[tokio::test]
+async fn an_already_exhausted_checkpoint_reports_spent_iterations_without_reexecution() {
+    let harness = ApprovalHarness::setup("iterations-already-spent");
+    let run = run(&harness, BTreeMap::new());
+    let journal = journal(&harness);
+    let runtime = Arc::new(test_runtime());
+    let mut node = ApprovalHarness::node();
+    node.params = serde_json::from_value(json!({
+        "prompt": "prompt.md", "max_iterations": 3, "max_tokens_total": 1000
+    }))
+    .unwrap();
+    let mut vars = contract::ValueBag::with_inputs(BTreeMap::new());
+    let mut ctx = context(&run, &journal, &mut vars, &runtime);
+    let mut stored = checkpoint(original(false));
+    stored.pending_side_effect = None;
+    stored.next_turn = 4;
+    stored.tokens_total = 42;
+    record_agent_checkpoint(&ctx, &node, 3, "after_tool_calls", &stored, &[]).unwrap();
+    let error = LlmAgentStep { runtime }
+        .execute(&mut ctx, &node)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            StepError::AgentIterationsExhausted {
+                resource: "iterations",
+                used: 4,
+                allowed: 3,
+                validation: None,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        agent_failure_code(&error),
+        AgentFailureCode::IterationBudgetExceeded
+    );
+    let saved: AgentCheckpoint =
+        serde_json::from_value(journal.state().checkpoints[&NodePath::root(&node.id)].clone())
+            .unwrap();
+    assert_eq!(saved.next_turn, 4);
+    assert_eq!(saved.tokens_total, 42);
+    assert!(
+        !harness.root.join("meta/audit.jsonl").exists(),
+        "no new model or tool call"
     );
 }
