@@ -31,6 +31,9 @@ pub enum EngineError {
     /// original error for diagnostics and failure classification.
     #[error(transparent)]
     ResumableAgent(Box<EngineError>),
+    /// A completed foreach sibling is replayed as a fact, not retried.
+    #[error("{0}")]
+    Settled(model::FailureDetail),
     #[error(transparent)]
     Gateway(#[from] crate::GatewayError),
     #[error(transparent)]
@@ -135,6 +138,7 @@ pub(crate) fn failure_detail_for_error(error: &EngineError) -> model::FailureDet
     let mut detail = FailureDetail::from(error.to_string());
     detail.code = match error {
         EngineError::ResumableAgent(error) => return failure_detail_for_error(error),
+        EngineError::Settled(detail) => return detail.clone(),
         EngineError::Step(
             StepError::ElapsedExceeded { .. } | StepError::ElapsedExpiredBeforeStart { .. },
         ) => FailureCode::ElapsedExceeded,
@@ -277,6 +281,7 @@ pub struct RunContext {
     pub snapshot_source: Option<Arc<dyn RunSnapshotSource>>,
     /// Resolved run references for this execution; immutable for the run.
     pub run_refs: Arc<BTreeMap<String, RunRefMaterial>>,
+    pub(crate) replay_through: u64,
     pub(crate) replayed_steps: Arc<BTreeMap<String, ReplayedStep>>,
     pub(crate) checkpoint_accounting: Arc<Mutex<CheckpointAccounting>>,
 }

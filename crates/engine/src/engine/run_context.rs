@@ -428,7 +428,7 @@ impl RunContext {
     /// loading) with fresh cancellation and empty replay state. Only
     /// available with the `test-support` feature, never in production
     /// builds; downstream crates opt in through dev-dependencies.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn for_tests(
         run_id: String,
         workspace: camino::Utf8PathBuf,
@@ -470,6 +470,7 @@ impl RunContext {
             elapsed_deadline: None,
             snapshot_source: None,
             run_refs: Arc::new(std::collections::BTreeMap::new()),
+            replay_through: 0,
             replayed_steps: Arc::new(std::collections::BTreeMap::new()),
             checkpoint_accounting: Arc::new(Mutex::new(
                 crate::engine::checkpoint::CheckpointAccounting::default(),
@@ -1354,6 +1355,7 @@ mod tests {
             parallel_compatibility: policy::scheduling::ParallelCompatibility::default(),
             elapsed_deadline: None,
             snapshot_source: None,
+            replay_through: 0,
             replayed_steps: Arc::new(std::collections::BTreeMap::new()),
             checkpoint_accounting: Arc::new(Mutex::new(CheckpointAccounting::default())),
         };

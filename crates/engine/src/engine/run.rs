@@ -606,6 +606,7 @@ impl Engine {
             parallel_compatibility: options.parallel_compatibility,
             snapshot_source: self.snapshot_source.clone(),
             run_refs: Arc::new(options.run_refs),
+            replay_through: replay.state.last_seq,
             replayed_steps: Arc::new(replay.steps.clone()),
             checkpoint_accounting: Arc::new(Mutex::new(CheckpointAccounting::default())),
             contract,
@@ -738,6 +739,16 @@ impl Engine {
                 NodeOutcome::Failed { reason } => NodeState::Failed(reason.clone()),
             };
             states.insert(path.as_str().to_string(), state);
+        }
+        // Re-enter only an explicitly answered foreach owner, never retry its settled siblings.
+        for fact in replay.state.foreach_reports.values() {
+            let answered = fact["question_id"].as_str().is_some_and(|id| context.answers.contains_key(id))
+                || fact["confirm_id"].as_str().is_some_and(|id| context.confirmations.contains_key(id));
+            if answered && let Some(parent) = fact["node"].as_str() {
+                for (id, state) in &mut states {
+                    if parent == id || parent.starts_with(&format!("{id}[")) { *state = NodeState::Pending; }
+                }
+            }
         }
         // Only direct node owners are authorizable; foreach facts identify the parent, not its child.
         let mut authorized = Vec::new();

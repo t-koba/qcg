@@ -1,10 +1,9 @@
 use crate::{JournalWriter, StepControlFlow, StepError, StepOutcome};
 use camino::Utf8PathBuf;
-use contract::NodeDef;
-use contract::ValueBag;
+use contract::{NodeDef, ValueBag};
 use model::{FailureCode, FailureDetail, NodePath};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tokio::task::{Id, JoinSet};
 
@@ -29,29 +28,30 @@ impl Engine {
         let params: ForeachControlParams = node.deserialize_params().map_err(|error| {
             StepError::failed(&node.id, format!("invalid foreach params: {error}"))
         })?;
-        if params.items.trim().is_empty() {
-            return Err(StepError::failed(&node.id, "foreach items is required").into());
+        for (field, value) in [("items", &params.items), ("subflow", &params.subflow)] {
+            if value.trim().is_empty() {
+                return Err(
+                    StepError::failed(&node.id, format!("foreach {field} is required")).into(),
+                );
+            }
         }
-        if params.subflow.trim().is_empty() {
-            return Err(StepError::failed(&node.id, "foreach subflow is required").into());
-        }
-        if !(1..=MAX_FOREACH_ITERATIONS).contains(&params.max_iterations) {
-            return Err(StepError::failed(
-                &node.id,
-                format!("foreach max_iterations must be from 1 through {MAX_FOREACH_ITERATIONS}"),
-            )
-            .into());
-        }
-        if !(1..=MAX_FOREACH_PARALLELISM).contains(&params.parallel) {
-            return Err(StepError::failed(
-                &node.id,
-                format!("foreach parallel must be from 1 through {MAX_FOREACH_PARALLELISM}"),
-            )
-            .into());
+        for (field, value, max) in [
+            (
+                "max_iterations",
+                params.max_iterations,
+                MAX_FOREACH_ITERATIONS,
+            ),
+            ("parallel", params.parallel, MAX_FOREACH_PARALLELISM),
+        ] {
+            if !(1..=max).contains(&value) {
+                return Err(StepError::failed(
+                    &node.id,
+                    format!("foreach {field} must be from 1 through {max}"),
+                )
+                .into());
+            }
         }
         let items_ref = params.items.as_str();
-        // Plain dotted paths resolve by direct lookup. Anything else
-        // (for example `sort(inputs.tags)`) evaluates as an expression.
         let items_value = match vars.get_path(items_ref) {
             Some(value) => value.clone(),
             None => vars.eval_value(items_ref).map_err(|error| {
@@ -97,183 +97,164 @@ impl Engine {
             .blocks
             .get(subflow)
             .ok_or_else(|| StepError::failed(&node.id, format!("unknown subflow `{subflow}`")))?;
-        // Parallel iterations isolate variables, but share workspace, journal
-        // and run-wide budget. Refuse unsafe/unknown leaves and on_fail routing,
-        // just like top-level waves. Nested control flow gates its own leaves.
         if params.parallel > 1 && item_count > 1 {
             for child in block.iter() {
-                let traits = self.registry.traits(&child.kind);
-                let leaf_unsafe = match traits {
-                    None => true,
-                    Some(traits) => {
-                        !traits.parallel_safe && traits.control_flow == StepControlFlow::Plain
-                    }
+                let unsafe_leaf = self.registry.traits(&child.kind).is_none_or(|traits| {
+                    !traits.parallel_safe && traits.control_flow == StepControlFlow::Plain
+                });
+                let message = if unsafe_leaf {
+                    format!(
+                        "foreach block child `{}` is not parallel-safe; use parallel = 1",
+                        child.id
+                    )
+                } else if child.on_fail.is_some() {
+                    format!(
+                        "foreach block child `{}` declares on_fail routing; parallel execution requires parallel = 1",
+                        child.id
+                    )
+                } else {
+                    continue;
                 };
-                if leaf_unsafe {
-                    return Err(StepError::failed(
-                        &node.id,
-                        format!(
-                            "foreach block child `{}` is not parallel-safe; use parallel = 1",
-                            child.id
-                        ),
-                    )
-                    .into());
-                }
-                if child.on_fail.is_some() {
-                    return Err(StepError::failed(
-                        &node.id,
-                        format!(
-                            "foreach block child `{}` declares on_fail routing; parallel execution requires parallel = 1",
-                            child.id
-                        ),
-                    )
-                    .into());
-                }
+                return Err(StepError::failed(&node.id, message).into());
             }
         }
-
         let mut files = Vec::new();
-        if params.parallel == 1 || item_count <= 1 {
-            for (index, item) in items.into_iter().enumerate() {
-                let mut iteration_vars = vars.clone();
-                iteration_vars.clear_step_outcome_subtree(&node.id);
-                let (iteration_files, outcome) = self
-                    .execute_foreach_iteration(
-                        context,
-                        journal,
-                        &mut iteration_vars,
-                        budget,
-                        ForeachIteration {
-                            node,
-                            block,
-                            index,
-                            item,
-                        },
-                    )
-                    .await?;
-                // Keep accumulated/failed files as exhaustion evidence.
-                if outcome.is_none() {
-                    vars.absorb_outputs(&iteration_vars);
-                }
-                files.extend(iteration_files);
-                if let Some(outcome) = outcome {
-                    let outcome = match outcome {
-                        StepOutcome::CheckFailed {
-                            findings,
-                            output,
-                            files: failed_files,
-                        } => {
-                            drop(failed_files);
-                            StepOutcome::CheckFailed {
-                                findings,
-                                output,
-                                files: files.clone(),
-                            }
-                        }
-                        other => other,
-                    };
-                    return Ok(outcome);
-                }
+        // Reuse settled checks without letting them abort an answered owner's path.
+        let mut terminals = BTreeMap::new();
+        let state = journal.state();
+        for fact in state.foreach_reports.values().filter(|fact| {
+            fact["node"] == node.id
+                && fact["seq"]
+                    .as_u64()
+                    .is_some_and(|seq| seq <= context.replay_through)
+        }) {
+            let owner = fact["owner"].as_str().unwrap_or("");
+            if state.foreach_reports.values().any(|child| {
+                child["node"].as_str().is_some_and(|node| {
+                    !owner.is_empty() && (node == owner || node.starts_with(&format!("{owner}[")))
+                }) && (child["question_id"]
+                    .as_str()
+                    .is_some_and(|id| context.answers.contains_key(id))
+                    || child["confirm_id"]
+                        .as_str()
+                        .is_some_and(|id| context.confirmations.contains_key(id)))
+            }) {
+                continue;
             }
-        } else {
-            let context = Arc::new(context.clone());
-            let journal = Arc::new(journal.clone_for_parallel()?);
-            let block = Arc::new(block.clone());
-            let mut tasks = JoinSet::new();
-            let mut task_indices = HashMap::new();
-            let mut pending = items.into_iter().enumerate();
-            loop {
-                while tasks.len() < params.parallel {
-                    let Some((index, item)) = pending.next() else {
-                        break;
-                    };
-                    let engine = self.clone();
-                    let context = Arc::clone(&context);
-                    let journal = Arc::clone(&journal);
-                    let block = Arc::clone(&block);
-                    let mut iteration_vars = vars.clone();
-                    iteration_vars.clear_step_outcome_subtree(&node.id);
-                    // Shared budget atomics, not an isolated budget: the
-                    // clone shares the run-wide counters, so every iteration
-                    // charges the same budget (E10).
-                    let mut iteration_budget = budget.clone();
-                    let foreach_node = node.clone();
-                    let task = tasks.spawn(async move {
-                        let outcome = engine
-                            .execute_foreach_iteration(
-                                &context,
-                                &journal,
-                                &mut iteration_vars,
-                                &mut iteration_budget,
-                                ForeachIteration {
-                                    node: &foreach_node,
-                                    block: &block,
-                                    index,
-                                    item,
-                                },
-                            )
-                            .await;
-                        (index, iteration_vars, outcome)
-                    });
-                    task_indices.insert(task.id(), index);
-                }
-                let Some(result) = tasks.join_next_with_id().await else {
+            if let Some(result) = fact.get("result") {
+                let result: Result<StepOutcome, FailureDetail> =
+                    serde_json::from_value(result.clone()).map_err(crate::JournalError::from)?;
+                files.extend(
+                    serde_json::from_value::<Vec<Utf8PathBuf>>(fact["files"].clone())
+                        .map_err(crate::JournalError::from)?
+                        .into_iter()
+                        .map(|path| context.workspace.join(path)),
+                );
+                let index = fact["index"]
+                    .as_u64()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .ok_or_else(|| StepError::failed(&node.id, "invalid recorded foreach index"))?;
+                terminals.insert(
+                    index,
+                    result
+                        .map(|outcome| (vec![], Some(outcome)))
+                        .map_err(EngineError::Settled),
+                );
+            }
+        }
+        let mut reporter = ForeachReporter {
+            vars,
+            files: &mut files,
+            journal,
+            node: &node.id,
+            workspace: &context.workspace,
+        };
+        let context = Arc::new(context.clone());
+        let journal = Arc::new(journal.clone_for_parallel()?);
+        let block = Arc::new(block.clone());
+        let mut tasks = JoinSet::new();
+        let mut task_indices = HashMap::new();
+        let mut pending = items.into_iter().enumerate();
+        loop {
+            while tasks.len() < params.parallel {
+                let Some((index, item)) = pending.next() else {
                     break;
                 };
-                let task_id = match &result {
-                    Ok((id, _)) => *id,
-                    Err(error) => error.id(),
-                };
-                task_indices.remove(&task_id);
-                let result = match result {
-                    Ok((_, (_, iteration_vars, Ok((iteration_files, None))))) => {
-                        vars.absorb_outputs(&iteration_vars);
-                        files.extend(iteration_files);
-                        continue;
-                    }
-                    other => other,
-                };
-                let parent_cancelled = match &result {
-                    Ok((_, (_, _, Err(error)))) => error.is_canceled(),
-                    Err(error) => error.is_cancelled(),
-                    _ => false,
-                };
-                // Preserve the first report's files before draining sibling files.
-                if let Ok((_, (_, _, Ok((iteration_files, Some(_)))))) = &result {
-                    files.extend(iteration_files.iter().cloned());
+                if terminals.contains_key(&index) {
+                    continue;
                 }
-                match super::execute::parallel_terminal_decision(context.parallel_compatibility) {
-                    super::execute::ParallelTerminalDecision::AbortAndDrain => {
-                        drain_foreach_tasks(
-                            &mut tasks,
-                            &mut task_indices,
-                            vars,
-                            &mut files,
+                let engine = self.clone();
+                let context = Arc::clone(&context);
+                let journal = Arc::clone(&journal);
+                let block = Arc::clone(&block);
+                let mut iteration_vars = reporter.vars.clone();
+                iteration_vars.clear_step_outcome_subtree(&node.id);
+                let mut iteration_budget = budget.clone();
+                let foreach_node = node.clone();
+                let task = tasks.spawn(async move {
+                    let mut owner = format!("{}[{index}]", foreach_node.id);
+                    let outcome = engine
+                        .execute_foreach_iteration(
+                            &context,
                             &journal,
-                            &node.id,
-                            parent_cancelled,
+                            &mut iteration_vars,
+                            &mut iteration_budget,
+                            &mut owner,
+                            ForeachIteration {
+                                node: &foreach_node,
+                                block: &block,
+                                index,
+                                item,
+                            },
                         )
-                        .await?;
-                    }
-                }
-                return match result {
-                    Ok((_, (_, _, Ok((_, Some(outcome)))))) => Ok(match outcome {
-                        StepOutcome::CheckFailed {
-                            findings, output, ..
-                        } => StepOutcome::CheckFailed {
-                            findings,
-                            output,
-                            files: files.clone(),
-                        },
-                        other => other,
-                    }),
-                    Ok((_, (_, _, Err(error)))) => Err(error),
-                    Err(error) if error.is_cancelled() => Err(EngineError::Canceled),
-                    Err(error) => Err(super::execute::join_task_error(error)),
-                    // Successful iterations were absorbed above, before applying policy.
-                    Ok((_, (_, _, Ok((_, None))))) => unreachable!("success already absorbed"),
-                };
+                        .await;
+                    (index, owner, iteration_vars, outcome)
+                });
+                task_indices.insert(task.id(), index);
             }
+            let Some(result) = tasks.join_next_with_id().await else {
+                break;
+            };
+            let id = match &result {
+                Ok((id, _)) => *id,
+                Err(error) => error.id(),
+            };
+            let index = task_indices.remove(&id).expect("registered foreach task");
+            let terminal = !matches!(&result, Ok((_, (_, _, _, Ok((_, None))))));
+            let unreported = result.is_err();
+            let parent_cancelled = match &result {
+                Ok((_, (_, _, _, Err(error)))) => error.is_canceled(),
+                Err(error) => error.is_cancelled(),
+                _ => false,
+            };
+            if terminal {
+                match super::execute::parallel_terminal_decision(context.parallel_compatibility) {
+                    super::execute::ParallelTerminalDecision::AbortAndDrain => tasks.abort_all(),
+                }
+            }
+            let first = reporter.record(
+                result.map(|(_, report)| report),
+                index,
+                parent_cancelled,
+                false,
+            );
+            if !terminal && first.is_ok() {
+                continue;
+            }
+            // Join even if persisting the first report failed.
+            let drained = reporter
+                .drain(&mut tasks, &mut task_indices, parent_cancelled)
+                .await;
+            terminals.extend(drained?);
+            if let Some(result) = first?
+                && (!unreported || terminals.is_empty())
+            {
+                terminals.insert(index, result);
+            }
+            return select_foreach_terminal(terminals, files);
+        }
+        if !terminals.is_empty() {
+            return select_foreach_terminal(terminals, files);
         }
         let files = existing_regular_files(files)?;
         Ok(StepOutcome::Success {
@@ -292,6 +273,7 @@ impl Engine {
         journal: &JournalWriter,
         vars: &mut ValueBag,
         budget: &mut BudgetTracker,
+        owner: &mut String,
         iteration: ForeachIteration<'_>,
     ) -> Result<(Vec<Utf8PathBuf>, Option<StepOutcome>), EngineError> {
         let ForeachIteration {
@@ -304,7 +286,6 @@ impl Engine {
         context.run_checkpoint()?;
         let parent_item = vars.item().cloned();
         vars.set_item(Some(item));
-        // Runtime paths use stable parent/index/child IDs for replay.
         journal.event(
             "foreach_iteration",
             json!({ "node": node.id, "index": index }),
@@ -315,8 +296,8 @@ impl Engine {
             vars.sync_step_outcome_subtree(&journal.state().vars, &iteration_scope);
             context.run_checkpoint()?;
             let block_path = foreach_path.foreach_child(index, &block_node.id);
+            *owner = block_path.to_string();
             let mut addressed_node = block_node.clone();
-            // Per-iteration IDs isolate replay/output; clear aliases to avoid sibling collisions.
             addressed_node.id = block_path.to_string();
             addressed_node.output = None;
             if !vars
@@ -341,6 +322,12 @@ impl Engine {
             }
             let block_id = block_path.to_string();
             if let Some(replayed) = context.replayed_steps.get(&block_id) {
+                files.extend(
+                    replayed
+                        .files
+                        .iter()
+                        .map(|pin| context.workspace.join(&pin.path)),
+                );
                 if let Some(output) = &replayed.output {
                     vars.set_step_output(&block_id, output.clone());
                 }
@@ -351,12 +338,10 @@ impl Engine {
                 vars.sync_step_outcome_subtree(&journal.state().vars, &iteration_scope);
                 continue;
             }
-            // One retry sequence and attempt counter per logical child.
             journal.event(
                 "step_started",
                 json!({ "node": block_id, "type": addressed_node.kind.to_string(), "attempt": 1 }),
             )?;
-            // Charge the foreach once; child retries/timeouts still apply, and nested attempt bounds multiply.
             let child_outcome = self
                 .execute_node_with_retry_charged(
                     context,
@@ -371,18 +356,13 @@ impl Engine {
                 Ok(outcome) => outcome,
                 Err(error)
                     if error.is_canceled()
+                        || error.is_resumable_agent()
                         || matches!(
                             error,
                             EngineError::NeedsUser { .. } | EngineError::NeedsConfirm { .. }
                         ) =>
                 {
                     vars.set_item(parent_item);
-                    return Err(error);
-                }
-                Err(error) if error.is_resumable_agent() => {
-                    vars.set_item(parent_item);
-                    // Preserve explicit continuation ownership through enclosing
-                    // scheduler boundaries; node kind alone never synthesizes one.
                     return Err(error);
                 }
                 Err(error) => {
@@ -396,209 +376,159 @@ impl Engine {
                     return Err(error);
                 }
             };
-            match child_outcome {
-                StepOutcome::Success {
-                    output,
-                    files: block_files,
-                } => {
-                    let file_pins = pin_attempt_files(context, &block_files)?;
-                    if let Some(value) = output.clone() {
-                        vars.set_step_output(&block_id, value);
+            let block_files = match &child_outcome {
+                StepOutcome::Success { files, .. }
+                | StepOutcome::CheckFailed { files, .. }
+                | StepOutcome::NeedsUser { files, .. }
+                | StepOutcome::NeedsConfirm { files, .. } => files,
+            };
+            let file_pins = pin_attempt_files(context, block_files)?;
+            files.extend(block_files.iter().cloned());
+            match &child_outcome {
+                StepOutcome::Success { output, .. } => {
+                    if let Some(value) = output {
+                        vars.set_step_output(&block_id, value.clone());
                     }
-                    files.extend(block_files);
-                    // Resolve the output name to the addressed per-iteration block id.
-                    let output_name = super::types::output_name_for(&addressed_node);
-                    journal.event(
-                        "step_finished",
-                        json!({ "node": block_id, "status": "success", "output": output, "output_name": output_name, "files": file_pins }),
-                    )?;
-                    vars.sync_step_outcome_subtree(&journal.state().vars, &iteration_scope);
+                    journal.event("step_finished", json!({"node": block_id, "status": "success", "output": output, "output_name": block_id, "files": file_pins}))?;
                 }
                 StepOutcome::CheckFailed {
-                    findings,
-                    output,
-                    files: failed_files,
+                    findings, output, ..
                 } => {
-                    // Preserve the child's failed revision using the top-level evidence keys.
-                    let failed_pins = pin_attempt_files(context, &failed_files)?;
-                    let reason = failure_from_findings(&findings, FailureCode::CheckFailed);
-                    journal.event(
-                        "step_finished",
-                        with_failed_evidence(
-                            json!({ "node": block_id.clone(), "status": "check_failed", "findings": findings.clone(), "reason": reason }),
-                            &output,
-                            &failed_pins,
-                        )?,
-                    )?;
-                    vars.sync_step_outcome_subtree(&journal.state().vars, &iteration_scope);
-                    vars.set_item(parent_item);
-                    let mut all_files = files;
-                    all_files.extend(failed_files);
-                    return Ok((
-                        all_files.clone(),
-                        Some(StepOutcome::CheckFailed {
-                            findings,
-                            output,
-                            files: all_files,
-                        }),
-                    ));
+                    let reason = failure_from_findings(findings, FailureCode::CheckFailed);
+                    journal.event("step_finished", with_failed_evidence(json!({"node": block_id, "status": "check_failed", "findings": findings, "reason": reason}), output, &file_pins)?)?;
                 }
-                StepOutcome::NeedsUser {
-                    question,
-                    files: child_files,
-                } => {
-                    // Journal the suspension and its pinned files under the child block id.
-                    const NO_OUTPUT: Option<serde_json::Value> = None;
-                    let file_pins = pin_attempt_files(context, &child_files)?;
-                    journal.event(
-                        "step_finished",
-                        with_failed_evidence(
-                            json!({ "node": block_id.clone(), "status": "needs_user", "question": question.clone(), "files": file_pins }),
-                            &NO_OUTPUT,
-                            &[],
-                        )?,
-                    )?;
-                    vars.set_item(parent_item);
-                    files.extend(child_files.clone());
-                    return Ok((
-                        files,
-                        Some(StepOutcome::NeedsUser {
-                            question,
-                            files: child_files,
-                        }),
-                    ));
+                StepOutcome::NeedsUser { question, .. } => {
+                    journal.event("step_finished", with_failed_evidence(json!({"node": block_id, "status": "needs_user", "question": question, "files": file_pins}), &None, &[])?)?;
                 }
-                StepOutcome::NeedsConfirm {
-                    confirm,
-                    files: child_files,
-                } => {
-                    let file_pins = pin_attempt_files(context, &child_files)?;
+                StepOutcome::NeedsConfirm { confirm, .. } => {
                     journal.event(
                         "confirm_request",
-                        json!({ "node": block_id.clone(), "confirm": confirm.clone(), "files": file_pins }),
+                        json!({"node": block_id, "confirm": confirm, "files": file_pins}),
                     )?;
-                    vars.set_item(parent_item);
-                    files.extend(child_files.clone());
-                    return Ok((
-                        files,
-                        Some(StepOutcome::NeedsConfirm {
-                            confirm,
-                            files: child_files,
-                        }),
-                    ));
                 }
+            }
+            vars.sync_step_outcome_subtree(&journal.state().vars, &iteration_scope);
+            if !matches!(child_outcome, StepOutcome::Success { .. }) {
+                vars.set_item(parent_item);
+                return Ok((files, Some(child_outcome)));
             }
         }
         vars.set_item(parent_item);
         Ok((files, None))
     }
 }
-
-type ForeachTaskOutcome = (
-    usize,
-    ValueBag,
-    Result<(Vec<Utf8PathBuf>, Option<StepOutcome>), EngineError>,
-);
-
-/// Record drained sibling facts by iteration; child events retain effects and prompts.
-/// Unknown interrupted effects remain unsettled; this diagnostic authorizes no replay.
-async fn drain_foreach_tasks(
-    tasks: &mut JoinSet<ForeachTaskOutcome>,
-    task_indices: &mut HashMap<Id, usize>,
-    vars: &mut ValueBag,
-    files: &mut Vec<Utf8PathBuf>,
-    journal: &JournalWriter,
-    node_id: &str,
-    parent_cancelled: bool,
-) -> Result<(), EngineError> {
-    tasks.abort_all();
-    let mut ignored: usize = 0;
-    // Keep joining all owners after a journal failure; return it only after quiescence.
-    let mut write_error: Option<EngineError> = None;
-    while let Some(result) = tasks.join_next_with_id().await {
-        let task_id = match &result {
-            Ok((id, _)) => *id,
-            Err(error) => error.id(),
+type IterationResult = Result<(Vec<Utf8PathBuf>, Option<StepOutcome>), EngineError>;
+type ForeachTaskOutcome = (usize, String, ValueBag, IterationResult);
+type JoinedIteration = Result<ForeachTaskOutcome, tokio::task::JoinError>;
+fn select_foreach_terminal(
+    terminals: BTreeMap<usize, IterationResult>,
+    mut files: Vec<Utf8PathBuf>,
+) -> Result<StepOutcome, EngineError> {
+    let (_, outcome) = terminals.into_values().next().expect("terminal report")?;
+    let mut outcome = outcome.expect("terminal outcome");
+    if let StepOutcome::CheckFailed { files: failed, .. } = &mut outcome {
+        files.sort();
+        files.dedup();
+        *failed = files;
+    }
+    Ok(outcome)
+}
+struct ForeachReporter<'a> {
+    vars: &'a mut ValueBag,
+    files: &'a mut Vec<Utf8PathBuf>,
+    journal: &'a JournalWriter,
+    node: &'a str,
+    workspace: &'a camino::Utf8Path,
+}
+impl ForeachReporter<'_> {
+    fn record(
+        &mut self,
+        result: JoinedIteration,
+        index: usize,
+        parent_cancelled: bool,
+        drained: bool,
+    ) -> Result<Option<IterationResult>, EngineError> {
+        let node = self.node;
+        let cause = if parent_cancelled {
+            "parent_cancellation"
+        } else {
+            "fail_fast"
         };
-        let index = task_indices
-            .remove(&task_id)
-            .expect("registered foreach task");
-        let mut record = json!({
-            "node": node_id,
-            "index": index,
-            "iteration": format!("{node_id}[{index}]"),
-            "drain_cause": if parent_cancelled { "parent_cancellation" } else { "fail_fast" },
-        });
-        match result {
-            Ok((_, (reported_index, iteration_vars, Ok((iteration_files, None))))) => {
-                debug_assert_eq!(index, reported_index);
-                vars.absorb_outputs(&iteration_vars);
-                files.extend(iteration_files);
-                record["classification"] = json!("completed_success");
-            }
-            Ok((_, (reported_index, _, Ok((_, Some(outcome)))))) => {
-                debug_assert_eq!(index, reported_index);
-                record["classification"] = json!("completed_terminal");
-                let (outcome, interaction) = match &outcome {
-                    StepOutcome::CheckFailed { .. } => ("check_failed", None),
-                    StepOutcome::NeedsUser { question, .. } => {
-                        ("needs_user", Some(("question_id", question.id.as_str())))
+        let mut record = json!({"node": node, "index": index, "iteration": format!("{node}[{index}]"), "drain_cause": cause});
+        let result = match result {
+            Ok((reported, owner, iteration_vars, result)) => {
+                debug_assert_eq!(index, reported);
+                record["owner"] = json!(owner);
+                match &result {
+                    Ok((iteration_files, outcome)) => {
+                        self.files.extend(iteration_files.iter().cloned());
+                        record["files"] = json!(
+                            iteration_files
+                                .iter()
+                                .map(|path| path.strip_prefix(self.workspace).unwrap_or(path))
+                                .collect::<Vec<_>>()
+                        );
+                        record["classification"] = json!(if outcome.is_some() {
+                            "completed_terminal"
+                        } else {
+                            "completed_success"
+                        });
+                        match outcome {
+                            None | Some(StepOutcome::Success { .. }) => {
+                                self.vars.absorb_outputs(&iteration_vars)
+                            }
+                            Some(outcome @ StepOutcome::CheckFailed { .. }) => {
+                                record["outcome"] = json!("check_failed");
+                                record["result"] = json!({"Ok": outcome});
+                                record["result"]["Ok"]["files"] = json!([]);
+                            }
+                            Some(StepOutcome::NeedsUser { question, .. }) => {
+                                record["outcome"] = json!("needs_user");
+                                record["question_id"] = json!(question.id);
+                            }
+                            Some(StepOutcome::NeedsConfirm { confirm, .. }) => {
+                                record["outcome"] = json!("needs_confirm");
+                                record["confirm_id"] = json!(confirm.id);
+                            }
+                        }
                     }
-                    StepOutcome::NeedsConfirm { confirm, .. } => {
-                        ("needs_confirm", Some(("confirm_id", confirm.id.as_str())))
+                    Err(error) => {
+                        record["classification"] = json!(match error {
+                            EngineError::NeedsUser { question_id, .. } => {
+                                record["question_id"] = json!(question_id);
+                                "interaction_pending"
+                            }
+                            EngineError::NeedsConfirm { confirm_id, .. } => {
+                                record["confirm_id"] = json!(confirm_id);
+                                "interaction_pending"
+                            }
+                            _ if error.is_resumable_agent() => {
+                                record["continuation_owner"] = json!(owner);
+                                "agent_continuation"
+                            }
+                            _ if error.is_canceled() => {
+                                record["cancellation_cause"] = json!("reported_by_task");
+                                "task_canceled"
+                            }
+                            _ => {
+                                record["code"] = json!(failure_detail_for_error(error).code);
+                                record["result"] = json!({"Err": failure_detail_for_error(error)});
+                                record["files"] = json!([]);
+                                "task_error"
+                            }
+                        });
+                        record["detail"] = json!(error.to_string());
                     }
-                    StepOutcome::Success { .. } => ("success", None),
-                };
-                record["outcome"] = json!(outcome);
-                if let Some((key, id)) = interaction {
-                    record[key] = json!(id);
                 }
-                ignored += 1;
-            }
-            Ok((_, (reported_index, _, Err(error)))) => {
-                debug_assert_eq!(index, reported_index);
-                let (classification, code, interaction) = match &error {
-                    EngineError::NeedsUser { question_id, .. } => (
-                        "interaction_pending",
-                        None,
-                        Some(("question_id", question_id.as_str())),
-                    ),
-                    EngineError::NeedsConfirm { confirm_id, .. } => (
-                        "interaction_pending",
-                        None,
-                        Some(("confirm_id", confirm_id.as_str())),
-                    ),
-                    _ if error.is_resumable_agent() => {
-                        record["continuation_owner"] = json!("agent");
-                        ("agent_continuation", None, None)
-                    }
-                    _ if error.is_canceled() => {
-                        record["cancellation_cause"] = json!("reported_by_task");
-                        ("task_canceled", None, None)
-                    }
-                    _ => (
-                        "task_error",
-                        Some(failure_detail_for_error(&error).code),
-                        None,
-                    ),
-                };
-                record["classification"] = json!(classification);
-                if let Some(code) = code {
-                    record["code"] = json!(code);
+                if matches!(result, Ok((_, None))) {
+                    None
+                } else {
+                    Some(result)
                 }
-                if let Some((key, id)) = interaction {
-                    record[key] = json!(id);
-                }
-                record["detail"] = json!(error.to_string());
-                ignored += 1;
             }
             Err(error) => {
-                let classification = if error.is_cancelled() {
-                    record["cancellation_cause"] = json!(if parent_cancelled {
-                        "parent_cancellation"
-                    } else {
-                        "fail_fast"
-                    });
+                record["classification"] = json!(if error.is_cancelled() {
+                    record["cancellation_cause"] = json!(cause);
                     if parent_cancelled {
                         "parent_canceled"
                     } else {
@@ -606,28 +536,92 @@ async fn drain_foreach_tasks(
                     }
                 } else {
                     "task_join_error"
-                };
-                record["classification"] = json!(classification);
+                });
                 record["detail"] = json!(error.to_string());
-                ignored += 1;
+                if drained {
+                    None
+                } else {
+                    Some(Err(if error.is_cancelled() {
+                        EngineError::Canceled
+                    } else {
+                        super::execute::join_task_error(error)
+                    }))
+                }
+            }
+        };
+        self.journal.event(
+            if drained {
+                "foreach_sibling_drained"
+            } else {
+                "foreach_iteration_settled"
+            },
+            record,
+        )?;
+        Ok(result)
+    }
+
+    /// Abort immediately, then join every owner even when persistence fails.
+    async fn drain(
+        &mut self,
+        tasks: &mut JoinSet<ForeachTaskOutcome>,
+        task_indices: &mut HashMap<Id, usize>,
+        parent_cancelled: bool,
+    ) -> Result<BTreeMap<usize, IterationResult>, EngineError> {
+        tasks.abort_all();
+        let mut terminals = BTreeMap::new();
+        let mut write_error = None;
+        while let Some(result) = tasks.join_next_with_id().await {
+            let id = match &result {
+                Ok((id, _)) => *id,
+                Err(error) => error.id(),
+            };
+            let index = task_indices.remove(&id).expect("registered foreach task");
+            match self.record(
+                result.map(|(_, report)| report),
+                index,
+                parent_cancelled,
+                true,
+            ) {
+                Ok(Some(result)) => {
+                    terminals.insert(index, result);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    write_error.get_or_insert(error);
+                }
             }
         }
-        if let Err(error) = journal.event("foreach_sibling_drained", record) {
-            write_error.get_or_insert_with(|| error.into());
-        }
+        write_error.map_or(Ok(terminals), Err)
     }
-    if ignored > 0 {
-        tracing::warn!(node = %node_id, ignored, "drain_foreach_tasks ignored sibling outcomes after fail-fast; see foreach_sibling_drained journal events");
-    }
-    write_error.map_or(Ok(()), Err)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{JournalLimits, RunState, read_journal_values};
+    mod settlement;
 
-    async fn completed(task: &tokio::task::AbortHandle) {
+    async fn drain_foreach_tasks(
+        tasks: &mut JoinSet<ForeachTaskOutcome>,
+        indices: &mut HashMap<Id, usize>,
+        vars: &mut ValueBag,
+        files: &mut Vec<Utf8PathBuf>,
+        journal: &JournalWriter,
+        node: &str,
+        canceled: bool,
+    ) -> Result<BTreeMap<usize, IterationResult>, EngineError> {
+        ForeachReporter {
+            vars,
+            files,
+            journal,
+            node,
+            workspace: camino::Utf8Path::new("."),
+        }
+        .drain(tasks, indices, canceled)
+        .await
+    }
+
+    pub(super) async fn completed(task: &tokio::task::AbortHandle) {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while !task.is_finished() {
                 tokio::task::yield_now().await;
@@ -653,13 +647,15 @@ mod tests {
         let first = tasks.spawn(async {
             (
                 0,
+                "each[0]/child".into(),
                 ValueBag::default(),
                 Ok((vec![], Some(StepOutcome::check_failed(vec![])))),
             )
         });
         indices.insert(first.id(), 0);
         completed(&first).await;
-        let (first_id, (_, _, first_outcome)) = tasks.join_next_with_id().await.unwrap().unwrap();
+        let (first_id, (_, _, _, first_outcome)) =
+            tasks.join_next_with_id().await.unwrap().unwrap();
         indices.remove(&first_id);
 
         let question = api::FormSpec {
@@ -693,8 +689,14 @@ mod tests {
         let mut scope = ValueBag::default();
         scope.set_item(Some(json!("identical user item")));
         scope.set_step_output("each[2]/child", json!({"value": "ok"}));
-        let success =
-            tasks.spawn(async move { (2, scope, Ok((vec![Utf8PathBuf::from("out.txt")], None))) });
+        let success = tasks.spawn(async move {
+            (
+                2,
+                "each[2]/child".into(),
+                scope,
+                Ok((vec![Utf8PathBuf::from("out.txt")], None)),
+            )
+        });
         indices.insert(success.id(), 2);
         let terminal = tasks.spawn(async move {
             let mut scope = ValueBag::default();
@@ -702,6 +704,7 @@ mod tests {
             scope.set_step_output("must_not_merge", json!(true));
             (
                 7,
+                "each[7]/child".into(),
                 scope,
                 Ok((
                     vec![],
@@ -716,6 +719,7 @@ mod tests {
         let error = tasks.spawn(async {
             (
                 11,
+                "each[11]/child".into(),
                 ValueBag::default(),
                 Err(EngineError::ResumableAgent(Box::new(EngineError::Failed(
                     "agent continuation retained".into(),
@@ -778,7 +782,7 @@ mod tests {
         assert_eq!(records[&7]["outcome"], "needs_user");
         assert_eq!(records[&7]["question_id"], "each[7]/ask.question");
         assert_eq!(records[&11]["classification"], "agent_continuation");
-        assert_eq!(records[&11]["continuation_owner"], "agent");
+        assert_eq!(records[&11]["continuation_owner"], "each[11]/child");
         assert_eq!(
             records[&11]["detail"],
             "run failed: agent continuation retained"
@@ -800,6 +804,7 @@ mod tests {
         // without inventing failed child outcomes.
         let replayed = RunState::fold_journal(&path).expect("journal replay");
         before.last_seq = replayed.last_seq;
+        before.foreach_reports = replayed.foreach_reports.clone();
         assert_eq!(replayed.unresolved_tasks.len(), 2);
         assert_eq!(replayed.unresolved_tasks["each[13]"], *records[&13]);
         assert_eq!(replayed.unresolved_tasks["each[19]"], *records[&19]);
@@ -835,6 +840,7 @@ mod tests {
             let task = tasks.spawn(async move {
                 (
                     index,
+                    format!("outer[{index}]/child"),
                     ValueBag::default(),
                     Err(EngineError::Failed("reported".into())),
                 )
@@ -952,7 +958,14 @@ mod tests {
         let mut tasks = JoinSet::new();
         let mut indices = HashMap::new();
         for (index, outcome) in outcomes.into_iter().enumerate() {
-            let task = tasks.spawn(async move { (index, ValueBag::default(), outcome) });
+            let task = tasks.spawn(async move {
+                (
+                    index,
+                    format!("outer[3]/inner[{index}]/child"),
+                    ValueBag::default(),
+                    outcome,
+                )
+            });
             indices.insert(task.id(), index);
             completed(&task).await;
         }

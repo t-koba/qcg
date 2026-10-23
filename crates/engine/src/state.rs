@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const RUN_STATE_SCHEMA_VERSION: u32 = 6;
+pub const RUN_STATE_SCHEMA_VERSION: u32 = 7;
 
 /// State-free diagnostics; fold tests ensure API internal-event registration.
 const STATE_FREE_JOURNAL_EVENT_KINDS: &[&str] = &[
@@ -144,6 +144,8 @@ pub struct RunState {
     pub checkpoints: BTreeMap<NodePath, Value>,
     /// Unreported join facts by stable owner: cause/seq survive starting or authorizing replay.
     pub(crate) unresolved_tasks: BTreeMap<String, Value>,
+    /// Completed reports by foreach iteration; these grant no retry authority.
+    pub(crate) foreach_reports: BTreeMap<String, Value>,
     /// Agent removals outlive checkpoints and must be retained separately.
     pub removed_files: BTreeMap<NodePath, BTreeSet<String>>,
     pub budget: BudgetState,
@@ -240,6 +242,7 @@ impl Default for RunState {
             pending_interactions: BTreeMap::new(),
             interaction_seqs: BTreeMap::new(),
             unresolved_tasks: BTreeMap::new(),
+            foreach_reports: BTreeMap::new(),
             terminal: None,
             execution_started: false,
             finished_at: None,
@@ -844,7 +847,7 @@ impl RunState {
                     self.vars.patch_step_statuses(values);
                 }
             }
-            "parallel_task_joined" | "foreach_sibling_drained" => {
+            "parallel_task_joined" | "foreach_sibling_drained" | "foreach_iteration_settled" => {
                 let class = event["classification"].as_str().unwrap_or("");
                 let unreported = !matches!(
                     class,
@@ -854,8 +857,18 @@ impl RunState {
                         | "task_error"
                         | "agent_continuation"
                 );
+                if !unreported && kind != "parallel_task_joined" {
+                    let owner = event["iteration"].as_str().ok_or_else(|| {
+                        crate::JournalError::InvalidEvent("foreach iteration is required".into())
+                    })?;
+                    let mut fact = event.clone();
+                    for key in ["t", "ts", "run_id", "trace_id", "span_id", "parent_span_id"] {
+                        fact.as_object_mut().expect("journal object").remove(key);
+                    }
+                    self.foreach_reports.insert(owner.to_string(), fact);
+                }
                 if unreported {
-                    let owner = if kind == "foreach_sibling_drained" {
+                    let owner = if kind != "parallel_task_joined" {
                         &event["iteration"]
                     } else {
                         &event["node"]
@@ -1877,6 +1890,7 @@ mod tests {
             "pending_interactions",
             "interaction_seqs",
             "unresolved_tasks",
+            "foreach_reports",
             "terminal",
             "execution_started",
             "operation_records",

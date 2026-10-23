@@ -878,9 +878,19 @@ Parallel compatibility is deployment-owned and frozen in
 `ServiceDeploymentPolicy`; run requests cannot override it. Only `fail_fast`
 exists and is the default: waves abort on the first observed terminal report or
 join failure; parallel foreach aborts/drains on its first terminal iteration
-report or join failure. Existing aggregation and observation timing are
-unchanged. Sibling facts remain journaled through quiescence; this selector does
-not choose new mixed-outcome precedence or authorize replay. New run identities
+report or join failure, without waiting for unfinished siblings. Among the
+completed terminal iteration reports, foreach selects the lowest numeric
+iteration index regardless of join order. This is an owner-identity tie-break,
+not universal interaction-wins or failure-wins precedence. Every observed
+completed report is retained canonically by iteration with its reporting child
+path, typed interaction IDs and concrete continuation owner; interrupted owners
+remain separately unresolved. On interaction answer/resume, completed checks
+and errors are reused without invoking their steps again, while the answered
+owner continues on its existing path. Saved terminal reports cannot prematurely
+abort that re-entry. Accounting and verified file revisions are retained. No new
+retry, continuation, or unknown-effect replay permission follows from these
+facts; an unresolved foreach iteration still refuses replay, even if its parent
+is declared replay-safe. The selector does not authorize replay. New run identities
 record the selector and `deployment_policy` provenance; older identities without
 these optional fields remain readable.
 

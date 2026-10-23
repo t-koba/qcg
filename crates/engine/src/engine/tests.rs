@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 /// Engine options for a test that does not exercise a specific channel:
 /// serial steps, no event stream, and the default budgets. A test that
 /// needs something else overrides only that field.
-fn run_options(output_dir: Utf8PathBuf) -> RunOptions {
+pub(super) fn run_options(output_dir: Utf8PathBuf) -> RunOptions {
     RunOptions {
         elapsed_budget_mode: policy::ElapsedBudgetMode::default(),
         output_dir,
@@ -44,7 +44,7 @@ fn run_options(output_dir: Utf8PathBuf) -> RunOptions {
 
 /// Contract over the graph its own manifest builds, which is what every
 /// engine test runs against.
-fn test_contract(root: &Utf8Path, manifest: Manifest) -> Contract {
+pub(super) fn test_contract(root: &Utf8Path, manifest: Manifest) -> Contract {
     let graph = Graph::build(&manifest).expect("test graph should build");
     Contract {
         root: root.to_owned(),
@@ -894,7 +894,7 @@ async fn repair_node_honors_its_own_retry_policy() {
     assert!(has_status(&events, "step_finished", "broken", "repaired"));
 }
 
-struct TestForeachStep;
+pub(super) struct TestForeachStep;
 
 #[async_trait]
 impl StepExecutor for TestForeachStep {
@@ -1503,7 +1503,7 @@ impl StepExecutor for SlowCancellableStep {
     }
 }
 
-fn foreach_node(
+pub(super) fn foreach_node(
     id: &str,
     subflow: &str,
     items_expr: &str,
@@ -1524,7 +1524,7 @@ fn foreach_node(
     node
 }
 
-fn foreach_items_input() -> contract::InputSpec {
+pub(super) fn foreach_items_input() -> contract::InputSpec {
     serde_json::from_value(json!({
         "stages": [{
             "id": "basic",
@@ -4762,7 +4762,7 @@ async fn sequential_step_records_started_before_execution_finishes() {
     let _ = std::fs::remove_dir_all(&run_dir);
 }
 
-fn manifest(flow: Vec<NodeDef>) -> Manifest {
+pub(super) fn manifest(flow: Vec<NodeDef>) -> Manifest {
     Manifest {
         generator: GeneratorMeta {
             id: "scheduler-test".into(),
@@ -5675,7 +5675,7 @@ async fn warned_run_started_hook_does_not_rerun_after_hitl_resume() {
     let _ = std::fs::remove_dir_all(&run_dir);
 }
 
-fn node(id: &str, kind: &str) -> NodeDef {
+pub(super) fn node(id: &str, kind: &str) -> NodeDef {
     NodeDef {
         id: id.into(),
         kind: StepType::literal(kind),
@@ -5692,7 +5692,7 @@ fn node(id: &str, kind: &str) -> NodeDef {
     }
 }
 
-fn temp_run_dir(name: &str) -> Utf8PathBuf {
+pub(super) fn temp_run_dir(name: &str) -> Utf8PathBuf {
     let dir = Utf8PathBuf::from_path_buf(
         std::env::temp_dir().join(format!("engine-{name}-{}", std::process::id())),
     )

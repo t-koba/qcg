@@ -15,9 +15,15 @@ using the stable `node` rather than Tokio's process-local task ID. Its
 panic, scheduler abort, and parent cancellation; `drain_cause` and
 `cancellation_cause` retain why the task stopped. Wave join reports retain only
 outcome and interaction IDs; they copy no prompt, answer, output, or raw error.
-`foreach_sibling_drained` retains the exact iteration path and its existing
-task-detail fields. The fold keeps unreported owners unresolved rather than
-inventing a failed step. Resume first
+`foreach_iteration_settled` records the consumed foreach report (including
+successes); `foreach_sibling_drained` records each sibling joined after abort.
+Both name the numeric `index`, stable `iteration` path, and reporting child
+`owner` when one completed. Typed `question_id` / `confirm_id` references and
+concrete `continuation_owner` paths retain who can continue; they copy no prompt
+or answer. Completed check/error `result` and workspace-relative `files` are
+retained for reuse, subject to the journal's normal redaction and event/state
+bounds; child events remain the source of pinned file revisions. The fold keeps
+unreported owners unresolved rather than inventing a failed step. Resume first
 surfaces their saved interactions, then refuses to re-enter an unresolved owner
 unless its `StepExecutor` explicitly declares guarded replay. That admission emits
 `parallel_replay_authorized` with the executor, capability, owner, and original
@@ -27,7 +33,18 @@ iteration, not the child executor whose effects are unknown, so the parent's
 capability cannot authorize it. After join facts persist, parent cancellation and
 wave-start failure still settle returned outcomes per owner before the run returns;
 only tasks actually aborted remain interrupted with unknown effects. These facts
-do not choose mixed-outcome failure precedence or change fail-fast settlement.
+do not authorize retries. Foreach abort timing remains fail-fast, but selection
+from the completed terminal reports is by lowest iteration index, independent of
+join order (not failure-vs-interaction precedence). Unreported aborts are not
+completed terminal outcomes. The state keeps the complete observed report set
+keyed by stable iteration, separately from unresolved-effect guards. On an
+answered-interaction resume, already completed checks and errors are reused,
+while the answered owner re-enters its existing child path. Saved terminal facts
+do not race to abort that re-entry; after fresh work settles, selection includes
+the saved facts. Reuse retains spending and verified file evidence and grants no
+retry or continuation authority. Reports from retries in the current execution
+are not mistaken for saved resume results. State schema 7 requires this report
+map; older/incomplete state sidecars fail closed rather than defaulting it away.
 
 Explicit continuation rule: a generic `StepError` from any node kind,
 including `llm.agent`, settles as an ordinary failure and never synthesizes a
