@@ -1,7 +1,6 @@
 use api::{GuardrailStage, ToolCallErrorCode, ToolCallPhase, ToolCallStatus};
 use async_trait::async_trait;
-use contract::AgentFailureCode;
-use contract::{Contract, NodeDef, ToolDecl};
+use contract::{AgentFailureAction, AgentFailureCode, Contract, NodeDef, ToolDecl};
 use engine::{ResultExt, StepContext, StepError, StepExecutor, StepOutcome};
 use llm::{ChatContent, ChatMessage, ChatToolCall, LlmRuntime};
 use model::NodePath;
@@ -14,9 +13,9 @@ use std::time::Instant;
 
 use crate::agent_runtime::{
     AgentToolCallFailure, AgentToolInvocation, AgentToolServices, AgentWrites,
-    agent_call_identity_hash_for_tool, check_used_call_id, execute_agent_tool,
-    finish_rejected_external_operation, recover_agent_tool_call_failure,
-    validate_agent_tool_call_args,
+    agent_call_identity_hash_for_tool, agent_failure_code, check_used_call_id, execute_agent_tool,
+    finish_rejected_external_operation, record_agent_failure_event,
+    recover_agent_tool_call_failure, validate_agent_tool_call_args,
 };
 use crate::agent_tools::{validate_agent_delegations, validate_agent_tool};
 use crate::completion::complete_llm;
@@ -1692,14 +1691,17 @@ impl StepExecutor for LlmAgentStep {
                 )
             },
         );
-        Err(StepError::AgentIterationsExhausted {
+        let error = StepError::AgentIterationsExhausted {
             node: node.id.clone(),
             message,
             resource: "iterations",
             used: first_turn.max(max_turns) as u64,
             allowed: max_turns as u64,
             validation,
-        })
+        };
+        let (code, action) = (agent_failure_code(&error), AgentFailureAction::Fail);
+        record_agent_failure_event(ctx, node, &node.id, None, code, action, &error)?;
+        Err(error)
     }
 }
 

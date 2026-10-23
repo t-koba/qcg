@@ -149,13 +149,25 @@
           "message": {
             "type": "string"
           },
+          "resource_exhaustion": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AgentResourceExhaustion"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "tool_call_id": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
           "agent",
-          "tool_call_id",
           "code",
           "action",
           "message"
@@ -232,6 +244,30 @@
         "required": [
           "agent",
           "tool_call_id"
+        ],
+        "type": "object"
+      },
+      "AgentResourceExhaustion": {
+        "additionalProperties": false,
+        "properties": {
+          "allowed": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "resource": {
+            "type": "string"
+          },
+          "used": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "resource",
+          "used",
+          "allowed"
         ],
         "type": "object"
       },

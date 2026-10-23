@@ -1991,7 +1991,8 @@ export interface components {
             agent: string;
             code: components["schemas"]["AgentFailureCode"];
             message: string;
-            tool_call_id: string;
+            resource_exhaustion?: components["schemas"]["AgentResourceExhaustion"] | null;
+            tool_call_id?: string | null;
         };
         /** @enum {string} */
         AgentFailureAction: "fail" | "return_error";
@@ -2003,6 +2004,13 @@ export interface components {
         AgentHandoffEventData: {
             agent: string;
             tool_call_id: string;
+        };
+        AgentResourceExhaustion: {
+            /** Format: uint64 */
+            allowed: number;
+            resource: string;
+            /** Format: uint64 */
+            used: number;
         };
         /** AnswerPayload */
         AnswerPayload: {

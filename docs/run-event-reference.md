@@ -58,7 +58,7 @@ their existing handling. See [`mcp.call`](contract-reference.md).
 
 Generated from the OpenAPI `RunEvent` schema. Every event uses the required envelope fields `seq`, `ts`, `run_id`, `trace_id`, `span_id`, `kind`, and `data`; `path` is present for node-scoped events. Trace and span IDs use W3C-compatible hexadecimal widths. Unknown `kind` values are preserved with opaque `data`.
 
-| Event | Required `data` fields |
+| Event | `data` fields (required unless marked optional) |
 |---|---|
 | `elapsed_accounted` | `active_nanoseconds`, `active_started_at` |
 | `run_queued` | `generator`, `generator_path`, `contract_sha256`, `inputs`, `schema_version`, `elapsed_budget_mode` |
@@ -83,7 +83,7 @@ Generated from the OpenAPI `RunEvent` schema. Every event uses the required enve
 | `agent_file_changes` | `removed_files`, `written_files` |
 | `agent_delegated` | `agent`, `tool_call_id`, `tools`, `max_calls`, `max_iterations`, `max_tokens_total`, `max_tool_calls_total` |
 | `agent_completed` | `agent`, `tool_call_id`, `turn`, `tokens_total` |
-| `agent_failed` | `agent`, `tool_call_id`, `code`, `action`, `message` |
+| `agent_failed` | `agent`, `code`, `action`, `message`; optional: `tool_call_id` (delegated calls only), `resource_exhaustion` (`{resource, used, allowed}`) |
 | `agent_handoff` | `agent`, `tool_call_id` |
 | `context_compacted` | none |
 | `llm_validation_failed` | `attempt`, `message` |
@@ -106,6 +106,7 @@ Generated from the OpenAPI `RunEvent` schema. Every event uses the required enve
 | `run_interrupted` | `reason` |
 | `run_finished` | `status`, `metrics` |
 | `lagged` | `action` |
+
 <!-- run-events:end -->
 
 ## Durability records

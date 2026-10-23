@@ -1616,7 +1616,15 @@ pub(crate) async fn execute_agent_tool(
                 Err(error) => {
                     let code = agent_failure_code(&error);
                     let action = on_failure.action(code);
-                    record_agent_failure_event(ctx, node, name, call_id, code, action, &error)?;
+                    record_agent_failure_event(
+                        ctx,
+                        node,
+                        name,
+                        Some(call_id),
+                        code,
+                        action,
+                        &error,
+                    )?;
                     return match action {
                         AgentFailureAction::Fail => Err(error),
                         AgentFailureAction::ReturnError => {
@@ -1701,41 +1709,31 @@ fn ensure_path_within_prefix(
 }
 
 pub(crate) fn agent_failure_code(error: &StepError) -> AgentFailureCode {
+    use AgentFailureCode::*;
     match error {
-        StepError::Cancelled => AgentFailureCode::Cancelled,
-        StepError::TimedOut { .. } => AgentFailureCode::TimedOut,
+        StepError::Cancelled => Cancelled,
+        StepError::TimedOut { .. } => TimedOut,
         StepError::ElapsedExceeded { .. } | StepError::ElapsedExpiredBeforeStart { .. } => {
-            AgentFailureCode::ElapsedExceeded
+            ElapsedExceeded
         }
-        StepError::BudgetExceeded { .. } => AgentFailureCode::RunBudgetExceeded,
+        StepError::BudgetExceeded { .. } => RunBudgetExceeded,
         StepError::AgentIterationsExhausted { validation, .. } if validation.is_some() => {
-            AgentFailureCode::ValidationFailed
+            ValidationFailed
         }
-        StepError::AgentIterationsExhausted { .. } => AgentFailureCode::IterationBudgetExceeded,
-        StepError::Failed { message, .. } if message.contains("token budget exceeded") => {
-            AgentFailureCode::TokenBudgetExceeded
-        }
-        StepError::Failed { message, .. } if message.contains("tool call budget exceeded") => {
-            AgentFailureCode::ToolCallBudgetExceeded
-        }
-        StepError::Failed { message, .. } if message.contains("call budget exceeded") => {
-            AgentFailureCode::ToolCallBudgetExceeded
-        }
-        StepError::Failed { message, .. } if message.contains("iteration budget exceeded") => {
-            AgentFailureCode::IterationBudgetExceeded
-        }
-        StepError::Failed { message, .. } if message.contains("guardrail") => {
-            AgentFailureCode::GuardrailRejected
-        }
-        StepError::Failed { message, .. } if message.contains("validation") => {
-            AgentFailureCode::ValidationFailed
-        }
-        StepError::Failed { message, .. }
-            if message.contains("LLM provider") || message.contains("LLM request") =>
-        {
-            AgentFailureCode::ProviderFailed
-        }
-        _ => AgentFailureCode::ToolFailed,
+        StepError::AgentIterationsExhausted { .. } => IterationBudgetExceeded,
+        StepError::Failed { message, .. } => [
+            ("token budget exceeded", TokenBudgetExceeded),
+            ("call budget exceeded", ToolCallBudgetExceeded),
+            ("iteration budget exceeded", IterationBudgetExceeded),
+            ("guardrail", GuardrailRejected),
+            ("validation", ValidationFailed),
+            ("LLM provider", ProviderFailed),
+            ("LLM request", ProviderFailed),
+        ]
+        .into_iter()
+        .find_map(|(text, code)| message.contains(text).then_some(code))
+        .unwrap_or(ToolFailed),
+        _ => ToolFailed,
     }
 }
 
@@ -1745,6 +1743,13 @@ pub(crate) struct AgentToolFailureLimits {
     pub(crate) max_iterations: usize,
     pub(crate) max_tokens_total: u64,
     pub(crate) max_tool_calls_total: usize,
+}
+
+// Strip URL secrets and credential assignments before truncation (E09-2).
+fn redacted_agent_error(error: &StepError) -> String {
+    let text = policy::redact_urls_in_text(&error.to_string());
+    let redacted = policy::redact_credential_assignments_in_text(&text);
+    utf8_head(&redacted, 2_048).into()
 }
 
 pub(crate) fn agent_error_result(
@@ -1760,16 +1765,7 @@ pub(crate) fn agent_error_result(
         "agent": name,
         "error": {
             "code": code,
-            // E09-2: strip URL secrets and credential assignments before
-            // truncating; truncation alone is not redaction. Error
-            // constructors never interpolate secret values (keys only),
-            // but remote echoes in free text still need masking.
-            "message": utf8_head(
-                &policy::redact_credential_assignments_in_text(
-                    &policy::redact_urls_in_text(&error.to_string()),
-                ),
-                2_048,
-            ),
+            "message": redacted_agent_error(error),
             "retryable": code.is_recoverable() && retryable && call_number < limits.max_calls,
             "call_number": call_number,
             "limits": {
@@ -1803,7 +1799,8 @@ pub(crate) fn recover_agent_tool_call_failure(
     else {
         return Ok(None);
     };
-    record_agent_failure_event(ctx, node, &call.name, &call.id, failure.code, action, error)?;
+    let id = Some(call.id.as_str());
+    record_agent_failure_event(ctx, node, &call.name, id, failure.code, action, error)?;
     if action == AgentFailureAction::Fail {
         return Ok(None);
     }
@@ -1866,30 +1863,36 @@ pub(crate) fn record_agent_failure_event(
     ctx: &StepContext<'_>,
     node: &NodeDef,
     name: &str,
-    call_id: &str,
+    call_id: Option<&str>,
     code: AgentFailureCode,
     action: AgentFailureAction,
     error: &StepError,
 ) -> Result<(), StepError> {
+    let resource_exhaustion = match error {
+        StepError::AgentIterationsExhausted {
+            resource,
+            used,
+            allowed,
+            ..
+        } => Some(api::AgentResourceExhaustion {
+            resource: (*resource).into(),
+            used: *used,
+            allowed: *allowed,
+        }),
+        _ => None,
+    };
+    let mut payload = serde_json::to_value(api::AgentFailedEventData {
+        agent: name.into(),
+        tool_call_id: call_id.map(str::to_owned),
+        code,
+        action,
+        message: redacted_agent_error(error),
+        resource_exhaustion,
+    })
+    .step_err(&node.id)?;
+    payload["node"] = json!(node.id);
     ctx.journal
-        .event(
-            "agent_failed",
-            json!({
-                "node": node.id,
-                "agent": name,
-                "tool_call_id": call_id,
-                "code": code,
-                "action": action,
-                // E09-2: strip URL secrets and credential assignments before
-                // truncating (see above).
-                "message": utf8_head(
-                    &policy::redact_credential_assignments_in_text(
-                        &policy::redact_urls_in_text(&error.to_string()),
-                    ),
-                    2_048,
-                ),
-            }),
-        )
+        .event("agent_failed", payload)
         .step_err(&node.id)
 }
 

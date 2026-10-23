@@ -661,6 +661,29 @@ async fn final_validation_at_the_iteration_boundary_keeps_both_facts() {
         assert_eq!(checkpoint.next_turn as u64, max_turns);
         assert!(checkpoint.tokens_total > 0, "spent tokens must survive");
         let audit = std::fs::read_to_string(harness.root.join("meta/audit.jsonl")).unwrap();
+        let events: Vec<Value> = audit
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let exhausted: Vec<_> = events
+            .iter()
+            .filter(|event| event["t"] == "agent_failed")
+            .collect();
+        assert_eq!(exhausted.len(), 1);
+        assert_eq!(
+            exhausted[0]["resource_exhaustion"],
+            json!({
+                "resource": "iterations", "used": max_turns, "allowed": max_turns
+            })
+        );
+        assert_eq!(exhausted[0]["code"], "validation_failed");
+        assert_eq!(exhausted[0]["action"], "fail");
+        assert!(
+            !exhausted[0]
+                .as_object()
+                .unwrap()
+                .contains_key("tool_call_id")
+        );
         let failures = audit
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
@@ -715,8 +738,23 @@ async fn an_already_exhausted_checkpoint_reports_spent_iterations_without_reexec
             .unwrap();
     assert_eq!(saved.next_turn, 4);
     assert_eq!(saved.tokens_total, 42);
-    assert!(
-        !harness.root.join("meta/audit.jsonl").exists(),
-        "no new model or tool call"
+    let audit = std::fs::read_to_string(harness.root.join("meta/audit.jsonl")).unwrap();
+    let events: Vec<Value> = audit
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events.len(), 1, "no new model or tool call: {events:?}");
+    let event = &events[0];
+    assert_eq!(event["t"], "agent_failed");
+    assert_eq!(event["agent"], node.id);
+    assert_eq!(event["code"], "iteration_budget_exceeded");
+    assert_eq!(event["action"], "fail");
+    assert!(!event.as_object().unwrap().contains_key("tool_call_id"));
+    assert_eq!(
+        event["resource_exhaustion"],
+        json!({
+            "resource": "iterations", "used": 4, "allowed": 3
+        })
     );
+    api::RunEvent::from_flat(event).expect("top-level event decodes");
 }

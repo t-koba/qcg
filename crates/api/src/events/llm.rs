@@ -116,12 +116,23 @@ pub struct AgentCompletedEventData {
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct AgentResourceExhaustion {
+    pub resource: String,
+    pub used: u64,
+    pub allowed: u64,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AgentFailedEventData {
     pub agent: String,
-    pub tool_call_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
     pub code: AgentFailureCode,
     pub action: AgentFailureAction,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_exhaustion: Option<AgentResourceExhaustion>,
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize, JsonSchema)]

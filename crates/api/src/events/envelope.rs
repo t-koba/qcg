@@ -123,31 +123,18 @@ impl RunEvent {
             .get("seq")
             .and_then(Value::as_u64)
             .ok_or_else(|| "run event seq is required".to_string())?;
-        let ts = object
-            .get("ts")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "run event ts is required".to_string())?
-            .to_string();
-        let kind = object
-            .get("t")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "run event kind is required".to_string())?
-            .to_string();
-        let run_id = object
-            .get("run_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "run event run_id is required".to_string())?
-            .to_string();
-        let trace_id = object
-            .get("trace_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "run event trace_id is required".to_string())?
-            .to_string();
-        let span_id = object
-            .get("span_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "run event span_id is required".to_string())?
-            .to_string();
+        let required_string = |field: &str, label: &str| {
+            object
+                .get(field)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| format!("run event {label} is required"))
+        };
+        let ts = required_string("ts", "ts")?;
+        let kind = required_string("t", "kind")?;
+        let run_id = required_string("run_id", "run_id")?;
+        let trace_id = required_string("trace_id", "trace_id")?;
+        let span_id = required_string("span_id", "span_id")?;
         let path = object
             .get("node")
             .and_then(Value::as_str)

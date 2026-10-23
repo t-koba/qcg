@@ -456,6 +456,92 @@ mod tests {
     }
 
     #[test]
+    fn agent_failed_event_carries_optional_exhaustion_and_legacy_tool_id() {
+        // Legacy delegated payload: string tool id, no exhaustion.
+        let legacy = json!({
+            "t": "agent_failed",
+            "seq": 1,
+            "ts": "2026-08-31T00:00:00Z",
+            "run_id": "run-1",
+            "trace_id": "trace-1",
+            "span_id": "span-1",
+            "node": "research",
+            "agent": "parallel_researcher",
+            "tool_call_id": "call-1",
+            "code": "iteration_budget_exceeded",
+            "action": "fail",
+            "message": "specialist reached max_iterations 3"
+        });
+        let event = RunEvent::from_flat(&legacy).expect("legacy agent_failed should decode");
+        assert_eq!(event.path.as_ref().map(NodePath::as_str), Some("research"));
+        match event.data {
+            RunEventData::AgentFailed(data) => {
+                assert_eq!(data.tool_call_id.as_deref(), Some("call-1"));
+                assert!(data.resource_exhaustion.is_none());
+            }
+            other => panic!("expected typed agent_failed, got {other:?}"),
+        }
+        // New delegated payload: same string id plus typed exhaustion.
+        let delegated = json!({
+            "t": "agent_failed",
+            "seq": 2,
+            "ts": "2026-08-31T00:00:01Z",
+            "run_id": "run-1",
+            "trace_id": "trace-1",
+            "span_id": "span-2",
+            "node": "research",
+            "agent": "parallel_researcher",
+            "tool_call_id": "call-1",
+            "code": "iteration_budget_exceeded",
+            "action": "fail",
+            "message": "specialist reached max_iterations 3",
+            "resource_exhaustion": { "resource": "iterations", "used": 3, "allowed": 3 }
+        });
+        let event = RunEvent::from_flat(&delegated).expect("exhausted agent_failed should decode");
+        match event.data {
+            RunEventData::AgentFailed(data) => {
+                let exhaustion = data.resource_exhaustion.expect("exhaustion must decode");
+                assert_eq!(exhaustion.resource, "iterations");
+                assert_eq!((exhaustion.used, exhaustion.allowed), (3, 3));
+            }
+            other => panic!("expected typed agent_failed, got {other:?}"),
+        }
+        // Top-level payload: no tool id, exhaustion only. `node` stays in
+        // the envelope path, never in the typed data.
+        let top = json!({
+            "t": "agent_failed",
+            "seq": 3,
+            "ts": "2026-08-31T00:00:02Z",
+            "run_id": "run-1",
+            "trace_id": "trace-1",
+            "span_id": "span-3",
+            "node": "agent",
+            "agent": "agent",
+            "code": "iteration_budget_exceeded",
+            "action": "fail",
+            "message": "llm.agent reached max_iterations 3",
+            "resource_exhaustion": { "resource": "iterations", "used": 3, "allowed": 3 }
+        });
+        let event = RunEvent::from_flat(&top).expect("top-level agent_failed should decode");
+        assert_eq!(event.path.as_ref().map(NodePath::as_str), Some("agent"));
+        match event.data {
+            RunEventData::AgentFailed(data) => {
+                assert!(data.tool_call_id.is_none());
+                assert!(data.resource_exhaustion.is_some());
+                let value = serde_json::to_value(&data).expect("data should serialize");
+                assert!(!value.as_object().expect("object").contains_key("node"));
+                assert!(
+                    !value
+                        .as_object()
+                        .expect("object")
+                        .contains_key("tool_call_id")
+                );
+            }
+            other => panic!("expected typed agent_failed, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn unknown_event_kind_preserves_data() {
         let value = json!({
             "t": "third_party.progress",

@@ -250,29 +250,26 @@ fn response_schema(schema: ResponseSchema) -> Value {
 pub fn run_event_reference_markdown() -> String {
     let components = openapi_components();
     let mut markdown = String::from(
-        "## RunEvent Reference\n\nGenerated from the OpenAPI `RunEvent` schema. Every event uses the required envelope fields `seq`, `ts`, `run_id`, `trace_id`, `span_id`, `kind`, and `data`; `path` is present for node-scoped events. Trace and span IDs use W3C-compatible hexadecimal widths. Unknown `kind` values are preserved with opaque `data`.\n\n| Event | Required `data` fields |\n|---|---|\n",
+        "## RunEvent Reference\n\nGenerated from the OpenAPI `RunEvent` schema. Every event uses the required envelope fields `seq`, `ts`, `run_id`, `trace_id`, `span_id`, `kind`, and `data`; `path` is present for node-scoped events. Trace and span IDs use W3C-compatible hexadecimal widths. Unknown `kind` values are preserved with opaque `data`.\n\n| Event | `data` fields (required unless marked optional) |\n|---|---|\n",
     );
     for (event, schema_name) in run_event_data_schemas() {
-        let required = components["schemas"][schema_name]
-            .get("required")
-            .and_then(Value::as_array)
-            .map(|fields| {
-                fields
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(|field| format!("`{field}`"))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let required = if required.is_empty() {
-            "none".to_string()
+        let required = components["schemas"][schema_name]["required"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(|field| format!("`{field}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let fields = if required.is_empty() {
+            "none"
         } else {
-            required.join(", ")
+            &required
         };
-        markdown.push_str("| `");
-        markdown.push_str(event);
-        markdown.push_str("` | ");
-        markdown.push_str(&required);
+        markdown.push_str(&format!("| `{event}` | {fields}"));
+        if event == "agent_failed" {
+            markdown.push_str("; optional: `tool_call_id` (delegated calls only), `resource_exhaustion` (`{resource, used, allowed}`)");
+        }
         markdown.push_str(" |\n");
     }
     markdown

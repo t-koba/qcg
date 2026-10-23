@@ -2295,6 +2295,146 @@ fn a_model_without_the_capability_is_refused_before_the_request() {
 }
 
 #[test]
+fn agent_failed_event_emits_typed_exhaustion_counts() {
+    // Wire observability: delegated exhaustion carries the typed used/allowed
+    // payload, a generic failure carries none, and a top-level exhaustion
+    // truthfully omits the tool id. Counts come from the durable journal.
+    use crate::agent_runtime::record_agent_failure_event;
+    let root = std::env::temp_dir().join(format!("qcg-agent-failed-count-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("workspace")).expect("workspace");
+    std::fs::create_dir_all(root.join("meta")).expect("meta");
+    std::fs::write(root.join(contract::MANIFEST_FILE), "[generator]\nid = \"t\"\nname = \"t\"\nversion = \"0.1.0\"\n\n[llm]\nmodel = { provider = \"fake\", model = \"test\" }\nmax_tokens = 8\n\n[[flow]]\nid = \"agent\"\ntype = \"llm.agent\"\n\n[flow.params]\nprompt = \"p\"\nmax_iterations = 1\nmax_tokens_total = 8\n").expect("manifest");
+    let contract = Contract::load(camino::Utf8PathBuf::from_path_buf(root.clone()).expect("utf8"))
+        .expect("contract");
+    let node = agent_node();
+    let run_id = format!("agent-failed-{}", std::process::id());
+    let run = engine::RunContext::for_tests(
+        run_id.clone(),
+        camino::Utf8PathBuf::from_path_buf(root.join("workspace")).expect("utf8"),
+        camino::Utf8PathBuf::from_path_buf(root.join("meta")).expect("utf8"),
+        contract,
+        BTreeMap::new(),
+        BTreeMap::new(),
+    )
+    .expect("run");
+    let journal_path =
+        camino::Utf8PathBuf::from_path_buf(root.join("journal.jsonl")).expect("utf8");
+    let journal =
+        engine::JournalWriter::create(&journal_path, &run_id, false, None).expect("journal");
+    let mut vars = contract::ValueBag::with_inputs(BTreeMap::new());
+    let ctx = engine::StepContext {
+        run: &run,
+        journal: &journal,
+        vars: &mut vars,
+        llm: None,
+    };
+    let exhausted = StepError::AgentIterationsExhausted {
+        node: "agent".into(),
+        message: "llm.agent reached max_iterations 3".into(),
+        resource: "iterations",
+        used: 4,
+        allowed: 3,
+        validation: None,
+    };
+    let generic = StepError::failed(
+        "agent",
+        "boom api_key=hidden-key https://example.invalid/?token=hidden-query",
+    );
+    record_agent_failure_event(
+        &ctx,
+        &node,
+        "researcher",
+        Some("call-1"),
+        AgentFailureCode::IterationBudgetExceeded,
+        AgentFailureAction::Fail,
+        &exhausted,
+    )
+    .expect("delegated");
+    record_agent_failure_event(
+        &ctx,
+        &node,
+        "researcher",
+        Some("call-2"),
+        AgentFailureCode::ToolFailed,
+        AgentFailureAction::Fail,
+        &generic,
+    )
+    .expect("generic");
+    record_agent_failure_event(
+        &ctx,
+        &node,
+        &node.id,
+        None,
+        agent_failure_code(&exhausted),
+        AgentFailureAction::Fail,
+        &exhausted,
+    )
+    .expect("top-level");
+    let audit_path = journal_path.with_file_name("audit.jsonl");
+    drop(journal);
+    let text = std::fs::read_to_string(audit_path.as_std_path()).expect("audit text");
+    let failed: Vec<Value> = text
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .filter(|v: &Value| v.get("t").and_then(Value::as_str) == Some("agent_failed"))
+        .collect();
+    assert_eq!(
+        failed.len(),
+        3,
+        "two delegated plus one top-level: {failed:?}"
+    );
+    let with_exhaustion = failed
+        .iter()
+        .filter(|v| v.get("resource_exhaustion").is_some_and(|e| !e.is_null()))
+        .count();
+    assert_eq!(
+        with_exhaustion, 2,
+        "only typed exhaustion carries the payload: {failed:?}"
+    );
+    let first = &failed[0];
+    assert_eq!(first["resource_exhaustion"]["resource"], "iterations");
+    assert_eq!(first["resource_exhaustion"]["used"], 4);
+    assert_eq!(first["resource_exhaustion"]["allowed"], 3);
+    assert!(
+        !first["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("validation"),
+        "no validation text leaks into the payload"
+    );
+    assert_eq!(first["tool_call_id"], "call-1");
+    assert_eq!(first["code"], "iteration_budget_exceeded");
+    assert_eq!(first["action"], "fail");
+    assert!(
+        !failed[1]
+            .as_object()
+            .unwrap()
+            .contains_key("resource_exhaustion")
+    );
+    assert!(!text.contains("hidden-key"));
+    assert!(!text.contains("hidden-query"));
+    assert!(!failed[2].as_object().unwrap().contains_key("tool_call_id"));
+    // Typed parse of the durable rows: legacy shape without the payload
+    // still decodes, and the envelope node stays out of the typed data.
+    for row in &failed {
+        let event = api::RunEvent::from_flat(row).expect("durable agent_failed must parse");
+        match event.data {
+            api::RunEventData::AgentFailed(data) => {
+                if let Some(e) = data.resource_exhaustion {
+                    assert_eq!(
+                        (e.resource.as_str(), e.used, e.allowed),
+                        ("iterations", 4, 3)
+                    );
+                }
+            }
+            other => panic!("expected typed agent_failed, got {other:?}"),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn agent_iteration_exhaustion_is_a_typed_fact_not_a_message_substring() {
     // Pure max-iteration exhaustion carries resource/used/allowed as typed
     // fields and classifies without the message-substring match the
