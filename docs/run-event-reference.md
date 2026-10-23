@@ -57,12 +57,14 @@ Direct `mcp.call` cleanup failures emit a durable `mcp_cleanup_settled` record
 before settlement, alongside the observation-only `tool_call`. Both retain the
 execution `status` and a bounded result (64 KiB, `truncated` flag) independently
 of `cleanup_error`; the exact result stays in the operation replay state for
-redispatch-free replay. `cleanup_settlement` identifies the explicitly
-configured `policy` (`preserve_execution` or `fail_fast`) and
-`source: node_parameter` only for a completed call or input request that uses
-that policy; null means no policy was configured or the execution itself
-failed, not a selected disposition. A missing policy after a completed call or
-input request produces a "cleanup settlement policy required" refusal. The
+redispatch-free replay. `cleanup_settlement` identifies the effective
+`policy` (`preserve_execution` or `fail_fast`) and `source` (`default` when the
+node parameter is omitted, `node_parameter` when explicit) for a completed call
+or input request. The default preserves the result or suspends with the exact
+durable question; explicit fail-fast refuses settlement without execution retry
+or `on_fail` routing. Null means cleanup succeeded or execution itself failed;
+historical null policy facts remain null and never authorize continuation or
+replay of a previously refused settlement. The
 operation result and `mcp_input_pending` continuation remain durable under
 every disposition. Independent execution errors and optional degradation retain
 their existing handling. See [`mcp.call`](contract-reference.md).

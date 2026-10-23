@@ -17,7 +17,7 @@ pub struct ToolCallEventData {
     /// Cleanup failure retained beside the execution outcome.
     #[serde(default)]
     pub cleanup_error: Option<ToolCallError>,
-    /// Explicit cleanup policy and its configuration source; absent when none was supplied.
+    /// Effective cleanup policy and source; absent when cleanup settlement is not applied.
     #[serde(default)]
     pub cleanup_settlement: Option<McpCleanupSettlement>,
     pub duration_ms: u64,
@@ -26,7 +26,7 @@ pub struct ToolCallEventData {
     pub sources: Vec<ToolCallSource>,
     pub truncated: bool,
 }
-/// Explicit per-node settlement of a failed direct MCP session cleanup.
+/// Settlement of a failed direct MCP session cleanup.
 #[derive(Debug, Clone, Copy, Serialize, serde::Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum McpCleanupPolicy {
@@ -42,6 +42,7 @@ pub struct McpCleanupSettlement {
 #[derive(Debug, Clone, Copy, Serialize, serde::Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum McpCleanupPolicySource {
+    Default,
     NodeParameter,
 }
 #[derive(Debug, Clone, Copy, Serialize, serde::Deserialize, JsonSchema, PartialEq, Eq)]
@@ -146,5 +147,41 @@ mod tests {
         let read: ToolCallEventData =
             serde_json::from_value(payload).expect("an older event still reads");
         assert!(read.cleanup_error.is_none());
+    }
+
+    #[test]
+    fn cleanup_policy_provenance_roundtrips_without_defaulting_historical_events() {
+        for source in [
+            McpCleanupPolicySource::Default,
+            McpCleanupPolicySource::NodeParameter,
+        ] {
+            let mut event = event(None);
+            event.cleanup_settlement = Some(McpCleanupSettlement {
+                policy: McpCleanupPolicy::PreserveExecution,
+                source,
+            });
+            let payload = serde_json::to_value(event).unwrap();
+            let read: ToolCallEventData = serde_json::from_value(payload).unwrap();
+            let settlement = read.cleanup_settlement.unwrap();
+            assert_eq!(settlement.policy, McpCleanupPolicy::PreserveExecution);
+            assert_eq!(settlement.source, source);
+        }
+        let mut payload = serde_json::to_value(event(None)).unwrap();
+        // A historical refusal's null policy is not authorization from the
+        // newly introduced default, nor is an absent historical field.
+        for absent in [false, true] {
+            if absent {
+                payload
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("cleanup_settlement");
+            }
+            let read: ToolCallEventData = serde_json::from_value(payload.clone()).unwrap();
+            assert!(read.cleanup_settlement.is_none());
+        }
+        assert_eq!(
+            crate::openapi_components()["schemas"]["McpCleanupPolicySource"]["enum"],
+            json!(["default", "node_parameter"])
+        );
     }
 }

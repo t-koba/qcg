@@ -2622,12 +2622,12 @@ export interface components {
             authorization_url: string;
         };
         /**
-         * @description Explicit per-node settlement of a failed direct MCP session cleanup.
+         * @description Settlement of a failed direct MCP session cleanup.
          * @enum {string}
          */
         McpCleanupPolicy: "preserve_execution" | "fail_fast";
         /** @enum {string} */
-        McpCleanupPolicySource: "node_parameter";
+        McpCleanupPolicySource: "default" | "node_parameter";
         McpCleanupSettlement: {
             policy: components["schemas"]["McpCleanupPolicy"];
             source: components["schemas"]["McpCleanupPolicySource"];
@@ -3364,7 +3364,7 @@ export interface components {
              */
             cleanup_error: components["schemas"]["ToolCallError"] | null;
             /**
-             * @description Explicit cleanup policy and its configuration source; absent when none was supplied.
+             * @description Effective cleanup policy and source; absent when cleanup settlement is not applied.
              * @default null
              */
             cleanup_settlement: components["schemas"]["McpCleanupSettlement"] | null;

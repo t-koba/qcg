@@ -29,6 +29,20 @@ pub(crate) struct McpCallParams {
     pub(crate) cleanup_failure: Option<api::McpCleanupPolicy>,
 }
 
+impl McpCallParams {
+    pub(crate) fn cleanup_settlement(&self) -> api::McpCleanupSettlement {
+        api::McpCleanupSettlement {
+            policy: self
+                .cleanup_failure
+                .unwrap_or(api::McpCleanupPolicy::PreserveExecution),
+            source: if self.cleanup_failure.is_some() {
+                api::McpCleanupPolicySource::NodeParameter
+            } else {
+                api::McpCleanupPolicySource::Default
+            },
+        }
+    }
+}
 fn default_true() -> bool {
     true
 }

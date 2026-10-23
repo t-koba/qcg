@@ -771,21 +771,22 @@ hold exactly is refused rather than stated approximately - and `min` and
   call) fail the run unless `optional = true`, which degrades to a null
   output and records a `degraded` tool call. Validation, elicitation, and
   confirmation paths still fail. For a cleanup failure after a completed call
-  or a request for user input, set the node parameter `cleanup_failure`
-  explicitly to `"preserve_execution"` (return the result or suspend with the
-  question) or `"fail_fast"` (refuse settlement without ordinary execution
-  retry or `on_fail` routing). If unset, cleanup failure produces an explicit
-  "cleanup settlement policy required" refusal, not a selected disposition.
+  or a request for user input, the node parameter `cleanup_failure` defaults to
+  `"preserve_execution"`: return the result or suspend with the exact durable
+  question. Cleanup failure does not prove that the remote effect failed or
+  authorize repeating it. Set `cleanup_failure = "fail_fast"` to refuse settlement
+  without ordinary execution retry or `on_fail` routing.
   Cleanup policy does not replace independent execution-error handling or
   optional execution-error degradation.
 
   Both execution and cleanup facts are recorded before applying cleanup policy
   in durable `mcp_cleanup_settled` and observation `tool_call` events. Their
   `status` describes execution, not the cleanup disposition. `cleanup_error`
-  retains the close failure; `cleanup_settlement` carries the explicit `policy`
-  and `source = "node_parameter"` only when settlement of a completed call or
-  input request uses that policy, and is null when no policy was supplied or
-  when the execution itself failed. Every disposition retains the exact
+  retains the close failure; `cleanup_settlement` carries the effective `policy`
+  and its `source`: `"default"` when omitted or `"node_parameter"` when explicit.
+  It is null when cleanup succeeded or execution itself failed. Historical null
+  settlement facts remain null: the new default does not reinterpret an earlier
+  refusal as authorization. Every disposition retains the exact
   completed result in the operation replay state and a bounded event result
   (64 KiB, `truncated` flag), and retains the exact `mcp_input_pending`
   continuation when the tool asked for input. Fail-fast does not turn a
@@ -4158,6 +4159,7 @@ metadata. Update it with `qcg docs step-schemas`.
       "type": "object"
     },
     "cleanup_failure": {
+      "default": "preserve_execution",
       "enum": [
         "preserve_execution",
         "fail_fast"

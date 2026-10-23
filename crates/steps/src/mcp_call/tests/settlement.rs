@@ -71,7 +71,10 @@ impl ServerHandler for CountingTool {
         }
         if args["ask"] == true {
             assert_eq!(request.request_state.as_deref(), Some("opaque-state"));
-            assert!(request.input_responses.unwrap().contains_key("profile"));
+            assert_eq!(
+                request.input_responses.unwrap()["profile"],
+                json!({"action": "accept", "content": {"name": "Ada"}})
+            );
         }
         if args["large"] == true {
             return Ok(CallToolResult::structured(json!({"text": "x".repeat(70 * 1024)})).into());
@@ -193,9 +196,12 @@ tool = "echo"
 }
 
 fn params(policy: Option<McpCleanupPolicy>, optional: bool) -> McpCallParams {
-    serde_json::from_value(json!({"server": "mock", "tool": "echo", "arguments": {},
-        "optional": optional, "cleanup_failure": policy}))
-    .unwrap()
+    let mut value = json!({"server": "mock", "tool": "echo", "arguments": {},
+        "optional": optional});
+    if let Some(policy) = policy {
+        value["cleanup_failure"] = serde_json::to_value(policy).unwrap();
+    }
+    serde_json::from_value(value).unwrap()
 }
 
 fn settle(
@@ -303,6 +309,11 @@ async fn completed_result_survives_every_cleanup_disposition_and_replays_without
         let before = mock.hits.lock().unwrap().len();
         let settled = settle(&ctx, &harness.node, policy, false, execution);
         assert_disposition(&settled, policy);
+        if policy != Some(FailFast) {
+            assert!(
+                matches!(&settled, Ok(StepOutcome::Success { output: Some(value), .. }) if value["result"] == raw)
+            );
+        }
         let records = harness.records("mcp_cleanup_settled");
         assert_eq!(records.len(), 1);
         let fact = &records[0];
@@ -337,7 +348,7 @@ async fn completed_result_survives_every_cleanup_disposition_and_replays_without
 async fn pending_continuation_survives_every_cleanup_disposition() {
     let mock = MockMcp::start().await;
     for policy in [Some(PreserveExecution), Some(FailFast), None] {
-        let harness = Harness::new();
+        let mut harness = Harness::new();
         let journal = harness.journal();
         let mut vars = ValueBag::with_inputs(BTreeMap::new());
         let ctx = StepContext {
@@ -355,7 +366,7 @@ async fn pending_continuation_survives_every_cleanup_disposition() {
         assert_eq!(pending.len(), 1);
         let settled = settle(&ctx, &harness.node, policy, false, execution);
         assert_disposition(&settled, policy);
-        if policy == Some(PreserveExecution) {
+        if policy != Some(FailFast) {
             assert!(
                 matches!(settled, Ok(StepOutcome::NeedsUser { question, .. }) if question.id == question_id)
             );
@@ -364,37 +375,55 @@ async fn pending_continuation_survives_every_cleanup_disposition() {
         let fact = &harness.records("mcp_cleanup_settled")[0];
         assert_eq!(fact["status"], "needs_user");
         assert_policy(fact, policy);
+        let before = mock.hits.lock().unwrap().len();
         drop(journal);
-        assert_eq!(harness.journal().state().mcp_pending, pending);
+        let journal = harness.journal();
+        assert_eq!(journal.state().mcp_pending, pending);
+        assert_eq!(mock.hits.lock().unwrap().len(), before);
+        if policy != Some(FailFast) {
+            // Cleanup alone never sends a follow-up. An answer plus explicit
+            // re-entry resumes exactly the durable request after restart.
+            harness
+                .run
+                .answers
+                .insert(question_id, json!({"response_0": {"name": "Ada"}}));
+            let ctx = StepContext {
+                run: &harness.run,
+                journal: &journal,
+                vars: &mut vars,
+                llm: None,
+            };
+            let resumed = execute(&mock, &ctx, &harness.node, true).await.unwrap();
+            assert!(matches!(resumed, DirectMcpCallOutcome::Complete(_)));
+            assert_eq!(mock.hits.lock().unwrap().len(), before + 1);
+            assert!(journal.state().mcp_pending.is_empty());
+        }
     }
 }
 
 fn assert_disposition(result: &Result<StepOutcome, StepError>, policy: Option<McpCleanupPolicy>) {
     match policy {
-        Some(PreserveExecution) => assert!(result.is_ok(), "{result:?}"),
+        Some(PreserveExecution) | None => assert!(result.is_ok(), "{result:?}"),
         Some(FailFast) => assert!(
             matches!(result, Err(StepError::Refused { message, .. }) if message.contains("fail_fast"))
-        ),
-        None => assert!(
-            matches!(result, Err(StepError::Refused { message, .. }) if message.contains("cleanup settlement policy required"))
         ),
     }
 }
 
 fn assert_policy(fact: &Value, policy: Option<McpCleanupPolicy>) {
     assert_eq!(fact["cleanup_error"]["code"], "cleanup_failed");
-    if let Some(policy) = policy {
-        assert_eq!(
-            fact["cleanup_settlement"]["policy"],
-            serde_json::to_value(policy).unwrap()
-        );
-        assert_eq!(fact["cleanup_settlement"]["source"], "node_parameter");
-    } else {
-        assert!(
-            fact["cleanup_settlement"].is_null(),
-            "missing policy is not a selected disposition"
-        );
-    }
+    assert_eq!(
+        fact["cleanup_settlement"]["policy"],
+        serde_json::to_value(policy.unwrap_or(PreserveExecution)).unwrap()
+    );
+    assert_eq!(
+        fact["cleanup_settlement"]["source"],
+        if policy.is_some() {
+            "node_parameter"
+        } else {
+            "default"
+        }
+    );
 }
 
 #[test]
@@ -439,14 +468,15 @@ fn execution_errors_keep_their_own_handling_including_optional_degradation() {
 }
 
 #[test]
-fn missing_policy_is_not_defaulted_and_invalid_values_are_rejected() {
+fn missing_policy_resolves_to_default_and_invalid_values_are_rejected() {
     let harness = Harness::new();
     let mut node = harness.node.clone();
-    assert!(
-        super::validate::mcp_call_params(&node)
-            .unwrap()
-            .cleanup_failure
-            .is_none()
+    let params = super::validate::mcp_call_params(&node).unwrap();
+    assert!(params.cleanup_failure.is_none());
+    assert_eq!(params.cleanup_settlement().policy, PreserveExecution);
+    assert_eq!(
+        params.cleanup_settlement().source,
+        api::McpCleanupPolicySource::Default
     );
     node.params.insert(
         "cleanup_failure".into(),
@@ -548,4 +578,40 @@ async fn oversized_results_stay_bounded_in_events_but_replay_exact() {
     let replay = execute_large(&mock, &ctx, &harness.node).await.unwrap();
     assert!(matches!(replay, DirectMcpCallOutcome::Complete(value) if value == raw));
     assert_eq!(mock.hits.lock().unwrap().len(), before);
+}
+
+#[test]
+fn cleanup_policy_never_hides_invalid_completed_output_even_when_optional() {
+    for policy in [None, Some(PreserveExecution), Some(FailFast)] {
+        for optional in [false, true] {
+            let harness = Harness::new();
+            let journal = harness.journal();
+            let mut vars = ValueBag::with_inputs(BTreeMap::new());
+            let ctx = StepContext {
+                run: &harness.run,
+                journal: &journal,
+                vars: &mut vars,
+                llm: None,
+            };
+            let mut params = params(policy, optional);
+            params.output_schema = Some(json!({"type": "string"}));
+            let cleanup_error = StepError::failed("call", "injected close failure");
+            let result = settle_direct_mcp(
+                &ctx,
+                &harness.node,
+                &params,
+                Ok(DirectMcpCallOutcome::Complete(json!({"invalid": true}))),
+                &json!({}),
+                Some(&cleanup_error),
+                0,
+            );
+            assert!(
+                matches!(result, Err(StepError::Failed { message, .. }) if message.contains("output_schema"))
+            );
+            let fact = &harness.records("mcp_cleanup_settled")[0];
+            assert_eq!(fact["status"], "failed");
+            assert_eq!(fact["result"]["value"], json!({"invalid": true}));
+            assert_policy(fact, policy);
+        }
+    }
 }

@@ -2070,7 +2070,7 @@
         "type": "object"
       },
       "McpCleanupPolicy": {
-        "description": "Explicit per-node settlement of a failed direct MCP session cleanup.",
+        "description": "Settlement of a failed direct MCP session cleanup.",
         "enum": [
           "preserve_execution",
           "fail_fast"
@@ -2079,6 +2079,7 @@
       },
       "McpCleanupPolicySource": {
         "enum": [
+          "default",
           "node_parameter"
         ],
         "type": "string"
@@ -4097,7 +4098,7 @@
               }
             ],
             "default": null,
-            "description": "Explicit cleanup policy and its configuration source; absent when none was supplied."
+            "description": "Effective cleanup policy and source; absent when cleanup settlement is not applied."
           },
           "duration_ms": {
             "format": "uint64",

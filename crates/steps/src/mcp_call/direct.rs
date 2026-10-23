@@ -648,7 +648,7 @@ pub(crate) struct DirectMcpToolEvent<'a> {
     /// The session cleanup that followed the tool call failed. Retained
     /// beside the execution fact: it never replaces the call's outcome.
     pub(crate) cleanup_error: Option<&'a StepError>,
-    pub(crate) cleanup_policy: Option<api::McpCleanupPolicy>,
+    pub(crate) cleanup_settlement: Option<api::McpCleanupSettlement>,
     pub(crate) duration_ms: u64,
     pub(crate) degraded: bool,
 }
@@ -664,7 +664,7 @@ pub(crate) fn record_direct_mcp_tool_event(
         result,
         error,
         cleanup_error,
-        cleanup_policy,
+        cleanup_settlement,
         duration_ms,
         degraded,
     } = details;
@@ -737,12 +737,7 @@ pub(crate) fn record_direct_mcp_tool_event(
         phase,
         agent: None,
         error: error_value,
-        cleanup_settlement: cleanup_error.as_ref().and(cleanup_policy).map(|policy| {
-            api::McpCleanupSettlement {
-                policy,
-                source: api::McpCleanupPolicySource::NodeParameter,
-            }
-        }),
+        cleanup_settlement: cleanup_error.as_ref().and(cleanup_settlement),
         cleanup_error,
         duration_ms,
         arguments,
@@ -753,7 +748,6 @@ pub(crate) fn record_direct_mcp_tool_event(
     let mut event = serde_json::to_value(event)?;
     event["node"] = Value::String(node.id.clone());
     // Settlement facts must survive even when observation auditing is off.
-    // Missing policy remains None, not a selected disposition.
     if event["cleanup_error"].is_object() {
         ctx.journal
             .event("mcp_cleanup_settled", &event)

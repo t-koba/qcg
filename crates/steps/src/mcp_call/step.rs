@@ -29,7 +29,7 @@ impl StepExecutor for McpCallStep {
                 "timeout_seconds": { "type": "integer", "minimum": 1 },
                 "side_effects": { "type": "boolean" },
                 "optional": { "type": "boolean" },
-                "cleanup_failure": { "type": "string", "enum": ["preserve_execution", "fail_fast"] },
+                "cleanup_failure": { "type": "string", "enum": ["preserve_execution", "fail_fast"], "default": "preserve_execution" },
             }),
         ))
     }

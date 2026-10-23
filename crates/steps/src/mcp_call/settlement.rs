@@ -22,7 +22,7 @@ pub(super) fn settle_direct_mcp(
         result: None,
         error: None,
         cleanup_error,
-        cleanup_policy: None,
+        cleanup_settlement: None,
         duration_ms,
         degraded: false,
     };
@@ -39,7 +39,9 @@ pub(super) fn settle_direct_mcp(
         }
         Ok(execution) => execution,
     };
-    event.cleanup_policy = params.cleanup_failure;
+    let settlement = params.cleanup_settlement();
+    let cleanup_policy = settlement.policy;
+    event.cleanup_settlement = Some(settlement);
     // Store the raw result even if output validation or cleanup settlement fails.
     let validated = match &execution {
         DirectMcpCallOutcome::Complete(result) => {
@@ -59,20 +61,11 @@ pub(super) fn settle_direct_mcp(
     record_direct_mcp_tool_event(ctx, node, event)?;
     // Execution errors keep their independent handling. Cleanup never redispatches.
     let result = validated.transpose()?;
-    if cleanup_failed {
-        let message = match params.cleanup_failure {
-            Some(McpCleanupPolicy::PreserveExecution) => None,
-            Some(McpCleanupPolicy::FailFast) => {
-                Some("MCP cleanup failed; cleanup_failure = fail_fast")
-            }
-            None => Some("MCP cleanup settlement policy required: configure cleanup_failure"),
-        };
-        if let Some(message) = message {
-            return Err(StepError::Refused {
-                node: node.id.clone(),
-                message: message.into(),
-            });
-        }
+    if cleanup_failed && cleanup_policy == McpCleanupPolicy::FailFast {
+        return Err(StepError::Refused {
+            node: node.id.clone(),
+            message: "MCP cleanup failed; cleanup_failure = fail_fast".into(),
+        });
     }
     match execution {
         DirectMcpCallOutcome::NeedsUser(question) => Ok(StepOutcome::NeedsUser {

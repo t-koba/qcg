@@ -31,7 +31,7 @@ pub(crate) async fn degrade_optional_mcp_call(
             result: None,
             error: Some(&error),
             cleanup_error: None,
-            cleanup_policy: None,
+            cleanup_settlement: None,
             duration_ms: 0,
             degraded: params.optional,
         },
