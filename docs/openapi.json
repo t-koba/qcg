@@ -411,6 +411,31 @@
           }
         ]
       },
+      "BudgetExhaustion": {
+        "additionalProperties": false,
+        "description": "Amounts reported by the enforcing budget check; resource names retain that check's scope.",
+        "properties": {
+          "allowed": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "resource": {
+            "type": "string"
+          },
+          "used": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "resource",
+          "used",
+          "allowed"
+        ],
+        "type": "object"
+      },
       "CommandIsolation": {
         "enum": [
           "container",
@@ -790,12 +815,12 @@
           },
           {
             "const": "timed_out",
-            "description": "A per-attempt node timeout fired. Distinct from execution failure\nand elapsed exceedance so run cancel, node timeout, and elapsed\nlimit stay distinguishable (E11).",
+            "description": "Per-attempt timeout, distinct from execution failure and run elapsed expiry (E11).",
             "type": "string"
           },
           {
             "const": "refused",
-            "description": "A guard or admission refused the attempt. Distinct from execution\nfailure so a refusal never reads as a failed execution (E11).",
+            "description": "Guard/admission refusal, not a failed execution (E11).",
             "type": "string"
           }
         ]
@@ -811,6 +836,16 @@
               "$ref": "#/components/schemas/DependencyFailure"
             },
             "type": "array"
+          },
+          "exhaustion": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BudgetExhaustion"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "message": {
             "type": "string"

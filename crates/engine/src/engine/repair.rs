@@ -385,10 +385,7 @@ impl Engine {
                 return Err(error);
             }
             Err(error) => {
-                let reason = FailureDetail::new(
-                    super::types::failure_code_for_error(&error),
-                    error.to_string(),
-                );
+                let reason = super::types::failure_detail_for_error(&error);
                 states.insert(graph_node_id.clone(), NodeState::Failed(reason.clone()));
                 env.journal.event(
                     "step_finished",

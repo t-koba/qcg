@@ -49,9 +49,8 @@ pub(crate) fn dependency_failure(
             .join("; ")
     };
     Some(FailureDetail {
-        code,
-        message,
         dependencies,
+        ..FailureDetail::new(code, message)
     })
 }
 

@@ -75,22 +75,23 @@ pub enum Progress {
 pub enum RunFailureKind {
     Canceled,
     Execution,
-    /// The workspace was rewound to an older pinned revision instead of
-    /// projecting the latest pin. Distinct from generic execution failure
-    /// so operators can tell a rollback apart from corruption (E06). The
-    /// durable `FailureCode` stays `ExecutionFailed` because that enum is
-    /// FOREIGN (`model`); the kind preserves the distinction to
-    /// `Progress::Failed`.
+    /// Workspace rollback, distinct from corruption via Progress::Failed (E06).
+    /// The canonical FailureCode remains ExecutionFailed.
     Rewound,
 }
 
 #[derive(Debug)]
 pub struct RunFailure {
     pub kind: RunFailureKind,
-    /// Dedicated failure code so consumers can distinguish a hard elapsed
-    /// deadline (never retried) from ordinary execution failures (E11).
-    pub code: model::FailureCode,
-    pub message: String,
+    /// The same canonical detail persisted in step/run failure records.
+    pub detail: model::FailureDetail,
+}
+
+impl std::ops::Deref for RunFailure {
+    type Target = model::FailureDetail;
+    fn deref(&self) -> &Self::Target {
+        &self.detail
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -127,28 +128,34 @@ pub(crate) fn output_name_for(node: &contract::NodeDef) -> &str {
     node.output.as_deref().unwrap_or(&node.id)
 }
 
-/// Single mapping from engine errors to durable failure codes so parallel
-/// and sequential paths never diverge: run cancel, node timeout, elapsed
-/// exceedance, budget exceedance, guard refusal, and ordinary execution
-/// failures stay distinguishable (E11). `Rewound` maps to `ExecutionFailed`
-/// for the FOREIGN code (no dedicated `Rewound` code exists there) while
-/// `RunFailureKind::Rewound` preserves the distinct observable to `Progress`.
-pub(crate) fn failure_code_for_error(error: &EngineError) -> model::FailureCode {
-    match error {
-        EngineError::ResumableAgent(error) => failure_code_for_error(error),
+/// Canonical projection shared by durable step failures and host reports.
+/// Rewound retains ExecutionFailed here; RunFailureKind distinguishes it.
+pub(crate) fn failure_detail_for_error(error: &EngineError) -> model::FailureDetail {
+    use model::{BudgetExhaustion, FailureCode, FailureDetail};
+    let mut detail = FailureDetail::from(error.to_string());
+    detail.code = match error {
+        EngineError::ResumableAgent(error) => return failure_detail_for_error(error),
         EngineError::Step(
-            crate::StepError::ElapsedExceeded { .. }
-            | crate::StepError::ElapsedExpiredBeforeStart { .. },
-        ) => model::FailureCode::ElapsedExceeded,
-        EngineError::Step(crate::StepError::TimedOut { .. }) => model::FailureCode::TimedOut,
-        EngineError::Step(crate::StepError::BudgetExceeded { .. }) => {
-            model::FailureCode::BudgetExceeded
+            StepError::ElapsedExceeded { .. } | StepError::ElapsedExpiredBeforeStart { .. },
+        ) => FailureCode::ElapsedExceeded,
+        EngineError::Step(StepError::TimedOut { .. }) => FailureCode::TimedOut,
+        EngineError::Step(StepError::BudgetExceeded {
+            resource,
+            used,
+            limit,
+        }) => {
+            detail.exhaustion = Some(BudgetExhaustion {
+                resource: (*resource).into(),
+                used: *used,
+                allowed: *limit,
+            });
+            FailureCode::BudgetExceeded
         }
-        EngineError::Step(crate::StepError::Refused { .. }) => model::FailureCode::Refused,
-        EngineError::Rewound(_) => model::FailureCode::ExecutionFailed,
-        _ if error.is_canceled() => model::FailureCode::Canceled,
-        _ => model::FailureCode::ExecutionFailed,
-    }
+        EngineError::Step(StepError::Refused { .. }) => FailureCode::Refused,
+        _ if error.is_canceled() => FailureCode::Canceled,
+        _ => FailureCode::ExecutionFailed,
+    };
+    detail
 }
 
 /// Maps an engine error to its distinct `RunFailureKind` without collapsing
@@ -566,46 +573,51 @@ mod tests {
         // E11: run cancel, node timeout, elapsed exceedance, and ordinary
         // failures must never collapse into one code.
         assert_eq!(
-            failure_code_for_error(&EngineError::Canceled),
+            failure_detail_for_error(&EngineError::Canceled).code,
             model::FailureCode::Canceled
         );
         assert_eq!(
-            failure_code_for_error(&EngineError::Step(crate::StepError::Cancelled)),
+            failure_detail_for_error(&EngineError::Step(crate::StepError::Cancelled)).code,
             model::FailureCode::Canceled
         );
         assert_eq!(
-            failure_code_for_error(&EngineError::Step(crate::StepError::TimedOut {
+            failure_detail_for_error(&EngineError::Step(crate::StepError::TimedOut {
                 node: "n".into(),
                 timeout_secs: 1,
-            })),
+            }))
+            .code,
             model::FailureCode::TimedOut
         );
         assert_eq!(
-            failure_code_for_error(&EngineError::Step(crate::StepError::ElapsedExceeded {
+            failure_detail_for_error(&EngineError::Step(crate::StepError::ElapsedExceeded {
                 node: "n".into(),
                 limit_secs: 1,
-            })),
+            }))
+            .code,
             model::FailureCode::ElapsedExceeded
         );
         assert_eq!(
-            failure_code_for_error(&EngineError::Step(crate::StepError::failed("n", "boom"))),
+            failure_detail_for_error(&EngineError::Step(crate::StepError::failed("n", "boom")))
+                .code,
             model::FailureCode::ExecutionFailed
         );
         assert_eq!(
-            failure_code_for_error(&EngineError::Step(crate::StepError::BudgetExceeded {
+            failure_detail_for_error(&EngineError::Step(crate::StepError::BudgetExceeded {
                 resource: "tokens",
                 used: 10,
                 limit: 5,
-            })),
+            }))
+            .code,
             model::FailureCode::BudgetExceeded
         );
         // A guard refusal carries its own durable code with the refusal
         // message preserved alongside it.
         assert_eq!(
-            failure_code_for_error(&EngineError::Step(crate::StepError::Refused {
+            failure_detail_for_error(&EngineError::Step(crate::StepError::Refused {
                 node: "n".into(),
                 message: "indeterminate outcome without opt-in".into(),
-            })),
+            }))
+            .code,
             model::FailureCode::Refused
         );
     }

@@ -16,3 +16,5 @@ pub(crate) mod scheduling;
 pub(crate) mod package_pinning;
 
 mod invalidation;
+
+mod budget_failures;

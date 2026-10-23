@@ -2057,6 +2057,14 @@ export interface components {
         AttemptStatus: "success" | "repaired" | "repair_failed" | "recheck_failed" | "check_failed" | "needs_user" | "needs_confirm";
         /** @description Audit preset declared by the contract designer. */
         AuditLevel: "standard" | "minimal";
+        /** @description Amounts reported by the enforcing budget check; resource names retain that check's scope. */
+        BudgetExhaustion: {
+            /** Format: uint64 */
+            allowed: number;
+            resource: string;
+            /** Format: uint64 */
+            used: number;
+        };
         /** @enum {string} */
         CommandIsolation: "container" | "trusted_host";
         CommandPermission: {
@@ -2187,6 +2195,7 @@ export interface components {
         FailureDetail: {
             code: components["schemas"]["FailureCode"];
             dependencies?: components["schemas"]["DependencyFailure"][];
+            exhaustion?: components["schemas"]["BudgetExhaustion"] | null;
             message: string;
         };
         /** @description A retained workspace file revision: its path and the digest of its bytes. */

@@ -35,7 +35,7 @@ fn audit_policies(
 }
 use super::types::{
     Engine, EngineError, Progress, RunContext, RunFailure, RunOptions, RunSnapshotSource,
-    canonical_file_inputs, failure_code_for_error, with_failed_evidence,
+    canonical_file_inputs, failure_detail_for_error, with_failed_evidence,
 };
 
 /// Staging filename fragment reaped at startup (E13): the single current
@@ -257,8 +257,7 @@ impl Engine {
             }
             Err(error) => Progress::Failed(RunFailure {
                 kind: super::types::failure_kind_for_error(&error),
-                code: failure_code_for_error(&error),
-                message: error.to_string(),
+                detail: failure_detail_for_error(&error),
             }),
         }
     }
@@ -922,8 +921,7 @@ impl Engine {
                         return Err(error);
                     }
                     Err(error) => {
-                        let reason =
-                            FailureDetail::new(failure_code_for_error(&error), error.to_string());
+                        let reason = failure_detail_for_error(&error);
                         states.insert(id.clone(), NodeState::Failed(reason.clone()));
                         journal.event(
                             "step_finished",
@@ -1380,26 +1378,20 @@ impl Engine {
             // list is published under the reserved `hook_failures` step so a
             // hook template can render it.
             vars.set_step_output("hook_failures", json!({ "failures": &failed }));
-            if let Err(error) = self
-                .run_hooks(&context, &journal, &mut vars, &mut budget, "step_failed")
-                .await
-            {
-                failed.push(RunNodeFailureEventData {
-                    path: NodePath::root("hook.step_failed"),
-                    failure: FailureDetail::new(FailureCode::ExecutionFailed, error.to_string()),
-                });
-            }
-            if let Err(error) = self
-                .run_hooks(&context, &journal, &mut vars, &mut budget, "run_failed")
-                .await
-            {
-                // The run is already failing; a run_failed hook failure is
-                // recorded and appended to the failure list instead of
-                // replacing the original cause.
-                failed.push(RunNodeFailureEventData {
-                    path: NodePath::root("hook.run_failed"),
-                    failure: FailureDetail::new(FailureCode::ExecutionFailed, error.to_string()),
-                });
+            // Hook failures append without replacing the original cause; both
+            // hooks observe the same original hook_failures output, in order.
+            for event in ["step_failed", "run_failed"] {
+                if let Err(error) = self
+                    .run_hooks(&context, &journal, &mut vars, &mut budget, event)
+                    .await
+                {
+                    let mut failure = failure_detail_for_error(&error);
+                    failure.code = FailureCode::ExecutionFailed;
+                    failed.push(RunNodeFailureEventData {
+                        path: NodePath::root(format!("hook.{event}")),
+                        failure,
+                    });
+                }
             }
             super::elapsed::close(&mut episode, &journal)?;
             journal.event(

@@ -13,17 +13,14 @@ pub enum FailureCode {
     CheckFailed,
     ExecutionFailed,
     ElapsedExceeded,
-    /// A per-attempt node timeout fired. Distinct from execution failure
-    /// and elapsed exceedance so run cancel, node timeout, and elapsed
-    /// limit stay distinguishable (E11).
+    /// Per-attempt timeout, distinct from execution failure and run elapsed expiry (E11).
     TimedOut,
     RepairExhausted,
     SchedulerFailed,
     Canceled,
     Interrupted,
     BudgetExceeded,
-    /// A guard or admission refused the attempt. Distinct from execution
-    /// failure so a refusal never reads as a failed execution (E11).
+    /// Guard/admission refusal, not a failed execution (E11).
     Refused,
 }
 
@@ -42,6 +39,15 @@ pub struct DependencyFailure {
     pub message: String,
 }
 
+/// Amounts reported by the enforcing budget check; resource names retain that check's scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetExhaustion {
+    pub resource: String,
+    pub used: u64,
+    pub allowed: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FailureDetail {
@@ -49,6 +55,8 @@ pub struct FailureDetail {
     pub message: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dependencies: Vec<DependencyFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exhaustion: Option<BudgetExhaustion>,
 }
 
 impl FailureDetail {
@@ -57,11 +65,8 @@ impl FailureDetail {
             code,
             message: message.into(),
             dependencies: Vec::new(),
+            exhaustion: None,
         }
-    }
-
-    pub fn execution(message: impl Into<String>) -> Self {
-        Self::new(FailureCode::ExecutionFailed, message)
     }
 }
 
@@ -79,14 +84,8 @@ impl std::ops::Deref for FailureDetail {
     }
 }
 
-impl From<String> for FailureDetail {
-    fn from(message: String) -> Self {
-        Self::execution(message)
-    }
-}
-
-impl From<&str> for FailureDetail {
-    fn from(message: &str) -> Self {
-        Self::execution(message)
+impl<T: Into<String>> From<T> for FailureDetail {
+    fn from(message: T) -> Self {
+        Self::new(FailureCode::ExecutionFailed, message)
     }
 }

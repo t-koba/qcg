@@ -2209,7 +2209,7 @@ impl LocalService {
                             "run_error",
                             json!({
                                 "error": error.message,
-                                "reason": FailureDetail::new(error.code, error.message.clone()),
+                                "reason": error.detail,
                             }),
                         ));
                     }

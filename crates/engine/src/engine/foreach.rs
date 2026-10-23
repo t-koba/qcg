@@ -13,7 +13,7 @@ use super::repair_support::failure_from_findings;
 use super::replay::BudgetTracker;
 use super::types::{
     Engine, EngineError, ForeachControlParams, ForeachIteration, RunContext,
-    failure_code_for_error, with_failed_evidence,
+    failure_detail_for_error, with_failed_evidence,
 };
 use policy::{MAX_FOREACH_ITERATIONS, MAX_FOREACH_PARALLELISM};
 
@@ -386,8 +386,7 @@ impl Engine {
                     return Err(error);
                 }
                 Err(error) => {
-                    let reason =
-                        FailureDetail::new(failure_code_for_error(&error), error.to_string());
+                    let reason = failure_detail_for_error(&error);
                     journal.event(
                         "step_finished",
                         json!({ "node": block_id, "status": "failed", "reason": reason }),
@@ -577,7 +576,11 @@ async fn drain_foreach_tasks(
                         record["cancellation_cause"] = json!("reported_by_task");
                         ("task_canceled", None, None)
                     }
-                    _ => ("task_error", Some(failure_code_for_error(&error)), None),
+                    _ => (
+                        "task_error",
+                        Some(failure_detail_for_error(&error).code),
+                        None,
+                    ),
                 };
                 record["classification"] = json!(classification);
                 if let Some(code) = code {

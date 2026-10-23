@@ -87,3 +87,39 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn legacy_failure_details_roundtrip_without_inventing_exhaustion() {
+        for code in ["execution_failed", "budget_exceeded"] {
+            let legacy = json!({"code":code,"message":"historical diagnostic"});
+            let detail: FailureDetail = serde_json::from_value(legacy.clone()).unwrap();
+            assert_eq!(detail.exhaustion, None);
+            assert_eq!(serde_json::to_value(detail).unwrap(), legacy);
+        }
+        assert_eq!(
+            FailureDetail::from("text"),
+            FailureDetail::from(String::from("text"))
+        );
+    }
+
+    #[test]
+    fn budget_amounts_are_exact_and_closed() {
+        let value = json!({"code":"budget_exceeded","message":"unchanged",
+            "exhaustion":{"resource":"tokens","used":u64::MAX,"allowed":0}});
+        let detail: FailureDetail = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(detail).unwrap(), value);
+        for exhaustion in [
+            json!({"resource":"tokens","used":1}),
+            json!({"resource":"tokens","used":1,"allowed":0,"scope":"run"}),
+        ] {
+            let mut invalid = value.clone();
+            invalid["exhaustion"] = exhaustion;
+            assert!(serde_json::from_value::<FailureDetail>(invalid).is_err());
+        }
+    }
+}

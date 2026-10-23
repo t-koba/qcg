@@ -441,3 +441,38 @@ fn run_identity_parallel_compatibility_is_optional_and_roundtrips() {
             .any(|name| name == "parallel_compatibility_origin")
     );
 }
+
+#[test]
+fn failure_exhaustion_is_optional_typed_and_amounts_are_unsigned() {
+    let components = api::openapi_components();
+    let schemas = &components["schemas"];
+    let detail = &schemas["FailureDetail"];
+    assert!(
+        !detail["required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("exhaustion"))
+    );
+    assert_eq!(
+        detail["properties"]["exhaustion"]["anyOf"][0]["$ref"],
+        "#/components/schemas/BudgetExhaustion"
+    );
+    let facts = &schemas["BudgetExhaustion"];
+    assert_eq!(facts["additionalProperties"], false);
+    for amount in ["used", "allowed"] {
+        assert_eq!(facts["properties"][amount]["type"], "integer");
+        assert_eq!(facts["properties"][amount]["minimum"], 0);
+        assert!(
+            facts["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(amount))
+        );
+    }
+    assert!(
+        facts["required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("resource"))
+    );
+}

@@ -7954,3 +7954,5 @@ mod replay_safety;
 
 #[path = "tests/saved_interactions.rs"]
 mod saved_interactions;
+
+mod budget_failures;

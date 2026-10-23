@@ -1,7 +1,7 @@
 use crate::{JournalWriter, StepContext, StepError, StepOutcome};
 use contract::NodeDef;
 use contract::{NodeState, RetryPolicy, ValueBag};
-use model::{FailureCode, FailureDetail};
+use model::FailureCode;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -14,7 +14,9 @@ use super::checkpoint::pin_attempt_files;
 use super::repair_support::failure_from_findings;
 use super::replay::BudgetTracker;
 use super::run_context::elapsed_limit_secs;
-use super::types::{Engine, EngineError, RunContext, failure_code_for_error, with_failed_evidence};
+use super::types::{
+    Engine, EngineError, RunContext, failure_detail_for_error, with_failed_evidence,
+};
 
 /// Admission-time bounds shared by backoff and attempts; None means unconfigured (E10).
 #[derive(Clone, Copy)]
@@ -162,7 +164,7 @@ fn record_wave_join(
                 "interaction_pending"
             }
             error => {
-                record["code"] = json!(failure_code_for_error(error));
+                record["code"] = json!(failure_detail_for_error(error).code);
                 if error.is_resumable_agent() {
                     record["continuation_owner"] = json!("agent");
                 }
@@ -371,8 +373,7 @@ impl Engine {
                         terminal_errors.push(error);
                         continue;
                     }
-                    let reason =
-                        FailureDetail::new(failure_code_for_error(&error), error.to_string());
+                    let reason = failure_detail_for_error(&error);
                     states.insert(node.id.clone(), NodeState::Failed(reason.clone()));
                     journal.event(
                         "step_finished",
