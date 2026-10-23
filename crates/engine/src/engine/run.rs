@@ -1479,6 +1479,7 @@ fn is_distinct_execution_error(error: &EngineError) -> bool {
     match error {
         EngineError::Step(
             StepError::TimedOut { .. }
+            | StepError::ProviderContextExhausted { .. }
             | StepError::ElapsedExceeded { .. }
             | StepError::ElapsedExpiredBeforeStart { .. }
             | StepError::BudgetExceeded { .. },

@@ -39,6 +39,16 @@ Unreported-task replay remains separately guarded by the executor's explicit
 `replay_safe_after_interruption` capability; checkpoints alone never authorize
 replay.
 
+Completion `llm_call` events carry optional `stop_reason` (absent in older
+journals and decision calls). `model_context_window_exceeded` retains Anthropic's
+context-exhaustion terminal after its reported tokens and configured cost have
+settled exactly once. Canonical failures use `provider_context_exhausted` with no
+numeric `exhaustion`: Anthropic supplies no used/allowed capacity amounts.
+Partial output is not a completed step or permission to dispatch tools; no
+partial response text is added to this accounting or failure payload. Existing
+stream deltas remain observations only. No automatic retry, fallback, compaction
+or continuation is authorized by this terminal.
+
 Canonical failure details in step summaries, `step_finished.reason`,
 `run_finished.failures[].failure`, and `run_error.reason` may carry
 `exhaustion: {resource, used, allowed}`. These are exact unsigned amounts

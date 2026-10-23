@@ -33,6 +33,9 @@ pub struct LlmCallEventData {
     pub verbosity: Option<model::ResponseVerbosity>,
     #[serde(default)]
     pub stream: bool,
+    /// Normalized terminal reason; absent in older journals and decision calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
     pub tokens: TokenUsageEventData,
     pub cost_microusd: u64,
     #[serde(default)]

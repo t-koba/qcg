@@ -2987,3 +2987,168 @@ mod cache_usage;
 
 #[path = "tests/web_search.rs"]
 mod web_search;
+
+#[tokio::test]
+async fn anthropic_context_exhaustion_messages_and_sse_retain_equivalent_partial_facts() {
+    // Both documented transports include cache usage in total input. Empty,
+    // text, external tools and the structured-output shim are all incomplete.
+    for content in [
+        json!([]),
+        json!([{"type":"text","text":"partial answer"}]),
+        json!([{"type":"tool_use","id":"t1","name":"write_file","input":{"path":"out.txt"}}]),
+        json!([{"type":"tool_use","id":"t1","name":"response","input":{"answer":"partial"}}]),
+    ] {
+        let usage = json!({"input_tokens":10,"cache_read_input_tokens":4,
+            "cache_creation_input_tokens":2,"output_tokens":3});
+        let direct = parse_anthropic_response(json!({
+            "content":content, "stop_reason":"model_context_window_exceeded", "usage":usage
+        }))
+        .unwrap();
+        let mut accumulator =
+            HttpStreamAccumulator::new(ApiFlavor::AnthropicMessages, false).unwrap();
+        let (events, _receiver) = mpsc::channel(16);
+        accumulator
+            .ingest(
+                json!({"type":"message_start","message":{"usage":usage}}),
+                &events,
+            )
+            .await
+            .unwrap();
+        for (index, block) in content.as_array().unwrap().iter().enumerate() {
+            let mut start = block.clone();
+            if block["type"] == "tool_use" {
+                start["input"] = json!({});
+            }
+            accumulator
+                .ingest(
+                    json!({"type":"content_block_start","index":index,"content_block":start}),
+                    &events,
+                )
+                .await
+                .unwrap();
+            if block["type"] == "text" {
+                accumulator
+                    .ingest(
+                        json!({"type":"content_block_delta","index":index,
+                    "delta":{"type":"text_delta","text":block["text"]}}),
+                        &events,
+                    )
+                    .await
+                    .unwrap();
+            }
+            if block["type"] == "tool_use" {
+                accumulator
+                    .ingest(
+                        json!({"type":"content_block_delta","index":index,
+                    "delta":{"type":"input_json_delta","partial_json":block["input"].to_string()}}),
+                        &events,
+                    )
+                    .await
+                    .unwrap();
+            }
+            accumulator
+                .ingest(json!({"type":"content_block_stop","index":index}), &events)
+                .await
+                .unwrap();
+        }
+        accumulator.ingest(json!({"type":"message_delta","delta":{"stop_reason":"model_context_window_exceeded"},
+            "usage":{"output_tokens":3}}), &events).await.unwrap();
+        accumulator
+            .ingest(json!({"type":"message_stop"}), &events)
+            .await
+            .unwrap();
+        let streamed = accumulator.finish().unwrap();
+        assert_eq!(direct.stop, StopReason::ModelContextWindowExceeded);
+        assert_eq!(
+            serde_json::to_value(&direct).unwrap(),
+            serde_json::to_value(&streamed).unwrap()
+        );
+        assert_eq!(
+            (
+                direct.usage.input,
+                direct.usage.output,
+                direct.usage.cached_input,
+                direct.usage.cache_creation_input
+            ),
+            (16, 3, 4, 2)
+        );
+    }
+}
+
+#[tokio::test]
+async fn anthropic_context_exhaustion_retains_unfinished_tool_json_but_unknown_stops_still_fail() {
+    for reason in [
+        "model_context_window_exceeded",
+        "future_unknown",
+        "max_tokens",
+        "refusal",
+    ] {
+        let mut accumulator =
+            HttpStreamAccumulator::new(ApiFlavor::AnthropicMessages, false).unwrap();
+        let (events, _receiver) = mpsc::channel(8);
+        for event in [
+            json!({"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"write_file","input":{}}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}),
+        ] {
+            accumulator.ingest(event, &events).await.unwrap();
+        }
+        let delta = accumulator.ingest(json!({"type":"message_delta","delta":{"stop_reason":reason},"usage":{"output_tokens":3}}), &events).await;
+        if reason == "future_unknown" {
+            assert!(delta.is_err());
+            assert!(
+                parse_anthropic_response(
+                    json!({"content":[{"type":"text","text":"partial"}],"stop_reason":reason,
+                "usage":{"input_tokens":10,"output_tokens":3}})
+                )
+                .is_err()
+            );
+        } else {
+            delta.unwrap();
+            accumulator
+                .ingest(json!({"type":"message_stop"}), &events)
+                .await
+                .unwrap();
+            let result = accumulator.finish();
+            if reason == "model_context_window_exceeded" {
+                let response = result.unwrap();
+                assert_eq!(response.stop, StopReason::ModelContextWindowExceeded);
+                assert_eq!(response.usage.output, 3);
+                assert!(
+                    matches!(&response.content[0], ChatContent::ToolCall {args, ..} if args == &json!("{\"path\":"))
+                );
+            } else {
+                assert!(
+                    result.is_err(),
+                    "normal terminals must still validate tool JSON"
+                );
+            }
+        }
+    }
+    for reason in ["max_tokens", "refusal"] {
+        let response = parse_anthropic_response(
+            json!({"content":[{"type":"text","text":"partial"}],"stop_reason":reason,
+            "usage":{"input_tokens":10,"output_tokens":3}}),
+        )
+        .unwrap();
+        assert_eq!(
+            response.stop,
+            if reason == "max_tokens" {
+                StopReason::MaxTokens
+            } else {
+                StopReason::Refusal
+            }
+        );
+    }
+    for usage in [
+        json!({"input_tokens":10}),
+        json!({"input_tokens":-1,"output_tokens":3}),
+    ] {
+        assert!(
+            parse_anthropic_response(
+                json!({"content":[],"stop_reason":"model_context_window_exceeded","usage":usage})
+            )
+            .is_err()
+        );
+    }
+}

@@ -123,3 +123,26 @@ mod failure_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod metrics_defaults_tests {
+    use super::RunMetrics;
+    use serde_json::json;
+
+    #[test]
+    fn missing_metrics_default_without_changing_supplied_values_or_null_validation() {
+        let defaults = serde_json::to_value(RunMetrics::default()).unwrap();
+        let empty: RunMetrics = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(serde_json::to_value(empty).unwrap(), defaults);
+        for key in defaults.as_object().unwrap().keys() {
+            let mut input = json!({});
+            input[key] = json!(17);
+            let metrics: RunMetrics = serde_json::from_value(input.clone()).unwrap();
+            let mut expected = defaults.clone();
+            expected[key] = json!(17);
+            assert_eq!(serde_json::to_value(metrics).unwrap(), expected);
+            input[key] = serde_json::Value::Null;
+            assert!(serde_json::from_value::<RunMetrics>(input).is_err());
+        }
+    }
+}

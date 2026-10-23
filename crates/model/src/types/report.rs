@@ -40,43 +40,28 @@ pub enum Severity {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(default)]
 pub struct RunMetrics {
-    #[serde(default)]
     pub steps_total: u64,
-    #[serde(default)]
     pub steps_succeeded: u64,
-    #[serde(default)]
     pub steps_failed: u64,
-    #[serde(default)]
     pub steps_skipped: u64,
-    #[serde(default)]
     pub steps_executed: u64,
     /// Durable step-budget consumption (F13): sum of `budget_charged`
     /// deltas. `steps_executed` counts `step_started` events (observational,
     /// includes uncharged foreach children); this counter drives
     /// `max_steps` enforcement and survives restarts identically.
-    #[serde(default)]
     pub budget_charged: u64,
-    #[serde(default)]
     pub repair_attempts: u64,
-    #[serde(default)]
     pub regenerate_attempts: u64,
-    #[serde(default)]
     pub llm_calls: u64,
-    #[serde(default)]
     pub tokens_input: u64,
-    #[serde(default)]
     pub tokens_output: u64,
     /// Input tokens served from provider cache, included in `tokens_input`.
-    #[serde(default)]
     pub tokens_cached_input: u64,
     /// Input tokens used to create cache entries, included in total input.
-    #[serde(default)]
     pub tokens_cache_creation_input: u64,
-    #[serde(default)]
     pub tokens_total: u64,
-    #[serde(default)]
     pub cost_microusd: u64,
-    #[serde(default)]
     pub duration_ms: u64,
 }

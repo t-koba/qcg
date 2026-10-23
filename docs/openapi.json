@@ -809,7 +809,8 @@
               "scheduler_failed",
               "canceled",
               "interrupted",
-              "budget_exceeded"
+              "budget_exceeded",
+              "provider_context_exhausted"
             ],
             "type": "string"
           },
@@ -1576,6 +1577,13 @@
             "minimum": 0,
             "type": [
               "integer",
+              "null"
+            ]
+          },
+          "stop_reason": {
+            "description": "Normalized terminal reason; absent in older journals and decision calls.",
+            "type": [
+              "string",
               "null"
             ]
           },

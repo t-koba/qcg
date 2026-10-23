@@ -2191,7 +2191,7 @@ export interface components {
             active_started_at: string | null;
         };
         EmptyEventData: Record<string, never>;
-        FailureCode: ("when_false" | "dependency_unsatisfied" | "no_dependency_succeeded" | "check_failed" | "execution_failed" | "elapsed_exceeded" | "repair_exhausted" | "scheduler_failed" | "canceled" | "interrupted" | "budget_exceeded") | "timed_out" | "refused";
+        FailureCode: ("when_false" | "dependency_unsatisfied" | "no_dependency_succeeded" | "check_failed" | "execution_failed" | "elapsed_exceeded" | "repair_exhausted" | "scheduler_failed" | "canceled" | "interrupted" | "budget_exceeded" | "provider_context_exhausted") | "timed_out" | "refused";
         FailureDetail: {
             code: components["schemas"]["FailureCode"];
             dependencies?: components["schemas"]["DependencyFailure"][];
@@ -2446,6 +2446,8 @@ export interface components {
              * @default null
              */
             seed: number | null;
+            /** @description Normalized terminal reason; absent in older journals and decision calls. */
+            stop_reason?: string | null;
             /** @default [] */
             stop_sequences: string[];
             /** @default false */

@@ -1227,3 +1227,25 @@ run that wants the whole bill metered prices them with
 search charge is recorded as unmetered rather than free, and a run whose
 cost budget requires pricing refuses the node instead of settling an
 unpriced search.
+
+### Anthropic context-window terminal
+
+Anthropic Messages (including SSE) can terminate with
+`model_context_window_exceeded` (documented for Sonnet 4.5 and newer supported
+models). qcg retains this as `StopReason::ModelContextWindowExceeded`, not an
+unknown response or a completed answer. Partial text, empty output and tool
+blocks retain their reported usage; unfinished SSE tool JSON is retained as a
+string argument fact, never an executable call. Unknown terminal reasons remain
+invalid responses.
+
+The gateway writes one `llm_call` with the original normalized `stop_reason`,
+reported token usage (including cache usage), and the configured usage-based
+cost, then returns nonretryable `provider_context_exhausted`. Canonical failure
+details omit `exhaustion`: the provider does not report context capacity or an
+exact used/allowed pair. Partial output cannot complete a generation or dispatch
+tools, including through the structured-output shim. This terminal does not
+trigger route fallback, step/validation retry, delegated-agent error recovery,
+automatic compaction, continuation, or a limit increase. Existing `max_tokens`
+and `refusal` behavior is unchanged. Stream deltas already published remain
+partial observations, not successful step outputs; no partial response text is
+added to the failure report or `llm_call`.

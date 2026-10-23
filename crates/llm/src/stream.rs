@@ -409,7 +409,7 @@ impl AnthropicAccumulator {
                 self.stop = value
                     .pointer("/delta/stop_reason")
                     .and_then(Value::as_str)
-                    .map(parse_anthropic_stop_reason)
+                    .map(crate::parse::parse_anthropic_stop_reason)
                     .transpose()?;
             }
             _ => {}
@@ -423,6 +423,9 @@ impl AnthropicAccumulator {
                 "Anthropic stream included invalid usage",
             ));
         }
+        let stop = self.stop.ok_or_else(|| {
+            LlmError::invalid_response("Anthropic stream did not include stop_reason")
+        })?;
         let mut content = Vec::new();
         let mut structured_response = false;
         if !self.text.is_empty() {
@@ -434,9 +437,17 @@ impl AnthropicAccumulator {
                     "Anthropic stream returned an incomplete tool call",
                 ));
             }
-            let args: Value = serde_json::from_str(&call.arguments).map_err(|_| {
-                LlmError::invalid_response("Anthropic stream returned invalid tool arguments")
-            })?;
+            let args: Value = serde_json::from_str(&call.arguments)
+                .or_else(|error| {
+                    if stop == StopReason::ModelContextWindowExceeded {
+                        Ok(Value::String(call.arguments)) // Retain partial arguments, never executable.
+                    } else {
+                        Err(error)
+                    }
+                })
+                .map_err(|_| {
+                    LlmError::invalid_response("Anthropic stream returned invalid tool arguments")
+                })?;
             if call.name == "response" {
                 structured_response = true;
                 content.push(ChatContent::Text(args.to_string()));
@@ -448,12 +459,13 @@ impl AnthropicAccumulator {
                 });
             }
         }
-        if content.is_empty() {
+        if content.is_empty() && stop != StopReason::ModelContextWindowExceeded {
             return Err(LlmError::invalid_response(
                 "Anthropic stream did not include text or tool calls",
             ));
         }
-        if structured_response
+        if stop != StopReason::ModelContextWindowExceeded
+            && structured_response
             && content
                 .iter()
                 .any(|item| matches!(item, ChatContent::ToolCall { .. }))
@@ -462,19 +474,7 @@ impl AnthropicAccumulator {
                 "Anthropic stream mixed response with external tool calls",
             ));
         }
-        let stop = self.stop.ok_or_else(|| {
-            LlmError::invalid_response("Anthropic stream did not include stop_reason")
-        })?;
-        let stop = if structured_response {
-            if stop != StopReason::ToolUse {
-                return Err(LlmError::invalid_response(
-                    "Anthropic stream returned response without tool_use stop_reason",
-                ));
-            }
-            StopReason::EndTurn
-        } else {
-            stop
-        };
+        let stop = crate::parse::anthropic_structured_stop(stop, structured_response)?;
         Ok(ChatResponse {
             content,
             usage: TokenUsage {
@@ -489,18 +489,6 @@ impl AnthropicAccumulator {
             provider_state: None,
             web_search: None,
         })
-    }
-}
-
-fn parse_anthropic_stop_reason(reason: &str) -> Result<StopReason, LlmError> {
-    match reason {
-        "end_turn" | "stop_sequence" => Ok(StopReason::EndTurn),
-        "tool_use" => Ok(StopReason::ToolUse),
-        "max_tokens" => Ok(StopReason::MaxTokens),
-        "refusal" => Ok(StopReason::Refusal),
-        _ => Err(LlmError::invalid_response(
-            "Anthropic stream returned an unknown stop_reason",
-        )),
     }
 }
 

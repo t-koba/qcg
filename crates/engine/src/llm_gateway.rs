@@ -10,6 +10,8 @@ pub use types::*;
 mod tests {
     #[path = "cache_cost.rs"]
     mod cache_cost;
+    #[path = "context_exhaustion.rs"]
+    mod context_exhaustion;
     #[path = "tier_cost.rs"]
     mod tier_cost;
     #[path = "web_search_cost.rs"]

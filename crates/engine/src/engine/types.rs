@@ -151,6 +151,9 @@ pub(crate) fn failure_detail_for_error(error: &EngineError) -> model::FailureDet
             });
             FailureCode::BudgetExceeded
         }
+        EngineError::Step(StepError::ProviderContextExhausted { .. }) => {
+            FailureCode::ProviderContextExhausted
+        }
         EngineError::Step(StepError::Refused { .. }) => FailureCode::Refused,
         _ if error.is_canceled() => FailureCode::Canceled,
         _ => FailureCode::ExecutionFailed,

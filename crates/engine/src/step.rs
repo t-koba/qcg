@@ -28,6 +28,9 @@ pub enum StepError {
         used: u64,
         limit: u64,
     },
+    /// Provider terminal without reported capacity; partial output is not completion.
+    #[error("step `{node}` exhausted the provider context window (model_context_window_exceeded)")]
+    ProviderContextExhausted { node: String },
     /// Agent-local limit (not a run budget): settles like `Failed`, retaining validation errors.
     #[error("step `{node}` failed: {message}")]
     AgentIterationsExhausted {

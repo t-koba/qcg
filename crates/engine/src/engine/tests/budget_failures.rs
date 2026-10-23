@@ -193,3 +193,80 @@ fn only_typed_budget_errors_project_exhaustion() {
         assert!(failure_detail_for_error(&error).exhaustion.is_none());
     }
 }
+
+struct ProviderContextStep(Arc<AtomicUsize>);
+#[async_trait]
+impl StepExecutor for ProviderContextStep {
+    crate::step_type_id!("test.context_exhausted");
+    crate::parallel_step_traits!();
+    async fn execute(
+        &self,
+        _: &mut StepContext<'_>,
+        node: &NodeDef,
+    ) -> Result<StepOutcome, StepError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err(StepError::ProviderContextExhausted {
+            node: node.id.clone(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn provider_context_exhaustion_is_nonretryable_and_survives_canonical_reports_without_fake_capacity()
+ {
+    for parallel in [false, true] {
+        let root = temp_run_dir("provider-context-exhaustion");
+        let _guard = TempGuard(root.clone());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut exhausted = node("exhausted", "test.context_exhausted");
+        exhausted.retry = Some(RetryPolicy {
+            max_attempts: 3,
+            ..Default::default()
+        });
+        let mut spec = manifest(vec![exhausted, node("sibling", "test.pass")]);
+        if parallel {
+            spec.parallel = vec!["exhausted".into(), "sibling".into()];
+        }
+        let mut registry = test_registry();
+        registry.register(ProviderContextStep(calls.clone()));
+        let mut options = run_options(root.join("workspace"));
+        options.max_parallel_steps = 2;
+        let progress = Engine::new(registry)
+            .advance_with_id(
+                "provider-context-test".into(),
+                root.join("meta"),
+                test_contract(&root, spec),
+                BTreeMap::new(),
+                options,
+            )
+            .await;
+        let Progress::Failed(failure) = progress else {
+            panic!("expected failure: {progress:?}")
+        };
+        assert_eq!(failure.code, FailureCode::ProviderContextExhausted);
+        assert_eq!(failure.kind, RunFailureKind::Execution);
+        assert!(failure.exhaustion.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let state = RunState::fold_journal(&root.join("meta/journal.jsonl")).unwrap();
+        let crate::NodeOutcome::Failed { reason } = &state.nodes[&NodePath::root("exhausted")]
+        else {
+            panic!("failed node required")
+        };
+        assert_eq!(reason, &failure.detail);
+        let value = serde_json::to_value(reason).unwrap();
+        assert_eq!(value["code"], "provider_context_exhausted");
+        assert!(value.get("exhaustion").is_none());
+        let events: Vec<Value> = std::fs::read_to_string(root.join("meta/journal.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert!(!events.iter().any(|e| e["t"] == "step_retry"));
+        let finished = events
+            .iter()
+            .find(|e| e["t"] == "step_finished" && e["node"] == "exhausted")
+            .unwrap();
+        assert_eq!(finished["reason"], value);
+        assert!(finished["failed_output"].is_null());
+    }
+}

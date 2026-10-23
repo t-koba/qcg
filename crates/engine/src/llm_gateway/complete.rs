@@ -168,29 +168,7 @@ impl<'a> LlmGateway<'a> {
                 limit: tokens,
             });
         }
-        let state = self.journal.state();
-        let used = state
-            .budget
-            .tokens_input
-            .saturating_add(state.budget.tokens_output);
-        if let Some(limit) = self.budget.max_tokens
-            && used > limit
-        {
-            return Err(StepError::BudgetExceeded {
-                resource: "tokens",
-                used,
-                limit,
-            });
-        }
-        if let Some(limit) = self.budget.max_cost_microusd
-            && state.budget.cost_microusd > limit
-        {
-            return Err(StepError::BudgetExceeded {
-                resource: "cost_microusd",
-                used: state.budget.cost_microusd,
-                limit,
-            });
-        }
+        self.check_budget()?;
         response.validate(&request).step_err(&node.id)?;
         self.assert_value_absent(node, &serde_json::to_value(&response)?)?;
         Ok(response)
@@ -441,7 +419,9 @@ impl<'a> LlmGateway<'a> {
                     .unwrap_or_else(|| "no LLM route was available".into()),
             )
         })?;
-        self.scan_response(node, &response)?;
+        if response.stop != llm::StopReason::ModelContextWindowExceeded {
+            self.scan_response(node, &response)?;
+        }
         let usage = response.usage.clone();
         let web_search = response.web_search.clone();
         let web_search_calls = web_search.as_ref().and_then(|outcome| outcome.calls);
@@ -469,6 +449,7 @@ impl<'a> LlmGateway<'a> {
             "verbosity": verbosity,
             "stream": stream,
             "tokens": usage,
+            "stop_reason": response.stop,
             "cost_microusd": cost_microusd,
         });
         // The hosted search is reported with its own count and charge: an
@@ -488,17 +469,27 @@ impl<'a> LlmGateway<'a> {
         }
         merge_event_extra(&mut event, event_extra(&response.usage));
         self.journal.event("llm_call", event).step_err(&node.id)?;
+        self.check_budget()?;
+        if response.stop == llm::StopReason::ModelContextWindowExceeded {
+            return Err(StepError::ProviderContextExhausted {
+                node: node.id.clone(),
+            });
+        }
+        Ok(response)
+    }
+
+    fn check_budget(&self) -> Result<(), StepError> {
         let state = self.journal.state();
-        let tokens = state
+        let used = state
             .budget
             .tokens_input
             .saturating_add(state.budget.tokens_output);
         if let Some(limit) = self.budget.max_tokens
-            && tokens > limit
+            && used > limit
         {
             return Err(StepError::BudgetExceeded {
                 resource: "tokens",
-                used: tokens,
+                used,
                 limit,
             });
         }
@@ -511,7 +502,7 @@ impl<'a> LlmGateway<'a> {
                 limit,
             });
         }
-        Ok(response)
+        Ok(())
     }
 
     fn record_route_failure(
@@ -677,7 +668,9 @@ impl<'a> LlmGateway<'a> {
             ChatStreamEvent::Completed {
                 response: completed,
             } => {
-                if !self.secrets.is_empty() {
+                if !self.secrets.is_empty()
+                    && completed.stop != llm::StopReason::ModelContextWindowExceeded
+                {
                     // Final gate before the withheld suffix becomes visible.
                     // A rejection here publishes nothing further, and the
                     // already-visible prefixes were each verified jointly

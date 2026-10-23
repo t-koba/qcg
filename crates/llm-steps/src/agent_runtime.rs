@@ -1617,6 +1617,9 @@ pub(crate) async fn execute_agent_tool(
             {
                 Ok(result) => result,
                 Err(error) => {
+                    if matches!(error, StepError::ProviderContextExhausted { .. }) {
+                        return Err(error);
+                    }
                     let code = agent_failure_code(&error);
                     let action = on_failure.action(code);
                     record_agent_failure_event(

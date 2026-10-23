@@ -657,6 +657,9 @@ pub(crate) fn validate_agent_stop(
 ) -> Result<(), StepError> {
     match (stop, has_tool_calls) {
         (StopReason::EndTurn, false) | (StopReason::ToolUse, true) => Ok(()),
+        (StopReason::ModelContextWindowExceeded, _) => Err(StepError::ProviderContextExhausted {
+            node: node_id.into(),
+        }),
         (StopReason::MaxTokens, _) => Err(StepError::failed(
             node_id,
             "LLM agent response reached the provider output-token limit",

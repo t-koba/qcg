@@ -393,6 +393,7 @@ pub(crate) fn parse_anthropic_response(value: Value) -> Result<ChatResponse, Llm
         .ok_or_else(|| {
             LlmError::invalid_response("Anthropic response did not include content array")
         })?;
+    let stop = parse_anthropic_stop_reason(value["stop_reason"].as_str().unwrap_or("missing"))?;
     let mut content = Vec::new();
     let mut structured_response = false;
     for block in blocks {
@@ -431,26 +432,15 @@ pub(crate) fn parse_anthropic_response(value: Value) -> Result<ChatResponse, Llm
             _ => {}
         }
     }
-    if content.is_empty() {
+    if content.is_empty() && stop != StopReason::ModelContextWindowExceeded {
         return Err(LlmError::invalid_response(
             "Anthropic response did not include text or tool calls",
         ));
     }
     let mut usage = crate::usage::anthropic_input(&value["usage"])?;
     usage.output = crate::usage::count(&value["usage"], "output_tokens", true)?;
-    let stop = match value.get("stop_reason").and_then(Value::as_str) {
-        Some("tool_use") => StopReason::ToolUse,
-        Some("max_tokens") => StopReason::MaxTokens,
-        Some("refusal") => StopReason::Refusal,
-        Some("end_turn") | Some("stop_sequence") => StopReason::EndTurn,
-        other => {
-            return Err(LlmError::invalid_response(format!(
-                "Anthropic response returned unsupported stop_reason `{}`",
-                other.unwrap_or("missing")
-            )));
-        }
-    };
-    if structured_response
+    if stop != StopReason::ModelContextWindowExceeded
+        && structured_response
         && content
             .iter()
             .any(|item| matches!(item, ChatContent::ToolCall { .. }))
@@ -459,16 +449,7 @@ pub(crate) fn parse_anthropic_response(value: Value) -> Result<ChatResponse, Llm
             "Anthropic response mixed response with external tool calls",
         ));
     }
-    let stop = if structured_response {
-        if stop != StopReason::ToolUse {
-            return Err(LlmError::invalid_response(
-                "Anthropic response returned response without tool_use stop_reason",
-            ));
-        }
-        StopReason::EndTurn
-    } else {
-        stop
-    };
+    let stop = anthropic_structured_stop(stop, structured_response)?;
     Ok(ChatResponse {
         content,
         usage,
@@ -520,4 +501,34 @@ pub(crate) fn marker_block(prompt: &str, marker: &str) -> Option<String> {
         }
     }
     None
+}
+
+pub(crate) fn parse_anthropic_stop_reason(reason: &str) -> Result<StopReason, LlmError> {
+    match reason {
+        "end_turn" | "stop_sequence" => Ok(StopReason::EndTurn),
+        "tool_use" => Ok(StopReason::ToolUse),
+        "max_tokens" => Ok(StopReason::MaxTokens),
+        "model_context_window_exceeded" => Ok(StopReason::ModelContextWindowExceeded),
+        "refusal" => Ok(StopReason::Refusal),
+        _ => Err(LlmError::invalid_response(
+            "Anthropic response returned an unknown stop_reason",
+        )),
+    }
+}
+
+pub(crate) fn anthropic_structured_stop(
+    stop: StopReason,
+    structured_response: bool,
+) -> Result<StopReason, LlmError> {
+    let stop = if structured_response && stop != StopReason::ModelContextWindowExceeded {
+        if stop != StopReason::ToolUse {
+            return Err(LlmError::invalid_response(
+                "Anthropic response returned response without tool_use stop_reason",
+            ));
+        }
+        StopReason::EndTurn
+    } else {
+        stop
+    };
+    Ok(stop)
 }

@@ -250,6 +250,7 @@ pub enum StopReason {
     EndTurn,
     ToolUse,
     MaxTokens,
+    ModelContextWindowExceeded,
     Refusal,
 }
 

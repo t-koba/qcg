@@ -20,6 +20,7 @@ pub enum FailureCode {
     Canceled,
     Interrupted,
     BudgetExceeded,
+    ProviderContextExhausted,
     /// Guard/admission refusal, not a failed execution (E11).
     Refused,
 }
