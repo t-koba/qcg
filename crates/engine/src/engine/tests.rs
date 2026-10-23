@@ -4870,10 +4870,28 @@ async fn budget_boundary_exact_succeeds_and_over_fails() {
 
 #[tokio::test]
 async fn parallel_hitl_interruption_resumes_siblings() {
-    // F12-01: a fast suspending step plus a slow side-effect-free step
-    // in one wave: the answer resumes the run and the interrupted
-    // sibling completes instead of staying permanently failed.
-    struct AnswerOnceStep;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        parallel_hitl_interruption(true),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn parallel_hitl_interruption_refuses_unknown_effects() {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        parallel_hitl_interruption(false),
+    )
+    .await
+    .unwrap();
+}
+
+async fn parallel_hitl_interruption(replay_safe: bool) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Semaphore;
+    struct AnswerOnceStep(Arc<Semaphore>);
     #[async_trait]
     impl StepExecutor for AnswerOnceStep {
         fn type_id(&self) -> &'static str {
@@ -4896,6 +4914,7 @@ async fn parallel_hitl_interruption_resumes_siblings() {
                     files: vec![],
                 });
             }
+            self.0.acquire().await.unwrap().forget();
             Ok(StepOutcome::NeedsUser {
                 question: api::FormSpec {
                     id: "q-fast".into(),
@@ -4907,11 +4926,14 @@ async fn parallel_hitl_interruption_resumes_siblings() {
             })
         }
     }
-    struct SlowPassStep;
+    struct SlowPassStep(bool, Arc<Semaphore>, Arc<AtomicUsize>);
     #[async_trait]
     impl StepExecutor for SlowPassStep {
         fn type_id(&self) -> &'static str {
             "test.slow_pass"
+        }
+        fn replay_safe_after_interruption(&self) -> bool {
+            self.0
         }
         fn traits(&self) -> StepTraits {
             StepTraits {
@@ -4921,21 +4943,31 @@ async fn parallel_hitl_interruption_resumes_siblings() {
         }
         async fn execute(
             &self,
-            _ctx: &mut StepContext<'_>,
+            ctx: &mut StepContext<'_>,
             node: &NodeDef,
         ) -> Result<StepOutcome, StepError> {
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            self.2.fetch_add(1, Ordering::SeqCst);
+            self.1.add_permits(1);
+            if !ctx.run.answers.contains_key("q-fast") {
+                std::future::pending::<()>().await;
+            }
             Ok(StepOutcome::Success {
                 output: Some(json!({ "node": node.id })),
                 files: vec![],
             })
         }
     }
-    let run_dir = temp_run_dir("parallel-hitl-resume");
+    let run_dir = temp_run_dir(if replay_safe {
+        "parallel-hitl-safe"
+    } else {
+        "parallel-hitl-unsafe"
+    });
     let _ = std::fs::remove_dir_all(&run_dir);
     let mut registry = StepRegistry::new();
-    registry.register(AnswerOnceStep);
-    registry.register(SlowPassStep);
+    let entered = Arc::new(Semaphore::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    registry.register(AnswerOnceStep(entered.clone()));
+    registry.register(SlowPassStep(replay_safe, entered, calls.clone()));
     registry.register(TestPassStep);
     let mut observer = node("observer", "test.pass");
     observer.when = Some(contract::Expr("steps.seed.status == \"success\"".into()));
@@ -4988,10 +5020,29 @@ async fn parallel_hitl_interruption_resumes_siblings() {
                 .any(|line| line.contains("\"node\":\"slow\"") && line.contains("\"failed\"")),
         "the aborted sibling must not journal failure: {journal}"
     );
-    // Answer and resume: both steps complete and the run succeeds.
+    let state = RunState::fold_journal(&run_dir.join("meta/journal.jsonl")).unwrap();
+    assert_eq!(state.unresolved_tasks.len(), 1);
+    assert_eq!(
+        state.unresolved_tasks["slow"]["classification"],
+        "scheduler_abort"
+    );
+    assert!(!state.nodes.contains_key(&model::NodePath::root("slow")));
+    // The saved question wins over the replay guard, without re-entering either owner.
+    let unanswered = Engine::new(registry.clone())
+        .run_with_id(
+            "parallel-hitl".into(),
+            run_dir.join("meta"),
+            contract.clone(),
+            BTreeMap::new(),
+            options(BTreeMap::new()),
+        )
+        .await;
+    assert!(matches!(unanswered, Err(EngineError::NeedsUser { .. })));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    // Answering grants no authority to replay an unknown-effect sibling.
     let mut answers = BTreeMap::new();
     answers.insert("q-fast".to_string(), json!({ "answer": "yes" }));
-    Engine::new(registry)
+    let resumed = Engine::new(registry)
         .run_with_id(
             "parallel-hitl".into(),
             run_dir.join("meta"),
@@ -4999,8 +5050,29 @@ async fn parallel_hitl_interruption_resumes_siblings() {
             BTreeMap::new(),
             options(answers),
         )
-        .await
-        .expect("the resumed wave must succeed");
+        .await;
+    if !replay_safe {
+        let error = resumed.unwrap_err();
+        assert!(matches!(
+            error,
+            EngineError::Step(StepError::Refused { .. })
+        ));
+        assert!(error.to_string().contains("unreported task `slow`"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let events = journal_events(&run_dir);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e["t"] == "step_started" && e["node"] == "slow")
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|e| e["scope"] == "interrupted_task"));
+        let _ = std::fs::remove_dir_all(&run_dir);
+        return;
+    }
+    resumed.expect("explicit replay capability permits the guarded re-entry");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
     let journal =
         std::fs::read_to_string(run_dir.join("meta/journal.jsonl")).expect("journal reads");
     assert!(
@@ -5008,6 +5080,32 @@ async fn parallel_hitl_interruption_resumes_siblings() {
         "the resumed run must settle successfully: {journal}"
     );
     let events = journal_events(&run_dir);
+    let authorization = events
+        .iter()
+        .position(|e| e["scope"] == "interrupted_task")
+        .unwrap();
+    assert_eq!(events[authorization]["owner"], "slow");
+    assert_eq!(events[authorization]["executor"], "test.slow_pass");
+    assert_eq!(
+        events[authorization]["authorization"],
+        "StepExecutor.replay_safe_after_interruption"
+    );
+    assert_eq!(
+        events[authorization]["unresolved_seq"],
+        state.unresolved_tasks["slow"]["seq"]
+    );
+    assert!(
+        events
+            .iter()
+            .enumerate()
+            .any(|(i, e)| i > authorization && e["t"] == "step_started" && e["node"] == "slow")
+    );
+    assert!(
+        RunState::fold_journal(&run_dir.join("meta/journal.jsonl"))
+            .unwrap()
+            .unresolved_tasks
+            .is_empty()
+    );
     assert!(has_event(&events, "step_replayed", "seed"));
     assert!(
         has_event(&events, "step_finished", "observer"),
@@ -7360,6 +7458,7 @@ async fn active_parallel_wave_has_one_elapsed_interval_not_one_per_node() {
 
 #[path = "tests/parallel_facts.rs"]
 mod parallel_facts;
+mod replay_safety;
 
 #[path = "tests/saved_interactions.rs"]
 mod saved_interactions;

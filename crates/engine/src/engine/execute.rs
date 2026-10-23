@@ -246,10 +246,10 @@ impl Engine {
         // Collect all failures and panic detail, not just the first (E10).
         let mut join_errors: Vec<EngineError> = Vec::new();
         // Abort siblings on the first terminal outcome; external cancellation aborts all.
-        // Join facts are diagnostic only: existing settlement below remains authoritative.
+        // Join facts retain unresolved execution separately from settlement.
         let mut abort_on_settle = false;
         // Drain to full quiescence before settlement: no writer may outlive this loop.
-        // Late outcomes win; missing outcomes settle as scheduler failures.
+        // Late outcomes win; missing reports prove neither failure nor replay safety.
         loop {
             if tasks.is_empty() {
                 break;
@@ -292,7 +292,15 @@ impl Engine {
                         }
                         Err(error) => {
                             if error.is_cancelled() {
-                                // Sibling aborted after fail-fast; ignore.
+                                // Unrequested cancellation starts fail-fast; a sibling abort does not.
+                                if !abort_on_settle {
+                                    join_errors.push(EngineError::Step(StepError::Refused {
+                                        node: "scheduler".into(),
+                                        message: "parallel task cancellation had no parent or fail-fast cause".into(),
+                                    }));
+                                    abort_on_settle = true;
+                                    tasks.abort_all();
+                                }
                                 continue;
                             }
                             join_errors.push(join_task_error(error));
@@ -308,15 +316,9 @@ impl Engine {
         }
 
         fact_result?;
-        let had_join_errors = !join_errors.is_empty();
         let mut terminal_errors: Vec<EngineError> = join_errors;
-        // Keep HITL-aborted siblings Pending; panics remain scheduler failures (F12-02). Scan outcomes too.
-        let hitl_pending = terminal_errors.iter().any(|error| {
-            matches!(
-                error,
-                EngineError::NeedsUser { .. } | EngineError::NeedsConfirm { .. }
-            )
-        }) || outcomes.values().any(|(_, outcome)| {
+        // Reported cancellations accompanying an interaction remain interruptions.
+        let hitl_pending = outcomes.values().any(|(_, outcome)| {
             matches!(
                 outcome,
                 Ok(StepOutcome::NeedsUser { .. }) | Ok(StepOutcome::NeedsConfirm { .. })
@@ -324,33 +326,11 @@ impl Engine {
         });
         for node in nodes {
             let Some((node, outcome)) = outcomes.remove(&node.id) else {
-                if hitl_pending && !had_join_errors {
-                    states.insert(node.id.clone(), NodeState::Pending);
-                    journal.event(
-                        "step_interrupted",
-                        json!({ "node": node.id, "reason": "parallel sibling suspended for user input; will resume", "parallel": true }),
-                    )?;
-                    continue;
-                }
-                states.insert(
-                    node.id.clone(),
-                    NodeState::Failed(FailureDetail::new(
-                        FailureCode::SchedulerFailed,
-                        "parallel task did not report an outcome",
-                    )),
-                );
-                let reason = FailureDetail::new(
-                    FailureCode::SchedulerFailed,
-                    "parallel task did not report an outcome",
-                );
+                states.insert(node.id.clone(), NodeState::Pending);
                 journal.event(
-                    "step_finished",
-                    json!({ "node": node.id, "status": "failed", "reason": reason, "parallel": true }),
+                    "step_interrupted",
+                    json!({ "node": node.id, "reason": "parallel task did not report an outcome; effects unknown", "parallel": true }),
                 )?;
-                terminal_errors.push(EngineError::Step(StepError::failed(
-                    "scheduler",
-                    format!("parallel node `{}` did not report an outcome", node.id),
-                )));
                 continue;
             };
             let outcome = match outcome {

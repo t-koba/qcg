@@ -2731,6 +2731,7 @@
               "operation_repeated",
               "operation_started",
               "out_of_contract",
+              "parallel_replay_authorized",
               "parallel_task_joined",
               "regenerate_attempt_finished",
               "regenerate_attempt_started",

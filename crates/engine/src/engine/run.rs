@@ -725,6 +725,39 @@ impl Engine {
             };
             states.insert(path.as_str().to_string(), state);
         }
+        // Surface saved reports in owner order before re-entry; supplied answers keep direct-run behavior.
+        for (owner, interaction) in &replay.state.pending_interactions {
+            match interaction {
+                crate::Interaction::Question { question } if !context.answers.contains_key(&question.id) => {
+                    return Err(EngineError::NeedsUser { question_id: question.id.clone(), question: Box::new(question.clone()) });
+                }
+                crate::Interaction::Confirmation { confirm } if !context.confirmations.contains_key(&confirm.id) => {
+                    journal.event("confirm_request", json!({"node": owner, "confirm": confirm}))?;
+                    return Err(EngineError::NeedsConfirm { confirm_id: confirm.id.clone(), confirm: Box::new(confirm.clone()) });
+                }
+                _ => {}
+            }
+        }
+        // Preflight every unresolved owner before replay or hooks.
+        let mut authorized = Vec::new();
+        for (owner, fact) in &replay.state.unresolved_tasks {
+            let node = fact["node"].as_str().and_then(|id| context.contract.graph.nodes.get(id));
+            let executor = node.and_then(|node| self.registry.get(&node.kind));
+            if !executor.as_ref().is_some_and(|executor| executor.replay_safe_after_interruption()) {
+                return Err(StepError::Refused {
+                    node: owner.clone(),
+                    message: format!("unreported task `{owner}` has unknown effects; guarded replay is not declared"),
+                }.into());
+            }
+            authorized.push((owner, fact, executor.unwrap()));
+        }
+        for (owner, fact, executor) in authorized {
+            journal.event("parallel_replay_authorized", json!({
+                "node": fact["node"], "owner": owner, "scope": "interrupted_task",
+                "authorization": "StepExecutor.replay_safe_after_interruption",
+                "executor": executor.type_id(), "unresolved_seq": fact["seq"],
+            }))?;
+        }
         self.run_hooks(&context, &journal, &mut vars, &mut budget, "run_started")
             .await?;
 
@@ -743,20 +776,6 @@ impl Engine {
                 super::elapsed::close(&mut episode, &journal)?;
                 journal.event("run_yielded", json!({}))?;
                 return Err(EngineError::Yielded);
-            }
-            // Surface saved reports in node-path order before re-entering any owner.
-            // Supplied answers retain the direct-run API's existing resume behavior.
-            for (owner, interaction) in &replay.state.pending_interactions {
-                match interaction {
-                    crate::Interaction::Question { question } if !context.answers.contains_key(&question.id) => {
-                        return Err(EngineError::NeedsUser { question_id: question.id.clone(), question: Box::new(question.clone()) });
-                    }
-                    crate::Interaction::Confirmation { confirm } if !context.confirmations.contains_key(&confirm.id) => {
-                        journal.event("confirm_request", json!({"node": owner, "confirm": confirm}))?;
-                        return Err(EngineError::NeedsConfirm { confirm_id: confirm.id.clone(), confirm: Box::new(confirm.clone()) });
-                    }
-                    _ => {}
-                }
             }
             let mut progressed = false;
             let mut ready = Vec::new();
@@ -837,7 +856,9 @@ impl Engine {
                     )
                     .await
                 {
-                    if error.is_canceled()
+                    // Do not loop back into unreported executions in this invocation either.
+                    if !journal.state().unresolved_tasks.is_empty()
+                        || error.is_canceled()
                         || error.is_resumable_agent()
                         || matches!(
                             error,

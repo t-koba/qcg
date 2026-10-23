@@ -9,19 +9,20 @@ schema for legacy/direct journals; the service refuses recovery or fork when it
 is absent. `generator_path` remains the original source path, not the derived
 per-run snapshot location. See [operations](operations.md#per-run-generator-package-snapshots).
 
-Parallel waves also emit the internal, state-free `parallel_task_joined` record at
-each actual join (including cancellation drains). It uses the stable `node`, not
-Tokio's process-local task ID. `classification` distinguishes `completed_success`,
-`completed_terminal`, `task_error`, `task_canceled`, `interaction_pending`, `task_panic`, `task_join_error`,
-`scheduler_abort`, and `parent_canceled`. `drain_cause` is `none`, `fail_fast`, or
-`parent_cancellation`; `cancellation_cause` records the abort request responsible
-(or `reported_by_task` for a task-returned cancellation). Completed terminal
-reports include `outcome` and, for interactions, only `question_id` or `confirm_id`.
-Task errors carry a failure `code`; an explicit resumable-agent error additionally
-references `continuation_owner: agent`. No prompt, answer, output, or raw error
-text is copied. Existing child/operation/agent journal records remain the evidence
-for effects, accounting, and continuation safety. These facts neither change
-settlement nor authorize replay.
+Parallel waves emit a durable `parallel_task_joined` fact at each actual join,
+using the stable `node` rather than Tokio's process-local task ID. Its
+`classification` distinguishes completion, task error/cancellation, interaction,
+panic, scheduler abort, and parent cancellation; `drain_cause` and
+`cancellation_cause` retain why the task stopped. Wave join reports retain only
+outcome and interaction IDs; they copy no prompt, answer, output, or raw error.
+`foreach_sibling_drained` retains the exact iteration path and its existing
+task-detail fields. The fold keeps unreported owners unresolved rather than
+inventing a failed step. Resume first
+surfaces their saved interactions, then refuses to re-enter an unresolved owner
+unless its `StepExecutor` explicitly declares guarded replay. That admission emits
+`parallel_replay_authorized` with the executor, capability, owner, and original
+fact sequence; parallel safety alone does not authorize replay. These facts do
+not choose failure precedence or change fail-fast settlement.
 
 Direct `mcp.call` cleanup failures emit a durable `mcp_cleanup_settled` record
 before settlement, alongside the observation-only `tool_call`. Both retain the

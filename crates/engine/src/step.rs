@@ -168,6 +168,11 @@ pub trait StepExecutor: Send + Sync {
         StepTraits::default()
     }
 
+    /// Safe/guarded re-entry after an unreported execution; not implied by parallel safety.
+    fn replay_safe_after_interruption(&self) -> bool {
+        false
+    }
+
     fn params_schema(&self) -> Option<Value> {
         None
     }

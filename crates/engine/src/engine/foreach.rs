@@ -815,10 +815,14 @@ mod tests {
         assert!(records[&19].get("outcome").is_none());
         assert!(records[&19].get("code").is_none());
 
-        // Real journal replay: typed API validation plus fold. The new kind
-        // is state-free, preserving child state without inventing failures.
+        // Typed replay preserves child history and unresolved iteration identity,
+        // without inventing failed child outcomes.
         let replayed = RunState::fold_journal(&path).expect("journal replay");
         before.last_seq = replayed.last_seq;
+        assert_eq!(replayed.unresolved_tasks.len(), 2);
+        assert_eq!(replayed.unresolved_tasks["each[13]"], *records[&13]);
+        assert_eq!(replayed.unresolved_tasks["each[19]"], *records[&19]);
+        before.unresolved_tasks = replayed.unresolved_tasks.clone();
         assert_eq!(
             serde_json::to_value(before).unwrap(),
             serde_json::to_value(&replayed).unwrap()

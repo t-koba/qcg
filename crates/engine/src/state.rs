@@ -7,20 +7,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const RUN_STATE_SCHEMA_VERSION: u32 = 4;
+pub const RUN_STATE_SCHEMA_VERSION: u32 = 5;
 
-/// Durable diagnostics the journal keeps for operators but that carry no folded
-/// state. `internal_journal_kinds_pass_the_fold_gate` pins that every entry is
-/// declared in `api::INTERNAL_RUN_EVENT_KINDS`.
+/// State-free diagnostics; fold tests ensure API internal-event registration.
 const STATE_FREE_JOURNAL_EVENT_KINDS: &[&str] = &[
     "audit_degraded",
     "elapsed_exceeded",
-    "foreach_sibling_drained",
     "foreach_sibling_ignored",
     "hook_replayed",
     "mcp_destination_decision",
     "operation_repeated",
-    "parallel_task_joined",
+    "parallel_replay_authorized",
     "step_interrupted",
     "step_timeout",
 ];
@@ -29,12 +26,7 @@ fn is_known_journal_event_kind(kind: &str) -> bool {
     api::is_known_run_event_kind(kind) || api::INTERNAL_RUN_EVENT_KINDS.contains(&kind)
 }
 
-/// Requires a field to be PRESENT on read while still accepting an explicit
-/// null for `Option` fields. Serde implicitly defaults missing `Option`
-/// fields to `None`, so removing `#[serde(default)]` alone cannot make them
-/// required (E07): every `Option` field in the persisted state uses this so
-/// a partial or old-format record fails closed instead of silently
-/// degrading.
+/// Requires Option presence (E07): explicit null is accepted; absence fails closed.
 pub(crate) fn required_presence<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -81,12 +73,7 @@ pub enum NodeOutcome {
     },
 }
 
-// No `#[serde(default)]` compat shims (E07): every field is required on read,
-// so a partial or old-format record fails closed instead of silently
-// degrading to zero values. Writers always persist complete records, so a
-// missing field is corruption, not a version to tolerate. `Option` fields use
-// `required_presence` so an explicit null is accepted and an absent key is
-// not.
+// Missing persisted fields are corruption (E07); Option fields distinguish null from absence.
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BudgetState {
@@ -94,15 +81,10 @@ pub struct BudgetState {
     #[serde(deserialize_with = "required_presence")]
     pub elapsed: Option<api::ElapsedAccountedEventData>,
     pub steps_executed: usize,
-    /// Durable budget consumption (F13): sum of `budget_charged` deltas.
-    /// Live execution and journal recovery share this counter so retry and
-    /// foreach charge rules mean the same after a restart. `steps_executed`
-    /// stays as the observational event count (step_started events).
+    /// Durable consumption (F13): `budget_charged` deltas shared by live/recovered
+    /// retry and foreach accounting; `steps_executed` only observes starts.
     pub budget_charged: usize,
-    /// Whether any `budget_charged` event folded. A run resumes its budget
-    /// from `budget_charged` when this is set and from the observational
-    /// `steps_executed` count otherwise, so the two counters never disagree
-    /// about how much of the ceiling is spent.
+    /// Resume from charged deltas when present, otherwise from observed starts.
     pub has_budget_charges: bool,
     pub steps_succeeded: u64,
     pub steps_failed: u64,
@@ -135,19 +117,15 @@ pub struct RunState {
     /// Original source path for identity events, not the runtime snapshot root.
     #[serde(default)]
     pub generator_path: Option<String>,
-    /// Owning generator id derived from the journal identity event, so
-    /// disk-only snapshots never parse it out of the run id string.
-    /// Required on read: persisted state without an owner is corrupt and
-    /// must fail instead of silently degrading to ownerless.
+    /// Required owner from journal identity, never parsed from a run id.
+    /// An ownerless persisted state is corrupt and fails closed.
     #[serde(deserialize_with = "required_presence")]
     pub generator_id: Option<String>,
     pub last_seq: u64,
     /// Run metadata admitted with the run; metadata only.
     pub labels: BTreeMap<String, String>,
-    /// Last assigned audit-record seq. Durable and audit records share one
-    /// monotonic seq space so a merged reader observes a single order;
-    /// `last_seq` still tracks durable records only, so resume folds remain
-    /// independent of audit policy. Persisted alongside `last_seq`.
+    /// Last audit seq in the shared monotonic space; `last_seq` is durable-only,
+    /// keeping resume independent of audit policy while merged readers see one order.
     pub audit_seq: u64,
     /// The canonical inputs recorded by `run_started`; retained for replay.
     #[serde(deserialize_with = "required_presence")]
@@ -155,31 +133,22 @@ pub struct RunState {
     pub vars: ValueBag,
     pub nodes: BTreeMap<NodePath, NodeOutcome>,
     pub checkpoints: BTreeMap<NodePath, Value>,
-    /// The files each node's agent removed. A removal outlives the
-    /// attempt that made it, and it outlives the node's checkpoint: the
-    /// engine clears a checkpoint when the step finishes, so the record
-    /// that holds the removals cannot be the checkpoint itself.
+    /// Unreported join facts by stable owner: cause/seq survive starting or authorizing replay.
+    pub(crate) unresolved_tasks: BTreeMap<String, Value>,
+    /// Agent removals outlive checkpoints and must be retained separately.
     pub removed_files: BTreeMap<NodePath, BTreeSet<String>>,
     pub budget: BudgetState,
     pub resource_pins: BTreeMap<String, String>,
-    /// Latest pinned revision per workspace path. Values always reflect the
-    /// journal-latest write (sequential fold overwrites); iteration order is
-    /// the map's key order, not journal order. Resume verifies the workspace
-    /// against this revision and every historical revision against its
-    /// immutable blob, so a later step overwriting an earlier pin is
-    /// legitimate while a rollback or tamper is rejected (E06).
+    /// Journal-latest revision per path; resume checks workspace and immutable history,
+    /// allowing later writes but rejecting rollback/tamper (E06).
     pub latest_file_pins: BTreeMap<String, String>,
     /// Finished executions by node: invocation-scoped approvals survive suspension (Q1).
     pub node_executions: BTreeMap<String, u64>,
-    /// All output revisions, accumulated in journal order, for immutable-blob
-    /// verification on resume (E06). Map/set iteration is not journal order.
+    /// All revisions for immutable-blob verification (E06); map/set order is not journal order.
     pub historical_file_pins: BTreeMap<String, BTreeSet<String>>,
     #[serde(deserialize_with = "required_presence")]
     pub pending: Option<Interaction>,
-    /// Journal seq of the event that installed the current `pending` prompt.
-    /// Answer and confirm acceptance must match this generation, not just
-    /// the prompt id, so a stale observation cannot accept a prompt that a
-    /// peer already regenerated (A02).
+    /// Installing seq: answers must match the prompt generation, not only its id (A02).
     #[serde(deserialize_with = "required_presence")]
     pub pending_seq: Option<u64>,
     /// Reported suspensions by owner, independent of the one-at-a-time `pending`.
@@ -198,18 +167,11 @@ pub struct RunState {
     pub priority: i32,
     pub parent_run_id: Option<String>,
     pub queued_at: Option<String>,
-    /// External side-effect operations by operation_id. Identity binds
-    /// run, node, and invocation ONLY: the content digest lives on the
-    /// record as a compared attribute, never in the key, so distinct
-    /// invocations never share an id even for identical content, while
-    /// the same invocation reuses its id across resends and retries.
-    /// Statuses: `Started` (remote may have executed, result unknown),
-    /// `Succeeded` (the operation completed; a small result is cached
-    /// inline while a large result spills to a sidecar blob named by
-    /// `result_ref`, and an uncached success refuses automatic replay
-    /// instead of re-executing), `FailedClean` (proven nothing applied,
-    /// retryable), `FailedIndeterminate` (unknown effects, refused unless
-    /// the node opts into at-least-once repeat).
+    /// External operations keyed by run/node/invocation, not digest; digest is compared.
+    /// Retries reuse identity, but equal content in another invocation does not share it.
+    /// `Started` means remote execution may be unknown. `Succeeded` caches small results
+    /// inline and large ones by `result_ref`; uncached success refuses replay. `FailedClean`
+    /// is retryable; indeterminate failure is refused unless the node opts into repetition.
     pub operation_records: BTreeMap<String, OperationRecord>,
     /// Guard generations by operation_id: counts `operation_started` events
     /// so each guard journals a truthful attempt number derived from durable
@@ -265,6 +227,7 @@ impl Default for RunState {
             pending: None,
             pending_seq: None,
             pending_interactions: BTreeMap::new(),
+            unresolved_tasks: BTreeMap::new(),
             terminal: None,
             execution_started: false,
             finished_at: None,
@@ -869,6 +832,34 @@ impl RunState {
                     self.vars.patch_step_statuses(values);
                 }
             }
+            "parallel_task_joined" | "foreach_sibling_drained" => {
+                let class = event["classification"].as_str().unwrap_or("");
+                let unreported = !matches!(
+                    class,
+                    "completed_success"
+                        | "completed_terminal"
+                        | "interaction_pending"
+                        | "task_error"
+                        | "agent_continuation"
+                );
+                if unreported {
+                    let owner = if kind == "foreach_sibling_drained" {
+                        &event["iteration"]
+                    } else {
+                        &event["node"]
+                    };
+                    let owner = owner
+                        .as_str()
+                        .filter(|_| event["node"].is_string())
+                        .ok_or_else(|| {
+                            crate::JournalError::InvalidEvent(
+                                "unreported task owner is required".into(),
+                            )
+                        })?;
+                    self.unresolved_tasks
+                        .insert(owner.to_string(), event.clone());
+                }
+            }
             "step_finished" => self.apply_step_finished(event)?,
             "step_skipped" => {
                 self.budget.steps_skipped =
@@ -1268,24 +1259,19 @@ impl RunState {
             crate::JournalError::InvalidEvent("step_finished status is required".into())
         })?;
         // Retain every revision for resume verification; absent lists default empty.
-        let files: Vec<crate::FilePin> = event
-            .get("files")
-            .cloned()
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|error| {
-                crate::JournalError::InvalidEvent(format!("invalid step output file pins: {error}"))
-            })?
-            .unwrap_or_default();
-        let failed_files: Vec<crate::FilePin> = event
-            .get("failed_files")
-            .cloned()
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|error| {
-                crate::JournalError::InvalidEvent(format!("invalid step failed file pins: {error}"))
-            })?
-            .unwrap_or_default();
+        let pins = |key: &str| -> Result<Vec<crate::FilePin>, crate::JournalError> {
+            event
+                .get(key)
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|error| {
+                    crate::JournalError::InvalidEvent(format!("invalid {key} pins: {error}"))
+                })
+                .map(Option::unwrap_or_default)
+        };
+        let files = pins("files")?;
+        let failed_files = pins("failed_files")?;
         for pin in files.iter().chain(failed_files.iter()) {
             self.historical_file_pins
                 .entry(pin.path.to_string())
@@ -1297,6 +1283,11 @@ impl RunState {
             "success" | "repaired" | "routed" | "answered_on_fail" | "regenerated"
         );
         let suspended = matches!(status, "needs_user" | "needs_confirm");
+        // A foreach suspension/failure does not settle its aborted iterations.
+        // Only completion of the parent, or a later report by the exact owner, does.
+        self.unresolved_tasks.retain(|owner, fact| {
+            owner != path && !(succeeded && fact["node"].as_str() == Some(path))
+        });
         if succeeded || suspended {
             self.apply_workspace_file_pins(path, &files);
         }
@@ -1337,9 +1328,6 @@ impl RunState {
             self.vars.set_step_outcome(path, "success", None);
             self.nodes
                 .insert(NodePath::root(path), NodeOutcome::Success { output, files });
-            self.checkpoints.remove(&NodePath::root(path));
-            self.pending_interactions.remove(&NodePath::root(path));
-            self.record_node_execution(path)?;
         } else if !suspended {
             self.budget.steps_failed =
                 self.budget.steps_failed.checked_add(1).ok_or_else(|| {
@@ -1355,6 +1343,8 @@ impl RunState {
                 .set_step_outcome(path, "failed", Some(serialized_reason));
             self.nodes
                 .insert(NodePath::root(path), NodeOutcome::Failed { reason });
+        }
+        if !suspended {
             self.checkpoints.remove(&NodePath::root(path));
             self.pending_interactions.remove(&NodePath::root(path));
             self.record_node_execution(path)?;
@@ -1887,6 +1877,7 @@ mod tests {
             "pending",
             "pending_seq",
             "pending_interactions",
+            "unresolved_tasks",
             "terminal",
             "execution_started",
             "operation_records",
