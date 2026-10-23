@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const RUN_STATE_SCHEMA_VERSION: u32 = 3;
+pub const RUN_STATE_SCHEMA_VERSION: u32 = 4;
 
 /// Durable diagnostics the journal keeps for operators but that carry no folded
 /// state. `internal_journal_kinds_pass_the_fold_gate` pins that every entry is
@@ -169,18 +169,10 @@ pub struct RunState {
     /// immutable blob, so a later step overwriting an earlier pin is
     /// legitimate while a rollback or tamper is rejected (E06).
     pub latest_file_pins: BTreeMap<String, String>,
-    /// Finished executions per node in journal order. Single-shot side
-    /// effects derive their invocation identity from this count, so retries
-    /// and crash resumes keep the current execution's approval while a
-    /// repair or regenerate is a new invocation that re-confirms under
-    /// `invocation` scope (Q1).
+    /// Finished executions by node: invocation-scoped approvals survive suspension (Q1).
     pub node_executions: BTreeMap<String, u64>,
-    /// Every file revision any step finished with. Values accumulate in
-    /// journal order (later writes add revisions, never remove); iteration
-    /// order is the map's key order. Resume verifies each revision against
-    /// its immutable blob, so a same-node overwrite whose intermediate
-    /// revision is no longer the node's final outcome is still checked
-    /// instead of silently trusted (E06).
+    /// All output revisions, accumulated in journal order, for immutable-blob
+    /// verification on resume (E06). Map/set iteration is not journal order.
     pub historical_file_pins: BTreeMap<String, BTreeSet<String>>,
     #[serde(deserialize_with = "required_presence")]
     pub pending: Option<Interaction>,
@@ -190,6 +182,8 @@ pub struct RunState {
     /// peer already regenerated (A02).
     #[serde(deserialize_with = "required_presence")]
     pub pending_seq: Option<u64>,
+    /// Reported suspensions by owner, independent of the one-at-a-time `pending`.
+    pub(crate) pending_interactions: BTreeMap<NodePath, Interaction>,
     #[serde(deserialize_with = "required_presence")]
     pub terminal: Option<TerminalState>,
     pub execution_started: bool,
@@ -270,6 +264,7 @@ impl Default for RunState {
             historical_file_pins: BTreeMap::new(),
             pending: None,
             pending_seq: None,
+            pending_interactions: BTreeMap::new(),
             terminal: None,
             execution_started: false,
             finished_at: None,
@@ -889,6 +884,7 @@ impl RunState {
                             reason: reason.clone(),
                         },
                     );
+                    self.pending_interactions.remove(&NodePath::root(path));
                     let serialized_reason = serde_json::to_value(&reason).map_err(|error| {
                         crate::JournalError::InvalidEvent(format!(
                             "invalid structured failure detail: {error}"
@@ -937,7 +933,12 @@ impl RunState {
                             "invalid confirmation payload: {error}"
                         ))
                     })?;
-                    self.pending = Some(Interaction::Confirmation { confirm });
+                    let interaction = Interaction::Confirmation { confirm };
+                    if let Some(node) = event.get("node").and_then(Value::as_str) {
+                        self.pending_interactions
+                            .insert(NodePath::root(node), interaction.clone());
+                    }
+                    self.pending = Some(interaction);
                     self.pending_seq = event.get("seq").and_then(Value::as_u64);
                 }
             }
@@ -958,11 +959,7 @@ impl RunState {
                     .and_then(Value::as_str)
                     .or_else(|| event.get("ts").and_then(Value::as_str))
                     .map(str::to_string);
-                // Durability record for an accepted HITL response. The engine
-                // consumes the persisted answers map on resume, so the
-                // pending prompt is cleared here and rehydrate restores the
-                // values from the same events. Later events win on the same
-                // key, matching read_persisted_hitl.
+                // Accepted responses remove only their own typed interaction.
                 if kind == "user_answered" {
                     let id = event
                         .get("question_id")
@@ -998,8 +995,23 @@ impl RunState {
                             })?;
                     self.confirmations.insert(id.to_string(), approved);
                 }
-                self.pending = None;
-                self.pending_seq = None;
+                let matches = |interaction: &Interaction| {
+                    let (expected, key, id) = match interaction {
+                        Interaction::Question { question } => {
+                            ("user_answered", "question_id", question.id.as_str())
+                        }
+                        Interaction::Confirmation { confirm } => {
+                            ("user_confirmed", "confirmation_id", confirm.id.as_str())
+                        }
+                    };
+                    kind == expected && event.get(key).and_then(Value::as_str) == Some(id)
+                };
+                self.pending_interactions
+                    .retain(|_, interaction| !matches(interaction));
+                if self.pending.as_ref().is_some_and(matches) {
+                    self.pending = None;
+                    self.pending_seq = None;
+                }
                 self.terminal = None;
             }
             "user_cancel_requested" => {
@@ -1288,6 +1300,24 @@ impl RunState {
         if succeeded || suspended {
             self.apply_workspace_file_pins(path, &files);
         }
+        if suspended {
+            let (key, kind) = if status == "needs_user" {
+                ("question", "question")
+            } else {
+                ("confirm", "confirmation")
+            };
+            if let Some(payload) = event.get(key) {
+                let interaction =
+                    serde_json::from_value(serde_json::json!({"kind": kind, (key): payload}))
+                        .map_err(|error| {
+                            crate::JournalError::InvalidEvent(format!(
+                                "invalid saved interaction: {error}"
+                            ))
+                        })?;
+                self.pending_interactions
+                    .insert(NodePath::root(path), interaction);
+            }
+        }
         if succeeded {
             self.budget.steps_succeeded =
                 self.budget.steps_succeeded.checked_add(1).ok_or_else(|| {
@@ -1308,8 +1338,7 @@ impl RunState {
             self.nodes
                 .insert(NodePath::root(path), NodeOutcome::Success { output, files });
             self.checkpoints.remove(&NodePath::root(path));
-            self.pending = None;
-            self.pending_seq = None;
+            self.pending_interactions.remove(&NodePath::root(path));
             self.record_node_execution(path)?;
         } else if !suspended {
             self.budget.steps_failed =
@@ -1327,6 +1356,7 @@ impl RunState {
             self.nodes
                 .insert(NodePath::root(path), NodeOutcome::Failed { reason });
             self.checkpoints.remove(&NodePath::root(path));
+            self.pending_interactions.remove(&NodePath::root(path));
             self.record_node_execution(path)?;
         }
         Ok(())
@@ -1856,6 +1886,7 @@ mod tests {
             "historical_file_pins",
             "pending",
             "pending_seq",
+            "pending_interactions",
             "terminal",
             "execution_started",
             "operation_records",

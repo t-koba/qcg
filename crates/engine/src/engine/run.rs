@@ -659,15 +659,10 @@ impl Engine {
             )?;
         }
 
-        // Verify checkpoint pins and resource pins before placing file
-        // inputs: a failed verification must not leave fresh writes behind.
-        // The resume marker is appended only after both verification and
-        // input placement succeed, so repeated failed resumes cannot grow
-        // the journal (E06). Single-handle handoff: `verify_files` hashes
-        // each workspace projection once FROM ITS FD; the returned digests
-        // are threaded to input materialization so the same source is never
-        // re-hashed (E06). FOREIGN `run_dirs` double-hashing stays outside;
-        // this side eliminates its own duplication here.
+        // E06: verify checkpoints and resources before materializing inputs, then
+        // append the resume marker. Failed verification leaves no new writes or
+        // repeated markers. Workspace digests come from one FD hash and are
+        // reused for input materialization; foreign run_dirs stay outside this path.
         let preverified = replay.verify_files(
             &context.workspace,
             &context.metadata,
@@ -675,9 +670,7 @@ impl Engine {
             &context.checkpoint_accounting,
         )?;
         verify_resource_pins(&replay.state, &resource_hashes)?;
-        // `run_id` is already set on a never-executed `run_queued`
-        // journal, so the resume decision must follow `execution_started`,
-        // not the run id (E06).
+        // E06: run_queued already sets run_id; execution_started decides resume.
         let resume = replay.state.execution_started;
         let materialized_inputs = super::types::materialize_file_inputs_with_preverified(
             &context.contract,
@@ -735,10 +728,8 @@ impl Engine {
         self.run_hooks(&context, &journal, &mut vars, &mut budget, "run_started")
             .await?;
 
-        // First distinct execution error (timeout/elapsed/budget) stashed
-        // while failure settlement still runs hooks (F07-01 + E11): the
-        // journal and hooks observe the failure, but the caller keeps the
-        // distinct classification instead of a joined generic failure.
+        // F07-01/E11: settle failures through hooks without losing the caller's
+        // first distinct timeout/elapsed/budget classification.
         let mut first_distinct_error: Option<EngineError> = None;
         loop {
             if context.cancellation.is_cancelled() {
@@ -752,6 +743,20 @@ impl Engine {
                 super::elapsed::close(&mut episode, &journal)?;
                 journal.event("run_yielded", json!({}))?;
                 return Err(EngineError::Yielded);
+            }
+            // Surface saved reports in node-path order before re-entering any owner.
+            // Supplied answers retain the direct-run API's existing resume behavior.
+            for (owner, interaction) in &replay.state.pending_interactions {
+                match interaction {
+                    crate::Interaction::Question { question } if !context.answers.contains_key(&question.id) => {
+                        return Err(EngineError::NeedsUser { question_id: question.id.clone(), question: Box::new(question.clone()) });
+                    }
+                    crate::Interaction::Confirmation { confirm } if !context.confirmations.contains_key(&confirm.id) => {
+                        journal.event("confirm_request", json!({"node": owner, "confirm": confirm}))?;
+                        return Err(EngineError::NeedsConfirm { confirm_id: confirm.id.clone(), confirm: Box::new(confirm.clone()) });
+                    }
+                    _ => {}
+                }
             }
             let mut progressed = false;
             let mut ready = Vec::new();
@@ -858,33 +863,21 @@ impl Engine {
                 progressed = true;
             } else if let Some(node) = ready.first() {
                 let id = node.id.clone();
-                // Check the run-wide deadline before journaling start:
-                // starting a node after the limit fired pollutes accounting
-                // with work that can never commit (E11). Budget is charged
-                // once per attempt inside the retry wrapper (unified rule,
-                // E10), not here, so retries pay while the start marker
-                // stays a single attempt-1 event.
+                // E11: check the deadline before recording work that cannot commit.
+                // E10: the retry wrapper charges each attempt; start is recorded once.
                 context.run_checkpoint()?;
                 sync_live_outcomes(&mut vars, &journal);
                 states.insert(id.clone(), NodeState::Running);
-                // Record start before execution so long-running steps are
-                // observable and durations reflect actual processing time,
-                // matching the parallel wave path.
+                // Record start before execution for observability, like parallel waves.
                 journal.event(
                     "step_started",
                     json!({ "node": id, "type": node.kind.to_string(), "attempt": 1 }),
                 )?;
                 tracing::debug!(run_id = %context.run_id, node = %id, "step started");
-                // Ordinary execution errors (command/HTTP/LLM failures,
-                // timeouts) become node failures (F07-01) so the shared
-                // failure settlement runs step_failed/run_failed hooks.
-                // Cancellations and HITL suspensions still propagate.
-                // Agent failures propagate too: the agent owns durable
-                // continuations (checkpoints plus operation records) whose
-                // replay-safety verdict only its operation guard can make
-                // on re-entry. Settling one here as a terminal node failure
-                // would report the stale error on resume instead of
-                // re-entering the agent, stranding the continuation.
+                // F07-01: ordinary execution errors become node failures so hooks
+                // settle them. Cancellation, HITL and agent errors propagate:
+                // only the agent's operation guard can decide replay safety for
+                // its durable continuation; terminalizing it here would strand it.
                 let outcome = match self
                     .execute_node_with_retry(&context, &journal, &mut vars, &mut budget, node)
                     .await
@@ -1263,14 +1256,8 @@ impl Engine {
                         }
                     }
                     StepOutcome::NeedsUser { question, files } => {
-                        // Direct suspension without a failed attempt: still
-                        // journal the unified failed-evidence keys (null plus
-                        // an empty list) so every suspension shares one
-                        // notation with the failure paths (E06). The files
-                        // the attempt produced are pinned and journaled
-                        // under `files`, like the success path: a resume
-                        // restores the writes the attempt made before it
-                        // asked instead of losing them with the attempt.
+                        // E06: direct suspensions use null/empty failed evidence,
+                        // while `files` pins writes produced before the question.
                         const NO_OUTPUT: Option<serde_json::Value> = None;
                         let file_pins = pin_attempt_files(&context, &files)?;
                         journal.event(
@@ -1287,14 +1274,8 @@ impl Engine {
                         });
                     }
                     StepOutcome::NeedsConfirm { confirm, files } => {
-                        // `confirm_request` keeps its strict FOREIGN schema
-                        // (`api::ConfirmRequestEventData` allows only
-                        // `confirm` plus the files it carries): the
-                        // failed-evidence keys would be rejected at journal
-                        // validation, so they stay off this event. The files
-                        // the attempt produced are pinned here, so the
-                        // writes before the confirmation are journaled like
-                        // the success path's.
+                        // E06: the strict confirm_request schema carries produced
+                        // file pins, but excludes failed-evidence keys.
                         let file_pins = pin_attempt_files(&context, &files)?;
                         journal.event(
                             "confirm_request",

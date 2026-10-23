@@ -7360,3 +7360,6 @@ async fn active_parallel_wave_has_one_elapsed_interval_not_one_per_node() {
 
 #[path = "tests/parallel_facts.rs"]
 mod parallel_facts;
+
+#[path = "tests/saved_interactions.rs"]
+mod saved_interactions;
