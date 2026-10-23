@@ -729,9 +729,10 @@ impl LocalService {
     /// terminal event). A failed terminal append leaves memory at
     /// `CancelRequested` with the task slot cleared, so the periodic
     /// resumer retries settlement instead of wedging on a believed
-    /// terminal state the journal never recorded. A task slot holding a
-    /// completed handle is not a running task, so the slot is always
-    /// cleared here.
+    /// terminal state the journal never recorded. Drain or fold failures
+    /// leave the accepted request and interaction state untouched for retry.
+    /// Completed settlement clears the task slot. Observation failure may
+    /// leave a finished handle there; the resumer treats it as non-running.
     pub(crate) async fn settle_queued_cancel(
         &self,
         run_id: &str,
@@ -740,12 +741,13 @@ impl LocalService {
     ) {
         if let Err(error) = self.drain_cancel_controls(run_id, run_dir).await {
             tracing::warn!(run_id = %run_id, %error, "cancel drain failed during queued settlement; mailbox retained");
+            return;
         }
         let terminal = match self.authoritative_state(run_dir).await {
             Ok(state) => state.terminal.clone(),
             Err(error) => {
-                tracing::error!(run_id = %run_id, %error, "state fold failed during queued settlement");
-                None
+                tracing::error!(run_id = %run_id, %error, "state fold failed during queued settlement; acceptance retained for retry");
+                return;
             }
         };
         if let Some(terminal) = terminal {
@@ -850,6 +852,8 @@ impl LocalService {
         run_id: &str,
         run_dir: &Utf8PathBuf,
     ) -> Result<(), ServiceError> {
+        #[cfg(test)]
+        crate::tests::cancel_observation::fail_cancel_observation(run_dir, "drain")?;
         let pending = list_pending_cancel_controls(run_dir)?;
         if pending.is_empty() {
             return Ok(());
@@ -1393,17 +1397,10 @@ impl LocalService {
                 // Convert pending cancel mailbox entries to single journal events
                 // before the engine writer starts. This task holds the execution
                 // lease, so no other owner appends concurrently (A01/A02). A
-                // failed drain refuses to start: settle terminally so the run
-                // converges instead of wedging half-started past a cancel.
+                // failed drain refuses to start without inventing cancellation;
+                // the resumer retries observation after this task exits.
                 if let Err(error) = service.drain_cancel_controls(&run_id, &run_dir).await {
                     tracing::error!(run_id = %run_id, %error, "cancel drain failed; refusing to start execution");
-                    service
-                        .settle_queued_cancel(
-                            &run_id,
-                            &run_dir,
-                            "cancel drain failed before execution",
-                        )
-                        .await;
                     return;
                 }
                 // Priority admission: only the queue head takes a slot, so a
@@ -1420,8 +1417,8 @@ impl LocalService {
                     {
                         Ok(cancel) => cancel,
                         Err(error) => {
-                            tracing::error!(%error, run_id = %run_id, "cancel check failed while queued; settling as canceled");
-                            true
+                            tracing::error!(%error, run_id = %run_id, "cancel check failed while queued; refusing to start execution");
+                            return;
                         }
                     };
                     if queued_cancel || cancellation.is_cancelled() {
@@ -1460,13 +1457,13 @@ impl LocalService {
                     // Re-check peer cancel after admission: a cancel that landed
                     // while waiting must win over starting execution (A02).
                     // An unreadable cancel state refuses to start execution:
-                    // starting work nobody can observe or stop is the unsafe
-                    // direction, so the error arm means cancel.
+                    // observation failure is not a cancellation signal. The
+                    // resumer must re-read before execution or settlement.
                     let peer_cancel = match crate::summaries::has_remote_cancel_request(&run_dir) {
                         Ok(cancel) => cancel,
                         Err(error) => {
                             tracing::error!(%error, run_id = %run_id, "cancel check failed; refusing to start execution");
-                            true
+                            return;
                         }
                     };
                     // A settled run never regresses: only non-terminal records

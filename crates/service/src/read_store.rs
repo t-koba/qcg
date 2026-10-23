@@ -328,6 +328,9 @@ impl LocalService {
         &self,
         directory: &Utf8Path,
     ) -> Result<RunState, ApiError> {
+        #[cfg(test)]
+        crate::tests::cancel_observation::fail_cancel_observation(directory, "fold")
+            .map_err(ApiError::from)?;
         let directory = directory.to_owned();
         self.blocking_read(move || crate::summaries::fold_run_state(&directory))
             .await
