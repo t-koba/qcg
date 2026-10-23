@@ -186,10 +186,17 @@ impl Engine {
     ) -> Result<(), EngineError> {
         let context = Arc::new(context.clone());
         let journal = Arc::new(journal.clone_for_parallel()?);
+        let mut nodes = nodes;
         let mut tasks = JoinSet::new();
         let mut task_nodes = BTreeMap::new();
         // Defer journal errors until all writers are quiescent.
         let mut fact_result = Ok(());
+        let mut outcomes = BTreeMap::new();
+        let mut join_errors: Vec<EngineError> = Vec::new();
+        let mut abort_on_settle = false;
+        let mut parent_cancelled = false;
+        let mut start_error = None;
+        let mut started_count = 0usize;
         for node in &nodes {
             // Check elapsed before start (E11); charge attempts in the retry wrapper (E10).
             let started = context.run_checkpoint().and_then(|()| {
@@ -207,18 +214,17 @@ impl Engine {
                 } else {
                     "wave_start_failure"
                 };
+                states.insert(node.id.clone(), NodeState::Pending);
                 tasks.abort_all();
                 while let Some(result) = tasks.join_next_with_id().await {
-                    fact_result = fact_result.and(record_wave_join(
-                        &journal,
-                        &mut task_nodes,
-                        &result,
-                        cause,
-                        cause,
-                    ));
+                    let fact = record_wave_join(&journal, &mut task_nodes, &result, cause, cause);
+                    fact_result = fact_result.and(fact);
+                    if let Ok((_, (node, outcome))) = result {
+                        outcomes.insert(node.id.clone(), (node, outcome));
+                    }
                 }
-                fact_result?;
-                return Err(error);
+                start_error = Some(error);
+                break;
             }
             let engine = self.clone();
             let context = Arc::clone(&context);
@@ -240,17 +246,15 @@ impl Engine {
                 (node, outcome)
             });
             task_nodes.insert(task.id(), node_id);
+            started_count += 1;
+        }
+        if start_error.is_some() {
+            nodes.truncate(started_count);
         }
 
-        let mut outcomes = BTreeMap::new();
-        // Collect all failures and panic detail, not just the first (E10).
-        let mut join_errors: Vec<EngineError> = Vec::new();
         // Abort siblings on the first terminal outcome; external cancellation aborts all.
         // Join facts retain unresolved execution separately from settlement.
-        let mut abort_on_settle = false;
-        let mut parent_cancelled = false;
-        // Drain to full quiescence before settlement: no writer may outlive this loop.
-        // Late outcomes win; missing reports prove neither failure nor replay safety.
+        // Drain to quiescence; late outcomes win, missing reports prove neither failure nor replay safety.
         loop {
             if tasks.is_empty() {
                 break;
@@ -416,10 +420,9 @@ impl Engine {
             }
         }
         if parent_cancelled {
-            Err(EngineError::Canceled)
-        } else {
-            combine_terminal_errors(terminal_errors)
+            return Err(EngineError::Canceled);
         }
+        start_error.map_or_else(|| combine_terminal_errors(terminal_errors), Err)
     }
 
     /// Run a node under its retry policy: only execution failures retry; other classes fail fast, and cancellation interrupts backoff.
