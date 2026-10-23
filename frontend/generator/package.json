@@ -20,7 +20,7 @@
     "svelte-check": "^4.1.4",
     "typescript": "^5.7.3",
     "vite": "^6.1.0",
-    "vitest": "4.1.11",
+    "vitest": "4.1.12",
     "esbuild": "0.25.12",
     "playwright": "1.63.0"
   }
