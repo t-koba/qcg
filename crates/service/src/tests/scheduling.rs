@@ -103,7 +103,12 @@ async fn bounded_scheduler_comparison_boundary_safety_and_interrupt_latency() {
     ] {
         for mode in [PreemptionMode::StepBoundary, PreemptionMode::Interrupt] {
             let root = temp_run_dir(&format!("scheduler-comparison-{mode:?}"));
-            generator(&root, "slow", "0.3");
+            let slow_command = if mode == PreemptionMode::StepBoundary {
+                "0; while [ ! -f release ]; do sleep 0.02; done"
+            } else {
+                "0.3"
+            };
+            generator(&root, "slow", slow_command);
             generator(&root, "urgent", "0.1");
             let mut deployment = if mode == PreemptionMode::Interrupt {
                 ServiceDeploymentPolicy {
@@ -119,7 +124,25 @@ async fn bounded_scheduler_comparison_boundary_safety_and_interrupt_latency() {
             let victim = start(&service, "slow", 0).await;
             operation_started(&service, &victim).await;
             let clock = Instant::now();
-            let urgent = start(&service, "urgent", 5).await;
+            let urgent = if mode == PreemptionMode::StepBoundary {
+                let clone = service.clone();
+                let arriving = tokio::spawn(async move { start(&clone, "urgent", 5).await });
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    while !service.inner.runs.read().await[&victim].preempted {
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                std::fs::write(
+                    run_workspace_dir(&service.inner.runs_dir.join(&victim)).join("release"),
+                    "go",
+                )
+                .unwrap();
+                arriving.await.unwrap()
+            } else {
+                start(&service, "urgent", 5).await
+            };
             wait_for_snapshot(&service, &urgent, RunStatus::Running).await;
             let admission = clock.elapsed();
             let journal = read_journal_string(&service, victim.clone()).await;
