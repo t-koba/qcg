@@ -28,6 +28,15 @@ export class QcgError extends Error {
   }
 }
 
+/** Reads only nonempty string messages; the original problem stays unknown. */
+function problemMessage(problem: unknown): string | undefined {
+  if (typeof problem !== "object" || problem === null) return undefined;
+  const { detail, title } = problem as { detail?: unknown; title?: unknown };
+  if (typeof detail === "string" && detail.length > 0) return detail;
+  if (typeof title === "string" && title.length > 0) return title;
+  return undefined;
+}
+
 /** Encodes one path segment (no slashes survive). */
 function encodeSegment(value: string): string {
   return encodeURIComponent(value);

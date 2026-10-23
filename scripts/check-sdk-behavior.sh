@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# G07-04: SDK behavior gate, separate from freshness (scripts/check-sdk.sh).
+# G07-04: SDK behavior gate, separate from freshness/typecheck (check-sdk.sh).
 #
-# Freshness proves the checked-in clients match the generator; this script
+# Freshness/typecheck proves clients match the generator and compile; this script
 # proves the generated clients actually behave: SSE delivery/framing over a
 # live server and chunk matrix (G04), finite consistent redirects (G05), and
-# typed response readers. CI runs both gates; neither subsumes the other.
+# typed response readers and safe HTTP problem errors. CI runs both gates;
+# neither subsumes the other.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -18,5 +19,6 @@ trap 'rm -rf "$bundle_dir"' EXIT
 (cd "$repo_root/frontend/generator" && npx --no-install esbuild "$repo_root/clients/ts/client.ts" \
   --format=esm --outfile="$bundle_dir/client.mjs" --log-level=error)
 QCG_TS_CLIENT="$bundle_dir/client.mjs" node "$repo_root/scripts/sdk-behavior/test_sse_redirect.mjs"
+QCG_TS_CLIENT="$bundle_dir/client.mjs" node "$repo_root/scripts/sdk-behavior/test_problem_errors.mjs"
 
 echo "SDK behavior check passed"

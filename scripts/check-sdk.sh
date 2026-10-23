@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fails when the checked-in SDKs are stale relative to docs/openapi.json.
+# Fails when SDKs are stale relative to docs/openapi.json or fail strict TS checks.
 #
 # Generation runs into a temporary directory and the result is diffed against
 # clients/, so the check never rewrites the worktree and never depends on a
@@ -25,4 +25,10 @@ if [ "$status" -ne 0 ]; then
   echo "checked-in SDKs are stale; run node scripts/generate-sdk.mjs" >&2
   exit "$status"
 fi
-echo "SDK check passed"
+# Use the already-required frontend devDependency; no install or transpile-only
+# substitute: every generated SDK TypeScript file must compile under strict mode.
+node "$repo_root/frontend/generator/node_modules/typescript/bin/tsc" \
+  --noEmit --strict --target ES2022 --module ESNext --moduleResolution bundler \
+  --lib ES2022,DOM "$repo_root"/clients/ts/*.ts
+
+echo "SDK freshness and strict TypeScript check passed"
