@@ -534,6 +534,8 @@ async fn drain_foreach_tasks(
 ) -> Result<(), EngineError> {
     tasks.abort_all();
     let mut ignored: usize = 0;
+    // Keep joining all owners after a journal failure; return it only after quiescence.
+    let mut write_error: Option<EngineError> = None;
     while let Some(result) = tasks.join_next_with_id().await {
         let task_id = match &result {
             Ok((id, _)) => *id,
@@ -627,12 +629,14 @@ async fn drain_foreach_tasks(
                 ignored += 1;
             }
         }
-        journal.event("foreach_sibling_drained", record)?;
+        if let Err(error) = journal.event("foreach_sibling_drained", record) {
+            write_error.get_or_insert_with(|| error.into());
+        }
     }
     if ignored > 0 {
         tracing::warn!(node = %node_id, ignored, "drain_foreach_tasks ignored sibling outcomes after fail-fast; see foreach_sibling_drained journal events");
     }
-    Ok(())
+    write_error.map_or(Ok(()), Err)
 }
 
 #[cfg(test)]
@@ -830,6 +834,65 @@ mod tests {
         drop(journal);
         std::fs::remove_dir_all(dir).unwrap();
     }
+    #[tokio::test]
+    async fn drain_quiesces_every_task_after_a_fact_write_failure() {
+        let dir =
+            std::env::temp_dir().join(format!("foreach-write-failure-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.join("journal.jsonl")).unwrap();
+        let limits = JournalLimits {
+            max_event_count: Some(1),
+            ..JournalLimits::default()
+        };
+        let journal =
+            JournalWriter::create_with_limits(&path, "write-failure", false, None, limits).unwrap();
+        let mut tasks = JoinSet::new();
+        let mut indices = HashMap::new();
+        for index in 0..3 {
+            let task = tasks.spawn(async move {
+                (
+                    index,
+                    ValueBag::default(),
+                    Err(EngineError::Failed("reported".into())),
+                )
+            });
+            indices.insert(task.id(), index);
+            completed(&task).await;
+        }
+        let result = drain_foreach_tasks(
+            &mut tasks,
+            &mut indices,
+            &mut ValueBag::default(),
+            &mut vec![],
+            &journal,
+            "outer",
+            false,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "the event-count limit must reject later facts"
+        );
+        assert!(
+            tasks.is_empty(),
+            "all task joins must be consumed before return"
+        );
+        assert!(indices.is_empty(), "no task owner may remain unjoined");
+        let events = read_journal_values(&path, JournalLimits::default())
+            .unwrap()
+            .events;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["t"] == "foreach_sibling_drained")
+                .count(),
+            1,
+            "the bounded journal must retain the first fact and reject the rest"
+        );
+        drop(journal);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn drain_records_parent_cancellation_separately_from_fail_fast_abort() {
         let dir = std::env::temp_dir().join(format!("foreach-cancel-{}", uuid::Uuid::now_v7()));
