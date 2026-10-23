@@ -3615,7 +3615,7 @@ impl StepExecutor for TypedAgentFailureStep {
                 allowed: 1,
                 validation: None,
             },
-            TypedAgentFailure::Resource => StepError::AgentResourceExhausted {
+            TypedAgentFailure::Resource => StepError::LocalResourceExhausted {
                 node: node.id.clone(),
                 message: "agent token budget exceeded".into(),
                 resource: "tokens_total",

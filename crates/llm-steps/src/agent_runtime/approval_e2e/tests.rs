@@ -809,7 +809,7 @@ async fn specialist_token_exhaustion_keeps_typed_facts_through_failure_policy() 
     assert!(
         matches!(
             &error,
-            StepError::AgentResourceExhausted {
+            StepError::LocalResourceExhausted {
                 resource: "tokens_total",
                 used,
                 allowed: 1,

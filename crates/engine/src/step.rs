@@ -47,9 +47,9 @@ pub enum StepError {
         allowed: u64,
         validation: Option<String>,
     },
-    /// Agent-local token/tool-call limit (not a run budget): settles like `Failed`.
+    /// Step-local resource limit (not a run budget): settles like `Failed`.
     #[error("step `{node}` failed: {message}")]
-    AgentResourceExhausted {
+    LocalResourceExhausted {
         node: String,
         message: String,
         resource: &'static str,

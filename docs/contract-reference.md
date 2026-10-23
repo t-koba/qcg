@@ -807,7 +807,13 @@ hold exactly is refused rather than stated approximately - and `min` and
 
 `llm.choose`
 : Choose from the closed `options` list. Out-of-set responses retry up to
-  `max_iterations` attempts. When `output_file` is set, the selected option is
+  `max_iterations` attempts. `max_tokens_total` caps cumulative input and output
+  tokens across these attempts (equality is allowed). Exceeding it fails before
+  accepting a choice or writing output; canonical failure details retain exact
+  `exhaustion: {resource: "tokens_total", used, allowed}` with code
+  `execution_failed`, not the distinct run-wide `budget_exceeded` token limit.
+  This does not change retry policy or authorize continuation.
+  When `output_file` is set, the selected option is
   written as UTF-8 text and reported as an output file.
 
 `llm.repair`

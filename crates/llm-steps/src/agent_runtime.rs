@@ -1719,7 +1719,7 @@ pub(crate) fn agent_resource_exhausted(
     scope: &str,
     (resource, used, allowed): (&'static str, u64, u64),
 ) -> StepError {
-    StepError::AgentResourceExhausted {
+    StepError::LocalResourceExhausted {
         node: node.into(),
         message: format!("{scope} budget exceeded: {used} > {allowed}"),
         resource,
@@ -1741,7 +1741,7 @@ pub(crate) fn agent_failure_code(error: &StepError) -> AgentFailureCode {
             ValidationFailed
         }
         StepError::AgentIterationsExhausted { .. } => IterationBudgetExceeded,
-        StepError::AgentResourceExhausted { resource, .. } => match *resource {
+        StepError::LocalResourceExhausted { resource, .. } => match *resource {
             "tokens_total" => TokenBudgetExceeded,
             "tool_calls_total" | "tool_calls_per_tool" => ToolCallBudgetExceeded,
             _ => ToolFailed,
@@ -1834,7 +1834,7 @@ pub(crate) fn recover_agent_tool_call_failure(
     let id = Some(call.id.as_str());
     let Some((action, limits)) = agent_tool_failure_resolution(tools, &call.name, failure.code)
     else {
-        if matches!(error, StepError::AgentResourceExhausted { .. }) {
+        if matches!(error, StepError::LocalResourceExhausted { .. }) {
             let action = AgentFailureAction::Fail;
             record_agent_failure_event(ctx, node, &node.id, id, failure.code, action, error)?;
         }
@@ -1915,7 +1915,7 @@ pub(crate) fn record_agent_failure_event(
             allowed,
             ..
         }
-        | StepError::AgentResourceExhausted {
+        | StepError::LocalResourceExhausted {
             resource,
             used,
             allowed,

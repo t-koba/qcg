@@ -2544,21 +2544,21 @@ fn agent_iteration_exhaustion_keeps_failure_disposition_and_hooks() {
 fn agent_resource_exhaustion_carries_typed_facts_without_numeric_parsing() {
     // Typed facts travel in fields, never parsed from message numbers: the
     // message here names different numbers than the fields carry.
-    let token = StepError::AgentResourceExhausted {
+    let token = StepError::LocalResourceExhausted {
         node: "agent".into(),
         message: "llm.agent token budget exceeded: 999 > 111".into(),
         resource: "tokens_total",
         used: 9,
         allowed: 8,
     };
-    let total = StepError::AgentResourceExhausted {
+    let total = StepError::LocalResourceExhausted {
         node: "agent".into(),
         message: "llm.agent tool call budget exceeded: 999 > 111".into(),
         resource: "tool_calls_total",
         used: 3,
         allowed: 2,
     };
-    let per_tool = StepError::AgentResourceExhausted {
+    let per_tool = StepError::LocalResourceExhausted {
         node: "agent".into(),
         message: "llm.agent tool `search` call budget exceeded: 999 > 111".into(),
         resource: "tool_calls_per_tool",
@@ -2577,7 +2577,7 @@ fn agent_resource_exhaustion_carries_typed_facts_without_numeric_parsing() {
         agent_failure_code(&per_tool),
         AgentFailureCode::ToolCallBudgetExceeded
     );
-    let unknown = StepError::AgentResourceExhausted {
+    let unknown = StepError::LocalResourceExhausted {
         node: "agent".into(),
         message: "token budget exceeded: must not classify by message".into(),
         resource: "future_resource",
@@ -2587,7 +2587,7 @@ fn agent_resource_exhaustion_carries_typed_facts_without_numeric_parsing() {
     assert_eq!(agent_failure_code(&unknown), AgentFailureCode::ToolFailed);
     assert_ne!(per_tool.to_string(), total.to_string());
     match &per_tool {
-        StepError::AgentResourceExhausted {
+        StepError::LocalResourceExhausted {
             resource,
             used,
             allowed,
@@ -2644,7 +2644,7 @@ fn agent_resource_exhaustion_carries_typed_facts_without_numeric_parsing() {
     )
     .expect_err("over-cap call fails");
     match &error {
-        StepError::AgentResourceExhausted {
+        StepError::LocalResourceExhausted {
             resource,
             used,
             allowed,
@@ -2689,7 +2689,7 @@ fn agent_resource_exhaustion_carries_typed_facts_without_numeric_parsing() {
     .expect_err("per-tool cap binds before the total cap");
     assert!(matches!(
         error,
-        StepError::AgentResourceExhausted {
+        StepError::LocalResourceExhausted {
             resource: "tool_calls_per_tool",
             used: 2,
             allowed: 1,
@@ -2714,7 +2714,7 @@ fn agent_resource_exhaustion_carries_typed_facts_without_numeric_parsing() {
         &mut counts,
     )
     .expect_err("saturated counters still exceed the cap");
-    assert!(matches!(error, StepError::AgentResourceExhausted {
+    assert!(matches!(error, StepError::LocalResourceExhausted {
         resource: "tool_calls_total", used, allowed: 1, ..
     } if used == usize::MAX as u64));
     assert_eq!(total_count, usize::MAX);
@@ -2771,7 +2771,7 @@ async fn agent_resource_exhaustion_emits_fail_once_for_top_level_and_unresolved_
     assert!(
         matches!(
             error,
-            StepError::AgentResourceExhausted {
+            StepError::LocalResourceExhausted {
                 resource: "tokens_total",
                 used: 9,
                 allowed: 8,
@@ -3056,3 +3056,5 @@ fn exhaustion_test_gateway<'a>(
 }
 
 mod context_exhaustion;
+
+mod choose_exhaustion;

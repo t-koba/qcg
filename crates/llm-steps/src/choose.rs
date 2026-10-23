@@ -23,9 +23,7 @@ pub(crate) struct LlmChooseStep {
 #[async_trait]
 impl StepExecutor for LlmChooseStep {
     engine::step_type_id!("llm.choose");
-
     engine::parallel_step_traits!();
-
     fn params_schema(&self) -> Option<Value> {
         Some(params_schema(
             &["prompt", "options", "max_iterations", "max_tokens_total"],
@@ -82,12 +80,15 @@ impl StepExecutor for LlmChooseStep {
                 complete_llm(ctx, node, request, |_| json!({ "attempt": attempt })).await?;
             tokens_total = checked_usage_total(node, tokens_total, &response.usage)?;
             if tokens_total > max_tokens_total {
-                return Err(StepError::failed(
-                    &node.id,
-                    format!(
+                return Err(StepError::LocalResourceExhausted {
+                    node: node.id.clone(),
+                    message: format!(
                         "llm.choose token budget exceeded: {tokens_total} > {max_tokens_total}"
                     ),
-                ));
+                    resource: "tokens_total",
+                    used: tokens_total,
+                    allowed: max_tokens_total,
+                });
             }
             let choice = response_text(response.content)?;
             if params.options.iter().any(|option| option == &choice) {

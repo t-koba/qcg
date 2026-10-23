@@ -1481,17 +1481,17 @@ fn is_failure_settlement_event(event: &str) -> bool {
     matches!(event, "step_failed" | "run_failed")
 }
 
-/// Execution errors with a distinct caller-visible classification (F07+E11):
-/// timeouts, elapsed overruns, and budget exhaustion settle through failure
-/// hooks like every other failure, but the caller keeps the original error
-/// instead of a joined generic failure.
+/// Keep typed classification/resource facts through failure hooks and settlement
+/// instead of joining them into a generic failure (F07+E11).
 fn is_distinct_execution_error(error: &EngineError) -> bool {
     is_budget_exhaustion(error)
         || is_elapsed_exhaustion(error)
         || matches!(
             error,
             EngineError::Step(
-                StepError::TimedOut { .. } | StepError::ProviderContextExhausted { .. }
+                StepError::TimedOut { .. }
+                    | StepError::ProviderContextExhausted { .. }
+                    | StepError::LocalResourceExhausted { .. }
             )
         )
 }

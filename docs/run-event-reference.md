@@ -75,7 +75,10 @@ Canonical failure details in step summaries, `step_finished.reason`,
 copied from typed enforcing errors, not parsed from their messages.
 `cost_microusd` uses millionths of a US dollar; `tokens` retains the check's
 scope, which can be a gateway call allowance or a run budget. The field does
-not assert that every token error measures a run total. The `steps` resource
+not assert that every token error measures a run total. Step-local token caps
+(including `llm.choose.max_tokens_total`) use `tokens_total`, not `tokens`,
+and retain `execution_failed` settlement. Local tool-call caps use
+`tool_calls_total` or `tool_calls_per_tool`. The `steps` resource
 reports the run-wide step budget: `used` is the exact already-charged count
 and `allowed` the configured maximum, refused once `used` reaches `allowed`.
 Admission checks may report projected/reserved usage, not spent usage;

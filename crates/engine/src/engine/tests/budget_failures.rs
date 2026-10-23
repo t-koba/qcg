@@ -167,7 +167,7 @@ async fn typed_budget_failures_survive_execution_journal_and_replay() {
 }
 
 #[test]
-fn only_typed_budget_errors_project_exhaustion() {
+fn typed_enforcing_errors_project_exhaustion() {
     use super::super::types::failure_detail_for_error;
     let typed = EngineError::Step(StepError::BudgetExceeded {
         resource: "tokens",
@@ -204,18 +204,28 @@ fn only_typed_budget_errors_project_exhaustion() {
         failure_detail_for_error(&EngineError::ResumableAgent(Box::new(steps))),
         detail
     );
-    for error in [
-        EngineError::Failed(detail.message.clone()),
-        EngineError::Step(StepError::AgentResourceExhausted {
-            node: "n".into(),
-            message: "local".into(),
-            resource: "tokens",
+    assert!(
+        failure_detail_for_error(&EngineError::Failed(detail.message))
+            .exhaustion
+            .is_none()
+    );
+    let local = failure_detail_for_error(&EngineError::Step(StepError::LocalResourceExhausted {
+        node: "n".into(),
+        message: "local".into(),
+        resource: "tokens_total",
+        used: 9,
+        allowed: 8,
+    }));
+    assert_eq!(local.code, FailureCode::ExecutionFailed);
+    assert_eq!(
+        local.exhaustion.unwrap(),
+        BudgetExhaustion {
+            resource: "tokens_total".into(),
             used: 9,
             allowed: 8,
-        }),
-    ] {
-        assert!(failure_detail_for_error(&error).exhaustion.is_none());
-    }
+            used_subsec_nanoseconds: None,
+        }
+    );
 }
 
 struct StepBudgetCountingStep(Arc<AtomicUsize>);

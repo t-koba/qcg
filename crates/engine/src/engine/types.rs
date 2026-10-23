@@ -131,7 +131,6 @@ pub(crate) fn output_name_for(node: &contract::NodeDef) -> &str {
 }
 
 /// Canonical projection shared by durable step failures and host reports.
-/// Rewound retains ExecutionFailed here; RunFailureKind distinguishes it.
 pub(crate) fn failure_detail_for_error(error: &EngineError) -> model::FailureDetail {
     use model::{BudgetExhaustion, FailureCode, FailureDetail};
     let mut detail = FailureDetail::from(error.to_string());
@@ -148,18 +147,30 @@ pub(crate) fn failure_detail_for_error(error: &EngineError) -> model::FailureDet
             FailureCode::ElapsedExceeded
         }
         EngineError::Step(StepError::TimedOut { .. }) => FailureCode::TimedOut,
-        EngineError::Step(StepError::BudgetExceeded {
-            resource,
-            used,
-            limit,
-        }) => {
+        EngineError::Step(
+            StepError::BudgetExceeded {
+                resource,
+                used,
+                limit,
+            }
+            | StepError::LocalResourceExhausted {
+                resource,
+                used,
+                allowed: limit,
+                ..
+            },
+        ) => {
             detail.exhaustion = Some(BudgetExhaustion {
                 resource: (*resource).into(),
                 used: *used,
                 allowed: *limit,
                 used_subsec_nanoseconds: None,
             });
-            FailureCode::BudgetExceeded
+            if matches!(error, EngineError::Step(StepError::BudgetExceeded { .. })) {
+                FailureCode::BudgetExceeded
+            } else {
+                FailureCode::ExecutionFailed
+            }
         }
         EngineError::Step(StepError::GlobalStepBudgetExceeded { used, allowed, .. }) => {
             detail.exhaustion = Some(BudgetExhaustion {
@@ -179,7 +190,6 @@ pub(crate) fn failure_detail_for_error(error: &EngineError) -> model::FailureDet
     };
     detail
 }
-
 /// Maps an engine error to its distinct `RunFailureKind` without collapsing
 /// `Rewound` into generic execution failure (E06).
 pub(crate) fn failure_kind_for_error(error: &EngineError) -> RunFailureKind {
@@ -191,18 +201,11 @@ pub(crate) fn failure_kind_for_error(error: &EngineError) -> RunFailureKind {
         RunFailureKind::Execution
     }
 }
-
-/// Single shared helper for ALL step_finished exhaustion/failure/suspension
-/// determinations (E06): every `step_finished` failure or suspension journal
-/// event carries the failed attempt output and file pins under the unified
-/// `failed_output` / `failed_files` keys, never `output` / `files` for failed
-/// revisions. Suspensions without a failed attempt pass `None` and an empty
-/// slice, which still journals the unified keys for notation uniformity. The
-/// function touches only its payload value, so it is safe to call from
-/// parallel tasks. `confirm_request` events are intentionally out of scope:
-/// their FOREIGN schema (`api::ConfirmRequestEventData`) allows only
-/// `confirm` plus `parallel`, so failed-evidence keys would be rejected at
-/// journal validation there.
+/// Shared step_finished failure/exhaustion/suspension evidence projection (E06).
+/// Failed revisions always carry failed_output/failed_files, never output/files;
+/// suspensions without attempt evidence pass None and an empty slice.
+/// Only the payload is mutated, so parallel tasks can share this helper.
+/// confirm_request is excluded: its foreign API schema rejects evidence keys.
 pub(crate) fn with_failed_evidence(
     mut payload: serde_json::Value,
     failed_output: &Option<serde_json::Value>,
@@ -213,9 +216,7 @@ pub(crate) fn with_failed_evidence(
             "failed_output".into(),
             failed_output.clone().unwrap_or(serde_json::Value::Null),
         );
-        // Fail closed (E11/G-1): a serialization failure must surface instead
-        // of journaling an empty array that is indistinguishable from
-        // genuinely-no-files evidence.
+        // Fail closed on serialization error, never invent empty file evidence (E11/G-1).
         let failed_files = serde_json::to_value(failed_files).map_err(|error| {
             EngineError::Failed(format!(
                 "failed_files evidence is not serializable: {error}"

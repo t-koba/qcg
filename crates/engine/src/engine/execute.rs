@@ -498,7 +498,7 @@ impl Engine {
                     error @ (StepError::Failed { .. }
                     | StepError::TimedOut { .. }
                     | StepError::AgentIterationsExhausted { .. }
-                    | StepError::AgentResourceExhausted { .. }),
+                    | StepError::LocalResourceExhausted { .. }),
                 )) if attempt < max_attempts => {
                     journal.event(
                         "step_retry",
