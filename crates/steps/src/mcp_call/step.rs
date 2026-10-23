@@ -1,29 +1,22 @@
+use super::direct::execute_direct_mcp_call;
+use super::types::McpCallStep;
+use super::validate::{
+    degrade_optional_mcp_call, mcp_access, mcp_call_params, validate_mcp_call_arguments,
+    validate_mcp_call_schema, validate_mcp_call_timeout,
+};
 use crate::common::render_json_templates;
 use async_trait::async_trait;
 use contract::{Contract, NodeDef};
-use engine::{StepContext, StepError, StepExecutor, StepOutcome, StepTraits, tool_call_sources};
+use engine::{StepContext, StepError, StepExecutor, StepOutcome, StepTraits};
 use policy::{params_schema, string_schema};
 use serde_json::{Value, json};
 use sha2::Digest as _;
-
-use super::direct::{
-    DirectMcpToolEvent, execute_direct_mcp_call, record_direct_mcp_tool_event,
-    validate_direct_mcp_result,
-};
-use super::types::McpCallStep;
-use super::validate::{
-    DirectMcpCallOutcome, degrade_optional_mcp_call, mcp_access, mcp_call_params,
-    validate_mcp_call_arguments, validate_mcp_call_schema, validate_mcp_call_timeout,
-};
-
 #[async_trait]
 impl StepExecutor for McpCallStep {
     engine::step_type_id!("mcp.call");
-
     fn traits(&self) -> StepTraits {
         StepTraits::default()
     }
-
     fn params_schema(&self) -> Option<Value> {
         Some(params_schema(
             &["server", "tool"],
@@ -36,10 +29,10 @@ impl StepExecutor for McpCallStep {
                 "timeout_seconds": { "type": "integer", "minimum": 1 },
                 "side_effects": { "type": "boolean" },
                 "optional": { "type": "boolean" },
+                "cleanup_failure": { "type": "string", "enum": ["preserve_execution", "fail_fast"] },
             }),
         ))
     }
-
     fn validate(&self, node: &NodeDef, _contract: &Contract) -> Result<(), StepError> {
         let params = mcp_call_params(node)?;
         if params.server.trim().is_empty() || params.tool.trim().is_empty() {
@@ -67,7 +60,6 @@ impl StepExecutor for McpCallStep {
         validate_mcp_call_timeout(node, params.timeout_seconds, profile.timeout_seconds())?;
         Ok(())
     }
-
     async fn execute(
         &self,
         ctx: &mut StepContext<'_>,
@@ -135,11 +127,9 @@ impl StepExecutor for McpCallStep {
                 files: Vec::new(),
             });
         }
-
         let runtime = self.runtime.clone();
         let server = params.server.clone();
         let tool_name = params.tool.clone();
-        let optional = params.optional;
         let cancellation = ctx.run.cancellation.clone();
         let connect = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_seconds),
@@ -159,8 +149,7 @@ impl StepExecutor for McpCallStep {
         };
         let started = std::time::Instant::now();
         // The tool call and the session cleanup are two separate facts.
-        // The call settles on its own outcome, and a cleanup failure is
-        // retained beside that outcome instead of erasing it.
+        // Settlement records both facts before applying an explicit cleanup policy.
         let execution = execute_direct_mcp_call(
             &session,
             &tool_name,
@@ -176,108 +165,17 @@ impl StepExecutor for McpCallStep {
             .await
             .err()
             .map(|error| StepError::failed(&node.id, error.to_string()));
-        let mut event = DirectMcpToolEvent {
-            server: &params.server,
-            tool: &params.tool,
-            arguments: &arguments,
-            result: None,
-            error: None,
-            cleanup_error: None,
-            duration_ms: started.elapsed().as_millis() as u64,
-            degraded: false,
-        };
-        let (result, cleanup_error) = match settle_direct_mcp(execution, cleanup_error, optional) {
-            DirectMcpSettlement::Suspend(question, cleanup_error) => {
-                event.cleanup_error = cleanup_error.as_ref();
-                record_direct_mcp_tool_event(ctx, node, event)?;
-                return Ok(StepOutcome::NeedsUser {
-                    question,
-                    files: Vec::new(),
-                });
-            }
-            DirectMcpSettlement::Complete(result, cleanup_error) => (result, cleanup_error),
-            DirectMcpSettlement::Failed(error, cleanup_error) => {
-                event.error = Some(&error);
-                event.cleanup_error = cleanup_error.as_ref();
-                record_direct_mcp_tool_event(ctx, node, event)?;
-                return Err(error);
-            }
-            DirectMcpSettlement::Degraded(error, cleanup_error) => {
-                event.error = Some(&error);
-                event.cleanup_error = cleanup_error.as_ref();
-                event.degraded = true;
-                record_direct_mcp_tool_event(ctx, node, event)?;
-                return Ok(StepOutcome::success(None));
-            }
-        };
-        let raw_result = result.clone();
-        let result = match validate_direct_mcp_result(
+        super::settlement::settle_direct_mcp(
+            ctx,
             node,
-            &params.server,
-            &params.tool,
-            params.output_schema.as_ref(),
-            result,
-        ) {
-            Ok(result) => result,
-            Err(error) => {
-                event.result = Some(&raw_result);
-                event.error = Some(&error);
-                event.cleanup_error = cleanup_error.as_ref();
-                record_direct_mcp_tool_event(ctx, node, event)?;
-                return Err(error);
-            }
-        };
-        let sources = tool_call_sources(&result);
-        event.result = Some(&result);
-        event.cleanup_error = cleanup_error.as_ref();
-        record_direct_mcp_tool_event(ctx, node, event)?;
-        Ok(StepOutcome::success(Some(json!({
-            "server": params.server,
-            "tool": params.tool,
-            "result": result,
-            "sources": sources,
-        }))))
+            &params,
+            execution,
+            &arguments,
+            cleanup_error.as_ref(),
+            started.elapsed().as_millis() as u64,
+        )
     }
 }
-
-/// What a direct MCP call settled on, with the cleanup failure that
-/// followed it. The execution outcome decides the settlement; the cleanup
-/// outcome is carried beside it and never changes it.
-#[derive(Debug)]
-enum DirectMcpSettlement {
-    /// The tool asked the user something: the run suspends and the
-    /// already-journaled continuation stays valid.
-    Suspend(api::FormSpec, Option<StepError>),
-    /// The tool returned a result.
-    Complete(Value, Option<StepError>),
-    /// The tool call failed.
-    Failed(StepError, Option<StepError>),
-    /// The tool call failed and the step is optional, so the step
-    /// degrades instead of failing.
-    Degraded(StepError, Option<StepError>),
-}
-
-/// Settle a direct MCP call on its execution outcome alone. A session
-/// cleanup failure is retained beside the settlement and never replaces
-/// it: a completed tool result and a pending question both survive a
-/// cleanup that failed afterwards.
-fn settle_direct_mcp(
-    execution: Result<DirectMcpCallOutcome, StepError>,
-    cleanup_error: Option<StepError>,
-    optional: bool,
-) -> DirectMcpSettlement {
-    match execution {
-        Ok(DirectMcpCallOutcome::NeedsUser(question)) => {
-            DirectMcpSettlement::Suspend(question, cleanup_error)
-        }
-        Ok(DirectMcpCallOutcome::Complete(result)) => {
-            DirectMcpSettlement::Complete(result, cleanup_error)
-        }
-        Err(error) if optional => DirectMcpSettlement::Degraded(error, cleanup_error),
-        Err(error) => DirectMcpSettlement::Failed(error, cleanup_error),
-    }
-}
-
 /// Execution-time destination gate for the direct `mcp.call` path:
 /// re-extracts hosts, enforces the static `allowed_destinations` ceiling,
 /// then delegates a remaining miss to the operator `destination_decider`
@@ -357,7 +255,6 @@ async fn authorize_direct_destinations(
         }
     }
 }
-
 /// Fail-closed destination-policy gate for the direct `mcp.call` path:
 /// every host extracted from the rendered arguments must sit within the
 /// operator's per-profile `allowed_destinations` (exact match or `"*"`).
@@ -391,7 +288,6 @@ fn check_direct_destinations(
     }
     Ok(())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,83 +309,6 @@ mod tests {
             retry: None,
             params: Default::default(),
         }
-    }
-
-    fn question() -> api::FormSpec {
-        api::FormSpec {
-            id: "q1".into(),
-            title: "Which one?".into(),
-            title_i18n: Default::default(),
-            fields: Vec::new(),
-        }
-    }
-
-    fn cleanup_failed() -> StepError {
-        StepError::failed("mcp-call", "MCP session close timed out")
-    }
-
-    #[test]
-    fn a_cleanup_failure_keeps_the_completed_tool_result() {
-        let settlement = settle_direct_mcp(
-            Ok(DirectMcpCallOutcome::Complete(json!({"ok": true}))),
-            Some(cleanup_failed()),
-            false,
-        );
-        let DirectMcpSettlement::Complete(result, cleanup_error) = settlement else {
-            panic!("a completed call stays completed: {settlement:?}");
-        };
-        assert_eq!(result, json!({"ok": true}));
-        assert!(
-            cleanup_error.is_some(),
-            "the cleanup failure is retained beside the result"
-        );
-    }
-
-    #[test]
-    fn a_cleanup_failure_keeps_the_pending_question() {
-        let settlement = settle_direct_mcp(
-            Ok(DirectMcpCallOutcome::NeedsUser(question())),
-            Some(cleanup_failed()),
-            false,
-        );
-        let DirectMcpSettlement::Suspend(question, cleanup_error) = settlement else {
-            panic!("a pending question stays pending: {settlement:?}");
-        };
-        assert_eq!(question.id, "q1");
-        assert!(
-            cleanup_error.is_some(),
-            "the cleanup failure is retained beside the question"
-        );
-    }
-
-    #[test]
-    fn a_cleanup_failure_never_replaces_the_execution_error() {
-        let settlement = settle_direct_mcp(
-            Err(StepError::failed("mcp-call", "tool call failed")),
-            Some(cleanup_failed()),
-            false,
-        );
-        let DirectMcpSettlement::Failed(error, cleanup_error) = settlement else {
-            panic!("the execution error decides the settlement: {settlement:?}");
-        };
-        assert!(
-            error.to_string().contains("tool call failed"),
-            "the execution error is the one that is reported: {error}"
-        );
-        assert!(
-            cleanup_error.is_some(),
-            "the cleanup failure is retained beside the error"
-        );
-    }
-
-    #[test]
-    fn an_optional_call_degrades_on_the_execution_error() {
-        let settlement = settle_direct_mcp(
-            Err(StepError::failed("mcp-call", "tool call failed")),
-            Some(cleanup_failed()),
-            true,
-        );
-        assert!(matches!(settlement, DirectMcpSettlement::Degraded(..)));
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use super::validate::DirectMcpCallOutcome;
 use api::{FormSpec, ToolCallErrorCode, ToolCallPhase, ToolCallStatus};
 use api::{ToolCallError, ToolCallEventData, ToolCallSource};
 use contract::NodeDef;
@@ -6,9 +7,6 @@ use mcp::{McpCallOutcome, McpError, McpInputRequired, McpSession};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-
-use super::validate::DirectMcpCallOutcome;
-
 pub(crate) async fn execute_direct_mcp_call(
     session: &McpSession,
     tool_name: &str,
@@ -308,7 +306,6 @@ pub(crate) async fn execute_direct_mcp_call(
         "MCP tool exceeded 10 input-required rounds",
     ))
 }
-
 pub(crate) fn validate_direct_mcp_result(
     node: &NodeDef,
     server: &str,
@@ -351,7 +348,6 @@ pub(crate) fn validate_direct_mcp_result(
     }
     Ok(result)
 }
-
 fn direct_mcp_question_id(
     node_id: &str,
     server: &str,
@@ -380,7 +376,6 @@ fn direct_mcp_question_id(
     let digest = hex::encode(Sha256::digest(bytes));
     format!("{node_id}:mcp:{server}/{tool}:{digest}")
 }
-
 fn direct_mcp_form_spec(
     question_id: String,
     alias: &str,
@@ -389,7 +384,6 @@ fn direct_mcp_form_spec(
     let requests = direct_mcp_requests(required);
     engine::mcp_elicitation_form_spec(question_id, alias, &requests)
 }
-
 fn direct_mcp_input_responses(
     required: &McpInputRequired,
     answer: &Value,
@@ -411,7 +405,6 @@ fn direct_mcp_input_responses(
         .collect::<Result<BTreeMap<_, _>, StepError>>()?;
     Ok(responses)
 }
-
 fn mcp_continuation_key(
     node_id: &str,
     server: &str,
@@ -430,11 +423,9 @@ fn mcp_continuation_key(
     let digest = hex::encode(Sha256::digest(bytes));
     format!("{node_id}:mcpcont:{server}/{tool}:{digest}")
 }
-
 fn mcp_pending_reserved_key(continuation_key: &str) -> String {
     format!("{continuation_key}#__mcp_pending")
 }
-
 /// Resume decision for one direct MCP call: start fresh, continue a
 /// suspended remote request, or refuse when a previous resume proves a
 /// crash mid-remote-call with an indeterminate remote outcome.
@@ -445,7 +436,6 @@ enum ContinuationDecision {
         input_responses: Option<BTreeMap<String, Value>>,
     },
 }
-
 /// Pure lookup half of [`resume_direct_mcp_continuation`]: decides from
 /// folded state alone, without touching the journal, so the full decision
 /// matrix is unit-testable without a step harness.
@@ -459,7 +449,6 @@ enum DirectResumeLookup {
         input_responses: BTreeMap<String, Value>,
     },
 }
-
 fn decide_direct_mcp_continuation(
     state: &engine::RunState,
     answers: &BTreeMap<String, Value>,
@@ -553,7 +542,6 @@ fn decide_direct_mcp_continuation(
         input_responses: responses,
     })
 }
-
 /// Finds a journaled continuation matching this exact remote call and
 /// records the resume before touching the remote.
 ///
@@ -607,7 +595,6 @@ fn resume_direct_mcp_continuation(
         }
     }
 }
-
 /// Classifies a direct-call transport failure: refused-before-dispatch is
 /// clean, while timeouts and transport I/O may have applied remote effects.
 fn direct_mcp_error_outcome(error: &McpError) -> engine::OperationOutcome {
@@ -623,7 +610,6 @@ fn direct_mcp_error_outcome(error: &McpError) -> engine::OperationOutcome {
         },
     }
 }
-
 /// Marks the direct-call continuation consumed so a later identical call
 /// starts a fresh remote request instead of resuming a completed one.
 fn consume_direct_mcp_continuation(
@@ -646,7 +632,6 @@ fn consume_direct_mcp_continuation(
         )
         .step_err(&node.id)
 }
-
 fn direct_mcp_requests(required: &McpInputRequired) -> Vec<(&String, &Value)> {
     let mut requests = required.input_requests.iter().collect::<Vec<_>>();
     // Deterministic order over the serialized request; a JSON value always
@@ -654,7 +639,6 @@ fn direct_mcp_requests(required: &McpInputRequired) -> Vec<(&String, &Value)> {
     requests.sort_by_key(|(_id, request)| request.to_string());
     requests
 }
-
 pub(crate) struct DirectMcpToolEvent<'a> {
     pub(crate) server: &'a str,
     pub(crate) tool: &'a str,
@@ -664,10 +648,10 @@ pub(crate) struct DirectMcpToolEvent<'a> {
     /// The session cleanup that followed the tool call failed. Retained
     /// beside the execution fact: it never replaces the call's outcome.
     pub(crate) cleanup_error: Option<&'a StepError>,
+    pub(crate) cleanup_policy: Option<api::McpCleanupPolicy>,
     pub(crate) duration_ms: u64,
     pub(crate) degraded: bool,
 }
-
 pub(crate) fn record_direct_mcp_tool_event(
     ctx: &StepContext<'_>,
     node: &NodeDef,
@@ -680,6 +664,7 @@ pub(crate) fn record_direct_mcp_tool_event(
         result,
         error,
         cleanup_error,
+        cleanup_policy,
         duration_ms,
         degraded,
     } = details;
@@ -752,6 +737,12 @@ pub(crate) fn record_direct_mcp_tool_event(
         phase,
         agent: None,
         error: error_value,
+        cleanup_settlement: cleanup_error.as_ref().and(cleanup_policy).map(|policy| {
+            api::McpCleanupSettlement {
+                policy,
+                source: api::McpCleanupPolicySource::NodeParameter,
+            }
+        }),
         cleanup_error,
         duration_ms,
         arguments,
@@ -761,11 +752,17 @@ pub(crate) fn record_direct_mcp_tool_event(
     };
     let mut event = serde_json::to_value(event)?;
     event["node"] = Value::String(node.id.clone());
+    // Settlement facts must survive even when observation auditing is off.
+    // Missing policy remains None, not a selected disposition.
+    if event["cleanup_error"].is_object() {
+        ctx.journal
+            .event("mcp_cleanup_settled", &event)
+            .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
+    }
     ctx.journal
         .event("tool_call", event)
         .map_err(|journal_error| StepError::failed(&node.id, journal_error.to_string()))
 }
-
 fn bounded_direct_mcp_event_value(value: &Value) -> (Value, bool) {
     const MAX_BYTES: usize = 64 * 1024;
     let Ok(bytes) = serde_json::to_vec(value) else {
@@ -782,7 +779,6 @@ fn bounded_direct_mcp_event_value(value: &Value) -> (Value, bool) {
         true,
     )
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

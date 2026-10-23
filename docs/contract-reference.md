@@ -770,10 +770,28 @@ hold exactly is refused rather than stated approximately - and `min` and
 : Call a tool on a configured MCP server. Transport failures (connect and
   call) fail the run unless `optional = true`, which degrades to a null
   output and records a `degraded` tool call. Validation, elicitation, and
-  confirmation paths still fail. A session cleanup that fails after the
-  call does not change the call's outcome: the returned result and a
-  pending question both stand, and the cleanup failure is recorded beside
-  the call in the `tool_call` event's `cleanup_error` field.
+  confirmation paths still fail. For a cleanup failure after a completed call
+  or a request for user input, set the node parameter `cleanup_failure`
+  explicitly to `"preserve_execution"` (return the result or suspend with the
+  question) or `"fail_fast"` (refuse settlement without ordinary execution
+  retry or `on_fail` routing). If unset, cleanup failure produces an explicit
+  "cleanup settlement policy required" refusal, not a selected disposition.
+  Cleanup policy does not replace independent execution-error handling or
+  optional execution-error degradation.
+
+  Both execution and cleanup facts are recorded before applying cleanup policy
+  in durable `mcp_cleanup_settled` and observation `tool_call` events. Their
+  `status` describes execution, not the cleanup disposition. `cleanup_error`
+  retains the close failure; `cleanup_settlement` carries the explicit `policy`
+  and `source = "node_parameter"` only when settlement of a completed call or
+  input request uses that policy, and is null when no policy was supplied or
+  when the execution itself failed. Every disposition retains the exact
+  completed result in the operation replay state and a bounded event result
+  (64 KiB, `truncated` flag), and retains the exact `mcp_input_pending`
+  continuation when the tool asked for input. Fail-fast does not turn a
+  completed tool call into an execution failure or erase its pending question.
+  The external-operation guard reuses completed results rather than
+  redispatching the remote effect.
 
 `llm.generate`
 : Produce text, optionally writing it to `output_file`.
@@ -4138,6 +4156,13 @@ metadata. Update it with `qcg docs step-schemas`.
   "properties": {
     "arguments": {
       "type": "object"
+    },
+    "cleanup_failure": {
+      "enum": [
+        "preserve_execution",
+        "fail_fast"
+      ],
+      "type": "string"
     },
     "input_schema": {},
     "optional": {

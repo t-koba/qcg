@@ -26,6 +26,7 @@ pub(crate) struct McpCallParams {
     /// Validation, elicitation, and confirmation paths still fail.
     #[serde(default)]
     pub(crate) optional: bool,
+    pub(crate) cleanup_failure: Option<api::McpCleanupPolicy>,
 }
 
 fn default_true() -> bool {

@@ -23,6 +23,20 @@ text is copied. Existing child/operation/agent journal records remain the eviden
 for effects, accounting, and continuation safety. These facts neither change
 settlement nor authorize replay.
 
+Direct `mcp.call` cleanup failures emit a durable `mcp_cleanup_settled` record
+before settlement, alongside the observation-only `tool_call`. Both retain the
+execution `status` and a bounded result (64 KiB, `truncated` flag) independently
+of `cleanup_error`; the exact result stays in the operation replay state for
+redispatch-free replay. `cleanup_settlement` identifies the explicitly
+configured `policy` (`preserve_execution` or `fail_fast`) and
+`source: node_parameter` only for a completed call or input request that uses
+that policy; null means no policy was configured or the execution itself
+failed, not a selected disposition. A missing policy after a completed call or
+input request produces a "cleanup settlement policy required" refusal. The
+operation result and `mcp_input_pending` continuation remain durable under
+every disposition. Independent execution errors and optional degradation retain
+their existing handling. See [`mcp.call`](contract-reference.md).
+
 <!-- run-events:start -->
 ## RunEvent Reference
 
@@ -59,6 +73,7 @@ Generated from the OpenAPI `RunEvent` schema. Every event uses the required enve
 | `llm_validation_failed` | `attempt`, `message` |
 | `llm_route_failed` | `provider`, `model`, `attempt`, `kind` |
 | `tool_call` | `tool`, `id`, `status`, `phase`, `duration_ms`, `arguments`, `result`, `sources`, `truncated` |
+| `mcp_cleanup_settled` | `tool`, `id`, `status`, `phase`, `duration_ms`, `arguments`, `result`, `sources`, `truncated` |
 | `guardrail_evaluated` | `guardrail`, `kind`, `stage`, `passed`, `tripwire` |
 | `guardrail_error` | `guardrail`, `kind`, `stage`, `error_kind`, `code`, `message`, `policy` |
 | `guardrail_tripwire` | `guardrail`, `kind`, `stage`, `violation` |

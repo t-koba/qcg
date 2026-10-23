@@ -1,8 +1,3 @@
-use model::OutputArtifact;
-use schemars::JsonSchema;
-use serde::Serialize;
-use serde_json::Value;
-
 use super::attempts::AttemptFinishedEventData;
 use super::completion::{LaggedEventData, RunErrorEventData, RunFinishedEventData};
 use super::guardrails::{
@@ -26,7 +21,10 @@ use super::steps::{
     StepReplayedEventData, StepRetryEventData, StepStartedEventData,
 };
 use super::tools::ToolCallEventData;
-
+use model::OutputArtifact;
+use schemars::JsonSchema;
+use serde::Serialize;
+use serde_json::Value;
 macro_rules! run_event_data_registry {
     (
         terminal: [$($terminal:literal),* $(,)?];
@@ -34,14 +32,12 @@ macro_rules! run_event_data_registry {
     ) => {
         /// Terminal kinds shared by the service live tail and pollers (E12).
         pub const TERMINAL_EVENT_KINDS: &[&str] = &[$($terminal),*];
-
         #[derive(Debug, Clone, Serialize, JsonSchema)]
         #[serde(untagged)]
         pub enum RunEventData {
             $($variant($data),)*
             Unknown(Value),
         }
-
         impl RunEventData {
             pub fn parse(kind: &str, data: Value) -> Result<Self, String> {
                 // Explicit schema-1 migration: historical run identity events
@@ -65,13 +61,11 @@ macro_rules! run_event_data_registry {
                             .map_err(|error| format!("invalid `{kind}` event data: {error}"))
                     };
                 }
-
                 match kind {
                     $($kind => decode!($variant, $data),)*
                     _ => Ok(Self::Unknown(data)),
                 }
             }
-
             pub fn run_started(&self) -> Option<&RunStartedEventData> {
                 match self {
                     Self::RunQueued(data) | Self::RunStarted(data) => Some(data),
@@ -79,18 +73,15 @@ macro_rules! run_event_data_registry {
                 }
             }
         }
-
         pub fn is_known_run_event_kind(kind: &str) -> bool {
             matches!(kind, $($kind)|*)
         }
-
         /// The single source of event schemas for OpenAPI, docs, and clients.
         pub fn run_event_data_schemas() -> Vec<(&'static str, String)> {
             vec![$(($kind, <$data as JsonSchema>::schema_name().into_owned())),*]
         }
     };
 }
-
 run_event_data_registry! {
     terminal: ["run_finished", "run_error", "run_canceled", "run_interrupted"];
     "elapsed_accounted" => ElapsedAccounted: super::run::ElapsedAccountedEventData,
@@ -122,6 +113,7 @@ run_event_data_registry! {
     "llm_validation_failed" => LlmValidationFailed: LlmValidationFailedEventData,
     "llm_route_failed" => LlmRouteFailed: LlmRouteFailedEventData,
     "tool_call" => ToolCall: ToolCallEventData,
+    "mcp_cleanup_settled" => McpCleanupSettled: ToolCallEventData,
     "guardrail_evaluated" => GuardrailEvaluated: GuardrailEvaluatedEventData,
     "guardrail_error" => GuardrailError: GuardrailErrorEventData,
     "guardrail_tripwire" => GuardrailTripwire: GuardrailTripwireEventData,
@@ -139,7 +131,6 @@ run_event_data_registry! {
     "run_finished" => RunFinished: RunFinishedEventData,
     "lagged" => Lagged: LaggedEventData,
 }
-
 #[derive(Debug, Clone, Default, Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EmptyEventData {}

@@ -1,7 +1,6 @@
 use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::Value;
-
 #[derive(Debug, Clone, Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ToolCallEventData {
@@ -15,18 +14,36 @@ pub struct ToolCallEventData {
     pub agent: Option<String>,
     #[serde(default)]
     pub error: Option<ToolCallError>,
-    /// The session cleanup that followed the tool call failed. The
-    /// execution outcome stands on its own; the cleanup failure is
-    /// retained here so it can be settled separately.
+    /// Cleanup failure retained beside the execution outcome.
     #[serde(default)]
     pub cleanup_error: Option<ToolCallError>,
+    /// Explicit cleanup policy and its configuration source; absent when none was supplied.
+    #[serde(default)]
+    pub cleanup_settlement: Option<McpCleanupSettlement>,
     pub duration_ms: u64,
     pub arguments: Value,
     pub result: Value,
     pub sources: Vec<ToolCallSource>,
     pub truncated: bool,
 }
-
+/// Explicit per-node settlement of a failed direct MCP session cleanup.
+#[derive(Debug, Clone, Copy, Serialize, serde::Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpCleanupPolicy {
+    PreserveExecution,
+    FailFast,
+}
+#[derive(Debug, Clone, Serialize, serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct McpCleanupSettlement {
+    pub policy: McpCleanupPolicy,
+    pub source: McpCleanupPolicySource,
+}
+#[derive(Debug, Clone, Copy, Serialize, serde::Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpCleanupPolicySource {
+    NodeParameter,
+}
 #[derive(Debug, Clone, Copy, Serialize, serde::Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolCallStatus {
@@ -36,7 +53,6 @@ pub enum ToolCallStatus {
     NeedsConfirmation,
     Degraded,
 }
-
 #[derive(Debug, Clone, Copy, Serialize, serde::Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolCallPhase {
@@ -46,14 +62,12 @@ pub enum ToolCallPhase {
     OutputGuardrail,
     Completed,
 }
-
 #[derive(Debug, Clone, Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ToolCallError {
     pub code: ToolCallErrorCode,
     pub message: String,
 }
-
 #[derive(Debug, Clone, Copy, Serialize, serde::Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolCallErrorCode {
@@ -64,17 +78,13 @@ pub enum ToolCallErrorCode {
     Cancelled,
     BudgetExceeded,
     ToolReportedError,
-    /// A per-attempt node timeout fired (E11). Distinct from
-    /// `ExecutionFailed` so timeouts are observable and retryable.
+    /// Per-attempt node timeout (E11), distinct from `ExecutionFailed`.
     TimedOut,
-    /// The run-wide elapsed budget stopped this call (E11). Distinct from
-    /// node timeout and cancellation.
+    /// Run-wide elapsed budget stop (E11), distinct from timeout/cancel.
     ElapsedExceeded,
-    /// The session cleanup that followed the tool call failed. The call's
-    /// own outcome is reported separately and stands.
+    /// Session cleanup failed; the call outcome stands separately.
     CleanupFailed,
 }
-
 #[derive(Debug, Clone, Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ToolCallSource {
@@ -82,7 +92,6 @@ pub struct ToolCallSource {
     #[serde(default)]
     pub title: Option<String>,
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,6 +107,7 @@ mod tests {
             agent: None,
             error: None,
             cleanup_error,
+            cleanup_settlement: None,
             duration_ms: 12,
             arguments: json!({"argument_names": []}),
             result: json!({"bytes": 2, "value": {}}),

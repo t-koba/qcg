@@ -1,4 +1,8 @@
 mod direct;
+mod settlement;
+#[cfg(test)]
+#[path = "mcp_call/tests/settlement.rs"]
+mod settlement_tests;
 mod step;
 mod types;
 mod validate;

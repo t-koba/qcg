@@ -1998,6 +1998,36 @@
         "title": "McpAuthorizationStart",
         "type": "object"
       },
+      "McpCleanupPolicy": {
+        "description": "Explicit per-node settlement of a failed direct MCP session cleanup.",
+        "enum": [
+          "preserve_execution",
+          "fail_fast"
+        ],
+        "type": "string"
+      },
+      "McpCleanupPolicySource": {
+        "enum": [
+          "node_parameter"
+        ],
+        "type": "string"
+      },
+      "McpCleanupSettlement": {
+        "additionalProperties": false,
+        "properties": {
+          "policy": {
+            "$ref": "#/components/schemas/McpCleanupPolicy"
+          },
+          "source": {
+            "$ref": "#/components/schemas/McpCleanupPolicySource"
+          }
+        },
+        "required": [
+          "policy",
+          "source"
+        ],
+        "type": "object"
+      },
       "McpServerList": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
@@ -2692,6 +2722,7 @@
               "llm_delta",
               "llm_route_failed",
               "llm_validation_failed",
+              "mcp_cleanup_settled",
               "mcp_continuation_consumed",
               "mcp_continuation_resumed",
               "mcp_destination_decision",
@@ -2865,6 +2896,9 @@
           },
           {
             "$ref": "#/components/schemas/LlmRouteFailedEventData"
+          },
+          {
+            "$ref": "#/components/schemas/ToolCallEventData"
           },
           {
             "$ref": "#/components/schemas/ToolCallEventData"
@@ -3917,17 +3951,17 @@
           },
           {
             "const": "timed_out",
-            "description": "A per-attempt node timeout fired (E11). Distinct from\n`ExecutionFailed` so timeouts are observable and retryable.",
+            "description": "Per-attempt node timeout (E11), distinct from `ExecutionFailed`.",
             "type": "string"
           },
           {
             "const": "elapsed_exceeded",
-            "description": "The run-wide elapsed budget stopped this call (E11). Distinct from\nnode timeout and cancellation.",
+            "description": "Run-wide elapsed budget stop (E11), distinct from timeout/cancel.",
             "type": "string"
           },
           {
             "const": "cleanup_failed",
-            "description": "The session cleanup that followed the tool call failed. The call's\nown outcome is reported separately and stands.",
+            "description": "Session cleanup failed; the call outcome stands separately.",
             "type": "string"
           }
         ]
@@ -3953,7 +3987,19 @@
               }
             ],
             "default": null,
-            "description": "The session cleanup that followed the tool call failed. The\nexecution outcome stands on its own; the cleanup failure is\nretained here so it can be settled separately."
+            "description": "Cleanup failure retained beside the execution outcome."
+          },
+          "cleanup_settlement": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/McpCleanupSettlement"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Explicit cleanup policy and its configuration source; absent when none was supplied."
           },
           "duration_ms": {
             "format": "uint64",
