@@ -247,10 +247,7 @@ impl StepRegistry {
             .insert(executor.type_id().to_string(), Arc::new(executor));
     }
 
-    pub fn reserve_secret_env_names<I>(&mut self, names: I)
-    where
-        I: IntoIterator<Item = String>,
-    {
+    pub fn reserve_secret_env_names<I: IntoIterator<Item = String>>(&mut self, names: I) {
         self.reserved_secret_env_names.extend(names);
     }
 
@@ -306,15 +303,10 @@ impl StepRegistry {
                 errors.push(error);
             }
         }
-        if errors.is_empty() {
-            Ok(())
-        } else if errors.len() == 1 {
-            Err(StepError::failed(
-                "contract",
-                errors.pop().unwrap_or_default(),
-            ))
-        } else {
-            Err(StepError::failed(
+        match errors.as_slice() {
+            [] => Ok(()),
+            [message] => Err(StepError::failed("contract", message)),
+            _ => Err(StepError::failed(
                 "contract",
                 format!(
                     "invalid contract ({} problems):\n{}",
@@ -326,7 +318,7 @@ impl StepRegistry {
                         .collect::<Vec<_>>()
                         .join("\n")
                 ),
-            ))
+            )),
         }
     }
 
@@ -341,10 +333,8 @@ impl StepRegistry {
             Some(executor) => executor.validate(node, contract).err()?.to_string(),
             None => format!("step type `{}` is not registered", node.kind),
         };
-        Some(format!(
-            "{label} `{name}`: {}",
-            contract.line_hint(&message)
-        ))
+        let message = contract.line_hint(&message);
+        Some(format!("{label} `{name}`: {message}"))
     }
 }
 
