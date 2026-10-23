@@ -24,8 +24,10 @@ unless its `StepExecutor` explicitly declares guarded replay. That admission emi
 fact sequence; parallel safety alone does not authorize replay. An unresolved
 foreach iteration is currently refused: its drain fact names the parent and
 iteration, not the child executor whose effects are unknown, so the parent's
-capability cannot authorize it. These facts do not choose failure precedence or
-change fail-fast settlement.
+capability cannot authorize it. On parent cancellation, outcomes already
+reported by joined tasks are still settled per owner before the run returns
+canceled; only tasks actually aborted remain interrupted with unknown effects. These facts do not choose mixed-outcome
+failure precedence or change fail-fast settlement.
 
 Explicit continuation rule: a generic `StepError` from any node kind,
 including `llm.agent`, settles as an ordinary failure and never synthesizes a

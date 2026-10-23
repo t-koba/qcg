@@ -248,6 +248,7 @@ impl Engine {
         // Abort siblings on the first terminal outcome; external cancellation aborts all.
         // Join facts retain unresolved execution separately from settlement.
         let mut abort_on_settle = false;
+        let mut parent_cancelled = false;
         // Drain to full quiescence before settlement: no writer may outlive this loop.
         // Late outcomes win; missing reports prove neither failure nor replay safety.
         loop {
@@ -258,22 +259,17 @@ impl Engine {
                 biased;
                 _ = context.cancellation.cancelled() => {
                     tasks.abort_all();
+                    // Preserve returned outcomes through the normal per-owner settlement.
                     while let Some(result) = tasks.join_next_with_id().await {
                         let fact = record_wave_join(&journal, &mut task_nodes, &result, "parent_cancellation",
                             if abort_on_settle { "fail_fast" } else { "parent_cancellation" });
                         fact_result = fact_result.and(fact);
-                        if let Ok((_, (node, _))) = result {
-                            states.insert(
-                                node.id.clone(),
-                                NodeState::Failed(FailureDetail::new(
-                                    FailureCode::Canceled,
-                                    "parallel wave canceled",
-                                )),
-                            );
+                        if let Ok((_, (node, outcome))) = result {
+                            outcomes.insert(node.id.clone(), (node, outcome));
                         }
                     }
-                    fact_result?;
-                    return Err(EngineError::Canceled);
+                    parent_cancelled = true;
+                    break;
                 }
                 result = tasks.join_next_with_id(), if !tasks.is_empty() => {
                     let Some(result) = result else { break };
@@ -419,7 +415,11 @@ impl Engine {
                 }
             }
         }
-        combine_terminal_errors(terminal_errors)
+        if parent_cancelled {
+            Err(EngineError::Canceled)
+        } else {
+            combine_terminal_errors(terminal_errors)
+        }
     }
 
     /// Run a node under its retry policy: only execution failures retry; other classes fail fast, and cancellation interrupts backoff.

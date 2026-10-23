@@ -3128,6 +3128,131 @@ async fn repair_exhaustion_returns_the_declared_typed_form() {
     assert_eq!(question.fields[0].options, ["retry", "stop"]);
 }
 
+struct ParallelOutputStep;
+
+#[async_trait]
+impl StepExecutor for ParallelOutputStep {
+    fn type_id(&self) -> &'static str {
+        "test.parallel_output"
+    }
+
+    fn traits(&self) -> StepTraits {
+        StepTraits {
+            parallel_safe: true,
+            ..StepTraits::default()
+        }
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &mut StepContext<'_>,
+        _node: &NodeDef,
+    ) -> Result<StepOutcome, StepError> {
+        Ok(StepOutcome::Success {
+            output: Some(json!({"retained": true})),
+            files: vec![],
+        })
+    }
+}
+
+struct ParallelPendingStep;
+
+#[async_trait]
+impl StepExecutor for ParallelPendingStep {
+    fn type_id(&self) -> &'static str {
+        "test.parallel_pending"
+    }
+
+    fn traits(&self) -> StepTraits {
+        StepTraits {
+            parallel_safe: true,
+            ..StepTraits::default()
+        }
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &mut StepContext<'_>,
+        _node: &NodeDef,
+    ) -> Result<StepOutcome, StepError> {
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn parallel_parent_cancellation_settles_reported_sibling_outcomes() {
+    let mut manifest = manifest(vec![
+        node("reported", "test.parallel_output"),
+        node("pending", "test.parallel_pending"),
+    ]);
+    manifest.parallel = vec!["reported".into(), "pending".into()];
+    let run_dir = temp_run_dir("parallel-parent-cancel-settles-reports");
+    let contract = test_contract(&run_dir, manifest);
+    let mut registry = test_registry();
+    registry.register(ParallelOutputStep);
+    registry.register(ParallelPendingStep);
+    let (event_sender, mut event_receiver) = tokio::sync::broadcast::channel(32);
+    let cancellation = CancellationToken::new();
+    let mut options = run_options(run_dir.join("workspace"));
+    options.max_parallel_steps = 2;
+    options.json_events = true;
+    options.event_sender = Some(event_sender);
+    options.cancellation = cancellation.clone();
+    let run_dir_for_task = run_dir.clone();
+    let run = tokio::spawn(async move {
+        Engine::new(registry)
+            .run_with_id(
+                "parallel-parent-cancel-settles-reports".into(),
+                run_dir_for_task.join("meta"),
+                contract,
+                BTreeMap::new(),
+                options,
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if event_receiver
+                .recv()
+                .await
+                .expect("event stream stays open")
+                .kind
+                == "parallel_task_joined"
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the completed sibling must be joined before cancellation");
+    cancellation.cancel();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        .await
+        .expect("parent cancellation must settle the wave")
+        .expect("run task stays alive")
+        .expect_err("parent cancellation remains the run-level outcome");
+    assert!(error.is_canceled(), "unexpected run result: {error}");
+    let events = journal_events(&run_dir);
+    let reported = events
+        .iter()
+        .find(|event| event["t"] == "step_finished" && event["node"] == "reported")
+        .expect("the completed owner must be settled");
+    assert_eq!(reported["status"], "success");
+    assert_eq!(reported["output"], json!({"retained": true}));
+    assert!(
+        events
+            .iter()
+            .any(|event| { event["t"] == "step_interrupted" && event["node"] == "pending" })
+    );
+    let state = RunState::fold_journal(&run_dir.join("meta/journal.jsonl"))
+        .expect("canceled wave state replays");
+    assert_eq!(
+        state.vars.get_path("steps.reported.output.retained"),
+        Some(&json!(true))
+    );
+    let _ = std::fs::remove_dir_all(&run_dir);
+}
+
 #[tokio::test]
 async fn parallel_wave_records_every_started_node_before_reporting_failure() {
     let mut manifest = manifest(vec![
