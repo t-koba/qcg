@@ -75,13 +75,15 @@ Canonical failure details in step summaries, `step_finished.reason`,
 copied from typed enforcing errors, not parsed from their messages.
 `cost_microusd` uses millionths of a US dollar; `tokens` retains the check's
 scope, which can be a gateway call allowance or a run budget. The field does
-not assert that every token error measures a run total. Admission checks may
-report projected/reserved usage, not spent usage; consult the unchanged run
-metrics for actual spending. The existing code and message still identify the
-failure. Absent facts (including old histories, joined generic errors, and
-non-typed step/foreach limits) remain absent, not inferred. These
-facts neither authorize replay nor change retry, hooks, accounting, or terminal
-failure settlement.
+not assert that every token error measures a run total. The `steps` resource
+reports the run-wide step budget: `used` is the exact already-charged count
+and `allowed` the configured maximum, refused once `used` reaches `allowed`.
+Admission checks may report projected/reserved usage, not spent usage;
+consult the unchanged run metrics for actual spending. The existing code and
+message still identify the failure. Absent facts (including old histories,
+joined generic errors, and non-typed foreach limits) remain absent, not
+inferred. These facts neither authorize replay nor change retry, hooks,
+accounting, or terminal failure settlement.
 
 Elapsed failures (`elapsed_exceeded`, including expiry before the next step)
 use `exhaustion.resource: "elapsed_seconds"`. `allowed` is the configured

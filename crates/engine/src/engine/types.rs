@@ -161,6 +161,15 @@ pub(crate) fn failure_detail_for_error(error: &EngineError) -> model::FailureDet
             });
             FailureCode::BudgetExceeded
         }
+        EngineError::Step(StepError::GlobalStepBudgetExceeded { used, allowed, .. }) => {
+            detail.exhaustion = Some(BudgetExhaustion {
+                resource: "steps".into(),
+                used: *used,
+                allowed: *allowed,
+                used_subsec_nanoseconds: None,
+            });
+            FailureCode::BudgetExceeded
+        }
         EngineError::Step(StepError::ProviderContextExhausted { .. }) => {
             FailureCode::ProviderContextExhausted
         }

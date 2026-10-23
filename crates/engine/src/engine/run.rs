@@ -1459,15 +1459,13 @@ impl Engine {
     }
 }
 
-/// Whether an error exhausted a non-elapsed run budget.
 fn is_budget_exhaustion(error: &EngineError) -> bool {
-    match error {
-        EngineError::Step(StepError::BudgetExceeded { .. }) => true,
-        EngineError::Step(StepError::Failed { message, .. }) => {
-            message.contains("global step budget exceeded")
-        }
-        _ => false,
-    }
+    matches!(
+        error,
+        EngineError::Step(
+            StepError::BudgetExceeded { .. } | StepError::GlobalStepBudgetExceeded { .. }
+        )
+    )
 }
 
 fn is_elapsed_exhaustion(error: &EngineError) -> bool {
@@ -1488,16 +1486,14 @@ fn is_failure_settlement_event(event: &str) -> bool {
 /// hooks like every other failure, but the caller keeps the original error
 /// instead of a joined generic failure.
 fn is_distinct_execution_error(error: &EngineError) -> bool {
-    match error {
-        EngineError::Step(
-            StepError::TimedOut { .. }
-            | StepError::ProviderContextExhausted { .. }
-            | StepError::ElapsedExceeded { .. }
-            | StepError::ElapsedExpiredBeforeStart { .. }
-            | StepError::BudgetExceeded { .. },
-        ) => true,
-        _ => is_budget_exhaustion(error),
-    }
+    is_budget_exhaustion(error)
+        || is_elapsed_exhaustion(error)
+        || matches!(
+            error,
+            EngineError::Step(
+                StepError::TimedOut { .. } | StepError::ProviderContextExhausted { .. }
+            )
+        )
 }
 
 fn hook_policy_name(policy: HookErrorPolicy) -> &'static str {

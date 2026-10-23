@@ -79,7 +79,19 @@ fn budget_tracker_rejects_after_global_limit() {
     let error = budget
         .consume("third")
         .expect_err("third step should exceed the run budget");
-    assert!(error.to_string().contains("global step budget exceeded"));
+    assert_eq!(
+        error.to_string(),
+        "step `third` failed: global step budget exceeded: 2 >= 2"
+    );
+    let StepError::GlobalStepBudgetExceeded {
+        node,
+        used,
+        allowed,
+    } = error
+    else {
+        panic!("global budget refusal must stay a typed exhaustion fact");
+    };
+    assert_eq!((node.as_str(), used, allowed), ("third", 2, 2));
 }
 
 #[test]

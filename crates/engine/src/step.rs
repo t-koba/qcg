@@ -28,6 +28,12 @@ pub enum StepError {
         used: u64,
         limit: u64,
     },
+    #[error("step `{node}` failed: global step budget exceeded: {used} >= {allowed}")]
+    GlobalStepBudgetExceeded {
+        node: String,
+        used: u64,
+        allowed: u64,
+    },
     /// Provider terminal without reported capacity; partial output is not completion.
     #[error("step `{node}` exhausted the provider context window (model_context_window_exceeded)")]
     ProviderContextExhausted { node: String },
@@ -373,15 +379,12 @@ pub struct StepContext<'a> {
 }
 
 impl StepContext<'_> {
-    /// Node-scoped checkpoint: same shared `checkpoint_scope` as
-    /// `RunContext::run_checkpoint`, with the node id as scope. The two
-    /// methods differ only in scope and error mapping, never in enforcement
-    /// (E11).
+    /// Node-scoped shared checkpoint; only scope and error mapping differ,
+    /// never elapsed enforcement (E11).
     pub async fn step_checkpoint(&self, node: &NodeDef) -> Result<(), StepError> {
         tokio::task::yield_now().await;
-        // Shared scope check (E11): the monotonic `elapsed_deadline` is
-        // authoritative and stops in-flight work; cancellation maps to the
-        // step Cancelled variant on this path.
+        // The monotonic deadline stops in-flight work; cancellation maps to
+        // this step's Cancelled variant.
         crate::engine::checkpoint_scope(
             &self.run.cancellation,
             self.run
@@ -414,12 +417,9 @@ impl StepContext<'_> {
                 });
             }
         }
-        // Enforcement uses the monotonic `elapsed_deadline` checked above
-        // only. The durable wall-clock record (`budget.started_at`) is
-        // diagnostic and never enforces: enforcing both clocks would drift
-        // up to 1 s on truncation and split NTP behavior (E11). Resume
-        // reconstructs the same monotonic deadline from the durable
-        // elapsed, so the basis never changes across restarts (E11).
+        // The monotonic deadline is authoritative; durable wall time is diagnostic
+        // only. Using both would drift at truncation/NTP; resume reconstructs the
+        // same deadline from durable elapsed (E11).
         Ok(())
     }
 

@@ -432,22 +432,17 @@ impl BudgetTracker {
         }
     }
 
-    pub(crate) fn consume(&self, node_id: &str) -> Result<(), StepError> {
-        let result =
-            self.executed_steps
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |executed| {
-                    (executed < self.max_total_steps).then_some(executed.saturating_add(1))
-                });
-        if let Err(executed) = result {
-            return Err(StepError::failed(
-                node_id,
-                format!(
-                    "global step budget exceeded: {} >= {}",
-                    executed, self.max_total_steps
-                ),
-            ));
-        }
-        Ok(())
+    pub(crate) fn consume(&self, node: &str) -> Result<(), StepError> {
+        self.executed_steps
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |executed| {
+                (executed < self.max_total_steps).then_some(executed.saturating_add(1))
+            })
+            .map(|_| ())
+            .map_err(|executed| StepError::GlobalStepBudgetExceeded {
+                node: node.into(),
+                used: executed as u64,
+                allowed: self.max_total_steps as u64,
+            })
     }
 }
 

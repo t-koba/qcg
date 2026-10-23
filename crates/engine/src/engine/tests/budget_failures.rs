@@ -180,6 +180,30 @@ fn only_typed_budget_errors_project_exhaustion() {
         failure_detail_for_error(&EngineError::ResumableAgent(Box::new(typed))),
         detail
     );
+    let steps = EngineError::Step(StepError::GlobalStepBudgetExceeded {
+        node: "steps".into(),
+        used: 2,
+        allowed: 2,
+    });
+    let detail = failure_detail_for_error(&steps);
+    assert_eq!(detail.code, FailureCode::BudgetExceeded);
+    assert_eq!(
+        detail.message,
+        "step `steps` failed: global step budget exceeded: 2 >= 2"
+    );
+    assert_eq!(
+        detail.exhaustion.as_ref(),
+        Some(&BudgetExhaustion {
+            resource: "steps".into(),
+            used: 2,
+            allowed: 2,
+            used_subsec_nanoseconds: None,
+        })
+    );
+    assert_eq!(
+        failure_detail_for_error(&EngineError::ResumableAgent(Box::new(steps))),
+        detail
+    );
     for error in [
         EngineError::Failed(detail.message.clone()),
         EngineError::Step(StepError::AgentResourceExhausted {
@@ -192,6 +216,109 @@ fn only_typed_budget_errors_project_exhaustion() {
     ] {
         assert!(failure_detail_for_error(&error).exhaustion.is_none());
     }
+}
+
+struct StepBudgetCountingStep(Arc<AtomicUsize>);
+
+#[async_trait]
+impl StepExecutor for StepBudgetCountingStep {
+    crate::step_type_id!("test.step_budget_count");
+
+    async fn execute(
+        &self,
+        _: &mut StepContext<'_>,
+        node: &NodeDef,
+    ) -> Result<StepOutcome, StepError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(StepOutcome::success(Some(json!({ "node": node.id }))))
+    }
+}
+
+#[tokio::test]
+async fn global_step_budget_projects_typed_exhaustion() {
+    let root = temp_run_dir("global-step-budget");
+    let _guard = TempGuard(root.clone());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut first = node("first", "test.step_budget_count");
+    first.retry = Some(RetryPolicy {
+        max_attempts: 3,
+        ..Default::default()
+    });
+    let mut second = node("second", "test.step_budget_count");
+    second.retry = Some(RetryPolicy {
+        max_attempts: 3,
+        ..Default::default()
+    });
+    let spec = manifest(vec![first, second]);
+    let mut registry = test_registry();
+    registry.register(StepBudgetCountingStep(calls.clone()));
+    let engine = Engine::new(registry);
+    let mut options = run_options(root.join("workspace"));
+    options.max_total_steps = 1;
+    let progress = engine
+        .advance_with_id(
+            "global-step-budget".into(),
+            root.join("meta"),
+            test_contract(&root, spec),
+            BTreeMap::new(),
+            options,
+        )
+        .await;
+    let Progress::Failed(failure) = progress else {
+        panic!("expected failure: {progress:?}");
+    };
+    let expected = BudgetExhaustion {
+        used_subsec_nanoseconds: None,
+        resource: "steps".into(),
+        used: 1,
+        allowed: 1,
+    };
+    assert_eq!(failure.code, FailureCode::BudgetExceeded);
+    assert_eq!(failure.kind, RunFailureKind::Execution);
+    assert_eq!(failure.exhaustion.as_ref(), Some(&expected));
+    assert_eq!(
+        failure.message,
+        "step `second` failed: global step budget exceeded: 1 >= 1"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "budget errors must not retry"
+    );
+    let state = RunState::fold_journal(&root.join("meta/journal.jsonl")).unwrap();
+    let crate::NodeOutcome::Failed { reason } = &state.nodes[&NodePath::root("second")] else {
+        panic!("failed second node required: {:?}", state.nodes);
+    };
+    assert_eq!(reason, &failure.detail);
+    assert_eq!(
+        state.vars.get_path("steps.second.reason.exhaustion.used"),
+        Some(&json!(1))
+    );
+    let events: Vec<Value> = std::fs::read_to_string(root.join("meta/journal.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("journal line should be JSON"))
+        .collect();
+    let finished = events
+        .iter()
+        .find(|e| e["t"] == "step_finished" && e["node"] == "second" && e["status"] == "failed")
+        .unwrap();
+    let decoded = api::RunEvent::from_flat(finished).unwrap();
+    assert_eq!(
+        serde_json::from_value::<FailureDetail>(
+            serde_json::to_value(decoded.data).unwrap()["reason"].clone()
+        )
+        .unwrap(),
+        failure.detail
+    );
+    let terminal = events.iter().find(|e| e["t"] == "run_finished").unwrap();
+    assert!(
+        terminal["failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["failure"]["exhaustion"] == json!(expected))
+    );
 }
 
 struct ProviderContextStep(Arc<AtomicUsize>);
