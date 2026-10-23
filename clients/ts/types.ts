@@ -2648,6 +2648,11 @@ export interface components {
         OutputManifest: {
             artifacts: components["schemas"]["OutputArtifact"][];
         };
+        /**
+         * @description Compatibility preserves existing abort timing and aggregation, not replay authority.
+         * @enum {string}
+         */
+        ParallelCompatibility: "fail_fast";
         Permissions: {
             commands: components["schemas"]["CommandPermission"][];
             containers: components["schemas"]["ContainerPermission"];
@@ -3138,6 +3143,13 @@ export interface components {
              * @default null
              */
             package_sha256: string | null;
+            /**
+             * @description Deployment-owned parallel compatibility; only fail-fast exists.
+             * @default null
+             */
+            parallel_compatibility: components["schemas"]["ParallelCompatibility"] | null;
+            /** @default null */
+            parallel_compatibility_origin: string | null;
             /**
              * @description Parent run id for runs created by fork.
              * @default null

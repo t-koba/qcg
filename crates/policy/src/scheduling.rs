@@ -1,6 +1,14 @@
-//! Deployment-owned preemption choices; never accepted from run callers.
+//! Deployment-owned preemption/compatibility choices; never from run callers.
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+fn parse_env<T: Default>(name: &str, parse: fn(&str) -> Result<T, String>) -> Result<T, String> {
+    match std::env::var(name) {
+        Ok(value) => parse(&value).map_err(|error| format!("{name}: {error}")),
+        Err(std::env::VarError::NotPresent) => Ok(T::default()),
+        Err(_) => Err(format!("{name} must be Unicode")),
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -21,14 +29,9 @@ impl PreemptionMode {
     }
 
     pub fn from_env(name: &str) -> Result<Self, String> {
-        match std::env::var(name) {
-            Ok(value) => Self::parse(&value).map_err(|error| format!("{name}: {error}")),
-            Err(std::env::VarError::NotPresent) => Ok(Self::default()),
-            Err(_) => Err(format!("{name} must be Unicode")),
-        }
+        parse_env(name, Self::parse)
     }
 }
-
 /// FIFO position used only when the scheduler requeues a preempted run.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -49,14 +52,9 @@ impl PreemptionQueuePosition {
     }
 
     pub fn from_env(name: &str) -> Result<Self, String> {
-        match std::env::var(name) {
-            Ok(value) => Self::parse(&value).map_err(|error| format!("{name}: {error}")),
-            Err(std::env::VarError::NotPresent) => Ok(Self::default()),
-            Err(_) => Err(format!("{name} must be Unicode")),
-        }
+        parse_env(name, Self::parse)
     }
 }
-
 /// Deployment-owned selection of elapsed wall durations to charge.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -76,14 +74,16 @@ impl ElapsedBudgetMode {
     }
 
     pub fn from_env(name: &str) -> Result<Self, String> {
-        match std::env::var(name) {
-            Ok(value) => Self::parse(&value).map_err(|error| format!("{name}: {error}")),
-            Err(std::env::VarError::NotPresent) => Ok(Self::default()),
-            Err(_) => Err(format!("{name} must be Unicode")),
-        }
+        parse_env(name, Self::parse)
     }
 }
-
+/// Compatibility preserves existing abort timing and aggregation, not replay authority.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ParallelCompatibility {
+    #[default]
+    FailFast,
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,6 +109,21 @@ mod tests {
         ] {
             assert!(ElapsedBudgetMode::parse(bad).is_err());
         }
+    }
+
+    #[test]
+    fn parallel_compatibility_defaults_to_fail_fast() {
+        assert_eq!(
+            ParallelCompatibility::default(),
+            ParallelCompatibility::FailFast
+        );
+        assert_eq!(
+            serde_json::to_value(ParallelCompatibility::FailFast).unwrap(),
+            serde_json::json!("fail_fast")
+        );
+        assert!(
+            serde_json::from_value::<ParallelCompatibility>(serde_json::json!("wait")).is_err()
+        );
     }
 
     #[test]

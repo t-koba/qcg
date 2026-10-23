@@ -399,3 +399,45 @@ fn generator_detail_and_start_document_the_package_identity_precondition() {
             .is_some_and(|description| { description.contains("loaded GeneratorDetail") })
     );
 }
+
+#[test]
+fn run_identity_parallel_compatibility_is_optional_and_roundtrips() {
+    let old: api::RunStartedEventData = serde_json::from_value(serde_json::json!({
+        "generator": "g@1",
+        "generator_path": "g",
+        "contract_sha256": "abc",
+        "inputs": {},
+        "schema_version": 2,
+        "elapsed_budget_mode": "wall_clock"
+    }))
+    .expect("old identity without compat fields must parse");
+    assert!(old.parallel_compatibility.is_none());
+    assert!(old.parallel_compatibility_origin.is_none());
+    let new: api::RunStartedEventData = serde_json::from_value(serde_json::json!({
+        "generator": "g@1",
+        "generator_path": "g",
+        "contract_sha256": "abc",
+        "inputs": {},
+        "schema_version": 2,
+        "elapsed_budget_mode": "wall_clock",
+        "parallel_compatibility": "fail_fast",
+        "parallel_compatibility_origin": "deployment_policy"
+    }))
+    .expect("new identity must parse");
+    assert_eq!(
+        serde_json::to_value(new.parallel_compatibility).unwrap(),
+        serde_json::json!("fail_fast")
+    );
+    assert_eq!(
+        new.parallel_compatibility_origin.as_deref(),
+        Some("deployment_policy")
+    );
+    let schema = &api::openapi_components()["schemas"]["RunStartedEventData"];
+    let required = schema["required"].as_array().expect("required");
+    assert!(!required.iter().any(|name| name == "parallel_compatibility"));
+    assert!(
+        !required
+            .iter()
+            .any(|name| name == "parallel_compatibility_origin")
+    );
+}

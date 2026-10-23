@@ -10,7 +10,6 @@ use super::resources::ResourceEventData;
 /// does not implement, so an incompatible format fails closed instead of
 /// being reinterpreted.
 pub const JOURNAL_SCHEMA_VERSION: u32 = 2;
-
 #[derive(Debug, Clone, Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RunStartedEventData {
@@ -54,19 +53,22 @@ pub struct RunStartedEventData {
     /// Origin of the effective budget for audit display.
     #[serde(default)]
     pub effective_policy_origin: Option<String>,
+    /// Deployment-owned parallel compatibility; only fail-fast exists.
+    #[serde(default)]
+    pub parallel_compatibility: Option<policy::scheduling::ParallelCompatibility>,
+    #[serde(default)]
+    pub parallel_compatibility_origin: Option<String>,
     /// Durable FIFO ordering key. Scheduler preemption may preserve the
     /// prior key; fresh/fork admissions establish a new one. Absent entries
     /// use the actual event timestamp (C04), which is never backdated.
     #[serde(default)]
     pub queued_at: Option<String>,
 }
-
 #[derive(Debug, Clone, Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GraphResolvedEventData {
     pub nodes: Vec<String>,
 }
-
 /// Single durable active elapsed ledger, preserving subsecond consumption.
 #[derive(Debug, Clone, Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -76,7 +78,6 @@ pub struct ElapsedAccountedEventData {
     #[schemars(required, schema_with = "nullable_active_start_schema")]
     pub active_started_at: Option<String>,
 }
-
 fn nullable_active_start_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
     <Option<String> as schemars::JsonSchema>::json_schema(generator)
 }

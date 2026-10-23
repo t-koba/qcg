@@ -208,6 +208,7 @@ pub struct RunOptions {
     pub confirmations: BTreeMap<String, bool>,
     pub max_total_steps: usize,
     pub max_parallel_steps: usize,
+    pub parallel_compatibility: policy::scheduling::ParallelCompatibility,
     pub llm_provider: Option<Arc<dyn llm::LlmProvider>>,
     pub llm_seed_override: Option<u64>,
     /// Resolved `run_ref` resources by resource name. An unresolved
@@ -255,6 +256,7 @@ pub struct RunContext {
     pub llm_seed_override: Option<u64>,
     pub templates: TemplateService,
     pub cancellation: CancellationToken,
+    pub parallel_compatibility: policy::scheduling::ParallelCompatibility,
     /// Monotonic deadline derived from the run's `max_elapsed_seconds`
     /// budget (a `tokio::time::Instant`, never wall time). Nodes stop with
     /// a distinct elapsed error instead of running past the limit and only

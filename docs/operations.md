@@ -860,8 +860,8 @@ never preempt each other. The victim keeps its journal: completed work replays
 on resume instead of re-executing.
 
 The server and CLI host resolve these independent **deployment** settings at
-boot. `PREEMPTION_MODE`, `PREEMPTION_QUEUE_POSITION`, and `ELAPSED_BUDGET_MODE` accept only the listed
-spellings: invalid, empty, or
+boot. `PREEMPTION_MODE`, `PREEMPTION_QUEUE_POSITION`, and
+`ELAPSED_BUDGET_MODE` accept only the listed spellings: invalid, empty, or
 non-Unicode values refuse startup, even when preemption is disabled. Embedded
 services pass the typed fields on
 `ServiceDeploymentPolicy` (or call `with_scheduling_env` before construction).
@@ -873,6 +873,16 @@ Run requests and generator contracts cannot override them.
 | `PREEMPTION_MODE` | `step_boundary`, `interrupt` | `step_boundary` |
 | `PREEMPTION_QUEUE_POSITION` | `preserve`, `tail` | `preserve` |
 | `ELAPSED_BUDGET_MODE` | `wall_clock`, `active_execution` | `wall_clock` |
+
+Parallel compatibility is deployment-owned and frozen in
+`ServiceDeploymentPolicy`; run requests cannot override it. Only `fail_fast`
+exists and is the default: waves abort on the first observed terminal report or
+join failure; parallel foreach aborts/drains on its first terminal iteration
+report or join failure. Existing aggregation and observation timing are
+unchanged. Sibling facts remain journaled through quiescence; this selector does
+not choose new mixed-outcome precedence or authorize replay. New run identities
+record the selector and `deployment_policy` provenance; older identities without
+these optional fields remain readable.
 
 `step_boundary` requests a cooperative yield distinct from ordinary cancellation.
 The current flow node (including nested execution), or a complete already-started

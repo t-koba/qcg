@@ -32,6 +32,7 @@ fn run_options(output_dir: Utf8PathBuf) -> RunOptions {
         confirmations: BTreeMap::new(),
         max_total_steps: 100,
         max_parallel_steps: 1,
+        parallel_compatibility: policy::scheduling::ParallelCompatibility::default(),
         llm_provider: None,
         llm_seed_override: None,
         run_refs: BTreeMap::new(),
@@ -7744,6 +7745,88 @@ async fn active_parallel_wave_has_one_elapsed_interval_not_one_per_node() {
     );
     assert!(accounting.last().unwrap()["active_started_at"].is_null());
     let _ = std::fs::remove_dir_all(run_dir);
+}
+
+#[test]
+fn parallel_compatibility_wiring_preserves_fail_fast() {
+    let dir = temp_run_dir("compat-wiring");
+    let options = run_options(dir.join("workspace"));
+    assert_eq!(
+        options.parallel_compatibility,
+        policy::scheduling::ParallelCompatibility::FailFast
+    );
+    assert_eq!(
+        super::execute::parallel_terminal_decision(options.parallel_compatibility),
+        super::execute::ParallelTerminalDecision::AbortAndDrain
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn parallel_wave_all_success_retains_behavior_with_provenance() {
+    let mut manifest = manifest(vec![node("a", "test.pass"), node("b", "test.pass")]);
+    manifest.parallel = vec!["a".into(), "b".into()];
+    let run_dir = temp_run_dir("compat-wave-success");
+    run_manifest(manifest, run_dir.clone(), 2)
+        .await
+        .expect("all-success wave must succeed");
+    let events = journal_events(&run_dir);
+    let started = events
+        .iter()
+        .find(|event| event["t"] == "run_started")
+        .expect("run_started must be journaled");
+    assert_eq!(started["parallel_compatibility"], "fail_fast");
+    assert_eq!(
+        started["parallel_compatibility_origin"],
+        "deployment_policy"
+    );
+    let _ = std::fs::remove_dir_all(&run_dir);
+}
+
+#[tokio::test]
+async fn foreach_parallel_all_success_retains_behavior_with_provenance() {
+    let manifest = manifest(vec![foreach_node(
+        "each",
+        "each_body",
+        "inputs.items",
+        2,
+        10,
+    )]);
+    let manifest = {
+        let mut manifest = manifest;
+        manifest.inputs = foreach_items_input();
+        manifest
+    };
+    let run_dir = temp_run_dir("compat-foreach-success");
+    let mut registry = StepRegistry::new();
+    registry.register(TestPassStep);
+    registry.register(TestForeachStep);
+    run_engine_with(
+        {
+            let mut manifest = manifest;
+            manifest
+                .blocks
+                .insert("each_body".into(), vec![node("child", "test.pass")]);
+            manifest
+        },
+        registry,
+        BTreeMap::from([("items".into(), json!(["a", "b"]))]),
+        run_dir.clone(),
+        100,
+    )
+    .await
+    .expect("all-success foreach must succeed");
+    let events = journal_events(&run_dir);
+    let started = events
+        .iter()
+        .find(|event| event["t"] == "run_started")
+        .expect("run_started must be journaled");
+    assert_eq!(started["parallel_compatibility"], "fail_fast");
+    assert_eq!(
+        started["parallel_compatibility_origin"],
+        "deployment_policy"
+    );
+    let _ = std::fs::remove_dir_all(&run_dir);
 }
 
 #[path = "tests/parallel_facts.rs"]

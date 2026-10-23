@@ -225,41 +225,25 @@ impl Engine {
                     Err(error) => error.id(),
                 };
                 task_indices.remove(&task_id);
-                match result {
-                    // Abort/drain on the first terminal result; absorb completed successes.
-                    Ok((_, (_, iteration_vars, Ok((iteration_files, Some(outcome)))))) => {
-                        drop(iteration_vars);
-                        files.extend(iteration_files);
-                        drain_foreach_tasks(
-                            &mut tasks,
-                            &mut task_indices,
-                            vars,
-                            &mut files,
-                            &journal,
-                            &node.id,
-                            false,
-                        )
-                        .await?;
-                        let outcome = match outcome {
-                            StepOutcome::CheckFailed {
-                                findings,
-                                output,
-                                files: _,
-                            } => StepOutcome::CheckFailed {
-                                findings,
-                                output,
-                                files: files.clone(),
-                            },
-                            other => other,
-                        };
-                        return Ok(outcome);
-                    }
+                let result = match result {
                     Ok((_, (_, iteration_vars, Ok((iteration_files, None))))) => {
                         vars.absorb_outputs(&iteration_vars);
                         files.extend(iteration_files);
+                        continue;
                     }
-                    Ok((_, (_, _iteration_vars, Err(error)))) => {
-                        let parent_cancelled = error.is_canceled();
+                    other => other,
+                };
+                let parent_cancelled = match &result {
+                    Ok((_, (_, _, Err(error)))) => error.is_canceled(),
+                    Err(error) => error.is_cancelled(),
+                    _ => false,
+                };
+                // Preserve the first report's files before draining sibling files.
+                if let Ok((_, (_, _, Ok((iteration_files, Some(_)))))) = &result {
+                    files.extend(iteration_files.iter().cloned());
+                }
+                match super::execute::parallel_terminal_decision(context.parallel_compatibility) {
+                    super::execute::ParallelTerminalDecision::AbortAndDrain => {
                         drain_foreach_tasks(
                             &mut tasks,
                             &mut task_indices,
@@ -270,29 +254,25 @@ impl Engine {
                             parent_cancelled,
                         )
                         .await?;
-                        return Err(error);
-                    }
-                    Err(error) => {
-                        let parent_cancelled = error.is_cancelled();
-                        drain_foreach_tasks(
-                            &mut tasks,
-                            &mut task_indices,
-                            vars,
-                            &mut files,
-                            &journal,
-                            &node.id,
-                            parent_cancelled,
-                        )
-                        .await?;
-                        let classified = if error.is_cancelled() {
-                            EngineError::Canceled
-                        } else {
-                            // Preserve panic details from join failures.
-                            super::execute::join_task_error(error)
-                        };
-                        return Err(classified);
                     }
                 }
+                return match result {
+                    Ok((_, (_, _, Ok((_, Some(outcome)))))) => Ok(match outcome {
+                        StepOutcome::CheckFailed {
+                            findings, output, ..
+                        } => StepOutcome::CheckFailed {
+                            findings,
+                            output,
+                            files: files.clone(),
+                        },
+                        other => other,
+                    }),
+                    Ok((_, (_, _, Err(error)))) => Err(error),
+                    Err(error) if error.is_cancelled() => Err(EngineError::Canceled),
+                    Err(error) => Err(super::execute::join_task_error(error)),
+                    // Successful iterations were absorbed above, before applying policy.
+                    Ok((_, (_, _, Ok((_, None))))) => unreachable!("success already absorbed"),
+                };
             }
         }
         let files = existing_regular_files(files)?;

@@ -366,7 +366,6 @@ pub fn resolve_server_policy_with_container_timeouts(
         shutdown_settle,
     })
 }
-
 pub(crate) async fn serve_with_resolved_policy_and_deadline(
     policy: ResolvedServerPolicy,
     config: ServerConfig,
@@ -467,6 +466,7 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
             gc_keep_failed,
             gc_interval_secs,
             max_parallel_steps,
+            parallel_compatibility: Default::default(),
             live_event_channel_capacity,
             journal_poll_interval_millis,
             max_directory_scan_entries,

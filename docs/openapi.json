@@ -2145,6 +2145,13 @@
         "title": "OutputManifest",
         "type": "object"
       },
+      "ParallelCompatibility": {
+        "description": "Compatibility preserves existing abort timing and aggregation, not replay authority.",
+        "enum": [
+          "fail_fast"
+        ],
+        "type": "string"
+      },
       "Permissions": {
         "additionalProperties": false,
         "properties": {
@@ -3427,6 +3434,25 @@
           "package_sha256": {
             "default": null,
             "description": "Full package identity for API runs. Absent on legacy/direct runs;\nthose runs cannot be recovered or forked by the service.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parallel_compatibility": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ParallelCompatibility"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Deployment-owned parallel compatibility; only fail-fast exists."
+          },
+          "parallel_compatibility_origin": {
+            "default": null,
             "type": [
               "string",
               "null"

@@ -24,6 +24,22 @@ struct AttemptBounds {
     backoff_ms: u64,
 }
 
+/// The compatibility policy controls only whether terminal reports stop sibling work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ParallelTerminalDecision {
+    AbortAndDrain,
+}
+
+pub(super) fn parallel_terminal_decision(
+    policy: policy::scheduling::ParallelCompatibility,
+) -> ParallelTerminalDecision {
+    match policy {
+        policy::scheduling::ParallelCompatibility::FailFast => {
+            ParallelTerminalDecision::AbortAndDrain
+        }
+    }
+}
+
 /// Preserve panic detail (including unknown payloads); callers handle cancellation (E10).
 pub(crate) fn join_task_error(error: tokio::task::JoinError) -> EngineError {
     debug_assert!(!error.is_cancelled());
@@ -215,7 +231,9 @@ impl Engine {
                     "wave_start_failure"
                 };
                 states.insert(node.id.clone(), NodeState::Pending);
-                tasks.abort_all();
+                match parallel_terminal_decision(context.parallel_compatibility) {
+                    ParallelTerminalDecision::AbortAndDrain => tasks.abort_all(),
+                }
                 while let Some(result) = tasks.join_next_with_id().await {
                     let fact = record_wave_join(&journal, &mut task_nodes, &result, cause, cause);
                     fact_result = fact_result.and(fact);
@@ -281,33 +299,30 @@ impl Engine {
                         if abort_on_settle { "fail_fast" } else { "none" },
                         if abort_on_settle { "fail_fast" } else { "none" });
                     fact_result = fact_result.and(fact);
-                    match result {
+                    let terminal = match result {
                         Ok((_, (node, outcome))) => {
                             let terminal = !matches!(&outcome, Ok(StepOutcome::Success { .. }));
                             outcomes.insert(node.id.clone(), (node, outcome));
-                            if terminal && !abort_on_settle {
-                                abort_on_settle = true;
-                                tasks.abort_all();
-                            }
+                            terminal
+                        }
+                        Err(error) if error.is_cancelled() => {
+                            // Unrequested cancellation starts fail-fast; a sibling abort does not.
+                            if abort_on_settle { continue; }
+                            join_errors.push(EngineError::Step(StepError::Refused {
+                                node: "scheduler".into(),
+                                message: "parallel task cancellation had no parent or fail-fast cause".into(),
+                            }));
+                            true
                         }
                         Err(error) => {
-                            if error.is_cancelled() {
-                                // Unrequested cancellation starts fail-fast; a sibling abort does not.
-                                if !abort_on_settle {
-                                    join_errors.push(EngineError::Step(StepError::Refused {
-                                        node: "scheduler".into(),
-                                        message: "parallel task cancellation had no parent or fail-fast cause".into(),
-                                    }));
-                                    abort_on_settle = true;
-                                    tasks.abort_all();
-                                }
-                                continue;
-                            }
                             join_errors.push(join_task_error(error));
-                            if !abort_on_settle {
-                                abort_on_settle = true;
-                                tasks.abort_all();
-                            }
+                            true
+                        }
+                    };
+                    if terminal && !abort_on_settle {
+                        abort_on_settle = true;
+                        match parallel_terminal_decision(context.parallel_compatibility) {
+                            ParallelTerminalDecision::AbortAndDrain => tasks.abort_all(),
                         }
                     }
                 }

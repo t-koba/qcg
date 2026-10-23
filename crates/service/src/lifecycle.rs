@@ -1678,6 +1678,7 @@ impl LocalService {
                     .get(&run_id)
                     .map(|record| record.scheduler_yield.clone())
                     .unwrap_or_default();
+                let parallel_compatibility = self.inner.deployment_policy.parallel_compatibility;
                 let progress = engine
                     .advance_with_id(
                         run_id.clone(),
@@ -1694,6 +1695,7 @@ impl LocalService {
                             confirmations,
                             max_total_steps: policy.max_total_steps,
                             max_parallel_steps: policy.max_parallel_steps,
+                            parallel_compatibility,
                             llm_provider: Some(Arc::clone(&runtime.provider)),
                             llm_seed_override: None,
                             cancellation,
@@ -1927,6 +1929,7 @@ impl LocalService {
                     confirmations: run.confirmations,
                     max_total_steps: policy.max_total_steps,
                     max_parallel_steps: policy.max_parallel_steps,
+                    parallel_compatibility: self.inner.deployment_policy.parallel_compatibility,
                     llm_provider: Some(Arc::clone(&runtime.provider)),
                     llm_seed_override: run.llm_seed_override,
                     run_refs: run_refs.clone(),

@@ -604,6 +604,7 @@ impl Engine {
             llm_seed_override: options.llm_seed_override,
             templates: TemplateService,
             cancellation: options.cancellation.clone(),
+            parallel_compatibility: options.parallel_compatibility,
             snapshot_source: self.snapshot_source.clone(),
             run_refs: Arc::new(options.run_refs),
             replayed_steps: Arc::new(replay.steps.clone()),
@@ -647,6 +648,8 @@ impl Engine {
                     "schema_version": api::JOURNAL_SCHEMA_VERSION,
                     "elapsed_budget_mode": mode,
                     "retention_days": context.contract.manifest.retention.days,
+                    "parallel_compatibility": context.parallel_compatibility,
+                    "parallel_compatibility_origin": "deployment_policy",
                 }),
             )?;
             }

@@ -60,6 +60,8 @@ pub struct ServiceDeploymentPolicy {
     /// Deployment cap on parallel wave scheduling. `None` uses the CPU
     /// count.
     pub max_parallel_steps: Option<usize>,
+    /// Deployment-owned parallel compatibility; only fail-fast exists.
+    pub parallel_compatibility: policy::scheduling::ParallelCompatibility,
     /// Capacity of the per-run live event broadcast channel.
     pub live_event_channel_capacity: usize,
     /// Shared-mode journal follow cadence, in milliseconds.
@@ -71,7 +73,6 @@ pub struct ServiceDeploymentPolicy {
     /// Queued-run resumer cadence, in seconds.
     pub queued_resumer_secs: u64,
 }
-
 impl Default for ServiceDeploymentPolicy {
     fn default() -> Self {
         Self {
@@ -87,6 +88,7 @@ impl Default for ServiceDeploymentPolicy {
             gc_keep_failed: policy::DEFAULT_GC_KEEP_FAILED,
             gc_interval_secs: policy::DEFAULT_GC_INTERVAL_SECS,
             max_parallel_steps: None,
+            parallel_compatibility: policy::scheduling::ParallelCompatibility::default(),
             live_event_channel_capacity: policy::LIVE_EVENT_CHANNEL_CAPACITY,
             journal_poll_interval_millis: policy::JOURNAL_POLL_INTERVAL_MILLIS,
             max_directory_scan_entries: policy::DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES,
@@ -95,7 +97,6 @@ impl Default for ServiceDeploymentPolicy {
         }
     }
 }
-
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
     #[error("{0}")]
@@ -112,13 +113,11 @@ pub enum ServiceError {
     #[error(transparent)]
     Zip(#[from] zip::result::ZipError),
 }
-
 impl From<ServiceError> for ApiError {
     fn from(error: ServiceError) -> Self {
         Self::internal(error.to_string())
     }
 }
-
 impl ServiceDeploymentPolicy {
     /// Resolve host scheduling environment once before constructing a service.
     /// Callers cannot supply any of these choices on a run request.
@@ -131,7 +130,6 @@ impl ServiceDeploymentPolicy {
         Ok(self)
     }
 }
-
 #[derive(Debug, Clone)]
 pub struct LocalService {
     pub(crate) inner: Arc<LocalServiceInner>,
@@ -473,5 +471,18 @@ mod send_probe_tests {
         assert_send::<std::fs::File>();
         assert_send::<tokio::sync::broadcast::Sender<api::RunEvent>>();
         assert_send::<api::ToolCallEventData>();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deployment_parallel_compatibility_defaults_to_fail_fast() {
+        assert_eq!(
+            ServiceDeploymentPolicy::default().parallel_compatibility,
+            policy::scheduling::ParallelCompatibility::FailFast
+        );
     }
 }
