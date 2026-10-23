@@ -31,7 +31,6 @@ pub enum EngineError {
     /// original error for diagnostics and failure classification.
     #[error(transparent)]
     ResumableAgent(Box<EngineError>),
-    /// A completed foreach sibling is replayed as a fact, not retried.
     #[error("{0}")]
     Settled(model::FailureDetail),
     #[error(transparent)]

@@ -144,22 +144,15 @@ impl Engine {
             if let Some(result) = fact.get("result") {
                 let result: Result<StepOutcome, FailureDetail> =
                     serde_json::from_value(result.clone()).map_err(crate::JournalError::from)?;
-                files.extend(
-                    serde_json::from_value::<Vec<Utf8PathBuf>>(fact["files"].clone())
-                        .map_err(crate::JournalError::from)?
-                        .into_iter()
-                        .map(|path| context.workspace.join(path)),
-                );
+                let saved: Vec<Utf8PathBuf> = serde_json::from_value(fact["files"].clone())
+                    .map_err(crate::JournalError::from)?;
+                files.extend(saved.into_iter().map(|path| context.workspace.join(path)));
                 let index = fact["index"]
                     .as_u64()
                     .and_then(|n| usize::try_from(n).ok())
                     .ok_or_else(|| StepError::failed(&node.id, "invalid recorded foreach index"))?;
-                terminals.insert(
-                    index,
-                    result
-                        .map(|outcome| (vec![], Some(outcome)))
-                        .map_err(EngineError::Settled),
-                );
+                let settled = result.map(|o| (vec![], Some(o)));
+                terminals.insert(index, settled.map_err(EngineError::Settled));
             }
         }
         let mut reporter = ForeachReporter {
