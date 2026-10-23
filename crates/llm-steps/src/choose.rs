@@ -7,7 +7,8 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 use crate::completion::{
-    checked_usage_total, complete_llm, complete_text_with_prompt, validate_retry_budget,
+    checked_usage_total, complete_llm, complete_text_with_prompt, local_resource_exhausted,
+    validate_retry_budget,
 };
 use crate::context::{record_llm_validation_failure, retry_prompt};
 use crate::output::write_output_file;
@@ -80,15 +81,11 @@ impl StepExecutor for LlmChooseStep {
                 complete_llm(ctx, node, request, |_| json!({ "attempt": attempt })).await?;
             tokens_total = checked_usage_total(node, tokens_total, &response.usage)?;
             if tokens_total > max_tokens_total {
-                return Err(StepError::LocalResourceExhausted {
-                    node: node.id.clone(),
-                    message: format!(
-                        "llm.choose token budget exceeded: {tokens_total} > {max_tokens_total}"
-                    ),
-                    resource: "tokens_total",
-                    used: tokens_total,
-                    allowed: max_tokens_total,
-                });
+                return Err(local_resource_exhausted(
+                    &node.id,
+                    "llm.choose token",
+                    ("tokens_total", tokens_total, max_tokens_total),
+                ));
             }
             let choice = response_text(response.content)?;
             if params.options.iter().any(|option| option == &choice) {

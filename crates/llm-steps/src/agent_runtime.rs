@@ -1714,20 +1714,6 @@ fn ensure_path_within_prefix(
     Ok(())
 }
 
-pub(crate) fn agent_resource_exhausted(
-    node: &str,
-    scope: &str,
-    (resource, used, allowed): (&'static str, u64, u64),
-) -> StepError {
-    StepError::LocalResourceExhausted {
-        node: node.into(),
-        message: format!("{scope} budget exceeded: {used} > {allowed}"),
-        resource,
-        used,
-        allowed,
-    }
-}
-
 pub(crate) fn agent_failure_code(error: &StepError) -> AgentFailureCode {
     use AgentFailureCode::*;
     match error {

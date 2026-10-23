@@ -13,12 +13,12 @@ use std::time::Instant;
 
 use crate::agent_runtime::{
     AgentToolCallFailure, AgentToolInvocation, AgentToolServices, AgentWrites,
-    agent_call_identity_hash_for_tool, agent_failure_code, agent_resource_exhausted,
-    check_used_call_id, execute_agent_tool, finish_rejected_external_operation,
-    record_agent_failure_event, recover_agent_tool_call_failure, validate_agent_tool_call_args,
+    agent_call_identity_hash_for_tool, agent_failure_code, check_used_call_id, execute_agent_tool,
+    finish_rejected_external_operation, record_agent_failure_event,
+    recover_agent_tool_call_failure, validate_agent_tool_call_args,
 };
 use crate::agent_tools::{validate_agent_delegations, validate_agent_tool};
-use crate::completion::complete_llm;
+use crate::completion::{complete_llm, local_resource_exhausted};
 use crate::context::{enforce_agent_transcript_limit, record_llm_validation_failure};
 use crate::guardrail::{apply_guardrails, validate_guardrails};
 use crate::mcp_tools::{AgentToolOutcome, McpAgentTools};
@@ -873,7 +873,7 @@ impl StepExecutor for LlmAgentStep {
             // Non-resumed turns validated stop below; resumed turns skip it
             // because they execute a previously validated approved call.
             if tokens_total > max_tokens_total {
-                let error = agent_resource_exhausted(
+                let error = local_resource_exhausted(
                     &node.id,
                     "llm.agent token",
                     ("tokens_total", tokens_total, max_tokens_total),
@@ -1791,7 +1791,7 @@ pub(crate) fn charge_agent_tool_call(
     let count = counts.entry(name.to_string()).or_default();
     *count = count.saturating_add(1);
     if *total > max_total {
-        return Err(agent_resource_exhausted(
+        return Err(local_resource_exhausted(
             node_id,
             &format!("{scope} tool call"),
             ("tool_calls_total", *total as u64, max_total as u64),
@@ -1803,7 +1803,7 @@ pub(crate) fn charge_agent_tool_call(
         .and_then(agent_tool_max_calls)
         && *count > max_calls
     {
-        return Err(agent_resource_exhausted(
+        return Err(local_resource_exhausted(
             node_id,
             &format!("{scope} tool `{name}` call"),
             ("tool_calls_per_tool", *count as u64, max_calls as u64),

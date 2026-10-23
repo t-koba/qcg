@@ -8,11 +8,11 @@ use std::time::Instant;
 
 use crate::agent::{agent_tool_requires_serial_execution, charge_agent_tool_call};
 use crate::agent_runtime::{
-    AgentToolInvocation, AgentToolServices, AgentWrites, agent_resource_exhausted,
-    execute_agent_tool, finish_rejected_external_operation, validate_agent_tool_call_args,
+    AgentToolInvocation, AgentToolServices, AgentWrites, execute_agent_tool,
+    finish_rejected_external_operation, validate_agent_tool_call_args,
 };
 use crate::agent_tools::load_agent_output_schema;
-use crate::completion::complete_llm_with_policy;
+use crate::completion::{complete_llm_with_policy, local_resource_exhausted};
 use crate::context::{enforce_agent_transcript_limit, record_llm_validation_failure};
 use crate::guardrail::apply_guardrails;
 use crate::mcp_tools::{AgentToolOutcome, McpAgentTools};
@@ -178,7 +178,7 @@ pub(crate) async fn execute_specialist_agent(
             }
         }
         if tokens_total > max_tokens_total {
-            let error = agent_resource_exhausted(
+            let error = local_resource_exhausted(
                 &node.id,
                 &format!("specialist `{agent_name}` token"),
                 ("tokens_total", tokens_total, max_tokens_total),

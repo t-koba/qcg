@@ -7,7 +7,9 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 use crate::choose::complete_text;
-use crate::completion::{checked_usage_total, complete_text_with_prompt, validate_retry_budget};
+use crate::completion::{
+    checked_usage_total, complete_text_with_prompt, local_resource_exhausted, validate_retry_budget,
+};
 use crate::context::{record_llm_validation_failure, retry_prompt};
 use crate::out_of_contract::{OutOfContractDecision, enforce_out_of_contract_policy};
 use crate::output::write_output_file;
@@ -117,9 +119,10 @@ impl StepExecutor for LlmFillStep {
             .await?;
             tokens_total = checked_usage_total(node, tokens_total, &completion.usage)?;
             if tokens_total > max_tokens_total {
-                return Err(StepError::failed(
+                return Err(local_resource_exhausted(
                     &node.id,
-                    format!("llm.fill token budget exceeded: {tokens_total} > {max_tokens_total}"),
+                    "llm.fill token",
+                    ("tokens_total", tokens_total, max_tokens_total),
                 ));
             }
             let text = completion.text;
