@@ -248,6 +248,97 @@ options = ["yes"]"#,
 }
 
 #[tokio::test]
+async fn a_late_spawn_for_a_nonqueued_run_releases_its_lease_and_store() {
+    async fn join_driver(task: &Mutex<Option<tokio::task::JoinHandle<()>>>) {
+        let mut handle = task
+            .lock()
+            .unwrap()
+            .take()
+            .expect("driver should be installed");
+        (&mut handle).await.expect("driver should exit normally");
+        assert!(task.lock().unwrap().replace(handle).is_none());
+    }
+
+    // Model a duplicate answer/adoption/requeue request delayed until the
+    // winning driver has exited. Both suspension and terminal settlement
+    // remove the run from queue_head; waiting for it again can never finish.
+    for settled in [false, true] {
+        let root = temp_run_dir("late-spawn-release");
+        let _guard = TempGuard(root.clone());
+        let runs = root.join("runs");
+        let generators =
+            Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+        let service = test_service(vec![generators], runs.clone());
+        let id = service
+            .start_run(StartRun {
+                generator_id: "ask-user".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let waiting = wait_for_snapshot(&service, &id, RunStatus::Waiting).await;
+        let record = service.inner.runs.read().await.get(&id).unwrap().clone();
+        join_driver(&record.task).await;
+        // Capture before the answer, as a real racing spawn does. Do not
+        // manufacture newer answer maps or a fresh admission snapshot.
+        let delayed = crate::lifecycle::SpawnRun {
+            run_id: id.clone(),
+            contract: record.contract,
+            inputs: record.inputs,
+            run_dir: record.run_dir.clone(),
+            events: record.events,
+            answers: record.answers,
+            confirmations: record.confirmations,
+            journal_snapshot: None,
+            cancellation: record.cancellation,
+            task: record.task.clone(),
+        };
+        if settled {
+            service
+                .answer(
+                    id.clone(),
+                    waiting.question.unwrap().id,
+                    AnswerPayload {
+                        values: BTreeMap::from([("answer".into(), json!("brief"))]),
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                wait_for_terminal_snapshot(&service, &id).await.state,
+                RunStatus::Succeeded
+            );
+            join_driver(&record.task).await;
+        }
+        let expected = if settled {
+            RunStatus::Succeeded
+        } else {
+            RunStatus::Waiting
+        };
+        let journal = crate::summaries::run_meta_dir(&record.run_dir).join("journal.jsonl");
+        let before = std::fs::read(&journal).unwrap();
+        service.clone().spawn_engine_run(delayed).await;
+        // The spawn has already acquired its lease before returning. This
+        // probe cannot succeed until the obsolete driver really drops it.
+        wait_for_run_execution_lease(&record.run_dir).await;
+        join_driver(&record.task).await;
+        assert_eq!(service.inner.runs.read().await[&id].state, expected);
+        assert_eq!(
+            std::fs::read(&journal).unwrap(),
+            before,
+            "no replay or settlement"
+        );
+        let weak = Arc::downgrade(&service.inner);
+        drop(service);
+        wait_for_runs_store_release(&runs).await;
+        assert!(
+            weak.upgrade().is_none(),
+            "no executor should retain the service"
+        );
+    }
+}
+
+#[tokio::test]
 async fn adopting_an_orphaned_run_restores_its_pending_question() {
     // E03: a disk adopt must fold the journal so accepted answers and
     // the pending prompt survive instead of being reset to Queued.

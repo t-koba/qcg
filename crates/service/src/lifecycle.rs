@@ -1291,6 +1291,19 @@ impl LocalService {
         )))
     }
 
+    // Memory-only settlement; callers own their diagnostic/journal handling.
+    async fn mark_spawn_failed(&self, run_id: &str) {
+        if let Some(record) = self.inner.runs.write().await.get_mut(run_id)
+            && !record.state.is_terminal()
+        {
+            record.state = RunStatus::Failed;
+            record.preempted = false;
+            record.question = None;
+            record.confirm = None;
+        }
+        self.inner.queue_notify.notify_waiters();
+    }
+
     /// Takes an owned service handle and returns a boxed future. The box
     /// is structural, not stylistic: the spawn is re-entered from the
     /// engine task it creates (task → finish → requeue → spawn), so an
@@ -1431,6 +1444,12 @@ impl LocalService {
                     }
                     let head = {
                         let runs = service.inner.runs.read().await;
+                        // A delayed duplicate spawn may outlive the pass that
+                        // already suspended or settled this run. It cannot
+                        // become queue head again; exit and release its lease.
+                        if runs.get(&run_id).map(|r| r.state) != Some(RunStatus::Queued) {
+                            return;
+                        }
                         queue_head(&runs)
                     };
                     if head.as_deref() == Some(run_id.as_str())
@@ -1614,17 +1633,7 @@ impl LocalService {
                         // re-resolved one would silently diverge admission
                         // from execution (E04).
                         tracing::error!(error = %error, run_id = %run_id, "admission policy missing from journal; marking the run failed instead of re-resolving");
-                        let mut runs = service.inner.runs.write().await;
-                        if let Some(record) = runs.get_mut(&run_id)
-                            && !record.state.is_terminal()
-                        {
-                            record.state = RunStatus::Failed;
-                            record.preempted = false;
-                            record.question = None;
-                            record.confirm = None;
-                        }
-                        drop(runs);
-                        service.inner.queue_notify.notify_waiters();
+                        service.mark_spawn_failed(&run_id).await;
                         return;
                     }
                 };
@@ -1656,17 +1665,7 @@ impl LocalService {
                         ) {
                             tracing::error!(%journal_error, run_id = %run_id, "failed to journal the run reference failure");
                         }
-                        let mut runs = service.inner.runs.write().await;
-                        if let Some(record) = runs.get_mut(&run_id)
-                            && !record.state.is_terminal()
-                        {
-                            record.state = RunStatus::Failed;
-                            record.preempted = false;
-                            record.question = None;
-                            record.confirm = None;
-                        }
-                        drop(runs);
-                        service.inner.queue_notify.notify_waiters();
+                        service.mark_spawn_failed(&run_id).await;
                         return;
                     }
                 };
