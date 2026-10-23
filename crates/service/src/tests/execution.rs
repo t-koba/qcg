@@ -3138,3 +3138,92 @@ images = ["images:alpine@sha256:{0}"]
     );
     assert!(daemon.log().contains("delete -f"));
 }
+
+#[tokio::test]
+async fn saved_confirmation_survivor_is_answerable_at_its_original_generation() {
+    for retirement in ["success", "failed", "skipped", "answered"] {
+        let root = temp_run_dir("saved-confirmation-survivor");
+        let _guard = TempGuard(root.clone());
+        let service = test_service(vec![], root.join("service-runs"));
+        let id = "saved-confirmations";
+        let mut record = synthetic_hitl_record(&root, id);
+        let confirm = |id: &str| {
+            json!({
+                "id": id, "title": id, "kind": "command", "target": "echo",
+                "dry_run": false, "operation_digest": "a".repeat(64), "scope": "invocation"
+            })
+        };
+        let survivor = confirm("z-confirm");
+        write_run_event(
+            &record,
+            "confirm_request",
+            json!({"node": "z-owner", "confirm": survivor}),
+        )
+        .unwrap();
+        let seq = service
+            .authoritative_state(&record.run_dir)
+            .await
+            .unwrap()
+            .pending_seq
+            .unwrap();
+        write_run_event(
+            &record,
+            "confirm_request",
+            json!({"node": "a-owner", "confirm": confirm("a-confirm")}),
+        )
+        .unwrap();
+        let (kind, payload) = match retirement {
+            "answered" => (
+                "user_confirmed",
+                json!({"confirmation_id": "a-confirm", "approved": true}),
+            ),
+            "skipped" => (
+                "step_skipped",
+                json!({"node": "a-owner", "reason": model::FailureDetail::new(model::FailureCode::ExecutionFailed, "skipped")}),
+            ),
+            status => (
+                "step_finished",
+                json!({"node": "a-owner", "status": status}),
+            ),
+        };
+        write_run_event(&record, kind, payload).unwrap();
+        let state = service.authoritative_state(&record.run_dir).await.unwrap();
+        assert_eq!(state.pending_seq, Some(seq));
+        assert!(
+            matches!(state.settled_pending(), Some(engine::Interaction::Confirmation { confirm }) if confirm.id == "z-confirm")
+        );
+        record.state = RunStatus::Confirming;
+        record.confirm = Some(serde_json::from_value(survivor).unwrap());
+        service
+            .inner
+            .runs
+            .write()
+            .await
+            .insert(id.into(), record.clone());
+        // Denial exercises the same lock-held generation validation as approval,
+        // without dispatching any executor or inventing continuation permission.
+        service
+            .confirm(
+                id.into(),
+                "z-confirm".into(),
+                ConfirmDecision {
+                    decision: ConfirmationDecision::Deny,
+                },
+            )
+            .await
+            .unwrap();
+        let state = service.authoritative_state(&record.run_dir).await.unwrap();
+        assert_eq!(state.confirmations.get("z-confirm"), Some(&false));
+        assert!(state.pending.is_none());
+        let journal =
+            std::fs::read_to_string(run_meta_dir(&record.run_dir).join("journal.jsonl")).unwrap();
+        assert_eq!(
+            journal
+                .lines()
+                .filter(|line| line.contains("\"t\":\"confirm_request\""))
+                .count(),
+            2
+        );
+        assert!(!journal.contains("\"t\":\"step_started\""));
+    }
+}

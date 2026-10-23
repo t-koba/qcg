@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const RUN_STATE_SCHEMA_VERSION: u32 = 5;
+pub const RUN_STATE_SCHEMA_VERSION: u32 = 6;
 
 /// State-free diagnostics; fold tests ensure API internal-event registration.
 const STATE_FREE_JOURNAL_EVENT_KINDS: &[&str] = &[
@@ -49,6 +49,15 @@ pub enum TerminalState {
 pub enum Interaction {
     Question { question: FormSpec },
     Confirmation { confirm: ConfirmSpec },
+}
+
+impl Interaction {
+    fn response_identity(&self) -> (&str, &str, &str) {
+        match self {
+            Self::Question { question } => ("user_answered", "question_id", &question.id),
+            Self::Confirmation { confirm } => ("user_confirmed", "confirmation_id", &confirm.id),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -153,6 +162,8 @@ pub struct RunState {
     pub pending_seq: Option<u64>,
     /// Reported suspensions by owner, independent of the one-at-a-time `pending`.
     pub(crate) pending_interactions: BTreeMap<NodePath, Interaction>,
+    /// Installing journal seq by owner; projection never creates a new generation.
+    pub(crate) interaction_seqs: BTreeMap<NodePath, u64>,
     #[serde(deserialize_with = "required_presence")]
     pub terminal: Option<TerminalState>,
     pub execution_started: bool,
@@ -227,6 +238,7 @@ impl Default for RunState {
             pending: None,
             pending_seq: None,
             pending_interactions: BTreeMap::new(),
+            interaction_seqs: BTreeMap::new(),
             unresolved_tasks: BTreeMap::new(),
             terminal: None,
             execution_started: false,
@@ -875,12 +887,8 @@ impl RunState {
                             reason: reason.clone(),
                         },
                     );
-                    self.pending_interactions.remove(&NodePath::root(path));
-                    let serialized_reason = serde_json::to_value(&reason).map_err(|error| {
-                        crate::JournalError::InvalidEvent(format!(
-                            "invalid structured failure detail: {error}"
-                        ))
-                    })?;
+                    self.retire_interaction(path);
+                    let serialized_reason = failure_value(&reason)?;
                     self.vars
                         .set_step_outcome(path, "skipped", Some(serialized_reason));
                 }
@@ -911,38 +919,17 @@ impl RunState {
                         .insert(name.to_string(), digest.to_string());
                 }
             }
-            "confirm_request" => {
+            "confirm_request" | "run_waiting" => {
                 // A confirmation's pins fold like a suspended step's.
-                if event.get("files").is_some() && event.get("node").is_some() {
+                if kind == "confirm_request"
+                    && event.get("files").is_some()
+                    && event.get("node").is_some()
+                {
                     let mut suspended_step = event.clone();
                     suspended_step["status"] = Value::String("needs_confirm".into());
                     self.apply_step_finished(&suspended_step)?;
                 }
-                if let Some(value) = event.get("confirm").cloned() {
-                    let confirm = serde_json::from_value(value).map_err(|error| {
-                        crate::JournalError::InvalidEvent(format!(
-                            "invalid confirmation payload: {error}"
-                        ))
-                    })?;
-                    let interaction = Interaction::Confirmation { confirm };
-                    if let Some(node) = event.get("node").and_then(Value::as_str) {
-                        self.pending_interactions
-                            .insert(NodePath::root(node), interaction.clone());
-                    }
-                    self.pending = Some(interaction);
-                    self.pending_seq = event.get("seq").and_then(Value::as_u64);
-                }
-            }
-            "run_waiting" => {
-                if let Some(value) = event.get("question").cloned() {
-                    let question = serde_json::from_value(value).map_err(|error| {
-                        crate::JournalError::InvalidEvent(format!(
-                            "invalid question payload: {error}"
-                        ))
-                    })?;
-                    self.pending = Some(Interaction::Question { question });
-                    self.pending_seq = event.get("seq").and_then(Value::as_u64);
-                }
+                self.install_interaction(event, kind == "confirm_request")?;
             }
             "user_answered" | "user_confirmed" => {
                 self.queued_at = event
@@ -951,15 +938,15 @@ impl RunState {
                     .or_else(|| event.get("ts").and_then(Value::as_str))
                     .map(str::to_string);
                 // Accepted responses remove only their own typed interaction.
+                let id_key = if kind == "user_answered" {
+                    "question_id"
+                } else {
+                    "confirmation_id"
+                };
+                let id = event.get(id_key).and_then(Value::as_str).ok_or_else(|| {
+                    crate::JournalError::InvalidEvent(format!("{kind} {id_key} is required"))
+                })?;
                 if kind == "user_answered" {
-                    let id = event
-                        .get("question_id")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| {
-                            crate::JournalError::InvalidEvent(
-                                "user_answered question_id is required".into(),
-                            )
-                        })?;
                     let values = event.get("values").cloned().ok_or_else(|| {
                         crate::JournalError::InvalidEvent(
                             "user_answered values are required".into(),
@@ -967,14 +954,6 @@ impl RunState {
                     })?;
                     self.answers.insert(id.to_string(), values);
                 } else {
-                    let id = event
-                        .get("confirmation_id")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| {
-                            crate::JournalError::InvalidEvent(
-                                "user_confirmed confirmation_id is required".into(),
-                            )
-                        })?;
                     let approved =
                         event
                             .get("approved")
@@ -987,21 +966,15 @@ impl RunState {
                     self.confirmations.insert(id.to_string(), approved);
                 }
                 let matches = |interaction: &Interaction| {
-                    let (expected, key, id) = match interaction {
-                        Interaction::Question { question } => {
-                            ("user_answered", "question_id", question.id.as_str())
-                        }
-                        Interaction::Confirmation { confirm } => {
-                            ("user_confirmed", "confirmation_id", confirm.id.as_str())
-                        }
-                    };
+                    let (expected, key, id) = interaction.response_identity();
                     kind == expected && event.get(key).and_then(Value::as_str) == Some(id)
                 };
                 self.pending_interactions
                     .retain(|_, interaction| !matches(interaction));
+                self.interaction_seqs
+                    .retain(|owner, _| self.pending_interactions.contains_key(owner));
                 if self.pending.as_ref().is_some_and(matches) {
-                    self.pending = None;
-                    self.pending_seq = None;
+                    self.project_interaction();
                 }
                 self.terminal = None;
             }
@@ -1027,11 +1000,7 @@ impl RunState {
                             .and_then(Value::as_str)
                             .unwrap_or("hook execution failed");
                         let reason = FailureDetail::new(FailureCode::ExecutionFailed, message);
-                        let serialized_reason = serde_json::to_value(&reason).map_err(|error| {
-                            crate::JournalError::InvalidEvent(format!(
-                                "invalid structured failure detail: {error}"
-                            ))
-                        })?;
+                        let serialized_reason = failure_value(&reason)?;
                         self.vars
                             .set_step_outcome(hook, "failed", Some(serialized_reason));
                     }
@@ -1053,11 +1022,7 @@ impl RunState {
                         .and_then(Value::as_str)
                         .unwrap_or("hook skipped because the run budget was exhausted");
                     let reason = FailureDetail::new(FailureCode::BudgetExceeded, message);
-                    let serialized_reason = serde_json::to_value(&reason).map_err(|error| {
-                        crate::JournalError::InvalidEvent(format!(
-                            "invalid structured failure detail: {error}"
-                        ))
-                    })?;
+                    let serialized_reason = failure_value(&reason)?;
                     self.vars
                         .set_step_outcome(hook, "skipped", Some(serialized_reason));
                     self.hooks_settled.insert(hook.to_string());
@@ -1114,29 +1079,16 @@ impl RunState {
                         .insert(key.to_string(), question_id.to_string());
                 }
             }
-            "run_finished" => {
+            "run_finished" | "run_error" | "run_canceled" | "run_interrupted" => {
                 self.finished_at = event.get("ts").and_then(Value::as_str).map(str::to_string);
                 self.pending = None;
                 self.pending_seq = None;
-                self.terminal = Some(
-                    if event.get("status").and_then(Value::as_str) == Some("success") {
-                        TerminalState::Succeeded
-                    } else {
-                        TerminalState::Failed
-                    },
-                );
-            }
-            "run_error" => {
-                self.finished_at = event.get("ts").and_then(Value::as_str).map(str::to_string);
-                self.pending = None;
-                self.pending_seq = None;
-                self.terminal = Some(TerminalState::Failed);
-            }
-            "run_canceled" => {
-                self.finished_at = event.get("ts").and_then(Value::as_str).map(str::to_string);
-                self.pending = None;
-                self.pending_seq = None;
-                self.terminal = Some(TerminalState::Canceled);
+                self.terminal = Some(match (kind, event.get("status").and_then(Value::as_str)) {
+                    ("run_finished", Some("success")) => TerminalState::Succeeded,
+                    ("run_canceled", _) => TerminalState::Canceled,
+                    ("run_interrupted", _) => TerminalState::Interrupted,
+                    _ => TerminalState::Failed,
+                });
             }
             "run_forked" => {
                 // The fork marker rebinds the copied journal to the fork's
@@ -1145,12 +1097,6 @@ impl RunState {
                     .get("run_id")
                     .and_then(Value::as_str)
                     .map(str::to_string);
-            }
-            "run_interrupted" => {
-                self.finished_at = event.get("ts").and_then(Value::as_str).map(str::to_string);
-                self.pending = None;
-                self.pending_seq = None;
-                self.terminal = Some(TerminalState::Interrupted);
             }
             "operation_started" => {
                 if let Some(id) = event.get("operation_id").and_then(Value::as_str) {
@@ -1251,6 +1197,71 @@ impl RunState {
         Ok(())
     }
 
+    /// Terminal reports retire only their owner's prompt, never a sibling's projection.
+    fn retire_interaction(&mut self, path: &str) {
+        if let Some(retired) = self.pending_interactions.remove(&NodePath::root(path))
+            && self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.response_identity() == retired.response_identity())
+        {
+            self.project_interaction();
+        }
+        self.interaction_seqs.remove(&NodePath::root(path));
+    }
+
+    /// Requests and suspended reports install generations; observation only projects them.
+    fn install_interaction(
+        &mut self,
+        event: &Value,
+        confirmation: bool,
+    ) -> Result<(), crate::JournalError> {
+        let (key, kind) = if confirmation {
+            ("confirm", "confirmation")
+        } else {
+            ("question", "question")
+        };
+        let Some(payload) = event.get(key) else {
+            return Ok(());
+        };
+        let interaction: Interaction = serde_json::from_value(
+            serde_json::json!({"kind": kind, (key): payload}),
+        )
+        .map_err(|error| {
+            crate::JournalError::InvalidEvent(format!("invalid saved interaction: {error}"))
+        })?;
+        let owner = event
+            .get("node")
+            .and_then(Value::as_str)
+            .map(NodePath::root)
+            .or_else(|| {
+                self.pending_interactions
+                    .iter()
+                    .find(|(_, saved)| saved.response_identity() == interaction.response_identity())
+                    .map(|(owner, _)| owner.clone())
+            });
+        let seq = event.get("seq").and_then(Value::as_u64);
+        if let Some(owner) = owner {
+            self.interaction_seqs.remove(&owner);
+            if let Some(seq) = seq {
+                self.interaction_seqs.insert(owner.clone(), seq);
+            }
+            self.pending_interactions.insert(owner, interaction);
+            self.project_interaction();
+        } else {
+            // Ownerless legacy requests still carry only their recorded generation.
+            self.pending = Some(interaction);
+            self.pending_seq = seq;
+        }
+        Ok(())
+    }
+
+    fn project_interaction(&mut self) {
+        let next = self.pending_interactions.first_key_value();
+        self.pending = next.map(|(_, prompt)| prompt.clone());
+        self.pending_seq = next.and_then(|(owner, _)| self.interaction_seqs.get(owner).copied());
+    }
+
     fn apply_step_finished(&mut self, event: &Value) -> Result<(), crate::JournalError> {
         let path = event.get("node").and_then(Value::as_str).ok_or_else(|| {
             crate::JournalError::InvalidEvent("step_finished node is required".into())
@@ -1292,22 +1303,7 @@ impl RunState {
             self.apply_workspace_file_pins(path, &files);
         }
         if suspended {
-            let (key, kind) = if status == "needs_user" {
-                ("question", "question")
-            } else {
-                ("confirm", "confirmation")
-            };
-            if let Some(payload) = event.get(key) {
-                let interaction =
-                    serde_json::from_value(serde_json::json!({"kind": kind, (key): payload}))
-                        .map_err(|error| {
-                            crate::JournalError::InvalidEvent(format!(
-                                "invalid saved interaction: {error}"
-                            ))
-                        })?;
-                self.pending_interactions
-                    .insert(NodePath::root(path), interaction);
-            }
+            self.install_interaction(event, status == "needs_confirm")?;
         }
         if succeeded {
             self.budget.steps_succeeded =
@@ -1334,11 +1330,7 @@ impl RunState {
                     crate::JournalError::InvalidEvent("failed step count overflowed".into())
                 })?;
             let reason = failure_detail(event, FailureCode::ExecutionFailed, status)?;
-            let serialized_reason = serde_json::to_value(&reason).map_err(|error| {
-                crate::JournalError::InvalidEvent(format!(
-                    "invalid structured failure detail: {error}"
-                ))
-            })?;
+            let serialized_reason = failure_value(&reason)?;
             self.vars
                 .set_step_outcome(path, "failed", Some(serialized_reason));
             self.nodes
@@ -1346,7 +1338,7 @@ impl RunState {
         }
         if !suspended {
             self.checkpoints.remove(&NodePath::root(path));
-            self.pending_interactions.remove(&NodePath::root(path));
+            self.retire_interaction(path);
             self.record_node_execution(path)?;
         }
         Ok(())
@@ -1406,6 +1398,12 @@ impl RunState {
         files::write_sidecar_atomic(path, bytes)?;
         Ok(())
     }
+}
+
+fn failure_value(reason: &FailureDetail) -> Result<Value, crate::JournalError> {
+    serde_json::to_value(reason).map_err(|error| {
+        crate::JournalError::InvalidEvent(format!("invalid structured failure detail: {error}"))
+    })
 }
 
 fn failure_detail(
@@ -1877,6 +1875,7 @@ mod tests {
             "pending",
             "pending_seq",
             "pending_interactions",
+            "interaction_seqs",
             "unresolved_tasks",
             "terminal",
             "execution_started",

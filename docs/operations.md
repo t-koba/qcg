@@ -915,6 +915,21 @@ new current admission times. It is independent of `PREEMPTION` and
 A concurrent `cancel` wins over resume. Priorities and queue order persist in
 the journal across restarts.
 
+### Saved interaction projection
+
+Suspended owners retain their own prompt and installing journal sequence. The
+one-at-a-time API projects the first remaining owner in stable owner-path order;
+answering or completing, failing, or skipping that owner projects a real survivor
+with its recorded sequence, not a newly generated confirmation request. Merely
+observing a saved prompt through the engine neither dispatches its executor nor
+appends a request or resume event. Recorded answers remain intact.
+
+Folded-state schema 6 retains these per-owner sequences. Older caches are rebuilt
+from existing journal events, including the latest request generation an older
+runtime actually recorded. A missing sequence is never synthesized: projecting a
+prompt without one does not bypass the service's generation validation. Existing
+stale-answer and replay-authorization checks still apply.
+
 ### Elapsed-budget waiting policy
 
 `ElapsedBudgetMode::WallClock` (the default, `wall_clock`) preserves total
@@ -939,8 +954,8 @@ and forks inherit the checkpoint's mode, accumulated consumption, and any open
 interval rather than applying today's deployment mode to the source's history.
 Changing deployment configuration cannot reinterpret existing runs. Journal
 schema 2 requires the pinned mode; schema-1 absence explicitly means historical
-`wall_clock`, never zero active consumption. Folded state is schema 2; old cached
-state is rebuilt from the journal. Unknown versions are refused.
+`wall_clock`, never zero active consumption. Old folded-state caches are rebuilt
+from the journal; caches from newer, unsupported versions are refused.
 
 Active accounting uses one durable `elapsed_accounted` ledger: accumulated
 `active_nanoseconds` plus nullable `active_started_at`. The first active-mode

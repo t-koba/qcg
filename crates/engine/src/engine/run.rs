@@ -684,6 +684,18 @@ impl Engine {
             &preverified,
         )
         .await?;
+        // Surface saved reports in owner order before re-entry; supplied answers keep direct-run behavior.
+        for interaction in replay.state.pending_interactions.values() {
+            match interaction {
+                crate::Interaction::Question { question } if !context.answers.contains_key(&question.id) => {
+                    return Err(EngineError::NeedsUser { question_id: question.id.clone(), question: Box::new(question.clone()) });
+                }
+                crate::Interaction::Confirmation { confirm } if !context.confirmations.contains_key(&confirm.id) => {
+                    return Err(EngineError::NeedsConfirm { confirm_id: confirm.id.clone(), confirm: Box::new(confirm.clone()) });
+                }
+                _ => {}
+            }
+        }
         if resume {
             journal.event("run_resumed", json!({ "run_id": run_id }))?;
         }
@@ -726,19 +738,6 @@ impl Engine {
                 NodeOutcome::Failed { reason } => NodeState::Failed(reason.clone()),
             };
             states.insert(path.as_str().to_string(), state);
-        }
-        // Surface saved reports in owner order before re-entry; supplied answers keep direct-run behavior.
-        for (owner, interaction) in &replay.state.pending_interactions {
-            match interaction {
-                crate::Interaction::Question { question } if !context.answers.contains_key(&question.id) => {
-                    return Err(EngineError::NeedsUser { question_id: question.id.clone(), question: Box::new(question.clone()) });
-                }
-                crate::Interaction::Confirmation { confirm } if !context.confirmations.contains_key(&confirm.id) => {
-                    journal.event("confirm_request", json!({"node": owner, "confirm": confirm}))?;
-                    return Err(EngineError::NeedsConfirm { confirm_id: confirm.id.clone(), confirm: Box::new(confirm.clone()) });
-                }
-                _ => {}
-            }
         }
         // Only direct node owners are authorizable; foreach facts identify the parent, not its child.
         let mut authorized = Vec::new();
