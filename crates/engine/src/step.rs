@@ -38,15 +38,23 @@ pub enum StepError {
         allowed: u64,
         validation: Option<String>,
     },
+    /// Agent-local token/tool-call limit (not a run budget): settles like `Failed`.
+    #[error("step `{node}` failed: {message}")]
+    AgentResourceExhausted {
+        node: String,
+        message: String,
+        resource: &'static str,
+        used: u64,
+        allowed: u64,
+    },
     /// The operation guard refused execution: resend of changed content,
     /// uncacheable prior success, or indeterminate outcome without an
     /// at-least-once opt-in. Never retried automatically; manual recovery
     /// or a policy decision is required.
     #[error("step `{node}` refused: {message}")]
     Refused { node: String, message: String },
-    /// A per-attempt execution timeout fired. Classified distinctly from
-    /// ordinary failures so retry policy can tell an unknown-outcome
-    /// timeout apart from a proven-clean error (B08/B11).
+    /// Per-attempt timeout, distinct from ordinary failures so retry policy
+    /// separates unknown outcomes from proven-clean errors (B08/B11).
     #[error("step `{node}` timed out after {timeout_secs}s")]
     TimedOut { node: String, timeout_secs: u64 },
     /// The run-wide elapsed budget stopped this node. Distinct from a node
@@ -54,9 +62,8 @@ pub enum StepError {
     /// (E11).
     #[error("step `{node}` exceeded the run elapsed limit of {limit_secs}s")]
     ElapsedExceeded { node: String, limit_secs: u64 },
-    /// The run-wide elapsed budget expired before the next step could start,
-    /// unlike `ElapsedExceeded`, which reports a step stopped while it ran
-    /// (E11).
+    /// Run elapsed budget expired before the next step, unlike `ElapsedExceeded`,
+    /// which stops a step already running (E11).
     #[error("run elapsed limit of {limit_secs}s expired before the next step could start")]
     ElapsedExpiredBeforeStart { limit_secs: u64 },
 }
@@ -479,7 +486,10 @@ impl TemplateService {
         env.set_fuel(Some(limits.template_fuel));
         env.add_template_owned("inline".to_owned(), source.to_owned())?;
         let template = env.get_template("inline")?;
-        let mut writer = BoundedTemplateWriter::new(limits.template_output_limit_bytes);
+        let mut writer = BoundedTemplateWriter {
+            bytes: Vec::new(),
+            limit: limits.template_output_limit_bytes,
+        };
         let captured = template
             .render_captured_to(context, &mut writer)
             .map_err(|error| {
@@ -543,7 +553,11 @@ fn validate_template_context(
         })?;
         return Ok(());
     };
-    let mut writer = CountingTemplateWriter::new(limit);
+    let mut writer = CountingTemplateWriter {
+        bytes: 0,
+        limit,
+        exceeded: false,
+    };
     serde_json::to_writer(&mut writer, context).map_err(|error| {
         if writer.exceeded {
             minijinja::Error::new(
@@ -563,16 +577,6 @@ struct CountingTemplateWriter {
     bytes: usize,
     limit: usize,
     exceeded: bool,
-}
-
-impl CountingTemplateWriter {
-    fn new(limit: usize) -> Self {
-        Self {
-            bytes: 0,
-            limit,
-            exceeded: false,
-        }
-    }
 }
 
 impl io::Write for CountingTemplateWriter {
@@ -603,13 +607,6 @@ struct BoundedTemplateWriter {
 }
 
 impl BoundedTemplateWriter {
-    fn new(limit: Option<usize>) -> Self {
-        Self {
-            bytes: Vec::new(),
-            limit,
-        }
-    }
-
     fn into_inner(self) -> Vec<u8> {
         self.bytes
     }

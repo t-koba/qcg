@@ -2539,3 +2539,518 @@ fn agent_iteration_exhaustion_keeps_failure_disposition_and_hooks() {
     assert!(AgentFailureCode::ValidationFailed.is_recoverable());
     assert!(!AgentFailureCode::RunBudgetExceeded.is_recoverable());
 }
+
+#[test]
+fn agent_resource_exhaustion_carries_typed_facts_without_numeric_parsing() {
+    // Typed facts travel in fields, never parsed from message numbers: the
+    // message here names different numbers than the fields carry.
+    let token = StepError::AgentResourceExhausted {
+        node: "agent".into(),
+        message: "llm.agent token budget exceeded: 999 > 111".into(),
+        resource: "tokens_total",
+        used: 9,
+        allowed: 8,
+    };
+    let total = StepError::AgentResourceExhausted {
+        node: "agent".into(),
+        message: "llm.agent tool call budget exceeded: 999 > 111".into(),
+        resource: "tool_calls_total",
+        used: 3,
+        allowed: 2,
+    };
+    let per_tool = StepError::AgentResourceExhausted {
+        node: "agent".into(),
+        message: "llm.agent tool `search` call budget exceeded: 999 > 111".into(),
+        resource: "tool_calls_per_tool",
+        used: 2,
+        allowed: 1,
+    };
+    assert_eq!(
+        agent_failure_code(&token),
+        AgentFailureCode::TokenBudgetExceeded
+    );
+    assert_eq!(
+        agent_failure_code(&total),
+        AgentFailureCode::ToolCallBudgetExceeded
+    );
+    assert_eq!(
+        agent_failure_code(&per_tool),
+        AgentFailureCode::ToolCallBudgetExceeded
+    );
+    let unknown = StepError::AgentResourceExhausted {
+        node: "agent".into(),
+        message: "token budget exceeded: must not classify by message".into(),
+        resource: "future_resource",
+        used: 9,
+        allowed: 8,
+    };
+    assert_eq!(agent_failure_code(&unknown), AgentFailureCode::ToolFailed);
+    assert_ne!(per_tool.to_string(), total.to_string());
+    match &per_tool {
+        StepError::AgentResourceExhausted {
+            resource,
+            used,
+            allowed,
+            ..
+        } => {
+            assert_eq!(*resource, "tool_calls_per_tool");
+            assert_ne!(*resource, "tool_calls_total");
+            assert_eq!((*used, *allowed), (2, 1));
+        }
+        _ => panic!("expected typed tool-call fact"),
+    }
+    for error in [&token, &total, &per_tool] {
+        assert!(
+            !matches!(error, StepError::BudgetExceeded { .. }),
+            "agent caps settle as ordinary failures so hooks still run: {error:?}"
+        );
+        assert_ne!(
+            agent_failure_code(error),
+            AgentFailureCode::RunBudgetExceeded
+        );
+        assert!(error.to_string().starts_with("step `agent` failed: "));
+    }
+    // `>` boundary with increment-before-check counters: at the cap passes,
+    // one more fails with used = allowed + 1 and the rejected call counts.
+    let tools = vec![ToolDecl::Mcp {
+        name: "read".into(),
+        description: None,
+        server: "public".into(),
+        tool: "read".into(),
+        max_calls: 1,
+        side_effects: false,
+        destinations: None,
+    }];
+    let mut total_count = 0;
+    let mut counts = BTreeMap::new();
+    charge_agent_tool_call(
+        "agent",
+        "llm.agent",
+        &tools,
+        "read",
+        &mut total_count,
+        1,
+        &mut counts,
+    )
+    .expect("at-cap call passes");
+    let error = charge_agent_tool_call(
+        "agent",
+        "llm.agent",
+        &tools,
+        "read",
+        &mut total_count,
+        1,
+        &mut counts,
+    )
+    .expect_err("over-cap call fails");
+    match &error {
+        StepError::AgentResourceExhausted {
+            resource,
+            used,
+            allowed,
+            ..
+        } => {
+            assert_eq!(*resource, "tool_calls_total");
+            assert_eq!((*used, *allowed), (2, 1));
+        }
+        _ => panic!("total over-cap must be typed: {error:?}"),
+    }
+    assert_eq!(
+        error.to_string(),
+        "step `agent` failed: llm.agent tool call budget exceeded: 2 > 1"
+    );
+    assert_eq!(
+        agent_failure_code(&error),
+        AgentFailureCode::ToolCallBudgetExceeded
+    );
+    assert_eq!(total_count, 2);
+    assert_eq!(counts["read"], 2);
+    let mut total_count = 0;
+    let mut counts = BTreeMap::new();
+    charge_agent_tool_call(
+        "agent",
+        "llm.agent",
+        &tools,
+        "read",
+        &mut total_count,
+        10,
+        &mut counts,
+    )
+    .expect("per-tool at-cap call passes");
+    let error = charge_agent_tool_call(
+        "agent",
+        "llm.agent",
+        &tools,
+        "read",
+        &mut total_count,
+        10,
+        &mut counts,
+    )
+    .expect_err("per-tool cap binds before the total cap");
+    assert!(matches!(
+        error,
+        StepError::AgentResourceExhausted {
+            resource: "tool_calls_per_tool",
+            used: 2,
+            allowed: 1,
+            ..
+        }
+    ));
+    assert_eq!(
+        error.to_string(),
+        "step `agent` failed: llm.agent tool `read` call budget exceeded: 2 > 1"
+    );
+    assert_eq!(total_count, 2);
+    assert_eq!(counts["read"], 2);
+    let mut total_count = usize::MAX;
+    let mut counts = BTreeMap::from([("read".into(), usize::MAX)]);
+    let error = charge_agent_tool_call(
+        "agent",
+        "llm.agent",
+        &tools,
+        "read",
+        &mut total_count,
+        1,
+        &mut counts,
+    )
+    .expect_err("saturated counters still exceed the cap");
+    assert!(matches!(error, StepError::AgentResourceExhausted {
+        resource: "tool_calls_total", used, allowed: 1, ..
+    } if used == usize::MAX as u64));
+    assert_eq!(total_count, usize::MAX);
+    assert_eq!(counts["read"], usize::MAX);
+}
+
+#[tokio::test]
+async fn agent_resource_exhaustion_emits_fail_once_for_top_level_and_unresolved_calls() {
+    use crate::agent_runtime::AgentToolCallFailure;
+    use crate::agent_runtime::recover_agent_tool_call_failure;
+    let root = std::env::temp_dir().join(format!("qcg-agent-resource-once-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("workspace")).expect("workspace");
+    std::fs::create_dir_all(root.join("meta")).expect("meta");
+    std::fs::write(root.join(contract::MANIFEST_FILE), "[generator]\nid = \"t\"\nname = \"t\"\nversion = \"0.1.0\"\n\n[llm]\nmodel = { provider = \"fake\", model = \"test\" }\nmax_tokens = 8\n\n[[flow]]\nid = \"agent\"\ntype = \"llm.agent\"\n\n[flow.params]\nprompt = \"p\"\nmax_iterations = 1\nmax_tokens_total = 8\n").expect("manifest");
+    let contract = Contract::load(camino::Utf8PathBuf::from_path_buf(root.clone()).expect("utf8"))
+        .expect("contract");
+    std::fs::write(root.join("prompt.txt"), "123456789").expect("prompt");
+    let mut node = agent_node();
+    node.params = serde_json::from_value(json!({
+        "prompt": "prompt.txt", "max_iterations": 1, "max_tokens_total": 8
+    }))
+    .expect("params");
+    let run_id = format!("agent-resource-once-{}", std::process::id());
+    let run = engine::RunContext::for_tests(
+        run_id.clone(),
+        camino::Utf8PathBuf::from_path_buf(root.join("workspace")).expect("utf8"),
+        camino::Utf8PathBuf::from_path_buf(root.join("meta")).expect("utf8"),
+        contract,
+        BTreeMap::new(),
+        BTreeMap::new(),
+    )
+    .expect("run");
+    let journal_path =
+        camino::Utf8PathBuf::from_path_buf(root.join("journal.jsonl")).expect("utf8");
+    let journal =
+        engine::JournalWriter::create(&journal_path, &run_id, false, None).expect("journal");
+    let gateway = exhaustion_test_gateway(&run, &journal);
+    let mut vars = contract::ValueBag::with_inputs(BTreeMap::new());
+    let mut ctx = engine::StepContext {
+        run: &run,
+        journal: &journal,
+        vars: &mut vars,
+        llm: Some(gateway),
+    };
+    // The fake provider reports prompt bytes as input usage (9), so this
+    // executes the real token producer after gateway accounting.
+    let executor = LlmAgentStep {
+        runtime: Arc::new(LlmRuntime::builtins()),
+    };
+    let error = engine::StepExecutor::execute(&executor, &mut ctx, &node)
+        .await
+        .expect_err("top-level token cap");
+    assert!(
+        matches!(
+            error,
+            StepError::AgentResourceExhausted {
+                resource: "tokens_total",
+                used: 9,
+                allowed: 8,
+                ..
+            }
+        ),
+        "actual producer error: {error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "step `agent` failed: llm.agent token budget exceeded: 9 > 8"
+    );
+    assert_eq!(journal.state().budget.tokens_input, 9);
+    assert_eq!(journal.state().budget.tokens_output, 0);
+    assert_eq!(journal.state().budget.llm_calls, 1);
+    // No policy resolution: the production recovery helper emits Fail.
+    let tools = vec![ToolDecl::FsRead {
+        name: "read".into(),
+        description: None,
+        input_schema: None,
+        path_prefix: "out/".into(),
+    }];
+    assert!(
+        agent_tool_failure_resolution(&tools, "read", AgentFailureCode::ToolCallBudgetExceeded)
+            .is_none()
+    );
+    let call = ChatToolCall {
+        id: "call-read-1".into(),
+        name: "read".into(),
+        args: json!({}),
+    };
+    let mut total_count = 1;
+    let mut counts = BTreeMap::from([("read".to_string(), 1)]);
+    let error = charge_agent_tool_call(
+        "agent",
+        "llm.agent",
+        &tools,
+        "read",
+        &mut total_count,
+        1,
+        &mut counts,
+    )
+    .expect_err("over-cap ordinary call fails");
+    let code = agent_failure_code(&error);
+    assert_eq!(code, AgentFailureCode::ToolCallBudgetExceeded);
+    let recovered = recover_agent_tool_call_failure(
+        &ctx,
+        &node,
+        &tools,
+        &call,
+        &error,
+        AgentToolCallFailure {
+            code,
+            phase: ToolCallPhase::InputValidation,
+            tool_error_code: ToolCallErrorCode::BudgetExceeded,
+            call_number: 2,
+            retryable: false,
+            started: std::time::Instant::now(),
+        },
+    )
+    .expect("recover without policy");
+    assert!(recovered.is_none(), "no policy means no recovery message");
+    let audit_path = journal_path.with_file_name("audit.jsonl");
+    drop(ctx);
+    drop(journal);
+    let text = std::fs::read_to_string(audit_path.as_std_path()).expect("audit text");
+    let failed: Vec<Value> = text
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .filter(|v: &Value| v.get("t").and_then(Value::as_str) == Some("agent_failed"))
+        .collect();
+    assert_eq!(failed.len(), 2, "top-level plus one unresolved: {failed:?}");
+    assert!(!failed[0].as_object().unwrap().contains_key("tool_call_id"));
+    assert_eq!(failed[0]["code"], "token_budget_exceeded");
+    assert_eq!(failed[0]["action"], "fail");
+    assert_eq!(failed[0]["resource_exhaustion"]["resource"], "tokens_total");
+    assert_eq!(failed[0]["resource_exhaustion"]["used"], 9);
+    assert_eq!(failed[0]["resource_exhaustion"]["allowed"], 8);
+    assert_eq!(failed[1]["agent"], "agent");
+    assert_eq!(failed[1]["tool_call_id"], "call-read-1");
+    assert_eq!(failed[1]["code"], "tool_call_budget_exceeded");
+    assert_eq!(failed[1]["action"], "fail");
+    assert_eq!(
+        failed[1]["resource_exhaustion"]["resource"],
+        "tool_calls_total"
+    );
+    assert_eq!(failed[1]["resource_exhaustion"]["used"], 2);
+    assert_eq!(failed[1]["resource_exhaustion"]["allowed"], 1);
+    let tool_events: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|row: &Value| row["t"] == "tool_call")
+        .collect();
+    assert_eq!(tool_events.len(), 1, "one failed unresolved tool call");
+    assert_eq!(tool_events[0]["status"], "failed");
+    assert_eq!(tool_events[0]["error"]["code"], "budget_exceeded");
+    for row in &failed {
+        let event = api::RunEvent::from_flat(row).expect("durable agent_failed must parse");
+        match event.data {
+            api::RunEventData::AgentFailed(data) => {
+                data.resource_exhaustion
+                    .expect("typed payload must survive");
+            }
+            other => panic!("expected typed agent_failed, got {other:?}"),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn agent_resource_exhaustion_keeps_configured_action_exactly_once() {
+    use crate::agent_runtime::AgentToolCallFailure;
+    use crate::agent_runtime::recover_agent_tool_call_failure;
+    for (policy, expect_action) in [
+        (AgentFailureAction::ReturnError, "return_error"),
+        (AgentFailureAction::Fail, "fail"),
+    ] {
+        let root = std::env::temp_dir().join(format!(
+            "qcg-agent-resource-policy-{}-{}",
+            expect_action,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("workspace")).expect("workspace");
+        std::fs::create_dir_all(root.join("meta")).expect("meta");
+        std::fs::write(root.join(contract::MANIFEST_FILE), "[generator]\nid = \"t\"\nname = \"t\"\nversion = \"0.1.0\"\n\n[llm]\nmodel = { provider = \"fake\", model = \"test\" }\nmax_tokens = 8\n\n[[flow]]\nid = \"agent\"\ntype = \"llm.agent\"\n\n[flow.params]\nprompt = \"p\"\nmax_iterations = 1\nmax_tokens_total = 8\n").expect("manifest");
+        let contract =
+            Contract::load(camino::Utf8PathBuf::from_path_buf(root.clone()).expect("utf8"))
+                .expect("contract");
+        let node = agent_node();
+        let run_id = format!(
+            "agent-resource-policy-{expect_action}-{}",
+            std::process::id()
+        );
+        let run = engine::RunContext::for_tests(
+            run_id.clone(),
+            camino::Utf8PathBuf::from_path_buf(root.join("workspace")).expect("utf8"),
+            camino::Utf8PathBuf::from_path_buf(root.join("meta")).expect("utf8"),
+            contract,
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .expect("run");
+        let journal_path =
+            camino::Utf8PathBuf::from_path_buf(root.join("journal.jsonl")).expect("utf8");
+        let journal =
+            engine::JournalWriter::create(&journal_path, &run_id, false, None).expect("journal");
+        let gateway = exhaustion_test_gateway(&run, &journal);
+        let mut vars = contract::ValueBag::with_inputs(BTreeMap::new());
+        let ctx = engine::StepContext {
+            run: &run,
+            journal: &journal,
+            vars: &mut vars,
+            llm: Some(gateway),
+        };
+        let on_failure: Box<contract::AgentFailurePolicy> = if policy == AgentFailureAction::Fail {
+            Box::new(contract::AgentFailurePolicy {
+                default: AgentFailureAction::Fail,
+                by_code: BTreeMap::new(),
+            })
+        } else {
+            Default::default()
+        };
+        let tools = vec![ToolDecl::Agent {
+            name: "researcher".into(),
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            instructions: "Research.".into(),
+            tools: vec![],
+            max_calls: 3,
+            max_iterations: 2,
+            max_tokens_total: 100,
+            max_tool_calls_total: 1,
+            model: None,
+            fallback_models: vec![],
+            request: Box::new(LlmRequestPolicy::default()),
+            on_failure,
+            handoff: false,
+        }];
+        let call = ChatToolCall {
+            id: "call-researcher-1".into(),
+            name: "researcher".into(),
+            args: json!({}),
+        };
+        let mut total_count = 1;
+        let mut counts = BTreeMap::from([("researcher".to_string(), 1)]);
+        let error = charge_agent_tool_call(
+            "agent",
+            "llm.agent",
+            &tools,
+            "researcher",
+            &mut total_count,
+            1,
+            &mut counts,
+        )
+        .expect_err("delegated over-cap call fails");
+        let code = agent_failure_code(&error);
+        assert_eq!(code, AgentFailureCode::ToolCallBudgetExceeded);
+        let recovered = recover_agent_tool_call_failure(
+            &ctx,
+            &node,
+            &tools,
+            &call,
+            &error,
+            AgentToolCallFailure {
+                code,
+                phase: ToolCallPhase::InputValidation,
+                tool_error_code: ToolCallErrorCode::BudgetExceeded,
+                call_number: 2,
+                retryable: false,
+                started: std::time::Instant::now(),
+            },
+        )
+        .expect("configured recovery");
+        match policy {
+            AgentFailureAction::Fail => assert!(recovered.is_none()),
+            AgentFailureAction::ReturnError => {
+                let message = recovered.expect("return_error produces a tool result");
+                let value: Value = serde_json::from_str(&message.content).expect("tool result");
+                assert_eq!(value["isError"], true);
+                assert_eq!(value["error"]["code"], "tool_call_budget_exceeded");
+                assert_eq!(value["error"]["call_number"], 2);
+                assert_eq!(value["error"]["retryable"], false);
+            }
+        }
+        let audit_path = journal_path.with_file_name("audit.jsonl");
+        drop(ctx);
+        drop(journal);
+        let text = std::fs::read_to_string(audit_path.as_std_path()).expect("audit text");
+        let failed: Vec<Value> = text
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .filter(|v: &Value| v.get("t").and_then(Value::as_str) == Some("agent_failed"))
+            .collect();
+        assert_eq!(
+            failed.len(),
+            1,
+            "configured resolution emits once: {failed:?}"
+        );
+        assert_eq!(failed[0]["code"], "tool_call_budget_exceeded");
+        assert_eq!(failed[0]["action"], expect_action);
+        assert_eq!(failed[0]["tool_call_id"], "call-researcher-1");
+        assert_eq!(
+            failed[0]["resource_exhaustion"],
+            json!({
+                "resource": "tool_calls_total", "used": 2, "allowed": 1
+            })
+        );
+        let tool_events: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|row: &Value| row["t"] == "tool_call")
+            .collect();
+        assert_eq!(
+            tool_events.len(),
+            1,
+            "exactly one tool event for {expect_action}"
+        );
+        assert_eq!(tool_events[0]["status"], "failed");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+fn exhaustion_test_gateway<'a>(
+    run: &'a engine::RunContext,
+    journal: &'a engine::JournalWriter,
+) -> engine::LlmGateway<'a> {
+    engine::LlmGateway::new(
+        Arc::new(llm::FakeLlmProvider),
+        &run.secrets,
+        journal,
+        run.cancellation.clone(),
+        policy::LlmCostBudget {
+            max_tokens: None,
+            max_cost_microusd: None,
+            require_pricing: false,
+        },
+        vec![],
+    )
+}

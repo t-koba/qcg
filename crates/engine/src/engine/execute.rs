@@ -494,7 +494,10 @@ impl Engine {
             // Retry failures/timeouts only; indeterminate effects need opt-in and refusals never retry (E10).
             match &result {
                 Err(EngineError::Step(
-                    error @ (StepError::Failed { .. } | StepError::TimedOut { .. }),
+                    error @ (StepError::Failed { .. }
+                    | StepError::TimedOut { .. }
+                    | StepError::AgentIterationsExhausted { .. }
+                    | StepError::AgentResourceExhausted { .. }),
                 )) if attempt < max_attempts => {
                     journal.event(
                         "step_retry",

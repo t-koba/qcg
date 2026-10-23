@@ -13,9 +13,9 @@ use std::time::Instant;
 
 use crate::agent_runtime::{
     AgentToolCallFailure, AgentToolInvocation, AgentToolServices, AgentWrites,
-    agent_call_identity_hash_for_tool, agent_failure_code, check_used_call_id, execute_agent_tool,
-    finish_rejected_external_operation, record_agent_failure_event,
-    recover_agent_tool_call_failure, validate_agent_tool_call_args,
+    agent_call_identity_hash_for_tool, agent_failure_code, agent_resource_exhausted,
+    check_used_call_id, execute_agent_tool, finish_rejected_external_operation,
+    record_agent_failure_event, recover_agent_tool_call_failure, validate_agent_tool_call_args,
 };
 use crate::agent_tools::{validate_agent_delegations, validate_agent_tool};
 use crate::completion::complete_llm;
@@ -873,9 +873,10 @@ impl StepExecutor for LlmAgentStep {
             // Non-resumed turns validated stop below; resumed turns skip it
             // because they execute a previously validated approved call.
             if tokens_total > max_tokens_total {
-                let error = StepError::failed(
+                let error = agent_resource_exhausted(
                     &node.id,
-                    format!("llm.agent token budget exceeded: {tokens_total} > {max_tokens_total}"),
+                    "llm.agent token",
+                    ("tokens_total", tokens_total, max_tokens_total),
                 );
                 record_tool_call_failures(
                     ctx,
@@ -885,6 +886,15 @@ impl StepExecutor for LlmAgentStep {
                     None,
                     ToolCallPhase::InputValidation,
                     ToolCallErrorCode::BudgetExceeded,
+                )?;
+                record_agent_failure_event(
+                    ctx,
+                    node,
+                    &node.id,
+                    None,
+                    agent_failure_code(&error),
+                    AgentFailureAction::Fail,
+                    &error,
                 )?;
                 return Err(error);
             }
@@ -1027,6 +1037,7 @@ impl StepExecutor for LlmAgentStep {
                     Ok(call_number) => call_number,
                     Err(error) => {
                         let call_number = tool_call_counts[&call.name];
+                        let code = agent_failure_code(&error);
                         if let Some(message) = recover_agent_tool_call_failure(
                             ctx,
                             node,
@@ -1034,7 +1045,7 @@ impl StepExecutor for LlmAgentStep {
                             &call,
                             &error,
                             AgentToolCallFailure {
-                                code: AgentFailureCode::ToolCallBudgetExceeded,
+                                code,
                                 phase: ToolCallPhase::InputValidation,
                                 tool_error_code: ToolCallErrorCode::BudgetExceeded,
                                 call_number,
@@ -1045,18 +1056,6 @@ impl StepExecutor for LlmAgentStep {
                             messages.push(message);
                             continue;
                         }
-                        record_tool_call_failure(
-                            ctx,
-                            node,
-                            &call,
-                            &error,
-                            tool_call_failure(
-                                None,
-                                ToolCallPhase::InputValidation,
-                                ToolCallErrorCode::BudgetExceeded,
-                                tool_started,
-                            ),
-                        )?;
                         return Err(error);
                     }
                 };
@@ -1113,18 +1112,6 @@ impl StepExecutor for LlmAgentStep {
                         messages.push(message);
                         continue;
                     }
-                    record_tool_call_failure(
-                        ctx,
-                        node,
-                        &call,
-                        &error,
-                        tool_call_failure(
-                            None,
-                            ToolCallPhase::InputValidation,
-                            ToolCallErrorCode::InvalidArguments,
-                            tool_started,
-                        ),
-                    )?;
                     return Err(error);
                 }
                 if let Err(error) = ctx.step_checkpoint(node).await {
@@ -1170,18 +1157,6 @@ impl StepExecutor for LlmAgentStep {
                         messages.push(message);
                         continue;
                     }
-                    record_tool_call_failure(
-                        ctx,
-                        node,
-                        &call,
-                        &error,
-                        tool_call_failure(
-                            None,
-                            ToolCallPhase::InputGuardrail,
-                            ToolCallErrorCode::GuardrailRejected,
-                            tool_started,
-                        ),
-                    )?;
                     return Err(error);
                 }
                 if let Err(error) = scan_llm_text(ctx, node, &serde_json::to_string(&call.args)?) {
@@ -1203,18 +1178,6 @@ impl StepExecutor for LlmAgentStep {
                         messages.push(message);
                         continue;
                     }
-                    record_tool_call_failure(
-                        ctx,
-                        node,
-                        &call,
-                        &error,
-                        tool_call_failure(
-                            None,
-                            ToolCallPhase::InputGuardrail,
-                            ToolCallErrorCode::GuardrailRejected,
-                            tool_started,
-                        ),
-                    )?;
                     return Err(error);
                 }
                 // E07-3: every side-effectful call — including safe HTTP
@@ -1555,18 +1518,6 @@ impl StepExecutor for LlmAgentStep {
                         messages.push(message);
                         continue;
                     }
-                    record_tool_call_failure(
-                        ctx,
-                        node,
-                        &call,
-                        &error,
-                        tool_call_failure(
-                            None,
-                            ToolCallPhase::OutputGuardrail,
-                            ToolCallErrorCode::OutputRejected,
-                            tool_started,
-                        ),
-                    )?;
                     return Err(error);
                 }
                 if let Err(error) = ctx.step_checkpoint(node).await {
@@ -1627,18 +1578,20 @@ impl StepExecutor for LlmAgentStep {
                         messages.push(message);
                         continue;
                     }
-                    record_tool_call_failure(
-                        ctx,
-                        node,
-                        &call,
-                        &error,
-                        tool_call_failure(
-                            None,
-                            ToolCallPhase::OutputGuardrail,
-                            ToolCallErrorCode::OutputRejected,
-                            tool_started,
-                        ),
-                    )?;
+                    if returned_agent_error {
+                        record_tool_call_failure(
+                            ctx,
+                            node,
+                            &call,
+                            &error,
+                            tool_call_failure(
+                                None,
+                                ToolCallPhase::OutputGuardrail,
+                                ToolCallErrorCode::OutputRejected,
+                                tool_started,
+                            ),
+                        )?;
+                    }
                     return Err(error);
                 }
                 // Every output check has passed: the operation may now be
@@ -1838,9 +1791,10 @@ pub(crate) fn charge_agent_tool_call(
     let count = counts.entry(name.to_string()).or_default();
     *count = count.saturating_add(1);
     if *total > max_total {
-        return Err(StepError::failed(
+        return Err(agent_resource_exhausted(
             node_id,
-            format!("{scope} tool call budget exceeded: {total} > {max_total}"),
+            &format!("{scope} tool call"),
+            ("tool_calls_total", *total as u64, max_total as u64),
         ));
     }
     if let Some(max_calls) = tools
@@ -1849,9 +1803,10 @@ pub(crate) fn charge_agent_tool_call(
         .and_then(agent_tool_max_calls)
         && *count > max_calls
     {
-        return Err(StepError::failed(
+        return Err(agent_resource_exhausted(
             node_id,
-            format!("{scope} tool `{name}` call budget exceeded: {count} > {max_calls}"),
+            &format!("{scope} tool `{name}` call"),
+            ("tool_calls_per_tool", *count as u64, max_calls as u64),
         ));
     }
     Ok(*count)

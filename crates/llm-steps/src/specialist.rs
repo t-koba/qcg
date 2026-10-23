@@ -8,8 +8,8 @@ use std::time::Instant;
 
 use crate::agent::{agent_tool_requires_serial_execution, charge_agent_tool_call};
 use crate::agent_runtime::{
-    AgentToolInvocation, AgentToolServices, AgentWrites, execute_agent_tool,
-    finish_rejected_external_operation, validate_agent_tool_call_args,
+    AgentToolInvocation, AgentToolServices, AgentWrites, agent_resource_exhausted,
+    execute_agent_tool, finish_rejected_external_operation, validate_agent_tool_call_args,
 };
 use crate::agent_tools::load_agent_output_schema;
 use crate::completion::complete_llm_with_policy;
@@ -178,11 +178,10 @@ pub(crate) async fn execute_specialist_agent(
             }
         }
         if tokens_total > max_tokens_total {
-            let error = StepError::failed(
+            let error = agent_resource_exhausted(
                 &node.id,
-                format!(
-                    "specialist `{agent_name}` token budget exceeded: {tokens_total} > {max_tokens_total}"
-                ),
+                &format!("specialist `{agent_name}` token"),
+                ("tokens_total", tokens_total, max_tokens_total),
             );
             record_tool_call_failures(
                 ctx,

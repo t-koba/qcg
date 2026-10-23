@@ -3570,6 +3570,51 @@ impl StepExecutor for IoFailStep {
     }
 }
 
+#[derive(Clone, Copy)]
+enum TypedAgentFailure {
+    Iterations,
+    Resource,
+}
+
+#[derive(Clone)]
+struct TypedAgentFailureStep {
+    calls: Arc<AtomicUsize>,
+    failure: TypedAgentFailure,
+}
+
+#[async_trait]
+impl StepExecutor for TypedAgentFailureStep {
+    fn type_id(&self) -> &'static str {
+        "test.typed_agent_failure"
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &mut StepContext<'_>,
+        node: &NodeDef,
+    ) -> Result<StepOutcome, StepError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let error = match self.failure {
+            TypedAgentFailure::Iterations => StepError::AgentIterationsExhausted {
+                node: node.id.clone(),
+                message: "agent iteration budget exceeded".into(),
+                resource: "iterations",
+                used: 2,
+                allowed: 1,
+                validation: None,
+            },
+            TypedAgentFailure::Resource => StepError::AgentResourceExhausted {
+                node: node.id.clone(),
+                message: "agent token budget exceeded".into(),
+                resource: "tokens_total",
+                used: 2,
+                allowed: 1,
+            },
+        };
+        Err(error)
+    }
+}
+
 fn retry_node(
     id: &str,
     kind: &str,
@@ -3656,6 +3701,47 @@ async fn retry_exhaustion_fails_after_max_attempts() {
     let events = journal_events(&run_dir);
     assert_eq!(retry_event_count(&events, "flaky"), 1);
     let _ = std::fs::remove_dir_all(&run_dir);
+}
+
+#[tokio::test]
+async fn typed_agent_exhaustion_obeys_step_retry_policy() {
+    for (name, failure) in [
+        ("iterations", TypedAgentFailure::Iterations),
+        ("resource", TypedAgentFailure::Resource),
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let step = TypedAgentFailureStep {
+            calls: Arc::clone(&calls),
+            failure,
+        };
+        let run_dir = temp_run_dir(&format!("retry-agent-{name}"));
+        let contract = test_contract(
+            &run_dir,
+            manifest(vec![retry_node(
+                name,
+                "test.typed_agent_failure",
+                2,
+                0,
+                None,
+            )]),
+        );
+        let mut registry = StepRegistry::new();
+        registry.register(step);
+        Engine::new(registry)
+            .run_with_id(
+                format!("retry-agent-{name}"),
+                run_dir.join("meta"),
+                contract,
+                BTreeMap::new(),
+                run_options(run_dir.join("workspace")),
+            )
+            .await
+            .expect_err("typed exhaustion remains an ordinary retryable failure");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "{name} attempts");
+        let events = journal_events(&run_dir);
+        assert_eq!(retry_event_count(&events, name), 1, "{name} retry event");
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
 }
 
 #[tokio::test]

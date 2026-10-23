@@ -23,7 +23,10 @@ use crate::prompting::utf8_head;
 use crate::request::scan_llm_text;
 use crate::search::{execute_web_search, http_body_value, url_host_matches};
 use crate::specialist::{SpecialistAgentSpec, execute_specialist_agent};
-use crate::tool_events::{execute_mcp_tool, tool_call_error, tool_call_event, tool_call_outcome};
+use crate::tool_events::{
+    execute_mcp_tool, record_tool_call_failure, tool_call_error, tool_call_event,
+    tool_call_failure, tool_call_outcome,
+};
 
 #[derive(Clone, Copy)]
 pub(crate) struct AgentToolServices<'a> {
@@ -1708,6 +1711,20 @@ fn ensure_path_within_prefix(
     Ok(())
 }
 
+pub(crate) fn agent_resource_exhausted(
+    node: &str,
+    scope: &str,
+    (resource, used, allowed): (&'static str, u64, u64),
+) -> StepError {
+    StepError::AgentResourceExhausted {
+        node: node.into(),
+        message: format!("{scope} budget exceeded: {used} > {allowed}"),
+        resource,
+        used,
+        allowed,
+    }
+}
+
 pub(crate) fn agent_failure_code(error: &StepError) -> AgentFailureCode {
     use AgentFailureCode::*;
     match error {
@@ -1721,6 +1738,11 @@ pub(crate) fn agent_failure_code(error: &StepError) -> AgentFailureCode {
             ValidationFailed
         }
         StepError::AgentIterationsExhausted { .. } => IterationBudgetExceeded,
+        StepError::AgentResourceExhausted { resource, .. } => match *resource {
+            "tokens_total" => TokenBudgetExceeded,
+            "tool_calls_total" | "tool_calls_per_tool" => ToolCallBudgetExceeded,
+            _ => ToolFailed,
+        },
         StepError::Failed { message, .. } => [
             ("token budget exceeded", TokenBudgetExceeded),
             ("call budget exceeded", ToolCallBudgetExceeded),
@@ -1795,14 +1817,29 @@ pub(crate) fn recover_agent_tool_call_failure(
     error: &StepError,
     failure: AgentToolCallFailure,
 ) -> Result<Option<ChatMessage>, StepError> {
-    let Some((action, limits)) = agent_tool_failure_resolution(tools, &call.name, failure.code)
-    else {
-        return Ok(None);
+    // Unrecovered calls keep the same failure event as the caller used to
+    // write; one owner handles both configured Fail and no resolution.
+    let fail = || {
+        let outcome = tool_call_failure(
+            None,
+            failure.phase,
+            failure.tool_error_code,
+            failure.started,
+        );
+        record_tool_call_failure(ctx, node, call, error, outcome).map(|()| None)
     };
     let id = Some(call.id.as_str());
+    let Some((action, limits)) = agent_tool_failure_resolution(tools, &call.name, failure.code)
+    else {
+        if matches!(error, StepError::AgentResourceExhausted { .. }) {
+            let action = AgentFailureAction::Fail;
+            record_agent_failure_event(ctx, node, &node.id, id, failure.code, action, error)?;
+        }
+        return fail();
+    };
     record_agent_failure_event(ctx, node, &call.name, id, failure.code, action, error)?;
     if action == AgentFailureAction::Fail {
-        return Ok(None);
+        return fail();
     }
     let result = agent_error_result(
         &call.name,
@@ -1870,6 +1907,12 @@ pub(crate) fn record_agent_failure_event(
 ) -> Result<(), StepError> {
     let resource_exhaustion = match error {
         StepError::AgentIterationsExhausted {
+            resource,
+            used,
+            allowed,
+            ..
+        }
+        | StepError::AgentResourceExhausted {
             resource,
             used,
             allowed,
