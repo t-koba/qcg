@@ -1309,6 +1309,7 @@ mod tests {
             &engine::StepError::ElapsedExceeded {
                 node: "n".into(),
                 limit_secs: 1,
+                used: std::time::Duration::from_secs(1),
             },
         );
         assert_eq!(elapsed.code, ToolCallErrorCode::ElapsedExceeded);

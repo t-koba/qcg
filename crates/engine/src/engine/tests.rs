@@ -64,9 +64,9 @@ fn is_elapsed_failure(error: &EngineError, limit_secs: u64) -> bool {
         EngineError::Step(StepError::ElapsedExceeded {
             limit_secs: limit, ..
         })
-        | EngineError::Step(StepError::ElapsedExpiredBeforeStart { limit_secs: limit }) => {
-            *limit == limit_secs
-        }
+        | EngineError::Step(StepError::ElapsedExpiredBeforeStart {
+            limit_secs: limit, ..
+        }) => *limit == limit_secs,
         _ => false,
     }
 }
@@ -1429,7 +1429,7 @@ impl StepExecutor for TestDelayedUserStep {
             .run
             .elapsed_deadline
             .expect("the test contract configures an elapsed deadline");
-        tokio::time::sleep_until(deadline + std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep_until(deadline.deadline + std::time::Duration::from_millis(100)).await;
         Ok(StepOutcome::NeedsUser {
             question: api::FormSpec {
                 id: "delayed-question".into(),
@@ -7702,7 +7702,7 @@ async fn active_elapsed_exhausted_or_crashed_run_starts_no_side_effects() {
         assert!(
             matches!(
                 error,
-                EngineError::Step(StepError::ElapsedExpiredBeforeStart { limit_secs: 1 })
+                EngineError::Step(StepError::ElapsedExpiredBeforeStart { limit_secs: 1, .. })
             ),
             "an exhausted allowance must report the expiry before a step could start, got: {error}"
         );
@@ -7717,6 +7717,14 @@ async fn active_elapsed_exhausted_or_crashed_run_starts_no_side_effects() {
         let ledger = state.budget.elapsed.unwrap();
         assert!(ledger.active_started_at.is_none());
         assert!(ledger.active_nanoseconds >= 1_000_000_000);
+        let facts = failure_detail_for_error(&error).exhaustion.unwrap();
+        assert_eq!(
+            facts,
+            model::BudgetExhaustion::elapsed(
+                std::time::Duration::from_nanos(ledger.active_nanoseconds),
+                1
+            )
+        );
         assert_eq!(state.budget.steps_executed, 0);
         let _ = std::fs::remove_dir_all(run_dir);
     }
@@ -7956,3 +7964,5 @@ mod replay_safety;
 mod saved_interactions;
 
 mod budget_failures;
+
+mod elapsed_facts;

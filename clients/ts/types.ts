@@ -2064,6 +2064,11 @@ export interface components {
             resource: string;
             /** Format: uint64 */
             used: number;
+            /**
+             * Format: uint32
+             * @description Fractional part of `used` for `elapsed_seconds` only; absent on legacy/non-time facts.
+             */
+            used_subsec_nanoseconds?: number | null;
         };
         /** @enum {string} */
         CommandIsolation: "container" | "trusted_host";

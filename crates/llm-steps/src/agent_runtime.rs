@@ -2138,7 +2138,8 @@ mod tests {
         assert_eq!(
             agent_failure_code(&StepError::ElapsedExceeded {
                 node: "n".into(),
-                limit_secs: 1
+                limit_secs: 1,
+                used: std::time::Duration::from_secs(1),
             }),
             AgentFailureCode::ElapsedExceeded
         );

@@ -6,6 +6,19 @@ use chrono::{DateTime, Utc};
 use std::time::Duration;
 use tokio::time::Instant;
 
+/// Exact measured usage, separate from the unchanged enforcement deadline.
+#[derive(Clone, Copy, Debug)]
+pub struct ElapsedClock {
+    pub deadline: Instant,
+    pub measured_at: Instant,
+    pub used: Duration,
+}
+impl ElapsedClock {
+    pub fn used(&self) -> Duration {
+        self.used + self.measured_at.elapsed()
+    }
+}
+
 pub(super) struct Episode {
     started: Instant,
     total: u64,
@@ -37,8 +50,7 @@ fn record(journal: &JournalWriter, total: u64, anchor: Option<String>) -> Result
     Ok(())
 }
 
-/// Called only while the caller holds the run execution lease/direct lock.
-/// A recovered open interval charges downtime; a closed one never charges again.
+/// Under the execution lock, recover downtime once for an open interval only.
 pub(super) fn recover(journal: &JournalWriter, now: DateTime<Utc>) -> Result<u64, EngineError> {
     let ledger = journal
         .state()
@@ -73,18 +85,23 @@ impl Episode {
         })
     }
 
-    pub(super) fn deadline(&self, remaining: Duration) -> Result<Instant, EngineError> {
-        self.started
+    pub(super) fn deadline(&self, remaining: Duration) -> Result<ElapsedClock, EngineError> {
+        let deadline = self
+            .started
             .checked_add(remaining)
-            .ok_or_else(|| invalid("deadline overflow"))
+            .ok_or_else(|| invalid("deadline overflow"))?;
+        Ok(ElapsedClock {
+            deadline,
+            measured_at: self.started,
+            used: Duration::from_nanos(self.total),
+        })
     }
 
     pub(super) fn close(&mut self, journal: &JournalWriter) -> Result<(), EngineError> {
         if self.closed {
             return Ok(());
         }
-        // Live episodes have a monotonic clock; wall time is only an anchor
-        // for crash recovery and must not veto a known live interval.
+        // Live monotonic accounting cannot be vetoed by recovery wall time.
         record(journal, add(self.total, self.started.elapsed())?, None)?;
         self.closed = true;
         Ok(())
@@ -97,7 +114,11 @@ pub(super) fn remaining(limit: u64, total: u64) -> Result<Duration, EngineError>
         .filter(|duration| !duration.is_zero())
         .ok_or_else(|| {
             // The allowance was exhausted before a step could start (E11).
-            StepError::ElapsedExpiredBeforeStart { limit_secs: limit }.into()
+            StepError::ElapsedExpiredBeforeStart {
+                limit_secs: limit,
+                used: Duration::from_nanos(total),
+            }
+            .into()
         })
 }
 
@@ -139,6 +160,30 @@ mod tests {
             "generator": "test@1", "generator_path": "test", "contract_sha256": "test",
             "inputs": {}, "schema_version": 2, "elapsed_budget_mode": "active_execution"
         })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_elapsed_facts_use_exact_total_and_live_monotonic_interval() {
+        let error = remaining(1, 1_000_000_007).unwrap_err();
+        assert_eq!(
+            crate::engine::types::failure_detail_for_error(&error)
+                .exhaustion
+                .unwrap(),
+            model::BudgetExhaustion::elapsed(Duration::new(1, 7), 1)
+        );
+        let (dir, writer) = journal("exact-clock");
+        record(&writer, 0, Some(Utc::now().to_rfc3339())).unwrap();
+        record(&writer, 123, None).unwrap();
+        let mut episode = Episode::open(&writer, 123).unwrap();
+        let clock = episode.deadline(Duration::from_secs(1)).unwrap();
+        tokio::time::advance(Duration::new(1, 7)).await;
+        assert_eq!(clock.used(), Duration::new(1, 130));
+        episode.close(&writer).unwrap();
+        assert_eq!(
+            writer.state().budget.elapsed.unwrap().active_nanoseconds,
+            1_000_000_130
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

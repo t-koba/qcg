@@ -545,15 +545,18 @@ impl Engine {
                 .budget
                 .max_elapsed_seconds
                 .map(|limit_secs| {
-                    let remaining = remaining_elapsed_secs(
+                    let (remaining, used) = wall_elapsed(
                         limit_secs,
                         replay.state.budget.started_at.as_deref(),
                         replay.state.execution_started,
                         chrono::Utc::now(),
                     )?;
-                    Ok::<_, EngineError>(
-                        tokio::time::Instant::now() + std::time::Duration::from_secs(remaining),
-                    )
+                    let measured_at = tokio::time::Instant::now();
+                    Ok::<_, EngineError>(super::ElapsedClock {
+                        deadline: measured_at + std::time::Duration::from_secs(remaining),
+                        measured_at,
+                        used,
+                    })
                 })
                 .transpose()
         };
@@ -1356,18 +1359,16 @@ impl Engine {
         if !failed.is_empty() {
             match context.run_checkpoint() {
                 Ok(()) => {}
-                Err(EngineError::Step(
+                Err(error @ EngineError::Step(
                     crate::StepError::ElapsedExceeded { limit_secs, .. }
-                    | crate::StepError::ElapsedExpiredBeforeStart { limit_secs },
+                    | crate::StepError::ElapsedExpiredBeforeStart { limit_secs, .. },
                 )) => {
                     failed.push(RunNodeFailureEventData {
                         path: NodePath::root("runtime"),
-                        failure: FailureDetail::new(
-                            FailureCode::ElapsedExceeded,
-                            format!(
-                                "run elapsed budget exceeded before finalization (limit {limit_secs}s)"
-                            ),
-                        ),
+                        failure: FailureDetail {
+                            message: format!("run elapsed budget exceeded before finalization (limit {limit_secs}s)"),
+                            ..failure_detail_for_error(&error)
+                        },
                     });
                 }
                 Err(EngineError::Canceled)
@@ -1506,53 +1507,41 @@ fn hook_policy_name(policy: HookErrorPolicy) -> &'static str {
     }
 }
 
-/// Remaining budget for the run-wide elapsed limit. Pure so the full
-/// decision matrix is unit-testable without a journal (E11). Enforcement
-/// after startup is monotonic (`Instant` deadline derived once here);
-/// this resume-time seeding reads the durable wall-clock start once to
-/// compute the remainder, then enforcement never touches wall time again,
-/// so an NTP step after startup cannot stretch enforcement (E11).
-/// `security.md` documents the same deadline; any wording that implies
-/// wall-clock enforcement needs a doc fix there (FOREIGN, reported not
-/// edited).
-///
-/// Defined elapsed semantics, pinned here and by the accounting test below:
-/// - The durable start is queue-inclusive: it is stamped by the first
-///   `run_queued`/`run_started` event, so time spent queued before execution
-///   consumes the same budget as execution time.
-/// - Suspension time is NOT deducted: HITL waits keep the clock running, so
-///   a long human pause can exhaust the budget like any other elapsed time.
-/// - A durable start in the future beyond clock-skew tolerance (5 s) is
-///   corrupt: refusing beats silently widening the deadline.
-/// - Small future skew (<= 5 s) clamps to zero elapsed, never negative.
-/// - A journal that already started execution but records no durable start
-///   is corrupt: resuming it with a fresh full budget would widen the
-///   deadline, so resume is refused instead.
+#[cfg(test)]
 pub(crate) fn remaining_elapsed_secs(
     limit_secs: u64,
     started_at: Option<&str>,
     execution_started: bool,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<u64, EngineError> {
+    wall_elapsed(limit_secs, started_at, execution_started, now).map(|(remaining, _)| remaining)
+}
+// Queue/HITL time counts. Tolerated future skew clamps to zero; larger skew or
+// missing execution identity refuses resume. Preserve whole-second deadline seeding,
+// but retain the unrounded duration for facts. Live enforcement is monotonic only.
+fn wall_elapsed(
+    limit_secs: u64,
+    started_at: Option<&str>,
+    execution_started: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(u64, std::time::Duration), EngineError> {
     const FUTURE_TOLERANCE_SECS: i64 = 5;
-    let elapsed_secs = match started_at {
+    let elapsed = match started_at {
         Some(started) => {
             let started = chrono::DateTime::parse_from_rfc3339(started).map_err(|error| {
                 EngineError::Failed(format!(
                     "cannot parse durable budget start `{started}`: {error}"
                 ))
             })?;
-            // Exact whole-second elapsed (floor, no ceil): ceiling would
-            // fire up to 1 s early by rounding 1001 ms to 2 s (E11).
-            // Enforcement compares with `>` (not `>=`) in `checkpoint_scope`
-            // for the same reason.
             let delta_ms = now.signed_duration_since(started).num_milliseconds();
             if delta_ms < -FUTURE_TOLERANCE_SECS * 1000 {
                 return Err(EngineError::Failed(format!(
                     "durable budget start `{started}` is more than {FUTURE_TOLERANCE_SECS}s in the future; refusing resume"
                 )));
             }
-            (delta_ms.max(0) / 1000) as u64
+            now.signed_duration_since(started)
+                .to_std()
+                .unwrap_or_default()
         }
         None => {
             if execution_started {
@@ -1561,10 +1550,10 @@ pub(crate) fn remaining_elapsed_secs(
                         .into(),
                 ));
             }
-            0
+            std::time::Duration::ZERO
         }
     };
-    Ok(limit_secs.saturating_sub(elapsed_secs))
+    Ok((limit_secs.saturating_sub(elapsed.as_secs()), elapsed))
 }
 
 #[cfg(test)]
@@ -1573,6 +1562,41 @@ mod elapsed_tests {
 
     fn now() -> chrono::DateTime<chrono::Utc> {
         chrono::Utc::now()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wall_elapsed_facts_keep_fraction_and_queue_overrun_without_changing_deadline() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:02:05.123456789Z")
+            .unwrap()
+            .to_utc();
+        let (remaining, used) =
+            super::wall_elapsed(60, Some("2026-01-01T00:00:00Z"), false, now).unwrap();
+        assert_eq!(remaining, 0);
+        assert_eq!(used, std::time::Duration::new(125, 123456789));
+        let measured_at = tokio::time::Instant::now();
+        let clock = crate::ElapsedClock {
+            deadline: measured_at,
+            measured_at,
+            used,
+        };
+        tokio::time::advance(std::time::Duration::from_nanos(1)).await;
+        let error = crate::engine::checkpoint_scope(
+            &tokio_util::sync::CancellationToken::new(),
+            Some((clock, 60)),
+            crate::engine::CheckpointScope::Run,
+        )
+        .unwrap_err();
+        let detail =
+            crate::engine::types::failure_detail_for_error(&crate::EngineError::Step(error));
+        assert_eq!(
+            detail.exhaustion.unwrap(),
+            model::BudgetExhaustion::elapsed(std::time::Duration::new(125, 123456790), 60)
+        );
+        // The fraction is retained for facts but never rounded up for enforcement.
+        let (remaining, used) =
+            super::wall_elapsed(126, Some("2026-01-01T00:00:00Z"), false, now).unwrap();
+        assert_eq!(remaining, 1);
+        assert_eq!(used.subsec_nanos(), 123456789);
     }
 
     #[test]

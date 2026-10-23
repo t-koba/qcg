@@ -1040,4 +1040,26 @@ mod tests {
             assert!(error.contains(field), "{error}");
         }
     }
+    #[test]
+    fn run_error_preserves_exact_elapsed_components_and_legacy_absence() {
+        for fractional in [None, Some(123456789)] {
+            let mut value = json!({
+                "t":"run_error", "seq":1, "ts":"2026-01-01T00:00:00Z",
+                "run_id":"elapsed", "trace_id":"trace", "span_id":"span",
+                "error":"elapsed budget expired", "reason": {
+                    "code":"elapsed_exceeded", "message":"elapsed budget expired",
+                    "exhaustion":{"resource":"elapsed_seconds", "used":125, "allowed":60}
+                }
+            });
+            if let Some(nanos) = fractional {
+                value["reason"]["exhaustion"]["used_subsec_nanoseconds"] = json!(nanos);
+            }
+            let event = RunEvent::from_flat(&value).unwrap();
+            let encoded = serde_json::to_value(event).unwrap();
+            assert_eq!(
+                encoded["data"]["reason"]["exhaustion"],
+                value["reason"]["exhaustion"]
+            );
+        }
+    }
 }

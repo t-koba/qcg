@@ -92,6 +92,7 @@ async fn typed_budget_failures_survive_execution_journal_and_replay() {
                 panic!("expected failure: {progress:?}")
             };
             let expected = BudgetExhaustion {
+                used_subsec_nanoseconds: None,
                 resource: resource.into(),
                 used: 1_000_001,
                 allowed: 1_000_000,
@@ -181,7 +182,6 @@ fn only_typed_budget_errors_project_exhaustion() {
     );
     for error in [
         EngineError::Failed(detail.message.clone()),
-        EngineError::Step(StepError::ElapsedExpiredBeforeStart { limit_secs: 1 }),
         EngineError::Step(StepError::AgentResourceExhausted {
             node: "n".into(),
             message: "local".into(),

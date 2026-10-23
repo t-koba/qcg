@@ -47,6 +47,19 @@ pub struct BudgetExhaustion {
     pub resource: String,
     pub used: u64,
     pub allowed: u64,
+    /// Fractional part of `used` for `elapsed_seconds` only; absent on legacy/non-time facts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_subsec_nanoseconds: Option<u32>,
+}
+impl BudgetExhaustion {
+    pub fn elapsed(used: std::time::Duration, allowed: u64) -> Self {
+        Self {
+            resource: "elapsed_seconds".into(),
+            used: used.as_secs(),
+            allowed,
+            used_subsec_nanoseconds: Some(used.subsec_nanos()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

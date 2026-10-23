@@ -13,6 +13,7 @@ mod types;
 pub(crate) use checkpoint::is_symlink_no_follow;
 #[cfg(test)]
 pub(crate) use checkpoint::*;
+pub use elapsed::ElapsedClock;
 #[cfg(test)]
 pub(crate) use replay::*;
 pub(crate) use run_context::{CheckpointScope, checkpoint_scope};

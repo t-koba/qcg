@@ -139,8 +139,14 @@ pub(crate) fn failure_detail_for_error(error: &EngineError) -> model::FailureDet
         EngineError::ResumableAgent(error) => return failure_detail_for_error(error),
         EngineError::Settled(detail) => return detail.clone(),
         EngineError::Step(
-            StepError::ElapsedExceeded { .. } | StepError::ElapsedExpiredBeforeStart { .. },
-        ) => FailureCode::ElapsedExceeded,
+            StepError::ElapsedExceeded {
+                used, limit_secs, ..
+            }
+            | StepError::ElapsedExpiredBeforeStart { used, limit_secs },
+        ) => {
+            detail.exhaustion = Some(BudgetExhaustion::elapsed(*used, *limit_secs));
+            FailureCode::ElapsedExceeded
+        }
         EngineError::Step(StepError::TimedOut { .. }) => FailureCode::TimedOut,
         EngineError::Step(StepError::BudgetExceeded {
             resource,
@@ -151,6 +157,7 @@ pub(crate) fn failure_detail_for_error(error: &EngineError) -> model::FailureDet
                 resource: (*resource).into(),
                 used: *used,
                 allowed: *limit,
+                used_subsec_nanoseconds: None,
             });
             FailureCode::BudgetExceeded
         }
@@ -274,7 +281,7 @@ pub struct RunContext {
     /// budget (a `tokio::time::Instant`, never wall time). Nodes stop with
     /// a distinct elapsed error instead of running past the limit and only
     /// noticing at the next checkpoint (E11).
-    pub elapsed_deadline: Option<tokio::time::Instant>,
+    pub elapsed_deadline: Option<super::ElapsedClock>,
     /// Server-side run status source for `await` nodes. Absent in
     /// single-process direct runs, where cross-run waiting is unsupported.
     pub snapshot_source: Option<Arc<dyn RunSnapshotSource>>,
@@ -599,6 +606,7 @@ mod tests {
             failure_detail_for_error(&EngineError::Step(crate::StepError::ElapsedExceeded {
                 node: "n".into(),
                 limit_secs: 1,
+                used: std::time::Duration::from_secs(1),
             }))
             .code,
             model::FailureCode::ElapsedExceeded

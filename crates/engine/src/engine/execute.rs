@@ -521,7 +521,7 @@ impl Engine {
                             _ = context.cancellation.cancelled() => {
                                 return Err(EngineError::Canceled);
                             }
-                            _ = tokio::time::sleep_until(deadline) => {
+                            _ = tokio::time::sleep_until(deadline.deadline) => {
                                 let Some(limit_secs) = elapsed_limit else {
                                     return Err(EngineError::Failed(
                                         "elapsed deadline fired without a configured elapsed limit".into(),
@@ -530,6 +530,7 @@ impl Engine {
                                 return Err(EngineError::Step(StepError::ElapsedExceeded {
                                     node: node.id.clone(),
                                     limit_secs,
+                                    used: deadline.used(),
                                 }));
                             }
                             _ = &mut backoff => {}
@@ -647,14 +648,9 @@ impl Engine {
                 // hard, and cancellation is checked inside the deadline arm
                 // (E11).
                 biased;
-                _ = tokio::time::sleep_until(deadline) => {
+                _ = tokio::time::sleep_until(deadline.deadline) => {
                     node_stop.cancel();
-                    // Give the attempt the same bounded cooperative grace as
-                    // the node timeout path, then record the elapsed error:
-                    // an executor that settles on the child stop must not be
-                    // misreported as a plain cancellation (E11). Cancel-race
-                    // entry uses the single shared helper, matching the
-                    // node-timeout arm above (E11).
+                    // Same bounded cooperative grace and parent-cancel precedence as node timeouts.
                     if grace_entry_parent_cancelled(context) {
                         return Err(EngineError::Canceled);
                     }
@@ -668,38 +664,21 @@ impl Engine {
                             if grace_entry_parent_cancelled(context) {
                                 return Err(EngineError::Canceled);
                             }
-                            // A grace-period interaction is preserved, not
-                            // discarded: the human answer is still required
-                            // to continue, so the suspension is delivered
-                            // with an elapsed-exceeded marker instead of
-                            // being dropped (E11). Any other cooperative
-                            // finish loses to the already-fired hard limit:
-                            // unlike a node timeout (an attempt budget whose
-                            // cooperative finish is adopted), the elapsed
-                            // limit is a run budget, so a post-limit success
-                            // must not commit (E11). When the inner attempt
-                            // already classified itself as a node timeout,
-                            // both classifications are preserved: the inner
-                            // timeout is journaled and the outer elapsed is
-                            // returned, never overwriting one with the other
-                            // (E10).
+                            // Deliver grace-period interactions without restoring budget (E11).
+                            // Other late finishes lose to the hard run limit; retain any inner timeout too.
                             let is_interaction = matches!(
                                 &result,
                                 Ok(StepOutcome::NeedsUser { .. })
                                     | Ok(StepOutcome::NeedsConfirm { .. })
                             );
                             if is_interaction {
-                                // Preserving the interaction does not preserve
-                                // budget (E11): the elapsed limit has already
-                                // fired and `elapsed_exceeded` is journaled
-                                // alongside, so resuming still requires a new
-                                // budget or limit extension — do not mistake
-                                // the delivered suspension for remaining time.
+                                // The marker records exhaustion beside the delivered interaction, not permission to resume.
                                 journal.event(
                                     "elapsed_exceeded",
                                     json!({
                                         "node": node.id,
                                         "limit_secs": limit_secs,
+                                        "exhaustion": model::BudgetExhaustion::elapsed(deadline.used(), limit_secs),
                                         "during": "interaction",
                                     }),
                                 )?;
@@ -722,6 +701,7 @@ impl Engine {
                             Err(EngineError::Step(StepError::ElapsedExceeded {
                                 node: node.id.clone(),
                                 limit_secs,
+                                used: deadline.used(),
                             }))
                         }
                         None => {
@@ -731,6 +711,7 @@ impl Engine {
                                 Err(EngineError::Step(StepError::ElapsedExceeded {
                                     node: node.id.clone(),
                                     limit_secs,
+                                    used: deadline.used(),
                                 }))
                             }
                         }

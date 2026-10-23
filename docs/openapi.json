@@ -427,6 +427,15 @@
             "format": "uint64",
             "minimum": 0,
             "type": "integer"
+          },
+          "used_subsec_nanoseconds": {
+            "description": "Fractional part of `used` for `elapsed_seconds` only; absent on legacy/non-time facts.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [

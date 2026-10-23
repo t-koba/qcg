@@ -361,39 +361,32 @@ pub(crate) enum CheckpointScope<'a> {
     Node(&'a str),
 }
 
-/// Single shared checkpoint implementation for loop scopes and step scopes
-/// (E11). The scope decides how an expiry is reported: the run scope
-/// reports that the limit expired before the next step could start, the
-/// node scope reports the running step that the limit stopped.
-///
-/// Enforcement uses the monotonic `elapsed_deadline` only. Wall-clock time
-/// appears in durable identity/active-accounting records, recovery and diagnostic
-/// messages, never in an in-process deadline decision, so an NTP step cannot
-/// stretch or shrink the budget (E11). The deadline and its limit travel
-/// as one `Option<(Instant, u64)>` so a deadline without a limit is
-/// unrepresentable at the type level (E11).
+/// Shared run/node checkpoint: cancellation wins; only the monotonic deadline
+/// enforces expiry. The paired limit and exact usage clock supply diagnostics,
+/// never another deadline decision (E11).
 pub(crate) fn checkpoint_scope(
     cancellation: &tokio_util::sync::CancellationToken,
-    elapsed: Option<(tokio::time::Instant, u64)>,
+    elapsed: Option<(super::ElapsedClock, u64)>,
     scope: CheckpointScope<'_>,
 ) -> Result<(), StepError> {
     if cancellation.is_cancelled() {
         return Err(StepError::Cancelled);
     }
-    // Loop checks must also stop at the run-wide hard deadline instead
-    // of waiting for the next attempt boundary (E11). Exact comparison
-    // with `>`: `>=` plus second-truncation would fire up to 1 s early,
-    // while `>` fires exactly at expiry (E11).
+    // Preserve strict `>` checkpoint comparison; timers keep their own existing expiry rule.
     if let Some((deadline, limit_secs)) = elapsed
-        && tokio::time::Instant::now() > deadline
+        && tokio::time::Instant::now() > deadline.deadline
     {
         return Err(match scope {
             // The run scope fires before a step starts, so an expiry there
             // must not read as a step that ran out of time while running (E11).
-            CheckpointScope::Run => StepError::ElapsedExpiredBeforeStart { limit_secs },
+            CheckpointScope::Run => StepError::ElapsedExpiredBeforeStart {
+                limit_secs,
+                used: deadline.used(),
+            },
             CheckpointScope::Node(node) => StepError::ElapsedExceeded {
                 node: node.to_string(),
                 limit_secs,
+                used: deadline.used(),
             },
         });
     }
@@ -2169,6 +2162,14 @@ mod tests {
         );
     }
 
+    fn test_elapsed_clock(deadline: tokio::time::Instant) -> super::super::ElapsedClock {
+        super::super::ElapsedClock {
+            deadline,
+            measured_at: deadline,
+            used: std::time::Duration::from_secs(60),
+        }
+    }
+
     #[test]
     fn checkpoint_scope_reports_the_scope_of_the_expiry() {
         // E11: the run scope is checked before a step can start, so an
@@ -2181,14 +2182,14 @@ mod tests {
         let past = tokio::time::Instant::now() - std::time::Duration::from_secs(1);
         let error = checkpoint_scope(
             &CancellationToken::new(),
-            Some((past, 60)),
+            Some((test_elapsed_clock(past), 60)),
             CheckpointScope::Run,
         )
         .expect_err("a past monotonic deadline must fire");
         assert!(
             matches!(
                 error,
-                crate::StepError::ElapsedExpiredBeforeStart { limit_secs: 60 }
+                crate::StepError::ElapsedExpiredBeforeStart { limit_secs: 60, .. }
             ),
             "the run scope must report the expiry before a step could start: {error}"
         );
@@ -2200,14 +2201,14 @@ mod tests {
         );
         let error = checkpoint_scope(
             &CancellationToken::new(),
-            Some((past, 60)),
+            Some((test_elapsed_clock(past), 60)),
             CheckpointScope::Node("build"),
         )
         .expect_err("a past monotonic deadline must fire");
         assert!(
             matches!(
                 error,
-                crate::StepError::ElapsedExceeded { ref node, limit_secs: 60 } if node.as_str() == "build"
+                crate::StepError::ElapsedExceeded { ref node, limit_secs: 60, .. } if node.as_str() == "build"
             ),
             "node scope must name the running step: {error}"
         );
@@ -2224,7 +2225,7 @@ mod tests {
         assert!(
             checkpoint_scope(
                 &CancellationToken::new(),
-                Some((past, 60)),
+                Some((test_elapsed_clock(past), 60)),
                 CheckpointScope::Node("n")
             )
             .is_err(),
@@ -2234,7 +2235,7 @@ mod tests {
         assert!(
             checkpoint_scope(
                 &CancellationToken::new(),
-                Some((future, 60)),
+                Some((test_elapsed_clock(future), 60)),
                 CheckpointScope::Node("n")
             )
             .is_ok(),
@@ -2248,7 +2249,11 @@ mod tests {
         cancelled.cancel();
         assert!(
             matches!(
-                checkpoint_scope(&cancelled, Some((future, 60)), CheckpointScope::Node("n")),
+                checkpoint_scope(
+                    &cancelled,
+                    Some((test_elapsed_clock(future), 60)),
+                    CheckpointScope::Node("n")
+                ),
                 Err(crate::StepError::Cancelled)
             ),
             "cancellation still wins over a future deadline"

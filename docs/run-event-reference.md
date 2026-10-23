@@ -72,16 +72,45 @@ or continuation is authorized by this terminal.
 Canonical failure details in step summaries, `step_finished.reason`,
 `run_finished.failures[].failure`, and `run_error.reason` may carry
 `exhaustion: {resource, used, allowed}`. These are exact unsigned amounts
-copied from an enforcing `BudgetExceeded` error, not parsed from its message.
+copied from typed enforcing errors, not parsed from their messages.
 `cost_microusd` uses millionths of a US dollar; `tokens` retains the check's
 scope, which can be a gateway call allowance or a run budget. The field does
 not assert that every token error measures a run total. Admission checks may
 report projected/reserved usage, not spent usage; consult the unchanged run
 metrics for actual spending. The existing code and message still identify the
-failure. Absent facts (including old histories, joined generic errors, elapsed
-limits, and non-typed step/foreach limits) remain absent, not inferred. These
+failure. Absent facts (including old histories, joined generic errors, and
+non-typed step/foreach limits) remain absent, not inferred. These
 facts neither authorize replay nor change retry, hooks, accounting, or terminal
 failure settlement.
+
+Elapsed failures (`elapsed_exceeded`, including expiry before the next step)
+use `exhaustion.resource: "elapsed_seconds"`. `allowed` is the configured
+whole-second limit. Exact usage is represented by two integer components:
+`used` whole seconds **plus** `used_subsec_nanoseconds` (0–999,999,999).
+For example, `{resource: "elapsed_seconds", used: 3, allowed: 3,
+used_subsec_nanoseconds: 125000000}` reports 3.125 seconds used, not a
+rounded four seconds. Keeping components avoids overflowing a `u64`
+nanosecond total for large valid second limits. The fractional field is
+present (even when zero) on new elapsed facts, absent on legacy/non-time
+facts; no fractional value is inferred when absent.
+
+Active-execution usage is the recovered durable active total plus the live
+monotonic episode interval. Wall-clock usage is the exact nonnegative duration
+from the durable queue/start anchor sampled at episode startup (including
+queue and HITL time), plus the live monotonic interval. The existing skew
+checks and whole-second flooring used to seed the wall-clock **deadline**
+are unchanged; the reported usage is not rounded to construct that deadline.
+Subsequent wall-clock changes cannot alter either live enforcement or usage.
+Amounts are sampled when the checkpoint/error or interaction marker is built,
+including any elapsed cooperative grace already spent. They are observations,
+not necessarily an amount strictly greater than the allowance: a timer can
+fire exactly at the limit. Later finalization checks may report later usage.
+
+The internal `elapsed_exceeded` journal marker emitted beside a preserved
+grace-period interaction keeps `node`, `limit_secs`, and `during: "interaction"`
+and adds the same `exhaustion` object. It remains an opaque API event payload.
+Delivering the question/confirmation does not restore time, change terminal
+settlement, or authorize continuation/replay. No elapsed accounting is reset.
 
 Direct `mcp.call` cleanup failures emit a durable `mcp_cleanup_settled` record
 before settlement, alongside the observation-only `tool_call`. Both retain the

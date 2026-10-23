@@ -64,11 +64,18 @@ pub enum StepError {
     /// timeout and from cancellation so hosts can report the actual cause
     /// (E11).
     #[error("step `{node}` exceeded the run elapsed limit of {limit_secs}s")]
-    ElapsedExceeded { node: String, limit_secs: u64 },
+    ElapsedExceeded {
+        node: String,
+        limit_secs: u64,
+        used: std::time::Duration,
+    },
     /// Run elapsed budget expired before the next step, unlike `ElapsedExceeded`,
     /// which stops a step already running (E11).
     #[error("run elapsed limit of {limit_secs}s expired before the next step could start")]
-    ElapsedExpiredBeforeStart { limit_secs: u64 },
+    ElapsedExpiredBeforeStart {
+        limit_secs: u64,
+        used: std::time::Duration,
+    },
 }
 
 impl StepError {
