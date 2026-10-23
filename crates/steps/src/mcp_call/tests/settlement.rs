@@ -456,30 +456,40 @@ fn missing_policy_is_not_defaulted_and_invalid_values_are_rejected() {
 }
 
 #[test]
-fn cleanup_success_needs_no_policy() {
-    let harness = Harness::new();
-    let journal = harness.journal();
-    let mut vars = ValueBag::with_inputs(BTreeMap::new());
-    let ctx = StepContext {
-        run: &harness.run,
-        journal: &journal,
-        vars: &mut vars,
-        llm: None,
-    };
-    let outcome = settle_direct_mcp(
-        &ctx,
-        &harness.node,
-        &params(None, false),
-        Ok(DirectMcpCallOutcome::Complete(json!({"ok": true}))),
-        &json!({}),
-        None,
-        0,
-    )
-    .unwrap();
-    assert!(
-        matches!(outcome, StepOutcome::Success { output: Some(value), .. } if value["result"]["ok"] == true)
-    );
-    assert!(harness.records("mcp_cleanup_settled").is_empty());
+fn cleanup_success_does_not_select_cleanup_policy() {
+    for cleanup_failure in [None, Some(PreserveExecution), Some(FailFast)] {
+        let harness = Harness::new();
+        let journal = harness.journal();
+        let mut vars = ValueBag::with_inputs(BTreeMap::new());
+        let ctx = StepContext {
+            run: &harness.run,
+            journal: &journal,
+            vars: &mut vars,
+            llm: None,
+        };
+        let outcome = settle_direct_mcp(
+            &ctx,
+            &harness.node,
+            &params(cleanup_failure, false),
+            Ok(DirectMcpCallOutcome::Complete(json!({"ok": true}))),
+            &json!({}),
+            None,
+            0,
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, StepOutcome::Success { output: Some(value), .. } if value["result"]["ok"] == true)
+        );
+        assert!(harness.records("mcp_cleanup_settled").is_empty());
+        let audit = std::fs::read_to_string(harness.root.join("audit.jsonl")).unwrap();
+        let call: Value = audit
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|record| record["t"] == "tool_call")
+            .unwrap();
+        assert!(call["cleanup_error"].is_null());
+        assert!(call["cleanup_settlement"].is_null());
+    }
 }
 
 #[tokio::test]
