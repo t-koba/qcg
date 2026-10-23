@@ -377,7 +377,6 @@ impl Engine {
             Err(error)
                 if error.is_canceled()
                     || error.is_resumable_agent()
-                    || node.kind.as_str() == "llm.agent"
                     || matches!(
                         error,
                         EngineError::NeedsUser { .. } | EngineError::NeedsConfirm { .. }

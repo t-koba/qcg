@@ -345,8 +345,9 @@ impl Engine {
                         )?;
                         continue;
                     }
-                    // Agent operation guards own replay safety; defer their continuations to sequential re-entry.
-                    if node.kind.as_str() == "llm.agent" || error.is_resumable_agent() {
+                    // Explicit continuations defer to sequential re-entry; node kind
+                    // alone is not continuation evidence and never synthesizes one.
+                    if error.is_resumable_agent() {
                         states.insert(node.id.clone(), NodeState::Pending);
                         journal.event(
                             "step_interrupted",

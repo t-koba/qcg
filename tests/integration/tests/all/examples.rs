@@ -2051,13 +2051,19 @@ async fn agent_secret_tool_result_never_reaches_sse() {
 }
 
 #[tokio::test]
-async fn resumed_agent_secret_result_refuses_replay_without_reexecuting() {
+async fn settled_agent_secret_result_replays_failure_without_reexecuting() {
     if env_process::isolated() {
         return;
     }
     // D03: after the secret-rejected run, a resume must not repeat the
     // external effect. The run is restarted into the same output directory
     // so the engine folds the previous journal and recovers the state.
+    // Explicit continuation contract: the secret rejection is an ordinary
+    // `StepError`, so the first run settles the agent node terminally
+    // instead of leaving a resumable continuation. Resume therefore replays
+    // the recorded failure without re-entering the agent (the operation
+    // guard's manual-recovery refusal never triggers because nothing is
+    // re-issued); `ran.txt` still proves the effect happened exactly once.
     let _guard = ENV_LOCK.lock().await;
     let canary = "TOPSECRETVALUE";
     let _secret = TestSecretEnv::set(canary);
@@ -2089,14 +2095,16 @@ async fn resumed_agent_secret_result_refuses_replay_without_reexecuting() {
         llm_seed_override: None,
     };
     let first = service.run_generator_path(direct()).await;
-    assert!(first.is_err(), "the secret result must fail the first run");
+    let first_error = first
+        .expect_err("the secret result must fail the first run")
+        .to_string();
     let resumed = service.run_generator_path(direct()).await;
     let error = resumed
-        .expect_err("the resumed run must refuse automatic replay")
+        .expect_err("the resumed run must replay the settled failure")
         .to_string();
-    assert!(
-        error.contains("manual recovery"),
-        "resume must refuse instead of re-executing: {error}"
+    assert_eq!(
+        error, first_error,
+        "resume must replay the recorded secret failure instead of re-executing"
     );
     assert_eq!(
         std::fs::read_to_string(output_dir.join("ran.txt")).unwrap_or_default(),

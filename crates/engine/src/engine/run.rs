@@ -899,9 +899,10 @@ impl Engine {
                 )?;
                 tracing::debug!(run_id = %context.run_id, node = %id, "step started");
                 // F07-01: ordinary execution errors become node failures so hooks
-                // settle them. Cancellation, HITL and agent errors propagate:
-                // only the agent's operation guard can decide replay safety for
-                // its durable continuation; terminalizing it here would strand it.
+                // settle them. Cancellation, HITL and explicit continuation
+                // errors propagate: only a durable typed interaction can decide
+                // replay safety for its continuation; checkpoints alone never
+                // authorize replay, so generic errors settle here.
                 let outcome = match self
                     .execute_node_with_retry(&context, &journal, &mut vars, &mut budget, node)
                     .await
@@ -913,8 +914,7 @@ impl Engine {
                             || matches!(
                                 error,
                                 EngineError::NeedsUser { .. } | EngineError::NeedsConfirm { .. }
-                            )
-                            || node.kind.as_str() == "llm.agent" =>
+                            ) =>
                     {
                         return Err(error);
                     }

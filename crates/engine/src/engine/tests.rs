@@ -2356,8 +2356,11 @@ async fn foreach_child_timeout_wins_over_parent_timeout() {
     let _ = std::fs::remove_dir_all(&run_dir);
 }
 
-/// The agent executor owns continuation replay (and its operation guard), so
-/// the engine must let it decide what is safe on the next entry.
+/// Explicit continuation contract: node kind alone (including `llm.agent`)
+/// never synthesizes a resumable continuation, and a checkpoint alone never
+/// authorizes replay. Only durable typed interactions (`NeedsUser` /
+/// `NeedsConfirm` with stable identity) stay resumable across scheduler
+/// boundaries; generic `StepError` settles as an ordinary terminal failure.
 struct FailOnceChildStep {
     kind: &'static str,
     calls: Arc<AtomicUsize>,
@@ -2388,7 +2391,11 @@ impl StepExecutor for FailOnceChildStep {
 }
 
 #[tokio::test]
-async fn foreach_agent_child_error_resumes_without_terminalizing_owners() {
+async fn foreach_agent_child_generic_error_settles_without_resuming() {
+    // Explicit continuation contract: a generic `StepError::failed` from an
+    // `llm.agent` child is an ordinary failure. Node kind alone never
+    // synthesizes a resumable continuation, so the owners settle terminally
+    // and a second run never redispatches the child.
     for nested in [false, true] {
         let mut manifest = manifest(vec![foreach_node(
             "each",
@@ -2418,52 +2425,144 @@ async fn foreach_agent_child_error_resumes_without_terminalizing_owners() {
             calls: Arc::clone(&calls),
         });
         let engine = Engine::new(registry);
-        let run_dir = temp_run_dir(&format!("foreach-agent-resume-{nested}"));
+        let run_dir = temp_run_dir(&format!("foreach-agent-settles-{nested}"));
         let _guard = TempGuard(run_dir.clone());
         let contract = test_contract(&run_dir, manifest);
         let inputs = || BTreeMap::from([("items".into(), json!(["a"]))]);
-        let error = engine
-            .run_with_id(
-                "agent-resume".into(),
-                run_dir.join("meta"),
-                contract.clone(),
-                inputs(),
-                run_options(run_dir.join("workspace")),
-            )
-            .await
-            .expect_err("first agent entry must fail");
-        assert!(error.is_resumable_agent(), "{error:?}");
-        assert!(
-            error
-                .to_string()
-                .contains("child failed before continuation")
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        for path in &paths {
+        for attempt in 0..2 {
+            let error = engine
+                .run_with_id(
+                    "agent-settles".into(),
+                    run_dir.join("meta"),
+                    contract.clone(),
+                    inputs(),
+                    run_options(run_dir.join("workspace")),
+                )
+                .await
+                .expect_err("generic agent error must settle as a failure");
             assert!(
-                !has_event(&journal_events(&run_dir), "step_finished", path),
-                "{path} must remain resumable before resume",
+                !error.is_resumable_agent(),
+                "node kind must not synthesize a continuation: {error:?}"
+            );
+            assert!(
+                !matches!(
+                    error,
+                    EngineError::NeedsUser { .. } | EngineError::NeedsConfirm { .. }
+                ),
+                "generic agent error is not a typed interaction: {error:?}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("child failed before continuation"),
+                "{error:?}"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "settled child must not redispatch on attempt {attempt}"
             );
         }
-        engine
-            .run_with_id(
-                "agent-resume".into(),
-                run_dir.join("meta"),
-                contract,
-                inputs(),
-                run_options(run_dir.join("workspace")),
-            )
-            .await
-            .expect("resume must re-enter the agent and complete");
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
         let events = journal_events(&run_dir);
         for path in &paths {
-            let finishes: Vec<_> = events
-                .iter()
-                .filter(|event| event["t"] == "step_finished" && event["node"] == *path)
-                .collect();
-            assert_eq!(finishes.len(), 1, "{path}: {finishes:?}");
-            assert_eq!(finishes[0]["status"], "success", "{path}");
+            assert!(
+                events.iter().any(|event| {
+                    event["t"] == "step_finished"
+                        && event["node"] == *path
+                        && event["status"] == "failed"
+                }),
+                "missing terminal failure for {path}",
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn foreach_typed_interaction_child_stays_resumable_with_stable_identity() {
+    // Explicit continuation contract: a typed `NeedsUser` interaction through
+    // foreach stays resumable with the same question identity. The owners
+    // never settle terminally; a second run suspends again instead of failing.
+    for nested in [false, true] {
+        let mut manifest = manifest(vec![foreach_node(
+            "each",
+            "each_body",
+            "inputs.items",
+            1,
+            10,
+        )]);
+        manifest.inputs = foreach_items_input();
+        let child = node("child", "test.needs_user");
+        let (owner_paths, child_path) = if nested {
+            manifest.blocks.insert(
+                "each_body".into(),
+                vec![foreach_node("inner", "inner_body", "inputs.items", 1, 10)],
+            );
+            manifest.blocks.insert("inner_body".into(), vec![child]);
+            (
+                vec!["each", "each[0]/inner"],
+                "each[0]/inner[0]/child".to_string(),
+            )
+        } else {
+            manifest.blocks.insert("each_body".into(), vec![child]);
+            (vec!["each"], "each[0]/child".to_string())
+        };
+        let mut registry = StepRegistry::new();
+        registry.register(TestForeachStep);
+        registry.register(TestNeedsUserStep);
+        let engine = Engine::new(registry);
+        let run_dir = temp_run_dir(&format!("foreach-interaction-resume-{nested}"));
+        let _guard = TempGuard(run_dir.clone());
+        let contract = test_contract(&run_dir, manifest);
+        let inputs = || BTreeMap::from([("items".into(), json!(["a"]))]);
+        let mut question_ids = Vec::new();
+        for _ in 0..2 {
+            let error = engine
+                .run_with_id(
+                    "interaction-resume".into(),
+                    run_dir.join("meta"),
+                    contract.clone(),
+                    inputs(),
+                    run_options(run_dir.join("workspace")),
+                )
+                .await
+                .expect_err("typed interaction must suspend the loop");
+            match error {
+                EngineError::NeedsUser {
+                    question_id,
+                    question,
+                } => {
+                    assert_eq!(question.id, question_id);
+                    question_ids.push(question_id);
+                }
+                other => panic!("typed interaction must stay NeedsUser: {other:?}"),
+            }
+        }
+        assert_eq!(question_ids.len(), 2);
+        assert_eq!(
+            question_ids[0], question_ids[1],
+            "interaction identity must be stable across resume"
+        );
+        let events = journal_events(&run_dir);
+        assert!(
+            events.iter().any(|event| {
+                event["t"] == "step_finished"
+                    && event["node"] == child_path
+                    && event["status"] == "needs_user"
+                    && event["question"]["id"] == question_ids[0]
+            }),
+            "missing durable needs_user suspension for {child_path}"
+        );
+        for path in &owner_paths {
+            assert!(
+                !events.iter().any(|event| {
+                    event["t"] == "step_finished"
+                        && event["node"] == *path
+                        && (event["status"] == "failed"
+                            || event["status"] == "success"
+                            || event["status"] == "check_failed")
+                }),
+                "{path} must remain resumable, never terminally settled",
+            );
         }
     }
 }
@@ -2627,6 +2726,72 @@ async fn parallel_wave_reports_all_terminal_failures_joined() {
         "both sibling failures must be reported, got: {message}"
     );
     let _ = std::fs::remove_dir_all(&run_dir);
+}
+
+struct ParallelGenericAgentFailure(Arc<AtomicUsize>);
+
+#[async_trait]
+impl StepExecutor for ParallelGenericAgentFailure {
+    fn type_id(&self) -> &'static str {
+        "llm.agent"
+    }
+
+    fn traits(&self) -> StepTraits {
+        StepTraits {
+            parallel_safe: true,
+            ..StepTraits::default()
+        }
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &mut StepContext<'_>,
+        node: &NodeDef,
+    ) -> Result<StepOutcome, StepError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err(StepError::failed(&node.id, "generic agent failure"))
+    }
+}
+
+#[tokio::test]
+async fn parallel_generic_agent_error_settles_without_resuming() {
+    let mut manifest = manifest(vec![node("agent", "llm.agent"), node("peer", "test.pass")]);
+    manifest.parallel = vec!["agent".into(), "peer".into()];
+    let run_dir = temp_run_dir("parallel-generic-agent-error");
+    let _guard = TempGuard(run_dir.clone());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = StepRegistry::new();
+    registry.register(ParallelGenericAgentFailure(calls.clone()));
+    registry.register(TestPassStep);
+    let engine = Engine::new(registry);
+    let contract = test_contract(&run_dir, manifest);
+    for _ in 0..2 {
+        let mut options = run_options(run_dir.join("workspace"));
+        options.max_parallel_steps = 2;
+        let error = engine
+            .run_with_id(
+                "parallel-generic-agent-error".into(),
+                run_dir.join("meta"),
+                contract.clone(),
+                BTreeMap::new(),
+                options,
+            )
+            .await
+            .expect_err("generic agent failure must remain terminal");
+        assert!(!error.is_resumable_agent(), "{error:?}");
+        assert!(
+            error.to_string().contains("generic agent failure"),
+            "{error}"
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "agent must not redispatch");
+    let events = journal_events(&run_dir);
+    assert!(events.iter().any(|event| {
+        event["t"] == "step_finished" && event["node"] == "agent" && event["status"] == "failed"
+    }));
+    assert!(events.iter().any(|event| {
+        event["t"] == "step_finished" && event["node"] == "peer" && event["status"] == "success"
+    }));
 }
 
 #[cfg(unix)]

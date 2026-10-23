@@ -399,17 +399,11 @@ impl Engine {
                     vars.set_item(parent_item);
                     return Err(error);
                 }
-                Err(error)
-                    if error.is_resumable_agent()
-                        || addressed_node.kind.as_str() == "llm.agent" =>
-                {
+                Err(error) if error.is_resumable_agent() => {
                     vars.set_item(parent_item);
-                    // Preserve agent continuation ownership through enclosing scheduler boundaries.
-                    return Err(if error.is_resumable_agent() {
-                        error
-                    } else {
-                        EngineError::ResumableAgent(Box::new(error))
-                    });
+                    // Preserve explicit continuation ownership through enclosing
+                    // scheduler boundaries; node kind alone never synthesizes one.
+                    return Err(error);
                 }
                 Err(error) => {
                     let reason =

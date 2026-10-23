@@ -27,6 +27,16 @@ iteration, not the child executor whose effects are unknown, so the parent's
 capability cannot authorize it. These facts do not choose failure precedence or
 change fail-fast settlement.
 
+Explicit continuation rule: a generic `StepError` from any node kind,
+including `llm.agent`, settles as an ordinary failure and never synthesizes a
+resumable continuation; node kind and checkpoint presence alone are not
+continuation evidence. Typed interactions (`NeedsUser` / `NeedsConfirm`,
+surfaced as `EngineError::NeedsUser` / `EngineError::NeedsConfirm`) retain
+their stable question/confirmation identity across scheduler boundaries.
+Unreported-task replay remains separately guarded by the executor's explicit
+`replay_safe_after_interruption` capability; checkpoints alone never authorize
+replay.
+
 Direct `mcp.call` cleanup failures emit a durable `mcp_cleanup_settled` record
 before settlement, alongside the observation-only `tool_call`. Both retain the
 execution `status` and a bounded result (64 KiB, `truncated` flag) independently
