@@ -1330,3 +1330,49 @@ fn workspace_relative_key_survives_gateway_spellings_and_removal() {
     }
     std::fs::remove_dir_all(&root).expect("clean up workspace");
 }
+
+#[test]
+fn command_permission_matches_exact_and_wildcard_argv() {
+    let permission = |bin: &str, args: &[&str]| contract::CommandPermission {
+        bin: bin.into(),
+        args: args.iter().map(|arg| (*arg).into()).collect(),
+        purpose: String::new(),
+        isolation: None,
+        image: None,
+    };
+    let argv = |values: &[&str]| {
+        values
+            .iter()
+            .map(|value| (*value).into())
+            .collect::<Vec<String>>()
+    };
+
+    assert!(command_permission_matches(
+        &permission("git", &["status"]),
+        &argv(&["git", "status"])
+    ));
+    assert!(command_permission_matches(
+        &permission("git", &["*"]),
+        &argv(&["git", "status"])
+    ));
+    assert!(!command_permission_matches(
+        &permission("hg", &["status"]),
+        &argv(&["git", "status"])
+    ));
+    assert!(!command_permission_matches(
+        &permission("git", &["status"]),
+        &argv(&["git"])
+    ));
+    assert!(!command_permission_matches(
+        &permission("git", &["*", "status"]),
+        &argv(&["git", "anything", "other"])
+    ));
+    assert!(!command_permission_matches(
+        &permission("git", &["status"]),
+        &argv(&["git", "*"])
+    ));
+    assert!(!command_permission_matches(
+        &permission("git", &["sta*"]),
+        &argv(&["git", "status"])
+    ));
+}

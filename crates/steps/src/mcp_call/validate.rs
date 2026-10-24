@@ -114,15 +114,7 @@ pub(crate) fn mcp_access(ctx: &StepContext<'_>, command: &[String]) -> McpAccess
     let commands = permissions
         .commands
         .iter()
-        .filter(|permission| {
-            permission.bin == command.first().cloned().unwrap_or_default()
-                && permission.args.len() == command.len().saturating_sub(1)
-                && permission
-                    .args
-                    .iter()
-                    .zip(command.iter().skip(1))
-                    .all(|(allowed, actual)| allowed == actual || allowed == "*")
-        })
+        .filter(|permission| engine::command_permission_matches(permission, command))
         .filter_map(|permission| {
             let isolation = permission.isolation.as_ref()?;
             Some(McpCommandAccess {

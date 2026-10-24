@@ -1816,16 +1816,10 @@ pub(crate) fn agent_command_permission<'a>(
     permissions: &'a [contract::CommandPermission],
     command: &[String],
 ) -> Option<&'a contract::CommandPermission> {
-    let (bin, args) = command.split_first()?;
-    permissions.iter().find(|permission| {
-        permission.bin == *bin
-            && permission.args.len() == args.len()
-            && permission
-                .args
-                .iter()
-                .zip(args)
-                .all(|(pattern, actual)| pattern == "*" || pattern == actual)
-    })
+    let _ = command.split_first()?;
+    permissions
+        .iter()
+        .find(|permission| engine::command_permission_matches(permission, command))
 }
 
 pub(crate) fn agent_command_allowed(
