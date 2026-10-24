@@ -144,20 +144,22 @@ pub(crate) fn record_tool_call_failure(
     ctx: &StepContext<'_>,
     node: &NodeDef,
     call: &ChatToolCall,
-    error: &StepError,
-    failure: ToolCallFailure<'_>,
+    agent: Option<&str>,
+    phase: ToolCallPhase,
+    started: Instant,
+    error: ToolCallError,
 ) -> Result<(), StepError> {
     let event = tool_call_event(
         &node.id,
-        failure.agent,
+        agent,
         None,
         call,
         &Value::Null,
         ToolCallEventOutcome {
             status: ToolCallStatus::Failed,
-            phase: failure.phase,
-            error: Some(tool_call_error(failure.code, error)),
-            duration: failure.started.elapsed(),
+            phase,
+            error: Some(error),
+            duration: started.elapsed(),
         },
         &ctx.run.contract.manifest.audit,
     )?;
@@ -178,32 +180,13 @@ pub(crate) fn record_tool_call_failures(
             ctx,
             node,
             call,
-            error,
-            tool_call_failure(agent, phase, code, Instant::now()),
+            agent,
+            phase,
+            Instant::now(),
+            tool_call_error(code, error),
         )?;
     }
     Ok(())
-}
-
-pub(crate) struct ToolCallFailure<'a> {
-    agent: Option<&'a str>,
-    phase: ToolCallPhase,
-    code: ToolCallErrorCode,
-    started: Instant,
-}
-
-pub(crate) fn tool_call_failure(
-    agent: Option<&str>,
-    phase: ToolCallPhase,
-    code: ToolCallErrorCode,
-    started: Instant,
-) -> ToolCallFailure<'_> {
-    ToolCallFailure {
-        agent,
-        phase,
-        code,
-        started,
-    }
 }
 
 pub(crate) fn tool_reported_error(result: &Value) -> ToolCallError {

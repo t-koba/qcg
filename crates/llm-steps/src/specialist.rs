@@ -22,7 +22,7 @@ use crate::request::{
 };
 use crate::routes::invocation_routes;
 use crate::tool_events::{
-    record_tool_call_failure, record_tool_call_failures, tool_call_event, tool_call_failure,
+    record_tool_call_failure, record_tool_call_failures, tool_call_error, tool_call_event,
     tool_call_outcome, tool_reported_error,
 };
 
@@ -303,13 +303,10 @@ pub(crate) async fn execute_specialist_agent(
                     ctx,
                     node,
                     &call,
-                    &error,
-                    tool_call_failure(
-                        Some(agent_name),
-                        ToolCallPhase::InputValidation,
-                        ToolCallErrorCode::InvalidArguments,
-                        tool_started,
-                    ),
+                    Some(agent_name),
+                    ToolCallPhase::InputValidation,
+                    tool_started,
+                    tool_call_error(ToolCallErrorCode::InvalidArguments, &error),
                 )?;
                 return Err(error);
             }
@@ -318,13 +315,10 @@ pub(crate) async fn execute_specialist_agent(
                     ctx,
                     node,
                     &call,
-                    &error,
-                    tool_call_failure(
-                        Some(agent_name),
-                        ToolCallPhase::InputValidation,
-                        ToolCallErrorCode::InvalidArguments,
-                        tool_started,
-                    ),
+                    Some(agent_name),
+                    ToolCallPhase::InputValidation,
+                    tool_started,
+                    tool_call_error(ToolCallErrorCode::InvalidArguments, &error),
                 )?;
                 return Err(error);
             }
@@ -341,13 +335,10 @@ pub(crate) async fn execute_specialist_agent(
                     ctx,
                     node,
                     &call,
-                    &error,
-                    tool_call_failure(
-                        Some(agent_name),
-                        ToolCallPhase::InputValidation,
-                        ToolCallErrorCode::BudgetExceeded,
-                        tool_started,
-                    ),
+                    Some(agent_name),
+                    ToolCallPhase::InputValidation,
+                    tool_started,
+                    tool_call_error(ToolCallErrorCode::BudgetExceeded, &error),
                 )?;
                 return Err(error);
             }
@@ -365,13 +356,10 @@ pub(crate) async fn execute_specialist_agent(
                     ctx,
                     node,
                     &call,
-                    &error,
-                    tool_call_failure(
-                        Some(agent_name),
-                        ToolCallPhase::InputGuardrail,
-                        ToolCallErrorCode::GuardrailRejected,
-                        tool_started,
-                    ),
+                    Some(agent_name),
+                    ToolCallPhase::InputGuardrail,
+                    tool_started,
+                    tool_call_error(ToolCallErrorCode::GuardrailRejected, &error),
                 )?;
                 return Err(error);
             }
@@ -380,13 +368,10 @@ pub(crate) async fn execute_specialist_agent(
                     ctx,
                     node,
                     &call,
-                    &error,
-                    tool_call_failure(
-                        Some(agent_name),
-                        ToolCallPhase::InputGuardrail,
-                        ToolCallErrorCode::GuardrailRejected,
-                        tool_started,
-                    ),
+                    Some(agent_name),
+                    ToolCallPhase::InputGuardrail,
+                    tool_started,
+                    tool_call_error(ToolCallErrorCode::GuardrailRejected, &error),
                 )?;
                 return Err(error);
             }
@@ -408,13 +393,10 @@ pub(crate) async fn execute_specialist_agent(
                     ctx,
                     node,
                     &call,
-                    &error,
-                    tool_call_failure(
-                        Some(agent_name),
-                        ToolCallPhase::InputValidation,
-                        ToolCallErrorCode::InvalidArguments,
-                        tool_started,
-                    ),
+                    Some(agent_name),
+                    ToolCallPhase::InputValidation,
+                    tool_started,
+                    tool_call_error(ToolCallErrorCode::InvalidArguments, &error),
                 )?;
                 return Err(error);
             }
@@ -441,13 +423,10 @@ pub(crate) async fn execute_specialist_agent(
                         ctx,
                         node,
                         &call,
-                        &error,
-                        tool_call_failure(
-                            Some(agent_name),
-                            ToolCallPhase::Execution,
-                            ToolCallErrorCode::ExecutionFailed,
-                            tool_started,
-                        ),
+                        Some(agent_name),
+                        ToolCallPhase::Execution,
+                        tool_started,
+                        tool_call_error(ToolCallErrorCode::ExecutionFailed, &error),
                     )?;
                     return Err(error);
                 }
@@ -471,13 +450,10 @@ pub(crate) async fn execute_specialist_agent(
                         ctx,
                         node,
                         &call,
-                        &error,
-                        tool_call_failure(
-                            Some(agent_name),
-                            ToolCallPhase::Execution,
-                            ToolCallErrorCode::ExecutionFailed,
-                            tool_started,
-                        ),
+                        Some(agent_name),
+                        ToolCallPhase::Execution,
+                        tool_started,
+                        tool_call_error(ToolCallErrorCode::ExecutionFailed, &error),
                     )?;
                     return Err(error);
                 }
@@ -533,13 +509,10 @@ pub(crate) async fn execute_specialist_agent(
                     ctx,
                     node,
                     &call,
-                    &error,
-                    tool_call_failure(
-                        Some(agent_name),
-                        ToolCallPhase::OutputGuardrail,
-                        ToolCallErrorCode::OutputRejected,
-                        tool_started,
-                    ),
+                    Some(agent_name),
+                    ToolCallPhase::OutputGuardrail,
+                    tool_started,
+                    tool_call_error(ToolCallErrorCode::OutputRejected, &error),
                 )?;
                 return Err(error);
             }
@@ -569,13 +542,10 @@ pub(crate) async fn execute_specialist_agent(
                     ctx,
                     node,
                     &call,
-                    &error,
-                    tool_call_failure(
-                        Some(agent_name),
-                        ToolCallPhase::OutputGuardrail,
-                        ToolCallErrorCode::OutputRejected,
-                        tool_started,
-                    ),
+                    Some(agent_name),
+                    ToolCallPhase::OutputGuardrail,
+                    tool_started,
+                    tool_call_error(ToolCallErrorCode::OutputRejected, &error),
                 )?;
                 return Err(error);
             }

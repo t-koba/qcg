@@ -24,8 +24,7 @@ use crate::request::scan_llm_text;
 use crate::search::{execute_web_search, http_body_value, url_host_matches};
 use crate::specialist::{SpecialistAgentSpec, execute_specialist_agent};
 use crate::tool_events::{
-    execute_mcp_tool, record_tool_call_failure, tool_call_error, tool_call_event,
-    tool_call_failure, tool_call_outcome,
+    execute_mcp_tool, record_tool_call_failure, tool_call_error, tool_call_event, tool_call_outcome,
 };
 
 #[derive(Clone, Copy)]
@@ -1809,13 +1808,16 @@ pub(crate) fn recover_agent_tool_call_failure(
     // Unrecovered calls keep the same failure event as the caller used to
     // write; one owner handles both configured Fail and no resolution.
     let fail = || {
-        let outcome = tool_call_failure(
+        record_tool_call_failure(
+            ctx,
+            node,
+            call,
             None,
             failure.phase,
-            failure.tool_error_code,
             failure.started,
-        );
-        record_tool_call_failure(ctx, node, call, error, outcome).map(|()| None)
+            tool_call_error(failure.tool_error_code, error),
+        )
+        .map(|()| None)
     };
     let id = Some(call.id.as_str());
     let Some((action, limits)) = agent_tool_failure_resolution(tools, &call.name, failure.code)
