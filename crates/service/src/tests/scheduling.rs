@@ -165,8 +165,10 @@ async fn bounded_scheduler_comparison_boundary_safety_and_interrupt_latency() {
                     "checkpoint must precede durable handoff"
                 );
                 assert!(
-                    !journal.contains("\"node\":\"after\""),
-                    "no next node before handoff"
+                    !events[..yielded]
+                        .iter()
+                        .any(|e| e["t"] == "step_started" && e["node"] == "after"),
+                    "no next node starts before handoff"
                 );
             }
             assert_eq!(
@@ -942,14 +944,52 @@ options = ["yes"]
     drop(restored);
     wait_for_runs_store_release(&runs).await;
     let again = service(&root, ServiceDeploymentPolicy::default());
-    let seq = recovered.last_seq;
     again.resume_recovered_runs().await;
+    let resumed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let finished = {
+                let runs = again.inner.runs.read().await;
+                let task = runs[&id]
+                    .task
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                task.as_ref()
+                    .is_some_and(tokio::task::JoinHandle::is_finished)
+            };
+            if finished {
+                break engine::RunState::fold_journal(&journal_path).unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        let state = engine::RunState::fold_journal(&journal_path).unwrap();
+        panic!(
+            "resumed prompt task did not finish: seq={} elapsed={:?}",
+            state.last_seq, state.budget.elapsed
+        );
+    });
+    let previously_recovered = recovered
+        .budget
+        .elapsed
+        .as_ref()
+        .unwrap()
+        .active_nanoseconds;
+    let elapsed_again = resumed.budget.elapsed.as_ref().unwrap();
+    assert!(elapsed_again.active_started_at.is_none());
+    assert!(
+        elapsed_again.active_nanoseconds < previously_recovered + 2_000_000_000,
+        "the two-second crash interval is recovered once, not on each restart"
+    );
+    let values = crate::summaries::read_journal_events(&runs.join(&id)).unwrap();
     assert_eq!(
-        engine::RunState::fold_journal(&journal_path)
-            .unwrap()
-            .last_seq,
-        seq,
-        "closed paused run is not recovered/charged again"
+        values
+            .iter()
+            .filter(|event| event["t"] == "operation_started")
+            .count(),
+        2,
+        "reopening the prompt must not replay completed effects"
     );
     again.shutdown_active_runs().await.unwrap();
 }
