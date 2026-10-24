@@ -168,9 +168,9 @@ deduplication: an otherwise eligible reuse can be admitted as a new request,
 starting another run or repeating side effects. Expiry removes only the
 idempotency mapping; it does not delete, cancel, or undo the original run.
 Clients should retain the original `run_id` and reconcile its state rather
-than rely on reuse of an expired key. The documented 24-hour default does not
-promise an exact per-peer cutoff because in-memory and durable TTL views can
-currently differ.
+than rely on reuse of an expired key. In-memory Ready caches keep the persisted
+record's original creation time, so reading or replaying a mapping does not
+restart its configured TTL.
 Snapshots of a `Queued` run additionally expose `queued_at` (RFC 3339) and
 `queue_position` (1-based admission order) for queue observability.
 The cancel response is returned after the active engine task has stopped. If a

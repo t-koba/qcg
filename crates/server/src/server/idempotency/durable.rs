@@ -24,6 +24,12 @@ pub(crate) struct DurableIdempotencyRecord {
     pub(crate) generation: u64,
 }
 
+impl DurableIdempotencyRecord {
+    pub(crate) fn expired_at(&self, now: u64, ttl: std::time::Duration) -> bool {
+        now.saturating_sub(self.created_at_unix) >= ttl.as_secs().max(1)
+    }
+}
+
 fn idempotency_dir(runs_dir: &Utf8PathBuf) -> Utf8PathBuf {
     runs_dir.join("idempotency")
 }
@@ -357,7 +363,7 @@ fn reap_expired_ready_snapshot(
         return Err("idempotency record key mismatch".into());
     }
     let generation = record.generation;
-    if now_unix()?.saturating_sub(record.created_at_unix) >= ttl.as_secs().max(1) {
+    if record.expired_at(now_unix()?, ttl) {
         std::fs::remove_file(idempotency_path(runs_dir, key).as_std_path())
             .map_err(|error| error.to_string())?;
         return Ok((None, generation));
@@ -460,9 +466,7 @@ pub(crate) fn claim_durable_pending(
         if committed.digest != digest {
             return Ok(ClaimOutcome::Conflict);
         }
-        return Ok(ClaimOutcome::Ready {
-            run_id: committed.run_id,
-        });
+        return Ok(ClaimOutcome::Ready(committed));
     }
     // A live (Valid) predecessor means another owner holds the key. When
     // the digest differs, conflict immediately at claim time instead of
@@ -755,9 +759,7 @@ pub(crate) enum ClaimOutcome {
     /// instead of executing. Checked under the claim lock so a commit
     /// landing between the waiter's last look and this claim cannot slip
     /// through into a second execution (B02).
-    Ready {
-        run_id: String,
-    },
+    Ready(DurableIdempotencyRecord),
     /// The key is committed for a different request digest.
     Conflict,
 }
@@ -993,7 +995,7 @@ fn parse_pending_bytes(key: &str, bytes: &[u8]) -> PendingRead {
 /// infrastructure, not a time to guess from: falling back to 0 would mark
 /// every record expired and let claimants adopt live owners' runs, so
 /// every caller fails closed instead (E02).
-fn now_unix() -> Result<u64, String> {
+pub(crate) fn now_unix() -> Result<u64, String> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -1010,6 +1012,15 @@ pub(crate) fn load_durable_ready_result(
     runs_dir: &Utf8PathBuf,
     key: &str,
     ttl: std::time::Duration,
+) -> Result<Option<DurableIdempotencyRecord>, String> {
+    load_durable_ready_at(runs_dir, key, ttl, now_unix)
+}
+
+fn load_durable_ready_at(
+    runs_dir: &Utf8PathBuf,
+    key: &str,
+    ttl: std::time::Duration,
+    now: impl FnOnce() -> Result<u64, String>,
 ) -> Result<Option<DurableIdempotencyRecord>, String> {
     let path = idempotency_path(runs_dir, key);
     let bytes = match read_bounded_idempotency_file(&path) {
@@ -1028,7 +1039,7 @@ pub(crate) fn load_durable_ready_result(
     if record.key != key {
         return Err("idempotency record key mismatch".into());
     }
-    if now_unix()?.saturating_sub(record.created_at_unix) >= ttl.as_secs().max(1) {
+    if record.expired_at(now()?, ttl) {
         return Ok(None);
     }
     Ok(Some(record))
@@ -1036,7 +1047,7 @@ pub(crate) fn load_durable_ready_result(
 
 #[derive(Debug)]
 pub(crate) enum WaitOutcome {
-    Ready(String),
+    Ready(DurableIdempotencyRecord),
     /// The owner died before committing: the caller loops back and claims,
     /// adopting the orphaned run id instead of wedging. The id rides along
     /// so a caller that cannot re-observe the claim still adopts the run
@@ -1104,7 +1115,7 @@ async fn wait_for_peer_ready_with_deadline(
                 if record.digest != digest {
                     return Err(idempotency_conflict());
                 }
-                return Ok(WaitOutcome::Ready(record.run_id));
+                return Ok(WaitOutcome::Ready(record));
             }
             Ok(None) => {}
             Err(detail) => {
@@ -1153,7 +1164,7 @@ async fn wait_for_peer_ready_with_deadline(
                     if record.digest != digest {
                         return Err(idempotency_conflict());
                     }
-                    return Ok(WaitOutcome::Ready(record.run_id));
+                    return Ok(WaitOutcome::Ready(record));
                 }
                 return Ok(WaitOutcome::RetryClaim {
                     adopted_run_id: pending.run_id.clone(),
@@ -1167,7 +1178,7 @@ async fn wait_for_peer_ready_with_deadline(
                     if record.digest != digest {
                         return Err(idempotency_conflict());
                     }
-                    return Ok(WaitOutcome::Ready(record.run_id));
+                    return Ok(WaitOutcome::Ready(record));
                 }
                 return Ok(WaitOutcome::RetryClaim {
                     adopted_run_id: None,
@@ -1187,7 +1198,7 @@ async fn wait_for_peer_ready_with_deadline(
                 if record.digest != digest {
                     return Err(idempotency_conflict());
                 }
-                return Ok(WaitOutcome::Ready(record.run_id));
+                return Ok(WaitOutcome::Ready(record));
             }
             return Err(ApiHttpError::service_unavailable(
                 "idempotent request is still in progress elsewhere; retry with the same key",
@@ -1230,7 +1241,8 @@ impl From<String> for StoreReadyError {
     }
 }
 
-/// Persist a Ready record atomically (create_new temp + rename) so restart
+/// Return the committed record (including its original timestamp), never a
+/// new lifetime for an existing winner. Persist a Ready record atomically (create_new temp + rename) so restart
 /// and peer processes observe the same operation id to run id mapping.
 ///
 /// The commit must prove it still owns the durable claim: under the single
@@ -1252,7 +1264,7 @@ pub(crate) fn store_durable_ready(
     owner: &str,
     generation: u64,
     ttl: std::time::Duration,
-) -> Result<String, StoreReadyError> {
+) -> Result<DurableIdempotencyRecord, StoreReadyError> {
     std::fs::create_dir_all(idempotency_dir(runs_dir).as_std_path())
         .map_err(|error| error.to_string())?;
     let path = idempotency_path(runs_dir, key);
@@ -1323,10 +1335,10 @@ pub(crate) fn store_durable_ready(
         match &pending_read {
             PendingRead::Valid(pending) => {
                 check_live_ownership(pending)?;
-                return Ok(existing.run_id);
+                return Ok(existing);
             }
             PendingRead::Absent => {
-                return Ok(existing.run_id);
+                return Ok(existing);
             }
             PendingRead::Expired(_) => {
                 return Err(StoreReadyError::Storage(
@@ -1430,7 +1442,7 @@ pub(crate) fn store_durable_ready(
     if let Err(error) = sync_dir(&idempotency_dir(runs_dir)) {
         tracing::warn!(%error, "idempotency ready directory sync failed; file sync already durable");
     }
-    Ok(run_id.to_string())
+    Ok(record)
 }
 
 /// Reverse mapping from a run to its idempotency key, stored alongside the
@@ -1673,6 +1685,124 @@ mod tests {
             generation,
             policy::IDEMPOTENCY_TTL,
         )
+        .map(|record| record.run_id)
+    }
+
+    /// Exercise the real cache constructor and pruning with a controlled wall
+    /// clock, without advancing monotonic time or sleeping near a deadline.
+    fn assert_cache_keeps_deadline(record: DurableIdempotencyRecord, created: u64) {
+        use super::super::config::{IdempotencyEntry, prune_idempotency};
+        use std::{collections::BTreeMap, time::Instant};
+
+        assert_eq!(record.created_at_unix, created);
+        let key = record.key.clone();
+        let mut cache = BTreeMap::from([(key.clone(), IdempotencyEntry::ready(record))]);
+        let ttl = policy::IDEMPOTENCY_TTL;
+        let deadline = created + ttl.as_secs();
+        let now = Instant::now();
+        prune_idempotency(&mut cache, now, deadline - 1, ttl, 2).expect("prune before expiry");
+        assert!(cache.contains_key(&key), "last retained second must replay");
+        prune_idempotency(&mut cache, now, deadline, ttl, 2).expect("prune at expiry");
+        assert!(cache.is_empty(), "cache insertion must not restart the TTL");
+    }
+
+    #[test]
+    fn fresh_cache_expires_at_the_persisted_ready_boundary() {
+        let runs_dir = temp_runs_dir("ready-cache-deadline");
+        let _guard = TempGuard(runs_dir.clone());
+        let created = 1_000_000;
+        let record = DurableIdempotencyRecord {
+            key: "near-expired".into(),
+            digest: "digest".into(),
+            run_id: "run-A".into(),
+            created_at_unix: created,
+            generation: 7,
+        };
+        std::fs::create_dir_all(idempotency_dir(&runs_dir)).expect("idempotency directory");
+        let path = idempotency_path(&runs_dir, &record.key);
+        let bytes = serde_json::to_vec(&record).expect("serialize Ready");
+        std::fs::write(&path, &bytes).expect("persist near-expired Ready");
+        let ttl = policy::IDEMPOTENCY_TTL;
+        let deadline = created + ttl.as_secs();
+        let loaded = load_durable_ready_at(&runs_dir, &record.key, ttl, || Ok(deadline - 1))
+            .expect("fresh reader")
+            .expect("still retained");
+        assert_cache_keeps_deadline(loaded, created);
+        for now in [deadline, deadline + 1] {
+            assert!(
+                load_durable_ready_at(&runs_dir, &record.key, ttl, || Ok(now))
+                    .expect("expired reader")
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            std::fs::read(path).expect("observation never deletes"),
+            bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn waiter_claim_and_commit_winner_keep_the_ready_timestamp() {
+        let runs_dir = temp_runs_dir("ready-protocol-deadline");
+        let _guard = TempGuard(runs_dir.clone());
+        let key = "key-ready-deadline";
+        let (owner, generation) = claim_owner(&runs_dir, key, "digest", "run-A");
+        let ttl = policy::IDEMPOTENCY_TTL;
+        let before = now_unix().expect("clock");
+        let mut record =
+            store_durable_ready(&runs_dir, key, "digest", "run-A", &owner, generation, ttl)
+                .expect("new local commit");
+        let after = now_unix().expect("clock");
+        assert!((before..=after).contains(&record.created_at_unix));
+        let persisted = load_durable_ready_result(&runs_dir, key, ttl)
+            .expect("read")
+            .expect("Ready");
+        assert_eq!(record.created_at_unix, persisted.created_at_unix);
+        assert_cache_keeps_deadline(record.clone(), record.created_at_unix);
+
+        // A 23-hour-old record leaves an hour of real time for the protocol
+        // calls; its final second and exact expiry are checked by virtual
+        // timestamps above. No scheduling race or arbitrary sleep is needed.
+        let created = before - ttl.as_secs() + 3600;
+        record.created_at_unix = created;
+        let path = idempotency_path(&runs_dir, key);
+        let bytes = serde_json::to_vec(&record).expect("serialize old Ready");
+        std::fs::write(&path, &bytes).expect("age Ready");
+
+        let WaitOutcome::Ready(waited) = wait_for_peer_ready(&runs_dir, key, "digest", ttl)
+            .await
+            .expect("same-digest waiter")
+        else {
+            panic!("Ready must win")
+        };
+        assert_cache_keeps_deadline(waited, created);
+        let ClaimOutcome::Ready(claimed) =
+            claim_pending(&runs_dir, key, "digest", "run-B").expect("claim observes Ready")
+        else {
+            panic!("Ready must win")
+        };
+        assert_cache_keeps_deadline(claimed, created);
+        // Both commit convergence arms must return the original record:
+        // a matching live reservation, then an absent (released) reservation.
+        let winner =
+            store_durable_ready(&runs_dir, key, "digest", "run-A", &owner, generation, ttl)
+                .expect("commit with live reservation");
+        assert_eq!(winner.run_id, "run-A");
+        assert_cache_keeps_deadline(winner, created);
+        release_durable_pending(&runs_dir, key, &owner, generation).expect("release reservation");
+        let winner = store_durable_ready(
+            &runs_dir,
+            key,
+            "digest",
+            "run-surplus",
+            &owner,
+            generation,
+            ttl,
+        )
+        .expect("commit adopts existing winner");
+        assert_eq!(winner.run_id, "run-A");
+        assert_cache_keeps_deadline(winner, created);
+        assert_eq!(std::fs::read(path).expect("winner unchanged"), bytes);
     }
 
     /// Rewrites the live pending claim for `key` with `created_at_unix: 0`, so
@@ -2234,7 +2364,7 @@ mod tests {
         // A retry for the same digest converges at claim time onto run-A
         // without a new owner.
         match claim_pending(&runs_dir, key, "digest", "run-B").expect("claim should not error") {
-            ClaimOutcome::Ready { run_id } => assert_eq!(run_id, "run-A"),
+            ClaimOutcome::Ready(record) => assert_eq!(record.run_id, "run-A"),
             other => panic!(
                 "same digest must converge at claim, got {}",
                 outcome_name(&other)
@@ -2321,7 +2451,7 @@ mod tests {
         match outcome {
             ClaimOutcome::Owner { .. } => "Owner",
             ClaimOutcome::Peer => "Peer",
-            ClaimOutcome::Ready { .. } => "Ready",
+            ClaimOutcome::Ready(_) => "Ready",
             ClaimOutcome::Conflict => "Conflict",
         }
     }

@@ -2,6 +2,7 @@
 //! entry table, and its pruning. Durable protocol lives in [`durable`],
 //! owner cleanup in [`guard`], request orchestration in the parent module.
 
+use super::durable::DurableIdempotencyRecord;
 use anyhow::Result;
 use policy::{IDEMPOTENCY_MAX_ENTRIES, IDEMPOTENCY_TTL};
 use std::collections::BTreeMap;
@@ -53,11 +54,20 @@ pub(crate) enum IdempotencyEntry {
         created_at: Instant,
         completed: tokio::sync::watch::Sender<bool>,
     },
+    // Persisted time governs TTL; cached_at only orders capacity eviction.
     Ready {
-        digest: String,
-        created_at: Instant,
-        run_id: String,
+        record: DurableIdempotencyRecord,
+        cached_at: Instant,
     },
+}
+
+impl IdempotencyEntry {
+    pub(crate) fn ready(record: DurableIdempotencyRecord) -> Self {
+        Self::Ready {
+            record,
+            cached_at: Instant::now(),
+        }
+    }
 }
 
 /// Entries are judged by the frozen boot `ttl` and `max_entries` passed by
@@ -69,21 +79,19 @@ pub(crate) enum IdempotencyEntry {
 pub(crate) fn prune_idempotency(
     entries: &mut BTreeMap<String, IdempotencyEntry>,
     now: Instant,
+    now_unix: u64,
     ttl: std::time::Duration,
     max_entries: usize,
 ) -> Result<(), String> {
-    entries.retain(|_, entry| {
-        let created_at = match entry {
-            IdempotencyEntry::Pending { created_at, .. }
-            | IdempotencyEntry::Ready { created_at, .. } => created_at,
-        };
-        now.duration_since(*created_at) < ttl
+    entries.retain(|_, entry| match entry {
+        IdempotencyEntry::Pending { created_at, .. } => now.duration_since(*created_at) < ttl,
+        IdempotencyEntry::Ready { record, .. } => !record.expired_at(now_unix, ttl),
     });
     while entries.len() >= max_entries {
         let Some(oldest) = entries
             .iter()
             .filter_map(|(key, entry)| match entry {
-                IdempotencyEntry::Ready { created_at, .. } => Some((key, *created_at)),
+                IdempotencyEntry::Ready { cached_at, .. } => Some((key, *cached_at)),
                 IdempotencyEntry::Pending { .. } => None,
             })
             .min_by_key(|(_, created_at)| *created_at)
@@ -101,6 +109,49 @@ mod tests {
     use super::*;
 
     static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn capacity_still_evicts_the_oldest_cache_insertion_not_pending() {
+        let now = Instant::now();
+        let ttl = policy::IDEMPOTENCY_TTL;
+        let (completed, _) = tokio::sync::watch::channel(false);
+        let record = |key: &str, created| DurableIdempotencyRecord {
+            key: key.into(),
+            digest: "digest".into(),
+            run_id: "run".into(),
+            created_at_unix: created,
+            generation: 1,
+        };
+        let mut entries = BTreeMap::from([
+            (
+                "first".into(),
+                IdempotencyEntry::Ready {
+                    record: record("first", 200),
+                    cached_at: now - std::time::Duration::from_secs(2),
+                },
+            ),
+            (
+                "second".into(),
+                IdempotencyEntry::Ready {
+                    record: record("second", 100),
+                    cached_at: now - std::time::Duration::from_secs(1),
+                },
+            ),
+            (
+                "pending".into(),
+                IdempotencyEntry::Pending {
+                    digest: "digest".into(),
+                    owner_id: uuid::Uuid::now_v7(),
+                    created_at: now,
+                    completed,
+                },
+            ),
+        ]);
+        prune_idempotency(&mut entries, now, 300, ttl, 3).expect("capacity prune");
+        assert!(!entries.contains_key("first"));
+        assert!(entries.contains_key("second"));
+        assert!(entries.contains_key("pending"));
+    }
 
     #[test]
     fn invalid_idempotency_policy_names_its_variable() {

@@ -636,8 +636,8 @@ Admission records and run coordination locks are different mechanisms.
   the key eligible for new admission: a reuse may start another run and repeat
   side effects. Expiry does not delete or undo the original run. Clients must
   retain the original run ID and reconcile it rather than depend on an expired
-  key. Because in-memory and durable TTL views can differ, 24 hours is the
-  default policy, not a promise of an exact per-peer cutoff.
+  key. In-memory Ready caches and durable records expire from the same
+  persisted creation time; loading or replaying a record does not renew it.
   The pre-execution ownership recheck cannot fully close the window before
   execution starts: a successor that acts in between may let the stale owner
   briefly start its engine. Such surplus execution never commits and is
@@ -667,8 +667,8 @@ result instead of starting a duplicate run; changed content for a still-bound
 key returns `409 Conflict`. Same-process identical pending requests wait and
 replay; a pending request owned by another process may return `503`. The
 24-hour default retention is subject to `IDEMPOTENCY_TTL_SECS` and the
-`IDEMPOTENCY_MAX_ENTRIES` limit, and does not promise an exact per-peer cutoff
-while in-memory and durable TTL views can differ. After expiry or eviction,
+`IDEMPOTENCY_MAX_ENTRIES` limit. Ready caches preserve the persisted record's
+creation time rather than restarting its TTL. After expiry or eviction,
 reuse may be admitted as new and start another run or repeat side effects;
 expiry does not remove or undo the original. Preserve its run ID and reconcile
 that run rather than rely on an expired key. Records under

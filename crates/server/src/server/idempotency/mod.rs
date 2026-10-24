@@ -109,15 +109,16 @@ where
     let (memory_run_id, memory_pending) = {
         let entries = call.state.idempotency.lock().await;
         match entries.get(&key) {
-            Some(IdempotencyEntry::Ready {
-                digest: stored,
-                created_at,
-                run_id,
-            }) if created_at.elapsed() < call.state.idempotency_ttl => {
-                if stored != &digest {
+            Some(IdempotencyEntry::Ready { record, .. })
+                if !record.expired_at(
+                    durable::now_unix().map_err(ApiHttpError::internal)?,
+                    call.state.idempotency_ttl,
+                ) =>
+            {
+                if record.digest != digest {
                     return Err(idempotency_conflict());
                 }
-                (Some(run_id.clone()), false)
+                (Some(record.run_id.clone()), false)
             }
             Some(IdempotencyEntry::Pending {
                 digest: stored,
@@ -266,16 +267,17 @@ where
                 prune_idempotency(
                     &mut idempotency,
                     Instant::now(),
+                    durable::now_unix().map_err(ApiHttpError::internal)?,
                     policy_ttl,
                     policy_max_entries,
                 )
                 .map_err(ApiHttpError::internal)?;
                 match idempotency.get(&idempotency_key) {
-                    Some(IdempotencyEntry::Ready { digest, run_id, .. }) => {
-                        if digest != &request_digest {
+                    Some(IdempotencyEntry::Ready { record, .. }) => {
+                        if record.digest != request_digest {
                             return Err(idempotency_conflict());
                         }
-                        let run_id = run_id.clone();
+                        let run_id = record.run_id.clone();
                         drop(idempotency);
                         let snapshot = state
                             .service
@@ -311,22 +313,7 @@ where
                             if durable.digest != request_digest {
                                 return Err(idempotency_conflict());
                             }
-                            let run_id = durable.run_id.clone();
-                            // Refresh in-memory cache for subsequent hits.
-                            state.idempotency.lock().await.insert(
-                                idempotency_key.clone(),
-                                IdempotencyEntry::Ready {
-                                    digest: durable.digest,
-                                    created_at: Instant::now(),
-                                    run_id: run_id.clone(),
-                                },
-                            );
-                            let snapshot = state
-                                .service
-                                .snapshot(run_id)
-                                .await
-                                .map_err(ApiHttpError::from_api)?;
-                            return respond_with_snapshot(snapshot, created);
+                            return replay_ready(state, durable, created).await;
                         }
                         // Cross-process reservation before becoming in-memory
                         // owner: peers with the same key converge to one run.
@@ -374,21 +361,8 @@ where
                                 )
                                 .await?
                                 {
-                                    WaitOutcome::Ready(run_id) => {
-                                        state.idempotency.lock().await.insert(
-                                            idempotency_key.clone(),
-                                            IdempotencyEntry::Ready {
-                                                digest: request_digest.clone(),
-                                                created_at: Instant::now(),
-                                                run_id: run_id.clone(),
-                                            },
-                                        );
-                                        let snapshot = state
-                                            .service
-                                            .snapshot(run_id)
-                                            .await
-                                            .map_err(ApiHttpError::from_api)?;
-                                        return respond_with_snapshot(snapshot, created);
+                                    WaitOutcome::Ready(record) => {
+                                        return replay_ready(state, record, created).await;
                                     }
                                     // The owner died before committing: loop back
                                     // and claim (adopting its run id) instead of
@@ -408,23 +382,9 @@ where
                                 claim_generation = Some(generation);
                                 run_id
                             }
-                            ClaimOutcome::Ready { run_id } => {
-                                // Committed between our last look and the claim:
-                                // converge without executing.
-                                state.idempotency.lock().await.insert(
-                                    idempotency_key.clone(),
-                                    IdempotencyEntry::Ready {
-                                        digest: request_digest.clone(),
-                                        created_at: Instant::now(),
-                                        run_id: run_id.clone(),
-                                    },
-                                );
-                                let snapshot = state
-                                    .service
-                                    .snapshot(run_id)
-                                    .await
-                                    .map_err(ApiHttpError::from_api)?;
-                                return respond_with_snapshot(snapshot, created);
+                            ClaimOutcome::Ready(record) => {
+                                // Committed between our last look and the claim.
+                                return replay_ready(state, record, created).await;
                             }
                             ClaimOutcome::Conflict => {
                                 return Err(idempotency_conflict());
@@ -449,10 +409,15 @@ where
                             Absent,
                         }
                         let reexamined = match idempotency.get(&idempotency_key) {
-                            Some(IdempotencyEntry::Ready { digest, run_id, .. }) => {
+                            Some(IdempotencyEntry::Ready { record, .. })
+                                if !record.expired_at(
+                                    durable::now_unix().map_err(ApiHttpError::internal)?,
+                                    policy_ttl,
+                                ) =>
+                            {
                                 Reexamined::Ready {
-                                    digest: digest.clone(),
-                                    run_id: run_id.clone(),
+                                    digest: record.digest.clone(),
+                                    run_id: record.run_id.clone(),
                                 }
                             }
                             Some(IdempotencyEntry::Pending {
@@ -461,7 +426,7 @@ where
                                 digest: digest.clone(),
                                 waiter: completed.subscribe(),
                             },
-                            None => Reexamined::Absent,
+                            None | Some(IdempotencyEntry::Ready { .. }) => Reexamined::Absent,
                         };
                         match reexamined {
                             Reexamined::Ready { digest, run_id } => {
@@ -705,7 +670,7 @@ where
             .await
             .map_err(ApiHttpError::from_api)
     };
-    let committed_run_id = match store_durable_ready_async(
+    let committed = match store_durable_ready_async(
         state.runs_dir.clone(),
         idempotency_key.clone(),
         request_digest.clone(),
@@ -717,7 +682,7 @@ where
     .await
     {
         Ok(committed) => {
-            if committed != run_id {
+            if committed.run_id != run_id {
                 // Same-digest race won by a peer's mapping: our execution
                 // is surplus; converge it and return the winner (E02). A
                 // cancel failure propagates instead of warn-only.
@@ -811,6 +776,7 @@ where
             )));
         }
     };
+    let committed_run_id = committed.run_id.clone();
     let completed = {
         let mut idempotency = state.idempotency.lock().await;
         let completed = if matches!(
@@ -827,14 +793,7 @@ where
         } else {
             None
         };
-        idempotency.insert(
-            idempotency_key.clone(),
-            IdempotencyEntry::Ready {
-                digest: request_digest.clone(),
-                created_at: Instant::now(),
-                run_id: committed_run_id.clone(),
-            },
-        );
+        idempotency.insert(idempotency_key.clone(), IdempotencyEntry::ready(committed));
         completed
     };
     release_durable_pending_or_503(
@@ -851,6 +810,26 @@ where
     let snapshot = state
         .service
         .snapshot(committed_run_id)
+        .await
+        .map_err(ApiHttpError::from_api)?;
+    respond_with_snapshot(snapshot, created)
+}
+
+/// Every observed Ready caches the original record, including its TTL anchor.
+async fn replay_ready(
+    state: &Arc<AppState>,
+    record: durable::DurableIdempotencyRecord,
+    created: bool,
+) -> Result<Response, ApiHttpError> {
+    let run_id = record.run_id.clone();
+    state
+        .idempotency
+        .lock()
+        .await
+        .insert(record.key.clone(), IdempotencyEntry::ready(record));
+    let snapshot = state
+        .service
+        .snapshot(run_id)
         .await
         .map_err(ApiHttpError::from_api)?;
     respond_with_snapshot(snapshot, created)
@@ -935,7 +914,7 @@ async fn store_durable_ready_async(
     owner: String,
     generation: u64,
     ttl: std::time::Duration,
-) -> Result<String, durable::StoreReadyError> {
+) -> Result<durable::DurableIdempotencyRecord, durable::StoreReadyError> {
     tokio::task::spawn_blocking(move || {
         store_durable_ready(&runs_dir, &key, &digest, &run_id, &owner, generation, ttl)
     })

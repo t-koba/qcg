@@ -1683,11 +1683,13 @@ async fn matching_pending_start_waits_after_package_removal() {
 
     state.idempotency.lock().await.insert(
         key.to_string(),
-        IdempotencyEntry::Ready {
+        IdempotencyEntry::ready(crate::durable::DurableIdempotencyRecord {
+            key: key.to_string(),
             digest,
-            created_at: Instant::now(),
+            created_at_unix: crate::durable::now_unix().expect("clock"),
             run_id: run_id.clone(),
-        },
+            generation: 1,
+        }),
     );
     completed.send(true).expect("wake pending retry");
     let response = retry
