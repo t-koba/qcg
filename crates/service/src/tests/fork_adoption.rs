@@ -387,8 +387,11 @@ options = ["yes"]"#,
         .expect("first start should win");
     let waiting = wait_for_snapshot(&service, &id, RunStatus::Waiting).await;
     let question = waiting.question.expect("run should expose its question");
-    // Simulate eviction/restart: drop the in-memory record. The run is
-    // suspended, so no engine task is executing.
+    // Waiting is published before the original engine task releases its
+    // execution lease. Wait for that release before evicting the record, so
+    // adoption starts from a genuinely orphaned run instead of racing the
+    // original driver.
+    wait_for_run_execution_lease(&runs.join(&id)).await;
     service.inner.runs.write().await.remove(&id);
     let adopted = service
         .start_run_with_id(request(), Some(reserved))
