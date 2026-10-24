@@ -38,24 +38,58 @@ impl LlmProvider for UnusedProvider {
 
 #[tokio::test]
 async fn local_prompt_context_limits_reach_terminal_failures_without_dispatch() {
-    for (unit, input, byte_limit, token_limit, used, allowed) in [
+    for (unit, input, byte_limit, token_limit, overflow, used, allowed, prefix) in [
         (
             "explicit byte cap",
             "123456789012345678901234567890",
             20,
             None,
-            30,
+            ContextOverflowPolicy::Error,
+            Some(30),
             20,
+            "LLM context byte limit exceeded",
         ),
         (
             "token-derived byte cap",
             "123456789012345678901234567890",
             100,
             Some(5),
-            30,
+            ContextOverflowPolicy::Error,
+            Some(30),
             20,
+            "LLM context byte limit exceeded",
+        ),
+        (
+            "request error policy",
+            "x",
+            22,
+            None,
+            ContextOverflowPolicy::Error,
+            None,
+            0,
+            "LLM request context byte limit exceeded",
+        ),
+        (
+            "request bounded compaction",
+            "123456789012345678901234567890",
+            22,
+            None,
+            ContextOverflowPolicy::TruncateTail,
+            None,
+            0,
+            "LLM request context byte limit exceeded and non-tool context cannot be compacted safely",
         ),
     ] {
+        let used = used.unwrap_or_else(|| {
+            let content = if unit == "request error policy" {
+                input
+            } else {
+                "\n[CONTEXT_TRUNCATED]\n"
+            };
+            serde_json::to_vec(&[llm::ChatMessage::text("user", content)])
+                .unwrap()
+                .len()
+        });
         let root = std::env::temp_dir().join(format!(
             "qcg-context-limits-{}-{}",
             std::process::id(),
@@ -74,7 +108,7 @@ async fn local_prompt_context_limits_reach_terminal_failures_without_dispatch() 
         let llm = contract.manifest.llm.as_mut().unwrap();
         llm.max_context_bytes = Some(byte_limit);
         llm.max_context_tokens = token_limit;
-        llm.context_overflow = ContextOverflowPolicy::Error;
+        llm.context_overflow = overflow;
         std::fs::write(root.join("prompt.j2"), "{{ inputs.x }}").unwrap();
         let workspace = root.join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -117,14 +151,14 @@ async fn local_prompt_context_limits_reach_terminal_failures_without_dispatch() 
             failure.exhaustion,
             Some(BudgetExhaustion {
                 resource: "context_bytes".into(),
-                used,
-                allowed,
+                used: used as u64,
+                allowed: allowed as u64,
                 used_subsec_nanoseconds: None,
             })
         );
         assert_eq!(
             failure.message,
-            format!("step `gen` failed: LLM context byte limit exceeded: {used} > {allowed}"),
+            format!("step `gen` failed: {prefix}: {used} > {allowed}"),
             "{unit}"
         );
         assert_eq!(provider.0.load(Ordering::SeqCst), 0);
@@ -164,4 +198,66 @@ async fn local_prompt_context_limits_reach_terminal_failures_without_dispatch() 
         api::RunEvent::from_flat(finished).unwrap();
         api::RunEvent::from_flat(terminal).unwrap();
     }
+}
+
+#[test]
+fn request_and_transcript_compaction_facts_use_the_serialized_message_domain() {
+    let node = agent_node();
+    for scope in ["request", "agent_transcript"] {
+        let mut messages = vec![llm::ChatMessage::text("user", "excess content")];
+        let original_bytes = serde_json::to_vec(&messages).unwrap().len() as u64;
+        let error = crate::context::compact_agent_messages(
+            &node,
+            &mut messages,
+            5,
+            scope,
+            &ContextOverflowPolicy::Error,
+        )
+        .unwrap_err();
+        assert_context_facts(
+            error,
+            original_bytes,
+            5,
+            &format!("LLM {scope} context byte limit exceeded: {original_bytes} > 5"),
+        );
+
+        let mut messages = vec![llm::ChatMessage::text("user", "excess content")];
+        let error = crate::context::compact_agent_messages(
+            &node,
+            &mut messages,
+            0,
+            scope,
+            &ContextOverflowPolicy::TruncateTail,
+        )
+        .unwrap_err();
+        let final_bytes =
+            serde_json::to_vec(&[llm::ChatMessage::text("user", "\n[CONTEXT_TRUNCATED]\n")])
+                .unwrap()
+                .len() as u64;
+        assert_context_facts(
+            error,
+            final_bytes,
+            0,
+            &format!(
+                "LLM {scope} context byte limit exceeded and non-tool context cannot be compacted safely: {final_bytes} > 0"
+            ),
+        );
+    }
+}
+
+fn assert_context_facts(error: engine::StepError, used: u64, allowed: u64, message: &str) {
+    let engine::StepError::LocalResourceExhausted {
+        resource,
+        used: actual_used,
+        allowed: actual_allowed,
+        message: actual_message,
+        ..
+    } = error
+    else {
+        panic!("expected typed context exhaustion, got {error:?}")
+    };
+    assert_eq!(resource, "context_bytes");
+    assert_eq!(actual_used, used);
+    assert_eq!(actual_allowed, allowed);
+    assert_eq!(actual_message, message);
 }

@@ -4,6 +4,7 @@ use llm::{ChatMessage, ChatRequest};
 use serde_json::json;
 
 use super::DEFAULT_RETRY_PROMPT;
+use crate::completion::local_exhaustion;
 use crate::prompting::{utf8_head, utf8_tail};
 use crate::request_policy::{EffectiveRequestPolicy, effective_request_policy};
 use policy::DEFAULT_LLM_CONTEXT_LIMIT_BYTES;
@@ -41,16 +42,14 @@ pub(crate) fn enforce_llm_request_context_limit(
         &mut request.messages,
         message_limit,
         "request",
-        actual,
         &policy.context_overflow,
     )?;
     let compacted = serde_json::to_vec(request)?.len();
     if compacted > limit {
-        return Err(StepError::failed(
+        return Err(local_exhaustion(
             &node.id,
-            format!(
-                "LLM request context byte limit exceeded after bounded compaction: {compacted} > {limit}"
-            ),
+            "LLM request context byte limit exceeded after bounded compaction",
+            ("context_bytes", compacted as u64, limit as u64),
         ));
     }
     record_context_compaction(
@@ -92,7 +91,6 @@ pub(crate) fn enforce_agent_transcript_limit(
         messages,
         limit,
         "agent_transcript",
-        actual,
         &policy.context_overflow,
     )?;
     let final_bytes = serde_json::to_vec(messages)?.len();
@@ -116,13 +114,14 @@ pub(crate) fn compact_agent_messages(
     messages: &mut Vec<ChatMessage>,
     limit: usize,
     scope: &str,
-    original_bytes: usize,
     policy: &ContextOverflowPolicy,
 ) -> Result<(usize, usize, ContextOverflowPolicy), StepError> {
     if matches!(policy, ContextOverflowPolicy::Error) {
-        return Err(StepError::failed(
+        let original_bytes = serde_json::to_vec(messages)?.len();
+        return Err(local_exhaustion(
             &node.id,
-            format!("LLM {scope} context byte limit exceeded: {original_bytes} > {limit}"),
+            &format!("LLM {scope} context byte limit exceeded"),
+            ("context_bytes", original_bytes as u64, limit as u64),
         ));
     }
     let compacted_results = compact_tool_results(
@@ -137,11 +136,12 @@ pub(crate) fn compact_agent_messages(
     )?;
     let final_bytes = serde_json::to_vec(messages)?.len();
     if final_bytes > limit {
-        return Err(StepError::failed(
+        return Err(local_exhaustion(
             &node.id,
-            format!(
-                "LLM {scope} context byte limit exceeded and non-tool context cannot be compacted safely: {final_bytes} > {limit}"
+            &format!(
+                "LLM {scope} context byte limit exceeded and non-tool context cannot be compacted safely"
             ),
+            ("context_bytes", final_bytes as u64, limit as u64),
         ));
     }
     Ok((compacted_results, compacted_messages, policy.clone()))
