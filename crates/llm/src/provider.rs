@@ -598,9 +598,9 @@ impl ProviderSpec {
         if let Some(attempts) = self.stream_retry_attempts
             && attempts > MAX_STREAM_RETRY_ATTEMPTS
         {
-            return Err(invalid(
-                "stream_retry_attempts must be between 0 and {MAX_STREAM_RETRY_ATTEMPTS}",
-            ));
+            return Err(invalid(&format!(
+                "stream_retry_attempts must be between 0 and {MAX_STREAM_RETRY_ATTEMPTS}"
+            )));
         }
         if self
             .retry_rate_limit_floor_ms

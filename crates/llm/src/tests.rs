@@ -2168,6 +2168,15 @@ model = { provider = "missing", model = "model" }
                 "retry-bounds",
                 "chat_completions",
                 "https://example.invalid",
+                "stream_retry_attempts = 4\n",
+            ),
+            "stream_retry_attempts must be between 0 and 3",
+        ),
+        (
+            &test_provider_row(
+                "retry-bounds",
+                "chat_completions",
+                "https://example.invalid",
                 "retry_base_backoff_ms = 60001\n",
             ),
             "retry_base_backoff_ms",
