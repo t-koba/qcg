@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::choose::complete_text;
 use crate::completion::{
-    checked_usage_total, complete_text_with_prompt, local_resource_exhausted, validate_retry_budget,
+    checked_usage_total, complete_text_with_prompt, local_exhaustion, validate_retry_budget,
 };
 use crate::context::{record_llm_validation_failure, retry_prompt};
 use crate::out_of_contract::{OutOfContractDecision, enforce_out_of_contract_policy};
@@ -119,9 +119,9 @@ impl StepExecutor for LlmFillStep {
             .await?;
             tokens_total = checked_usage_total(node, tokens_total, &completion.usage)?;
             if tokens_total > max_tokens_total {
-                return Err(local_resource_exhausted(
+                return Err(local_exhaustion(
                     &node.id,
-                    "llm.fill token",
+                    "llm.fill token budget exceeded",
                     ("tokens_total", tokens_total, max_tokens_total),
                 ));
             }

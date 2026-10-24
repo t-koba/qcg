@@ -18,7 +18,7 @@ use crate::agent_runtime::{
     recover_agent_tool_call_failure, validate_agent_tool_call_args,
 };
 use crate::agent_tools::{validate_agent_delegations, validate_agent_tool};
-use crate::completion::{complete_llm, local_resource_exhausted};
+use crate::completion::{complete_llm, local_exhaustion};
 use crate::context::{enforce_agent_transcript_limit, record_llm_validation_failure};
 use crate::guardrail::{apply_guardrails, validate_guardrails};
 use crate::mcp_tools::{AgentToolOutcome, McpAgentTools};
@@ -873,9 +873,9 @@ impl StepExecutor for LlmAgentStep {
             // Non-resumed turns validated stop below; resumed turns skip it
             // because they execute a previously validated approved call.
             if tokens_total > max_tokens_total {
-                let error = local_resource_exhausted(
+                let error = local_exhaustion(
                     &node.id,
-                    "llm.agent token",
+                    "llm.agent token budget exceeded",
                     ("tokens_total", tokens_total, max_tokens_total),
                 );
                 record_tool_call_failures(
@@ -1791,9 +1791,9 @@ pub(crate) fn charge_agent_tool_call(
     let count = counts.entry(name.to_string()).or_default();
     *count = count.saturating_add(1);
     if *total > max_total {
-        return Err(local_resource_exhausted(
+        return Err(local_exhaustion(
             node_id,
-            &format!("{scope} tool call"),
+            &format!("{scope} tool call budget exceeded"),
             ("tool_calls_total", *total as u64, max_total as u64),
         ));
     }
@@ -1803,9 +1803,9 @@ pub(crate) fn charge_agent_tool_call(
         .and_then(agent_tool_max_calls)
         && *count > max_calls
     {
-        return Err(local_resource_exhausted(
+        return Err(local_exhaustion(
             node_id,
-            &format!("{scope} tool `{name}` call"),
+            &format!("{scope} tool `{name}` call budget exceeded"),
             ("tool_calls_per_tool", *count as u64, max_calls as u64),
         ));
     }

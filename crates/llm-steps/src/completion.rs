@@ -52,21 +52,18 @@ pub(crate) fn validate_retry_budget(node: &NodeDef, params: &LlmParams) -> Resul
     }
     Ok(())
 }
+pub(crate) type ResourceFacts = (&'static str, u64, u64);
 
-pub(crate) fn local_resource_exhausted(
-    node: &str,
-    scope: &str,
-    (resource, used, allowed): (&'static str, u64, u64),
-) -> StepError {
+pub(crate) fn local_exhaustion(node: &str, prefix: &str, facts: ResourceFacts) -> StepError {
+    let (resource, used, allowed) = facts;
     StepError::LocalResourceExhausted {
         node: node.into(),
-        message: format!("{scope} budget exceeded: {used} > {allowed}"),
         resource,
         used,
         allowed,
+        message: format!("{prefix}: {used} > {allowed}"),
     }
 }
-
 pub(crate) fn checked_usage_total(
     node: &NodeDef,
     current: u64,

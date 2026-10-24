@@ -3057,6 +3057,8 @@ fn exhaustion_test_gateway<'a>(
 
 mod context_exhaustion;
 
+mod context_limits;
+
 mod choose_exhaustion;
 
 mod fill_exhaustion;

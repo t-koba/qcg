@@ -8,6 +8,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::io::Read;
 
+use crate::completion::local_exhaustion;
 use crate::context::effective_context_byte_limit;
 use crate::request_policy::{EffectiveRequestPolicy, effective_request_policy, llm_params};
 use policy::DEFAULT_LLM_CONTEXT_LIMIT_BYTES;
@@ -42,17 +43,19 @@ pub(crate) fn manage_context_limits(
     if matches!(policy.context_overflow, ContextOverflowPolicy::Error) {
         let actual = prompt.len();
         if actual > byte_limit {
-            return Err(StepError::failed(
+            return Err(local_exhaustion(
                 &node.id,
-                format!("LLM context byte limit exceeded: {actual} > {byte_limit}"),
+                "LLM context byte limit exceeded",
+                ("context_bytes", actual as u64, byte_limit as u64),
             ));
         }
         if let Some(max_tokens) = policy.max_context_tokens {
             let actual = estimate_context_tokens(prompt);
             if actual > max_tokens {
-                return Err(StepError::failed(
+                return Err(local_exhaustion(
                     &node.id,
-                    format!("LLM context token limit exceeded: {actual} > {max_tokens}"),
+                    "LLM context token limit exceeded",
+                    ("context_tokens", actual as u64, max_tokens as u64),
                 ));
             }
         }

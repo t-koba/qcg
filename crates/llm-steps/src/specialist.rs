@@ -12,7 +12,7 @@ use crate::agent_runtime::{
     finish_rejected_external_operation, validate_agent_tool_call_args,
 };
 use crate::agent_tools::load_agent_output_schema;
-use crate::completion::{complete_llm_with_policy, local_resource_exhausted};
+use crate::completion::{complete_llm_with_policy, local_exhaustion};
 use crate::context::{enforce_agent_transcript_limit, record_llm_validation_failure};
 use crate::guardrail::apply_guardrails;
 use crate::mcp_tools::{AgentToolOutcome, McpAgentTools};
@@ -178,9 +178,9 @@ pub(crate) async fn execute_specialist_agent(
             }
         }
         if tokens_total > max_tokens_total {
-            let error = local_resource_exhausted(
+            let error = local_exhaustion(
                 &node.id,
-                &format!("specialist `{agent_name}` token"),
+                &format!("specialist `{agent_name}` token budget exceeded"),
                 ("tokens_total", tokens_total, max_tokens_total),
             );
             record_tool_call_failures(
