@@ -108,35 +108,26 @@ for (const tail of ['data: {"c": 3}\n', 'data: {"c": 3}', 'data: {"c": 3}\r']) {
 
 // G04-04: consumer break releases the reader.
 {
-  const wire = enc.encode('data: {"a": 1}\n\ndata: {"b": 2}\n\n');
-  let reader;
-  const mock = async () => {
-    const { response } = sseResponse(chunkSplit(wire, [7]));
-    reader = response.body.getReader();
-    // Re-wrap so we observe cancel: return a Response sharing the reader.
-    const stream = new ReadableStream({
-      async start(c) {
-        // Pump is unnecessary; hand the original reader through.
-      },
-    });
-    return new Response(
-      new ReadableStream({
-        start(c) {
-          c.enqueue(wire);
-          c.close();
-        },
-        cancel() {
-          reader.cancel();
-        },
-      }),
-      { status: 200 },
-    );
-  };
-  const client = new QcgClient({ baseUrl: "http://127.0.0.1:9", fetch: mock });
+  const wire = enc.encode('data: {"a": 1}\n\n');
+  let cancelled = false;
+  const openStream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(wire);
+      // Stay open so returning the generator cancels an active reader.
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  const client = new QcgClient({
+    baseUrl: "http://127.0.0.1:9",
+    fetch: async () => new Response(openStream, { status: 200 }),
+  });
   const gen = client.streamRunEvents("r1");
   const first = await gen.next();
   check("G04-04 first event", first.value && first.value.a === 1, JSON.stringify(first.value));
   await gen.return();
+  check("G04-04 consumer return releases reader", cancelled, "reader was not cancelled");
 }
 
 // G04-04b: a parse error still releases the reader.
