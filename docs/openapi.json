@@ -819,7 +819,8 @@
               "canceled",
               "interrupted",
               "budget_exceeded",
-              "provider_context_exhausted"
+              "provider_context_exhausted",
+              "mcp_authorization_required"
             ],
             "type": "string"
           },
@@ -2819,6 +2820,7 @@
               "llm_delta",
               "llm_route_failed",
               "llm_validation_failed",
+              "mcp_authorization_required",
               "mcp_cleanup_settled",
               "mcp_continuation_consumed",
               "mcp_continuation_resumed",

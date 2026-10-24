@@ -7,6 +7,12 @@ use mcp::{McpCallOutcome, McpError, McpInputRequired, McpSession};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+
+pub(crate) fn has_operation_record(ctx: &StepContext<'_>, node: &NodeDef) -> bool {
+    let invocation = RunContext::execution_invocation(ctx.journal, node);
+    let id = engine::operation_id_for(&ctx.run.run_id, &node.id, &invocation);
+    ctx.journal.state().operation_records.contains_key(&id)
+}
 pub(crate) async fn execute_direct_mcp_call(
     session: &McpSession,
     tool_name: &str,
@@ -68,10 +74,7 @@ pub(crate) async fn execute_direct_mcp_call(
     let mut input_responses = None;
     let mut request_state: Option<String> = None;
     let invocation = RunContext::execution_invocation(ctx.journal, node);
-    // Resume a previously interrupted input-required round instead of
-    // starting a new remote request. The typed journal continuation store
-    // carries the pending descriptor, so a HITL restart continues the same
-    // remote call with its original request_state.
+    // Resume the same remote request from its typed descriptor and original request_state, never a new call.
     match resume_direct_mcp_continuation(
         ctx,
         node,
@@ -91,9 +94,7 @@ pub(crate) async fn execute_direct_mcp_call(
     }
     let fresh = request_state.is_none() && input_responses.is_none();
     let details = Some(arguments.clone());
-    // Single-shot invocations identify by node execution: retries and
-    // restarts recompute the same id until the execution finishes, while a
-    // repair or regenerate is a new invocation (Q1).
+    // Single-shot IDs survive retries/restarts until completion; repair or regenerate starts a new invocation (Q1).
     let target = format!("{}/{}", session.server_id(), tool_name);
     let operation_id = if fresh {
         match ctx.run.guard_external_operation(
@@ -105,8 +106,6 @@ pub(crate) async fn execute_direct_mcp_call(
             &invocation,
         )? {
             engine::GuardDecision::Proceed { operation_id } => Some(operation_id),
-            // Same invocation already succeeded: return the cached result
-            // without touching the remote again.
             engine::GuardDecision::Resend { result, .. } => {
                 return Ok(DirectMcpCallOutcome::Complete(result));
             }
@@ -123,10 +122,7 @@ pub(crate) async fn execute_direct_mcp_call(
         )),
     };
     for _ in 0..10 {
-        // The node-scoped token stops this wait on timeout or parent
-        // cancel; the session's connect-time token cannot cover a scope
-        // created after it. Cancellation finishes nothing and propagates
-        // without a completion record.
+        // Node token covers this later wait and timeout/parent cancel; connect token cannot cover it. Cancellation records no completion.
         let outcome = tokio::select! {
             _ = ctx.run.cancellation.cancelled() => {
                 return Err(StepError::Cancelled);
@@ -161,8 +157,6 @@ pub(crate) async fn execute_direct_mcp_call(
             Ok(outcome) => outcome,
             Err(McpError::ToolFailed { result, .. }) => McpCallOutcome::Complete(result),
             Err(error) => {
-                // Cancellation finishes nothing: it propagates without a
-                // completion record.
                 if !matches!(error, McpError::Canceled)
                     && let Some(operation_id) = &operation_id
                 {
@@ -178,9 +172,7 @@ pub(crate) async fn execute_direct_mcp_call(
         };
         match outcome {
             McpCallOutcome::Complete(value) => {
-                // Validation rejects a received result: the remote already
-                // executed, so this is indeterminate, never clean. Retries
-                // need an explicit at-least-once opt-in.
+                // Validation rejects a received result after remote execution: it is indeterminate; retry needs explicit at-least-once opt-in.
                 let fail = |node: &NodeDef, message: String| {
                     if let Some(operation_id) = &operation_id {
                         ctx.run.finish_external_operation_with_warn(

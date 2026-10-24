@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 use super::path::NodePath;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureCode {
@@ -23,6 +22,7 @@ pub enum FailureCode {
     ProviderContextExhausted,
     /// Guard/admission refusal, not a failed execution (E11).
     Refused,
+    McpAuthorizationRequired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

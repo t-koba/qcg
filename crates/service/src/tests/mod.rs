@@ -5,6 +5,7 @@ pub(crate) mod cancel_observation;
 pub(crate) mod endpoints;
 pub(crate) mod execution;
 pub(crate) mod fork_adoption;
+pub(crate) mod mcp_authorization;
 pub(crate) mod misc;
 pub(crate) mod providers;
 pub(crate) mod retention_gc;

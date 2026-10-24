@@ -4,6 +4,17 @@ use serde_json::Value;
 
 use crate::{StepError, required_input_field};
 
+/// Builds a fresh empty form for resuming an MCP authorization prerequisite.
+pub fn mcp_authorization_form_spec(title: String) -> FormSpec {
+    FormSpec {
+        id: format!("mcp-auth:{}", uuid::Uuid::now_v7()),
+        title: format!(
+            "Authorize {title} in Connections, then resume; authorization is rechecked."
+        ),
+        ..Default::default()
+    }
+}
+
 /// Builds the user-facing form for an ordered set of MCP elicitation requests.
 /// Request identity and ordering remain the caller's responsibility.
 pub fn mcp_elicitation_form_spec(

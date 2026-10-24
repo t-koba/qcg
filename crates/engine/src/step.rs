@@ -62,6 +62,8 @@ pub enum StepError {
     /// or a policy decision is required.
     #[error("step `{node}` refused: {message}")]
     Refused { node: String, message: String },
+    #[error("step `{node}` requires MCP authorization for `{server}`")]
+    McpAuthorizationRequired { node: String, server: String },
     /// Per-attempt timeout, distinct from ordinary failures so retry policy
     /// separates unknown outcomes from proven-clean errors (B08/B11).
     #[error("step `{node}` timed out after {timeout_secs}s")]

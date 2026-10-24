@@ -51,6 +51,7 @@ pub(crate) struct McpAgentTools {
     /// Missing entries keep the static ceiling exactly; present entries only
     /// widen a static miss at execution time, never a narrowing denial.
     deciders: BTreeMap<String, (Vec<String>, u64)>,
+    pub(crate) authorization_required: Vec<String>,
 }
 
 impl McpAgentTools {
@@ -249,22 +250,32 @@ impl McpAgentTools {
 
         let mut sessions = BTreeMap::new();
         let mut discovered = BTreeMap::new();
+        let mut authorization_required = Vec::new();
         while let Some(result) = joins.join_next().await {
-            let (server, session, tools) = result
-                .map_err(|error| StepError::failed(&node.id, error.to_string()))?
-                .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
-            discovered.insert(server.clone(), tools);
-            sessions.insert(server, session);
+            match result.map_err(|error| StepError::failed(&node.id, error.to_string()))? {
+                Ok((server, session, tools)) => {
+                    discovered.insert(server.clone(), tools);
+                    sessions.insert(server, session);
+                }
+                Err(McpError::AuthorizationRequired { server }) => {
+                    authorization_required.push(server);
+                }
+                Err(error) => return Err(StepError::failed(&node.id, error.to_string())),
+            }
         }
+        authorization_required.sort();
 
         let mut resolved = BTreeMap::new();
         for (server, bindings) in requested {
-            let tools = discovered.get(&server).ok_or_else(|| {
-                StepError::failed(
+            let Some(tools) = discovered.get(&server) else {
+                if authorization_required.contains(&server) {
+                    continue;
+                }
+                return Err(StepError::failed(
                     &node.id,
                     format!("MCP server `{server}` discovery result is missing"),
-                )
-            })?;
+                ));
+            };
             for (alias, remote_name, override_description) in bindings {
                 let tool = tools
                     .iter()
@@ -325,6 +336,7 @@ impl McpAgentTools {
             destinations,
             declared,
             deciders,
+            authorization_required,
         })
     }
 
@@ -688,6 +700,7 @@ mod tests {
             destinations: BTreeMap::from([("exa-public".to_string(), allowed)]),
             declared: BTreeMap::from([("fetch".to_string(), declared)]),
             deciders: BTreeMap::new(),
+            authorization_required: Vec::new(),
         }
     }
 

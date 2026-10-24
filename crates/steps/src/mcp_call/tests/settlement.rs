@@ -1,12 +1,12 @@
 //! Real MCP execution with a bounded injected close failure at the settlement seam.
 use super::direct::execute_direct_mcp_call;
 use super::settlement::settle_direct_mcp;
-use super::types::McpCallParams;
+use super::types::{McpCallParams, McpCallStep};
 use super::validate::DirectMcpCallOutcome;
 use api::McpCleanupPolicy::{self, FailFast, PreserveExecution};
 use camino::Utf8PathBuf;
 use contract::{Contract, NodeDef, ValueBag};
-use engine::{JournalWriter, RunContext, StepContext, StepError, StepOutcome};
+use engine::{JournalWriter, RunContext, StepContext, StepError, StepExecutor, StepOutcome};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ElicitRequest, ElicitRequestParams,
     InputRequest, InputRequiredResult, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
@@ -140,12 +140,7 @@ impl Drop for Harness {
 
 impl Harness {
     fn new() -> Self {
-        let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
-            .unwrap()
-            .join(format!("mcp-cleanup-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(
-            root.join(contract::MANIFEST_FILE),
+        Self::with_manifest(
             r#"
 [generator]
 id = "cleanup-test"
@@ -159,7 +154,14 @@ server = "mock"
 tool = "echo"
 "#,
         )
-        .unwrap();
+    }
+
+    fn with_manifest(manifest: &str) -> Self {
+        let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!("mcp-cleanup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(contract::MANIFEST_FILE), manifest).unwrap();
         let contract = Contract::load(root.clone()).unwrap();
         let node = contract.manifest.flow[0].clone();
         let run = RunContext::for_tests(
@@ -192,6 +194,84 @@ tool = "echo"
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .filter(|record| record["t"] == kind)
             .collect()
+    }
+}
+
+fn authorization_harness(optional: bool, action: Option<&str>) -> Harness {
+    let action = action
+        .map(|action| format!("on_authorization_required = \"{action}\"\n"))
+        .unwrap_or_default();
+    Harness::with_manifest(&format!(
+        r#"
+[generator]
+id = "cleanup-test"
+name = "Authorization test"
+version = "0.1.0"
+[permissions]
+fs_read = []
+fs_write = ["workspace"]
+network = ["127.0.0.1"]
+commands = []
+side_effects = "none"
+side_effects_scope = "invocation"
+[permissions.containers]
+enabled = false
+[[flow]]
+id = "call"
+type = "mcp.call"
+[flow.params]
+server = "oauth"
+tool = "echo"
+arguments = {{}}
+side_effects = false
+optional = {optional}
+{action}"#
+    ))
+}
+
+fn authorization_step() -> McpCallStep {
+    let spec = serde_json::from_value(json!({
+        "id": "oauth",
+        "transport": "streamable_http",
+        "url": "http://127.0.0.1:1/mcp",
+        "auth": "oauth",
+        "oauth_store": "memory",
+        "allowed_hosts": ["127.0.0.1"],
+        "timeout_seconds": 3
+    }))
+    .unwrap();
+    McpCallStep {
+        runtime: Arc::new(mcp::McpRuntime::from_specs(vec![spec]).unwrap()),
+    }
+}
+
+async fn execute_authorization_step(
+    step: &McpCallStep,
+    harness: &Harness,
+    journal: &JournalWriter,
+) -> Result<StepOutcome, StepError> {
+    let mut vars = ValueBag::with_inputs(BTreeMap::new());
+    let mut ctx = StepContext {
+        run: &harness.run,
+        journal,
+        vars: &mut vars,
+        llm: None,
+    };
+    step.execute(&mut ctx, &harness.node).await
+}
+
+fn transport_error_step() -> McpCallStep {
+    let spec = serde_json::from_value(json!({
+        "id": "oauth",
+        "transport": "streamable_http",
+        "url": "http://127.0.0.1:1/mcp",
+        "auth": "none",
+        "allowed_hosts": ["127.0.0.1"],
+        "timeout_seconds": 1
+    }))
+    .unwrap();
+    McpCallStep {
+        runtime: Arc::new(mcp::McpRuntime::from_specs(vec![spec]).unwrap()),
     }
 }
 
@@ -286,6 +366,120 @@ async fn execute_large(
     .await;
     session.close().await.unwrap();
     result
+}
+
+#[tokio::test]
+async fn typed_oauth_prerequisite_obeys_action_defaults_and_provenance() {
+    for (optional, configured, expected, source) in [
+        (false, None, "fail", "default"),
+        (true, None, "degrade", "default"),
+        (false, Some("wait"), "wait", "node_parameter"),
+        (false, Some("degrade"), "degrade", "node_parameter"),
+        (true, Some("fail"), "fail", "node_parameter"),
+    ] {
+        let harness = authorization_harness(optional, configured);
+        let journal = harness.journal();
+        let result = execute_authorization_step(&authorization_step(), &harness, &journal).await;
+        match expected {
+            "fail" => assert!(matches!(
+                result,
+                Err(StepError::McpAuthorizationRequired { server, .. }) if server == "oauth"
+            )),
+            "wait" => assert!(matches!(
+                result,
+                Ok(StepOutcome::NeedsUser { question, .. })
+                    if question.id.starts_with("mcp-auth:") && question.fields.is_empty()
+            )),
+            "degrade" => assert!(matches!(
+                result,
+                Ok(StepOutcome::Success { output: None, .. })
+            )),
+            _ => unreachable!(),
+        }
+        let event = harness.records("mcp_authorization_required");
+        assert_eq!(event.len(), 1);
+        assert_eq!(event[0]["node"], "call");
+        assert_eq!(event[0]["server"], "oauth");
+        assert_eq!(event[0]["phase"], "connect");
+        assert_eq!(event[0]["action"], expected);
+        assert_eq!(event[0]["source"], source);
+        assert!(harness.records("operation_started").is_empty());
+        assert!(harness.records("tool_call").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn authorization_degrade_refuses_to_hide_a_prior_external_operation() {
+    let harness = authorization_harness(false, Some("degrade"));
+    let journal = harness.journal();
+    let invocation = RunContext::execution_invocation(&journal, &harness.node);
+    harness
+        .run
+        .guard_external_operation(
+            &journal,
+            &harness.node,
+            "mcp:oauth/echo",
+            "oauth/echo",
+            &Some(json!({})),
+            &invocation,
+        )
+        .unwrap();
+
+    let result = execute_authorization_step(&authorization_step(), &harness, &journal).await;
+    assert!(matches!(
+        result,
+        Err(StepError::Refused { message, .. })
+            if message.contains("MCP operation may have executed")
+    ));
+    let event = harness.records("mcp_authorization_required");
+    assert_eq!(event.len(), 1);
+    assert_eq!(event[0]["action"], "degrade");
+    assert_eq!(harness.records("operation_started").len(), 1);
+    assert!(harness.records("operation_finished").is_empty());
+    assert!(harness.records("tool_call").is_empty());
+}
+
+#[tokio::test]
+async fn unrelated_transport_failures_are_not_authorization_prerequisites() {
+    let harness = authorization_harness(false, None);
+    let journal = harness.journal();
+    let error = execute_authorization_step(&transport_error_step(), &harness, &journal)
+        .await
+        .expect_err("an unavailable unauthenticated MCP server must fail");
+    assert!(!matches!(error, StepError::McpAuthorizationRequired { .. }));
+    assert!(harness.records("mcp_authorization_required").is_empty());
+    assert!(harness.records("operation_started").is_empty());
+}
+
+#[tokio::test]
+async fn empty_authorization_form_answer_rechecks_and_never_dispatches() {
+    let mut harness = authorization_harness(false, Some("wait"));
+    let journal = harness.journal();
+    let step = authorization_step();
+    let first = execute_authorization_step(&step, &harness, &journal)
+        .await
+        .unwrap();
+    let StepOutcome::NeedsUser { question, .. } = first else {
+        panic!("expected an authorization prerequisite form")
+    };
+    assert!(question.fields.is_empty());
+    harness.run.answers.insert(question.id.clone(), json!({}));
+
+    let resumed = execute_authorization_step(&step, &harness, &journal)
+        .await
+        .unwrap();
+    let StepOutcome::NeedsUser {
+        question: resumed_question,
+        ..
+    } = resumed
+    else {
+        panic!("an empty form answer must not authorize the server")
+    };
+    assert!(resumed_question.fields.is_empty());
+    assert_ne!(question.id, resumed_question.id);
+    assert_eq!(harness.records("mcp_authorization_required").len(), 2);
+    assert!(harness.records("operation_started").is_empty());
+    assert!(harness.records("tool_call").is_empty());
 }
 
 #[tokio::test]

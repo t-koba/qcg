@@ -196,7 +196,12 @@ The following journal records are not typed `RunEvent` variants; they travel
 as opaque `Unknown` kinds and exist so restarts and shared-store peers resume
 identical work. `user_answered` carries `question_id` and `values`,
 `user_confirmed` carries `confirmation_id` and `approved`, and
-`user_cancel_requested` carries `run_id`. `mcp_input_pending` carries `node`,
+`user_cancel_requested` carries `run_id`. `mcp_authorization_required` carries
+`node`, `server`, `phase` (`connect` or `discovery`), `action` (`fail`, `wait`,
+or `degrade`), and `source` (`default`, `agent_default`, or
+`node_parameter`); it never carries credentials or tokens. Its selected action
+records policy, not proof of authorization or an earlier effect.
+`mcp_input_pending` carries `node`,
 `pending_key`, `question_id`, `server`/`tool` (direct calls) or `alias`
 (agent calls), `arguments`, `request_state`, and `input_requests` so a resumed
 MCP call answers the original remote request instead of starting a new one.

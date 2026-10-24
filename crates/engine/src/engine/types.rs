@@ -26,9 +26,8 @@ pub enum EngineError {
     Contract(#[from] contract::ContractError),
     #[error(transparent)]
     Step(#[from] StepError),
-    /// An agent continuation must be re-entered on resume, not settled as a
-    /// terminal failure of its enclosing control-flow nodes. Preserve the
-    /// original error for diagnostics and failure classification.
+    /// Resume re-enters the agent continuation rather than settling a control-flow failure;
+    /// preserve the original error for diagnostics and classification.
     #[error(transparent)]
     ResumableAgent(Box<EngineError>),
     #[error("{0}")]
@@ -77,8 +76,7 @@ pub enum Progress {
 pub enum RunFailureKind {
     Canceled,
     Execution,
-    /// Workspace rollback, distinct from corruption via Progress::Failed (E06).
-    /// The canonical FailureCode remains ExecutionFailed.
+    /// Rollback is distinct from corruption via Progress::Failed (E06); FailureCode remains ExecutionFailed.
     Rewound,
 }
 
@@ -185,6 +183,9 @@ pub(crate) fn failure_detail_for_error(error: &EngineError) -> model::FailureDet
             FailureCode::ProviderContextExhausted
         }
         EngineError::Step(StepError::Refused { .. }) => FailureCode::Refused,
+        EngineError::Step(StepError::McpAuthorizationRequired { .. }) => {
+            FailureCode::McpAuthorizationRequired
+        }
         _ if error.is_canceled() => FailureCode::Canceled,
         _ => FailureCode::ExecutionFailed,
     };
@@ -644,6 +645,16 @@ mod tests {
             }))
             .code,
             model::FailureCode::Refused
+        );
+        assert_eq!(
+            failure_detail_for_error(&EngineError::Step(
+                crate::StepError::McpAuthorizationRequired {
+                    node: "n".into(),
+                    server: "oauth".into(),
+                },
+            ))
+            .code,
+            model::FailureCode::McpAuthorizationRequired
         );
     }
 

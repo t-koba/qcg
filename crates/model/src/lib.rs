@@ -108,6 +108,18 @@ mod failure_tests {
     }
 
     #[test]
+    fn mcp_authorization_failure_code_has_a_stable_public_name() {
+        let detail = FailureDetail::new(
+            FailureCode::McpAuthorizationRequired,
+            "authorization required for MCP server `oauth`",
+        );
+        assert_eq!(
+            serde_json::to_value(detail).unwrap()["code"],
+            "mcp_authorization_required"
+        );
+    }
+
+    #[test]
     fn budget_amounts_are_exact_and_closed() {
         let value = json!({"code":"budget_exceeded","message":"unchanged",
             "exhaustion":{"resource":"tokens","used":u64::MAX,"allowed":0}});

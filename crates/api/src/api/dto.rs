@@ -120,7 +120,7 @@ impl std::fmt::Display for RunStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct FormSpec {
     pub id: String,
     pub title: String,

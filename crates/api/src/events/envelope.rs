@@ -1,7 +1,6 @@
 use model::NodePath;
 use schemars::JsonSchema;
-use serde::Serialize;
-use serde::{Deserialize, Deserializer, de::Error as DeError};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as DeError};
 use serde_json::Value;
 
 use super::completion::{LaggedAction, LaggedEventData};
@@ -33,6 +32,7 @@ pub const INTERNAL_RUN_EVENT_KINDS: &[&str] = &[
     "hook_failed",
     "hook_replayed",
     "hook_skipped",
+    "mcp_authorization_required",
     "mcp_continuation_consumed",
     "mcp_continuation_resumed",
     "mcp_destination_decision",

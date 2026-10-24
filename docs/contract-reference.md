@@ -794,6 +794,19 @@ hold exactly is refused rather than stated approximately - and `min` and
   The external-operation guard reuses completed results rather than
   redispatching the remote effect.
 
+  OAuth prerequisites have a separate `on_authorization_required` policy:
+  `fail`, `wait`, or `degrade`. Omission defaults to `degrade` when
+  `optional = true` and `fail` otherwise. This policy applies only to the
+  typed MCP authorization-required error, not arbitrary transport or HTTP
+  failures. `wait` returns an empty form directing the user to authorize the
+  server in Connections and then resume; the answer itself contains no
+  credential or authorization proof. Resume reconnects and rechecks
+  authorization before any tool dispatch. `degrade` returns a null output
+  without dispatch only when no prior operation may have executed; otherwise it
+  refuses rather than hiding an unresolved effect. `fail` reports the distinct
+  `mcp_authorization_required` failure code and is not retried by node retry
+  policy; choose `wait` to resume after authorizing in Connections.
+
 `llm.generate`
 : Produce text, optionally writing it to `output_file`.
 
@@ -1544,6 +1557,14 @@ metadata. Update it with `qcg docs step-schemas`.
         "model"
       ],
       "type": "object"
+    },
+    "on_authorization_required": {
+      "enum": [
+        "fail",
+        "wait",
+        "degrade"
+      ],
+      "type": "string"
     },
     "output_file": {
       "type": "string"
@@ -4173,6 +4194,14 @@ metadata. Update it with `qcg docs step-schemas`.
       "type": "string"
     },
     "input_schema": {},
+    "on_authorization_required": {
+      "enum": [
+        "fail",
+        "wait",
+        "degrade"
+      ],
+      "type": "string"
+    },
     "optional": {
       "type": "boolean"
     },
@@ -4583,7 +4612,16 @@ side_effects = "none"
 The required fields are `name`, `kind`, `server`, and `tool`. `server` must
 match either a built-in public profile or an `[[mcp_server]]` row in the
 selected `providers.toml`; `tool` is the remote MCP name and is never chosen by
-the model. `max_calls` defaults to 3 and is limited to 10. `side_effects`
+the model. `max_calls` defaults to 3 and is limited to 10. For OAuth discovery,
+`llm.agent` accepts `on_authorization_required = "fail" | "wait" | "degrade"`;
+the default is `fail`. The policy applies only to typed MCP authorization
+prerequisites. `wait` returns an empty authorization form; resume repeats
+server discovery and authorization checks, and the form answer is not
+credentials or proof of authorization. `degrade` omits aliases for unavailable
+servers; it refuses to continue if a saved checkpoint has a pending MCP call
+to one of those servers. The durable `mcp_authorization_required` record
+includes the affected server, phase, selected action, and provenance.
+`side_effects`
 defaults to `true`; set it to `false` only for a known read-only operation. A
 true value routes the call through the
 contract's `[permissions].side_effects` policy: `none` denies it, `confirm`

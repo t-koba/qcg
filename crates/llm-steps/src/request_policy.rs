@@ -44,6 +44,8 @@ pub(crate) struct LlmParams {
     #[serde(default)]
     pub(crate) tools: Vec<ToolDecl>,
     #[serde(default)]
+    pub(crate) on_authorization_required: Option<policy::McpAuthorizationAction>,
+    #[serde(default)]
     pub(crate) guardrails: Vec<GuardrailDecl>,
     #[serde(default)]
     pub(crate) model: Option<contract::ModelRef>,

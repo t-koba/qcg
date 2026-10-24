@@ -1,4 +1,4 @@
-use super::direct::execute_direct_mcp_call;
+use super::direct::{execute_direct_mcp_call, has_operation_record};
 use super::types::McpCallStep;
 use super::validate::{
     degrade_optional_mcp_call, mcp_access, mcp_call_params, validate_mcp_call_arguments,
@@ -7,8 +7,8 @@ use super::validate::{
 use crate::common::render_json_templates;
 use async_trait::async_trait;
 use contract::{Contract, NodeDef};
-use engine::{StepContext, StepError, StepExecutor, StepOutcome, StepTraits};
-use policy::{params_schema, string_schema};
+use engine::{ResultExt, StepContext, StepError, StepExecutor, StepOutcome, StepTraits};
+use policy::{McpAuthorizationAction, params_schema, string_schema};
 use serde_json::{Value, json};
 use sha2::Digest as _;
 #[async_trait]
@@ -29,6 +29,7 @@ impl StepExecutor for McpCallStep {
                 "timeout_seconds": { "type": "integer", "minimum": 1 },
                 "side_effects": { "type": "boolean" },
                 "optional": { "type": "boolean" },
+                "on_authorization_required": { "type": "string", "enum": ["fail", "wait", "degrade"] },
                 "cleanup_failure": { "type": "string", "enum": ["preserve_execution", "fail_fast"], "default": "preserve_execution" },
             }),
         ))
@@ -105,9 +106,7 @@ impl StepExecutor for McpCallStep {
                     names
                 })
                 .unwrap_or_default(),
-            // The approval binds the full argument value, not just
-            // names: approving one call must never authorize a
-            // regenerated different payload.
+            // Bind full arguments: approving one call cannot authorize a regenerated payload.
             "arguments_sha256": hex::encode(sha2::Sha256::digest(&argument_bytes)),
         }));
         let confirm_target = format!("{}/{}", params.server, params.tool);
@@ -138,6 +137,31 @@ impl StepExecutor for McpCallStep {
         .await;
         let session = match connect {
             Ok(Ok(session)) => session,
+            Ok(Err(mcp::McpError::AuthorizationRequired { server })) => {
+                let (action, source) = params.authorization_action();
+                ctx.journal
+                    .event(
+                        "mcp_authorization_required",
+                        json!({"node": node.id, "server": &server, "phase": "connect", "action": action, "source": source}),
+                    )
+                    .step_err(&node.id)?;
+                return match action {
+                    McpAuthorizationAction::Fail => Err(StepError::McpAuthorizationRequired {
+                        node: node.id.clone(),
+                        server,
+                    }),
+                    McpAuthorizationAction::Wait => Ok(StepOutcome::NeedsUser {
+                        question: engine::mcp_authorization_form_spec(format!(
+                            "MCP server `{server}`"
+                        )),
+                        files: Vec::new(),
+                    }),
+                    McpAuthorizationAction::Degrade if has_operation_record(ctx, node) => {
+                        Err(StepError::Refused { node: node.id.clone(), message: "cannot degrade authorization after an MCP operation may have executed".into() })
+                    }
+                    McpAuthorizationAction::Degrade => Ok(StepOutcome::success(None)),
+                };
+            }
             Ok(Err(error)) => {
                 let error = StepError::failed(&node.id, error.to_string());
                 return degrade_optional_mcp_call(ctx, node, &params, &arguments, error).await;
@@ -148,8 +172,6 @@ impl StepExecutor for McpCallStep {
             }
         };
         let started = std::time::Instant::now();
-        // The tool call and the session cleanup are two separate facts.
-        // Settlement records both facts before applying an explicit cleanup policy.
         let execution = execute_direct_mcp_call(
             &session,
             &tool_name,
@@ -176,13 +198,8 @@ impl StepExecutor for McpCallStep {
         )
     }
 }
-/// Execution-time destination gate for the direct `mcp.call` path:
-/// re-extracts hosts, enforces the static `allowed_destinations` ceiling,
-/// then delegates a remaining miss to the operator `destination_decider`
-/// when one is configured. Static hits never consult the decider. The
-/// verdict is journaled (`mcp_destination_decision`, hosts only) for audit;
-/// resumes re-invoke fresh so tightening denies retroactively, and
-/// cancellation propagates instead of denying.
+/// Re-extract hosts and enforce static `allowed_destinations` before delegating misses to the operator decider.
+/// Static hits skip it; journal host-only verdicts, recheck fresh policy on resume, and propagate cancellation.
 async fn authorize_direct_destinations(
     ctx: &StepContext<'_>,
     node: &NodeDef,
@@ -191,8 +208,6 @@ async fn authorize_direct_destinations(
     tool: &str,
     args: &Value,
 ) -> Result<(), engine::StepError> {
-    // Static verdict first (host-free passes, misses refuse): the decider
-    // below only widens a miss, so this reuse keeps one matcher.
     if check_direct_destinations(node, server, tool, profile.allowed_destinations(), args).is_ok() {
         return Ok(());
     }
@@ -255,12 +270,7 @@ async fn authorize_direct_destinations(
         }
     }
 }
-/// Fail-closed destination-policy gate for the direct `mcp.call` path:
-/// every host extracted from the rendered arguments must sit within the
-/// operator's per-profile `allowed_destinations` (exact match or `"*"`).
-/// Calls with no extracted host pass, so pure-query search keeps working
-/// while fetch requires an explicit operator allow. Denials are `Refused`,
-/// never silent — mirroring the `llm.agent` MCP tool gate.
+/// Fail closed unless every host matches an exact or wildcard allowlist; host-free search passes, fetch needs operator allow; denial is `Refused`.
 fn check_direct_destinations(
     node: &NodeDef,
     server: &str,

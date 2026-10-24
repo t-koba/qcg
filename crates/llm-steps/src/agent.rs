@@ -4,7 +4,7 @@ use contract::{AgentFailureAction, AgentFailureCode, Contract, NodeDef, ToolDecl
 use engine::{ResultExt, StepContext, StepError, StepExecutor, StepOutcome};
 use llm::{ChatContent, ChatMessage, ChatToolCall, LlmRuntime};
 use model::NodePath;
-use policy::{params_schema, string_array_schema, string_schema};
+use policy::{McpAuthorizationAction, params_schema, string_array_schema, string_schema};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -224,6 +224,16 @@ fn validate_agent_checkpoint(
     Ok(())
 }
 
+fn checkpoint_has_pending_mcp_call(
+    checkpoint: Option<&AgentCheckpoint>,
+    declarations: &[ToolDecl],
+    required: &[String],
+) -> bool {
+    checkpoint.is_some_and(|stored| {
+        declarations.iter().any(|tool| matches!(tool, ToolDecl::Mcp { name, server, .. } if required.contains(server) && (stored.pending_side_effect.as_ref().is_some_and(|call| call.name == *name) || stored.pending_mcp_call.as_ref().is_some_and(|call| call.name == *name))))
+    })
+}
+
 fn resumed_mcp_call(
     checkpoint: Option<&AgentCheckpoint>,
     answers: &std::collections::BTreeMap<String, Value>,
@@ -352,6 +362,7 @@ impl StepExecutor for LlmAgentStep {
                 "max_iterations": { "type": "integer", "minimum": 1 },
                 "max_tokens_total": { "type": "integer", "minimum": 1 },
                 "max_tool_calls_total": { "type": "integer", "minimum": 1 },
+                "on_authorization_required": { "type": "string", "enum": ["fail", "wait", "degrade"] },
                 "guardrails": {
                     "type": "array",
                     "items": {
@@ -489,7 +500,7 @@ impl StepExecutor for LlmAgentStep {
         node: &NodeDef,
     ) -> Result<StepOutcome, StepError> {
         let prompt = render_prompt(ctx, node)?;
-        let params = llm_params(node)?;
+        let mut params = llm_params(node)?;
         let response_schema = load_schema(ctx, node)?;
         apply_guardrails(
             ctx,
@@ -580,6 +591,56 @@ impl StepExecutor for LlmAgentStep {
                 build_user_message(ctx, node, prompt).map(|message| vec![message])
             })?;
         let mcp_tools = McpAgentTools::prepare(ctx, node, &self.runtime, &params.tools).await?;
+        if !mcp_tools.authorization_required.is_empty() {
+            let (action, source) = params
+                .on_authorization_required
+                .map_or((McpAuthorizationAction::Fail, "agent_default"), |action| {
+                    (action, "node_parameter")
+                });
+            for server in &mcp_tools.authorization_required {
+                ctx.journal
+                    .event(
+                        "mcp_authorization_required",
+                        json!({"node": node.id, "server": server, "phase": "discovery", "action": action, "source": source}),
+                    )
+                    .step_err(&node.id)?;
+            }
+            match action {
+                McpAuthorizationAction::Fail => {
+                    return Err(StepError::McpAuthorizationRequired {
+                        node: node.id.clone(),
+                        server: mcp_tools.authorization_required[0].clone(),
+                    });
+                }
+                McpAuthorizationAction::Wait => {
+                    let servers = mcp_tools.authorization_required.join(", ");
+                    return Ok(StepOutcome::NeedsUser {
+                        question: engine::mcp_authorization_form_spec(format!(
+                            "MCP servers `{servers}`"
+                        )),
+                        files: Vec::new(),
+                    });
+                }
+                McpAuthorizationAction::Degrade => {
+                    if checkpoint_has_pending_mcp_call(
+                        checkpoint.as_ref(),
+                        &params.tools,
+                        &mcp_tools.authorization_required,
+                    ) {
+                        return Err(StepError::Refused {
+                            node: node.id.clone(),
+                            message: "authorization is required for a pending MCP call; refusing to degrade it".into(),
+                        });
+                    }
+                    let unavailable = mcp_tools
+                        .authorization_required
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<BTreeSet<_>>();
+                    params.tools.retain(|tool| !matches!(tool, ToolDecl::Mcp { server, .. } if unavailable.contains(server.as_str())));
+                }
+            }
+        }
         let tool_specs = params
             .tools
             .iter()

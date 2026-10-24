@@ -1,4 +1,5 @@
 use mcp::McpRuntime;
+use policy::McpAuthorizationAction;
 use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
@@ -22,10 +23,11 @@ pub(crate) struct McpCallParams {
     pub(crate) timeout_seconds: Option<u64>,
     #[serde(default = "default_true")]
     pub(crate) side_effects: bool,
-    /// Degrade transport failures to a null output instead of failing the run.
-    /// Validation, elicitation, and confirmation paths still fail.
+    /// Optional transport failures degrade to null; validation, elicitation, and confirmation still fail.
     #[serde(default)]
     pub(crate) optional: bool,
+    #[serde(default)]
+    pub(crate) on_authorization_required: Option<McpAuthorizationAction>,
     pub(crate) cleanup_failure: Option<api::McpCleanupPolicy>,
 }
 
@@ -40,6 +42,20 @@ impl McpCallParams {
             } else {
                 api::McpCleanupPolicySource::Default
             },
+        }
+    }
+
+    pub(crate) fn authorization_action(&self) -> (McpAuthorizationAction, &'static str) {
+        match self.on_authorization_required {
+            Some(action) => (action, "node_parameter"),
+            None => (
+                if self.optional {
+                    McpAuthorizationAction::Degrade
+                } else {
+                    McpAuthorizationAction::Fail
+                },
+                "default",
+            ),
         }
     }
 }

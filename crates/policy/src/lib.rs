@@ -2,6 +2,17 @@
 //! crate. Transport and execution code must not reimplement these; resolve
 //! policy here and pass plain values down.
 
+use serde::{Deserialize, Serialize};
+
+/// Operator-selected disposition for a missing MCP OAuth prerequisite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpAuthorizationAction {
+    Fail,
+    Wait,
+    Degrade,
+}
+
 pub mod audit;
 pub mod container;
 pub mod cost;

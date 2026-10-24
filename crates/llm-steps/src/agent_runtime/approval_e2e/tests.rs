@@ -2,7 +2,7 @@
 use super::*;
 use crate::agent::{LlmAgentStep, McpSuspendedCall};
 use crate::tool_events::execute_mcp_tool;
-use engine::StepExecutor;
+use engine::{StepExecutor, StepOutcome};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ElicitRequest, ElicitRequestParams,
     InputRequest, InputRequiredResult, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
@@ -119,6 +119,65 @@ impl MockMcp {
     }
 }
 
+fn authorization_runtime() -> llm::LlmRuntime {
+    let mut runtime = test_runtime();
+    let spec = serde_json::from_value(json!({
+        "id": "mock",
+        "transport": "streamable_http",
+        "url": "http://127.0.0.1:1/mcp",
+        "auth": "oauth",
+        "oauth_store": "memory",
+        "allowed_hosts": ["127.0.0.1"],
+        "timeout_seconds": 3
+    }))
+    .unwrap();
+    runtime.mcp = mcp::McpRuntime::from_specs(vec![spec]).unwrap();
+    runtime
+}
+
+#[derive(Clone)]
+struct CapturedFinalProvider(Arc<Mutex<Vec<Vec<String>>>>);
+
+#[async_trait::async_trait]
+impl llm::LlmProvider for CapturedFinalProvider {
+    fn id(&self) -> &str {
+        "fake"
+    }
+
+    fn capabilities(&self) -> llm::Capabilities {
+        llm::Capabilities {
+            tool_use: true,
+            ..Default::default()
+        }
+    }
+
+    async fn complete(
+        &self,
+        request: llm::ChatRequest,
+    ) -> Result<llm::ChatResponse, llm::LlmError> {
+        self.0
+            .lock()
+            .unwrap()
+            .push(request.tools.iter().map(|tool| tool.name.clone()).collect());
+        Ok(llm::ChatResponse {
+            content: vec![llm::ChatContent::Text("{\"ok\":true}".into())],
+            usage: llm::TokenUsage::default(),
+            stop: llm::StopReason::EndTurn,
+            provider_state: None,
+            web_search: None,
+        })
+    }
+}
+
+fn authorization_events(harness: &ApprovalHarness) -> Vec<Value> {
+    harness
+        .journal_text()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| event["t"] == "mcp_authorization_required")
+        .collect()
+}
+
 fn tools() -> Vec<ToolDecl> {
     vec![
         serde_json::from_value(json!({
@@ -217,6 +276,164 @@ fn node() -> NodeDef {
     }))
     .unwrap();
     node
+}
+
+#[tokio::test]
+async fn agent_oauth_discovery_fails_by_default_with_structured_provenance() {
+    let harness = ApprovalHarness::setup("mcp-auth-fail");
+    let runtime = Arc::new(authorization_runtime());
+    let node = node();
+    let operation_id = engine::operation_id_for(&harness.run_id, &node.id, "call-1");
+    let initial_run = run(&harness, BTreeMap::new());
+    let journal = journal(&harness);
+    let mut vars = contract::ValueBag::with_inputs(BTreeMap::new());
+    let mut ctx = context(&initial_run, &journal, &mut vars, &runtime);
+    let result = LlmAgentStep {
+        runtime: runtime.clone(),
+    }
+    .execute(&mut ctx, &node)
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(StepError::McpAuthorizationRequired { server, .. }) if server == "mock"
+    ));
+    let events = authorization_events(&harness);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["server"], "mock");
+    assert_eq!(events[0]["phase"], "discovery");
+    assert_eq!(events[0]["action"], "fail");
+    assert_eq!(events[0]["source"], "agent_default");
+    assert_eq!(harness.operation_started_count(&operation_id), 0);
+}
+
+#[tokio::test]
+async fn agent_wait_reenters_discovery_after_an_empty_answer_without_tool_dispatch() {
+    let harness = ApprovalHarness::setup("mcp-auth-wait");
+    let runtime = Arc::new(authorization_runtime());
+    let operation_id = engine::operation_id_for(&harness.run_id, "agent", "call-1");
+    let mut node = node();
+    node.params
+        .insert("on_authorization_required".into(), "wait".into());
+    let initial_run = run(&harness, BTreeMap::new());
+    let initial_journal = journal(&harness);
+    let mut vars = contract::ValueBag::with_inputs(BTreeMap::new());
+    let mut ctx = context(&initial_run, &initial_journal, &mut vars, &runtime);
+    let result = LlmAgentStep {
+        runtime: runtime.clone(),
+    }
+    .execute(&mut ctx, &node)
+    .await
+    .unwrap();
+    let StepOutcome::NeedsUser { question, .. } = result else {
+        panic!("expected an authorization prerequisite form")
+    };
+    assert!(question.fields.is_empty());
+
+    let resumed_run = run(&harness, BTreeMap::from([(question.id.clone(), json!({}))]));
+    let resumed_journal = journal(&harness);
+    let mut resumed_vars = contract::ValueBag::with_inputs(BTreeMap::new());
+    let mut resumed_ctx = context(&resumed_run, &resumed_journal, &mut resumed_vars, &runtime);
+    let resumed = LlmAgentStep {
+        runtime: runtime.clone(),
+    }
+    .execute(&mut resumed_ctx, &node)
+    .await
+    .unwrap();
+    let StepOutcome::NeedsUser {
+        question: resumed_question,
+        ..
+    } = resumed
+    else {
+        panic!("an empty answer must not authorize MCP discovery")
+    };
+    assert!(resumed_question.fields.is_empty());
+    assert_ne!(question.id, resumed_question.id);
+    let events = authorization_events(&harness);
+    assert_eq!(events.len(), 2);
+    assert!(
+        events
+            .iter()
+            .all(|event| { event["action"] == "wait" && event["source"] == "node_parameter" })
+    );
+    assert_eq!(harness.operation_started_count(&operation_id), 0);
+}
+
+#[tokio::test]
+async fn agent_degrade_omits_unavailable_server_tools_from_the_model_request() {
+    let harness = ApprovalHarness::setup("mcp-auth-degrade");
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let mut runtime = authorization_runtime();
+    runtime.provider = Arc::new(CapturedFinalProvider(captured.clone()));
+    let runtime = Arc::new(runtime);
+    let mut node = node();
+    node.params
+        .insert("on_authorization_required".into(), "degrade".into());
+    let mut run = run(&harness, BTreeMap::new());
+    run.contract.manifest.llm = Some(
+        serde_json::from_value(json!({
+            "model": {"provider": "fake", "model": "test"},
+            "max_tokens": 1000
+        }))
+        .unwrap(),
+    );
+    let journal = journal(&harness);
+    let mut vars = contract::ValueBag::with_inputs(BTreeMap::new());
+    let mut ctx = context(&run, &journal, &mut vars, &runtime);
+    let result = LlmAgentStep {
+        runtime: runtime.clone(),
+    }
+    .execute(&mut ctx, &node)
+    .await;
+
+    assert!(matches!(
+        result,
+        Ok(StepOutcome::Success { output: Some(value), .. }) if value == json!({"ok": true})
+    ));
+    assert_eq!(*captured.lock().unwrap(), vec![Vec::<String>::new()]);
+    let events = authorization_events(&harness);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["action"], "degrade");
+    assert_eq!(events[0]["source"], "node_parameter");
+}
+
+#[tokio::test]
+async fn agent_degrade_refuses_to_drop_a_checkpointed_mcp_call() {
+    let harness = ApprovalHarness::setup("mcp-auth-degrade-pending");
+    let runtime = Arc::new(authorization_runtime());
+    let operation_id = engine::operation_id_for(&harness.run_id, "agent", "call-1");
+    let mut node = node();
+    node.params
+        .insert("on_authorization_required".into(), "degrade".into());
+    let run = run(&harness, BTreeMap::new());
+    let journal = journal(&harness);
+    let mut vars = contract::ValueBag::with_inputs(BTreeMap::new());
+    let mut ctx = context(&run, &journal, &mut vars, &runtime);
+    record_agent_checkpoint(
+        &ctx,
+        &node,
+        0,
+        "before_side_effect",
+        &checkpoint(original(false)),
+        &tools(),
+    )
+    .unwrap();
+
+    let result = LlmAgentStep {
+        runtime: runtime.clone(),
+    }
+    .execute(&mut ctx, &node)
+    .await;
+    assert!(matches!(
+        result,
+        Err(StepError::Refused { message, .. })
+            if message.contains("pending MCP call")
+    ));
+    let events = authorization_events(&harness);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["action"], "degrade");
+    assert_eq!(events[0]["source"], "node_parameter");
+    assert_eq!(harness.operation_started_count(&operation_id), 0);
 }
 
 #[tokio::test]
