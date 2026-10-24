@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use contract::{Contract, ModelRef, NodeDef};
+use contract::{CacheWritePolicy, Contract, ModelRef, NodeDef, PromptCachePolicy};
 use engine::{StepContext, StepError, StepExecutor, StepOutcome};
 use llm::{DecisionQuestion, DecisionRequest, LlmRuntime};
 use serde::Deserialize;
@@ -55,6 +55,21 @@ impl LlmDecideStep {
                 return Err(StepError::failed(
                     &node.id,
                     format!("model.{field} must be finite and non-negative"),
+                ));
+            }
+        }
+        if let Some(llm) = &contract.manifest.llm {
+            llm.validate_cache_policy()
+                .map_err(|error| StepError::failed(&node.id, error))?;
+            // Decisions have no cache wire format: any non-default cache
+            // policy would be silently ignored, so fail before dispatch.
+            if llm.cache != PromptCachePolicy::Off
+                || llm.cache_write_policy != CacheWritePolicy::Allow
+                || llm.cache_retention.is_some()
+            {
+                return Err(StepError::failed(
+                    &node.id,
+                    "llm.decide does not support prompt-cache policies: remove [llm] cache, cache_write_policy and cache_retention",
                 ));
             }
         }

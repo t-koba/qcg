@@ -22,6 +22,8 @@ pub(crate) fn validate_llm_node(
         .llm
         .as_ref()
         .ok_or_else(|| StepError::failed(&node.id, "[llm] is required"))?;
+    llm.validate_cache_policy()
+        .map_err(|error| StepError::failed(&node.id, error))?;
     let params = llm_params(node)?;
     if let Some(search) = &params.provider_web_search {
         validate_provider_web_search(node, search)?;

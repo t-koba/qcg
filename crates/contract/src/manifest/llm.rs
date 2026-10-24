@@ -55,8 +55,22 @@ pub struct LlmConfig {
     pub context_overflow: ContextOverflowPolicy,
     /// Prompt-cache policy. Unset and `off` send no cache instructions;
     /// `auto` sends the selected provider's cache instructions.
+    /// `off` only omits qcg cache instructions; it does not disable
+    /// provider-side caching. See `cache_write_policy` for a disable.
     #[serde(default)]
     pub cache: PromptCachePolicy,
+    /// Prompt-cache write policy. `allow` (default) leaves provider
+    /// caching alone; `forbid` requires qcg/provider caching to be
+    /// disabled for the request and fails before network dispatch when
+    /// the selected route cannot honor the disable.
+    #[serde(default)]
+    pub cache_write_policy: CacheWritePolicy,
+    /// Optional prompt-cache retention tier. Only `extended` is defined;
+    /// absent means the provider default lifetime. Valid only with
+    /// `cache = "auto"` and `cache_write_policy = "allow"`, and only
+    /// when the selected route explicitly declares the tier mechanism.
+    #[serde(default)]
+    pub cache_retention: Option<CacheRetention>,
     #[serde(default)]
     pub requires: Vec<String>,
     #[serde(default)]
@@ -174,6 +188,43 @@ pub enum PromptCachePolicy {
     /// Never send cache instructions.
     #[default]
     Off,
+}
+
+/// Declared prompt-cache write policy for this contract's LLM requests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheWritePolicy {
+    /// Leave provider caching alone (default).
+    #[default]
+    Allow,
+    /// Require qcg/provider caching to be disabled for the request.
+    Forbid,
+}
+
+/// Declared prompt-cache retention tier. Only `extended` is defined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheRetention {
+    /// The route's explicitly declared extended-retention mechanism.
+    Extended,
+}
+
+impl LlmConfig {
+    /// Fail-closed combination rule for the advanced cache controls.
+    /// Retention needs `cache = "auto"` with write `allow`; `forbid`
+    /// itself is validated against the selected route at dispatch.
+    pub fn validate_cache_policy(&self) -> Result<(), String> {
+        if self.cache_retention.is_some()
+            && (self.cache != PromptCachePolicy::Auto
+                || self.cache_write_policy != CacheWritePolicy::Allow)
+        {
+            return Err(
+                "cache_retention requires cache = \"auto\" and cache_write_policy = \"allow\""
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -443,5 +494,42 @@ mod tests {
         let error = toml::from_str::<LlmConfig>("max_tokens = 128\ncache = \"always\"")
             .expect_err("unknown cache value must fail");
         assert!(error.to_string().contains("unknown variant"), "{error}");
+    }
+
+    #[test]
+    fn cache_control_defaults_and_combination_rule() {
+        let unset: LlmConfig =
+            toml::from_str("max_tokens = 128").expect("unset cache should parse");
+        assert_eq!(unset.cache, PromptCachePolicy::Off);
+        assert_eq!(unset.cache_write_policy, CacheWritePolicy::Allow);
+        assert_eq!(unset.cache_retention, None);
+        unset
+            .validate_cache_policy()
+            .expect("defaults must validate");
+
+        let extended: LlmConfig =
+            toml::from_str("max_tokens = 128\ncache = \"auto\"\ncache_retention = \"extended\"")
+                .expect("extended retention should parse");
+        assert_eq!(extended.cache_retention, Some(CacheRetention::Extended));
+        extended
+            .validate_cache_policy()
+            .expect("auto+allow+extended must validate");
+
+        let off_extended: LlmConfig =
+            toml::from_str("max_tokens = 128\ncache_retention = \"extended\"")
+                .expect("off+extended should parse");
+        assert!(
+            off_extended.validate_cache_policy().is_err(),
+            "retention requires cache=auto"
+        );
+
+        let forbid_extended: LlmConfig = toml::from_str(
+            "max_tokens = 128\ncache = \"auto\"\ncache_write_policy = \"forbid\"\ncache_retention = \"extended\"",
+        )
+        .expect("forbid+extended should parse");
+        assert!(
+            forbid_extended.validate_cache_policy().is_err(),
+            "retention requires write allow"
+        );
     }
 }

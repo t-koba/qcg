@@ -156,7 +156,15 @@ fn cache_cost_validates_counts_and_does_not_mix_pricing_rows() {
         reasoning: 0,
     };
     let cost = |routes: &[ModelRef], usage: &TokenUsage| {
-        gateway.cost_microusd(&test_node(), routes, "cache-metered", "test", usage, None)
+        gateway.cost_microusd(
+            &test_node(),
+            routes,
+            "cache-metered",
+            "test",
+            usage,
+            None,
+            None,
+        )
     };
     // A complete invocation row wins as a whole: its omitted cache rates
     // fall back to its own input rate, not the discounted registry row.
@@ -198,6 +206,7 @@ fn cache_cost_validates_counts_and_does_not_mix_pricing_rows() {
                 "cache-metered",
                 "test",
                 &usage,
+                None,
                 None
             )
             .is_err()
@@ -216,6 +225,7 @@ fn cache_cost_validates_counts_and_does_not_mix_pricing_rows() {
                     cached_input: 2,
                     ..Default::default()
                 },
+                None,
                 None,
             )
             .is_err()

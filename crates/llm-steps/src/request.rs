@@ -1,5 +1,7 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use contract::{LlmRequestPolicy, NodeDef, PromptCachePolicy, ToolDecl};
+use contract::{
+    CacheRetention, CacheWritePolicy, LlmRequestPolicy, NodeDef, PromptCachePolicy, ToolDecl,
+};
 use engine::{StepContext, StepError};
 use llm::{ChatContentPart, ChatMessage, ChatRequest, LlmRuntime, ToolSpec};
 use model::StructuredOutputMode;
@@ -14,6 +16,14 @@ use crate::request_policy::{
     effective_request_policy_with_request, llm_params, resolve_llm_efforts,
 };
 use crate::validation::{capabilities_for, resolve_model, validate_resolved_model};
+
+pub(crate) fn validate_cache_combo(
+    node: &NodeDef,
+    llm: &contract::LlmConfig,
+) -> Result<(), StepError> {
+    llm.validate_cache_policy()
+        .map_err(|error| StepError::failed(&node.id, error))
+}
 
 pub(crate) fn build_request(
     ctx: &StepContext<'_>,
@@ -30,6 +40,7 @@ pub(crate) fn build_request(
         .as_ref()
         .ok_or_else(|| StepError::failed(&node.id, "[llm] is required"))?
         .clone();
+    validate_cache_combo(node, &llm)?;
     let params = llm_params(node)?;
     let (llm, request, _) = resolve_llm_efforts(ctx, node, &llm, &params.request, None)?;
     let policy = effective_request_policy_with_request(node, &llm, &request, None)?;
@@ -77,6 +88,13 @@ pub(crate) fn build_request(
             PromptCachePolicy::Auto => llm::PromptCache::Auto,
             PromptCachePolicy::Off => llm::PromptCache::Off,
         },
+        cache_write: match llm.cache_write_policy {
+            CacheWritePolicy::Allow => llm::CacheWritePolicy::Allow,
+            CacheWritePolicy::Forbid => llm::CacheWritePolicy::Forbid,
+        },
+        cache_retention: llm
+            .cache_retention
+            .map(|CacheRetention::Extended| llm::CacheRetention::Extended),
         provider_web_search: params.provider_web_search.clone(),
     })
 }
@@ -216,6 +234,7 @@ pub(crate) fn build_request_with_messages(
         .as_ref()
         .ok_or_else(|| StepError::failed(&node.id, "[llm] is required"))?
         .clone();
+    validate_cache_combo(node, &llm)?;
     let params = llm_params(node)?;
     let (llm, request, specialist_request) =
         resolve_llm_efforts(ctx, node, &llm, &params.request, specialist_request)?;
@@ -268,6 +287,13 @@ pub(crate) fn build_request_with_messages(
             PromptCachePolicy::Auto => llm::PromptCache::Auto,
             PromptCachePolicy::Off => llm::PromptCache::Off,
         },
+        cache_write: match llm.cache_write_policy {
+            CacheWritePolicy::Allow => llm::CacheWritePolicy::Allow,
+            CacheWritePolicy::Forbid => llm::CacheWritePolicy::Forbid,
+        },
+        cache_retention: llm
+            .cache_retention
+            .map(|CacheRetention::Extended| llm::CacheRetention::Extended),
         provider_web_search: params.provider_web_search.clone(),
     })
 }

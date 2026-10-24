@@ -15,6 +15,8 @@
   "AttemptStatus",
   "AuditLevel",
   "BudgetExhaustion",
+  "CacheRetention",
+  "CacheWritePolicy",
   "CommandIsolation",
   "CommandPermission",
   "ConfirmDecision",

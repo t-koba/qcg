@@ -48,6 +48,16 @@ pub struct LlmCallEventData {
     pub max_tokens_total: Option<u64>,
     #[serde(default)]
     pub repair: Option<bool>,
+    /// Requested cache write policy when non-default (`forbid` only).
+    /// Absent means the default `allow`: the request left provider caching
+    /// alone. Present only to make the TTL cost basis inspectable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_policy: Option<contract::CacheWritePolicy>,
+    /// Requested cache retention tier when non-default (`extended` only).
+    /// Absent means the provider default lifetime. Present only to make the
+    /// TTL cost basis inspectable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_retention: Option<contract::CacheRetention>,
     /// What the provider's hosted web search did in this call. Absent when
     /// the request did not enable the hosted search.
     #[serde(default)]

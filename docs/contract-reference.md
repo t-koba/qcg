@@ -108,6 +108,41 @@ Fields:
   `capabilities.prompt_cache` refuses an `auto` request explicitly instead of
   dropping the policy. Cache reads are reported as `cached_input`, cache
   creation as `cache_creation_input`; both are disjoint subsets of total `input`.
+  `off` only omits qcg cache instructions; it does not disable provider-side
+  caching (see `cache_write_policy`).
+- `cache_write_policy`: `allow` (default) leaves provider caching alone;
+  `forbid` requires qcg/provider caching to be disabled for the request, not
+  just omitted. Anthropic Messages honors `forbid` by omitting every explicit
+  and top-level automatic marker. OpenAI/Azure chat and Responses routes honor
+  `forbid` only when the selected model/row explicitly declares
+  `prompt_cache_explicit_mode = true`, emitting
+  `prompt_cache_options: {"mode": "explicit"}` with no qcg explicit breakpoints
+  (so no cache read/write). A route that cannot honor an explicit `forbid`
+  fails before network dispatch, on every fallback route. `llm.decide` and
+  `system_one` routes reject any non-default cache policy before dispatch.
+- `cache_retention`: optional retention tier; only `extended` is defined and
+  absent means the provider default lifetime. Valid only with `cache = "auto"`
+  and `cache_write_policy = "allow"`, and only when the selected model/row
+  explicitly declares the tier mechanism in `prompt_cache_retention`
+  (model-aware: a `[[provider.models]]` entry may declare or override the row
+  value for that model; a row-level value is an operator claim that every model
+  on the row honors it). The single `extended` tier maps to exactly one
+  declared mechanism: older OpenAI/Azure models `prompt_cache_retention: "24h"`;
+  OpenAI GPT-5.6+ Responses `prompt_cache_options: {"ttl": "12h"}` (Responses
+  only); Anthropic Messages `cache_control: {"ttl": "1h"}` added to every cache
+  marker the row emits (system and top-level automatic markers). Azure newer
+  models support only `prompt_cache_options.ttl: "30m"`, which is not an
+  extended-retention choice, so no `extended` mechanism is declared for them.
+  These provider cache-lifetime/retention controls do not state a data-retention
+  policy or guarantee deletion at any time. Usage normalization is unchanged.
+  With `extended`,
+  `ttl_1h` bills only `cache_creation_input` at 2x the selected context tier's
+  ordinary input rate, and `ttl_12h` at 2.5x; `retention_24h` keeps the
+  configured cache-write rate. The meter uses the requested TTL because
+  provider usage totals may omit the TTL breakdown (especially streaming).
+  A max-cost budget reserves with the extended multiplier at the dearest
+  context-tier input rate and refuses dispatch if the ordinary input rate
+  needed for a possible tier is missing.
 - `context_overflow`: `error` by default, or explicitly `truncate_head` /
   `truncate_tail`. Truncation is UTF-8 safe, visibly marked, deterministic,
   and recorded as `context_compacted`; no silent compaction occurs.

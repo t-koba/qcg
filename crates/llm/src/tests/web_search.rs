@@ -63,7 +63,7 @@ fn hosted_search_is_off_by_default() {
         request.provider_web_search.is_none(),
         "selecting a model must never enable the hosted search"
     );
-    let payload = responses_payload(&request, None);
+    let payload = responses_payload(&request, None, None, false);
     assert!(
         payload.get("tools").is_none(),
         "no hosted tool without the opt-in: {payload}"
@@ -76,7 +76,7 @@ fn hosted_search_is_off_by_default() {
 
 #[test]
 fn responses_payload_sends_the_hosted_search_tool() {
-    let payload = responses_payload(&search_request(), None);
+    let payload = responses_payload(&search_request(), None, None, false);
     assert_eq!(
         payload["tools"],
         json!([{
@@ -97,7 +97,7 @@ fn hosted_search_keeps_the_function_tools_and_the_call_bound() {
         description: "Write a draft".into(),
         input_schema: json!({"type": "object"}),
     }];
-    let payload = responses_payload(&request, None);
+    let payload = responses_payload(&request, None, None, false);
     assert_eq!(payload["tools"][0]["name"], json!("write_draft"));
     assert_eq!(payload["tools"][1]["type"], json!("web_search"));
     assert_eq!(payload["max_tool_calls"], json!(3));

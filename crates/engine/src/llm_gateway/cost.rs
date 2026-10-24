@@ -1,10 +1,28 @@
 use crate::StepError;
 use contract::{ModelRef, NodeDef};
-use llm::TokenUsage;
+use llm::{CacheRetention, PromptCacheRetention, TokenUsage};
 
 use super::types::LlmGateway;
 
 impl<'a> LlmGateway<'a> {
+    /// Price the requested TTL, because usage (notably streaming usage) may
+    /// report only the total cache creation tokens, without a TTL breakdown.
+    pub(super) fn cache_write_multiplier(
+        &self,
+        provider: &str,
+        model: &str,
+        retention: Option<CacheRetention>,
+    ) -> Option<f64> {
+        if retention != Some(CacheRetention::Extended) {
+            return None;
+        }
+        match self.provider.prompt_cache_retention_for(provider, model)? {
+            PromptCacheRetention::Ttl1h => Some(2.0),
+            PromptCacheRetention::Ttl12h => Some(2.5),
+            PromptCacheRetention::Retention24h => None,
+        }
+    }
+
     /// The route that bills this call: the contract's routes first, then
     /// the gateway's priced models. The selection rule lives in the policy
     /// crate, so the meter and the pre-call reservation pick the same row.
@@ -53,6 +71,7 @@ impl<'a> LlmGateway<'a> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn cost_microusd(
         &self,
         node: &NodeDef,
@@ -60,6 +79,7 @@ impl<'a> LlmGateway<'a> {
         provider: &str,
         model: &str,
         usage: &TokenUsage,
+        retention: Option<CacheRetention>,
         web_search_calls: Option<u64>,
     ) -> Result<u64, StepError> {
         let ordinary_input = usage
@@ -97,7 +117,14 @@ impl<'a> LlmGateway<'a> {
         let input = rates.input.unwrap_or_default();
         let output = rates.output.unwrap_or_default();
         let read = rates.cache_read.unwrap_or_default();
-        let creation = rates.cache_creation.unwrap_or_default();
+        // Extended TTL writes replace only the creation rate, using the
+        // selected context tier's ordinary input price, not its default
+        // cache-write price. Other categories and 24h retention stay intact.
+        let creation = match self.cache_write_multiplier(provider, model, retention) {
+            Some(multiplier) => rates.input.map(|rate| rate * multiplier),
+            None => rates.cache_creation,
+        }
+        .unwrap_or_default();
         if [input, output, read, creation]
             .into_iter()
             .any(|rate| !rate.is_finite() || rate < 0.0)

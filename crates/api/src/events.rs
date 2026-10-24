@@ -286,9 +286,82 @@ mod tests {
         match event.data {
             RunEventData::LlmCall(data) => {
                 assert_eq!(data.agent.as_deref(), Some("parallel_researcher"));
+                assert!(data.cache_write_policy.is_none());
+                assert!(data.cache_retention.is_none());
             }
             other => panic!("expected typed llm_call, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn llm_call_cache_policy_fields_decode_and_stay_optional() {
+        let value = serde_json::json!({
+            "t": "llm_call",
+            "seq": 2,
+            "ts": "2026-08-31T00:00:01Z",
+            "run_id": "run-1",
+            "trace_id": "trace-1",
+            "span_id": "span-2",
+            "node": "research",
+            "provider": "fake",
+            "model": "fake",
+            "max_tokens": 128,
+            "tokens": { "input": 10, "output": 2 },
+            "cost_microusd": 0,
+            "cache_write_policy": "forbid",
+            "cache_retention": "extended"
+        });
+        let event = RunEvent::from_flat(&value).expect("cache-policy llm_call should decode");
+        match event.data {
+            RunEventData::LlmCall(data) => {
+                assert_eq!(
+                    data.cache_write_policy,
+                    Some(contract::CacheWritePolicy::Forbid)
+                );
+                assert_eq!(
+                    data.cache_retention,
+                    Some(contract::CacheRetention::Extended)
+                );
+            }
+            other => panic!("expected typed llm_call, got {other:?}"),
+        }
+        // Serializing the decoded form omits defaults but keeps non-defaults.
+        let roundtrip = serde_json::to_value(RunEventData::LlmCall(crate::LlmCallEventData {
+            provider: "fake".into(),
+            model: "fake".into(),
+            agent: None,
+            seed: None,
+            reasoning_effort: None,
+            temperature: None,
+            top_p: None,
+            max_tokens: 128,
+            stop_sequences: Vec::new(),
+            structured_output: Default::default(),
+            tool_choice: None,
+            parallel_tool_calls: None,
+            verbosity: None,
+            stream: false,
+            stop_reason: None,
+            tokens: crate::TokenUsageEventData {
+                input: 10,
+                output: 2,
+                reasoning: 0,
+                cached_input: 0,
+                cache_creation_input: 0,
+            },
+            cost_microusd: 0,
+            attempt: 0,
+            turn: None,
+            tokens_total: None,
+            max_tokens_total: None,
+            repair: None,
+            cache_write_policy: None,
+            cache_retention: None,
+            web_search: None,
+        }))
+        .expect("typed llm_call should serialize");
+        assert!(roundtrip.get("cache_write_policy").is_none());
+        assert!(roundtrip.get("cache_retention").is_none());
     }
 
     #[test]

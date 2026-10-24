@@ -33,6 +33,8 @@ fn sample_request() -> ChatRequest {
         verbosity: None,
         stream: false,
         prompt_cache: PromptCache::Off,
+        cache_write: CacheWritePolicy::Allow,
+        cache_retention: None,
         provider_web_search: None,
     }
 }
@@ -180,10 +182,24 @@ fn responses_continuation_preserves_reasoning_state() {
 fn chat_completions_payload_gates_seed_by_capability() {
     let request = sample_request();
 
-    let payload = chat_completions_payload(&request, true, ChatTokenLimitField::MaxTokens, None);
+    let payload = chat_completions_payload(
+        &request,
+        true,
+        ChatTokenLimitField::MaxTokens,
+        None,
+        None,
+        false,
+    );
     assert_eq!(payload["seed"], 42);
 
-    let payload = chat_completions_payload(&request, false, ChatTokenLimitField::MaxTokens, None);
+    let payload = chat_completions_payload(
+        &request,
+        false,
+        ChatTokenLimitField::MaxTokens,
+        None,
+        None,
+        false,
+    );
     assert!(payload.get("seed").is_none());
 }
 
@@ -198,7 +214,14 @@ fn chat_completions_payload_omits_null_fields_and_includes_schema_and_tools() {
         input_schema: json!({ "type": "object" }),
     }];
 
-    let payload = chat_completions_payload(&request, false, ChatTokenLimitField::MaxTokens, None);
+    let payload = chat_completions_payload(
+        &request,
+        false,
+        ChatTokenLimitField::MaxTokens,
+        None,
+        None,
+        false,
+    );
 
     assert!(payload.get("temperature").is_none());
     assert_eq!(payload["max_tokens"], 128);
@@ -222,11 +245,13 @@ fn structured_output_mode_selects_strict_compatible_or_prompt_transport() {
         false,
         ChatTokenLimitField::MaxCompletionTokens,
         None,
+        None,
+        false,
     );
     assert_eq!(auto["response_format"]["json_schema"]["strict"], true);
 
     request.structured_output = StructuredOutputMode::NativeCompatible;
-    let compatible = responses_payload(&request, None);
+    let compatible = responses_payload(&request, None, None, false);
     assert_eq!(compatible["text"]["format"]["strict"], false);
 
     request.structured_output = StructuredOutputMode::Prompt;
@@ -235,9 +260,11 @@ fn structured_output_mode_selects_strict_compatible_or_prompt_transport() {
         false,
         ChatTokenLimitField::MaxCompletionTokens,
         None,
+        None,
+        false,
     );
     assert!(prompt.get("response_format").is_none());
-    let anthropic = anthropic_payload(&request, None);
+    let anthropic = anthropic_payload(&request, None, None);
     assert!(anthropic.get("tool_choice").is_none());
 }
 
@@ -279,21 +306,25 @@ fn auto_matches_explicit_native_transport_or_fail_closed() {
             &auto_req,
             false,
             ChatTokenLimitField::MaxCompletionTokens,
-            None
+            None,
+            None,
+            false,
         )["response_format"],
         chat_completions_payload(
             &strict_req,
             false,
             ChatTokenLimitField::MaxCompletionTokens,
-            None
+            None,
+            None,
+            false,
         )["response_format"]
     );
     assert_eq!(
-        responses_payload(&auto_req, None)["text"],
-        responses_payload(&strict_req, None)["text"]
+        responses_payload(&auto_req, None, None, false)["text"],
+        responses_payload(&strict_req, None, None, false)["text"]
     );
-    let auto_anthropic = anthropic_payload(&auto_req, None);
-    let strict_anthropic = anthropic_payload(&strict_req, None);
+    let auto_anthropic = anthropic_payload(&auto_req, None, None);
+    let strict_anthropic = anthropic_payload(&strict_req, None, None);
     assert_eq!(auto_anthropic["tools"], strict_anthropic["tools"]);
     assert_eq!(
         auto_anthropic["tool_choice"],
@@ -326,13 +357,15 @@ fn auto_matches_explicit_native_transport_or_fail_closed() {
             &auto_open,
             false,
             ChatTokenLimitField::MaxCompletionTokens,
-            None
+            None,
+            None,
+            false,
         )
         .get("response_format")
         .is_none()
     );
     assert!(
-        anthropic_payload(&auto_open, None)["tools"]
+        anthropic_payload(&auto_open, None, None)["tools"]
             .as_array()
             .is_none_or(|tools| tools.iter().all(|tool| tool["name"] != "response"))
     );
@@ -571,16 +604,23 @@ fn multimodal_parts_map_to_provider_native_payloads() {
             },
         ],
     )];
-    let chat = chat_completions_payload(&request, true, ChatTokenLimitField::MaxTokens, None);
+    let chat = chat_completions_payload(
+        &request,
+        true,
+        ChatTokenLimitField::MaxTokens,
+        None,
+        None,
+        false,
+    );
     assert_eq!(chat["messages"][1]["content"][1]["type"], "image_url");
     assert_eq!(
         chat["messages"][1]["content"][1]["image_url"]["url"],
         "data:image/png;base64,aGVsbG8="
     );
-    let responses = responses_payload(&request, None);
+    let responses = responses_payload(&request, None, None, false);
     assert_eq!(responses["input"][1]["content"][2]["type"], "input_file");
     assert_eq!(responses["input"][1]["content"][2]["filename"], "input.pdf");
-    let anthropic = anthropic_payload(&request, None);
+    let anthropic = anthropic_payload(&request, None, None);
     assert_eq!(anthropic["messages"][0]["content"][1]["type"], "image");
     assert_eq!(
         anthropic["messages"][0]["content"][2]["source"]["media_type"],
@@ -609,20 +649,27 @@ fn provider_payloads_map_explicit_invocation_policy() {
 
     validate_chat_request(&request, ApiFlavor::ChatCompletions)
         .expect("portable request policy should validate");
-    let chat = chat_completions_payload(&request, true, ChatTokenLimitField::MaxTokens, None);
+    let chat = chat_completions_payload(
+        &request,
+        true,
+        ChatTokenLimitField::MaxTokens,
+        None,
+        None,
+        false,
+    );
     assert_eq!(chat["top_p"], 0.25);
     assert_eq!(chat["stop"], json!(["END"]));
     assert_eq!(chat["tool_choice"], "required");
     assert_eq!(chat["parallel_tool_calls"], false);
 
-    let responses = responses_payload(&request, None);
+    let responses = responses_payload(&request, None, None, false);
     assert_eq!(responses["top_p"], 0.25);
     assert!(responses.get("stop").is_none());
     assert_eq!(responses["tool_choice"], "required");
     assert_eq!(responses["parallel_tool_calls"], false);
     assert_eq!(responses["text"]["verbosity"], "high");
 
-    let anthropic = anthropic_payload(&request, None);
+    let anthropic = anthropic_payload(&request, None, None);
     assert_eq!(anthropic["top_p"], 0.25);
     assert_eq!(anthropic["stop_sequences"], json!(["END"]));
     assert_eq!(anthropic["tool_choice"]["type"], "any");
@@ -632,16 +679,22 @@ fn provider_payloads_map_explicit_invocation_policy() {
         tool: "lookup".into(),
     });
     assert_eq!(
-        chat_completions_payload(&request, true, ChatTokenLimitField::MaxTokens, None)["tool_choice"]
-            ["function"]["name"],
+        chat_completions_payload(
+            &request,
+            true,
+            ChatTokenLimitField::MaxTokens,
+            None,
+            None,
+            false
+        )["tool_choice"]["function"]["name"],
         "lookup"
     );
     assert_eq!(
-        responses_payload(&request, None)["tool_choice"]["name"],
+        responses_payload(&request, None, None, false)["tool_choice"]["name"],
         "lookup"
     );
     assert_eq!(
-        anthropic_payload(&request, None)["tool_choice"]["name"],
+        anthropic_payload(&request, None, None)["tool_choice"]["name"],
         "lookup"
     );
 }
@@ -658,7 +711,7 @@ fn responses_payload_keeps_verbosity_alongside_native_schema_format() {
     // Verbosity-only keeps the text object without a format key.
     let mut verbose_only = sample_request();
     verbose_only.verbosity = Some(ResponseVerbosity::Low);
-    let payload = responses_payload(&verbose_only, None);
+    let payload = responses_payload(&verbose_only, None, None, false);
     assert_eq!(payload["text"]["verbosity"], "low");
     assert!(payload["text"].get("format").is_none());
 
@@ -666,7 +719,7 @@ fn responses_payload_keeps_verbosity_alongside_native_schema_format() {
     let mut schema_only = sample_request();
     schema_only.response_schema = Some(schema.clone());
     schema_only.structured_output = StructuredOutputMode::NativeStrict;
-    let payload = responses_payload(&schema_only, None);
+    let payload = responses_payload(&schema_only, None, None, false);
     assert_eq!(payload["text"]["format"]["type"], "json_schema");
     assert!(payload["text"]["format"]["strict"].as_bool().unwrap());
     assert!(payload["text"].get("verbosity").is_none());
@@ -674,7 +727,7 @@ fn responses_payload_keeps_verbosity_alongside_native_schema_format() {
     // The combination keeps both: verbosity must survive the format branch.
     let mut combined = schema_only.clone();
     combined.verbosity = Some(ResponseVerbosity::Low);
-    let payload = responses_payload(&combined, None);
+    let payload = responses_payload(&combined, None, None, false);
     assert_eq!(payload["text"]["verbosity"], "low");
     assert_eq!(payload["text"]["format"]["type"], "json_schema");
     assert_eq!(payload["text"]["format"]["schema"], schema);
@@ -947,6 +1000,8 @@ fn chat_completions_payload_maps_reasoning_effort_and_completion_limit() {
         false,
         ChatTokenLimitField::MaxCompletionTokens,
         None,
+        None,
+        false,
     );
 
     assert_eq!(payload["reasoning_effort"], "high");
@@ -961,7 +1016,7 @@ fn responses_payload_maps_reasoning_effort() {
     request.seed = None;
     request.reasoning_effort = Some(ReasoningEffort::Max);
 
-    let payload = responses_payload(&request, None);
+    let payload = responses_payload(&request, None, None, false);
 
     assert_eq!(payload["reasoning"]["effort"], "max");
     assert_eq!(payload["max_output_tokens"], 128);
@@ -1106,7 +1161,7 @@ fn anthropic_payload_forces_response_tool_choice() {
     let mut request = sample_request();
     request.response_schema = Some(json!({ "type": "object" }));
 
-    let payload = anthropic_payload(&request, None);
+    let payload = anthropic_payload(&request, None, None);
 
     assert_eq!(payload["tool_choice"]["name"], "response");
     assert_eq!(payload["system"], "system");
@@ -1447,6 +1502,8 @@ fn spec_with_base_url(id: &str, base_url: &str) -> ProviderSpec {
         retry_backoff_exponent_cap: None,
         chat_token_limit_field: None,
         prompt_cache_field: None,
+        prompt_cache_retention: None,
+        prompt_cache_explicit_mode: false,
         decision_input_wrapper: DecisionInputWrapper::None,
         decision_model_in_body: true,
         decision_response_wrapper: DecisionResponseWrapper::Auto,
@@ -2473,6 +2530,8 @@ fn stream_request() -> ChatRequest {
         verbosity: None,
         stream: true,
         prompt_cache: PromptCache::Off,
+        cache_write: CacheWritePolicy::Allow,
+        cache_retention: None,
         provider_web_search: None,
     }
 }
@@ -2558,6 +2617,8 @@ async fn router_retries_retryable_provider_error() {
             verbosity: None,
             stream: false,
             prompt_cache: PromptCache::Off,
+            cache_write: CacheWritePolicy::Allow,
+            cache_retention: None,
             provider_web_search: None,
         })
         .await
@@ -3151,4 +3212,211 @@ async fn anthropic_context_exhaustion_retains_unfinished_tool_json_but_unknown_s
             .is_err()
         );
     }
+}
+
+#[tokio::test]
+async fn unsupported_write_disable_fails_before_network() {
+    // Unroutable base: a cache-policy failure must surface instead of a
+    // connection error, proving the check runs before network dispatch.
+    let mut spec = spec_with_base_url("no-explicit", "http://127.0.0.1:9/v1/");
+    spec.capabilities.prompt_cache = true;
+    spec.prompt_cache_field = Some(PromptCacheField::PromptCacheKey);
+    let provider = HttpProvider::from_spec(spec);
+    let mut request = sample_request();
+    request.provider = "no-explicit".into();
+    request.seed = None;
+    request.prompt_cache = PromptCache::Auto;
+    request.cache_write = CacheWritePolicy::Forbid;
+    let error = provider
+        .complete(request)
+        .await
+        .expect_err("forbid without explicit mode must fail");
+    assert!(
+        error.to_string().contains("cannot disable caching"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn unsupported_retention_fails_before_network() {
+    let mut spec = spec_with_base_url("no-retention", "http://127.0.0.1:9/v1/");
+    spec.capabilities.prompt_cache = true;
+    spec.prompt_cache_field = Some(PromptCacheField::PromptCacheKey);
+    let provider = HttpProvider::from_spec(spec);
+    let mut request = sample_request();
+    request.provider = "no-retention".into();
+    request.seed = None;
+    request.prompt_cache = PromptCache::Auto;
+    request.cache_write = CacheWritePolicy::Allow;
+    request.cache_retention = Some(CacheRetention::Extended);
+    let error = provider
+        .complete(request)
+        .await
+        .expect_err("retention without a declared mechanism must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("does not declare an extended-retention mechanism"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn retention_requires_auto_and_allow_before_network() {
+    let mut spec = spec_with_base_url("retention-combo", "http://127.0.0.1:9/v1/");
+    spec.capabilities.prompt_cache = true;
+    spec.prompt_cache_field = Some(PromptCacheField::PromptCacheKey);
+    spec.prompt_cache_retention = Some(PromptCacheRetention::Retention24h);
+    let provider = HttpProvider::from_spec(spec);
+    // Extended with Off contradicts the combination rule.
+    let mut off = sample_request();
+    off.provider = "retention-combo".into();
+    off.seed = None;
+    off.prompt_cache = PromptCache::Off;
+    off.cache_retention = Some(CacheRetention::Extended);
+    let error = provider
+        .complete(off)
+        .await
+        .expect_err("retention with cache=off must fail");
+    assert!(
+        error.to_string().contains("requires cache ="),
+        "unexpected error: {error}"
+    );
+    // Extended with Forbid contradicts the combination rule.
+    let mut forbid = sample_request();
+    forbid.provider = "retention-combo".into();
+    forbid.seed = None;
+    forbid.prompt_cache = PromptCache::Auto;
+    forbid.cache_write = CacheWritePolicy::Forbid;
+    forbid.cache_retention = Some(CacheRetention::Extended);
+    let error = provider
+        .complete(forbid)
+        .await
+        .expect_err("retention with forbid must fail");
+    assert!(
+        error.to_string().contains("requires cache_write_policy"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn system_one_rejects_advanced_cache_before_network() {
+    let mut spec = spec_with_base_url("decisions", "http://127.0.0.1:9/v1/");
+    spec.api = ApiFlavor::SystemOne;
+    spec.capabilities = Capabilities::default();
+    let provider = HttpProvider::from_spec(spec);
+    for (prompt_cache, cache_write, cache_retention, hint) in [
+        (
+            PromptCache::Auto,
+            CacheWritePolicy::Allow,
+            None,
+            "cache=auto",
+        ),
+        (PromptCache::Off, CacheWritePolicy::Forbid, None, "forbid"),
+        (
+            PromptCache::Auto,
+            CacheWritePolicy::Allow,
+            Some(CacheRetention::Extended),
+            "retention",
+        ),
+    ] {
+        let mut request = sample_request();
+        request.provider = "decisions".into();
+        request.seed = None;
+        request.temperature = None;
+        request.prompt_cache = prompt_cache;
+        request.cache_write = cache_write;
+        request.cache_retention = cache_retention;
+        let error = provider
+            .complete(request)
+            .await
+            .expect_err("system_one must reject advanced cache policies");
+        assert!(
+            error.to_string().contains("system_one"),
+            "{hint}: unexpected error: {error}"
+        );
+    }
+}
+
+#[test]
+fn fallback_routes_are_revalidated_per_route() {
+    // Same advanced request against two rows: the declaring row validates,
+    // the row without the mechanism refuses. The gateway runs this check
+    // per route before dispatch, so every fallback is revalidated.
+    let mut supported = spec_with_base_url("primary", "http://127.0.0.1:9/v1/");
+    supported.capabilities.prompt_cache = true;
+    supported.prompt_cache_field = Some(PromptCacheField::PromptCacheKey);
+    supported.prompt_cache_explicit_mode = true;
+    let primary = HttpProvider::from_spec(supported);
+    let mut missing = spec_with_base_url("fallback", "http://127.0.0.1:9/v1/");
+    missing.capabilities.prompt_cache = true;
+    missing.prompt_cache_field = Some(PromptCacheField::PromptCacheKey);
+    let fallback = HttpProvider::from_spec(missing);
+    let capabilities = Capabilities {
+        prompt_cache: true,
+        ..Capabilities::default()
+    };
+    let mut request = sample_request();
+    request.prompt_cache = PromptCache::Auto;
+    request.cache_write = CacheWritePolicy::Forbid;
+    request.model = "model".into();
+    assert!(
+        primary
+            .check_cache_policy(&request, &primary.capabilities_for_model("model"))
+            .is_ok(),
+        "primary declares explicit mode"
+    );
+    let _ = &capabilities;
+    let error = fallback
+        .check_cache_policy(&request, &fallback.capabilities_for_model("model"))
+        .expect_err("fallback without explicit mode must fail");
+    assert!(
+        error.to_string().contains("cannot disable caching"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn supported_forbid_and_retention_validate_per_route() {
+    let mut spec = spec_with_base_url("extended", "http://127.0.0.1:9/v1/");
+    spec.capabilities.prompt_cache = true;
+    spec.prompt_cache_field = Some(PromptCacheField::PromptCacheKey);
+    spec.prompt_cache_retention = Some(PromptCacheRetention::Retention24h);
+    spec.prompt_cache_explicit_mode = true;
+    let provider = HttpProvider::from_spec(spec);
+    let capabilities = provider.capabilities_for_model("model");
+    let mut forbid = sample_request();
+    forbid.model = "model".into();
+    forbid.prompt_cache = PromptCache::Auto;
+    forbid.cache_write = CacheWritePolicy::Forbid;
+    let (retention, explicit) = provider
+        .check_cache_policy(&forbid, &capabilities)
+        .expect("declared explicit mode must validate");
+    assert_eq!(retention, None);
+    assert!(explicit);
+    let mut extended = sample_request();
+    extended.model = "model".into();
+    extended.prompt_cache = PromptCache::Auto;
+    extended.cache_write = CacheWritePolicy::Allow;
+    extended.cache_retention = Some(CacheRetention::Extended);
+    let (retention, explicit) = provider
+        .check_cache_policy(&extended, &capabilities)
+        .expect("declared retention must validate");
+    assert_eq!(retention, Some(PromptCacheRetention::Retention24h));
+    assert!(!explicit);
+}
+
+#[test]
+fn default_cache_controls_are_omitted_from_serialized_requests() {
+    let request = sample_request();
+    let defaults = serde_json::to_value(&request).expect("request should serialize");
+    assert!(defaults.get("cache_write").is_none());
+    assert!(defaults.get("cache_retention").is_none());
+
+    let mut explicit = request;
+    explicit.cache_write = CacheWritePolicy::Forbid;
+    explicit.cache_retention = Some(CacheRetention::Extended);
+    let explicit = serde_json::to_value(&explicit).expect("explicit controls should serialize");
+    assert_eq!(explicit["cache_write"], "forbid");
+    assert_eq!(explicit["cache_retention"], "extended");
 }

@@ -2070,6 +2070,10 @@ export interface components {
              */
             used_subsec_nanoseconds?: number | null;
         };
+        /** @description Declared prompt-cache retention tier. Only `extended` is defined. */
+        CacheRetention: "extended";
+        /** @description Declared prompt-cache write policy for this contract's LLM requests. */
+        CacheWritePolicy: "allow" | "forbid";
         /** @enum {string} */
         CommandIsolation: "container" | "trusted_host";
         CommandPermission: {
@@ -2429,6 +2433,18 @@ export interface components {
              * @default 0
              */
             attempt: number;
+            /**
+             * @description Requested cache retention tier when non-default (`extended` only).
+             *     Absent means the provider default lifetime. Present only to make the
+             *     TTL cost basis inspectable.
+             */
+            cache_retention?: components["schemas"]["CacheRetention"] | null;
+            /**
+             * @description Requested cache write policy when non-default (`forbid` only).
+             *     Absent means the default `allow`: the request left provider caching
+             *     alone. Present only to make the TTL cost basis inspectable.
+             */
+            cache_write_policy?: components["schemas"]["CacheWritePolicy"] | null;
             /** Format: uint64 */
             cost_microusd: number;
             /** Format: uint32 */

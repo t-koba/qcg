@@ -7080,7 +7080,9 @@ async fn queue_interrupt_resume_keeps_elapsed_budget_end_to_end() {
 
 #[tokio::test]
 async fn duplicate_write_and_extra_effect_pass_shape_validation_with_wrong_readback() {
-    use llm::{ChatMessage, ChatRequest, FakeLlmProvider, LlmProvider, PromptCache};
+    use llm::{
+        CacheWritePolicy, ChatMessage, ChatRequest, FakeLlmProvider, LlmProvider, PromptCache,
+    };
     use model::StructuredOutputMode;
 
     let schema = json!({
@@ -7188,6 +7190,8 @@ async fn duplicate_write_and_extra_effect_pass_shape_validation_with_wrong_readb
         verbosity: None,
         stream: false,
         prompt_cache: PromptCache::Off,
+        cache_write: CacheWritePolicy::Allow,
+        cache_retention: None,
         provider_web_search: None,
     };
     let first = FakeLlmProvider
@@ -7223,6 +7227,8 @@ async fn duplicate_write_and_extra_effect_pass_shape_validation_with_wrong_readb
         verbosity: None,
         stream: false,
         prompt_cache: PromptCache::Off,
+        cache_write: CacheWritePolicy::Allow,
+        cache_retention: None,
         provider_web_search: None,
     };
     let second = FakeLlmProvider
@@ -7307,7 +7313,9 @@ async fn duplicate_write_and_extra_effect_pass_shape_validation_with_wrong_readb
 
 #[tokio::test]
 async fn acrfence_crash_after_commit_and_token_resurrection_replay_gap() {
-    use llm::{ChatMessage, ChatRequest, FakeLlmProvider, LlmProvider, PromptCache};
+    use llm::{
+        CacheWritePolicy, ChatMessage, ChatRequest, FakeLlmProvider, LlmProvider, PromptCache,
+    };
     use model::StructuredOutputMode;
 
     let schema = json!({
@@ -7380,6 +7388,8 @@ async fn acrfence_crash_after_commit_and_token_resurrection_replay_gap() {
             verbosity: None,
             stream: false,
             prompt_cache: PromptCache::Off,
+            cache_write: CacheWritePolicy::Allow,
+            cache_retention: None,
             provider_web_search: None,
         };
         let response = FakeLlmProvider

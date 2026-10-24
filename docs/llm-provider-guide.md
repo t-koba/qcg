@@ -176,6 +176,39 @@ Fields:
   diverges after compaction; per-turn tool-discovery reorder likewise breaks the
   tools prefix. Minimum cacheable prefixes and TTL pricing are model-dependent;
   verify with `cache_read_input_tokens` after any prompt-assembly change.
+- `prompt_cache_retention`: extended-retention mechanism for the `extended`
+  tier (`retention_24h`, `ttl_12h`, `ttl_1h`). Optional; absent means the route
+  declares no `extended` tier and an `extended` request fails closed before
+  dispatch. Model-aware: a `[[provider.models]]` entry may set
+  `prompt_cache_retention` for that model only (overriding the row); a
+  row-level value is an operator claim that every model on the row honors the
+  mechanism (never inferred from the model-name string). API compatibility is
+  enforced: `retention_24h` is valid for `chat_completions` and `responses`
+  only (older OpenAI/Azure models, emitting `prompt_cache_retention: "24h"`);
+  `ttl_12h` is valid for `responses` only (OpenAI GPT-5.6+, emitting
+  `prompt_cache_options: {"ttl": "12h"}`); `ttl_1h` is valid for
+  `anthropic_messages` only (adding `cache_control: {"ttl": "1h"}` to every
+  cache marker the row emits, system and top-level automatic markers). Setting
+  `prompt_cache_retention` requires `capabilities.prompt_cache` on the
+  effective row/model. Azure newer models support only
+  `prompt_cache_options.ttl: "30m"`, which is not an extended-retention choice:
+  do not declare an `extended` mechanism for them. These values are cache
+  lifetime/retention controls, not data-retention policies or guarantees of
+  provider-data deletion. See OpenAI
+  https://developers.openai.com/api/docs/guides/prompt-caching, Azure
+  https://learn.microsoft.com/en-us/azure/ai-foundry/openai/how-to/prompt-caching,
+  Anthropic https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching.
+- `prompt_cache_explicit_mode`: when `true`, the row/model honors
+  `cache_write_policy = "forbid"` via `prompt_cache_options: {"mode":
+  "explicit"}` with no qcg explicit breakpoints (so no cache read/write).
+  Valid for `chat_completions` and `responses` only (OpenAI/Azure routes whose
+  API/model explicitly supports the mode). A `[[provider.models]]` entry may
+  override the row per model. Anthropic Messages needs no declaration: `forbid`
+  is honored by omitting every explicit and top-level automatic marker.
+  Unsupported explicit `forbid` fails before network dispatch on every route,
+  including each fallback. Explicit advanced cache policies on `system_one`
+  rows fail before dispatch rather than being ignored; `llm.decide` rejects any
+  non-default cache policy before dispatch.
 - `capabilities`: advertised support for `tool_use`, `json_schema`,
   `structured_output_with_tools`, `seed`, `image_input`, `audio_input`,
   `file_input`, `streaming`, `temperature`, `top_p`, `stop_sequences`,
@@ -1168,8 +1201,24 @@ reports disjoint `input_tokens`, `cache_read_input_tokens`, and
 `cache_creation_input_tokens`. qcg sums them as total `input` and retains both
 cache buckets. Streaming uses the same normalization; cumulative delta counters
 replace earlier counters.
-The current Anthropic payload uses ephemeral cache markers with the default
-five-minute lifetime; no TTL tiers or prices are inferred from that marker.
+Without explicit extended retention, Anthropic cache markers use the default
+five-minute lifetime. Default Anthropic writes cost 1.25x ordinary input;
+extended `ttl_1h` writes cost 2x. OpenAI GPT-5.6+ default 30-minute writes cost
+1.25x ordinary input; Responses extended `ttl_12h` writes cost 2.5x. Default
+write rates remain supplied by the selected pricing row; qcg does not infer
+prices from model names or default markers. Older OpenAI/Azure
+`retention_24h` policies do not change the configured write rate.
+
+When `cache_retention = "extended"` requests `ttl_1h` or `ttl_12h`, the cost
+meter replaces only the `cache_creation_input` rate with the corresponding
+multiplier of the selected context tier's ordinary input rate. Read, ordinary
+input and output prices, usage normalization, and context-tier selection are
+unchanged. qcg prices the requested TTL rather than a response TTL breakdown:
+provider totals (especially Anthropic streaming usage) may omit that breakdown.
+Pre-call max-cost admission includes the multiplier at the dearest possible
+tier's input rate; if an ordinary input rate needed for a possible tier is
+unavailable, dispatch fails closed. This is still an estimated reservation,
+not a bound on provider spend or a redesign of fallback-route reservations.
 Missing optional counters are zero; present invalid counts, subset overflow,
 and cache sums exceeding total input fail closed instead of being clamped.
 

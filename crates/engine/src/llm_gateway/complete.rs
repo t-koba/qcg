@@ -126,6 +126,7 @@ impl<'a> LlmGateway<'a> {
             &model.model,
             &worst_usage,
             None,
+            None,
         )?;
         let reservation = PendingReservation {
             tokens,
@@ -149,8 +150,15 @@ impl<'a> LlmGateway<'a> {
             }
         };
         let usage = response.token_usage();
-        let cost_microusd =
-            self.cost_microusd(node, routes, &model.provider, &model.model, &usage, None)?;
+        let cost_microusd = self.cost_microusd(
+            node,
+            routes,
+            &model.provider,
+            &model.model,
+            &usage,
+            None,
+            None,
+        )?;
         self.journal
             .event(
                 "llm_call",
@@ -235,7 +243,30 @@ impl<'a> LlmGateway<'a> {
                     // The estimate cannot know which tier the request
                     // reaches, so it reserves at the dearest rate any tier
                     // names instead of at a tier it cannot prove.
-                    let rates = policy::max_cost_rates(&route.rates(), &route.cost_tiers);
+                    let mut rates = policy::max_cost_rates(&route.rates(), &route.cost_tiers);
+                    if let Some(multiplier) = self.cache_write_multiplier(
+                        &request.provider,
+                        &request.model,
+                        request.cache_retention,
+                    ) {
+                        // Every possible context tier needs an ordinary input
+                        // price. A cache price alone cannot price a TTL write;
+                        // max_cost_rates would otherwise hide an unpriced row.
+                        let base = route.rates();
+                        for tier in std::iter::once(None).chain(route.cost_tiers.iter().map(Some)) {
+                            let input = base.resolve(tier).input.ok_or_else(|| StepError::failed(
+                                &node.id,
+                                format!("model `{}/{}` lacks ordinary input pricing for extended cache TTL while budget.max_cost_usd is enforced; refusing blind spend", request.provider, request.model),
+                            ))?;
+                            if !input.is_finite()
+                                || input < 0.0
+                                || !(input * multiplier).is_finite()
+                            {
+                                return Err(StepError::failed(&node.id, "invalid model pricing"));
+                            }
+                        }
+                        rates.cache_creation = rates.input.map(|input| input * multiplier);
+                    }
                     match (rates.max_input_rate(), rates.output) {
                         (Some(input_rate), Some(output)) => {
                             // The reservation cannot know how the prompt
@@ -431,6 +462,7 @@ impl<'a> LlmGateway<'a> {
             &provider_id,
             &model_id,
             &usage,
+            request.cache_retention,
             web_search_calls,
         )?;
         let mut event = json!({
@@ -452,6 +484,15 @@ impl<'a> LlmGateway<'a> {
             "stop_reason": response.stop,
             "cost_microusd": cost_microusd,
         });
+        // The requested cache policy is the TTL cost basis: usage totals may
+        // omit the TTL breakdown, so the requested tier rides with the call.
+        // Defaults stay absent so older journals keep decoding.
+        if request.cache_write == llm::CacheWritePolicy::Forbid {
+            event["cache_write_policy"] = json!("forbid");
+        }
+        if request.cache_retention == Some(llm::CacheRetention::Extended) {
+            event["cache_retention"] = json!("extended");
+        }
         // The hosted search is reported with its own count and charge: an
         // unpriced search is unmetered, never free.
         if let Some(outcome) = &web_search {

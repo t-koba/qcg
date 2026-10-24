@@ -445,6 +445,31 @@
         ],
         "type": "object"
       },
+      "CacheRetention": {
+        "description": "Declared prompt-cache retention tier. Only `extended` is defined.",
+        "oneOf": [
+          {
+            "const": "extended",
+            "description": "The route's explicitly declared extended-retention mechanism.",
+            "type": "string"
+          }
+        ]
+      },
+      "CacheWritePolicy": {
+        "description": "Declared prompt-cache write policy for this contract's LLM requests.",
+        "oneOf": [
+          {
+            "const": "allow",
+            "description": "Leave provider caching alone (default).",
+            "type": "string"
+          },
+          {
+            "const": "forbid",
+            "description": "Require qcg/provider caching to be disabled for the request.",
+            "type": "string"
+          }
+        ]
+      },
       "CommandIsolation": {
         "enum": [
           "container",
@@ -1530,6 +1555,28 @@
             "format": "uint",
             "minimum": 0,
             "type": "integer"
+          },
+          "cache_retention": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CacheRetention"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Requested cache retention tier when non-default (`extended` only).\nAbsent means the provider default lifetime. Present only to make the\nTTL cost basis inspectable."
+          },
+          "cache_write_policy": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CacheWritePolicy"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Requested cache write policy when non-default (`forbid` only).\nAbsent means the default `allow`: the request left provider caching\nalone. Present only to make the TTL cost basis inspectable."
           },
           "cost_microusd": {
             "format": "uint64",

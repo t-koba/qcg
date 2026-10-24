@@ -35,9 +35,35 @@ pub struct Capabilities {
 pub enum PromptCache {
     /// Attach the provider's cache instructions for this request.
     Auto,
-    /// Send no cache instructions.
+    /// Send no cache instructions (omit qcg hints only; provider-side
+    /// caching is unchanged).
     #[default]
     Off,
+}
+
+/// Per-request prompt-cache write directive resolved from
+/// `[llm].cache_write_policy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheWritePolicy {
+    /// Leave provider caching alone.
+    #[default]
+    Allow,
+    /// Require qcg/provider caching to be disabled for the request.
+    Forbid,
+}
+
+fn is_default_cache_write_policy(policy: &CacheWritePolicy) -> bool {
+    *policy == CacheWritePolicy::Allow
+}
+
+/// Per-request prompt-cache retention tier resolved from
+/// `[llm].cache_retention`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheRetention {
+    /// The route's explicitly declared extended-retention mechanism.
+    Extended,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +89,10 @@ pub struct ChatRequest {
     pub stream: bool,
     #[serde(default)]
     pub prompt_cache: PromptCache,
+    #[serde(default, skip_serializing_if = "is_default_cache_write_policy")]
+    pub cache_write: CacheWritePolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_retention: Option<CacheRetention>,
     /// The hosted web search this request opts into. Absent by default:
     /// selecting a model never enables the provider's search.
     #[serde(default)]

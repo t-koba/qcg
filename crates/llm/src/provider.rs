@@ -47,6 +47,15 @@ pub trait LlmProvider: Send + Sync {
     fn model_pricing_for(&self, _provider: &str, _model: &str) -> Option<ModelPricing> {
         None
     }
+    /// Declared extended-retention mechanism for billing the requested tier.
+    /// This is route/model metadata, never inferred from usage or model names.
+    fn prompt_cache_retention_for(
+        &self,
+        _provider: &str,
+        _model: &str,
+    ) -> Option<PromptCacheRetention> {
+        None
+    }
     fn configuration_error_for(&self, _provider: &str) -> Option<String> {
         None
     }
@@ -203,6 +212,42 @@ pub enum PromptCacheField {
     PromptCacheKey,
 }
 
+/// Explicitly declared extended-retention mechanism for one route.
+/// Model-aware: a `[[provider.models]]` entry may declare or override the
+/// row value for that model only; never infer from the model-name string.
+/// A provider-level declaration applies to every model in that row only as
+/// an operator claim (the operator asserts every model on the row honors
+/// the mechanism).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheRetention {
+    /// Older OpenAI/Azure model mechanism: `prompt_cache_retention: "24h"`
+    /// (provider maximum-retention policy, not a deletion deadline).
+    /// Valid for `chat_completions` and `responses`.
+    #[serde(rename = "retention_24h")]
+    Retention24h,
+    /// OpenAI GPT-5.6+ Responses mechanism:
+    /// `prompt_cache_options: {"ttl": "12h"}` (minimum lifetime, not a
+    /// deletion deadline). Responses only.
+    #[serde(rename = "ttl_12h")]
+    Ttl12h,
+    /// Anthropic Messages mechanism: add `cache_control: {"ttl": "1h"}`
+    /// to every cache marker the row emits (system and top-level auto
+    /// marker). Anthropic Messages only.
+    #[serde(rename = "ttl_1h")]
+    Ttl1h,
+}
+
+impl PromptCacheRetention {
+    pub(crate) fn supports_api(self, api: ApiFlavor) -> bool {
+        match self {
+            Self::Retention24h => matches!(api, ApiFlavor::ChatCompletions | ApiFlavor::Responses),
+            Self::Ttl12h => matches!(api, ApiFlavor::Responses),
+            Self::Ttl1h => matches!(api, ApiFlavor::AnthropicMessages),
+        }
+    }
+}
+
 /// Decision request wire format. Mechanism only: how the logical
 /// `{model, state, questions}` decision maps onto the HTTP JSON body.
 /// Direct TypeSafe/OpenRouter/Vercel gateways send state and questions at the
@@ -301,6 +346,15 @@ pub struct ModelSpec {
     /// prompt input reaches a tier's threshold.
     #[serde(default)]
     pub cost_tiers: Vec<policy::CostTier>,
+    /// Extended-retention mechanism for this model only. Overrides the
+    /// provider row when set; `None` inherits the row value.
+    #[serde(default)]
+    pub prompt_cache_retention: Option<PromptCacheRetention>,
+    /// When true, this model honors a write-disable via
+    /// `prompt_cache_options: {"mode": "explicit"}` with no qcg explicit
+    /// breakpoints (so no cache read/write). Overrides the provider row.
+    #[serde(default)]
+    pub prompt_cache_explicit_mode: Option<bool>,
     #[serde(default)]
     pub context_tokens: Option<u64>,
     #[serde(default)]
@@ -376,6 +430,30 @@ impl ModelSpec {
         }
         if let Err(error) = policy::validate_cost_tiers(&self.cost_tiers) {
             return Err(format!("provider `{provider}` model `{}` {error}", self.id));
+        }
+        if let Some(retention) = self.prompt_cache_retention {
+            if !retention.supports_api(api) {
+                return Err(format!(
+                    "provider `{provider}` model `{}` has a `prompt_cache_retention` that is not valid for its api",
+                    self.id
+                ));
+            }
+            if let Some(capabilities) = &self.capabilities
+                && !capabilities.prompt_cache
+            {
+                return Err(format!(
+                    "provider `{provider}` model `{}` may only set `prompt_cache_retention` when prompt caching is enabled",
+                    self.id
+                ));
+            }
+        }
+        if self.prompt_cache_explicit_mode == Some(true)
+            && !matches!(api, ApiFlavor::ChatCompletions | ApiFlavor::Responses)
+        {
+            return Err(format!(
+                "provider `{provider}` model `{}` may only set `prompt_cache_explicit_mode` for chat_completions or responses",
+                self.id
+            ));
         }
         for (field, value) in [
             ("context_tokens", self.context_tokens),
@@ -455,6 +533,17 @@ pub struct ProviderSpec {
     /// the `prompt_cache` capability is enabled and invalid otherwise.
     #[serde(default)]
     pub prompt_cache_field: Option<PromptCacheField>,
+    /// Extended-retention mechanism for the `extended` tier on this row.
+    /// Model entries may override per model. A provider-level value is an
+    /// operator claim that every model on the row honors the mechanism.
+    #[serde(default)]
+    pub prompt_cache_retention: Option<PromptCacheRetention>,
+    /// When true, models on this row honor `cache_write_policy = "forbid"`
+    /// via `prompt_cache_options: {"mode": "explicit"}` with no qcg
+    /// explicit breakpoints (so no cache read/write). Valid only for
+    /// `chat_completions` and `responses`. Model entries may override.
+    #[serde(default)]
+    pub prompt_cache_explicit_mode: bool,
     /// Decision wire-format mechanism for `api = "system_one"` rows.
     /// `decision_input_wrapper` selects the request envelope (`none` for
     /// direct TypeSafe shape, `input` for Cloudflare `{"input":{...}}`).
@@ -725,6 +814,31 @@ impl ProviderSpec {
             }
             (false, None) => {}
         }
+        if let Some(retention) = self.prompt_cache_retention
+            && !retention.supports_api(self.api)
+        {
+            return Err(format!(
+                "provider `{}` declares `prompt_cache_retention` that is not valid for its api",
+                self.id
+            ));
+        }
+        if let Some(retention) = self.prompt_cache_retention
+            && !self.capabilities.prompt_cache
+        {
+            let _ = retention;
+            return Err(format!(
+                "provider `{}` may only set `prompt_cache_retention` when `capabilities.prompt_cache` is enabled",
+                self.id
+            ));
+        }
+        if self.prompt_cache_explicit_mode
+            && !matches!(self.api, ApiFlavor::ChatCompletions | ApiFlavor::Responses)
+        {
+            return Err(format!(
+                "provider `{}` may only set `prompt_cache_explicit_mode` for chat_completions or responses",
+                self.id
+            ));
+        }
         if self.api == ApiFlavor::ChatCompletions
             && !self.capabilities.reasoning_effort.is_empty()
             && self.chat_token_limit_field != Some(ChatTokenLimitField::MaxCompletionTokens)
@@ -737,6 +851,16 @@ impl ProviderSpec {
         let mut model_ids = BTreeMap::new();
         for model in &self.models {
             model.validate(&self.id, self.api)?;
+            if model.prompt_cache_retention.is_some()
+                && !model
+                    .effective_capabilities(&self.capabilities)
+                    .prompt_cache
+            {
+                return Err(format!(
+                    "provider `{}` model `{}` may only set `prompt_cache_retention` when prompt caching is enabled",
+                    self.id, model.id
+                ));
+            }
             if model_ids.insert(model.id.as_str(), ()).is_some() {
                 return Err(format!(
                     "provider `{}` declares duplicate model id `{}`",
@@ -799,6 +923,27 @@ impl ProviderSpec {
 
     pub fn pricing_for_model(&self, id: &str) -> Option<ModelPricing> {
         self.model(id).and_then(ModelSpec::pricing)
+    }
+
+    /// Effective extended-retention mechanism for one model: the model
+    /// entry overrides the row when set, otherwise the row value applies
+    /// (an operator claim for every model on the row).
+    pub fn retention_for_model(&self, id: &str) -> Option<PromptCacheRetention> {
+        match self.model(id) {
+            Some(model) => model.prompt_cache_retention.or(self.prompt_cache_retention),
+            None => self.prompt_cache_retention,
+        }
+    }
+
+    /// Effective write-disable mechanism for one model: the model entry
+    /// overrides the row when set, otherwise the row value applies.
+    pub fn explicit_mode_for_model(&self, id: &str) -> bool {
+        match self.model(id) {
+            Some(model) => model
+                .prompt_cache_explicit_mode
+                .unwrap_or(self.prompt_cache_explicit_mode),
+            None => self.prompt_cache_explicit_mode,
+        }
     }
 }
 

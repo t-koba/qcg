@@ -278,6 +278,16 @@ impl LlmProvider for LlmRouter {
         self.catalog.model_pricing(provider, model)
     }
 
+    fn prompt_cache_retention_for(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Option<crate::PromptCacheRetention> {
+        self.providers
+            .get(provider)
+            .and_then(|entry| entry.prompt_cache_retention_for(provider, model))
+    }
+
     fn configuration_error_for(&self, provider: &str) -> Option<String> {
         self.providers
             .get(provider)

@@ -10,6 +10,8 @@ pub use types::*;
 mod tests {
     #[path = "cache_cost.rs"]
     mod cache_cost;
+    #[path = "cache_retention_cost.rs"]
+    mod cache_retention_cost;
     #[path = "context_exhaustion.rs"]
     mod context_exhaustion;
     #[path = "tier_cost.rs"]
@@ -768,6 +770,8 @@ mod tests {
             verbosity: None,
             stream: false,
             prompt_cache: llm::PromptCache::Off,
+            cache_write: llm::CacheWritePolicy::Allow,
+            cache_retention: None,
             provider_web_search: None,
         }
     }

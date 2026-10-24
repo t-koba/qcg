@@ -2,14 +2,19 @@ use model::{ProviderWebSearch, StructuredOutputMode, ToolChoice, ToolChoiceMode}
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::provider::{ChatTokenLimitField, PromptCacheField};
-use crate::types::{ChatContentPart, ChatMessage, ChatRequest, ImageDetail, PromptCache, ToolSpec};
+use crate::provider::{ChatTokenLimitField, PromptCacheField, PromptCacheRetention};
+use crate::types::{
+    CacheRetention, CacheWritePolicy, ChatContentPart, ChatMessage, ChatRequest, ImageDetail,
+    PromptCache, ToolSpec,
+};
 
 pub(crate) fn chat_completions_payload(
     req: &ChatRequest,
     send_seed: bool,
     token_limit_field: ChatTokenLimitField,
     prompt_cache: Option<PromptCacheField>,
+    retention: Option<PromptCacheRetention>,
+    explicit_disable: bool,
 ) -> Value {
     let mut payload = json!({
         "model": req.model,
@@ -52,8 +57,23 @@ pub(crate) fn chat_completions_payload(
             payload["parallel_tool_calls"] = json!(parallel);
         }
     }
-    if wants_prompt_cache(req, prompt_cache, PromptCacheField::PromptCacheKey) {
-        payload["prompt_cache_key"] = json!(prompt_cache_key(req));
+    if req.cache_write == CacheWritePolicy::Forbid {
+        // Write-disable honored via explicit mode with no qcg explicit
+        // breakpoints, so no cache read/write. Auto hints stay suppressed.
+        if explicit_disable {
+            payload["prompt_cache_options"] = json!({ "mode": "explicit" });
+        }
+    } else {
+        if wants_prompt_cache(req, prompt_cache, PromptCacheField::PromptCacheKey) {
+            payload["prompt_cache_key"] = json!(prompt_cache_key(req));
+        }
+        // Older-model maximum-retention policy, not a deletion deadline.
+        if req.prompt_cache == PromptCache::Auto
+            && req.cache_retention == Some(CacheRetention::Extended)
+            && retention == Some(PromptCacheRetention::Retention24h)
+        {
+            payload["prompt_cache_retention"] = json!("24h");
+        }
     }
     payload
 }
@@ -61,6 +81,8 @@ pub(crate) fn chat_completions_payload(
 pub(crate) fn responses_payload(
     req: &ChatRequest,
     prompt_cache: Option<PromptCacheField>,
+    retention: Option<PromptCacheRetention>,
+    explicit_disable: bool,
 ) -> Value {
     let mut payload = json!({
         "model": req.model,
@@ -107,8 +129,31 @@ pub(crate) fn responses_payload(
         payload["tools"] = Value::Array(tools);
         payload["max_tool_calls"] = json!(search.max_calls);
     }
-    if wants_prompt_cache(req, prompt_cache, PromptCacheField::PromptCacheKey) {
-        payload["prompt_cache_key"] = json!(prompt_cache_key(req));
+    if req.cache_write == CacheWritePolicy::Forbid {
+        // Write-disable honored via explicit mode with no qcg explicit
+        // breakpoints, so no cache read/write. Auto hints stay suppressed.
+        if explicit_disable {
+            payload["prompt_cache_options"] = json!({ "mode": "explicit" });
+        }
+    } else {
+        if wants_prompt_cache(req, prompt_cache, PromptCacheField::PromptCacheKey) {
+            payload["prompt_cache_key"] = json!(prompt_cache_key(req));
+        }
+        if req.prompt_cache == PromptCache::Auto
+            && req.cache_retention == Some(CacheRetention::Extended)
+        {
+            match retention {
+                // Older-model maximum-retention policy, not a deletion deadline.
+                Some(PromptCacheRetention::Retention24h) => {
+                    payload["prompt_cache_retention"] = json!("24h");
+                }
+                // Minimum lifetime, not a deletion deadline. Responses only.
+                Some(PromptCacheRetention::Ttl12h) => {
+                    payload["prompt_cache_options"] = json!({ "ttl": "12h" });
+                }
+                _ => {}
+            }
+        }
     }
     payload
 }
@@ -150,6 +195,7 @@ fn provider_web_search_tool(search: &ProviderWebSearch) -> Value {
 pub(crate) fn anthropic_payload(
     req: &ChatRequest,
     prompt_cache: Option<PromptCacheField>,
+    retention: Option<PromptCacheRetention>,
 ) -> Value {
     let mut tools: Vec<Value> = req.tools.iter().map(anthropic_tool).collect();
     if let Some((schema, _)) = native_response_schema(req) {
@@ -164,14 +210,23 @@ pub(crate) fn anthropic_payload(
         "max_tokens": req.max_tokens,
         "messages": anthropic_messages(req),
     });
+    // The 1h extended marker is a lifetime, not a deletion deadline.
+    let extended_ttl = req.prompt_cache == PromptCache::Auto
+        && req.cache_write == CacheWritePolicy::Allow
+        && req.cache_retention == Some(CacheRetention::Extended)
+        && retention == Some(PromptCacheRetention::Ttl1h);
     if let Some(system) = &req.system {
         if wants_anthropic_cache(req, prompt_cache) {
             // Anthropic caches explicit content blocks; the system block is
             // the stable prefix, so the marker goes on its text block.
+            let mut marker = json!({ "type": "ephemeral" });
+            if extended_ttl {
+                marker["ttl"] = json!("1h");
+            }
             payload["system"] = json!([{
                 "type": "text",
                 "text": system,
-                "cache_control": { "type": "ephemeral" },
+                "cache_control": marker,
             }]);
         } else {
             payload["system"] = Value::String(system.clone());
@@ -181,7 +236,11 @@ pub(crate) fn anthropic_payload(
         // Top-level automatic caching covers the growing conversation tail;
         // the explicit system marker above keeps the stable prefix readable.
         // Both default to the 5-minute TTL and consume 2 of 4 slots.
-        payload["cache_control"] = json!({ "type": "ephemeral" });
+        let mut top = json!({ "type": "ephemeral" });
+        if extended_ttl {
+            top["ttl"] = json!("1h");
+        }
+        payload["cache_control"] = top;
     }
     if let Some(temperature) = req.temperature {
         payload["temperature"] = json!(temperature);
@@ -234,6 +293,7 @@ fn responses_tool_choice(choice: Option<&ToolChoice>) -> Value {
 /// `cache_control_auto`; the latter adds the top-level tail marker below.
 fn wants_anthropic_cache(req: &ChatRequest, prompt_cache: Option<PromptCacheField>) -> bool {
     req.prompt_cache == PromptCache::Auto
+        && req.cache_write == CacheWritePolicy::Allow
         && matches!(
             prompt_cache,
             Some(PromptCacheField::CacheControl | PromptCacheField::CacheControlAuto)
@@ -247,7 +307,9 @@ fn wants_prompt_cache(
     prompt_cache: Option<PromptCacheField>,
     expected: PromptCacheField,
 ) -> bool {
-    req.prompt_cache == PromptCache::Auto && prompt_cache == Some(expected)
+    req.prompt_cache == PromptCache::Auto
+        && req.cache_write == CacheWritePolicy::Allow
+        && prompt_cache == Some(expected)
 }
 
 /// Stable routing key for OpenAI-compatible prompt caches. Digesting the
@@ -861,6 +923,8 @@ mod tests {
             verbosity: None,
             stream: false,
             prompt_cache,
+            cache_write: CacheWritePolicy::Allow,
+            cache_retention: None,
             provider_web_search: None,
         }
     }
@@ -868,7 +932,7 @@ mod tests {
     #[test]
     fn off_cache_sends_no_cache_instructions() {
         let req = request(Some("stable system"), PromptCache::Off);
-        let anthropic = anthropic_payload(&req, Some(PromptCacheField::CacheControl));
+        let anthropic = anthropic_payload(&req, Some(PromptCacheField::CacheControl), None);
         assert_eq!(anthropic["system"], json!("stable system"));
 
         let chat = chat_completions_payload(
@@ -876,17 +940,20 @@ mod tests {
             true,
             ChatTokenLimitField::MaxTokens,
             Some(PromptCacheField::PromptCacheKey),
+            None,
+            false,
         );
         assert!(chat.get("prompt_cache_key").is_none());
 
-        let responses = responses_payload(&req, Some(PromptCacheField::PromptCacheKey));
+        let responses =
+            responses_payload(&req, Some(PromptCacheField::PromptCacheKey), None, false);
         assert!(responses.get("prompt_cache_key").is_none());
     }
 
     #[test]
     fn auto_cache_marks_the_anthropic_system_block() {
         let req = request(Some("stable system"), PromptCache::Auto);
-        let payload = anthropic_payload(&req, Some(PromptCacheField::CacheControl));
+        let payload = anthropic_payload(&req, Some(PromptCacheField::CacheControl), None);
         let blocks = payload["system"]
             .as_array()
             .expect("cached system should be a text block array");
@@ -896,7 +963,7 @@ mod tests {
         assert_eq!(blocks[0]["cache_control"], json!({"type": "ephemeral"}));
 
         // Without a declared mechanism the builder must not guess.
-        let payload = anthropic_payload(&req, None);
+        let payload = anthropic_payload(&req, None, None);
         assert_eq!(payload["system"], json!("stable system"));
     }
 
@@ -904,14 +971,14 @@ mod tests {
     fn auto_tail_uses_top_level_marker_only_on_opt_in() {
         let req = request(Some("stable system"), PromptCache::Auto);
         // Explicit-only stays the safe default: system marker, no top level.
-        let explicit = anthropic_payload(&req, Some(PromptCacheField::CacheControl));
+        let explicit = anthropic_payload(&req, Some(PromptCacheField::CacheControl), None);
         assert_eq!(
             explicit["system"][0]["cache_control"],
             json!({"type": "ephemeral"})
         );
         assert!(explicit.get("cache_control").is_none());
         // Opt-in robust combination: same system marker plus top-level tail.
-        let auto = anthropic_payload(&req, Some(PromptCacheField::CacheControlAuto));
+        let auto = anthropic_payload(&req, Some(PromptCacheField::CacheControlAuto), None);
         assert_eq!(
             auto["system"][0]["cache_control"],
             json!({"type": "ephemeral"})
@@ -920,7 +987,7 @@ mod tests {
         assert_eq!(explicit["system"], auto["system"]);
         // Off sends neither marker.
         let off = request(Some("stable system"), PromptCache::Off);
-        let off_payload = anthropic_payload(&off, Some(PromptCacheField::CacheControlAuto));
+        let off_payload = anthropic_payload(&off, Some(PromptCacheField::CacheControlAuto), None);
         assert_eq!(off_payload["system"], json!("stable system"));
         assert!(off_payload.get("cache_control").is_none());
     }
@@ -933,12 +1000,15 @@ mod tests {
             true,
             ChatTokenLimitField::MaxTokens,
             Some(PromptCacheField::PromptCacheKey),
+            None,
+            false,
         );
         let key = chat["prompt_cache_key"]
             .as_str()
             .expect("auto cache should add prompt_cache_key");
         assert!(key.starts_with("cache-"), "{key}");
-        let responses = responses_payload(&req, Some(PromptCacheField::PromptCacheKey));
+        let responses =
+            responses_payload(&req, Some(PromptCacheField::PromptCacheKey), None, false);
         assert_eq!(responses["prompt_cache_key"], key);
 
         // A cache-control row must not leak the OpenAI routing key.
@@ -947,6 +1017,8 @@ mod tests {
             true,
             ChatTokenLimitField::MaxTokens,
             Some(PromptCacheField::CacheControl),
+            None,
+            false,
         );
         assert!(chat.get("prompt_cache_key").is_none());
     }
@@ -987,6 +1059,8 @@ mod tests {
             true,
             ChatTokenLimitField::MaxTokens,
             Some(PromptCacheField::PromptCacheKey),
+            None,
+            false,
         )["prompt_cache_key"]
             .as_str()
             .expect("turn1 key")
@@ -996,6 +1070,8 @@ mod tests {
             true,
             ChatTokenLimitField::MaxTokens,
             Some(PromptCacheField::PromptCacheKey),
+            None,
+            false,
         )["prompt_cache_key"]
             .as_str()
             .expect("turn2 key")
@@ -1003,8 +1079,8 @@ mod tests {
         assert_eq!(key1, key2, "key must survive append-only turns");
 
         // Anthropic breakpoint prefix (tools + system) identical; append-only.
-        let prefix1 = anthropic_payload(&turn1, Some(PromptCacheField::CacheControl));
-        let prefix2 = anthropic_payload(&turn2, Some(PromptCacheField::CacheControl));
+        let prefix1 = anthropic_payload(&turn1, Some(PromptCacheField::CacheControl), None);
+        let prefix2 = anthropic_payload(&turn2, Some(PromptCacheField::CacheControl), None);
         assert_eq!(prefix1["tools"], prefix2["tools"]);
         assert_eq!(prefix1["system"], prefix2["system"]);
         assert_eq!(
@@ -1016,7 +1092,8 @@ mod tests {
         // Tool shuffle diverges the tools prefix (key correctly stays: system unchanged).
         let mut shuffled = turn1.clone();
         shuffled.tools = vec![tool("search_web"), tool("lookup")];
-        let shuffled_payload = anthropic_payload(&shuffled, Some(PromptCacheField::CacheControl));
+        let shuffled_payload =
+            anthropic_payload(&shuffled, Some(PromptCacheField::CacheControl), None);
         assert_ne!(prefix1["tools"], shuffled_payload["tools"]);
 
         // Volatile system suffix breaks key and system block.
@@ -1027,6 +1104,8 @@ mod tests {
             true,
             ChatTokenLimitField::MaxTokens,
             Some(PromptCacheField::PromptCacheKey),
+            None,
+            false,
         )["prompt_cache_key"]
             .as_str()
             .expect("volatile key")
@@ -1035,7 +1114,8 @@ mod tests {
             key1, volatile_key,
             "per-run system bytes must break the key"
         );
-        let volatile_payload = anthropic_payload(&volatile, Some(PromptCacheField::CacheControl));
+        let volatile_payload =
+            anthropic_payload(&volatile, Some(PromptCacheField::CacheControl), None);
         assert_ne!(prefix1["system"], volatile_payload["system"]);
 
         // Head truncation diverges messages.
@@ -1045,6 +1125,167 @@ mod tests {
             anthropic_messages(&turn2),
             anthropic_messages(&truncated),
             "head compaction must diverge the tail"
+        );
+    }
+
+    #[test]
+    fn forbid_omits_anthropic_markers_exactly() {
+        let mut req = request(Some("stable system"), PromptCache::Auto);
+        req.cache_write = CacheWritePolicy::Forbid;
+        let payload = anthropic_payload(&req, Some(PromptCacheField::CacheControlAuto), None);
+        assert_eq!(payload["system"], json!("stable system"));
+        assert!(payload.get("cache_control").is_none());
+        assert!(payload.get("prompt_cache_key").is_none());
+        assert!(payload.get("prompt_cache_options").is_none());
+        assert!(payload.get("prompt_cache_retention").is_none());
+    }
+
+    #[test]
+    fn forbid_emits_explicit_mode_without_cache_read_write() {
+        for (api_payload, name) in [
+            (
+                chat_completions_payload(
+                    &{
+                        let mut req = request(Some("stable system"), PromptCache::Auto);
+                        req.cache_write = CacheWritePolicy::Forbid;
+                        req
+                    },
+                    true,
+                    ChatTokenLimitField::MaxTokens,
+                    Some(PromptCacheField::PromptCacheKey),
+                    None,
+                    true,
+                ),
+                "chat",
+            ),
+            (
+                responses_payload(
+                    &{
+                        let mut req = request(Some("stable system"), PromptCache::Auto);
+                        req.cache_write = CacheWritePolicy::Forbid;
+                        req
+                    },
+                    Some(PromptCacheField::PromptCacheKey),
+                    None,
+                    true,
+                ),
+                "responses",
+            ),
+        ] {
+            assert_eq!(
+                api_payload["prompt_cache_options"],
+                json!({ "mode": "explicit" }),
+                "{name} forbid must emit explicit mode"
+            );
+            assert!(
+                api_payload.get("prompt_cache_key").is_none(),
+                "{name} forbid must not emit a cache key"
+            );
+            assert!(
+                api_payload.get("prompt_cache_retention").is_none(),
+                "{name} forbid must not emit retention"
+            );
+        }
+    }
+
+    #[test]
+    fn retention_24h_emits_maximum_retention_policy() {
+        let mut req = request(Some("stable system"), PromptCache::Auto);
+        req.cache_retention = Some(CacheRetention::Extended);
+        let chat = chat_completions_payload(
+            &req,
+            true,
+            ChatTokenLimitField::MaxTokens,
+            Some(PromptCacheField::PromptCacheKey),
+            Some(PromptCacheRetention::Retention24h),
+            false,
+        );
+        assert!(chat.get("prompt_cache_key").is_some());
+        // Provider maximum-retention policy, not a deletion deadline.
+        assert_eq!(chat["prompt_cache_retention"], json!("24h"));
+        assert!(chat.get("prompt_cache_options").is_none());
+        let responses = responses_payload(
+            &req,
+            Some(PromptCacheField::PromptCacheKey),
+            Some(PromptCacheRetention::Retention24h),
+            false,
+        );
+        assert_eq!(responses["prompt_cache_retention"], json!("24h"));
+        assert!(responses.get("prompt_cache_options").is_none());
+    }
+
+    #[test]
+    fn retention_ttl_12h_emits_minimum_lifetime_on_responses() {
+        let mut req = request(Some("stable system"), PromptCache::Auto);
+        req.cache_retention = Some(CacheRetention::Extended);
+        let responses = responses_payload(
+            &req,
+            Some(PromptCacheField::PromptCacheKey),
+            Some(PromptCacheRetention::Ttl12h),
+            false,
+        );
+        // Minimum lifetime, not a deletion deadline. Responses only.
+        assert_eq!(responses["prompt_cache_options"], json!({ "ttl": "12h" }));
+        assert!(responses.get("prompt_cache_retention").is_none());
+        assert!(responses.get("prompt_cache_key").is_some());
+    }
+
+    #[test]
+    fn retention_ttl_1h_adds_ttl_to_every_anthropic_marker() {
+        let mut req = request(Some("stable system"), PromptCache::Auto);
+        req.cache_retention = Some(CacheRetention::Extended);
+        let payload = anthropic_payload(
+            &req,
+            Some(PromptCacheField::CacheControlAuto),
+            Some(PromptCacheRetention::Ttl1h),
+        );
+        assert_eq!(
+            payload["system"][0]["cache_control"],
+            json!({ "type": "ephemeral", "ttl": "1h" })
+        );
+        // Every marker the row emits carries the TTL, including the
+        // top-level automatic tail marker.
+        assert_eq!(
+            payload["cache_control"],
+            json!({ "type": "ephemeral", "ttl": "1h" })
+        );
+    }
+
+    #[test]
+    fn defaults_match_legacy_auto_off_payloads() {
+        // Default Allow/None with Off sends no cache instructions at all.
+        let off = request(Some("stable system"), PromptCache::Off);
+        assert_eq!(off.cache_write, CacheWritePolicy::Allow);
+        assert_eq!(off.cache_retention, None);
+        let chat = chat_completions_payload(
+            &off,
+            true,
+            ChatTokenLimitField::MaxTokens,
+            Some(PromptCacheField::PromptCacheKey),
+            None,
+            false,
+        );
+        assert!(chat.get("prompt_cache_key").is_none());
+        assert!(chat.get("prompt_cache_options").is_none());
+        assert!(chat.get("prompt_cache_retention").is_none());
+        // Default Allow/None with Auto keeps the legacy markers/keys and
+        // adds no retention or mode fields.
+        let auto = request(Some("stable system"), PromptCache::Auto);
+        let chat = chat_completions_payload(
+            &auto,
+            true,
+            ChatTokenLimitField::MaxTokens,
+            Some(PromptCacheField::PromptCacheKey),
+            None,
+            false,
+        );
+        assert!(chat.get("prompt_cache_key").is_some());
+        assert!(chat.get("prompt_cache_options").is_none());
+        assert!(chat.get("prompt_cache_retention").is_none());
+        let anthropic = anthropic_payload(&auto, Some(PromptCacheField::CacheControl), None);
+        assert_eq!(
+            anthropic["system"][0]["cache_control"],
+            json!({ "type": "ephemeral" })
         );
     }
 }

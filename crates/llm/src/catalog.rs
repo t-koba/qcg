@@ -943,6 +943,10 @@ fn merge_model(base: &ModelSpec, over: &ModelSpec) -> ModelSpec {
         output_cost_per_million_usd: over
             .output_cost_per_million_usd
             .or(base.output_cost_per_million_usd),
+        prompt_cache_retention: over.prompt_cache_retention.or(base.prompt_cache_retention),
+        prompt_cache_explicit_mode: over
+            .prompt_cache_explicit_mode
+            .or(base.prompt_cache_explicit_mode),
         // A tier list is a whole price schedule: a registry row that
         // declares its own tiers replaces the external one outright;
         // otherwise the external tiers are inherited, with the registry's
@@ -1327,6 +1331,8 @@ pub(crate) fn map_models_dev(text: &str) -> Result<ExternalCatalog, String> {
                     cache_read_input_cost_per_million_usd: cost.and_then(|c| c.cache_read),
                     output_cost_per_million_usd: cost.and_then(|c| c.output),
                     cost_tiers,
+                    prompt_cache_retention: None,
+                    prompt_cache_explicit_mode: None,
                     context_tokens: model.limit.as_ref().and_then(|limit| limit.context),
                     max_output_tokens: model.limit.as_ref().and_then(|limit| limit.output),
                     enabled,
@@ -1425,6 +1431,8 @@ mod tests {
             cache_read_input_cost_per_million_usd: Some(0.0),
             output_cost_per_million_usd: None,
             cost_tiers: Vec::new(),
+            prompt_cache_retention: None,
+            prompt_cache_explicit_mode: None,
             context_tokens: None,
             max_output_tokens: None,
             enabled: None,
@@ -1609,6 +1617,8 @@ mod tests {
             cache_read_input_cost_per_million_usd: None,
             output_cost_per_million_usd: None,
             cost_tiers: Vec::new(),
+            prompt_cache_retention: None,
+            prompt_cache_explicit_mode: None,
             context_tokens: None,
             max_output_tokens: None,
             enabled: None,
@@ -1651,6 +1661,8 @@ mod tests {
                 cache_creation_input_cost_per_million_usd: None,
                 output_cost_per_million_usd: None,
             }],
+            prompt_cache_retention: None,
+            prompt_cache_explicit_mode: None,
             context_tokens: None,
             max_output_tokens: None,
             enabled: None,
@@ -1711,6 +1723,8 @@ base_url = "https://example.test/v1"
             cache_read_input_cost_per_million_usd: None,
             output_cost_per_million_usd: Some(2.0),
             cost_tiers: Vec::new(),
+            prompt_cache_retention: None,
+            prompt_cache_explicit_mode: None,
             context_tokens: Some(1000),
             max_output_tokens: Some(500),
             enabled: None,
@@ -1725,6 +1739,8 @@ base_url = "https://example.test/v1"
             cache_read_input_cost_per_million_usd: None,
             output_cost_per_million_usd: None,
             cost_tiers: Vec::new(),
+            prompt_cache_retention: None,
+            prompt_cache_explicit_mode: None,
             context_tokens: None,
             max_output_tokens: None,
             enabled: Some(false),
@@ -2092,6 +2108,8 @@ label = "Explicit label"
                     cache_read_input_cost_per_million_usd: Some(0.0),
                     output_cost_per_million_usd: Some(2.0),
                     cost_tiers: Vec::new(),
+                    prompt_cache_retention: None,
+                    prompt_cache_explicit_mode: None,
                     context_tokens: Some(1000),
                     max_output_tokens: Some(500),
                     enabled: None,

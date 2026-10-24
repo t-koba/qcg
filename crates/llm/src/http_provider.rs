@@ -24,11 +24,12 @@ use crate::payload::{anthropic_payload, chat_completions_payload, responses_payl
 use crate::provider::{
     ApiFlavor, ChatTokenLimitField, DEFAULT_RETRY_BACKOFF_EXPONENT_CAP,
     DEFAULT_RETRY_RATE_LIMIT_FLOOR_MS, DecisionInputWrapper, DecisionResponseWrapper, LlmProvider,
-    ModelPricing, ModelSpec, PromptCacheField, ProviderSpec,
+    ModelPricing, ModelSpec, PromptCacheField, PromptCacheRetention, ProviderSpec,
 };
 use crate::stream::{HttpStreamAccumulator, json_contains_string_fragment};
 use crate::types::{
-    Capabilities, ChatRequest, ChatResponse, ChatStreamEvent, LlmError, LlmErrorKind, PromptCache,
+    CacheRetention, CacheWritePolicy, Capabilities, ChatRequest, ChatResponse, ChatStreamEvent,
+    LlmError, LlmErrorKind, PromptCache,
 };
 use crate::validate::{
     validate_chat_request, validate_multimodal_capabilities,
@@ -64,6 +65,8 @@ pub struct HttpProvider {
     retry_backoff_exponent_cap: u32,
     chat_token_limit_field: ChatTokenLimitField,
     prompt_cache_field: Option<PromptCacheField>,
+    prompt_cache_retention: Option<PromptCacheRetention>,
+    prompt_cache_explicit_mode: bool,
     decision_input_wrapper: DecisionInputWrapper,
     decision_model_in_body: bool,
     decision_response_wrapper: DecisionResponseWrapper,
@@ -202,6 +205,8 @@ impl HttpProvider {
                 .chat_token_limit_field
                 .unwrap_or(ChatTokenLimitField::MaxTokens),
             prompt_cache_field: spec.prompt_cache_field,
+            prompt_cache_retention: spec.prompt_cache_retention,
+            prompt_cache_explicit_mode: spec.prompt_cache_explicit_mode,
             decision_input_wrapper: spec.decision_input_wrapper,
             decision_model_in_body: spec.decision_model_in_body,
             decision_response_wrapper: spec.decision_response_wrapper,
@@ -245,6 +250,11 @@ impl HttpProvider {
         if req.prompt_cache != PromptCache::Auto {
             return Ok(None);
         }
+        if req.cache_write == CacheWritePolicy::Forbid {
+            // A write-disable suppresses auto hints; the disable mechanism
+            // is validated separately. Never emit auto markers here.
+            return Ok(None);
+        }
         if !capabilities.prompt_cache {
             return Err(LlmError::new(format!(
                 "{} provider does not support prompt caching",
@@ -257,6 +267,112 @@ impl HttpProvider {
                 self.id
             ))
         })
+    }
+
+    fn retention_for_model(&self, model: &str) -> Option<PromptCacheRetention> {
+        match self.models.get(model) {
+            Some(spec) => spec.prompt_cache_retention.or(self.prompt_cache_retention),
+            None => self.prompt_cache_retention,
+        }
+    }
+
+    fn explicit_mode_for_model(&self, model: &str) -> bool {
+        match self.models.get(model) {
+            Some(spec) => spec
+                .prompt_cache_explicit_mode
+                .unwrap_or(self.prompt_cache_explicit_mode),
+            None => self.prompt_cache_explicit_mode,
+        }
+    }
+
+    /// Fail-closed validation for the advanced cache controls. Runs before
+    /// any network dispatch, per route, so every fallback route is
+    /// revalidated against its own declared mechanisms.
+    pub(crate) fn check_cache_policy(
+        &self,
+        req: &ChatRequest,
+        capabilities: &Capabilities,
+    ) -> Result<(Option<PromptCacheRetention>, bool), LlmError> {
+        let advanced = req.prompt_cache == PromptCache::Auto
+            || req.cache_write == CacheWritePolicy::Forbid
+            || req.cache_retention.is_some();
+        if self.api == ApiFlavor::SystemOne {
+            if advanced {
+                return Err(LlmError::new(format!(
+                    "provider `{}` model `{}` cannot use advanced cache policies on a system_one route: remove cache, cache_write_policy and cache_retention",
+                    self.id, req.model
+                )));
+            }
+            return Ok((None, false));
+        }
+        if req.cache_retention.is_some() {
+            if req.prompt_cache != PromptCache::Auto {
+                return Err(LlmError::new(format!(
+                    "provider `{}` model `{}` cache_retention requires cache = \"auto\"",
+                    self.id, req.model
+                )));
+            }
+            if req.cache_write == CacheWritePolicy::Forbid {
+                return Err(LlmError::new(format!(
+                    "provider `{}` model `{}` cache_retention requires cache_write_policy = \"allow\"",
+                    self.id, req.model
+                )));
+            }
+            let mechanism = self.retention_for_model(&req.model);
+            let Some(mechanism) = mechanism else {
+                return Err(LlmError::new(format!(
+                    "provider `{}` model `{}` does not declare an extended-retention mechanism: add `prompt_cache_retention` for this model or row",
+                    self.id, req.model
+                )));
+            };
+            if !mechanism.supports_api(self.api) {
+                return Err(LlmError::new(format!(
+                    "provider `{}` model `{}` declares an extended-retention mechanism that is not valid for its api",
+                    self.id, req.model
+                )));
+            }
+            if !capabilities.prompt_cache {
+                return Err(LlmError::new(format!(
+                    "provider `{}` model `{}` cannot use cache_retention without prompt caching support",
+                    self.id, req.model
+                )));
+            }
+            if req.cache_retention == Some(CacheRetention::Extended)
+                && self.api == ApiFlavor::AnthropicMessages
+                && mechanism != PromptCacheRetention::Ttl1h
+            {
+                return Err(LlmError::new(format!(
+                    "provider `{}` model `{}` declares an extended-retention mechanism that is not valid for its api",
+                    self.id, req.model
+                )));
+            }
+            return Ok((Some(mechanism), false));
+        }
+        if req.cache_write == CacheWritePolicy::Forbid {
+            match self.api {
+                ApiFlavor::AnthropicMessages => {
+                    // Honored by omitting every explicit/top-level marker;
+                    // no registry mechanism needed.
+                    return Ok((None, false));
+                }
+                ApiFlavor::ChatCompletions | ApiFlavor::Responses => {
+                    if !self.explicit_mode_for_model(&req.model) {
+                        return Err(LlmError::new(format!(
+                            "provider `{}` model `{}` cannot disable caching: declare `prompt_cache_explicit_mode = true` for this model or row",
+                            self.id, req.model
+                        )));
+                    }
+                    return Ok((None, true));
+                }
+                ApiFlavor::SystemOne => {
+                    return Err(LlmError::new(format!(
+                        "provider `{}` model `{}` cannot use advanced cache policies on a system_one route: remove cache, cache_write_policy and cache_retention",
+                        self.id, req.model
+                    )));
+                }
+            }
+        }
+        Ok((None, false))
     }
 
     /// Refuses a hosted web search the endpoint or the model cannot honor.
@@ -854,6 +970,16 @@ impl LlmProvider for HttpProvider {
             .flatten()
     }
 
+    fn prompt_cache_retention_for(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Option<PromptCacheRetention> {
+        (provider == self.id)
+            .then(|| self.retention_for_model(model))
+            .flatten()
+    }
+
     fn configuration_error_for(&self, provider: &str) -> Option<String> {
         if provider != self.id() {
             return None;
@@ -955,6 +1081,8 @@ impl LlmProvider for HttpProvider {
             }
         }
         self.check_provider_web_search(&req, &capabilities)?;
+        let (cache_retention, cache_explicit_disable) =
+            self.check_cache_policy(&req, &capabilities)?;
         let prompt_cache = self.prompt_cache_field_for(&req, &capabilities)?;
         let payload = match self.api {
             ApiFlavor::ChatCompletions => chat_completions_payload(
@@ -962,9 +1090,13 @@ impl LlmProvider for HttpProvider {
                 req.seed.is_some() && capabilities.seed,
                 self.chat_token_limit_field,
                 prompt_cache,
+                cache_retention,
+                cache_explicit_disable,
             ),
-            ApiFlavor::Responses => responses_payload(&req, prompt_cache),
-            ApiFlavor::AnthropicMessages => anthropic_payload(&req, prompt_cache),
+            ApiFlavor::Responses => {
+                responses_payload(&req, prompt_cache, cache_retention, cache_explicit_disable)
+            }
+            ApiFlavor::AnthropicMessages => anthropic_payload(&req, prompt_cache, cache_retention),
             ApiFlavor::SystemOne => {
                 return Err(LlmError::new("system_one requires typed decisions"));
             }
@@ -993,6 +1125,8 @@ impl LlmProvider for HttpProvider {
             )));
         }
         self.check_provider_web_search(&req, &capabilities)?;
+        let (cache_retention, cache_explicit_disable) =
+            self.check_cache_policy(&req, &capabilities)?;
         let prompt_cache = self.prompt_cache_field_for(&req, &capabilities)?;
         let mut payload = match self.api {
             ApiFlavor::ChatCompletions => chat_completions_payload(
@@ -1000,9 +1134,13 @@ impl LlmProvider for HttpProvider {
                 req.seed.is_some() && capabilities.seed,
                 self.chat_token_limit_field,
                 prompt_cache,
+                cache_retention,
+                cache_explicit_disable,
             ),
-            ApiFlavor::Responses => responses_payload(&req, prompt_cache),
-            ApiFlavor::AnthropicMessages => anthropic_payload(&req, prompt_cache),
+            ApiFlavor::Responses => {
+                responses_payload(&req, prompt_cache, cache_retention, cache_explicit_disable)
+            }
+            ApiFlavor::AnthropicMessages => anthropic_payload(&req, prompt_cache, cache_retention),
             ApiFlavor::SystemOne => {
                 return Err(LlmError::new("system_one requires typed decisions"));
             }
@@ -1260,6 +1398,8 @@ mod loopback_stream_tests {
             verbosity: None,
             stream: true,
             prompt_cache: PromptCache::Off,
+            cache_write: CacheWritePolicy::Allow,
+            cache_retention: None,
             provider_web_search: None,
         }
     }
