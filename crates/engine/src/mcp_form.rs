@@ -1,8 +1,8 @@
 use api::FormSpec;
-use contract::{FieldType, InputField};
+use contract::FieldType;
 use serde_json::Value;
 
-use crate::StepError;
+use crate::{StepError, required_input_field};
 
 /// Builds the user-facing form for an ordered set of MCP elicitation requests.
 /// Request identity and ordering remain the caller's responsibility.
@@ -54,26 +54,13 @@ pub fn mcp_elicitation_form_spec(
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("MCP tool requested structured input");
-        fields.push(InputField {
-            id: format!("response_{index}"),
-            label: Some(message.to_string()),
-            label_i18n: Default::default(),
-            description: Some(message.to_string()),
-            description_i18n: Default::default(),
-            placeholder: None,
-            placeholder_i18n: Default::default(),
-            kind: FieldType::Json,
-            required: true,
-            default: None,
-            pattern: None,
-            options: vec![],
-            option_labels_i18n: Default::default(),
-            min_items: None,
-            item_type: None,
-            schema: params.get("requestedSchema").cloned(),
-            options_from: None,
-            ui: Default::default(),
-        });
+        fields.push(required_input_field(
+            format!("response_{index}"),
+            FieldType::Json,
+            Some(message.to_string()),
+            Some(message.to_string()),
+            params.get("requestedSchema").cloned(),
+        ));
     }
     Ok(FormSpec {
         id: question_id,
@@ -111,6 +98,8 @@ mod tests {
         assert_eq!(form.fields[0].id, "response_0");
         assert_eq!(form.fields[0].label.as_deref(), Some("Second"));
         assert_eq!(form.fields[0].schema, Some(json!({ "type": "string" })));
+        assert!(form.fields[0].required);
+        assert!(form.fields[1].required);
         assert_eq!(form.fields[1].id, "response_1");
         assert_eq!(form.fields[1].label.as_deref(), Some("First"));
         assert_eq!(form.fields[1].schema, Some(json!({ "type": "object" })));

@@ -1702,7 +1702,6 @@ pub(crate) fn record_agent_checkpoint(
     // bytes; a redacted journal copy alone still fails closed.
     use crate::agent_runtime::{redact_messages_for_journal, redact_tool_call_for_journal};
     let mut journaled = checkpoint.clone();
-    // Stamp the authoritative removal set; prior agent_file_changes survive.
     let (root, folded) = (NodePath::root(&node.id), ctx.journal.state());
     journaled.removed_files = folded.removed_files.get(&root).cloned().unwrap_or_default();
     if let Some(call) = checkpoint.pending_side_effect.as_ref() {

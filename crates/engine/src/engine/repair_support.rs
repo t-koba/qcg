@@ -1,3 +1,4 @@
+use crate::required_input_field;
 use api::FormSpec;
 use contract::NodeDef;
 use contract::{FieldType, InputField};
@@ -19,28 +20,15 @@ pub(crate) fn exhausted_question(
     fields: &[InputField],
 ) -> FormSpec {
     let fields = if fields.is_empty() {
-        vec![InputField {
-            id: "answer".into(),
-            label: Some("Resolution".into()),
-            label_i18n: Default::default(),
-            description: Some(format!(
+        vec![required_input_field(
+            "answer",
+            FieldType::Text,
+            Some("Resolution".into()),
+            Some(format!(
                 "Provide the resolution after {phase} attempts were exhausted"
             )),
-            description_i18n: Default::default(),
-            placeholder: None,
-            placeholder_i18n: Default::default(),
-            kind: FieldType::Text,
-            required: true,
-            default: None,
-            pattern: None,
-            options: Vec::new(),
-            option_labels_i18n: Default::default(),
-            min_items: None,
-            item_type: None,
-            schema: None,
-            options_from: None,
-            ui: Default::default(),
-        }]
+            None,
+        )]
     } else {
         fields.to_vec()
     };

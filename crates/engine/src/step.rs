@@ -1,7 +1,7 @@
 use api::{ConfirmSpec, FormSpec};
 use async_trait::async_trait;
 use camino::Utf8PathBuf;
-use contract::{Contract, NodeDef, RuntimeLimits, StepType};
+use contract::{Contract, FieldType, InputField, NodeDef, RuntimeLimits, StepType};
 use minijinja::{Environment, ErrorKind};
 use model::Finding;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -190,6 +190,36 @@ impl StepOutcome {
             output: None,
             files: Vec::new(),
         }
+    }
+}
+
+/// Required-field defaults shared by engine form builders.
+pub(crate) fn required_input_field(
+    id: impl Into<String>,
+    kind: FieldType,
+    label: Option<String>,
+    description: Option<String>,
+    schema: Option<Value>,
+) -> InputField {
+    InputField {
+        id: id.into(),
+        label,
+        label_i18n: Default::default(),
+        description,
+        description_i18n: Default::default(),
+        placeholder: None,
+        placeholder_i18n: Default::default(),
+        kind,
+        required: true,
+        default: None,
+        pattern: None,
+        options: Vec::new(),
+        option_labels_i18n: Default::default(),
+        min_items: None,
+        item_type: None,
+        schema,
+        options_from: None,
+        ui: Default::default(),
     }
 }
 
@@ -649,6 +679,50 @@ impl io::Write for BoundedTemplateWriter {
 mod tests {
     use super::{RuntimeLimits, TemplateService};
     use serde_json::json;
+
+    #[test]
+    fn required_input_field_serializes_required_defaults() {
+        let field = super::required_input_field(
+            "answer",
+            contract::FieldType::Text,
+            Some("Resolution".to_string()),
+            Some("Describe it".to_string()),
+            Some(json!({ "type": "string" })),
+        );
+        let value = serde_json::to_value(&field).expect("field should serialize");
+        assert_eq!(
+            value,
+            json!({
+                "id": "answer",
+                "label": "Resolution",
+                "description": "Describe it",
+                "type": "text",
+                "required": true,
+                "default": null,
+                "pattern": null,
+                "options": [],
+                "min_items": null,
+                "item_type": null,
+                "schema": { "type": "string" }
+            })
+        );
+        let bare =
+            super::required_input_field("answer", contract::FieldType::String, None, None, None);
+        let bare_value = serde_json::to_value(&bare).expect("bare field should serialize");
+        assert_eq!(
+            bare_value,
+            json!({
+                "id": "answer",
+                "type": "string",
+                "required": true,
+                "default": null,
+                "pattern": null,
+                "options": [],
+                "min_items": null,
+                "item_type": null
+            })
+        );
+    }
 
     #[test]
     fn template_service_renders_repeated_sources_without_retaining_cache_state() {

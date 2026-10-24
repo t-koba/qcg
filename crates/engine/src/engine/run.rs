@@ -1,13 +1,13 @@
 use crate::{
     CmdGateway, CommandBounds, FsGateway, HttpGateway, JournalLimits, JournalWriter, NodeOutcome,
     SecretStore, StepError, StepOutcome, StepRegistry, TemplateService, collect_outputs,
-    collect_resource_hashes, write_output_manifest_with_limits,
+    collect_resource_hashes, required_input_field, write_output_manifest_with_limits,
 };
 use api::{FormSpec, RunNodeFailureEventData};
 use camino::Utf8PathBuf;
+use contract::FieldType;
 use contract::{Contract, NodeState, ValueBag};
 use contract::{ExhaustedAction, HookErrorPolicy, OnFail};
-use contract::{FieldType, InputField};
 use model::{FailureCode, FailureDetail, NodePath, OutputManifest};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -1096,26 +1096,13 @@ impl Engine {
                                             node.id
                                         ),
                                         title_i18n: Default::default(),
-                                        fields: vec![InputField {
-                                            id: "answer".into(),
-                                            label: None,
-                                            label_i18n: Default::default(),
-                                            description: None,
-                                            description_i18n: Default::default(),
-                                            placeholder: None,
-                                            placeholder_i18n: Default::default(),
-                                            kind: FieldType::String,
-                                            required: true,
-                                            default: None,
-                                            pattern: None,
-                                            options: vec![],
-                                            option_labels_i18n: Default::default(),
-                                            min_items: None,
-                                            item_type: None,
-                                            schema: None,
-                                            options_from: None,
-                                            ui: Default::default(),
-                                        }],
+                                        fields: vec![required_input_field(
+                                            "answer",
+                                            FieldType::String,
+                                            None,
+                                            None,
+                                            None,
+                                        )],
                                     };
                                     journal.event(
                                         "step_finished",
