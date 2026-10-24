@@ -1958,6 +1958,7 @@ async fn waiting_run_survives_gc_and_rehydrates_after_restart() {
         "GC must not delete a waiting run"
     );
     assert!(runs.join(&id).is_dir());
+    service.mark_shutting_down();
     drop(service);
 
     let restored = test_service(vec![generators], runs);
