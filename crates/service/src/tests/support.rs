@@ -4,6 +4,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -13,12 +14,14 @@ use tokio_util::sync::CancellationToken;
 /// It must exceed the run's own queue and startup: a loaded runner spent
 /// 1.04 s there, so a one-second budget expired before the run reached the
 /// state under test.
+#[cfg(unix)]
 pub(super) const ELAPSED_BUDGET_SECS: u64 = 3;
 
 /// The dwell that lets the wall-clock budget expire before the resume.
 ///
 /// It must exceed the budget, or the wall-clock case would not prove that
 /// the expired budget is what stops the run.
+#[cfg(unix)]
 pub(super) const ELAPSED_BUDGET_DWELL: Duration = Duration::from_millis(3500);
 
 pub(crate) fn temp_run_dir(name: &str) -> Utf8PathBuf {
