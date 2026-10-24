@@ -9,19 +9,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const RUN_STATE_SCHEMA_VERSION: u32 = 7;
 
-/// State-free diagnostics; fold tests ensure API internal-event registration.
-const STATE_FREE_JOURNAL_EVENT_KINDS: &[&str] = &[
-    "audit_degraded",
-    "elapsed_exceeded",
-    "foreach_sibling_ignored",
-    "hook_replayed",
-    "mcp_destination_decision",
-    "operation_repeated",
-    "parallel_replay_authorized",
-    "step_interrupted",
-    "step_timeout",
-];
-
 fn is_known_journal_event_kind(kind: &str) -> bool {
     api::is_known_run_event_kind(kind) || api::INTERNAL_RUN_EVENT_KINDS.contains(&kind)
 }
@@ -1209,9 +1196,8 @@ impl RunState {
                     record.result_ref = result_ref;
                 }
             }
-            kind if STATE_FREE_JOURNAL_EVENT_KINDS.contains(&kind) => {
-                // Durable operator diagnostics with no folded state. The arm
-                // exists so accepting them is a decision, not a fallthrough.
+            kind if api::INTERNAL_RUN_EVENT_KINDS.contains(&kind) => {
+                // Internal diagnostics have no folded state unless an earlier arm consumes them.
             }
             _ => {}
         }
@@ -1444,6 +1430,19 @@ fn failure_detail(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// State-free diagnostics; fold tests ensure API internal-event registration.
+    const STATE_FREE_JOURNAL_EVENT_KINDS: &[&str] = &[
+        "audit_degraded",
+        "elapsed_exceeded",
+        "foreach_sibling_ignored",
+        "hook_replayed",
+        "mcp_destination_decision",
+        "operation_repeated",
+        "parallel_replay_authorized",
+        "step_interrupted",
+        "step_timeout",
+    ];
 
     #[test]
     fn internal_journal_kinds_pass_the_fold_gate() {
