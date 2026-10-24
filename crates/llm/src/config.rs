@@ -202,7 +202,7 @@ fn has_url_userinfo(url: &Url) -> bool {
         .is_some_and(|authority| authority.contains('@'))
 }
 
-fn is_loopback_host(url: &Url) -> bool {
+pub(crate) fn is_loopback_host(url: &Url) -> bool {
     let Some(host) = url.host_str() else {
         return false;
     };

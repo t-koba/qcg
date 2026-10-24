@@ -28,17 +28,13 @@ fn normalize_request_schemas(schemas: &mut serde_json::Map<String, Value>) {
         let required = schema
             .get("required")
             .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect::<Vec<String>>()
-            })
+            .cloned()
             .unwrap_or_default();
         if let Some(Value::Object(properties)) = schema.get_mut("properties") {
             for (property, definition) in properties.iter_mut() {
-                if !required.iter().any(|entry| entry == property)
+                if !required
+                    .iter()
+                    .any(|entry| entry.as_str() == Some(property))
                     && let Value::Object(definition) = definition
                 {
                     definition.remove("default");
@@ -65,15 +61,7 @@ fn narrow_event_kind(schemas: &mut serde_json::Map<String, Value>) {
         return;
     };
     kind.insert("type".into(), Value::String("string".into()));
-    kind.insert(
-        "enum".into(),
-        Value::Array(
-            crate::events::all_run_event_kinds()
-                .into_iter()
-                .map(|kind| Value::from(kind.to_string()))
-                .collect(),
-        ),
-    );
+    kind.insert("enum".into(), json!(crate::events::all_run_event_kinds()));
 }
 
 /// Schemas of the document. Exposed as a map for callers that build a

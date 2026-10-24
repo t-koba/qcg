@@ -23,13 +23,13 @@ use crate::parse::{
 use crate::payload::{anthropic_payload, chat_completions_payload, responses_payload};
 use crate::provider::{
     ApiFlavor, ChatTokenLimitField, DEFAULT_RETRY_BACKOFF_EXPONENT_CAP,
-    DEFAULT_RETRY_RATE_LIMIT_FLOOR_MS, DecisionInputWrapper, DecisionResponseWrapper, LlmProvider,
-    ModelPricing, ModelSpec, PromptCacheField, PromptCacheRetention, ProviderSpec,
+    DEFAULT_RETRY_RATE_LIMIT_FLOOR_MS, LlmProvider, ModelPricing, PromptCacheField,
+    PromptCacheRetention, ProviderSpec,
 };
 use crate::stream::{HttpStreamAccumulator, json_contains_string_fragment};
 use crate::types::{
-    CacheRetention, CacheWritePolicy, Capabilities, ChatRequest, ChatResponse, ChatStreamEvent,
-    LlmError, LlmErrorKind, PromptCache,
+    CacheWritePolicy, Capabilities, ChatRequest, ChatResponse, ChatStreamEvent, LlmError,
+    LlmErrorKind, PromptCache,
 };
 use crate::validate::{
     validate_chat_request, validate_multimodal_capabilities,
@@ -47,34 +47,14 @@ enum SseBodyError {
 }
 
 pub struct HttpProvider {
-    id: String,
-    api: ApiFlavor,
+    spec: ProviderSpec,
     base_url: Option<Url>,
-    auth_header: Option<String>,
-    credential_env: Option<String>,
-    credential_file_env: Option<String>,
-    capabilities: Capabilities,
-    models: BTreeMap<String, ModelSpec>,
-    path_template: Option<String>,
     query: BTreeMap<String, String>,
-    timeout_seconds: u64,
-    retry_attempts: usize,
-    retry_base_backoff_ms: u64,
-    stream_retry_attempts: usize,
-    retry_rate_limit_floor_ms: u64,
-    retry_backoff_exponent_cap: u32,
     chat_token_limit_field: ChatTokenLimitField,
-    prompt_cache_field: Option<PromptCacheField>,
-    prompt_cache_retention: Option<PromptCacheRetention>,
-    prompt_cache_explicit_mode: bool,
-    decision_input_wrapper: DecisionInputWrapper,
-    decision_model_in_body: bool,
-    decision_response_wrapper: DecisionResponseWrapper,
     response_body_limit_bytes: usize,
     config_errors: Vec<String>,
     client: Option<Client>,
     concurrency: Option<Arc<Semaphore>>,
-    requests_per_minute: Option<usize>,
     rate_window: Arc<Mutex<VecDeque<Instant>>>,
     circuit: Arc<Mutex<CircuitState>>,
     circuit_breaker_failures: usize,
@@ -106,41 +86,20 @@ impl HttpProvider {
             },
             None => spec.base_url.clone(),
         };
-        let base_url = match raw_base_url {
-            Some(raw) => match credential_placeholder(&raw, credential_source_env) {
-                Some(name) => {
-                    config_errors.push(format!(
-                        "provider `{}` base_url must not interpolate credential environment variable `{name}`",
-                        spec.id
-                    ));
-                    None
-                }
-                None => match interpolate_env(&raw) {
-                    Ok(resolved) => match validate_base_url(&resolved, has_credential) {
-                        Ok(url) => Some(url),
-                        Err(error) => {
-                            config_errors.push(format!(
-                                "provider `{}` has an invalid base_url: {error}",
-                                spec.id
-                            ));
-                            None
-                        }
-                    },
-                    Err(error) => {
-                        config_errors.push(format!(
-                            "provider `{}` has an invalid base_url: {error}",
-                            spec.id
-                        ));
-                        None
-                    }
-                },
-            },
-            None => {
-                let source = spec.base_url_env.as_deref().unwrap_or("base_url");
-                config_errors.push(format!("set `{source}` before running the generator"));
-                None
+        let base_url = raw_base_url.ok_or_else(|| {
+            let source = spec.base_url_env.as_deref().unwrap_or("base_url");
+            format!("set `{source}` before running the generator")
+        }).and_then(|raw| {
+            if let Some(name) = credential_placeholder(&raw, credential_source_env) {
+                return Err(format!(
+                    "provider `{}` base_url must not interpolate credential environment variable `{name}`",
+                    spec.id
+                ));
             }
-        };
+            interpolate_env(&raw)
+                .and_then(|resolved| validate_base_url(&resolved, has_credential))
+                .map_err(|error| format!("provider `{}` has an invalid base_url: {error}", spec.id))
+        }).map_err(|error| config_errors.push(error)).ok();
         let mut query = BTreeMap::new();
         let query_is_safe = match validate_query_parameters(&spec.query, credential_source_env) {
             Ok(()) => true,
@@ -152,13 +111,13 @@ impl HttpProvider {
                 false
             }
         };
-        for (key, value) in spec.query {
+        for (key, value) in &spec.query {
             if !query_is_safe {
                 continue;
             }
-            match interpolate_env(&value) {
+            match interpolate_env(value) {
                 Ok(resolved) => {
-                    query.insert(key, resolved);
+                    query.insert(key.clone(), resolved);
                 }
                 Err(error) => config_errors.push(error),
             }
@@ -177,39 +136,11 @@ impl HttpProvider {
             }
         };
         Self {
-            id: spec.id,
-            api: spec.api,
             base_url,
-            auth_header: spec.auth_header,
-            credential_env: spec.api_key_env,
-            credential_file_env: spec.api_key_file_env,
-            capabilities: spec.capabilities,
-            models: spec
-                .models
-                .into_iter()
-                .map(|model| (model.id.clone(), model))
-                .collect(),
-            path_template: spec.path_template,
             query,
-            timeout_seconds: spec.timeout_seconds.unwrap_or(120),
-            retry_attempts: spec.retry_attempts.unwrap_or(3),
-            retry_base_backoff_ms: spec.retry_base_backoff_ms.unwrap_or(200),
-            stream_retry_attempts: spec.stream_retry_attempts.unwrap_or(0) as usize,
-            retry_rate_limit_floor_ms: spec
-                .retry_rate_limit_floor_ms
-                .unwrap_or(DEFAULT_RETRY_RATE_LIMIT_FLOOR_MS),
-            retry_backoff_exponent_cap: spec
-                .retry_backoff_exponent_cap
-                .unwrap_or(DEFAULT_RETRY_BACKOFF_EXPONENT_CAP),
             chat_token_limit_field: spec
                 .chat_token_limit_field
                 .unwrap_or(ChatTokenLimitField::MaxTokens),
-            prompt_cache_field: spec.prompt_cache_field,
-            prompt_cache_retention: spec.prompt_cache_retention,
-            prompt_cache_explicit_mode: spec.prompt_cache_explicit_mode,
-            decision_input_wrapper: spec.decision_input_wrapper,
-            decision_model_in_body: spec.decision_model_in_body,
-            decision_response_wrapper: spec.decision_response_wrapper,
             response_body_limit_bytes: spec
                 .response_body_limit_bytes
                 .unwrap_or(DEFAULT_RESPONSE_BODY_LIMIT_BYTES),
@@ -218,25 +149,22 @@ impl HttpProvider {
             concurrency: spec
                 .max_concurrency
                 .map(|limit| Arc::new(Semaphore::new(limit))),
-            requests_per_minute: spec.requests_per_minute,
             rate_window: Arc::new(Mutex::new(VecDeque::new())),
             circuit: Arc::new(Mutex::new(CircuitState::default())),
             circuit_breaker_failures: spec.circuit_breaker_failures.unwrap_or(5),
             circuit_breaker_cooldown: Duration::from_secs(
                 spec.circuit_breaker_cooldown_seconds.unwrap_or(30),
             ),
+            spec,
         }
     }
 
     pub fn capabilities_for_model(&self, model: &str) -> Capabilities {
-        match self.models.get(model) {
-            Some(spec) => spec.effective_capabilities(&self.capabilities),
-            None => self.capabilities.clone(),
-        }
+        self.spec.capabilities_for_model(model)
     }
 
     pub fn pricing_for_model(&self, model: &str) -> Option<ModelPricing> {
-        self.models.get(model).and_then(ModelSpec::pricing)
+        self.spec.pricing_for_model(model)
     }
 
     /// Resolves the cache mechanism for one request. An `auto` request against
@@ -247,42 +175,19 @@ impl HttpProvider {
         req: &ChatRequest,
         capabilities: &Capabilities,
     ) -> Result<Option<PromptCacheField>, LlmError> {
-        if req.prompt_cache != PromptCache::Auto {
-            return Ok(None);
-        }
-        if req.cache_write == CacheWritePolicy::Forbid {
-            // A write-disable suppresses auto hints; the disable mechanism
-            // is validated separately. Never emit auto markers here.
+        // Off and write-disable never emit auto hints; the disable mechanism
+        // is validated separately.
+        if req.prompt_cache != PromptCache::Auto || req.cache_write == CacheWritePolicy::Forbid {
             return Ok(None);
         }
         if !capabilities.prompt_cache {
-            return Err(LlmError::new(format!(
-                "{} provider does not support prompt caching",
-                self.id
-            )));
+            return Err(LlmError::new(
+                self.message("does not support prompt caching"),
+            ));
         }
-        self.prompt_cache_field.map(Some).ok_or_else(|| {
-            LlmError::new(format!(
-                "{} provider enables prompt caching without a `prompt_cache_field`",
-                self.id
-            ))
+        self.spec.prompt_cache_field.map(Some).ok_or_else(|| {
+            LlmError::new(self.message("enables prompt caching without a `prompt_cache_field`"))
         })
-    }
-
-    fn retention_for_model(&self, model: &str) -> Option<PromptCacheRetention> {
-        match self.models.get(model) {
-            Some(spec) => spec.prompt_cache_retention.or(self.prompt_cache_retention),
-            None => self.prompt_cache_retention,
-        }
-    }
-
-    fn explicit_mode_for_model(&self, model: &str) -> bool {
-        match self.models.get(model) {
-            Some(spec) => spec
-                .prompt_cache_explicit_mode
-                .unwrap_or(self.prompt_cache_explicit_mode),
-            None => self.prompt_cache_explicit_mode,
-        }
     }
 
     /// Fail-closed validation for the advanced cache controls. Runs before
@@ -293,86 +198,65 @@ impl HttpProvider {
         req: &ChatRequest,
         capabilities: &Capabilities,
     ) -> Result<(Option<PromptCacheRetention>, bool), LlmError> {
-        let advanced = req.prompt_cache == PromptCache::Auto
-            || req.cache_write == CacheWritePolicy::Forbid
-            || req.cache_retention.is_some();
-        if self.api == ApiFlavor::SystemOne {
-            if advanced {
-                return Err(LlmError::new(format!(
-                    "provider `{}` model `{}` cannot use advanced cache policies on a system_one route: remove cache, cache_write_policy and cache_retention",
-                    self.id, req.model
-                )));
+        let invalid = |message: &str| {
+            LlmError::new(format!(
+                "provider `{}` model `{}` {message}",
+                self.spec.id, req.model
+            ))
+        };
+        if self.spec.api == ApiFlavor::SystemOne {
+            if req.prompt_cache == PromptCache::Auto
+                || req.cache_write == CacheWritePolicy::Forbid
+                || req.cache_retention.is_some()
+            {
+                return Err(invalid(
+                    "cannot use advanced cache policies on a system_one route: remove cache, cache_write_policy and cache_retention",
+                ));
             }
             return Ok((None, false));
         }
         if req.cache_retention.is_some() {
             if req.prompt_cache != PromptCache::Auto {
-                return Err(LlmError::new(format!(
-                    "provider `{}` model `{}` cache_retention requires cache = \"auto\"",
-                    self.id, req.model
-                )));
+                return Err(invalid("cache_retention requires cache = \"auto\""));
             }
             if req.cache_write == CacheWritePolicy::Forbid {
-                return Err(LlmError::new(format!(
-                    "provider `{}` model `{}` cache_retention requires cache_write_policy = \"allow\"",
-                    self.id, req.model
-                )));
+                return Err(invalid(
+                    "cache_retention requires cache_write_policy = \"allow\"",
+                ));
             }
-            let mechanism = self.retention_for_model(&req.model);
-            let Some(mechanism) = mechanism else {
-                return Err(LlmError::new(format!(
-                    "provider `{}` model `{}` does not declare an extended-retention mechanism: add `prompt_cache_retention` for this model or row",
-                    self.id, req.model
-                )));
-            };
-            if !mechanism.supports_api(self.api) {
-                return Err(LlmError::new(format!(
-                    "provider `{}` model `{}` declares an extended-retention mechanism that is not valid for its api",
-                    self.id, req.model
-                )));
+            let mechanism = self.spec.retention_for_model(&req.model).ok_or_else(|| invalid(
+                "does not declare an extended-retention mechanism: add `prompt_cache_retention` for this model or row"
+            ))?;
+            if !mechanism.supports_api(self.spec.api) {
+                return Err(invalid(
+                    "declares an extended-retention mechanism that is not valid for its api",
+                ));
             }
             if !capabilities.prompt_cache {
-                return Err(LlmError::new(format!(
-                    "provider `{}` model `{}` cannot use cache_retention without prompt caching support",
-                    self.id, req.model
-                )));
-            }
-            if req.cache_retention == Some(CacheRetention::Extended)
-                && self.api == ApiFlavor::AnthropicMessages
-                && mechanism != PromptCacheRetention::Ttl1h
-            {
-                return Err(LlmError::new(format!(
-                    "provider `{}` model `{}` declares an extended-retention mechanism that is not valid for its api",
-                    self.id, req.model
-                )));
+                return Err(invalid(
+                    "cannot use cache_retention without prompt caching support",
+                ));
             }
             return Ok((Some(mechanism), false));
         }
-        if req.cache_write == CacheWritePolicy::Forbid {
-            match self.api {
-                ApiFlavor::AnthropicMessages => {
-                    // Honored by omitting every explicit/top-level marker;
-                    // no registry mechanism needed.
-                    return Ok((None, false));
-                }
-                ApiFlavor::ChatCompletions | ApiFlavor::Responses => {
-                    if !self.explicit_mode_for_model(&req.model) {
-                        return Err(LlmError::new(format!(
-                            "provider `{}` model `{}` cannot disable caching: declare `prompt_cache_explicit_mode = true` for this model or row",
-                            self.id, req.model
-                        )));
-                    }
-                    return Ok((None, true));
-                }
-                ApiFlavor::SystemOne => {
-                    return Err(LlmError::new(format!(
-                        "provider `{}` model `{}` cannot use advanced cache policies on a system_one route: remove cache, cache_write_policy and cache_retention",
-                        self.id, req.model
-                    )));
-                }
-            }
+        let explicit_disable = req.cache_write == CacheWritePolicy::Forbid
+            && matches!(
+                self.spec.api,
+                ApiFlavor::ChatCompletions | ApiFlavor::Responses
+            );
+        if req.cache_write == CacheWritePolicy::Forbid
+            && self.spec.api == ApiFlavor::AnthropicMessages
+        {
+            return Err(invalid(
+                "cannot guarantee no cache writes: Anthropic may cache tool/thinking continuations and server-tool results without qcg markers",
+            ));
         }
-        Ok((None, false))
+        if explicit_disable && !self.spec.explicit_mode_for_model(&req.model) {
+            return Err(invalid(
+                "cannot disable caching: declare `prompt_cache_explicit_mode = true` for this model or row",
+            ));
+        }
+        Ok((None, explicit_disable))
     }
 
     /// Refuses a hosted web search the endpoint or the model cannot honor.
@@ -386,19 +270,47 @@ impl HttpProvider {
         if req.provider_web_search.is_none() {
             return Ok(());
         }
-        if self.api != ApiFlavor::Responses {
+        if self.spec.api != ApiFlavor::Responses {
             return Err(LlmError::new(format!(
                 "provider `{}` model `{}` cannot use provider web search: the hosted search tool exists only on the Responses API; use a Responses endpoint or remove `provider_web_search`",
-                self.id, req.model
+                self.spec.id, req.model
             )));
         }
         if !capabilities.web_search {
             return Err(LlmError::new(format!(
                 "provider `{}` model `{}` does not support provider web search: select a model whose registry row advertises the `web_search` capability or remove `provider_web_search`",
-                self.id, req.model
+                self.spec.id, req.model
             )));
         }
         Ok(())
+    }
+
+    fn request_payload(
+        &self,
+        req: &ChatRequest,
+        capabilities: &Capabilities,
+    ) -> Result<Value, LlmError> {
+        self.check_provider_web_search(req, capabilities)?;
+        let (cache_retention, cache_explicit_disable) =
+            self.check_cache_policy(req, capabilities)?;
+        let prompt_cache = self.prompt_cache_field_for(req, capabilities)?;
+        Ok(match self.spec.api {
+            ApiFlavor::ChatCompletions => chat_completions_payload(
+                req,
+                req.seed.is_some() && capabilities.seed,
+                self.chat_token_limit_field,
+                prompt_cache,
+                cache_retention,
+                cache_explicit_disable,
+            ),
+            ApiFlavor::Responses => {
+                responses_payload(req, prompt_cache, cache_retention, cache_explicit_disable)
+            }
+            ApiFlavor::AnthropicMessages => anthropic_payload(req, prompt_cache, cache_retention),
+            ApiFlavor::SystemOne => {
+                return Err(LlmError::new("system_one requires typed decisions"));
+            }
+        })
     }
 
     fn default_path(api: ApiFlavor) -> &'static str {
@@ -416,9 +328,10 @@ impl HttpProvider {
             .clone()
             .ok_or_else(|| "provider base_url is not configured".to_owned())?;
         let path = self
+            .spec
             .path_template
             .as_deref()
-            .unwrap_or(Self::default_path(self.api))
+            .unwrap_or(Self::default_path(self.spec.api))
             .to_owned();
         {
             let mut segments = url
@@ -445,19 +358,12 @@ impl HttpProvider {
                         );
                     }
                     let replaced = segment.replace("{model}", model);
-                    let mut pushed = false;
                     for piece in replaced.split('/') {
                         if piece.is_empty() || matches!(piece, "." | "..") {
                             return Err("provider model contains an empty or unsafe path segment"
                                 .to_owned());
                         }
                         segments.push(piece);
-                        pushed = true;
-                    }
-                    if !pushed {
-                        return Err(
-                            "provider model contains an empty or unsafe path segment".to_owned()
-                        );
                     }
                 } else {
                     segments.push(segment);
@@ -475,8 +381,8 @@ impl HttpProvider {
 
     fn credential_for_request(&self) -> Result<Option<String>, LlmError> {
         match (
-            self.credential_env.as_deref(),
-            self.credential_file_env.as_deref(),
+            self.spec.api_key_env.as_deref(),
+            self.spec.api_key_file_env.as_deref(),
         ) {
             (Some(name), None) => match std::env::var(name) {
                 Ok(value) if !value.is_empty() => Ok(Some(value)),
@@ -515,7 +421,7 @@ impl HttpProvider {
             if let Some(until) = circuit.open_until {
                 if until > Instant::now() {
                     return Err(LlmError {
-                        message: format!("{} provider circuit breaker is open", self.id),
+                        message: self.message("circuit breaker is open"),
                         kind: LlmErrorKind::CircuitOpen,
                     });
                 }
@@ -523,7 +429,7 @@ impl HttpProvider {
                 circuit.consecutive_failures = 0;
             }
         }
-        if let Some(limit) = self.requests_per_minute {
+        if let Some(limit) = self.spec.requests_per_minute {
             loop {
                 let delay = {
                     let mut window = self
@@ -585,7 +491,7 @@ impl HttpProvider {
         provider_web_search: bool,
     ) -> Result<ChatResponse, LlmError> {
         let value = self.send_json(payload, model).await?;
-        match self.api {
+        match self.spec.api {
             ApiFlavor::ChatCompletions => parse_chat_completions_response(value),
             ApiFlavor::Responses => parse_responses_response(value, provider_web_search),
             ApiFlavor::AnthropicMessages => parse_anthropic_response(value),
@@ -593,89 +499,97 @@ impl HttpProvider {
         }
     }
 
-    async fn send_json(&self, payload: Value, model: &str) -> Result<Value, LlmError> {
-        if let Some(error) = self.configuration_error_for(&self.id) {
+    fn message(&self, detail: impl std::fmt::Display) -> String {
+        format!("{} provider {detail}", self.spec.id)
+    }
+
+    async fn send_request(
+        &self,
+        payload: Value,
+        model: &str,
+    ) -> Result<(reqwest::Response, Option<String>), LlmError> {
+        if let Some(error) = self.configuration_error_for(&self.spec.id) {
             return Err(LlmError::new(error));
         }
         let credential = self.credential_for_request()?;
-        let client = self.client.as_ref().ok_or_else(|| {
-            LlmError::new(format!("{} provider HTTP client is unavailable", self.id))
-        })?;
+        let client = self
+            .client
+            .as_ref()
+            .ok_or_else(|| LlmError::new(self.message("HTTP client is unavailable")))?;
         let endpoint = self.endpoint_for(model).map_err(|error| {
             LlmError::new(format!(
                 "provider `{}` has an invalid endpoint: {error}",
-                self.id
+                self.spec.id
             ))
         })?;
         let mut builder = client.post(endpoint).json(&payload);
         if let Some(key) = credential.as_deref() {
-            builder = match &self.auth_header {
+            builder = match &self.spec.auth_header {
                 Some(header) => builder.header(header.as_str(), key),
                 None => builder.bearer_auth(key),
             };
         }
-        if self.api == ApiFlavor::AnthropicMessages {
+        if self.spec.api == ApiFlavor::AnthropicMessages {
             builder = builder.header("anthropic-version", "2023-06-01");
         }
-        let mut response = builder.send().await.map_err(llm_http_error)?;
+        let response = builder.send().await.map_err(llm_http_error)?;
         let status = response.status();
         if !status.is_success() {
             return Err(LlmError::http_status(
                 status.as_u16(),
-                format!("{} provider returned HTTP {}", self.id, status.as_u16()),
+                format!(
+                    "{} provider returned HTTP {}",
+                    self.spec.id,
+                    status.as_u16()
+                ),
             ));
         }
+        Ok((response, credential))
+    }
+
+    async fn send_json(&self, payload: Value, model: &str) -> Result<Value, LlmError> {
+        let (mut response, credential) = self.send_request(payload, model).await?;
         let mut body = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(llm_http_error)? {
             let next_len = body.len().checked_add(chunk.len()).ok_or_else(|| {
-                LlmError::invalid_response(format!(
-                    "{} provider response exceeded the configured body limit",
-                    self.id
-                ))
+                LlmError::invalid_response(
+                    self.message("response exceeded the configured body limit"),
+                )
             })?;
             if next_len > self.response_body_limit_bytes {
                 return Err(LlmError::invalid_response(format!(
                     "{} provider response exceeded response_body_limit_bytes ({})",
-                    self.id, self.response_body_limit_bytes
+                    self.spec.id, self.response_body_limit_bytes
                 )));
             }
             body.extend_from_slice(&chunk);
         }
         let body = String::from_utf8(body).map_err(|_| {
-            LlmError::invalid_response(format!(
-                "{} provider returned a response body that was not UTF-8",
-                self.id
-            ))
+            LlmError::invalid_response(self.message("returned a response body that was not UTF-8"))
         })?;
         if body.trim().is_empty() {
-            return Err(LlmError::empty_response(format!(
-                "{} provider returned an empty response body",
-                self.id
-            )));
+            return Err(LlmError::empty_response(
+                self.message("returned an empty response body"),
+            ));
         }
         if credential
             .as_deref()
             .is_some_and(|key| !key.is_empty() && body.contains(key))
         {
-            return Err(LlmError::new(format!(
-                "{} provider response contained its configured credential",
-                self.id
-            )));
+            return Err(LlmError::new(
+                self.message("response contained its configured credential"),
+            ));
         }
         let value: Value = serde_json::from_str(&body).map_err(|error| {
-            LlmError::invalid_response(format!(
-                "{} provider returned invalid JSON: {error}",
-                self.id
-            ))
+            LlmError::invalid_response(self.message(format_args!("returned invalid JSON: {error}")))
         })?;
         if credential
             .as_deref()
             .is_some_and(|key| !key.is_empty() && json_contains_string_fragment(&value, key))
         {
-            return Err(LlmError::new(format!(
-                "{} provider response contained its configured credential",
-                self.id
-            )));
+            return Err(LlmError::new(
+                self.message("response contained its configured credential"),
+            ));
         }
         Ok(value)
     }
@@ -687,37 +601,7 @@ impl HttpProvider {
         provider_web_search: bool,
         events: mpsc::Sender<ChatStreamEvent>,
     ) -> Result<(), LlmError> {
-        if let Some(error) = self.configuration_error_for(&self.id) {
-            return Err(LlmError::new(error));
-        }
-        let credential = self.credential_for_request()?;
-        let client = self.client.as_ref().ok_or_else(|| {
-            LlmError::new(format!("{} provider HTTP client is unavailable", self.id))
-        })?;
-        let endpoint = self.endpoint_for(model).map_err(|error| {
-            LlmError::new(format!(
-                "provider `{}` has an invalid endpoint: {error}",
-                self.id
-            ))
-        })?;
-        let mut builder = client.post(endpoint).json(&payload);
-        if let Some(key) = credential.as_deref() {
-            builder = match &self.auth_header {
-                Some(header) => builder.header(header.as_str(), key),
-                None => builder.bearer_auth(key),
-            };
-        }
-        if self.api == ApiFlavor::AnthropicMessages {
-            builder = builder.header("anthropic-version", "2023-06-01");
-        }
-        let response = builder.send().await.map_err(llm_http_error)?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(LlmError::http_status(
-                status.as_u16(),
-                format!("{} provider returned HTTP {}", self.id, status.as_u16()),
-            ));
-        }
+        let (response, credential) = self.send_request(payload, model).await?;
         let body = response.bytes_stream().scan(
             (self.response_body_limit_bytes, false),
             |(remaining, terminated), chunk| {
@@ -747,7 +631,7 @@ impl HttpProvider {
             },
         );
         let mut stream = SseStream::from_bytes_stream(body);
-        let mut accumulator = HttpStreamAccumulator::new(self.api, provider_web_search)?;
+        let mut accumulator = HttpStreamAccumulator::new(self.spec.api, provider_web_search)?;
         // Pre-publication gate for the provider credential (B04): text
         // deltas pass through it, and only prefixes proven free of the
         // credential are released downstream. A metadata-mixed window can
@@ -760,7 +644,10 @@ impl HttpProvider {
         // assumption: the loop drains the gate after every ingest, and no
         // single ingest can block waiting for that drain.
         let (gate_tx, mut gate_rx) = mpsc::channel::<ChatStreamEvent>(64);
-        while let Some(event) = stream.next().await {
+        let response = loop {
+            let Some(event) = stream.next().await else {
+                break accumulator.finish()?;
+            };
             let event = event.map_err(|error| {
                 if let sse_stream::Error::Body(error) = error
                     && let Ok(error) = error.downcast::<SseBodyError>()
@@ -769,42 +656,37 @@ impl HttpProvider {
                         SseBodyError::Http(error) => llm_http_error(error),
                         SseBodyError::LimitExceeded => LlmError::invalid_response(format!(
                             "{} provider stream exceeded response_body_limit_bytes ({})",
-                            self.id, self.response_body_limit_bytes
+                            self.spec.id, self.response_body_limit_bytes
                         )),
                     };
                 }
-                LlmError::invalid_response(format!("{} provider returned invalid SSE", self.id))
+                LlmError::invalid_response(self.message("returned invalid SSE"))
             })?;
             let Some(data) = event.data else {
                 continue;
             };
             if data.trim() == "[DONE]" {
-                break;
+                break accumulator.finish()?;
             }
             if credential
                 .as_deref()
                 .is_some_and(|key| !key.is_empty() && data.contains(key))
             {
-                return Err(LlmError::new(format!(
-                    "{} provider stream contained its configured credential",
-                    self.id
-                )));
+                return Err(LlmError::new(
+                    self.message("stream contained its configured credential"),
+                ));
             }
             let value: Value = serde_json::from_str(&data).map_err(|_| {
-                LlmError::invalid_response(format!(
-                    "{} provider returned invalid JSON in its SSE stream",
-                    self.id
-                ))
+                LlmError::invalid_response(self.message("returned invalid JSON in its SSE stream"))
             })?;
             if let Some(key) = credential.as_deref().filter(|key| !key.is_empty()) {
                 // Decoded JSON inspection covers Unicode escapes and string
                 // fragmentation inside one chunk, including metadata (A08).
                 // Cross-chunk text reassembly is the gate's job below.
                 if json_contains_string_fragment(&value, key) {
-                    return Err(LlmError::new(format!(
-                        "{} provider stream contained its configured credential",
-                        self.id
-                    )));
+                    return Err(LlmError::new(
+                        self.message("stream contained its configured credential"),
+                    ));
                 }
             }
             if value
@@ -814,37 +696,16 @@ impl HttpProvider {
                     kind == "error" || kind.ends_with(".failed") || kind.ends_with(".error")
                 })
             {
-                return Err(LlmError::new(format!(
-                    "{} provider stream reported an error",
-                    self.id
-                )));
+                return Err(LlmError::new(self.message("stream reported an error")));
             }
             if let Some(response) = accumulator.ingest(value, &gate_tx).await? {
                 self.forward_gated_text(&mut gate_rx, &mut credential_gate, &events)
                     .await?;
-                if credential.as_deref().is_some_and(|key| {
-                    !key.is_empty()
-                        && json_contains_string_fragment(
-                            &serde_json::to_value(&response).unwrap_or(Value::Null),
-                            key,
-                        )
-                }) {
-                    return Err(LlmError::new(format!(
-                        "{} provider stream contained its configured credential",
-                        self.id
-                    )));
-                }
-                self.flush_gate_tail(&mut credential_gate, &events).await?;
-                events
-                    .send(ChatStreamEvent::Completed { response })
-                    .await
-                    .map_err(|_| LlmError::new("LLM stream receiver closed"))?;
-                return Ok(());
+                break response;
             }
             self.forward_gated_text(&mut gate_rx, &mut credential_gate, &events)
                 .await?;
-        }
-        let response = accumulator.finish()?;
+        };
         if credential.as_deref().is_some_and(|key| {
             !key.is_empty()
                 && json_contains_string_fragment(
@@ -852,10 +713,9 @@ impl HttpProvider {
                     key,
                 )
         }) {
-            return Err(LlmError::new(format!(
-                "{} provider stream contained its configured credential",
-                self.id
-            )));
+            return Err(LlmError::new(
+                self.message("stream contained its configured credential"),
+            ));
         }
         self.flush_gate_tail(&mut credential_gate, &events).await?;
         events
@@ -874,28 +734,22 @@ impl HttpProvider {
         events: &mpsc::Sender<ChatStreamEvent>,
     ) -> Result<(), LlmError> {
         while let Ok(event) = gate_rx.try_recv() {
-            match event {
+            let event = match event {
                 ChatStreamEvent::TextDelta { text } => {
                     let cleared = gate.push(&text).map_err(|()| {
-                        LlmError::new(format!(
-                            "{} provider stream contained its configured credential",
-                            self.id
-                        ))
+                        LlmError::new(self.message("stream contained its configured credential"))
                     })?;
-                    if !cleared.is_empty() {
-                        events
-                            .send(ChatStreamEvent::TextDelta { text: cleared })
-                            .await
-                            .map_err(|_| LlmError::new("LLM stream receiver closed"))?;
+                    if cleared.is_empty() {
+                        continue;
                     }
+                    ChatStreamEvent::TextDelta { text: cleared }
                 }
-                other => {
-                    events
-                        .send(other)
-                        .await
-                        .map_err(|_| LlmError::new("LLM stream receiver closed"))?;
-                }
-            }
+                other => other,
+            };
+            events
+                .send(event)
+                .await
+                .map_err(|_| LlmError::new("LLM stream receiver closed"))?;
         }
         Ok(())
     }
@@ -911,10 +765,7 @@ impl HttpProvider {
         // `finish` consumes; rebuild an empty gate in its place.
         let gate = std::mem::replace(gate, crate::text_gate::SensitiveTextGate::new(None));
         let tail = gate.finish().map_err(|()| {
-            LlmError::new(format!(
-                "{} provider stream contained its configured credential",
-                self.id
-            ))
+            LlmError::new(self.message("stream contained its configured credential"))
         })?;
         if !tail.is_empty() {
             events
@@ -929,43 +780,49 @@ impl HttpProvider {
 #[async_trait]
 impl LlmProvider for HttpProvider {
     fn id(&self) -> &str {
-        &self.id
+        &self.spec.id
     }
 
     fn timeout_seconds(&self) -> u64 {
-        self.timeout_seconds
+        self.spec.timeout_seconds.unwrap_or(120)
     }
 
     fn retry_attempts(&self) -> usize {
-        self.retry_attempts
+        self.spec.retry_attempts.unwrap_or(3)
     }
 
     fn retry_base_backoff(&self) -> Duration {
-        Duration::from_millis(self.retry_base_backoff_ms)
+        Duration::from_millis(self.spec.retry_base_backoff_ms.unwrap_or(200))
     }
 
     fn stream_retry_attempts(&self) -> usize {
-        self.stream_retry_attempts
+        self.spec.stream_retry_attempts.unwrap_or(0) as usize
     }
 
     fn retry_rate_limit_floor(&self) -> Duration {
-        Duration::from_millis(self.retry_rate_limit_floor_ms)
+        Duration::from_millis(
+            self.spec
+                .retry_rate_limit_floor_ms
+                .unwrap_or(DEFAULT_RETRY_RATE_LIMIT_FLOOR_MS),
+        )
     }
 
     fn retry_backoff_exponent_cap(&self) -> u32 {
-        self.retry_backoff_exponent_cap
+        self.spec
+            .retry_backoff_exponent_cap
+            .unwrap_or(DEFAULT_RETRY_BACKOFF_EXPONENT_CAP)
     }
 
     fn capabilities(&self) -> Capabilities {
-        self.capabilities.clone()
+        self.spec.capabilities.clone()
     }
 
     fn model_capabilities_for(&self, provider: &str, model: &str) -> Option<Capabilities> {
-        (provider == self.id).then(|| self.capabilities_for_model(model))
+        (provider == self.spec.id).then(|| self.capabilities_for_model(model))
     }
 
     fn model_pricing_for(&self, provider: &str, model: &str) -> Option<ModelPricing> {
-        (provider == self.id)
+        (provider == self.spec.id)
             .then(|| self.pricing_for_model(model))
             .flatten()
     }
@@ -975,8 +832,8 @@ impl LlmProvider for HttpProvider {
         provider: &str,
         model: &str,
     ) -> Option<PromptCacheRetention> {
-        (provider == self.id)
-            .then(|| self.retention_for_model(model))
+        (provider == self.spec.id)
+            .then(|| self.spec.retention_for_model(model))
             .flatten()
     }
 
@@ -992,15 +849,16 @@ impl LlmProvider for HttpProvider {
     }
 
     fn credential_env_names(&self) -> Vec<String> {
-        self.credential_env
+        self.spec
+            .api_key_env
             .iter()
-            .chain(self.credential_file_env.iter())
+            .chain(self.spec.api_key_file_env.iter())
             .cloned()
             .collect()
     }
 
     fn supports_decisions_for(&self, provider: &str) -> bool {
-        provider == self.id && self.api == ApiFlavor::SystemOne
+        provider == self.spec.id && self.spec.api == ApiFlavor::SystemOne
     }
 
     async fn decide(
@@ -1013,9 +871,13 @@ impl LlmProvider for HttpProvider {
         req.validate()?;
         let _slot = self.acquire_request_slot().await?;
         let result = async {
-            let payload = req.payload_for(self.decision_model_in_body, self.decision_input_wrapper);
+            let payload = req.payload_for(
+                self.spec.decision_model_in_body,
+                self.spec.decision_input_wrapper,
+            );
             let value = self.send_json(payload, &req.model).await?;
-            let response = crate::parse_decision_response(value, self.decision_response_wrapper)?;
+            let response =
+                crate::parse_decision_response(value, self.spec.decision_response_wrapper)?;
             response.validate(&req)?;
             Ok(response)
         }
@@ -1025,29 +887,19 @@ impl LlmProvider for HttpProvider {
     }
 
     async fn complete(&self, req: ChatRequest) -> Result<ChatResponse, LlmError> {
-        validate_chat_request(&req, self.api)?;
+        validate_chat_request(&req, self.spec.api)?;
         let capabilities = self.capabilities_for_model(&req.model);
         validate_multimodal_capabilities(&req, &capabilities)?;
-        validate_structured_output_capabilities(&req, self.api, &capabilities)?;
+        validate_structured_output_capabilities(&req, self.spec.api, &capabilities)?;
         if req.seed.is_some() && !capabilities.seed {
-            return Err(LlmError::new(format!(
-                "{} provider does not support seed",
-                self.id
-            )));
+            return Err(LlmError::new(self.message("does not support seed")));
         }
-        if req
-            .reasoning_effort
-            .is_some_and(|effort| !capabilities.reasoning_effort.contains(&effort))
+        if let Some(effort) = req.reasoning_effort
+            && !capabilities.reasoning_effort.contains(&effort)
         {
-            return Err(LlmError::new(match req.reasoning_effort {
-                Some(effort) => format!(
-                    "{} provider does not support reasoning_effort `{effort}`",
-                    self.id,
-                ),
-                // Unreachable: the enclosing `is_some_and` already proved
-                // presence. Fail closed instead of panicking.
-                None => format!("{} provider does not support reasoning_effort", self.id),
-            }));
+            return Err(LlmError::new(self.message(format_args!(
+                "does not support reasoning_effort `{effort}`"
+            ))));
         }
         for (configured, supported, name) in [
             (
@@ -1074,33 +926,12 @@ impl LlmProvider for HttpProvider {
             (req.verbosity.is_some(), capabilities.verbosity, "verbosity"),
         ] {
             if configured && !supported {
-                return Err(LlmError::new(format!(
-                    "{} provider does not support {name}",
-                    self.id
-                )));
+                return Err(LlmError::new(
+                    self.message(format_args!("does not support {name}")),
+                ));
             }
         }
-        self.check_provider_web_search(&req, &capabilities)?;
-        let (cache_retention, cache_explicit_disable) =
-            self.check_cache_policy(&req, &capabilities)?;
-        let prompt_cache = self.prompt_cache_field_for(&req, &capabilities)?;
-        let payload = match self.api {
-            ApiFlavor::ChatCompletions => chat_completions_payload(
-                &req,
-                req.seed.is_some() && capabilities.seed,
-                self.chat_token_limit_field,
-                prompt_cache,
-                cache_retention,
-                cache_explicit_disable,
-            ),
-            ApiFlavor::Responses => {
-                responses_payload(&req, prompt_cache, cache_retention, cache_explicit_disable)
-            }
-            ApiFlavor::AnthropicMessages => anthropic_payload(&req, prompt_cache, cache_retention),
-            ApiFlavor::SystemOne => {
-                return Err(LlmError::new("system_one requires typed decisions"));
-            }
-        };
+        let payload = self.request_payload(&req, &capabilities)?;
         let _slot = self.acquire_request_slot().await?;
         let result = self
             .send(payload, &req.model, req.provider_web_search.is_some())
@@ -1114,39 +945,16 @@ impl LlmProvider for HttpProvider {
         req: ChatRequest,
         events: mpsc::Sender<ChatStreamEvent>,
     ) -> Result<(), LlmError> {
-        validate_chat_request(&req, self.api)?;
+        validate_chat_request(&req, self.spec.api)?;
         let capabilities = self.capabilities_for_model(&req.model);
         validate_multimodal_capabilities(&req, &capabilities)?;
-        validate_structured_output_capabilities(&req, self.api, &capabilities)?;
+        validate_structured_output_capabilities(&req, self.spec.api, &capabilities)?;
         if !capabilities.streaming {
-            return Err(LlmError::new(format!(
-                "{} provider does not support streaming",
-                self.id
-            )));
+            return Err(LlmError::new(self.message("does not support streaming")));
         }
-        self.check_provider_web_search(&req, &capabilities)?;
-        let (cache_retention, cache_explicit_disable) =
-            self.check_cache_policy(&req, &capabilities)?;
-        let prompt_cache = self.prompt_cache_field_for(&req, &capabilities)?;
-        let mut payload = match self.api {
-            ApiFlavor::ChatCompletions => chat_completions_payload(
-                &req,
-                req.seed.is_some() && capabilities.seed,
-                self.chat_token_limit_field,
-                prompt_cache,
-                cache_retention,
-                cache_explicit_disable,
-            ),
-            ApiFlavor::Responses => {
-                responses_payload(&req, prompt_cache, cache_retention, cache_explicit_disable)
-            }
-            ApiFlavor::AnthropicMessages => anthropic_payload(&req, prompt_cache, cache_retention),
-            ApiFlavor::SystemOne => {
-                return Err(LlmError::new("system_one requires typed decisions"));
-            }
-        };
+        let mut payload = self.request_payload(&req, &capabilities)?;
         payload["stream"] = Value::Bool(true);
-        if self.api == ApiFlavor::ChatCompletions {
+        if self.spec.api == ApiFlavor::ChatCompletions {
             payload["stream_options"] = json!({ "include_usage": true });
         }
         let _slot = self.acquire_request_slot().await?;

@@ -162,9 +162,12 @@ Fields:
   prompt caching stay unchanged. `cache_control` marks only the stable system
   prefix and is the safe default; `cache_control_auto` adds the top-level
   automatic tail marker (explicit system plus automatic tail, 5-minute default,
-  2 of 4 slots) for multi-turn agent loops. Opt in to `cache_control_auto`
-  only on routes that accept the top-level field; routes without automatic
-  caching reject it, so they keep `cache_control`.
+  2 of 4 slots) for multi-turn agent loops. Opt in only on routes whose docs
+  support the top-level field. Azure breakpoint support is deployment-specific:
+  Standard pay-as-you-go supports breakpoints; PTU-M does not. Before GPT-5.6,
+  Azure does not support `prompt_cache_options`/breakpoints. Keep cache mechanism
+  rows scoped to the exact API/model/deployment; split rows when deployment
+  tiers differ, and never infer support from an arbitrary deployment name.
   Prefix hygiene (author guidance, no new mechanism): caching is a prefix
   match, so keep the contract tool declaration order stable and `[llm].system`
   templates free of per-run values (timestamps, UUIDs, run IDs). qcg emits
@@ -185,30 +188,37 @@ Fields:
   mechanism (never inferred from the model-name string). API compatibility is
   enforced: `retention_24h` is valid for `chat_completions` and `responses`
   only (older OpenAI/Azure models, emitting `prompt_cache_retention: "24h"`);
+  OpenAI older-model availability/defaults can depend on model and organization
+  (including Zero Data Retention); qcg does not discover this, so declare only
+  the exact route/org mechanism supported by its official documentation.
   `ttl_12h` is valid for `responses` only (OpenAI GPT-5.6+, emitting
   `prompt_cache_options: {"ttl": "12h"}`); `ttl_1h` is valid for
   `anthropic_messages` only (adding `cache_control: {"ttl": "1h"}` to every
   cache marker the row emits, system and top-level automatic markers). Setting
   `prompt_cache_retention` requires `capabilities.prompt_cache` on the
-  effective row/model. Azure newer models support only
-  `prompt_cache_options.ttl: "30m"`, which is not an extended-retention choice:
-  do not declare an `extended` mechanism for them. These values are cache
-  lifetime/retention controls, not data-retention policies or guarantees of
-  provider-data deletion. See OpenAI
+  effective row/model. Azure GPT-5.6+ supports only
+  `prompt_cache_options.ttl: "30m"`, not an `extended` tier; older Azure models
+  use the separate `prompt_cache_retention` control. These are cache-lifetime
+  controls, not data-retention policies or deletion guarantees. Official
+  documentation checked 2026-10-24 UTC: OpenAI's GPT-5.6+ Responses and
+  earlier-model prompt-caching material; Azure's GPT-5.6+ and deployment-tier
+  material; Anthropic's automatic/explicit caching, TTL and usage material:
+  OpenAI
   https://developers.openai.com/api/docs/guides/prompt-caching, Azure
-  https://learn.microsoft.com/en-us/azure/ai-foundry/openai/how-to/prompt-caching,
-  Anthropic https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching.
-- `prompt_cache_explicit_mode`: when `true`, the row/model honors
-  `cache_write_policy = "forbid"` via `prompt_cache_options: {"mode":
-  "explicit"}` with no qcg explicit breakpoints (so no cache read/write).
-  Valid for `chat_completions` and `responses` only (OpenAI/Azure routes whose
-  API/model explicitly supports the mode). A `[[provider.models]]` entry may
-  override the row per model. Anthropic Messages needs no declaration: `forbid`
-  is honored by omitting every explicit and top-level automatic marker.
-  Unsupported explicit `forbid` fails before network dispatch on every route,
-  including each fallback. Explicit advanced cache policies on `system_one`
-  rows fail before dispatch rather than being ignored; `llm.decide` rejects any
-  non-default cache policy before dispatch.
+  https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/prompt-caching,
+  Anthropic https://platform.claude.com/docs/en/build-with-claude/prompt-caching.
+- `prompt_cache_explicit_mode`: when `true`, the row/model claims that the exact
+  API/model/deployment disables reads and writes with
+  `prompt_cache_options: {"mode": "explicit"}` and no qcg breakpoints. OpenAI
+  documents this for GPT-5.6+ Responses; do not infer it for Chat Completions.
+  Azure documents no-breakpoint explicit mode for GPT-5.6+; use it only on the
+  exact API/model/deployment covered. Its separate breakpoint support is
+  Standard pay-as-you-go only, not PTU-M; do not infer either declaration
+  across mixed deployment tiers.
+  Anthropic Messages rejects `forbid`: caching may occur during thinking/tool
+  continuations or on server-tool results even without markers. Unsupported
+  explicit `forbid` fails before dispatch on every route/fallback;
+  `system_one` and `llm.decide` also reject non-default cache policies.
 - `capabilities`: advertised support for `tool_use`, `json_schema`,
   `structured_output_with_tools`, `seed`, `image_input`, `audio_input`,
   `file_input`, `streaming`, `temperature`, `top_p`, `stop_sequences`,
@@ -1196,14 +1206,15 @@ and prices must be rechecked when changing the configuration.
 reports total Chat `prompt_tokens` or Responses `input_tokens`, with
 `cached_tokens` and (when supplied) `cache_write_tokens` as disjoint subsets.
 qcg preserves the inclusive total and records reads as `cached_input` and
-writes as `cache_creation_input`. [Anthropic prompt caching](https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching)
+writes as `cache_creation_input`. [Anthropic prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
 reports disjoint `input_tokens`, `cache_read_input_tokens`, and
 `cache_creation_input_tokens`. qcg sums them as total `input` and retains both
-cache buckets. Streaming uses the same normalization; cumulative delta counters
-replace earlier counters.
+cache buckets. Anthropic can also report TTL-specific 5m/1h write subcounters;
+qcg currently consumes the aggregate only. Streaming uses the same normalization;
+cumulative delta counters replace earlier counters.
 Without explicit extended retention, Anthropic cache markers use the default
 five-minute lifetime. Default Anthropic writes cost 1.25x ordinary input;
-extended `ttl_1h` writes cost 2x. OpenAI GPT-5.6+ default 30-minute writes cost
+extended `ttl_1h` writes cost 2x. OpenAI GPT-5.6+ Responses default 30-minute writes cost
 1.25x ordinary input; Responses extended `ttl_12h` writes cost 2.5x. Default
 write rates remain supplied by the selected pricing row; qcg does not infer
 prices from model names or default markers. Older OpenAI/Azure
@@ -1213,11 +1224,14 @@ When `cache_retention = "extended"` requests `ttl_1h` or `ttl_12h`, the cost
 meter replaces only the `cache_creation_input` rate with the corresponding
 multiplier of the selected context tier's ordinary input rate. Read, ordinary
 input and output prices, usage normalization, and context-tier selection are
-unchanged. qcg prices the requested TTL rather than a response TTL breakdown:
-provider totals (especially Anthropic streaming usage) may omit that breakdown.
-Pre-call max-cost admission includes the multiplier at the dearest possible
-tier's input rate; if an ordinary input rate needed for a possible tier is
-unavailable, dispatch fails closed. This is still an estimated reservation,
+unchanged. qcg prices aggregate cache writes at the requested TTL multiplier,
+not provider-specific TTL subcounters; streaming usage may omit the breakdown.
+Anthropic may create default 5m writes during tool/thinking continuations even
+when qcg requested 1h markers, so extended write-cost estimates can differ from
+provider charges. Pre-call max-cost admission includes the multiplier at the
+dearest possible tier's input rate; if an ordinary input rate needed for a
+possible tier is unavailable, dispatch fails closed. This is still an
+estimated reservation,
 not a bound on provider spend or a redesign of fallback-route reservations.
 Missing optional counters are zero; present invalid counts, subset overflow,
 and cache sums exceeding total input fail closed instead of being clamped.

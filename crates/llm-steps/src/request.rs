@@ -32,71 +32,19 @@ pub(crate) fn build_request(
     prompt: String,
     response_schema: Option<Value>,
 ) -> Result<ChatRequest, StepError> {
-    let llm = ctx
-        .run
-        .contract
-        .manifest
-        .llm
-        .as_ref()
-        .ok_or_else(|| StepError::failed(&node.id, "[llm] is required"))?
-        .clone();
-    validate_cache_combo(node, &llm)?;
-    let params = llm_params(node)?;
-    let (llm, request, _) = resolve_llm_efforts(ctx, node, &llm, &params.request, None)?;
-    let policy = effective_request_policy_with_request(node, &llm, &request, None)?;
-    let (provider, model) = resolve_model(ctx, &llm, runtime, node)?;
-    validate_resolved_model(
-        runtime,
+    build_chat_request(
+        ctx,
         node,
-        &policy,
-        &provider,
-        &model,
-        response_schema.is_some(),
-        false,
-    )?;
-    let structured_output = resolve_structured_output_mode(
         runtime,
-        node,
-        &provider,
-        &model,
-        policy.structured_output,
-        response_schema.as_ref(),
-        false,
-    )?;
-    let system = ctx.render_inline(node, &system_prompt(&policy, FILL_SYSTEM_GUARDRAIL))?;
-    let system = structured_system_prompt(system, structured_output, response_schema.as_ref())?;
-    let seed = effective_seed(ctx, node, &policy)?;
-    Ok(ChatRequest {
-        provider,
-        model,
-        system: Some(system),
-        messages: vec![build_user_message(ctx, node, prompt)?],
-        tools: vec![],
-        response_schema,
-        structured_output,
-        temperature: policy.temperature,
-        top_p: policy.top_p,
-        max_tokens: policy.max_tokens,
-        stop_sequences: policy.stop_sequences,
-        seed,
-        reasoning_effort: policy.reasoning_effort,
-        tool_choice: policy.tool_choice,
-        parallel_tool_calls: policy.parallel_tool_calls,
-        verbosity: policy.verbosity,
-        stream: policy.stream,
-        prompt_cache: match llm.cache {
-            PromptCachePolicy::Auto => llm::PromptCache::Auto,
-            PromptCachePolicy::Off => llm::PromptCache::Off,
+        || Ok(vec![build_user_message(ctx, node, prompt)?]),
+        FILL_SYSTEM_GUARDRAIL,
+        MessageRequestOptions {
+            response_schema,
+            tools: &[],
+            model: None,
+            policy: None,
         },
-        cache_write: match llm.cache_write_policy {
-            CacheWritePolicy::Allow => llm::CacheWritePolicy::Allow,
-            CacheWritePolicy::Forbid => llm::CacheWritePolicy::Forbid,
-        },
-        cache_retention: llm
-            .cache_retention
-            .map(|CacheRetention::Extended| llm::CacheRetention::Extended),
-        provider_web_search: params.provider_web_search.clone(),
-    })
+    )
 }
 
 pub(crate) fn build_user_message(
@@ -220,6 +168,24 @@ pub(crate) fn build_request_with_messages(
     messages: Vec<ChatMessage>,
     options: MessageRequestOptions<'_>,
 ) -> Result<ChatRequest, StepError> {
+    build_chat_request(
+        ctx,
+        node,
+        runtime,
+        || Ok(messages),
+        AGENT_SYSTEM_GUARDRAIL,
+        options,
+    )
+}
+
+fn build_chat_request(
+    ctx: &StepContext<'_>,
+    node: &NodeDef,
+    runtime: &LlmRuntime,
+    messages: impl FnOnce() -> Result<Vec<ChatMessage>, StepError>,
+    guardrail: &str,
+    options: MessageRequestOptions<'_>,
+) -> Result<ChatRequest, StepError> {
     let MessageRequestOptions {
         response_schema,
         tools,
@@ -262,14 +228,14 @@ pub(crate) fn build_request_with_messages(
         response_schema.as_ref(),
         !tools.is_empty(),
     )?;
-    let system = ctx.render_inline(node, &system_prompt(&policy, AGENT_SYSTEM_GUARDRAIL))?;
+    let system = ctx.render_inline(node, &system_prompt(&policy, guardrail))?;
     let system = structured_system_prompt(system, structured_output, response_schema.as_ref())?;
     let seed = effective_seed(ctx, node, &policy)?;
     Ok(ChatRequest {
         provider,
         model,
         system: Some(system),
-        messages,
+        messages: messages()?,
         tools: tools.to_vec(),
         response_schema,
         structured_output,

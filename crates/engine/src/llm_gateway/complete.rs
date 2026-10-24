@@ -42,17 +42,21 @@ struct StreamAccumulator<'a> {
 
 impl Drop for DecisionReservationGuard {
     fn drop(&mut self) {
-        let mut map = reservations()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(entry) = map.get_mut(&self.run_id) {
-            entry.tokens = entry.tokens.saturating_sub(self.reservation.tokens);
-            entry.cost_microusd = entry
-                .cost_microusd
-                .saturating_sub(self.reservation.cost_microusd);
-            if entry.tokens == 0 && entry.cost_microusd == 0 {
-                map.remove(&self.run_id);
-            }
+        release_pending(&self.run_id, &self.reservation);
+    }
+}
+
+fn release_pending(run_id: &str, reservation: &PendingReservation) {
+    let mut map = reservations()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(entry) = map.get_mut(run_id) {
+        entry.tokens = entry.tokens.saturating_sub(reservation.tokens);
+        entry.cost_microusd = entry
+            .cost_microusd
+            .saturating_sub(reservation.cost_microusd);
+        if entry.tokens == 0 && entry.cost_microusd == 0 {
+            map.remove(run_id);
         }
     }
 }
@@ -237,72 +241,49 @@ impl<'a> LlmGateway<'a> {
         let tokens = input_est.saturating_add(max_output);
         let mut cost_microusd = 0_u64;
         if self.budget.max_cost_microusd.is_some() {
-            let route = self.selected_route(routes, &request.provider, &request.model);
-            match route {
-                Some(route) => {
-                    // The estimate cannot know which tier the request
-                    // reaches, so it reserves at the dearest rate any tier
-                    // names instead of at a tier it cannot prove.
-                    let mut rates = policy::max_cost_rates(&route.rates(), &route.cost_tiers);
-                    if let Some(multiplier) = self.cache_write_multiplier(
-                        &request.provider,
-                        &request.model,
-                        request.cache_retention,
-                    ) {
-                        // Every possible context tier needs an ordinary input
-                        // price. A cache price alone cannot price a TTL write;
-                        // max_cost_rates would otherwise hide an unpriced row.
-                        let base = route.rates();
-                        for tier in std::iter::once(None).chain(route.cost_tiers.iter().map(Some)) {
-                            let input = base.resolve(tier).input.ok_or_else(|| StepError::failed(
-                                &node.id,
-                                format!("model `{}/{}` lacks ordinary input pricing for extended cache TTL while budget.max_cost_usd is enforced; refusing blind spend", request.provider, request.model),
-                            ))?;
-                            if !input.is_finite()
-                                || input < 0.0
-                                || !(input * multiplier).is_finite()
-                            {
-                                return Err(StepError::failed(&node.id, "invalid model pricing"));
-                            }
-                        }
-                        rates.cache_creation = rates.input.map(|input| input * multiplier);
-                    }
-                    match (rates.max_input_rate(), rates.output) {
-                        (Some(input_rate), Some(output)) => {
-                            // The reservation cannot know how the prompt
-                            // splits into cached and uncached input, so it
-                            // reserves at the dearest rate the row names.
-                            if [input_rate, output]
-                                .into_iter()
-                                .any(|rate| !rate.is_finite() || rate < 0.0)
-                            {
-                                return Err(StepError::failed(&node.id, "invalid model pricing"));
-                            }
-                            cost_microusd = ((input_est as f64 * input_rate)
-                                + (max_output as f64 * output))
-                                .ceil() as u64;
-                        }
-                        _ => {
-                            return Err(StepError::failed(
-                                &node.id,
-                                format!(
-                                    "model `{}/{}` lacks pricing while budget.max_cost_usd is enforced; refusing blind spend",
-                                    request.provider, request.model
-                                ),
-                            ));
-                        }
+            let provider = &request.provider;
+            let model = &request.model;
+            let unpriced = |detail: &str| {
+                StepError::failed(
+                    &node.id,
+                    format!(
+                        "model `{provider}/{model}` {detail} while budget.max_cost_usd is enforced; refusing blind spend"
+                    ),
+                )
+            };
+            let route = self
+                .selected_route(routes, provider, model)
+                .ok_or_else(|| unpriced("has no priced entry"))?;
+            // Reserve at the dearest rate across all context tiers and
+            // input categories: neither tier nor cache split is known yet.
+            let mut rates = policy::max_cost_rates(&route.rates(), &route.cost_tiers);
+            if let Some(multiplier) =
+                self.cache_write_multiplier(provider, model, request.cache_retention)
+            {
+                // A cache price cannot price a TTL write. Require ordinary
+                // input pricing in every tier, not just the maximum row.
+                let base = route.rates();
+                for tier in std::iter::once(None).chain(route.cost_tiers.iter().map(Some)) {
+                    let input = base.resolve(tier).input.ok_or_else(|| {
+                        unpriced("lacks ordinary input pricing for extended cache TTL")
+                    })?;
+                    if !input.is_finite() || input < 0.0 || !(input * multiplier).is_finite() {
+                        return Err(StepError::failed(&node.id, "invalid model pricing"));
                     }
                 }
-                None => {
-                    return Err(StepError::failed(
-                        &node.id,
-                        format!(
-                            "model `{}/{}` has no priced entry while budget.max_cost_usd is enforced; refusing blind spend",
-                            request.provider, request.model
-                        ),
-                    ));
-                }
+                rates.cache_creation = rates.input.map(|input| input * multiplier);
             }
+            let (Some(input_rate), Some(output)) = (rates.max_input_rate(), rates.output) else {
+                return Err(unpriced("lacks pricing"));
+            };
+            if [input_rate, output]
+                .into_iter()
+                .any(|rate| !rate.is_finite() || rate < 0.0)
+            {
+                return Err(StepError::failed(&node.id, "invalid model pricing"));
+            }
+            cost_microusd =
+                ((input_est as f64 * input_rate) + (max_output as f64 * output)).ceil() as u64;
         }
         Ok(Some(PendingReservation {
             tokens,
@@ -331,24 +312,7 @@ impl<'a> LlmGateway<'a> {
         let projected_cost = spent_cost
             .saturating_add(entry.cost_microusd)
             .saturating_add(reservation.cost_microusd);
-        if let Some(limit) = self.budget.max_tokens
-            && projected_tokens > limit
-        {
-            return Err(StepError::BudgetExceeded {
-                resource: "tokens",
-                used: projected_tokens,
-                limit,
-            });
-        }
-        if let Some(limit) = self.budget.max_cost_microusd
-            && projected_cost > limit
-        {
-            return Err(StepError::BudgetExceeded {
-                resource: "cost_microusd",
-                used: projected_cost,
-                limit,
-            });
-        }
+        self.check_budget_values(projected_tokens, projected_cost)?;
         entry.tokens = entry.tokens.saturating_add(reservation.tokens);
         entry.cost_microusd = entry
             .cost_microusd
@@ -360,19 +324,7 @@ impl<'a> LlmGateway<'a> {
         let Some(reservation) = reservation else {
             return;
         };
-        let run_id = run_id_of(self.journal);
-        let mut map = reservations()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(entry) = map.get_mut(&run_id) {
-            entry.tokens = entry.tokens.saturating_sub(reservation.tokens);
-            entry.cost_microusd = entry
-                .cost_microusd
-                .saturating_sub(reservation.cost_microusd);
-            if entry.tokens == 0 && entry.cost_microusd == 0 {
-                map.remove(&run_id);
-            }
-        }
+        release_pending(&run_id_of(self.journal), &reservation);
     }
 
     async fn complete_inner<F>(
@@ -387,17 +339,6 @@ impl<'a> LlmGateway<'a> {
     {
         let provider_id = request.provider.clone();
         let model_id = request.model.clone();
-        let seed = request.seed;
-        let reasoning_effort = request.reasoning_effort;
-        let temperature = request.temperature;
-        let top_p = request.top_p;
-        let max_tokens = request.max_tokens;
-        let stop_sequences = request.stop_sequences.clone();
-        let structured_output = request.structured_output;
-        let tool_choice = request.tool_choice.clone();
-        let parallel_tool_calls = request.parallel_tool_calls;
-        let verbosity = request.verbosity;
-        let stream = request.stream;
         if routes
             .first()
             .is_none_or(|route| route.provider != provider_id || route.model != model_id)
@@ -408,7 +349,6 @@ impl<'a> LlmGateway<'a> {
             ));
         }
         let mut response = None;
-        let mut last_error = None;
         for (attempt, route) in routes.iter().enumerate() {
             let provider = &route.provider;
             let model = &route.model;
@@ -434,22 +374,14 @@ impl<'a> LlmGateway<'a> {
                     if error.kind == LlmErrorKind::Canceled {
                         return Err(StepError::Cancelled);
                     }
-                    if error.is_retryable() && attempt + 1 < routes.len() {
-                        last_error = Some(error);
-                    } else {
+                    if !error.is_retryable() || attempt + 1 == routes.len() {
                         return Err(error).step_err(&node.id);
                     }
                 }
             }
         }
-        let (provider_id, model_id, response) = response.ok_or_else(|| {
-            StepError::failed(
-                &node.id,
-                last_error
-                    .map(|error| error.to_string())
-                    .unwrap_or_else(|| "no LLM route was available".into()),
-            )
-        })?;
+        let (provider_id, model_id, response) =
+            response.ok_or_else(|| StepError::failed(&node.id, "no LLM route was available"))?;
         if response.stop != llm::StopReason::ModelContextWindowExceeded {
             self.scan_response(node, &response)?;
         }
@@ -469,17 +401,17 @@ impl<'a> LlmGateway<'a> {
             "node": node.id,
             "provider": provider_id,
             "model": model_id,
-            "seed": seed,
-            "reasoning_effort": reasoning_effort,
-            "temperature": temperature,
-            "top_p": top_p,
-            "max_tokens": max_tokens,
-            "stop_sequences": stop_sequences,
-            "structured_output": structured_output,
-            "tool_choice": tool_choice,
-            "parallel_tool_calls": parallel_tool_calls,
-            "verbosity": verbosity,
-            "stream": stream,
+            "seed": request.seed,
+            "reasoning_effort": request.reasoning_effort,
+            "temperature": request.temperature,
+            "top_p": request.top_p,
+            "max_tokens": request.max_tokens,
+            "stop_sequences": request.stop_sequences,
+            "structured_output": request.structured_output,
+            "tool_choice": request.tool_choice,
+            "parallel_tool_calls": request.parallel_tool_calls,
+            "verbosity": request.verbosity,
+            "stream": request.stream,
             "tokens": usage,
             "stop_reason": response.stop,
             "cost_microusd": cost_microusd,
@@ -525,23 +457,23 @@ impl<'a> LlmGateway<'a> {
             .budget
             .tokens_input
             .saturating_add(state.budget.tokens_output);
-        if let Some(limit) = self.budget.max_tokens
-            && used > limit
-        {
-            return Err(StepError::BudgetExceeded {
-                resource: "tokens",
-                used,
-                limit,
-            });
-        }
-        if let Some(limit) = self.budget.max_cost_microusd
-            && state.budget.cost_microusd > limit
-        {
-            return Err(StepError::BudgetExceeded {
-                resource: "cost_microusd",
-                used: state.budget.cost_microusd,
-                limit,
-            });
+        self.check_budget_values(used, state.budget.cost_microusd)
+    }
+
+    fn check_budget_values(&self, tokens: u64, cost: u64) -> Result<(), StepError> {
+        for (resource, used, limit) in [
+            ("tokens", tokens, self.budget.max_tokens),
+            ("cost_microusd", cost, self.budget.max_cost_microusd),
+        ] {
+            if let Some(limit) = limit
+                && used > limit
+            {
+                return Err(StepError::BudgetExceeded {
+                    resource,
+                    used,
+                    limit,
+                });
+            }
         }
         Ok(())
     }

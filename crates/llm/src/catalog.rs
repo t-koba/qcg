@@ -98,10 +98,7 @@ impl CatalogConfig {
         }
         for source in &self.source {
             match (&source.url, &source.file) {
-                (Some(_), Some(_)) => {
-                    return Err("[catalog.source] must declare exactly one of url or file".into());
-                }
-                (None, None) => {
+                (Some(_), Some(_)) | (None, None) => {
                     return Err("[catalog.source] must declare exactly one of url or file".into());
                 }
                 (Some(url), None) => {
@@ -876,15 +873,7 @@ fn fake_provider_view() -> CatalogProviderView {
             enabled: true,
             source: "built-in".to_string(),
             capabilities: FakeLlmProvider.capabilities(),
-            reasoning_effort: vec![
-                ReasoningEffort::None,
-                ReasoningEffort::Minimal,
-                ReasoningEffort::Low,
-                ReasoningEffort::Medium,
-                ReasoningEffort::High,
-                ReasoningEffort::Xhigh,
-                ReasoningEffort::Max,
-            ],
+            reasoning_effort: FakeLlmProvider.capabilities().reasoning_effort,
             input_cost_per_million_usd: None,
             cache_creation_input_cost_per_million_usd: None,
             cache_read_input_cost_per_million_usd: None,
@@ -952,15 +941,7 @@ fn merge_model(base: &ModelSpec, over: &ModelSpec) -> ModelSpec {
         // otherwise the external tiers are inherited, with the registry's
         // pinned rates carried into them as a contract pin does.
         cost_tiers: if over.cost_tiers.is_empty() {
-            policy::carry_pinned_rates(
-                &base.cost_tiers,
-                &policy::CostRates {
-                    input: over.input_cost_per_million_usd,
-                    cache_read: over.cache_read_input_cost_per_million_usd,
-                    cache_creation: over.cache_creation_input_cost_per_million_usd,
-                    output: over.output_cost_per_million_usd,
-                },
-            )
+            policy::carry_pinned_rates(&base.cost_tiers, &over.rates())
         } else {
             over.cost_tiers.clone()
         },

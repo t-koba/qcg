@@ -5,8 +5,7 @@ use llm::{CacheRetention, PromptCacheRetention, TokenUsage};
 use super::types::LlmGateway;
 
 impl<'a> LlmGateway<'a> {
-    /// Price the requested TTL, because usage (notably streaming usage) may
-    /// report only the total cache creation tokens, without a TTL breakdown.
+    /// Price the requested TTL; streaming usage may omit its breakdown.
     pub(super) fn cache_write_multiplier(
         &self,
         provider: &str,
@@ -117,14 +116,13 @@ impl<'a> LlmGateway<'a> {
         let input = rates.input.unwrap_or_default();
         let output = rates.output.unwrap_or_default();
         let read = rates.cache_read.unwrap_or_default();
-        // Extended TTL writes replace only the creation rate, using the
-        // selected context tier's ordinary input price, not its default
-        // cache-write price. Other categories and 24h retention stay intact.
-        let creation = match self.cache_write_multiplier(provider, model, retention) {
-            Some(multiplier) => rates.input.map(|rate| rate * multiplier),
-            None => rates.cache_creation,
-        }
-        .unwrap_or_default();
+        // Extended TTL uses the tier's input rate, never the cache-write rate.
+        let creation = self
+            .cache_write_multiplier(provider, model, retention)
+            .map_or(rates.cache_creation, |factor| {
+                rates.input.map(|rate| rate * factor)
+            })
+            .unwrap_or_default();
         if [input, output, read, creation]
             .into_iter()
             .any(|rate| !rate.is_finite() || rate < 0.0)

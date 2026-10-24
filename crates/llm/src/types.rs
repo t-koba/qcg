@@ -126,47 +126,27 @@ impl ChatMessage {
     }
 
     pub fn assistant_tool_calls(content: impl Into<String>, tool_calls: Vec<ChatToolCall>) -> Self {
-        Self {
-            role: "assistant".into(),
-            content: content.into(),
-            parts: vec![],
-            tool_calls,
-            tool_call_id: None,
-            provider_state: None,
-        }
+        let mut message = Self::text("assistant", content);
+        message.tool_calls = tool_calls;
+        message
     }
 
     pub fn tool_result(id: impl Into<String>, content: impl Into<String>) -> Self {
-        Self {
-            role: "tool".into(),
-            content: content.into(),
-            parts: vec![],
-            tool_calls: vec![],
-            tool_call_id: Some(id.into()),
-            provider_state: None,
-        }
+        let mut message = Self::text("tool", content);
+        message.tool_call_id = Some(id.into());
+        message
     }
 
     pub fn provider_state(items: Vec<Value>) -> Self {
-        Self {
-            role: "provider".into(),
-            content: String::new(),
-            parts: vec![],
-            tool_calls: vec![],
-            tool_call_id: None,
-            provider_state: Some(items),
-        }
+        let mut message = Self::text("provider", String::new());
+        message.provider_state = Some(items);
+        message
     }
 
     pub fn with_parts(role: impl Into<String>, parts: Vec<ChatContentPart>) -> Self {
-        Self {
-            role: role.into(),
-            content: String::new(),
-            parts,
-            tool_calls: vec![],
-            tool_call_id: None,
-            provider_state: None,
-        }
+        let mut message = Self::text(role, String::new());
+        message.parts = parts;
+        message
     }
 }
 

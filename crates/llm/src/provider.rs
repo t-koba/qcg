@@ -297,10 +297,8 @@ pub enum ModelsDiscovery {
 pub struct ModelPricing {
     pub input_cost_per_million_usd: Option<f64>,
     /// Cache creation input USD/1M; absent falls back to ordinary input.
-    #[serde(default)]
     pub cache_creation_input_cost_per_million_usd: Option<f64>,
     /// Cache read input USD/1M; absent falls back to ordinary input.
-    #[serde(default)]
     pub cache_read_input_cost_per_million_usd: Option<f64>,
     pub output_cost_per_million_usd: Option<f64>,
     /// Context tiers: the rates that apply to a whole request once its
@@ -323,24 +321,17 @@ impl ModelPricing {
 #[serde(deny_unknown_fields)]
 pub struct ModelSpec {
     pub id: String,
-    #[serde(default)]
     pub label: Option<String>,
     /// Full capability override for this model. When omitted the provider
     /// capabilities apply.
-    #[serde(default)]
     pub capabilities: Option<Capabilities>,
     /// Shorthand that overrides only the provider's `reasoning_effort` list.
-    #[serde(default)]
     pub reasoning_effort: Option<Vec<ReasoningEffort>>,
-    #[serde(default)]
     pub input_cost_per_million_usd: Option<f64>,
     /// Cache creation input USD/1M; absent falls back to ordinary input.
-    #[serde(default)]
     pub cache_creation_input_cost_per_million_usd: Option<f64>,
     /// Cache read input USD/1M; absent falls back to ordinary input.
-    #[serde(default)]
     pub cache_read_input_cost_per_million_usd: Option<f64>,
-    #[serde(default)]
     pub output_cost_per_million_usd: Option<f64>,
     /// Context tiers: the rates that apply to a whole request once its
     /// prompt input reaches a tier's threshold.
@@ -348,20 +339,15 @@ pub struct ModelSpec {
     pub cost_tiers: Vec<policy::CostTier>,
     /// Extended-retention mechanism for this model only. Overrides the
     /// provider row when set; `None` inherits the row value.
-    #[serde(default)]
     pub prompt_cache_retention: Option<PromptCacheRetention>,
     /// When true, this model honors a write-disable via
     /// `prompt_cache_options: {"mode": "explicit"}` with no qcg explicit
     /// breakpoints (so no cache read/write). Overrides the provider row.
-    #[serde(default)]
     pub prompt_cache_explicit_mode: Option<bool>,
-    #[serde(default)]
     pub context_tokens: Option<u64>,
-    #[serde(default)]
     pub max_output_tokens: Option<u64>,
     /// Disabled models stay usable by pinned contracts but are hidden from
     /// the selectable catalog. `None` means enabled.
-    #[serde(default)]
     pub enabled: Option<bool>,
 }
 
@@ -381,6 +367,15 @@ impl ModelSpec {
         effective
     }
 
+    pub(crate) fn rates(&self) -> policy::CostRates {
+        policy::CostRates {
+            input: self.input_cost_per_million_usd,
+            cache_read: self.cache_read_input_cost_per_million_usd,
+            cache_creation: self.cache_creation_input_cost_per_million_usd,
+            output: self.output_cost_per_million_usd,
+        }
+    }
+
     pub fn pricing(&self) -> Option<ModelPricing> {
         let pricing = ModelPricing {
             input_cost_per_million_usd: self.input_cost_per_million_usd,
@@ -394,6 +389,8 @@ impl ModelSpec {
     }
 
     pub(crate) fn validate(&self, provider: &str, api: ApiFlavor) -> Result<(), String> {
+        let invalid =
+            |message: &str| format!("provider `{provider}` model `{}` {message}", self.id);
         if self.id.trim().is_empty() || self.id.chars().any(char::is_control) {
             return Err(format!(
                 "provider `{provider}` has a model with an empty or invalid id"
@@ -403,56 +400,30 @@ impl ModelSpec {
             validate_capabilities_for_api(provider, api, capabilities)
                 .map_err(|error| format!("model `{}`: {error}", self.id))?;
         }
-        for (field, value) in [
-            (
-                "input_cost_per_million_usd",
-                self.input_cost_per_million_usd,
-            ),
-            (
-                "cache_read_input_cost_per_million_usd",
-                self.cache_read_input_cost_per_million_usd,
-            ),
-            (
-                "cache_creation_input_cost_per_million_usd",
-                self.cache_creation_input_cost_per_million_usd,
-            ),
-            (
-                "output_cost_per_million_usd",
-                self.output_cost_per_million_usd,
-            ),
-        ] {
-            if value.is_some_and(|value| !value.is_finite() || value < 0.0) {
-                return Err(format!(
-                    "provider `{provider}` model `{}` {field} must be finite and non-negative",
-                    self.id
-                ));
-            }
+        if let Some(field) = self.rates().invalid_rate() {
+            return Err(invalid(&format!("{field} must be finite and non-negative")));
         }
-        if let Err(error) = policy::validate_cost_tiers(&self.cost_tiers) {
-            return Err(format!("provider `{provider}` model `{}` {error}", self.id));
-        }
+        policy::validate_cost_tiers(&self.cost_tiers)
+            .map_err(|error| invalid(&error.to_string()))?;
         if let Some(retention) = self.prompt_cache_retention {
             if !retention.supports_api(api) {
-                return Err(format!(
-                    "provider `{provider}` model `{}` has a `prompt_cache_retention` that is not valid for its api",
-                    self.id
+                return Err(invalid(
+                    "has a `prompt_cache_retention` that is not valid for its api",
                 ));
             }
             if let Some(capabilities) = &self.capabilities
                 && !capabilities.prompt_cache
             {
-                return Err(format!(
-                    "provider `{provider}` model `{}` may only set `prompt_cache_retention` when prompt caching is enabled",
-                    self.id
+                return Err(invalid(
+                    "may only set `prompt_cache_retention` when prompt caching is enabled",
                 ));
             }
         }
         if self.prompt_cache_explicit_mode == Some(true)
             && !matches!(api, ApiFlavor::ChatCompletions | ApiFlavor::Responses)
         {
-            return Err(format!(
-                "provider `{provider}` model `{}` may only set `prompt_cache_explicit_mode` for chat_completions or responses",
-                self.id
+            return Err(invalid(
+                "may only set `prompt_cache_explicit_mode` for chat_completions or responses",
             ));
         }
         for (field, value) in [
@@ -460,19 +431,15 @@ impl ModelSpec {
             ("max_output_tokens", self.max_output_tokens),
         ] {
             if value == Some(0) {
-                return Err(format!(
-                    "provider `{provider}` model `{}` {field} must be greater than zero",
-                    self.id
-                ));
+                return Err(invalid(&format!("{field} must be greater than zero")));
             }
         }
         if let Some(efforts) = &self.reasoning_effort {
             for (index, effort) in efforts.iter().enumerate() {
                 if efforts[index + 1..].contains(effort) {
-                    return Err(format!(
-                        "provider `{provider}` model `{}` advertises duplicate reasoning_effort `{effort}`",
-                        self.id
-                    ));
+                    return Err(invalid(&format!(
+                        "advertises duplicate reasoning_effort `{effort}`"
+                    )));
                 }
             }
         }
@@ -485,58 +452,41 @@ impl ModelSpec {
 pub struct ProviderSpec {
     pub id: String,
     pub api: ApiFlavor,
-    #[serde(default)]
     pub base_url: Option<String>,
-    #[serde(default)]
     pub base_url_env: Option<String>,
-    #[serde(default)]
     pub api_key_env: Option<String>,
-    #[serde(default)]
     pub api_key_file_env: Option<String>,
-    #[serde(default)]
     pub auth_header: Option<String>,
     #[serde(default)]
     pub capabilities: Capabilities,
     #[serde(default)]
     pub models: Vec<ModelSpec>,
-    #[serde(default)]
     pub models_discovery: Option<ModelsDiscovery>,
     /// External catalog provider key (for example a models.dev provider id).
-    #[serde(default)]
     pub catalog_id: Option<String>,
-    #[serde(default)]
     pub path_template: Option<String>,
     #[serde(default)]
     pub query: BTreeMap<String, String>,
-    #[serde(default)]
     pub timeout_seconds: Option<u64>,
     /// Retry attempts per completion call, including the first (default 3).
-    #[serde(default)]
     pub retry_attempts: Option<usize>,
     /// Base backoff between retries in milliseconds (default 200, exponential).
-    #[serde(default)]
     pub retry_base_backoff_ms: Option<u64>,
     /// Retry attempts for a stream that failed before delivering any event.
-    #[serde(default)]
     pub stream_retry_attempts: Option<u32>,
     /// Minimum wait per rate-limited (429) or empty-response retry attempt in
     /// milliseconds (default 5000, multiplied by the attempt number). `0`
     /// disables the floor.
-    #[serde(default)]
     pub retry_rate_limit_floor_ms: Option<u64>,
     /// Cap on the exponential retry-backoff exponent (default 8).
-    #[serde(default)]
     pub retry_backoff_exponent_cap: Option<u32>,
-    #[serde(default)]
     pub chat_token_limit_field: Option<ChatTokenLimitField>,
     /// How `[llm].cache = "auto"` is expressed for this row. Required when
     /// the `prompt_cache` capability is enabled and invalid otherwise.
-    #[serde(default)]
     pub prompt_cache_field: Option<PromptCacheField>,
     /// Extended-retention mechanism for the `extended` tier on this row.
     /// Model entries may override per model. A provider-level value is an
     /// operator claim that every model on the row honors the mechanism.
-    #[serde(default)]
     pub prompt_cache_retention: Option<PromptCacheRetention>,
     /// When true, models on this row honor `cache_write_policy = "forbid"`
     /// via `prompt_cache_options: {"mode": "explicit"}` with no qcg
@@ -560,15 +510,10 @@ pub struct ProviderSpec {
     pub decision_model_in_body: bool,
     #[serde(default)]
     pub decision_response_wrapper: DecisionResponseWrapper,
-    #[serde(default)]
     pub response_body_limit_bytes: Option<usize>,
-    #[serde(default)]
     pub max_concurrency: Option<usize>,
-    #[serde(default)]
     pub requests_per_minute: Option<usize>,
-    #[serde(default)]
     pub circuit_breaker_failures: Option<usize>,
-    #[serde(default)]
     pub circuit_breaker_cooldown_seconds: Option<u64>,
 }
 
@@ -576,6 +521,7 @@ const MAX_STREAM_RETRY_ATTEMPTS: u32 = 3;
 
 impl ProviderSpec {
     pub(crate) fn validate(&self) -> Result<(), String> {
+        let invalid = |message: &str| format!("provider `{}` {message}", self.id);
         if !is_provider_id(&self.id) {
             return Err(format!(
                 "provider id `{}` must contain only lowercase ASCII letters, digits, `.`, `_`, or `-`",
@@ -586,26 +532,19 @@ impl ProviderSpec {
             return Err("provider id `fake` is reserved for the built-in provider".into());
         }
         if self.base_url.is_none() && self.base_url_env.is_none() {
-            return Err(format!(
-                "provider `{}` must declare `base_url` or `base_url_env`",
-                self.id
-            ));
+            return Err(invalid("must declare `base_url` or `base_url_env`"));
         }
         for (field, value) in [
             ("api_key_env", self.api_key_env.as_deref()),
             ("api_key_file_env", self.api_key_file_env.as_deref()),
         ] {
             if value.is_some_and(str::is_empty) {
-                return Err(format!(
-                    "provider `{}` declares an empty `{field}`",
-                    self.id
-                ));
+                return Err(invalid(&format!("declares an empty `{field}`")));
             }
         }
         if self.api_key_env.is_some() && self.api_key_file_env.is_some() {
-            return Err(format!(
-                "provider `{}` must declare at most one of api_key_env or api_key_file_env",
-                self.id
+            return Err(invalid(
+                "must declare at most one of api_key_env or api_key_file_env",
             ));
         }
         let has_credential = self.api_key_env.is_some() || self.api_key_file_env.is_some();
@@ -614,18 +553,14 @@ impl ProviderSpec {
             .as_deref()
             .or(self.api_key_file_env.as_deref());
         if self.auth_header.is_some() && !has_credential {
-            return Err(format!(
-                "provider `{}` may not set `auth_header` without a credential source",
-                self.id
+            return Err(invalid(
+                "may not set `auth_header` without a credential source",
             ));
         }
         if let Some(header) = self.auth_header.as_deref()
             && reqwest::header::HeaderName::from_bytes(header.as_bytes()).is_err()
         {
-            return Err(format!(
-                "provider `{}` has an invalid auth_header `{header}`",
-                self.id
-            ));
+            return Err(invalid(&format!("has an invalid auth_header `{header}`")));
         }
         if let Some(path) = self.path_template.as_deref() {
             if (path.contains('{') && !path.contains("{model}"))
@@ -634,72 +569,53 @@ impl ProviderSpec {
                     .chars()
                     .any(|character| matches!(character, '{' | '}'))
             {
-                return Err(format!(
-                    "provider `{}` path_template contains an unknown placeholder",
-                    self.id
-                ));
+                return Err(invalid("path_template contains an unknown placeholder"));
             }
             if path
                 .trim_matches('/')
                 .split('/')
                 .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
             {
-                return Err(format!(
-                    "provider `{}` path_template must contain safe non-empty path segments",
-                    self.id
+                return Err(invalid(
+                    "path_template must contain safe non-empty path segments",
                 ));
             }
         }
         if self.query.keys().any(String::is_empty) {
-            return Err(format!(
-                "provider `{}` query parameter names must not be empty",
-                self.id
-            ));
+            return Err(invalid("query parameter names must not be empty"));
         }
-        match self.retry_attempts {
-            Some(attempts) if !(1..=10).contains(&attempts) => {
-                return Err(format!(
-                    "provider `{}` retry_attempts must be between 1 and 10",
-                    self.id
-                ));
-            }
-            _ => {}
+        if let Some(attempts) = self.retry_attempts
+            && !(1..=10).contains(&attempts)
+        {
+            return Err(invalid("retry_attempts must be between 1 and 10"));
         }
         if self
             .retry_base_backoff_ms
             .is_some_and(|backoff| backoff > 60_000)
         {
-            return Err(format!(
-                "provider `{}` retry_base_backoff_ms must not exceed 60000",
-                self.id
-            ));
+            return Err(invalid("retry_base_backoff_ms must not exceed 60000"));
         }
-        match self.stream_retry_attempts {
-            Some(attempts) if attempts > MAX_STREAM_RETRY_ATTEMPTS => {
-                return Err(format!(
-                    "provider `{}` stream_retry_attempts must be between 0 and {MAX_STREAM_RETRY_ATTEMPTS}",
-                    self.id
-                ));
-            }
-            _ => {}
+        if let Some(attempts) = self.stream_retry_attempts
+            && attempts > MAX_STREAM_RETRY_ATTEMPTS
+        {
+            return Err(invalid(
+                "stream_retry_attempts must be between 0 and {MAX_STREAM_RETRY_ATTEMPTS}",
+            ));
         }
         if self
             .retry_rate_limit_floor_ms
             .is_some_and(|floor| floor > 60_000)
         {
-            return Err(format!(
-                "provider `{}` retry_rate_limit_floor_ms must be between 0 and 60000",
-                self.id
+            return Err(invalid(
+                "retry_rate_limit_floor_ms must be between 0 and 60000",
             ));
         }
-        match self.retry_backoff_exponent_cap {
-            Some(cap) if !(1..=16).contains(&cap) => {
-                return Err(format!(
-                    "provider `{}` retry_backoff_exponent_cap must be between 1 and 16",
-                    self.id
-                ));
-            }
-            _ => {}
+        if let Some(cap) = self.retry_backoff_exponent_cap
+            && !(1..=16).contains(&cap)
+        {
+            return Err(invalid(
+                "retry_backoff_exponent_cap must be between 1 and 16",
+            ));
         }
         for (field, name) in [
             ("base_url_env", self.base_url_env.as_deref()),
@@ -709,22 +625,17 @@ impl ProviderSpec {
             if let Some(name) = name
                 && !is_env_name(name)
             {
-                return Err(format!(
-                    "provider `{}` has an invalid `{field}` environment variable name `{name}`",
-                    self.id
-                ));
+                return Err(invalid(&format!(
+                    "has an invalid `{field}` environment variable name `{name}`"
+                )));
             }
         }
         if self.timeout_seconds == Some(0) {
-            return Err(format!(
-                "provider `{}` timeout_seconds must be greater than zero",
-                self.id
-            ));
+            return Err(invalid("timeout_seconds must be greater than zero"));
         }
         if self.response_body_limit_bytes == Some(0) {
-            return Err(format!(
-                "provider `{}` response_body_limit_bytes must be greater than zero",
-                self.id
+            return Err(invalid(
+                "response_body_limit_bytes must be greater than zero",
             ));
         }
         for (field, value) in [
@@ -733,30 +644,18 @@ impl ProviderSpec {
             ("circuit_breaker_failures", self.circuit_breaker_failures),
         ] {
             if value == Some(0) {
-                return Err(format!(
-                    "provider `{}` {field} must be greater than zero",
-                    self.id
-                ));
+                return Err(invalid(&format!("{field} must be greater than zero")));
             }
         }
         if self.circuit_breaker_cooldown_seconds == Some(0) {
-            return Err(format!(
-                "provider `{}` circuit_breaker_cooldown_seconds must be greater than zero",
-                self.id
+            return Err(invalid(
+                "circuit_breaker_cooldown_seconds must be greater than zero",
             ));
-        }
-        if self.api == ApiFlavor::SystemOne
-            && serde_json::to_value(&self.capabilities).map_err(|error| error.to_string())?
-                != serde_json::to_value(Capabilities::default())
-                    .map_err(|error| error.to_string())?
-        {
-            return Err("system_one may not advertise chat capabilities".into());
         }
         validate_capabilities_for_api(&self.id, self.api, &self.capabilities)?;
         if self.chat_token_limit_field.is_some() && self.api != ApiFlavor::ChatCompletions {
-            return Err(format!(
-                "provider `{}` may only set `chat_token_limit_field` for chat_completions",
-                self.id
+            return Err(invalid(
+                "may only set `chat_token_limit_field` for chat_completions",
             ));
         }
         let decision_transport_is_default = self.decision_input_wrapper
@@ -764,9 +663,8 @@ impl ProviderSpec {
             && self.decision_model_in_body
             && self.decision_response_wrapper == DecisionResponseWrapper::Auto;
         if self.api != ApiFlavor::SystemOne && !decision_transport_is_default {
-            return Err(format!(
-                "provider `{}` may only set `decision_input_wrapper`, `decision_model_in_body`, or `decision_response_wrapper` for system_one",
-                self.id
+            return Err(invalid(
+                "may only set `decision_input_wrapper`, `decision_model_in_body`, or `decision_response_wrapper` for system_one",
             ));
         }
         if self.api == ApiFlavor::SystemOne && !self.decision_model_in_body {
@@ -775,23 +673,20 @@ impl ProviderSpec {
                 .as_deref()
                 .is_some_and(|template| template.contains("{model}"));
             if !carries_model {
-                return Err(format!(
-                    "provider `{}` with `decision_model_in_body = false` must set `path_template` containing `{{model}}`",
-                    self.id
+                return Err(invalid(
+                    "with `decision_model_in_body = false` must set `path_template` containing `{model}`",
                 ));
             }
         }
         match (self.capabilities.prompt_cache, self.prompt_cache_field) {
             (true, None) => {
-                return Err(format!(
-                    "provider `{}` must set `prompt_cache_field` when `capabilities.prompt_cache` is enabled",
-                    self.id
+                return Err(invalid(
+                    "must set `prompt_cache_field` when `capabilities.prompt_cache` is enabled",
                 ));
             }
             (false, Some(_)) => {
-                return Err(format!(
-                    "provider `{}` may only set `prompt_cache_field` when `capabilities.prompt_cache` is enabled",
-                    self.id
+                return Err(invalid(
+                    "may only set `prompt_cache_field` when `capabilities.prompt_cache` is enabled",
                 ));
             }
             (true, Some(field)) => {
@@ -806,9 +701,8 @@ impl ProviderSpec {
                     )
                 );
                 if !supported {
-                    return Err(format!(
-                        "provider `{}` has a `prompt_cache_field` that is not valid for its api",
-                        self.id
+                    return Err(invalid(
+                        "has a `prompt_cache_field` that is not valid for its api",
                     ));
                 }
             }
@@ -817,35 +711,28 @@ impl ProviderSpec {
         if let Some(retention) = self.prompt_cache_retention
             && !retention.supports_api(self.api)
         {
-            return Err(format!(
-                "provider `{}` declares `prompt_cache_retention` that is not valid for its api",
-                self.id
+            return Err(invalid(
+                "declares `prompt_cache_retention` that is not valid for its api",
             ));
         }
-        if let Some(retention) = self.prompt_cache_retention
-            && !self.capabilities.prompt_cache
-        {
-            let _ = retention;
-            return Err(format!(
-                "provider `{}` may only set `prompt_cache_retention` when `capabilities.prompt_cache` is enabled",
-                self.id
+        if self.prompt_cache_retention.is_some() && !self.capabilities.prompt_cache {
+            return Err(invalid(
+                "may only set `prompt_cache_retention` when `capabilities.prompt_cache` is enabled",
             ));
         }
         if self.prompt_cache_explicit_mode
             && !matches!(self.api, ApiFlavor::ChatCompletions | ApiFlavor::Responses)
         {
-            return Err(format!(
-                "provider `{}` may only set `prompt_cache_explicit_mode` for chat_completions or responses",
-                self.id
+            return Err(invalid(
+                "may only set `prompt_cache_explicit_mode` for chat_completions or responses",
             ));
         }
         if self.api == ApiFlavor::ChatCompletions
             && !self.capabilities.reasoning_effort.is_empty()
             && self.chat_token_limit_field != Some(ChatTokenLimitField::MaxCompletionTokens)
         {
-            return Err(format!(
-                "provider `{}` must set `chat_token_limit_field = \"max_completion_tokens\"` when reasoning_effort is enabled",
-                self.id
+            return Err(invalid(
+                "must set `chat_token_limit_field = \"max_completion_tokens\"` when reasoning_effort is enabled",
             ));
         }
         let mut model_ids = BTreeMap::new();
@@ -877,33 +764,27 @@ impl ProviderSpec {
                     .is_empty()
             })
         {
-            return Err(format!(
-                "provider `{}` must set `chat_token_limit_field = \"max_completion_tokens\"` when a declared model advertises reasoning_effort",
-                self.id
+            return Err(invalid(
+                "must set `chat_token_limit_field = \"max_completion_tokens\"` when a declared model advertises reasoning_effort",
             ));
         }
         if let Some(catalog_id) = self.catalog_id.as_deref()
             && (catalog_id.trim().is_empty() || catalog_id.chars().any(char::is_control))
         {
-            return Err(format!(
-                "provider `{}` catalog_id must be a non-empty identifier",
-                self.id
-            ));
+            return Err(invalid("catalog_id must be a non-empty identifier"));
         }
         if let Some(base_url) = self.base_url.as_deref() {
             if let Some(name) = credential_placeholder(base_url, credential_source_env) {
-                return Err(format!(
-                    "provider `{}` base_url must not interpolate credential environment variable `{name}`",
-                    self.id
-                ));
+                return Err(invalid(&format!(
+                    "base_url must not interpolate credential environment variable `{name}`"
+                )));
             }
             let validation_url = normalize_url_placeholders(base_url);
-            validate_base_url(&validation_url, has_credential).map_err(|error| {
-                format!("provider `{}` has an invalid `base_url`: {error}", self.id)
-            })?;
+            validate_base_url(&validation_url, has_credential)
+                .map_err(|error| invalid(&format!("has an invalid `base_url`: {error}")))?;
         }
         validate_query_parameters(&self.query, credential_source_env)
-            .map_err(|error| format!("provider `{}` has an invalid `query`: {error}", self.id))?;
+            .map_err(|error| invalid(&format!("has an invalid `query`: {error}")))?;
         Ok(())
     }
 
@@ -938,12 +819,9 @@ impl ProviderSpec {
     /// Effective write-disable mechanism for one model: the model entry
     /// overrides the row when set, otherwise the row value applies.
     pub fn explicit_mode_for_model(&self, id: &str) -> bool {
-        match self.model(id) {
-            Some(model) => model
-                .prompt_cache_explicit_mode
-                .unwrap_or(self.prompt_cache_explicit_mode),
-            None => self.prompt_cache_explicit_mode,
-        }
+        self.model(id)
+            .and_then(|model| model.prompt_cache_explicit_mode)
+            .unwrap_or(self.prompt_cache_explicit_mode)
     }
 }
 
@@ -955,6 +833,7 @@ fn validate_capabilities_for_api(
     api: ApiFlavor,
     capabilities: &Capabilities,
 ) -> Result<(), String> {
+    let invalid = |message: &str| format!("provider `{provider}` {message}");
     if api == ApiFlavor::SystemOne
         && serde_json::to_value(capabilities).map_err(|error| error.to_string())?
             != serde_json::to_value(Capabilities::default()).map_err(|error| error.to_string())?
@@ -962,38 +841,36 @@ fn validate_capabilities_for_api(
         return Err("system_one may not advertise chat capabilities".into());
     }
     if capabilities.seed && api != ApiFlavor::ChatCompletions {
-        return Err(format!(
-            "provider `{provider}` may only advertise `seed` for chat_completions"
-        ));
+        return Err(invalid("may only advertise `seed` for chat_completions"));
     }
     if !capabilities.reasoning_effort.is_empty() && api == ApiFlavor::AnthropicMessages {
-        return Err(format!(
-            "provider `{provider}` may not advertise OpenAI reasoning_effort for anthropic_messages"
+        return Err(invalid(
+            "may not advertise OpenAI reasoning_effort for anthropic_messages",
         ));
     }
     if capabilities.structured_output_with_tools && api == ApiFlavor::AnthropicMessages {
-        return Err(format!(
-            "provider `{provider}` may not advertise `structured_output_with_tools` for anthropic_messages because response must be selected exclusively"
+        return Err(invalid(
+            "may not advertise `structured_output_with_tools` for anthropic_messages because response must be selected exclusively",
         ));
     }
     if capabilities.stop_sequences && api == ApiFlavor::Responses {
-        return Err(format!(
-            "provider `{provider}` may not advertise `stop_sequences` for the Responses API"
+        return Err(invalid(
+            "may not advertise `stop_sequences` for the Responses API",
         ));
     }
     if capabilities.verbosity && api != ApiFlavor::Responses {
-        return Err(format!(
-            "provider `{provider}` may only advertise `verbosity` for the Responses API"
+        return Err(invalid(
+            "may only advertise `verbosity` for the Responses API",
         ));
     }
     if capabilities.web_search && api != ApiFlavor::Responses {
-        return Err(format!(
-            "provider `{provider}` may only advertise `web_search` for the Responses API"
+        return Err(invalid(
+            "may only advertise `web_search` for the Responses API",
         ));
     }
     if (capabilities.tool_choice || capabilities.parallel_tool_calls) && !capabilities.tool_use {
-        return Err(format!(
-            "provider `{provider}` may not advertise tool selection controls without `tool_use`"
+        return Err(invalid(
+            "may not advertise tool selection controls without `tool_use`",
         ));
     }
     for (index, effort) in capabilities.reasoning_effort.iter().enumerate() {
@@ -1009,16 +886,13 @@ fn validate_capabilities_for_api(
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DefaultSection {
-    #[serde(default)]
     pub model: Option<ModelSelection>,
-    #[serde(default)]
     pub search: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProvidersFile {
-    #[serde(default)]
     pub default: Option<DefaultSection>,
     #[serde(default)]
     pub provider: Vec<ProviderSpec>,
@@ -1026,7 +900,6 @@ pub struct ProvidersFile {
     pub search_provider: Vec<SearchProviderSpec>,
     #[serde(default)]
     pub mcp_server: Vec<mcp::McpServerSpec>,
-    #[serde(default)]
     pub catalog: Option<crate::catalog::CatalogConfig>,
 }
 

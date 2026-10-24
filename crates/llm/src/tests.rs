@@ -3238,6 +3238,32 @@ async fn unsupported_write_disable_fails_before_network() {
 }
 
 #[tokio::test]
+async fn anthropic_write_disable_fails_before_network_even_without_markers() {
+    let mut spec = spec_with_base_url("anthropic", "http://127.0.0.1:9/v1/");
+    spec.api = ApiFlavor::AnthropicMessages;
+    spec.capabilities.prompt_cache = true;
+    spec.prompt_cache_field = Some(PromptCacheField::CacheControlAuto);
+    let provider = HttpProvider::from_spec(spec);
+    for cache in [PromptCache::Off, PromptCache::Auto] {
+        let mut request = sample_request();
+        request.provider = "anthropic".into();
+        request.seed = None;
+        request.prompt_cache = cache;
+        request.cache_write = CacheWritePolicy::Forbid;
+        let error = provider
+            .complete(request)
+            .await
+            .expect_err("Anthropic cannot guarantee writes are disabled");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot guarantee no cache writes"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn unsupported_retention_fails_before_network() {
     let mut spec = spec_with_base_url("no-retention", "http://127.0.0.1:9/v1/");
     spec.capabilities.prompt_cache = true;

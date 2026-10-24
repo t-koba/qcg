@@ -189,14 +189,14 @@ fn parameter_schema(schema: ParameterSchema) -> Value {
             default,
         } => {
             let mut schema = json!({ "type": "integer" });
-            if let Some(minimum) = minimum {
-                schema["minimum"] = json!(minimum);
-            }
-            if let Some(maximum) = maximum {
-                schema["maximum"] = json!(maximum);
-            }
-            if let Some(default) = default {
-                schema["default"] = json!(default);
+            for (key, value) in [
+                ("minimum", minimum),
+                ("maximum", maximum),
+                ("default", default),
+            ] {
+                if let Some(value) = value {
+                    schema[key] = json!(value);
+                }
             }
             schema
         }

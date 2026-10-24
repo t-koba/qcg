@@ -28,18 +28,13 @@ impl LlmDecideStep {
         node: &NodeDef,
         contract: &Contract,
     ) -> Result<DecideParams, StepError> {
+        let invalid = |message: &str| StepError::failed(&node.id, message);
         if !node.context.is_empty() {
-            return Err(StepError::failed(
-                &node.id,
-                "llm.decide does not support node.context",
-            ));
+            return Err(invalid("llm.decide does not support node.context"));
         }
         let value = node.params_json();
         if contains_template(&value) {
-            return Err(StepError::failed(
-                &node.id,
-                "llm.decide does not support templates",
-            ));
+            return Err(invalid("llm.decide does not support templates"));
         }
         for field in [
             "input_cost_per_million_usd",
@@ -67,8 +62,7 @@ impl LlmDecideStep {
                 || llm.cache_write_policy != CacheWritePolicy::Allow
                 || llm.cache_retention.is_some()
             {
-                return Err(StepError::failed(
-                    &node.id,
+                return Err(invalid(
                     "llm.decide does not support prompt-cache policies: remove [llm] cache, cache_write_policy and cache_retention",
                 ));
             }
@@ -77,25 +71,16 @@ impl LlmDecideStep {
             StepError::failed(&node.id, format!("invalid llm.decide params: {error}"))
         })?;
         if params.max_tokens == 0 {
-            return Err(StepError::failed(
-                &node.id,
-                "max_tokens must be greater than zero",
-            ));
+            return Err(invalid("max_tokens must be greater than zero"));
         }
         let state = match (&params.state, &params.state_from) {
             (Some(state), None) => state.clone(),
             (None, Some(path)) if valid_state_path(path) => json!({}),
             (None, Some(_)) => {
-                return Err(StepError::failed(
-                    &node.id,
-                    "state_from must be a dotted ValueBag path",
-                ));
+                return Err(invalid("state_from must be a dotted ValueBag path"));
             }
             _ => {
-                return Err(StepError::failed(
-                    &node.id,
-                    "exactly one of state or state_from is required",
-                ));
+                return Err(invalid("exactly one of state or state_from is required"));
             }
         };
         params.request(node, state)?;
@@ -103,8 +88,7 @@ impl LlmDecideStep {
             && (params.model.input_cost_per_million_usd.is_none()
                 || params.model.output_cost_per_million_usd.is_none())
         {
-            return Err(StepError::failed(
-                &node.id,
+            return Err(invalid(
                 "llm.decide model must declare input and output pricing when budget.max_cost_usd is set",
             ));
         }

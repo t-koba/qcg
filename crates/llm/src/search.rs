@@ -1,3 +1,4 @@
+use crate::config::{is_env_name, is_loopback_host, is_provider_id};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -501,29 +502,6 @@ fn valid_http_header_name(value: &str) -> bool {
                         | b'~'
                 )
         })
-}
-
-fn is_provider_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
-        })
-}
-
-fn is_env_name(value: &str) -> bool {
-    let mut bytes = value.bytes();
-    matches!(bytes.next(), Some(b'A'..=b'Z') | Some(b'_'))
-        && bytes.all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
-}
-
-fn is_loopback_host(url: &Url) -> bool {
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    host.trim_end_matches('.').eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
 }
 
 #[cfg(test)]

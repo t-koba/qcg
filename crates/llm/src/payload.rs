@@ -57,24 +57,14 @@ pub(crate) fn chat_completions_payload(
             payload["parallel_tool_calls"] = json!(parallel);
         }
     }
-    if req.cache_write == CacheWritePolicy::Forbid {
-        // Write-disable honored via explicit mode with no qcg explicit
-        // breakpoints, so no cache read/write. Auto hints stay suppressed.
-        if explicit_disable {
-            payload["prompt_cache_options"] = json!({ "mode": "explicit" });
-        }
-    } else {
-        if wants_prompt_cache(req, prompt_cache, PromptCacheField::PromptCacheKey) {
-            payload["prompt_cache_key"] = json!(prompt_cache_key(req));
-        }
-        // Older-model maximum-retention policy, not a deletion deadline.
-        if req.prompt_cache == PromptCache::Auto
-            && req.cache_retention == Some(CacheRetention::Extended)
-            && retention == Some(PromptCacheRetention::Retention24h)
-        {
-            payload["prompt_cache_retention"] = json!("24h");
-        }
-    }
+    openai_cache_policy(
+        &mut payload,
+        req,
+        prompt_cache,
+        retention,
+        explicit_disable,
+        false,
+    );
     payload
 }
 
@@ -129,33 +119,52 @@ pub(crate) fn responses_payload(
         payload["tools"] = Value::Array(tools);
         payload["max_tool_calls"] = json!(search.max_calls);
     }
+    openai_cache_policy(
+        &mut payload,
+        req,
+        prompt_cache,
+        retention,
+        explicit_disable,
+        true,
+    );
+    payload
+}
+
+/// Shared OpenAI cache controls. Keep API-specific TTL support even when
+/// builders are called directly rather than through route validation.
+fn openai_cache_policy(
+    payload: &mut Value,
+    req: &ChatRequest,
+    prompt_cache: Option<PromptCacheField>,
+    retention: Option<PromptCacheRetention>,
+    explicit_disable: bool,
+    responses: bool,
+) {
     if req.cache_write == CacheWritePolicy::Forbid {
-        // Write-disable honored via explicit mode with no qcg explicit
-        // breakpoints, so no cache read/write. Auto hints stay suppressed.
+        // Explicit mode without breakpoints disables reads and writes.
         if explicit_disable {
             payload["prompt_cache_options"] = json!({ "mode": "explicit" });
         }
-    } else {
-        if wants_prompt_cache(req, prompt_cache, PromptCacheField::PromptCacheKey) {
-            payload["prompt_cache_key"] = json!(prompt_cache_key(req));
-        }
-        if req.prompt_cache == PromptCache::Auto
-            && req.cache_retention == Some(CacheRetention::Extended)
-        {
-            match retention {
-                // Older-model maximum-retention policy, not a deletion deadline.
-                Some(PromptCacheRetention::Retention24h) => {
-                    payload["prompt_cache_retention"] = json!("24h");
-                }
-                // Minimum lifetime, not a deletion deadline. Responses only.
-                Some(PromptCacheRetention::Ttl12h) => {
-                    payload["prompt_cache_options"] = json!({ "ttl": "12h" });
-                }
-                _ => {}
+        return;
+    }
+    if wants_prompt_cache(req, prompt_cache, PromptCacheField::PromptCacheKey) {
+        payload["prompt_cache_key"] = json!(prompt_cache_key(req));
+    }
+    if req.prompt_cache == PromptCache::Auto
+        && req.cache_retention == Some(CacheRetention::Extended)
+    {
+        match retention {
+            // Maximum-retention policy, not a deletion deadline.
+            Some(PromptCacheRetention::Retention24h) => {
+                payload["prompt_cache_retention"] = json!("24h")
             }
+            // Minimum lifetime, Responses only; not a deletion deadline.
+            Some(PromptCacheRetention::Ttl12h) if responses => {
+                payload["prompt_cache_options"] = json!({ "ttl": "12h" })
+            }
+            _ => {}
         }
     }
-    payload
 }
 
 /// The hosted web search tool object. Only the fields the contract declared
@@ -215,14 +224,14 @@ pub(crate) fn anthropic_payload(
         && req.cache_write == CacheWritePolicy::Allow
         && req.cache_retention == Some(CacheRetention::Extended)
         && retention == Some(PromptCacheRetention::Ttl1h);
+    let mut marker = json!({ "type": "ephemeral" });
+    if extended_ttl {
+        marker["ttl"] = json!("1h");
+    }
     if let Some(system) = &req.system {
         if wants_anthropic_cache(req, prompt_cache) {
             // Anthropic caches explicit content blocks; the system block is
             // the stable prefix, so the marker goes on its text block.
-            let mut marker = json!({ "type": "ephemeral" });
-            if extended_ttl {
-                marker["ttl"] = json!("1h");
-            }
             payload["system"] = json!([{
                 "type": "text",
                 "text": system,
@@ -236,11 +245,7 @@ pub(crate) fn anthropic_payload(
         // Top-level automatic caching covers the growing conversation tail;
         // the explicit system marker above keeps the stable prefix readable.
         // Both default to the 5-minute TTL and consume 2 of 4 slots.
-        let mut top = json!({ "type": "ephemeral" });
-        if extended_ttl {
-            top["ttl"] = json!("1h");
-        }
-        payload["cache_control"] = top;
+        payload["cache_control"] = marker;
     }
     if let Some(temperature) = req.temperature {
         payload["temperature"] = json!(temperature);
@@ -493,34 +498,26 @@ fn native_schema_node_compatible(
     }) {
         return false;
     }
-    if let Some(properties) = object.get("properties").and_then(Value::as_object) {
-        limits.properties = limits.properties.saturating_add(properties.len());
-        limits.string_chars = limits.string_chars.saturating_add(
-            properties
-                .keys()
-                .map(|name| name.chars().count())
-                .sum::<usize>(),
-        );
-        if limits.properties > 5_000
-            || !properties
+    for key in ["properties", "$defs"] {
+        if let Some(children) = object.get(key).and_then(Value::as_object) {
+            if key == "properties" {
+                limits.properties = limits.properties.saturating_add(children.len());
+                if limits.properties > 5_000 {
+                    return false;
+                }
+            }
+            limits.string_chars = limits.string_chars.saturating_add(
+                children
+                    .keys()
+                    .map(|name| name.chars().count())
+                    .sum::<usize>(),
+            );
+            if !children
                 .values()
                 .all(|schema| native_schema_node_compatible(schema, depth + 1, limits))
-        {
-            return false;
-        }
-    }
-    if let Some(definitions) = object.get("$defs").and_then(Value::as_object) {
-        limits.string_chars = limits.string_chars.saturating_add(
-            definitions
-                .keys()
-                .map(|name| name.chars().count())
-                .sum::<usize>(),
-        );
-        if !definitions
-            .values()
-            .all(|schema| native_schema_node_compatible(schema, depth + 1, limits))
-        {
-            return false;
+            {
+                return false;
+            }
         }
     }
     if let Some(values) = object.get("enum").and_then(Value::as_array) {
@@ -675,15 +672,24 @@ pub(crate) fn openai_messages(req: &ChatRequest) -> Vec<Value> {
     messages
 }
 
-fn openai_message_content(message: &ChatMessage) -> Value {
+fn message_content(
+    message: &ChatMessage,
+    text_type: &str,
+    encode: impl Fn(&ChatContentPart) -> Value,
+) -> Value {
     if message.parts.is_empty() {
         return Value::String(message.content.clone());
     }
     let mut parts = Vec::new();
     if !message.content.is_empty() {
-        parts.push(json!({ "type": "text", "text": message.content }));
+        parts.push(json!({ "type": text_type, "text": message.content }));
     }
-    parts.extend(message.parts.iter().map(|part| match part {
+    parts.extend(message.parts.iter().map(encode));
+    Value::Array(parts)
+}
+
+fn openai_message_content(message: &ChatMessage) -> Value {
+    message_content(message, "text", |part| match part {
         ChatContentPart::Text { text } => json!({ "type": "text", "text": text }),
         ChatContentPart::InputImage {
             media_type,
@@ -714,8 +720,7 @@ fn openai_message_content(message: &ChatMessage) -> Value {
                 "file_data": data_url(media_type, data),
             }
         }),
-    }));
-    Value::Array(parts)
+    })
 }
 
 pub(crate) fn openai_tool(tool: &ToolSpec) -> Value {
@@ -763,14 +768,7 @@ pub(crate) fn responses_input(req: &ChatRequest) -> Vec<Value> {
 }
 
 fn responses_message_content(message: &ChatMessage) -> Value {
-    if message.parts.is_empty() {
-        return Value::String(message.content.clone());
-    }
-    let mut parts = Vec::new();
-    if !message.content.is_empty() {
-        parts.push(json!({ "type": "input_text", "text": message.content }));
-    }
-    parts.extend(message.parts.iter().map(|part| match part {
+    message_content(message, "input_text", |part| match part {
         ChatContentPart::Text { text } => json!({ "type": "input_text", "text": text }),
         ChatContentPart::InputImage {
             media_type,
@@ -797,8 +795,7 @@ fn responses_message_content(message: &ChatMessage) -> Value {
             "file_data": data_url(media_type, data),
             "filename": filename,
         }),
-    }));
-    Value::Array(parts)
+    })
 }
 
 fn responses_tool(tool: &ToolSpec) -> Value {
@@ -847,14 +844,7 @@ pub(crate) fn anthropic_messages(req: &ChatRequest) -> Vec<Value> {
 }
 
 fn anthropic_message_content(message: &ChatMessage) -> Value {
-    if message.parts.is_empty() {
-        return Value::String(message.content.clone());
-    }
-    let mut parts = Vec::new();
-    if !message.content.is_empty() {
-        parts.push(json!({ "type": "text", "text": message.content }));
-    }
-    parts.extend(message.parts.iter().map(|part| match part {
+    message_content(message, "text", |part| match part {
         ChatContentPart::Text { text } => json!({ "type": "text", "text": text }),
         ChatContentPart::InputImage {
             media_type, data, ..
@@ -875,8 +865,7 @@ fn anthropic_message_content(message: &ChatMessage) -> Value {
             "type": "text",
             "text": "[UNSUPPORTED_AUDIO_INPUT]"
         }),
-    }));
-    Value::Array(parts)
+    })
 }
 
 fn data_url(media_type: &str, data: &str) -> String {
@@ -1129,7 +1118,10 @@ mod tests {
     }
 
     #[test]
-    fn forbid_omits_anthropic_markers_exactly() {
+    fn anthropic_payload_builder_omits_markers_for_forbid_only() {
+        // This low-level payload property is not a provider guarantee:
+        // HttpProvider rejects Anthropic `forbid` before dispatch because
+        // automatic cache writes can occur without explicit markers.
         let mut req = request(Some("stable system"), PromptCache::Auto);
         req.cache_write = CacheWritePolicy::Forbid;
         let payload = anthropic_payload(&req, Some(PromptCacheField::CacheControlAuto), None);

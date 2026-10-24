@@ -111,15 +111,14 @@ Fields:
   `off` only omits qcg cache instructions; it does not disable provider-side
   caching (see `cache_write_policy`).
 - `cache_write_policy`: `allow` (default) leaves provider caching alone;
-  `forbid` requires qcg/provider caching to be disabled for the request, not
-  just omitted. Anthropic Messages honors `forbid` by omitting every explicit
-  and top-level automatic marker. OpenAI/Azure chat and Responses routes honor
-  `forbid` only when the selected model/row explicitly declares
-  `prompt_cache_explicit_mode = true`, emitting
-  `prompt_cache_options: {"mode": "explicit"}` with no qcg explicit breakpoints
-  (so no cache read/write). A route that cannot honor an explicit `forbid`
-  fails before network dispatch, on every fallback route. `llm.decide` and
-  `system_one` routes reject any non-default cache policy before dispatch.
+  `forbid` requires the selected route to disable cache reads/writes, not just
+  omit qcg markers. A route must explicitly declare a documented mechanism
+  such as `prompt_cache_explicit_mode = true`, which emits
+  `prompt_cache_options: {"mode": "explicit"}` without qcg breakpoints.
+  Anthropic Messages rejects `forbid`: automatic caching during thinking/tool
+  continuations and server-tool results may create writes without markers.
+  Unsupported requirements fail before dispatch on every route/fallback;
+  `llm.decide` and `system_one` reject non-default cache policies too.
 - `cache_retention`: optional retention tier; only `extended` is defined and
   absent means the provider default lifetime. Valid only with `cache = "auto"`
   and `cache_write_policy = "allow"`, and only when the selected model/row
@@ -135,11 +134,13 @@ Fields:
   extended-retention choice, so no `extended` mechanism is declared for them.
   These provider cache-lifetime/retention controls do not state a data-retention
   policy or guarantee deletion at any time. Usage normalization is unchanged.
-  With `extended`,
-  `ttl_1h` bills only `cache_creation_input` at 2x the selected context tier's
-  ordinary input rate, and `ttl_12h` at 2.5x; `retention_24h` keeps the
-  configured cache-write rate. The meter uses the requested TTL because
-  provider usage totals may omit the TTL breakdown (especially streaming).
+  With `extended`, qcg estimates aggregate `cache_creation_input` at 2x the
+  selected context tier's ordinary input rate for requested `ttl_1h`, and 2.5x
+  for requested `ttl_12h`; `retention_24h` keeps the configured cache-write
+  rate. The meter does not use provider-specific TTL subcounters, which may be
+  absent from streaming usage. Anthropic may also create default 5m writes
+  during tool/thinking continuations alongside requested 1h markers, so the
+  extended write-cost estimate can differ from provider charges.
   A max-cost budget reserves with the extended multiplier at the dearest
   context-tier input rate and refuses dispatch if the ordinary input rate
   needed for a possible tier is missing.

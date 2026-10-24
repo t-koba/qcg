@@ -30,64 +30,42 @@ impl ReasoningEffortSpec {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
 pub struct LlmConfig {
-    #[serde(default)]
     pub model: Option<ModelRef>,
-    #[serde(default)]
     pub models: Vec<ModelRef>,
-    #[serde(default)]
     pub temperature: Option<f32>,
-    #[serde(default)]
     pub top_p: Option<f32>,
-    #[serde(default)]
     pub max_tokens: Option<u32>,
-    #[serde(default)]
     pub stop_sequences: Vec<String>,
-    #[serde(default)]
     pub max_context_bytes: Option<usize>,
-    #[serde(default)]
     pub max_context_tokens: Option<usize>,
-    #[serde(default)]
     pub max_media_bytes: Option<usize>,
-    #[serde(default)]
     pub context_overflow: ContextOverflowPolicy,
     /// Prompt-cache policy. Unset and `off` send no cache instructions;
     /// `auto` sends the selected provider's cache instructions.
     /// `off` only omits qcg cache instructions; it does not disable
     /// provider-side caching. See `cache_write_policy` for a disable.
-    #[serde(default)]
     pub cache: PromptCachePolicy,
     /// Prompt-cache write policy. `allow` (default) leaves provider
     /// caching alone; `forbid` requires qcg/provider caching to be
     /// disabled for the request and fails before network dispatch when
     /// the selected route cannot honor the disable.
-    #[serde(default)]
     pub cache_write_policy: CacheWritePolicy,
     /// Optional prompt-cache retention tier. Only `extended` is defined;
     /// absent means the provider default lifetime. Valid only with
     /// `cache = "auto"` and `cache_write_policy = "allow"`, and only
     /// when the selected route explicitly declares the tier mechanism.
-    #[serde(default)]
     pub cache_retention: Option<CacheRetention>,
-    #[serde(default)]
     pub requires: Vec<String>,
-    #[serde(default)]
     pub system: Option<String>,
-    #[serde(default)]
     pub retry_prompt: Option<String>,
-    #[serde(default)]
     pub seed: Option<u64>,
-    #[serde(default)]
     pub reasoning_effort: Option<ReasoningEffortSpec>,
-    #[serde(default)]
     pub structured_output: StructuredOutputMode,
-    #[serde(default)]
     pub tool_choice: Option<ToolChoice>,
-    #[serde(default)]
     pub parallel_tool_calls: Option<bool>,
-    #[serde(default)]
     pub verbosity: Option<ResponseVerbosity>,
 }
 
@@ -96,45 +74,26 @@ pub struct LlmConfig {
 /// The provider registry advertises transport capabilities. This value only
 /// selects behavior for one node or specialist invocation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct LlmRequestPolicy {
-    #[serde(default)]
     pub clear: Vec<LlmRequestControl>,
-    #[serde(default)]
     pub system: Option<String>,
-    #[serde(default)]
     pub temperature: Option<f32>,
-    #[serde(default)]
     pub top_p: Option<f32>,
-    #[serde(default)]
     pub max_tokens: Option<u32>,
-    #[serde(default)]
     pub stop_sequences: Option<Vec<String>>,
-    #[serde(default)]
     pub seed: Option<u64>,
-    #[serde(default)]
     pub reasoning_effort: Option<ReasoningEffortSpec>,
-    #[serde(default)]
     pub structured_output: Option<StructuredOutputMode>,
-    #[serde(default)]
     pub tool_choice: Option<ToolChoice>,
-    #[serde(default)]
     pub parallel_tool_calls: Option<bool>,
-    #[serde(default)]
     pub verbosity: Option<ResponseVerbosity>,
-    #[serde(default)]
     pub stream: Option<bool>,
-    #[serde(default)]
     pub requires: Vec<String>,
-    #[serde(default)]
     pub max_context_bytes: Option<usize>,
-    #[serde(default)]
     pub max_context_tokens: Option<usize>,
-    #[serde(default)]
     pub max_media_bytes: Option<usize>,
-    #[serde(default)]
     pub context_overflow: Option<ContextOverflowPolicy>,
-    #[serde(default)]
     pub retry_prompt: Option<String>,
 }
 
@@ -214,16 +173,13 @@ impl LlmConfig {
     /// Retention needs `cache = "auto"` with write `allow`; `forbid`
     /// itself is validated against the selected route at dispatch.
     pub fn validate_cache_policy(&self) -> Result<(), String> {
-        if self.cache_retention.is_some()
-            && (self.cache != PromptCachePolicy::Auto
-                || self.cache_write_policy != CacheWritePolicy::Allow)
-        {
-            return Err(
+        match (self.cache_retention, self.cache, self.cache_write_policy) {
+            (None, _, _) | (Some(_), PromptCachePolicy::Auto, CacheWritePolicy::Allow) => Ok(()),
+            _ => Err(
                 "cache_retention requires cache = \"auto\" and cache_write_policy = \"allow\""
                     .to_string(),
-            );
+            ),
         }
-        Ok(())
     }
 }
 
@@ -259,24 +215,11 @@ impl ModelRef {
     /// one definition of the price rule: the manifest check, the runtime cost
     /// meter and the decision path all ask this method.
     pub fn invalid_price(&self) -> Option<&'static str> {
-        let read = self.cache_read_input_cost_per_million_usd;
-        let creation = self.cache_creation_input_cost_per_million_usd;
-        [
-            (
-                "input_cost_per_million_usd",
-                self.input_cost_per_million_usd,
-            ),
-            ("cache_read_input_cost_per_million_usd", read),
-            ("cache_creation_input_cost_per_million_usd", creation),
-            (
-                "output_cost_per_million_usd",
-                self.output_cost_per_million_usd,
-            ),
-            ("web_search_call_cost_usd", self.web_search_call_cost_usd),
-        ]
-        .into_iter()
-        .find(|(_, value)| value.is_some_and(|value| !value.is_finite() || value < 0.0))
-        .map(|(name, _)| name)
+        self.rates().invalid_rate().or_else(|| {
+            self.web_search_call_cost_usd
+                .filter(|value| !value.is_finite() || *value < 0.0)
+                .map(|_| "web_search_call_cost_usd")
+        })
     }
 
     /// The cache-read rate: an absent rate bills at the ordinary input rate.
@@ -303,19 +246,16 @@ impl ModelRef {
 
     // Missing prices are allowed: catalog prices may fill the gaps at dispatch.
     pub(super) fn validate_pricing(&self) -> Result<(), super::ContractError> {
+        let invalid = |message| {
+            super::ContractError::Invalid(format!(
+                "model `{}/{}` {message}",
+                self.provider, self.model
+            ))
+        };
         if let Some(name) = self.invalid_price() {
-            return Err(super::ContractError::Invalid(format!(
-                "model `{}/{}` {name} must be finite and non-negative",
-                self.provider, self.model
-            )));
+            return Err(invalid(format!("{name} must be finite and non-negative")));
         }
-        if let Err(error) = policy::validate_cost_tiers(&self.cost_tiers) {
-            return Err(super::ContractError::Invalid(format!(
-                "model `{}/{}` {error}",
-                self.provider, self.model
-            )));
-        }
-        Ok(())
+        policy::validate_cost_tiers(&self.cost_tiers).map_err(|error| invalid(error.to_string()))
     }
 }
 
@@ -494,6 +434,40 @@ mod tests {
         let error = toml::from_str::<LlmConfig>("max_tokens = 128\ncache = \"always\"")
             .expect_err("unknown cache value must fail");
         assert!(error.to_string().contains("unknown variant"), "{error}");
+    }
+
+    #[test]
+    fn llm_container_defaults_preserve_missing_and_null_fields() {
+        let config: LlmConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(config.cache, PromptCachePolicy::Off);
+        assert_eq!(config.cache_write_policy, CacheWritePolicy::Allow);
+        assert_eq!(config.cache_retention, None);
+        assert!(config.stop_sequences.is_empty());
+        assert!(config.requires.is_empty());
+        for field in [
+            "cache",
+            "cache_write_policy",
+            "stop_sequences",
+            "requires",
+            "structured_output",
+        ] {
+            assert!(serde_json::from_value::<LlmConfig>(serde_json::json!({field: null})).is_err());
+        }
+        let nullable: LlmConfig = serde_json::from_value(serde_json::json!({
+            "model": null, "cache_retention": null
+        }))
+        .unwrap();
+        assert_eq!(nullable.model.map(|model| model.model), None);
+        assert_eq!(nullable.cache_retention, None);
+        let policy: LlmRequestPolicy = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(policy.clear.is_empty());
+        assert!(policy.requires.is_empty());
+        for field in ["clear", "requires"] {
+            assert!(
+                serde_json::from_value::<LlmRequestPolicy>(serde_json::json!({field: null}))
+                    .is_err()
+            );
+        }
     }
 
     #[test]
