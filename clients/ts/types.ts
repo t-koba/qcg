@@ -630,7 +630,7 @@ export interface paths {
                 header: {
                     /** @description Required SHA-256 identity from the loaded GeneratorDetail; start is rejected if the package changed. */
                     "X-QCG-Package-SHA256": string;
-                    /** @description Retries with the same key, request body, and package identity return the original run. */
+                    /** @description A retained key with the same request body and package identity replays the original run. Same-process identical pending requests wait and replay; a pending request owned by another process may return 503. Changed content for a bound key returns 409. Retention is subject to expiry and entry limits; after expiry or eviction, reuse may be treated as a new request. */
                     "Idempotency-Key"?: string;
                 };
                 path?: never;
@@ -1196,7 +1196,7 @@ export interface paths {
             parameters: {
                 query?: never;
                 header?: {
-                    /** @description Retries with the same key and request body return the original run. */
+                    /** @description A retained key with identical request content replays its result. Same-process identical pending requests wait and replay; a pending request owned by another process may return 503. Changed content for a bound key returns 409. Retention is subject to expiry and entry limits; after expiry or eviction, reuse may be treated as a new request. */
                     "Idempotency-Key"?: string;
                 };
                 path: {
@@ -1369,7 +1369,7 @@ export interface paths {
             parameters: {
                 query?: never;
                 header?: {
-                    /** @description Retries with the same key and request body return the original run. */
+                    /** @description A retained key with identical request content replays its result. Same-process identical pending requests wait and replay; a pending request owned by another process may return 503. Changed content for a bound key returns 409. Retention is subject to expiry and entry limits; after expiry or eviction, reuse may be treated as a new request. */
                     "Idempotency-Key"?: string;
                 };
                 path: {
@@ -1703,7 +1703,7 @@ export interface paths {
             parameters: {
                 query?: never;
                 header?: {
-                    /** @description Retries with the same key and request body return the original run. */
+                    /** @description A retained key with identical request content replays its result. Same-process identical pending requests wait and replay; a pending request owned by another process may return 503. Changed content for a bound key returns 409. Retention is subject to expiry and entry limits; after expiry or eviction, reuse may be treated as a new request. */
                     "Idempotency-Key"?: string;
                 };
                 path: {
@@ -1806,7 +1806,7 @@ export interface paths {
             parameters: {
                 query?: never;
                 header?: {
-                    /** @description Retries with the same key and request body return the original run. */
+                    /** @description A retained key with identical request content replays its result. Same-process identical pending requests wait and replay; a pending request owned by another process may return 503. Changed content for a bound key returns 409. Retention is subject to expiry and entry limits; after expiry or eviction, reuse may be treated as a new request. */
                     "Idempotency-Key"?: string;
                 };
                 path: {
