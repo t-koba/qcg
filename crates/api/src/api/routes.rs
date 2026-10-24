@@ -102,7 +102,7 @@ const OAUTH_CALLBACK_QUERY_PARAMETERS: &[ApiParameter] = &[
 const NO_ADDITIONAL_RESPONSES: &[ApiResponse] = &[];
 const IDEMPOTENCY_HEADERS: &[ApiHeader] = &[ApiHeader {
     name: "Idempotency-Key",
-    description: "Retries with the same key and request body return the original run.",
+    description: "A retained key with identical request content replays its result. Same-process identical pending requests wait and replay; a pending request owned by another process may return 503. Changed content for a bound key returns 409. Retention is subject to expiry and entry limits; after expiry or eviction, reuse may be treated as a new request.",
     required: false,
 }];
 const START_RUN_REQUEST_HEADERS: &[ApiHeader] = &[
@@ -113,7 +113,7 @@ const START_RUN_REQUEST_HEADERS: &[ApiHeader] = &[
     },
     ApiHeader {
         name: "Idempotency-Key",
-        description: "Retries with the same key, request body, and package identity return the original run.",
+        description: "A retained key with the same request body and package identity replays the original run. Same-process identical pending requests wait and replay; a pending request owned by another process may return 503. Changed content for a bound key returns 409. Retention is subject to expiry and entry limits; after expiry or eviction, reuse may be treated as a new request.",
         required: false,
     },
 ];

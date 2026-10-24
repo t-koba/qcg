@@ -626,11 +626,19 @@ native test pins this fail-closed behavior.
 Admission records and run coordination locks are different mechanisms.
 
 - Admission records are persistent: idempotency mappings under
-  `<runs-dir>/idempotency/` (24-hour TTL, survive restarts and shared-store
-  peers) plus the durable `run_queued` journal event. A reused
-  `Idempotency-Key` with identical content replays the original result; the
-  same key with different content is rejected with `409 Conflict`. The
-  pre-execution ownership recheck cannot fully close the window before
+  `<runs-dir>/idempotency/` plus the durable `run_queued` journal event. The
+  default mapping retention is 24 hours (`IDEMPOTENCY_TTL_SECS` configures it),
+  and `IDEMPOTENCY_MAX_ENTRIES` bounds retained entries. A retained key with
+  identical content replays the original result; same-process identical
+  pending requests wait and replay, while a request encountering another
+  process's pending claim may return `503 Service Unavailable`. Changed
+  content for a still-bound key returns `409 Conflict`. Expiry/eviction makes
+  the key eligible for new admission: a reuse may start another run and repeat
+  side effects. Expiry does not delete or undo the original run. Clients must
+  retain the original run ID and reconcile it rather than depend on an expired
+  key. Because in-memory and durable TTL views can differ, 24 hours is the
+  default policy, not a promise of an exact per-peer cutoff.
+  The pre-execution ownership recheck cannot fully close the window before
   execution starts: a successor that acts in between may let the stale owner
   briefly start its engine. Such surplus execution never commits and is
   canceled by the orphan settlement at commit time, so every stale execution
@@ -654,10 +662,18 @@ second boundary advances the body (and the validator) even when nothing
 else changed, so an unrelated `200` there is correct, not stale
 (`live_metrics` in `crates/service/src/summaries/metrics.rs`).
 
-A reused `Idempotency-Key` with identical content replays the original result
-instead of starting a duplicate run; the same key with different content is
-rejected with `409 Conflict`. Records persist for 24 hours under
-`<runs-dir>/idempotency/` and survive restarts and shared-store peers. If a run still reaches `Waiting` or
+A retained `Idempotency-Key` with identical content replays the original
+result instead of starting a duplicate run; changed content for a still-bound
+key returns `409 Conflict`. Same-process identical pending requests wait and
+replay; a pending request owned by another process may return `503`. The
+24-hour default retention is subject to `IDEMPOTENCY_TTL_SECS` and the
+`IDEMPOTENCY_MAX_ENTRIES` limit, and does not promise an exact per-peer cutoff
+while in-memory and durable TTL views can differ. After expiry or eviction,
+reuse may be admitted as new and start another run or repeat side effects;
+expiry does not remove or undo the original. Preserve its run ID and reconcile
+that run rather than rely on an expired key. Records under
+`<runs-dir>/idempotency/` survive restarts and shared-store peers while retained.
+If a run still reaches `Waiting` or
 `Confirming`, answer mechanically with
 `PUT /api/runs/{id}/questions/{qid}` or
 `PUT /api/runs/{id}/confirmations/{cid}`. `GET /healthz` and `GET /metrics`

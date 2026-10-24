@@ -150,15 +150,27 @@ malformed, or stale identity before run admission; the identity covers the
 complete package tree and participates in start idempotency. A committed
 start retried with the same key, body, and identity replays the original run
 even if the installed package has since changed or disappeared. An
-`Idempotency-Key` header makes retries deterministic for 24 hours. Records
-are persisted under `<runs-dir>/idempotency/` so the same key returns the
-same run across process restarts and shared-store peers; TTL and entry caps
-still apply. The same header is accepted by `POST /api/runs/{id}/fork`,
+`Idempotency-Key` header enables request replay while its mapping is retained.
+The default retention is 24 hours, configurable with `IDEMPOTENCY_TTL_SECS`;
+`IDEMPOTENCY_MAX_ENTRIES` also bounds retained entries. Records are persisted
+under `<runs-dir>/idempotency/` and shared across process restarts and
+shared-store peers. A retained key with identical request content replays the
+original result. Identical pending requests in the same process wait for the
+owner and replay its result; a pending request owned by another process may
+return `503 Service Unavailable`. Reusing a still-bound key with changed
+content returns `409 Conflict`.
+
+The same header is accepted by `POST /api/runs/{id}/fork`,
 `PUT /api/runs/{id}/questions/{qid}`,
-`PUT /api/runs/{id}/confirmations/{cid}`, and `POST /api/runs/{id}:cancel`:
-a reused key with identical content replays the original result instead of
-forking a duplicate run, while a reused key with different content is
-rejected with `409 Conflict`.
+`PUT /api/runs/{id}/confirmations/{cid}`, and `POST /api/runs/{id}:cancel`.
+Once a mapping expires or is evicted, that key no longer guarantees
+deduplication: an otherwise eligible reuse can be admitted as a new request,
+starting another run or repeating side effects. Expiry removes only the
+idempotency mapping; it does not delete, cancel, or undo the original run.
+Clients should retain the original `run_id` and reconcile its state rather
+than rely on reuse of an expired key. The documented 24-hour default does not
+promise an exact per-peer cutoff because in-memory and durable TTL views can
+currently differ.
 Snapshots of a `Queued` run additionally expose `queued_at` (RFC 3339) and
 `queue_position` (1-based admission order) for queue observability.
 The cancel response is returned after the active engine task has stopped. If a
