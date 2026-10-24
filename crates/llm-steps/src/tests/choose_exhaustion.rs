@@ -48,11 +48,17 @@ impl Drop for Fixture {
 }
 
 #[tokio::test]
-async fn choose_local_token_exhaustion_retains_exact_terminal_facts() {
+async fn choose_local_resource_exhaustion_retains_exact_terminal_facts() {
     // First response costs 5 and is invalid. At cap=5 equality permits the
     // second attempt, whose valid choice must not be accepted at cumulative 10.
     // At cap=10 that same choice succeeds; node retries keep their old policy.
-    for (cap, retries, expected_calls) in [(4, 1, 1), (5, 1, 2), (5, 2, 4), (10, 1, 2)] {
+    for (cap, retries, expected_calls, max_iterations) in [
+        (4, 1, 1, 3),
+        (5, 1, 2, 3),
+        (5, 2, 4, 3),
+        (10, 1, 2, 3),
+        (100, 1, 1, 1),
+    ] {
         let fixture = Fixture(
             Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
             "qcg-choose-exhaustion-{}-{}", std::process::id(),
@@ -95,7 +101,7 @@ on_indeterminate = "fail"
 [flow.params]
 prompt = "prompt.txt"
 options = ["yes"]
-max_iterations = 3
+max_iterations = {max_iterations}
 max_tokens_total = {cap}
 output_file = "out.txt"
 "#
@@ -150,21 +156,33 @@ output_file = "out.txt"
         let Progress::Failed(failure) = progress else {
             panic!("{progress:?}")
         };
-        let used = if cap == 4 { 5 } else { 10 };
+        let (resource, used, allowed, expected_message) = if cap == 100 {
+            (
+                "iterations",
+                1,
+                1,
+                "step `choice` failed: LLM did not choose one of declared options after 1 attempt(s)".to_string(),
+            )
+        } else {
+            let used = if cap == 4 { 5 } else { 10 };
+            (
+                "tokens_total",
+                used,
+                cap,
+                format!("step `choice` failed: llm.choose token budget exceeded: {used} > {cap}"),
+            )
+        };
         assert_eq!(failure.code, FailureCode::ExecutionFailed);
         assert_eq!(
             failure.exhaustion,
             Some(BudgetExhaustion {
-                resource: "tokens_total".into(),
+                resource: resource.into(),
                 used,
-                allowed: cap,
+                allowed,
                 used_subsec_nanoseconds: None,
             })
         );
-        assert_eq!(
-            failure.message,
-            format!("step `choice` failed: llm.choose token budget exceeded: {used} > {cap}")
-        );
+        assert_eq!(failure.message, expected_message);
         assert!(!root.join("workspace/out.txt").exists());
         let NodeOutcome::Failed { reason } = &state.nodes[&NodePath::root("choice")] else {
             panic!("expected failed choice")
@@ -184,6 +202,12 @@ output_file = "out.txt"
             finished["reason"],
             serde_json::to_value(&failure.detail).unwrap()
         );
+        if cap == 100 {
+            assert_eq!(
+                finished["reason"]["exhaustion"],
+                serde_json::json!({"resource": "iterations", "used": 1, "allowed": 1})
+            );
+        }
         let terminal = events.iter().find(|e| e["t"] == "run_finished").unwrap();
         assert!(
             terminal["failures"]
@@ -194,6 +218,12 @@ output_file = "out.txt"
                     entry["failure"] == serde_json::to_value(&failure.detail).unwrap()
                 })
         );
+        if cap == 100 {
+            assert_eq!(
+                terminal["failures"][0]["failure"]["exhaustion"],
+                serde_json::json!({"resource": "iterations", "used": 1, "allowed": 1})
+            );
+        }
         let audit: Vec<Value> = std::fs::read_to_string(root.join("meta/audit.jsonl"))
             .unwrap()
             .lines()

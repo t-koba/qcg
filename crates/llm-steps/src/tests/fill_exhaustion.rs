@@ -48,8 +48,10 @@ impl Drop for Fixture {
 }
 
 #[tokio::test]
-async fn fill_local_token_exhaustion_retains_exact_terminal_facts() {
-    for (cap, retries, expected_calls) in [(5, 1, 2), (5, 2, 4), (10, 1, 2)] {
+async fn fill_local_resource_exhaustion_retains_exact_terminal_facts() {
+    for (cap, retries, expected_calls, max_iterations) in
+        [(5, 1, 2, 3), (5, 2, 4, 3), (10, 1, 2, 3), (100, 1, 1, 1)]
+    {
         let fixture = Fixture(
             Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
                 "qcg-fill-exhaustion-{}-{}",
@@ -96,7 +98,7 @@ backoff_ms = 0
 on_indeterminate = "fail"
 [flow.params]
 prompt = "prompt.txt"
-max_iterations = 3
+max_iterations = {max_iterations}
 max_tokens_total = {cap}
 output_file = "out.json"
 "#
@@ -151,20 +153,38 @@ output_file = "out.json"
         let Progress::Failed(failure) = progress else {
             panic!("{progress:?}")
         };
+        let (resource, used, allowed, expected_message) = if cap == 100 {
+            (
+                "iterations",
+                1,
+                1,
+                "step `fill` failed: LLM response did not satisfy schema after 1 attempt(s): LLM response was not JSON: expected value at line 1 column 1".to_string(),
+            )
+        } else {
+            (
+                "tokens_total",
+                10,
+                cap,
+                format!("step `fill` failed: llm.fill token budget exceeded: 10 > {cap}"),
+            )
+        };
         assert_eq!(failure.code, FailureCode::ExecutionFailed);
         assert_eq!(
             failure.exhaustion,
             Some(BudgetExhaustion {
-                resource: "tokens_total".into(),
-                used: 10,
-                allowed: cap,
+                resource: resource.into(),
+                used,
+                allowed,
                 used_subsec_nanoseconds: None,
             })
         );
-        assert_eq!(
-            failure.message,
-            format!("step `fill` failed: llm.fill token budget exceeded: 10 > {cap}")
-        );
+        if cap == 100 {
+            assert!(failure.message.starts_with(
+                "step `fill` failed: LLM response did not satisfy schema after 1 attempt(s): LLM response was not JSON:"
+            ));
+        } else {
+            assert_eq!(failure.message, expected_message);
+        }
         assert!(!root.join("workspace/out.json").exists());
         let NodeOutcome::Failed { reason } = &state.nodes[&NodePath::root("fill")] else {
             panic!("expected failed fill")
@@ -184,6 +204,12 @@ output_file = "out.json"
             finished["reason"],
             serde_json::to_value(&failure.detail).unwrap()
         );
+        if cap == 100 {
+            assert_eq!(
+                finished["reason"]["exhaustion"],
+                serde_json::json!({"resource": "iterations", "used": 1, "allowed": 1})
+            );
+        }
         let terminal = events.iter().find(|e| e["t"] == "run_finished").unwrap();
         assert!(
             terminal["failures"]
@@ -194,6 +220,12 @@ output_file = "out.json"
                     entry["failure"] == serde_json::to_value(&failure.detail).unwrap()
                 })
         );
+        if cap == 100 {
+            assert_eq!(
+                terminal["failures"][0]["failure"]["exhaustion"],
+                serde_json::json!({"resource": "iterations", "used": 1, "allowed": 1})
+            );
+        }
         let audit: Vec<Value> = std::fs::read_to_string(root.join("meta/audit.jsonl"))
             .unwrap()
             .lines()

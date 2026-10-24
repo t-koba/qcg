@@ -46,7 +46,6 @@ impl StepExecutor for LlmChooseStep {
         validate_retry_budget(node, &params)?;
         Ok(())
     }
-
     async fn execute(
         &self,
         ctx: &mut StepContext<'_>,
@@ -101,9 +100,10 @@ impl StepExecutor for LlmChooseStep {
             record_llm_validation_failure(ctx, node, attempt, &message)?;
             last_error = Some(message);
         }
-        Err(StepError::failed(
+        Err(local_exhaustion(
             &node.id,
-            format!("LLM did not choose one of declared options after {max_attempts} attempt(s)"),
+            &format!("LLM did not choose one of declared options after {max_attempts} attempt(s)"),
+            ("iterations", max_attempts as u64, max_attempts as u64),
         ))
     }
 }

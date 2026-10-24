@@ -30,7 +30,6 @@ pub(crate) async fn complete_text_with_prompt(
         usage: response.usage,
     })
 }
-
 pub(crate) fn validate_retry_budget(node: &NodeDef, params: &LlmParams) -> Result<(), StepError> {
     let iterations = params
         .max_iterations
@@ -53,7 +52,6 @@ pub(crate) fn validate_retry_budget(node: &NodeDef, params: &LlmParams) -> Resul
     Ok(())
 }
 pub(crate) type ResourceFacts = (&'static str, u64, u64);
-
 pub(crate) fn local_exhaustion(node: &str, prefix: &str, facts: ResourceFacts) -> StepError {
     let (resource, used, allowed) = facts;
     StepError::LocalResourceExhausted {
@@ -61,7 +59,11 @@ pub(crate) fn local_exhaustion(node: &str, prefix: &str, facts: ResourceFacts) -
         resource,
         used,
         allowed,
-        message: format!("{prefix}: {used} > {allowed}"),
+        message: if used == allowed {
+            prefix.into()
+        } else {
+            format!("{prefix}: {used} > {allowed}")
+        },
     }
 }
 pub(crate) fn checked_usage_total(

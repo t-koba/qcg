@@ -21,7 +21,6 @@ use crate::validation::validate_llm_node;
 pub(crate) struct LlmGenerateStep {
     pub(crate) runtime: Arc<LlmRuntime>,
 }
-
 pub(crate) struct LlmFillStep {
     pub(crate) runtime: Arc<LlmRuntime>,
 }
@@ -79,7 +78,6 @@ impl StepExecutor for LlmFillStep {
             })),
         ))
     }
-
     fn validate(&self, node: &NodeDef, contract: &Contract) -> Result<(), StepError> {
         let params = llm_params(node)?;
         validate_llm_node(
@@ -93,7 +91,6 @@ impl StepExecutor for LlmFillStep {
         validate_retry_budget(node, &params)?;
         Ok(())
     }
-
     async fn execute(
         &self,
         ctx: &mut StepContext<'_>,
@@ -161,12 +158,13 @@ impl StepExecutor for LlmFillStep {
                 files,
             });
         }
-        Err(StepError::failed(
+        Err(local_exhaustion(
             &node.id,
-            format!(
+            &format!(
                 "LLM response did not satisfy schema after {max_attempts} attempt(s): {}",
-                last_error.unwrap_or_else(|| "unknown validation error".into())
+                last_error.unwrap()
             ),
+            ("iterations", max_attempts as u64, max_attempts as u64),
         ))
     }
 }
