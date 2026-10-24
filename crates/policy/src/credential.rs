@@ -446,26 +446,15 @@ pub fn extract_mcp_destinations(args: &serde_json::Value) -> std::collections::B
     fn walk(value: &serde_json::Value, hosts: &mut std::collections::BTreeSet<String>) {
         match value {
             serde_json::Value::String(text) => {
-                let Ok(url) = url::Url::parse(text.trim()) else {
-                    return;
-                };
-                if !matches!(url.scheme(), "http" | "https") {
-                    return;
-                }
-                if let Some(host) = url.host_str() {
+                if let Ok(url) = url::Url::parse(text.trim())
+                    && matches!(url.scheme(), "http" | "https")
+                    && let Some(host) = url.host_str()
+                {
                     hosts.insert(host.to_lowercase());
                 }
             }
-            serde_json::Value::Array(items) => {
-                for item in items {
-                    walk(item, hosts);
-                }
-            }
-            serde_json::Value::Object(map) => {
-                for value in map.values() {
-                    walk(value, hosts);
-                }
-            }
+            serde_json::Value::Array(items) => items.iter().for_each(|item| walk(item, hosts)),
+            serde_json::Value::Object(map) => map.values().for_each(|value| walk(value, hosts)),
             _ => {}
         }
     }
