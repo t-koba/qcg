@@ -2,6 +2,24 @@
 //! environment mutation can race unrelated tests.
 use std::{path::PathBuf, time::Duration};
 
+/// Wall-clock budget for a fixture client to start and publish its pid.
+///
+/// A deadline that has to cover the client's start cannot be smaller than
+/// the start itself: the measured publish latency is a few milliseconds on
+/// an idle runner, stayed under 120 ms on a runner oversubscribed threefold,
+/// and reached 444 ms on the same runner, so every deadline that covers a
+/// client start uses this budget. It stays below the client's own lifetime
+/// so a timeout still fires before the client exits on its own.
+#[cfg(target_os = "linux")]
+pub(super) const CLIENT_START_BUDGET: Duration = Duration::from_secs(2);
+
+/// Slack allowed between a stage deadline and the operation's return.
+///
+/// The deadline is honored to within the timer wakeup delay, which a loaded
+/// runner can stretch; the probe count carries the deterministic evidence
+/// that the deadline is global.
+pub(super) const DEADLINE_OVERSHOOT_SLACK: Duration = Duration::from_secs(1);
+
 /// How long a test waits for the container's outstanding cleanups to join.
 ///
 /// The cleanup itself is bounded by the container timeout, but it starts on a

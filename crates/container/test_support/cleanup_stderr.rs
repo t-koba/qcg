@@ -1,26 +1,11 @@
 //! Unix process/pipe regressions. Every fixture uses its own absolute path;
 //! no PATH or other process-wide environment changes are needed.
+#[cfg(target_os = "linux")]
+use super::daemon_policy_test_support::CLIENT_START_BUDGET;
+use super::daemon_policy_test_support::DEADLINE_OVERSHOOT_SLACK;
 use super::*;
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
-
-/// Wall-clock budget for a fixture client to start and publish its pid.
-///
-/// A deadline that has to cover the client's start cannot be smaller than
-/// the start itself: the measured publish latency is a few milliseconds on
-/// an idle runner, stayed under 120 ms on a runner oversubscribed threefold,
-/// and reached 444 ms on the same runner, so every deadline that covers a
-/// client start uses this budget. It stays below the client's own lifetime
-/// so a timeout still fires before the client exits on its own.
-#[cfg(target_os = "linux")]
-const CLIENT_START_BUDGET: Duration = Duration::from_secs(2);
-
-/// Slack allowed between a stage deadline and the operation's return.
-///
-/// The deadline is honored to within the timer wakeup delay, which a loaded
-/// runner can stretch; the probe count carries the deterministic evidence
-/// that the deadline is global.
-const DEADLINE_OVERSHOOT_SLACK: Duration = Duration::from_secs(1);
 
 /// How long the fixture client stays alive after it publishes its pid.
 ///

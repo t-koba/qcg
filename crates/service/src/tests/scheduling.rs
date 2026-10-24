@@ -5,19 +5,6 @@ use api::{RunStatus, StartRun};
 use camino::Utf8Path;
 use std::time::{Duration, Instant};
 
-/// The elapsed budget the timing tests declare.
-///
-/// It must exceed the run's own queue and startup: a loaded runner spent
-/// 1.04 s there, so a one-second budget expired before the run reached the
-/// state under test.
-const ELAPSED_BUDGET_SECS: u64 = 3;
-
-/// The dwell that lets the wall-clock budget expire before the resume.
-///
-/// It must exceed the budget, or the wall-clock case would not prove that
-/// the expired budget is what stops the run.
-const ELAPSED_BUDGET_DWELL: Duration = Duration::from_millis(3500);
-
 fn generator(root: &Utf8Path, id: &str, delay: &str) {
     let dir = root.join(id);
     std::fs::create_dir_all(&dir).unwrap();
