@@ -4,7 +4,6 @@ use camino::{Utf8Path, Utf8PathBuf};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-#[cfg(unix)]
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -23,6 +22,15 @@ pub(super) const ELAPSED_BUDGET_SECS: u64 = 3;
 /// the expired budget is what stops the run.
 #[cfg(unix)]
 pub(super) const ELAPSED_BUDGET_DWELL: Duration = Duration::from_millis(3500);
+
+/// Shared wall-clock bound for the removal tests' terminal-to-state-file poll.
+/// Both tests wait on the same state writer and use the same persistence edge.
+/// Five repeats per case under same-core CPU contention observed at most 363 µs
+/// from terminal snapshot to the satisfying state read (five ordinary repeats
+/// per case stayed below 1 ms). The fixed 1 s bound is over 2,700x that maximum;
+/// this is an engineering margin, not a statistical guarantee. Keep the bound
+/// fixed until a naturally occurring CI observation supports ratcheting it down.
+pub(super) const REMOVAL_STATE_SYNC_BUDGET: Duration = Duration::from_secs(1);
 
 pub(crate) fn temp_run_dir(name: &str) -> Utf8PathBuf {
     let dir = std::env::temp_dir().join(format!("service-test-{name}-{}", uuid::Uuid::now_v7()));

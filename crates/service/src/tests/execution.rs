@@ -1125,8 +1125,9 @@ done
     // being terminal does not mean the state file already carries the
     // last events. Wait for the state that holds both halves of the
     // claim, then assert on it.
-    let mut state = Value::Null;
-    for _ in 0..200 {
+    let mut state: Value;
+    let deadline = tokio::time::Instant::now() + REMOVAL_STATE_SYNC_BUDGET;
+    loop {
         state = std::fs::read(&state_path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
@@ -1144,7 +1145,7 @@ done
                     .iter()
                     .any(|removal| removal.as_str() == Some("out/note.txt"))
             });
-        if cleared && recorded {
+        if (cleared && recorded) || tokio::time::Instant::now() >= deadline {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1420,8 +1421,9 @@ done
     // being terminal does not mean the state file already carries the
     // last events. Wait for the state that holds both halves of the
     // claim, then assert on it.
-    let mut state = Value::Null;
-    for _ in 0..200 {
+    let mut state: Value;
+    let deadline = tokio::time::Instant::now() + REMOVAL_STATE_SYNC_BUDGET;
+    loop {
         state = std::fs::read(&state_path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
@@ -1439,7 +1441,7 @@ done
                     .iter()
                     .any(|removal| removal.as_str() == Some("out/note.txt"))
             });
-        if pinned && !removed {
+        if (pinned && !removed) || tokio::time::Instant::now() >= deadline {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
