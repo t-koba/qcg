@@ -5,6 +5,7 @@ Covers checklist G04-01..G04-04 against the real `clients/python/qcg_client.py`
 """
 from __future__ import annotations
 
+from contextlib import closing
 import json
 import sys
 import threading
@@ -100,7 +101,7 @@ def test_g04_03_multi_data_and_eof() -> None:
     print("G04-03 multi-data/EOF passed")
 
 
-def test_g04_04_release_on_break_and_error() -> None:
+def test_g04_04_explicit_close_and_parse_error() -> None:
     wire = b"data: {\"a\": 1}\n\ndata: {\"b\": 2}\n\n"
     raw = FakeRaw([wire[:10], wire[10:]])
     client = QcgClient(base_url="http://127.0.0.1:9")
@@ -109,7 +110,7 @@ def test_g04_04_release_on_break_and_error() -> None:
     first = next(stream)
     assert first == {"a": 1}
     stream.close()  # generator close -> finally releases the connection
-    assert raw.close_calls >= 1, "breaking the consumer must release the connection"
+    assert raw.close_calls >= 1, "explicit generator close must release the connection"
     # A parse error still releases the connection.
     raw2 = FakeRaw([b"data: not-json\n\n"])
     client._open = lambda request: raw2  # type: ignore[method-assign]
@@ -120,7 +121,18 @@ def test_g04_04_release_on_break_and_error() -> None:
     else:
         raise AssertionError("malformed JSON must raise")
     assert raw2.close_calls >= 1, "a parse error must release the connection"
-    print("G04-04 release passed")
+    print("G04-04 explicit close/parse-error cleanup passed")
+
+
+def test_g04_04_context_manager_closes_after_early_exit() -> None:
+    wire = b"data: {\"a\": 1}\n\ndata: {\"b\": 2}\n\n"
+    raw = FakeRaw([wire])
+    client = QcgClient(base_url="http://127.0.0.1:9")
+    client._open = lambda request: raw  # type: ignore[method-assign]
+    with closing(client.stream_run_events("r1")) as stream:
+        assert next(stream) == {"a": 1}
+    assert raw.close_calls >= 1, "contextlib.closing must release the response after early exit"
+    print("G04-04 context-manager early-exit cleanup passed")
 
 
 class FlushHandler(BaseHTTPRequestHandler):
@@ -268,7 +280,8 @@ def test_frame_limit() -> None:
 if __name__ == "__main__":
     test_g04_02_split_positions_match_unsplit()
     test_g04_03_multi_data_and_eof()
-    test_g04_04_release_on_break_and_error()
+    test_g04_04_explicit_close_and_parse_error()
+    test_g04_04_context_manager_closes_after_early_exit()
     test_g04_01_immediate_delivery_over_real_http()
     test_typed_readers()
     test_frame_limit()

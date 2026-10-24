@@ -1082,8 +1082,11 @@ uses read1 so flushed tens-of-bytes events arrive while the stream stays
 open). CR immediately ends a line; one following LF is swallowed across
 chunk boundaries, so split CRLF is one break. Multi-data lines join with LF;
 an EOF without a terminating blank line dispatches only already-terminated
-frames and never fabricates an event from the tail. Breaking the consumer
-or a parse failure releases the connection/reader.
+frames and never fabricates an event from the tail. Python's
+\`stream_run_events\` is a generator: after an early exit, explicitly close
+it, for example with \`contextlib.closing(client.stream_run_events(run_id))\`
+to release the response. TypeScript's async generator releases its reader
+when the consumer returns early; parse failures also run its cleanup.
 
 Run snapshots expose \`queue_position_quality\`: \`exact\`, \`estimated\`, or
 \`unavailable\`. Python returns the same fields in dictionaries. Transport
