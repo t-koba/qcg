@@ -50,6 +50,7 @@ bash scripts/check-capability-matrix.sh
 bash scripts/check-sdk.sh
 bash scripts/check-sdk-behavior.sh
 python3 scripts/comparison/test_run_cleanup.py
+python3 scripts/test-ci-job-minutes.py
 bash scripts/check-third-party-notices.sh
 # Clippy covers all targets here; the MSRV job keeps a separate plain workspace check.
 cargo clippy --workspace --all-targets --locked -- -D warnings
