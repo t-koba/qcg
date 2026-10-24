@@ -41,8 +41,8 @@ use crate::tool_events::{
     record_tool_call_failure, record_tool_call_failures, tool_call_event, tool_call_failure,
     tool_call_outcome, tool_reported_error,
 };
-use crate::validation::validate_llm_node;
 
+use crate::validation::validate_llm_node;
 pub(crate) struct LlmAgentStep {
     pub(crate) runtime: Arc<LlmRuntime>,
 }
@@ -119,7 +119,6 @@ impl std::fmt::Debug for AgentCheckpoint {
             .finish()
     }
 }
-
 /// A tool call suspended for user input, identified exactly as the
 /// journaled continuation key identifies it. `builtin` marks an AskUser
 /// call whose identity must be re-issued verbatim on resume, even before an
@@ -339,7 +338,6 @@ fn resumed_builtin_call(checkpoint: Option<&AgentCheckpoint>) -> Option<McpSuspe
     let suspended = checkpoint?.pending_mcp_call.clone()?;
     suspended.builtin.then_some(suspended)
 }
-
 #[async_trait]
 impl StepExecutor for LlmAgentStep {
     engine::step_type_id!("llm.agent");
@@ -1704,6 +1702,9 @@ pub(crate) fn record_agent_checkpoint(
     // bytes; a redacted journal copy alone still fails closed.
     use crate::agent_runtime::{redact_messages_for_journal, redact_tool_call_for_journal};
     let mut journaled = checkpoint.clone();
+    // Stamp the authoritative removal set; prior agent_file_changes survive.
+    let (root, folded) = (NodePath::root(&node.id), ctx.journal.state());
+    journaled.removed_files = folded.removed_files.get(&root).cloned().unwrap_or_default();
     if let Some(call) = checkpoint.pending_side_effect.as_ref() {
         journaled.pending_side_effect = Some(redact_tool_call_for_journal(tools, call));
         // Non-public continuation (F02): store the full call bound to this
@@ -2509,5 +2510,96 @@ mod tests {
             "invalid forms must write zero journal events"
         );
         let _ = journal;
+    }
+
+    #[test]
+    fn checkpoint_preserves_folded_removal_set_from_same_node_key() {
+        // The checkpoint carries the attempt's complete removal set: a
+        // removal folded from a prior agent_file_changes event for the
+        // same node must survive a later checkpoint that passes an empty
+        // set, because record_agent_checkpoint stamps the authoritative
+        // root-node set from folded journal state.
+        let run_id = format!("agent-checkpoint-removal-{}", std::process::id());
+        let (_temp, journal, journal_path) = execute_level_journal("checkpoint-removal", &run_id);
+        let root = journal_path.parent().expect("journal parent");
+        let workspace = root.join("workspace");
+        let metadata = root.join("meta");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::create_dir_all(&metadata).expect("metadata");
+        std::fs::write(
+            root.join(contract::MANIFEST_FILE),
+            "[generator]\nid = \"t\"\nname = \"t\"\nversion = \"0.1.0\"\n\n[llm]\nmodel = { provider = \"fake\", model = \"test\" }\nmax_tokens = 8\n\n[[flow]]\nid = \"agent\"\ntype = \"llm.agent\"\n\n[flow.params]\nprompt = \"p\"\nmax_iterations = 1\nmax_tokens_total = 8\n",
+        )
+        .expect("manifest");
+        let contract = contract::Contract::load(root).expect("contract");
+        let node = NodeDef {
+            id: "agent".into(),
+            kind: contract::StepType::literal("llm.agent"),
+            needs: vec![],
+            when: None,
+            on_deps: contract::OnDeps::AllSucceeded,
+            context: vec![],
+            output: None,
+            artifact: None,
+            on_fail: None,
+            failure: None,
+            retry: None,
+            params: Default::default(),
+        };
+        let run = engine::RunContext::for_tests(
+            run_id.clone(),
+            workspace,
+            metadata,
+            contract,
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .expect("run");
+        journal
+            .event(
+                "agent_file_changes",
+                json!({
+                    "node": "agent",
+                    "removed_files": ["out/note.txt"],
+                    "written_files": [],
+                }),
+            )
+            .expect("removal should journal");
+        assert_eq!(
+            journal.state().removed_files[&model::NodePath::root("agent")],
+            BTreeSet::from(["out/note.txt".to_string()]),
+            "folded removal must be visible before the checkpoint"
+        );
+        let mut vars = contract::ValueBag::with_inputs(BTreeMap::new());
+        let ctx = engine::StepContext {
+            run: &run,
+            journal: &journal,
+            vars: &mut vars,
+            llm: None,
+        };
+        let checkpoint = AgentCheckpoint {
+            messages: Vec::new(),
+            next_turn: 1,
+            tokens_total: 0,
+            tool_calls_total: 0,
+            tool_call_counts: BTreeMap::new(),
+            pending_side_effect: None,
+            pending_confirm: None,
+            pending_mcp_call: None,
+            used_calls: BTreeMap::new(),
+            removed_files: BTreeSet::new(),
+        };
+        record_agent_checkpoint(&ctx, &node, 1, "turn_completed", &checkpoint, &[])
+            .expect("checkpoint should journal");
+        assert_eq!(
+            journal.state().removed_files[&model::NodePath::root("agent")],
+            BTreeSet::from(["out/note.txt".to_string()]),
+            "the checkpoint must preserve the folded removal"
+        );
+        assert_eq!(
+            journal.state().checkpoints[&model::NodePath::root("agent")]["removed_files"],
+            json!(["out/note.txt"]),
+            "the journaled checkpoint must carry the authoritative set"
+        );
     }
 }
