@@ -541,6 +541,16 @@ impl HttpProvider {
         }
     }
 
+    async fn with_request_slot<T>(
+        &self,
+        request: impl std::future::Future<Output = Result<T, LlmError>>,
+    ) -> Result<T, LlmError> {
+        let _slot = self.acquire_request_slot().await?;
+        let result = request.await;
+        self.record_request_result(&result);
+        result
+    }
+
     async fn send(
         &self,
         payload: Value,
@@ -957,8 +967,7 @@ impl LlmProvider for HttpProvider {
             return Err(LlmError::new("provider does not support typed decisions"));
         }
         req.validate()?;
-        let _slot = self.acquire_request_slot().await?;
-        let result = async {
+        self.with_request_slot(async {
             let payload = req.payload_for(
                 self.spec.decision_model_in_body,
                 self.spec.decision_input_wrapper,
@@ -968,20 +977,14 @@ impl LlmProvider for HttpProvider {
                 crate::parse_decision_response(value, self.spec.decision_response_wrapper)?;
             response.validate(&req)?;
             Ok(response)
-        }
-        .await;
-        self.record_request_result(&result);
-        result
+        })
+        .await
     }
 
     async fn complete(&self, req: ChatRequest) -> Result<ChatResponse, LlmError> {
         let payload = self.prepare_request(&req)?;
-        let _slot = self.acquire_request_slot().await?;
-        let result = self
-            .send(payload, &req.model, req.provider_web_search.is_some())
-            .await;
-        self.record_request_result(&result);
-        result
+        self.with_request_slot(self.send(payload, &req.model, req.provider_web_search.is_some()))
+            .await
     }
 
     async fn stream(
@@ -994,17 +997,13 @@ impl LlmProvider for HttpProvider {
         if self.spec.api == ApiFlavor::ChatCompletions {
             payload["stream_options"] = json!({ "include_usage": true });
         }
-        let _slot = self.acquire_request_slot().await?;
-        let result = self
-            .send_stream(
-                payload,
-                &req.model,
-                req.provider_web_search.is_some(),
-                events,
-            )
-            .await;
-        self.record_request_result(&result);
-        result
+        self.with_request_slot(self.send_stream(
+            payload,
+            &req.model,
+            req.provider_web_search.is_some(),
+            events,
+        ))
+        .await
     }
 }
 
