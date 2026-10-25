@@ -68,6 +68,7 @@ pub struct SearchProviderSpec {
 
 impl SearchProviderSpec {
     pub(crate) fn validate(&self) -> Result<(), String> {
+        let invalid = |message: &str| format!("search provider `{}` {message}", self.id);
         if !is_provider_id(&self.id) {
             return Err(format!(
                 "search provider id `{}` must contain only lowercase ASCII letters, digits, `.`, `_`, or `-`",
@@ -75,26 +76,19 @@ impl SearchProviderSpec {
             ));
         }
         if self.endpoint.is_none() && self.endpoint_env.is_none() {
-            return Err(format!(
-                "search provider `{}` must declare `endpoint` or `endpoint_env`",
-                self.id
-            ));
+            return Err(invalid("must declare `endpoint` or `endpoint_env`"));
         }
-        if let Some(name) = self.endpoint_env.as_deref()
-            && !is_env_name(name)
-        {
-            return Err(format!(
-                "search provider `{}` has an invalid `endpoint_env` environment variable name `{name}`",
-                self.id
-            ));
-        }
-        if let Some(name) = self.api_key_env.as_deref()
-            && !is_env_name(name)
-        {
-            return Err(format!(
-                "search provider `{}` has an invalid `api_key_env` environment variable name `{name}`",
-                self.id
-            ));
+        for (field, name) in [
+            ("endpoint_env", self.endpoint_env.as_deref()),
+            ("api_key_env", self.api_key_env.as_deref()),
+        ] {
+            if let Some(name) = name
+                && !is_env_name(name)
+            {
+                return Err(invalid(&format!(
+                    "has an invalid `{field}` environment variable name `{name}`"
+                )));
+            }
         }
         if let Some(endpoint) = self.endpoint.as_deref() {
             validate_endpoint(&self.id, endpoint, self.api_key_env.is_some())?;
@@ -106,96 +100,73 @@ impl SearchProviderSpec {
         if let Some(value) = self.auth_query_param.as_deref() {
             validate_parameter_name(&self.id, "auth_query_param", value)?;
             if self.query.contains_key(value) {
-                return Err(format!(
-                    "search provider `{}` static query must not override auth_query_param `{value}`",
-                    self.id
-                ));
+                return Err(invalid(&format!(
+                    "static query must not override auth_query_param `{value}`"
+                )));
             }
         }
         for name in self.query.keys() {
             validate_parameter_name(&self.id, "static query parameter", name)?;
         }
         if self.body.keys().any(String::is_empty) {
-            return Err(format!(
-                "search provider `{}` body field names must not be empty",
-                self.id
-            ));
+            return Err(invalid("body field names must not be empty"));
         }
         if self.method == SearchMethod::Get && (!self.body.is_empty() || self.query_is_array) {
-            return Err(format!(
-                "search provider `{}` may use `body` and `query_is_array` only with method = \"post\"",
-                self.id
+            return Err(invalid(
+                "may use `body` and `query_is_array` only with method = \"post\"",
             ));
         }
-        if self.method == SearchMethod::Get {
-            if self.query.contains_key(&self.query_param) {
-                return Err(format!(
-                    "search provider `{}` static query must not override query_param `{}`",
-                    self.id, self.query_param
-                ));
+        let reserved = |name: &str| {
+            if self.method == SearchMethod::Get {
+                self.query.contains_key(name)
+            } else {
+                self.body.contains_key(name)
             }
-            if self
-                .limit_param
-                .as_ref()
-                .is_some_and(|name| self.query.contains_key(name))
-            {
-                return Err(format!(
-                    "search provider `{}` static query must not override limit_param",
-                    self.id
-                ));
-            }
+        };
+        let kind = if self.method == SearchMethod::Get {
+            "query"
         } else {
-            if self.body.contains_key(&self.query_param) {
-                return Err(format!(
-                    "search provider `{}` static body must not override query_param `{}`",
-                    self.id, self.query_param
-                ));
-            }
-            if self
-                .limit_param
-                .as_ref()
-                .is_some_and(|name| self.body.contains_key(name))
-            {
-                return Err(format!(
-                    "search provider `{}` static body must not override limit_param",
-                    self.id
-                ));
-            }
+            "body"
+        };
+        if reserved(&self.query_param) {
+            return Err(invalid(&format!(
+                "static {kind} must not override query_param `{}`",
+                self.query_param
+            )));
+        }
+        if self.limit_param.as_ref().is_some_and(|name| reserved(name)) {
+            return Err(invalid(&format!(
+                "static {kind} must not override limit_param"
+            )));
         }
         if self
             .limit_param
             .as_ref()
             .is_some_and(|name| name == &self.query_param)
         {
-            return Err(format!(
-                "search provider `{}` limit_param must differ from query_param",
-                self.id
-            ));
+            return Err(invalid("limit_param must differ from query_param"));
         }
         if self.auth_query_param.as_ref().is_some_and(|name| {
             name == &self.query_param || self.limit_param.as_ref() == Some(name)
         }) {
-            return Err(format!(
-                "search provider `{}` auth_query_param must differ from query_param and limit_param",
-                self.id
+            return Err(invalid(
+                "auth_query_param must differ from query_param and limit_param",
             ));
         }
         for (header, value) in &self.headers {
             if !valid_http_header_name(header) || value.contains(['\r', '\n']) {
-                return Err(format!(
-                    "search provider `{}` has an invalid static HTTP header `{header}`",
-                    self.id
-                ));
+                return Err(invalid(&format!(
+                    "has an invalid static HTTP header `{header}`"
+                )));
             }
             if self
                 .auth_header
                 .as_deref()
                 .is_some_and(|auth| auth.eq_ignore_ascii_case(header))
             {
-                return Err(format!(
-                    "search provider `{}` static headers must not override auth_header `{header}`",
-                    self.id
-                ));
+                return Err(invalid(&format!(
+                    "static headers must not override auth_header `{header}`"
+                )));
             }
         }
         match (
@@ -206,23 +177,16 @@ impl SearchProviderSpec {
             (None, None, None) if self.auth_prefix.is_empty() => {}
             (Some(_), Some(header), None) => {
                 if !valid_http_header_name(header) {
-                    return Err(format!(
-                        "search provider `{}` has an invalid auth_header `{header}`",
-                        self.id
-                    ));
+                    return Err(invalid(&format!("has an invalid auth_header `{header}`")));
                 }
                 if self.auth_prefix.contains(['\r', '\n']) {
-                    return Err(format!(
-                        "search provider `{}` auth_prefix must not contain a line break",
-                        self.id
-                    ));
+                    return Err(invalid("auth_prefix must not contain a line break"));
                 }
             }
             (Some(_), None, Some(_)) if self.auth_prefix.is_empty() => {}
             _ => {
-                return Err(format!(
-                    "search provider `{}` must pair api_key_env with exactly one of auth_header or auth_query_param",
-                    self.id
+                return Err(invalid(
+                    "must pair api_key_env with exactly one of auth_header or auth_query_param",
                 ));
             }
         }
@@ -339,10 +303,8 @@ impl SearchProfile {
 
     pub fn configuration_error(&self) -> Option<String> {
         let mut errors = self.config_errors.clone();
-        if let Some(name) = self.credential_env.as_deref()
-            && !matches!(std::env::var(name), Ok(value) if !value.is_empty())
-        {
-            errors.push(format!("set `{name}` before running the generator"));
+        if let Some(error) = self.credential().err() {
+            errors.push(error);
         }
         (!errors.is_empty()).then(|| errors.join("; "))
     }
