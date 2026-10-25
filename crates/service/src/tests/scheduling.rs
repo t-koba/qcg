@@ -96,7 +96,13 @@ async fn bounded_scheduler_comparison_boundary_safety_and_interrupt_latency() {
                 "0.3"
             };
             generator(&root, "slow", slow_command);
-            generator(&root, "urgent", "0.1");
+            // Keep the urgent run observable in Running until the test releases
+            // it; the finite wait also prevents a failed assertion orphaning a shell.
+            let urgent_command = concat!(
+                "0; count=0; while [ ! -f release ] && [ $count -lt 500 ]; ",
+                "do sleep 0.02; count=$((count + 1)); done; test -f release",
+            );
+            generator(&root, "urgent", urgent_command);
             let mut deployment = if mode == PreemptionMode::Interrupt {
                 ServiceDeploymentPolicy {
                     preemption_mode: mode,
@@ -131,7 +137,13 @@ async fn bounded_scheduler_comparison_boundary_safety_and_interrupt_latency() {
                 start(&service, "urgent", 5).await
             };
             wait_for_snapshot(&service, &urgent, RunStatus::Running).await;
+            operation_started(&service, &urgent).await;
             let admission = clock.elapsed();
+            std::fs::write(
+                run_workspace_dir(&service.inner.runs_dir.join(&urgent)).join("release"),
+                "go",
+            )
+            .unwrap();
             let journal = read_journal_string(&service, victim.clone()).await;
             if mode == PreemptionMode::StepBoundary {
                 assert!(journal.contains("run_yielded"));
