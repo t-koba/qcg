@@ -10,7 +10,37 @@ export function toolCallLabel(data: unknown, messages: Messages): string {
     toolCallStatus(value.status, messages),
     toolCallPhase(value.phase, messages),
     typeof record(value.error).message === "string" ? record(value.error).message : "",
+    record(value.cleanup_error).code === "cleanup_failed"
+      ? messages.eventMcpCleanupFailed
+      : "",
   ].filter(Boolean).join(" · ");
+}
+
+export function mcpCleanupSettledLabel(data: unknown, messages: Messages): string {
+  const settlement = record(record(data).cleanup_settlement);
+  const policy = cleanupPolicy(settlement.policy, messages);
+  const source = cleanupSource(settlement.source, messages);
+  return [
+    messages.eventMcpCleanupFailed,
+    policy ? `${messages.eventMcpCleanupPolicy}: ${policy}` : "",
+    source ? `${messages.eventMcpCleanupSource}: ${source}` : "",
+  ].filter(Boolean).join(" · ");
+}
+
+function cleanupPolicy(policy: unknown, messages: Messages): string {
+  switch (policy) {
+    case "preserve_execution": return messages.eventMcpCleanupPreserveExecution;
+    case "fail_fast": return messages.eventMcpCleanupFailFast;
+    default: return "";
+  }
+}
+
+function cleanupSource(source: unknown, messages: Messages): string {
+  switch (source) {
+    case "default": return messages.eventMcpCleanupDefaultSource;
+    case "node_parameter": return messages.eventMcpCleanupNodeParameterSource;
+    default: return "";
+  }
 }
 
 function toolCallStatus(status: unknown, messages: Messages): string {

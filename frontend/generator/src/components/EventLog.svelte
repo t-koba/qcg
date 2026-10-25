@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { RunEvent } from "../api/client";
   import type { Messages } from "../messages";
-  import { toolCallLabel } from "../event-log";
+  import { mcpCleanupSettledLabel, toolCallLabel } from "../event-log";
   import { record } from "../progress";
   let { events, messages }: { events: RunEvent[]; messages: Messages } = $props();
 
@@ -27,6 +27,7 @@
         typeof data.agent === "string" ? data.agent : "",
       ].filter(Boolean).join(" · ");
       case "tool_call": return toolCallLabel(data, messages);
+      case "mcp_cleanup_settled": return mcpCleanupSettledLabel(data, messages);
       case "agent_delegated": return [
         messages.eventAgentDelegated,
         typeof data.agent === "string" ? data.agent : "",
