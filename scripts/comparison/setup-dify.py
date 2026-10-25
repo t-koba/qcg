@@ -95,9 +95,17 @@ override = docker_dir / "comparison.override.yaml"
 override.write_text(text)
 compose = [args.compose,"--project-directory",str(docker_dir),"-f",str(docker_dir/"docker-compose.yaml"),"-f",str(override),"-p",project]
 services = ["api","worker","db_postgres","redis","sandbox","ssrf_proxy","plugin_daemon","init_permissions","comparison_gateway"]
-run(compose+["up","-d",*services])
-if output([args.docker,"network","inspect",project+"_default","--format","{{.Internal}}"]).lower() != "true":
-    raise SystemExit("Dify application network is not internal")
+cleanup_command = compose+["down","--volumes"]
+try:
+    run(compose+["up","-d",*services])
+    if output([args.docker,"network","inspect",project+"_default","--format","{{.Internal}}"]).lower() != "true":
+        raise SystemExit("Dify application network is not internal")
+except (Exception, SystemExit):
+    try:
+        run(cleanup_command, timeout=60)
+    except (Exception, SystemExit):
+        pass
+    raise
 config = {"directory": str(directory), "project": project, "url": f"http://127.0.0.1:{port}", "api_container": project+"-api-1", "compose_command": compose}
 (directory/"comparison-config.json").write_text(json.dumps(config,indent=2)+"\n")
 env = {"QCG_DIFY_URL": config["url"],"QCG_DIFY_PROJECT":project,"QCG_DIFY_API_CONTAINER":config["api_container"],"QCG_COMPARISON_DOCKER":args.docker,"QCG_DIFY_ACCOUNT_FILE":str(directory/"account.json")}

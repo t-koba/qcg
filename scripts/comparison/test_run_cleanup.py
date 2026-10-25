@@ -1,6 +1,10 @@
 """No-service regression tests for comparison-runner process cleanup."""
 import asyncio
+from contextlib import redirect_stdout
 import importlib.util
+import io
+import json
+import subprocess
 import sys
 import tempfile
 import types
@@ -187,6 +191,107 @@ class CleanupTests(unittest.TestCase):
                     run.Managed(["missing"], log)
         self.assertEqual(len(opened), 1)
         self.assertTrue(opened[0].closed)
+
+
+class DifySetupCleanupTests(unittest.TestCase):
+    def run_setup(self, root, *, network_internal="true", up_error=None, cleanup_error=None):
+        lock = json.loads((HERE / "runtime-lock.json").read_text())
+        directory = root / "fixture"
+        events = []
+        stdout = io.StringIO()
+
+        def fake_run(command, **options):
+            command = list(command)
+            events.append((command, options.copy()))
+            if command[:2] == ["git", "init"]:
+                docker_dir = Path(command[2]) / "docker"
+                docker_dir.mkdir(parents=True)
+                (docker_dir / ".env.example").write_text("# fixture\n")
+            if "up" in command and up_error is not None:
+                raise up_error
+            if "down" in command and cleanup_error is not None:
+                raise cleanup_error
+            return None
+
+        def fake_check_output(command, **options):
+            command = list(command)
+            if command[:2] == ["docker", "info"]:
+                return f'{lock["docker"]["version"]} name=rootless'
+            if command[:2] == ["docker-compose", "version"]:
+                return f'v{lock["compose"]["version"]}'
+            if command[:2] == ["git", "-C"] and command[-2:] == ["rev-parse", "HEAD"]:
+                return lock["dify"]["revision"]
+            if command[:2] == ["docker", "network"]:
+                return network_internal
+            raise AssertionError(f"unexpected output command: {command}")
+
+        error = None
+        with mock.patch.object(sys, "argv", [
+            "setup-dify.py", "--compose", "docker-compose", "--directory", str(directory)
+        ]):
+            with mock.patch.object(subprocess, "run", side_effect=fake_run):
+                with mock.patch.object(subprocess, "check_output", side_effect=fake_check_output):
+                    with redirect_stdout(stdout):
+                        spec = importlib.util.spec_from_file_location(
+                            "comparison_setup_dify", HERE / "setup-dify.py"
+                        )
+                        module = importlib.util.module_from_spec(spec)
+                        try:
+                            spec.loader.exec_module(module)
+                        except (Exception, SystemExit) as caught:
+                            error = caught
+        return error, events, stdout.getvalue(), directory
+
+    @staticmethod
+    def cleanup_calls(events):
+        return [(command, options) for command, options in events if "down" in command]
+
+    def assert_cleanup_for_started_project(self, events, cleanup):
+        up = next(command for command, _options in events if "up" in command)
+        self.assertEqual(cleanup[:-2], up[:up.index("up")])
+
+    def test_startup_failure_attempts_bounded_cleanup_and_preserves_error(self):
+        with tempfile.TemporaryDirectory(prefix="qcg-dify-cleanup-") as temp:
+            original = subprocess.CalledProcessError(1, ["docker-compose", "up"])
+            error, events, stdout, _directory = self.run_setup(
+                Path(temp), up_error=original, cleanup_error=OSError("cleanup failed")
+            )
+
+        self.assertIs(error, original)
+        cleanup = self.cleanup_calls(events)
+        self.assertEqual(len(cleanup), 1)
+        command, options = cleanup[0]
+        self.assertEqual(command[-2:], ["down", "--volumes"])
+        self.assertEqual(options["timeout"], 60)
+        self.assert_cleanup_for_started_project(events, command)
+        self.assertNotIn("Cleanup only this owned fixture with:", stdout)
+
+    def test_network_verification_failure_cleans_up_owned_project(self):
+        with tempfile.TemporaryDirectory(prefix="qcg-dify-cleanup-") as temp:
+            error, events, stdout, _directory = self.run_setup(
+                Path(temp), network_internal="false"
+            )
+
+        self.assertIsInstance(error, SystemExit)
+        self.assertEqual(str(error), "Dify application network is not internal")
+        cleanup = self.cleanup_calls(events)
+        self.assertEqual(len(cleanup), 1)
+        command, options = cleanup[0]
+        self.assertEqual(command[-2:], ["down", "--volumes"])
+        self.assertEqual(options["timeout"], 60)
+        self.assert_cleanup_for_started_project(events, command)
+        self.assertNotIn("Cleanup only this owned fixture with:", stdout)
+
+    def test_success_keeps_the_cleanup_handle_on_the_success_path(self):
+        with tempfile.TemporaryDirectory(prefix="qcg-dify-cleanup-") as temp:
+            error, events, stdout, directory = self.run_setup(Path(temp))
+            config = json.loads((directory / "comparison-config.json").read_text())
+
+        self.assertIsNone(error)
+        self.assertEqual(self.cleanup_calls(events), [])
+        self.assertIn("Cleanup only this owned fixture with:", stdout)
+        up = next(command for command, _options in events if "up" in command)
+        self.assertEqual(config["project"], up[up.index("-p") + 1])
 
 
 if __name__ == "__main__":
