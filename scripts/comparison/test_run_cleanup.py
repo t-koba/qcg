@@ -238,7 +238,7 @@ class DifySetupCleanupTests(unittest.TestCase):
                         module = importlib.util.module_from_spec(spec)
                         try:
                             spec.loader.exec_module(module)
-                        except (Exception, SystemExit) as caught:
+                        except (Exception, SystemExit, KeyboardInterrupt) as caught:
                             error = caught
         return error, events, stdout.getvalue(), directory
 
@@ -255,6 +255,24 @@ class DifySetupCleanupTests(unittest.TestCase):
             original = subprocess.CalledProcessError(1, ["docker-compose", "up"])
             error, events, stdout, _directory = self.run_setup(
                 Path(temp), up_error=original, cleanup_error=OSError("cleanup failed")
+            )
+
+        self.assertIs(error, original)
+        cleanup = self.cleanup_calls(events)
+        self.assertEqual(len(cleanup), 1)
+        command, options = cleanup[0]
+        self.assertEqual(command[-2:], ["down", "--volumes"])
+        self.assertEqual(options["timeout"], 60)
+        self.assert_cleanup_for_started_project(events, command)
+        self.assertNotIn("Cleanup only this owned fixture with:", stdout)
+
+    def test_keyboard_interrupt_during_startup_cleans_up_and_preserves_interrupt(self):
+        with tempfile.TemporaryDirectory(prefix="qcg-dify-cleanup-") as temp:
+            original = KeyboardInterrupt("startup cancelled")
+            error, events, stdout, _directory = self.run_setup(
+                Path(temp),
+                up_error=original,
+                cleanup_error=KeyboardInterrupt("cleanup interrupted"),
             )
 
         self.assertIs(error, original)

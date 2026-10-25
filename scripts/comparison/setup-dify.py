@@ -100,10 +100,10 @@ try:
     run(compose+["up","-d",*services])
     if output([args.docker,"network","inspect",project+"_default","--format","{{.Internal}}"]).lower() != "true":
         raise SystemExit("Dify application network is not internal")
-except (Exception, SystemExit):
+except (Exception, SystemExit, KeyboardInterrupt):
     try:
         run(cleanup_command, timeout=60)
-    except (Exception, SystemExit):
+    except (Exception, SystemExit, KeyboardInterrupt):
         pass
     raise
 config = {"directory": str(directory), "project": project, "url": f"http://127.0.0.1:{port}", "api_container": project+"-api-1", "compose_command": compose}
