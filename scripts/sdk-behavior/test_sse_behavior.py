@@ -14,7 +14,7 @@ from pathlib import Path
 
 CLIENT = Path(__file__).resolve().parents[2] / "clients" / "python"
 sys.path.insert(0, str(CLIENT))
-from qcg_client import QcgClient, QcgError, RunSnapshot, QueuePositionQuality  # noqa: E402
+from qcg_client import QcgClient, QcgError, RunSnapshot, QueuePositionQuality, _sse_frame_data  # noqa: E402
 
 
 class FakeRaw:
@@ -277,7 +277,25 @@ def test_frame_limit() -> None:
         raise AssertionError("unterminated oversized SSE frame was accepted")
 
 
+def test_raw_whatwg_data_fields() -> None:
+    # Raw WHATWG conformance: `data:` and bare `data` both dispatch "",
+    # while a dispatch with no data field yields None. The public
+    # `stream_run_events` parses only non-empty data strings as JSON.
+    assert _sse_frame_data("data:") == ""
+    assert _sse_frame_data("data") == ""
+    assert _sse_frame_data("data:  value") == " value"
+    assert _sse_frame_data(": comment") is None
+    assert _sse_frame_data("id: 3") is None
+    assert _sse_frame_data("data: {\"a\": 1}") == "{\"a\": 1}"
+    assert _sse_frame_data("data: first\ndata: second") == "first\nsecond"
+    wire = b"data:\n\ndata\n\n"
+    assert collect_with_fake(wire, [1]) == []
+    assert collect_with_fake(wire, [2, 3]) == []
+    print("raw WHATWG data fields passed")
+
+
 if __name__ == "__main__":
+    test_raw_whatwg_data_fields()
     test_g04_02_split_positions_match_unsplit()
     test_g04_03_multi_data_and_eof()
     test_g04_04_explicit_close_and_parse_error()
@@ -291,3 +309,20 @@ for fixture in json.loads((Path(__file__).resolve().parents[1] / "fixtures/sse.j
     wire = bytes.fromhex(fixture["wire_hex"]) if "wire_hex" in fixture else fixture["wire"].encode("utf-8")
     for size in range(1, len(wire) + 1):
         assert collect_with_fake(wire, [size]) == fixture["payloads"], fixture["name"]
+    if "raw_frames" in fixture:
+        # Raw conformance without changing the public contract: decode the
+        # wire like the stream path (BOM once, CR/CRLF to LF), split only on
+        # blank-line terminators, and map each terminated frame through the
+        # same helper the stream path uses. Unterminated tails dispatch nothing.
+        text = wire.decode("utf-8", errors="replace")
+        if text.startswith("\ufeff"):
+            text = text[1:]
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        raw: list[str] = []
+        buf = text
+        while "\n\n" in buf:
+            frame, buf = buf.split("\n\n", 1)
+            data = _sse_frame_data(frame)
+            if data is not None:
+                raw.append(data)
+        assert raw == fixture["raw_frames"], fixture["name"]

@@ -32,7 +32,7 @@ creates a temporary environment automatically. License declarations preserve
 metadata, converting Cargo's deprecated slash alternatives to `OR`; concluded
 licenses remain `NOASSERTION` because this inventory does not audit source licenses.
 
-SSE decoding follows the [WHATWG parsing rules](https://html.spec.whatwg.org/multipage/server-sent-events.html#parsing-an-event-stream).
+SSE decoding follows the [WHATWG parsing rules](https://html.spec.whatwg.org/multipage/server-sent-events.html#parsing-an-event-stream): raw frames dispatch an empty `data:` or bare `data` line as `""` (one leading space after the colon is stripped, multiple data lines join with LF, and a dispatch with no data field dispatches nothing). The public SDK projections (`streamRunEvents` / `stream_run_events`) parse only non-empty data strings as JSON, so empty raw frames are dispatched at the parser level but never surface as JSON events.
 OTLP malformed nonempty success responses are protocol failures; partial
 success advances accepted records without resending the complete batch, as
 required by the [OTLP specification](https://opentelemetry.io/docs/specs/otlp/#partial-success).

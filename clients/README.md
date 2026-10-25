@@ -30,12 +30,19 @@ in browsers, or a dummy origin in Node purely for URL resolution.
 Browser opaque-redirect responses expose no Location header and therefore
 surface as HTTP errors rather than silent follows.
 
-SSE (both clients): utilizable bytes are consumed incrementally (Python
-uses read1 so flushed tens-of-bytes events arrive while the stream stays
-open). CR immediately ends a line; one following LF is swallowed across
-chunk boundaries, so split CRLF is one break. Multi-data lines join with LF;
-an EOF without a terminating blank line dispatches only already-terminated
-frames and never fabricates an event from the tail. Python's
+SSE (both clients): raw frames follow the WHATWG parsing rules: a `data` line
+without a colon carries an empty value like `data:`, one leading space after
+the colon is stripped, multiple data lines join with LF, and a blank-line
+dispatch with no data field yields no frame while an empty data field yields
+`""` (comment-only frames yield nothing). The public `streamRunEvents` /
+`stream_run_events` projection parses only non-empty data strings as JSON using its
+truthy-data guard; empty raw frames are dispatched at the parser level but
+never surface as JSON events. Utilizable bytes are
+consumed incrementally (Python uses read1 so flushed tens-of-bytes events
+arrive while the stream stays open). CR immediately ends a line; one
+following LF is swallowed across chunk boundaries, so split CRLF is one
+break. An EOF without a terminating blank line dispatches only
+already-terminated frames and never fabricates an event from the tail. Python's
 `stream_run_events` is a generator: after an early exit, explicitly close
 it, for example with `contextlib.closing(client.stream_run_events(run_id))`
 to release the response. TypeScript's async generator releases its reader

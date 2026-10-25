@@ -84,6 +84,34 @@ def _normalize_query(query: dict[str, Any] | None) -> dict[str, Any]:
     return cleaned
 
 
+def _sse_frame_data(frame: str) -> str | None:
+    """Raw WHATWG data for one blank-line-terminated SSE frame.
+
+    Returns None when the frame carries no data field, otherwise the
+    LF-joined data values ("" for an empty `data:` or bare `data` line).
+    `stream_run_events` parses only non-empty data strings as JSON,
+    so an empty string never yields; raw conformance still dispatches it.
+    """
+    data_lines: list[str] | None = None
+    for line in frame.split("\n"):
+        if not line or line.startswith(":"):
+            continue
+        if line == "data":
+            value = ""
+        elif line.startswith("data:"):
+            value = line[5:]
+            if value.startswith(" "):
+                value = value[1:]
+        else:
+            continue
+        if data_lines is None:
+            data_lines = []
+        data_lines.append(value)
+    if data_lines is None:
+        return None
+    return "\n".join(data_lines)
+
+
 class _NoCrossOriginAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Strips Authorization on cross-origin redirects and downgrades (F04)."""
 
@@ -337,15 +365,12 @@ class QcgClient:
                         frame, text_buffer = text_buffer.split("\n\n", 1)
                         if len(frame) > 16 * 1024 * 1024:
                             raise QcgError(0, None, "SSE frame exceeds 16 MiB character limit")
-                        data_lines = [
-                            line[6:] if line[5:6] == " " else line[5:]
-                            for line in frame.split("\n")
-                            if line.startswith("data:")
-                        ]
-                        # Comment-only (: ...) and empty frames yield nothing.
-                        if not data_lines:
+                        data = _sse_frame_data(frame)
+                        # No data field (None) and empty data ("") both yield
+                        # nothing on the public parsed-JSON projection; raw
+                        # conformance still dispatches "" (see fixtures).
+                        if data is None:
                             continue
-                        data = "\n".join(data_lines)
                         if data:
                             yield json.loads(data)
                     if len(text_buffer) > 16 * 1024 * 1024:
@@ -373,14 +398,12 @@ class QcgClient:
                 pending_cr = False
                 while "\n\n" in text_buffer:
                     frame, text_buffer = text_buffer.split("\n\n", 1)
-                    data_lines = [
-                        line[6:] if line[5:6] == " " else line[5:]
-                        for line in frame.split("\n")
-                        if line.startswith("data:")
-                    ]
-                    if not data_lines:
+                    data = _sse_frame_data(frame)
+                    # No data field (None) and empty data ("") both yield
+                    # nothing on the public parsed-JSON projection; raw
+                    # conformance still dispatches "" (see fixtures).
+                    if data is None:
                         continue
-                    data = "\n".join(data_lines)
                     if data:
                         yield json.loads(data)
             finally:

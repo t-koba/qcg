@@ -66,5 +66,14 @@
         "text": "�"
       }
     ]
+  },
+  {
+    "name": "empty data and bare data",
+    "wire": "data:\n\ndata\n\n",
+    "raw_frames": [
+      "",
+      ""
+    ],
+    "payloads": []
   }
 ]

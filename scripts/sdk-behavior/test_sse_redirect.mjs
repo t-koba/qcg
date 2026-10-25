@@ -4,7 +4,7 @@ import { pathToFileURL } from "node:url";
 // QcgClient streaming + redirect paths with mocked fetch/ReadableStream.
 // The bundle path arrives via env and must be a file URL: a bare Windows
 // absolute path (C:\...) is rejected by the ESM loader.
-const { QcgClient } = await import(pathToFileURL(process.env.QCG_TS_CLIENT).href);
+const { QcgClient, SseParser } = await import(pathToFileURL(process.env.QCG_TS_CLIENT).href);
 
 const results = [];
 function check(name, cond, detail = "") {
@@ -378,11 +378,33 @@ function redirectResponse(location) {
 console.log(`TS SSE/redirect behavior: all G04/G05 checks passed (${results.length} assertions)`);
 
 // The SPA, TypeScript SDK and Python SDK consume the same wire fixtures.
+// Raw WHATWG conformance (`data:` and bare `data` dispatch `""`) is asserted
+// at the parser level; the public projection parses only non-empty data
+// strings as JSON.
 const fixtures = JSON.parse(await (await import('node:fs/promises')).readFile(new URL('../fixtures/sse.json', import.meta.url), 'utf8'));
 for (const fixture of fixtures) {
   const wire = fixture.wire_hex ? Buffer.from(fixture.wire_hex, "hex") : enc.encode(fixture.wire);
   for (let split = 1; split < wire.length; split++) {
     const client = new QcgClient({ baseUrl: 'http://127.0.0.1:9', fetch: async () => sseResponse([wire.slice(0,split), wire.slice(split)]).response });
     check(`shared fixture ${fixture.name}/${split}`, JSON.stringify(await collect(client,'r1')) === JSON.stringify(fixture.payloads));
+    if ("raw_frames" in fixture) {
+      const parser = new SseParser();
+      const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
+      const frames = [
+        ...parser.push(decoder.decode(wire.slice(0, split), { stream: true })),
+        ...parser.push(decoder.decode(wire.slice(split), { stream: true })),
+      ];
+      check(
+        `shared fixture raw ${fixture.name}/${split}`,
+        JSON.stringify(frames.map((frame) => frame.data)) === JSON.stringify(fixture.raw_frames),
+        JSON.stringify(frames.map((frame) => frame.data)),
+      );
+    }
   }
+}
+// Raw parser unit: `data:` and bare `data` dispatch empty strings.
+{
+  const parser = new SseParser();
+  const frames = parser.push("data:\n\ndata\n\n");
+  check("raw empty data and bare data", JSON.stringify(frames.map((f) => f.data)) === JSON.stringify(["", ""]));
 }

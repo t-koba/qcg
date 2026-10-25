@@ -721,6 +721,34 @@ def _normalize_query(query: dict[str, Any] | None) -> dict[str, Any]:
     return cleaned
 
 
+def _sse_frame_data(frame: str) -> str | None:
+    """Raw WHATWG data for one blank-line-terminated SSE frame.
+
+    Returns None when the frame carries no data field, otherwise the
+    LF-joined data values ("" for an empty \`data:\` or bare \`data\` line).
+    \`stream_run_events\` parses only non-empty data strings as JSON,
+    so an empty string never yields; raw conformance still dispatches it.
+    """
+    data_lines: list[str] | None = None
+    for line in frame.split("\\n"):
+        if not line or line.startswith(":"):
+            continue
+        if line == "data":
+            value = ""
+        elif line.startswith("data:"):
+            value = line[5:]
+            if value.startswith(" "):
+                value = value[1:]
+        else:
+            continue
+        if data_lines is None:
+            data_lines = []
+        data_lines.append(value)
+    if data_lines is None:
+        return None
+    return "\\n".join(data_lines)
+
+
 class _NoCrossOriginAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Strips Authorization on cross-origin redirects and downgrades (F04)."""
 
@@ -974,15 +1002,12 @@ class QcgClient:
                         frame, text_buffer = text_buffer.split("\\n\\n", 1)
                         if len(frame) > 16 * 1024 * 1024:
                             raise QcgError(0, None, "SSE frame exceeds 16 MiB character limit")
-                        data_lines = [
-                            line[6:] if line[5:6] == " " else line[5:]
-                            for line in frame.split("\\n")
-                            if line.startswith("data:")
-                        ]
-                        # Comment-only (: ...) and empty frames yield nothing.
-                        if not data_lines:
+                        data = _sse_frame_data(frame)
+                        # No data field (None) and empty data ("") both yield
+                        # nothing on the public parsed-JSON projection; raw
+                        # conformance still dispatches "" (see fixtures).
+                        if data is None:
                             continue
-                        data = "\\n".join(data_lines)
                         if data:
                             yield json.loads(data)
                     if len(text_buffer) > 16 * 1024 * 1024:
@@ -1010,14 +1035,12 @@ class QcgClient:
                 pending_cr = False
                 while "\\n\\n" in text_buffer:
                     frame, text_buffer = text_buffer.split("\\n\\n", 1)
-                    data_lines = [
-                        line[6:] if line[5:6] == " " else line[5:]
-                        for line in frame.split("\\n")
-                        if line.startswith("data:")
-                    ]
-                    if not data_lines:
+                    data = _sse_frame_data(frame)
+                    # No data field (None) and empty data ("") both yield
+                    # nothing on the public parsed-JSON projection; raw
+                    # conformance still dispatches "" (see fixtures).
+                    if data is None:
                         continue
-                    data = "\\n".join(data_lines)
                     if data:
                         yield json.loads(data)
             finally:
@@ -1077,12 +1100,19 @@ in browsers, or a dummy origin in Node purely for URL resolution.
 Browser opaque-redirect responses expose no Location header and therefore
 surface as HTTP errors rather than silent follows.
 
-SSE (both clients): utilizable bytes are consumed incrementally (Python
-uses read1 so flushed tens-of-bytes events arrive while the stream stays
-open). CR immediately ends a line; one following LF is swallowed across
-chunk boundaries, so split CRLF is one break. Multi-data lines join with LF;
-an EOF without a terminating blank line dispatches only already-terminated
-frames and never fabricates an event from the tail. Python's
+SSE (both clients): raw frames follow the WHATWG parsing rules: a \`data\` line
+without a colon carries an empty value like \`data:\`, one leading space after
+the colon is stripped, multiple data lines join with LF, and a blank-line
+dispatch with no data field yields no frame while an empty data field yields
+\`""\` (comment-only frames yield nothing). The public \`streamRunEvents\` /
+\`stream_run_events\` projection parses only non-empty data strings as JSON using its
+truthy-data guard; empty raw frames are dispatched at the parser level but
+never surface as JSON events. Utilizable bytes are
+consumed incrementally (Python uses read1 so flushed tens-of-bytes events
+arrive while the stream stays open). CR immediately ends a line; one
+following LF is swallowed across chunk boundaries, so split CRLF is one
+break. An EOF without a terminating blank line dispatches only
+already-terminated frames and never fabricates an event from the tail. Python's
 \`stream_run_events\` is a generator: after an early exit, explicitly close
 it, for example with \`contextlib.closing(client.stream_run_events(run_id))\`
 to release the response. TypeScript's async generator releases its reader

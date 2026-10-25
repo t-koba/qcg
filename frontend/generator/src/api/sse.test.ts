@@ -36,6 +36,12 @@ it('shared SPA and SDK conformance fixtures preserve every byte split', () => {
       const parser = new SseParser();
       const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
       const frames = [...parser.push(decoder.decode(bytes.slice(0, split), {stream:true})), ...parser.push(decoder.decode(bytes.slice(split), {stream:true}))];
+      // Raw WHATWG conformance: an empty `data:` or bare `data` line dispatches
+      // `""`; a dispatch with no data field dispatches nothing. The public
+      // projection below parses only non-empty data strings as JSON.
+      if ("raw_frames" in fixture) {
+        expect(frames.map((frame) => frame.data)).toEqual(fixture.raw_frames);
+      }
       expect(frames.filter(frame => frame.data).map(frame => JSON.parse(frame.data))).toEqual(fixture.payloads);
     }
   }
