@@ -191,27 +191,17 @@ pub fn split_id_source(source: &str) -> Option<(String, String)> {
 /// Fetch a registry index over `file://` or `https://`. Plain `http://` is
 /// rejected: use a local file or TLS.
 pub async fn fetch_index(url: &str) -> Result<IndexFile> {
-    if let Some(path) = url.strip_prefix("file://") {
-        let source = std::fs::read(path)
-            .with_context(|| format!("failed to read registry index `{url}`"))?;
-        return parse_index(&source, url);
-    }
-    if let Some(rest) = url.strip_prefix("https://") {
-        let _ = rest;
-        let response = reqwest::get(url)
+    let bytes = if let Some(path) = url.strip_prefix("file://") {
+        std::fs::read(path).with_context(|| format!("failed to read registry index `{url}`"))?
+    } else if url.starts_with("https://") {
+        crate::http::get(url, Some(policy::DEFAULT_HTTP_BODY_LIMIT_BYTES as u64))
             .await
-            .with_context(|| format!("failed to fetch registry index `{url}`"))?
-            .error_for_status()
-            .with_context(|| format!("registry index `{url}` returned an error status"))?;
-        let bytes = response
-            .bytes()
-            .await
-            .with_context(|| format!("failed to read registry index `{url}`"))?;
-        return parse_index(&bytes, url);
-    }
-    anyhow::bail!("registry index `{url}` must use file:// or https://");
+            .with_context(|| format!("failed to fetch or read registry index `{url}`"))?
+    } else {
+        anyhow::bail!("registry index `{url}` must use file:// or https://");
+    };
+    parse_index(&bytes, url)
 }
-
 fn parse_index(bytes: &[u8], url: &str) -> Result<IndexFile> {
     let source = std::str::from_utf8(bytes)
         .with_context(|| format!("registry index `{url}` must be UTF-8 TOML"))?;

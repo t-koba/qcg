@@ -1,23 +1,16 @@
-//! Registry install staging (E14): resolve, verify, and stage generator
-//! closures without committing. Split from `install.rs` with no behavior
-//! change (E14/C-5).
-
 use anyhow::{Context, Result};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use contract::{Contract, Graph};
-use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, Read as _};
 use uuid::Uuid;
 
-use super::plan::ensure_safe_install_id;
-
-use super::install::path_exists;
-use super::install::verify_package_bytes;
+use super::install::{path_exists, verify_package_bytes};
 use super::install_commit::{CleanupPaths, finish_closure, unique_stage_dir_in};
+use super::plan::ensure_safe_install_id;
 
 pub(crate) struct StagedInstall {
     pub(crate) path: Utf8PathBuf,
@@ -626,29 +619,7 @@ pub(crate) async fn stage_install_source(
         }
         path
     } else if source.starts_with("http://") || source.starts_with("https://") {
-        let response = reqwest::get(source).await?.error_for_status()?;
-        if let Some(limit) = limits.max_archive_bytes
-            && response
-                .content_length()
-                .is_some_and(|length| length > limit)
-        {
-            anyhow::bail!("remote package exceeds {limit} bytes");
-        }
-        let mut stream = response.bytes_stream();
-        let mut bytes = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            let next = bytes
-                .len()
-                .checked_add(chunk.len())
-                .context("remote package size overflowed")?;
-            if let Some(limit) = limits.max_archive_bytes
-                && next as u64 > limit
-            {
-                anyhow::bail!("remote package exceeds {limit} bytes");
-            }
-            bytes.extend_from_slice(&chunk);
-        }
+        let bytes = crate::http::get(source, limits.max_archive_bytes).await?;
         verify_package_bytes(&bytes, expected_sha256, signature)?;
         // Single create_new open holds the verified bytes; no re-open
         // window between create and write (E14-6).
@@ -700,7 +671,6 @@ pub(crate) async fn stage_install_source(
         let mut handle = open_archive_nofollow(&source_path)?;
         let mut bytes = Vec::new();
         if let Some(limit) = archive_limit {
-            use std::io::Read as _;
             handle
                 .take(limit.saturating_add(1) as u64)
                 .read_to_end(&mut bytes)?;
@@ -708,7 +678,6 @@ pub(crate) async fn stage_install_source(
                 anyhow::bail!("package archive exceeds {limit} bytes");
             }
         } else {
-            use std::io::Read as _;
             handle.read_to_end(&mut bytes)?;
         }
         verify_package_bytes(&bytes, expected_sha256, signature)?;

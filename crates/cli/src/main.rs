@@ -7,9 +7,9 @@ use serde_json::json;
 use service::{DirectRun, LocalService, step_param_schemas_markdown};
 use std::collections::BTreeSet;
 
-mod registry;
-
 mod cli;
+mod http;
+mod registry;
 
 use cli::args::{Cli, Command, DocsCommand, RegistryCommand, RunsCommand, SkillCommand};
 use cli::eval::run_eval;
