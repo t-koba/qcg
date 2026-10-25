@@ -584,7 +584,6 @@ dependencies = [
  "dunce",
  "engine",
  "files",
- "futures-util",
  "hex",
  "libc",
  "model",

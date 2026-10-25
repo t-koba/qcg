@@ -19,7 +19,6 @@ camino.workspace = true
 chrono.workspace = true
 clap.workspace = true
 dunce.workspace = true
-futures-util.workspace = true
 hex.workspace = true
 libc.workspace = true
 api = { path = "../api" }
