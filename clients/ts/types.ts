@@ -2463,6 +2463,11 @@ export interface components {
             /** @default null */
             repair: boolean | null;
             /**
+             * @description Failed provider attempts, including retries preceding a successful call.
+             * @default []
+             */
+            retry_decisions: components["schemas"]["RetryDecision"][];
+            /**
              * Format: uint64
              * @default null
              */
@@ -2612,6 +2617,10 @@ export interface components {
             provider: string;
             text: string;
         };
+        LlmErrorKind: ("timed_out" | "network" | "empty_response" | "invalid_response" | "partial_stream" | "canceled" | "circuit_open" | "other") | {
+            /** Format: uint16 */
+            http_status: number;
+        };
         LlmRouteFailedEventData: {
             /** Format: uint */
             attempt: number;
@@ -2621,19 +2630,22 @@ export interface components {
              * @default 0
              */
             fallback_index: number;
-            kind: components["schemas"]["LlmRouteFailureKind"];
+            /**
+             * @description Whether this invocation advanced to the next declared route.
+             * @default false
+             */
+            fallback_taken: boolean;
+            kind: components["schemas"]["LlmErrorKind"];
             model: string;
             provider: string;
+            /** @default [] */
+            retry_decisions: components["schemas"]["RetryDecision"][];
             /**
              * Format: uint
              * @description Number of declared routes available for this invocation.
              * @default 0
              */
             routes_total: number;
-        };
-        LlmRouteFailureKind: ("timed_out" | "network" | "empty_response" | "invalid_response" | "partial_stream" | "canceled" | "circuit_open" | "other") | {
-            /** Format: uint16 */
-            http_status: number;
         };
         LlmValidationFailedEventData: {
             /** Format: uint */
@@ -2807,6 +2819,8 @@ export interface components {
             repair: string;
         };
         /** @enum {string} */
+        RequestDispatch: "not_sent" | "sent" | "unknown";
+        /** @enum {string} */
         ResourceEventCacheStatus: "not_applicable" | "local" | "hit" | "miss";
         ResourceEventData: {
             /** Format: uint */
@@ -2860,6 +2874,28 @@ export interface components {
          * @enum {string}
          */
         ResponseVerbosity: "low" | "medium" | "high";
+        /** @enum {string} */
+        RetryAction: "fail_fast" | "retry" | "next_route";
+        /** @description One failed provider attempt, including the effective bounded decision. */
+        RetryDecision: {
+            action: components["schemas"]["RetryAction"];
+            /**
+             * Format: uint
+             * @description One-based attempt within this route (not the fallback index). Null
+             *     when gateway cancellation cannot know which router attempt is active.
+             */
+            attempt?: number | null;
+            facts: components["schemas"]["TransportFacts"];
+            /** @description A mechanism that overrode policy, if any. */
+            guard?: components["schemas"]["RetryGuard"] | null;
+            kind: components["schemas"]["LlmErrorKind"];
+            requested: components["schemas"]["RetryAction"];
+            /** @description `default`, `rule:<zero-based index>`, or `gateway` for terminal guards. */
+            source: string;
+            stream: boolean;
+        };
+        /** @enum {string} */
+        RetryGuard: "attempt_limit" | "stream_emitted" | "terminal_error" | "circuit_open";
         /** @enum {string} */
         RunCompletionStatus: "success" | "failed";
         /**
@@ -3420,6 +3456,12 @@ export interface components {
         };
         /** @enum {string} */
         ToolChoiceMode: "none" | "auto" | "required";
+        TransportFacts: {
+            dispatch: components["schemas"]["RequestDispatch"];
+            phase: components["schemas"]["TransportPhase"];
+        };
+        /** @enum {string} */
+        TransportPhase: "connect" | "response" | "unknown";
         /** @description One citation the provider attached to its answer. */
         UrlCitation: {
             /**

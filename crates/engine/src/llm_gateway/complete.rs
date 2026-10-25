@@ -69,6 +69,7 @@ fn run_id_of(journal: &JournalWriter) -> String {
 }
 
 use super::merge::merge_event_extra;
+use super::retry::RetryTrace;
 use super::types::{LLM_STREAM_CHANNEL_CAPACITY, LlmGateway};
 
 impl<'a> LlmGateway<'a> {
@@ -141,15 +142,20 @@ impl<'a> LlmGateway<'a> {
             run_id: run_id_of(self.journal),
             reservation,
         };
+        let trace = RetryTrace::default();
         let response = tokio::select! {
             biased;
-            _ = self.cancellation.cancelled() => return Err(StepError::Cancelled),
-            result = self.provider.decide(request.clone()) => result,
+            _ = self.cancellation.cancelled() => Err(LlmError { kind: LlmErrorKind::Canceled, message: "LLM decision canceled".into(), ..Default::default() }),
+            result = self.provider.decide_observed(request.clone(), trace.observer()) => result,
         };
         let response = match response {
             Ok(response) => response,
             Err(error) => {
+                let error = trace.finish_error(self.provider.as_ref(), error, false);
                 self.record_route_failure(node, &model.provider, &model.model, 1, 1, &error)?;
+                if error.kind == LlmErrorKind::Canceled {
+                    return Err(StepError::Cancelled);
+                }
                 return Err(error).step_err(&node.id);
             }
         };
@@ -168,7 +174,8 @@ impl<'a> LlmGateway<'a> {
                 "llm_call",
                 json!({
                     "node": node.id, "provider": model.provider, "model": model.model,
-                    "max_tokens": max_tokens, "tokens": usage, "cost_microusd": cost_microusd
+                    "max_tokens": max_tokens, "tokens": usage, "cost_microusd": cost_microusd,
+                    "retry_decisions": trace.decisions()
                 }),
             )
             .step_err(&node.id)?;
@@ -356,13 +363,31 @@ impl<'a> LlmGateway<'a> {
             routed_request.provider.clone_from(provider);
             routed_request.model.clone_from(model);
             self.scan_request(node, &routed_request)?;
-            let result = self.complete_route(node, routed_request).await;
+            let trace = RetryTrace::default();
+            let validation = if attempt == 0 {
+                Ok(())
+            } else {
+                llm::validate_route_capabilities(self.provider.as_ref(), &routed_request)
+            };
+            let result = match validation {
+                Ok(()) => {
+                    self.complete_route(node, routed_request, trace.observer())
+                        .await
+                }
+                Err(error) => Err(error),
+            };
             match result {
                 Ok(completed) => {
-                    response = Some((provider.clone(), model.clone(), completed));
+                    response = Some((
+                        provider.clone(),
+                        model.clone(),
+                        completed,
+                        trace.decisions(),
+                    ));
                     break;
                 }
                 Err(error) => {
+                    let error = trace.finish_error(self.provider.as_ref(), error, request.stream);
                     self.record_route_failure(
                         node,
                         provider,
@@ -374,13 +399,13 @@ impl<'a> LlmGateway<'a> {
                     if error.kind == LlmErrorKind::Canceled {
                         return Err(StepError::Cancelled);
                     }
-                    if !error.is_retryable() || attempt + 1 == routes.len() {
+                    if !error.allows_next_route() || attempt + 1 == routes.len() {
                         return Err(error).step_err(&node.id);
                     }
                 }
             }
         }
-        let (provider_id, model_id, response) =
+        let (provider_id, model_id, response, retry_decisions) =
             response.ok_or_else(|| StepError::failed(&node.id, "no LLM route was available"))?;
         if response.stop != llm::StopReason::ModelContextWindowExceeded {
             self.scan_response(node, &response)?;
@@ -441,6 +466,7 @@ impl<'a> LlmGateway<'a> {
             });
         }
         merge_event_extra(&mut event, event_extra(&response.usage));
+        event["retry_decisions"] = json!(retry_decisions);
         self.journal.event("llm_call", event).step_err(&node.id)?;
         self.check_budget()?;
         if response.stop == llm::StopReason::ModelContextWindowExceeded {
@@ -498,6 +524,8 @@ impl<'a> LlmGateway<'a> {
                     "fallback_index": attempt.saturating_sub(1),
                     "routes_total": routes_total,
                     "kind": error.kind,
+                    "retry_decisions": error.decisions,
+                    "fallback_taken": attempt < routes_total && error.allows_next_route(),
                 }),
             )
             .step_err(&node.id)
@@ -507,20 +535,22 @@ impl<'a> LlmGateway<'a> {
         &self,
         node: &NodeDef,
         request: ChatRequest,
+        observer: llm::RetryObserver,
     ) -> Result<ChatResponse, LlmError> {
         if !request.stream {
             return tokio::select! {
                 _ = self.cancellation.cancelled() => Err(LlmError {
                     message: "LLM call canceled".into(),
                     kind: LlmErrorKind::Canceled,
+                ..Default::default()
                 }),
-                response = self.provider.complete(request) => response,
+                response = self.provider.complete_observed(request, observer) => response,
             };
         }
         let provider_id = request.provider.clone();
         let model_id = request.model.clone();
         let (events, mut receiver) = tokio::sync::mpsc::channel(LLM_STREAM_CHANNEL_CAPACITY);
-        let stream = self.provider.stream(request, events);
+        let stream = self.provider.stream_observed(request, events, observer);
         tokio::pin!(stream);
         let mut response = None;
         let mut index = 0_usize;
@@ -536,6 +566,7 @@ impl<'a> LlmGateway<'a> {
                     return Err(LlmError {
                         message: "LLM stream canceled".into(),
                         kind: LlmErrorKind::Canceled,
+                ..Default::default()
                     });
                 }
                 result = &mut stream => {
@@ -560,6 +591,7 @@ impl<'a> LlmGateway<'a> {
                                     "LLM stream failed after {index} emitted deltas; route fallback is unsafe: {error}"
                                 ),
                                 kind: LlmErrorKind::PartialStream,
+                ..Default::default()
                             });
                         }
                         return Err(error);

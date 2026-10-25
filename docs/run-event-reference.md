@@ -206,6 +206,35 @@ records policy, not proof of authorization or an earlier effect.
 (agent calls), `arguments`, `request_state`, and `input_requests` so a resumed
 MCP call answers the original remote request instead of starting a new one.
 
+## LLM transport decisions
+
+`llm_call.retry_decisions` records failed provider attempts that preceded a
+successful call (chat, streaming, or decision). `llm_route_failed.retry_decisions`
+records attempts ending in a failed route. Both are optional on older journals
+and decode as an empty array. Each entry contains `kind`, `facts.phase`
+(`connect`, `response`, `unknown`), `facts.dispatch` (`not_sent`, `sent`, `unknown`),
+`attempt` (one-based **within** the route), `stream`, `requested`/`action`
+(`fail_fast`, `retry`, `next_route`), `source` (`default`, `rule:<index>`, or
+`gateway` for a gateway terminal guard), and
+nullable `guard` (`attempt_limit`, `circuit_open`, `terminal_error`,
+`stream_emitted`). Rule indexes are zero-based in the provider registry row.
+A gateway cancellation uses a null `attempt`: it cannot distinguish backoff
+from an active next attempt, and must not invent a dispatch count. A gateway
+partial-stream wrapper retains the router's attempt rather than adding one.
+The evidence never contains an error message, endpoint, request body, or secret.
+
+`llm_route_failed.attempt` remains the one-based route position, not an internal
+transport-attempt count. `fallback_index` is its zero-based equivalent;
+`routes_total` counts declared routes. `fallback_taken` is true only when this
+invocation advances to the next declared route; `next_route` with no remaining
+route still fails. A fallback can itself refuse dispatch during capability
+revalidation. Once any stream event has been forwarded, a mechanism guard
+refuses both retry and fallback regardless of policy. These are observation
+events subject to the contract's audit configuration, not completion or
+continuation authorization. See the provider guide's
+[transport policy](llm-provider-guide.md#transport-retry-and-route-policy) for
+defaults, matching, bounds, and duplicate-dispatch uncertainty.
+
 ## Cost metrics
 
 Every terminal event (`run_finished`, `run_error`, `run_canceled`,

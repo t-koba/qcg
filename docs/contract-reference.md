@@ -57,8 +57,10 @@ Fields:
 
 - `model`: a single `{ provider, model }` entry declaring the default route.
   An LLM node can override it with `params.model` and declare an ordered
-  `params.fallback_models` list. A retryable route failure advances through
-  that list and records `llm_route_failed`. When omitted, the `[default]`
+  `params.fallback_models` list. The provider registry transport policy must
+  select `next_route` before a failed route advances through that list; qcg
+  records `llm_route_failed` with the decision evidence and revalidates the
+  unchanged request on the fallback model. When omitted, the `[default]`
   model declared in `providers.toml` is used; a run fails when neither is
   present. Provider IDs come from the `providers.toml` registry documented in
   `docs/llm-provider-guide.md`.

@@ -38,6 +38,9 @@ pub struct LlmCallEventData {
     pub stop_reason: Option<String>,
     pub tokens: TokenUsageEventData,
     pub cost_microusd: u64,
+    /// Failed provider attempts, including retries preceding a successful call.
+    #[serde(default)]
+    pub retry_decisions: Vec<model::RetryDecision>,
     #[serde(default)]
     pub attempt: usize,
     #[serde(default)]
@@ -216,6 +219,11 @@ pub struct LlmRouteFailedEventData {
     pub model: String,
     pub attempt: usize,
     pub kind: LlmRouteFailureKind,
+    #[serde(default)]
+    pub retry_decisions: Vec<model::RetryDecision>,
+    /// Whether this invocation advanced to the next declared route.
+    #[serde(default)]
+    pub fallback_taken: bool,
     /// Zero-based index into the declared route list (0 is the primary route).
     #[serde(default)]
     pub fallback_index: usize,
@@ -224,16 +232,4 @@ pub struct LlmRouteFailedEventData {
     pub routes_total: usize,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, serde::Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum LlmRouteFailureKind {
-    HttpStatus(u16),
-    TimedOut,
-    Network,
-    EmptyResponse,
-    InvalidResponse,
-    PartialStream,
-    Canceled,
-    CircuitOpen,
-    Other,
-}
+pub type LlmRouteFailureKind = model::LlmErrorKind;

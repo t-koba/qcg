@@ -9,7 +9,9 @@ mod http_provider;
 mod parse;
 mod payload;
 mod provider;
+mod retry;
 mod router;
+pub use retry::*;
 mod stream;
 pub(crate) mod text_gate;
 mod types;
@@ -28,6 +30,7 @@ pub use search::{SearchMethod, SearchProfile, SearchProviderSpec, SearchRuntime}
 #[cfg(test)]
 pub(crate) use stream::*;
 pub use types::*;
+pub use validate::validate_route_capabilities;
 #[cfg(test)]
 pub(crate) use validate::*;
 

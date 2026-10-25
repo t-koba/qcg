@@ -979,6 +979,7 @@ async fn circuit_breaker_opens_after_declared_failures() {
         provider.record_request_result::<()>(&Err(LlmError {
             message: "unavailable".into(),
             kind: LlmErrorKind::HttpStatus(503),
+            ..Default::default()
         }));
     }
     let error = provider
@@ -1496,6 +1497,7 @@ fn spec_with_base_url(id: &str, base_url: &str) -> ProviderSpec {
         query: BTreeMap::new(),
         timeout_seconds: None,
         retry_attempts: None,
+        retry_policy: Default::default(),
         retry_base_backoff_ms: None,
         stream_retry_attempts: None,
         retry_rate_limit_floor_ms: None,
@@ -2453,6 +2455,7 @@ impl LlmProvider for RetryProvider {
             return Err(LlmError {
                 message: "rate limited".into(),
                 kind: LlmErrorKind::HttpStatus(429),
+                ..Default::default()
             });
         }
         Ok(ChatResponse {
@@ -2508,7 +2511,11 @@ impl LlmProvider for StreamRetryProvider {
                     })
                     .await;
             }
-            return Err(LlmError::new("stream failed"));
+            return Err(LlmError {
+                message: "stream failed".into(),
+                kind: LlmErrorKind::HttpStatus(503),
+                ..Default::default()
+            });
         }
         let _ = events
             .send(ChatStreamEvent::TextDelta {
@@ -2698,30 +2705,37 @@ fn retryability_is_structural_not_string_based() {
     assert!(!is_retryable_llm_error(&LlmError {
         message: "model gpt-500 failed".into(),
         kind: LlmErrorKind::Other,
+        ..Default::default()
     }));
     assert!(is_retryable_llm_error(&LlmError {
         message: "server error".into(),
         kind: LlmErrorKind::HttpStatus(503),
+        ..Default::default()
     }));
     assert!(is_retryable_llm_error(&LlmError {
         message: "slow".into(),
         kind: LlmErrorKind::TimedOut,
+        ..Default::default()
     }));
     assert!(!is_retryable_llm_error(&LlmError {
         message: "bad request".into(),
         kind: LlmErrorKind::HttpStatus(400),
+        ..Default::default()
     }));
     assert!(!is_retryable_llm_error(&LlmError {
         message: "refused".into(),
         kind: LlmErrorKind::Network,
+        ..Default::default()
     }));
     assert!(is_retryable_llm_error(&LlmError {
         message: "empty body".into(),
         kind: LlmErrorKind::EmptyResponse,
+        ..Default::default()
     }));
     assert!(!is_retryable_llm_error(&LlmError {
         message: "malformed response".into(),
         kind: LlmErrorKind::InvalidResponse,
+        ..Default::default()
     }));
 }
 
@@ -3455,3 +3469,6 @@ fn default_cache_controls_are_omitted_from_serialized_requests() {
     assert_eq!(explicit["cache_write"], "forbid");
     assert_eq!(explicit["cache_retention"], "extended");
 }
+
+#[path = "tests/retry_policy.rs"]
+mod retry_policy;

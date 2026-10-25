@@ -71,6 +71,40 @@ pub trait LlmProvider: Send + Sync {
     fn timeout_seconds(&self) -> u64 {
         120
     }
+    /// Provider-owned failure decisions. The router enforces attempt and
+    /// stream-emission guards; policy never grants route authorization.
+    fn retry_policy(&self) -> crate::RetryPolicy {
+        crate::RetryPolicy::default()
+    }
+
+    /// Like `complete`, but reports failed-attempt decisions even if a later
+    /// retry succeeds. Leaf providers need not override this; the router owns
+    /// retry loops and invokes the observer synchronously before each action.
+    async fn complete_observed(
+        &self,
+        req: ChatRequest,
+        _observer: crate::RetryObserver,
+    ) -> Result<ChatResponse, LlmError> {
+        self.complete(req).await
+    }
+
+    async fn decide_observed(
+        &self,
+        req: crate::DecisionRequest,
+        _observer: crate::RetryObserver,
+    ) -> Result<crate::DecisionResponse, LlmError> {
+        self.decide(req).await
+    }
+
+    async fn stream_observed(
+        &self,
+        req: ChatRequest,
+        events: mpsc::Sender<ChatStreamEvent>,
+        _observer: crate::RetryObserver,
+    ) -> Result<(), LlmError> {
+        self.stream(req, events).await
+    }
+
     /// Retry attempts per completion call, including the first.
     fn retry_attempts(&self) -> usize {
         3
@@ -470,6 +504,8 @@ pub struct ProviderSpec {
     pub timeout_seconds: Option<u64>,
     /// Retry attempts per completion call, including the first (default 3).
     pub retry_attempts: Option<usize>,
+    #[serde(default)]
+    pub retry_policy: crate::RetryPolicy,
     /// Base backoff between retries in milliseconds (default 200, exponential).
     pub retry_base_backoff_ms: Option<u64>,
     /// Retry attempts for a stream that failed before delivering any event.
@@ -584,6 +620,9 @@ impl ProviderSpec {
         if self.query.keys().any(String::is_empty) {
             return Err(invalid("query parameter names must not be empty"));
         }
+        self.retry_policy
+            .validate()
+            .map_err(|message| invalid(&message))?;
         if let Some(attempts) = self.retry_attempts
             && !(1..=10).contains(&attempts)
         {

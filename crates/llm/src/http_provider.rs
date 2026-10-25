@@ -17,7 +17,7 @@ use crate::config::{
     validate_query_parameters,
 };
 use crate::parse::{
-    llm_http_error, parse_anthropic_response, parse_chat_completions_response,
+    llm_http_error, llm_response_error, parse_anthropic_response, parse_chat_completions_response,
     parse_responses_response,
 };
 use crate::payload::{anthropic_payload, chat_completions_payload, responses_payload};
@@ -423,6 +423,7 @@ impl HttpProvider {
                     return Err(LlmError {
                         message: self.message("circuit breaker is open"),
                         kind: LlmErrorKind::CircuitOpen,
+                        ..Default::default()
                     });
                 }
                 circuit.open_until = None;
@@ -550,7 +551,7 @@ impl HttpProvider {
     async fn send_json(&self, payload: Value, model: &str) -> Result<Value, LlmError> {
         let (mut response, credential) = self.send_request(payload, model).await?;
         let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(llm_http_error)? {
+        while let Some(chunk) = response.chunk().await.map_err(llm_response_error)? {
             let next_len = body.len().checked_add(chunk.len()).ok_or_else(|| {
                 LlmError::invalid_response(
                     self.message("response exceeded the configured body limit"),
@@ -653,7 +654,7 @@ impl HttpProvider {
                     && let Ok(error) = error.downcast::<SseBodyError>()
                 {
                     return match *error {
-                        SseBodyError::Http(error) => llm_http_error(error),
+                        SseBodyError::Http(error) => llm_response_error(error),
                         SseBodyError::LimitExceeded => LlmError::invalid_response(format!(
                             "{} provider stream exceeded response_body_limit_bytes ({})",
                             self.spec.id, self.response_body_limit_bytes
@@ -787,6 +788,10 @@ impl LlmProvider for HttpProvider {
         self.spec.timeout_seconds.unwrap_or(120)
     }
 
+    fn retry_policy(&self) -> crate::RetryPolicy {
+        self.spec.retry_policy.clone()
+    }
+
     fn retry_attempts(&self) -> usize {
         self.spec.retry_attempts.unwrap_or(3)
     }
@@ -891,47 +896,8 @@ impl LlmProvider for HttpProvider {
         let capabilities = self.capabilities_for_model(&req.model);
         validate_multimodal_capabilities(&req, &capabilities)?;
         validate_structured_output_capabilities(&req, self.spec.api, &capabilities)?;
-        if req.seed.is_some() && !capabilities.seed {
-            return Err(LlmError::new(self.message("does not support seed")));
-        }
-        if let Some(effort) = req.reasoning_effort
-            && !capabilities.reasoning_effort.contains(&effort)
-        {
-            return Err(LlmError::new(self.message(format_args!(
-                "does not support reasoning_effort `{effort}`"
-            ))));
-        }
-        for (configured, supported, name) in [
-            (
-                req.temperature.is_some(),
-                capabilities.temperature,
-                "temperature",
-            ),
-            (req.top_p.is_some(), capabilities.top_p, "top_p"),
-            (
-                !req.stop_sequences.is_empty(),
-                capabilities.stop_sequences,
-                "stop_sequences",
-            ),
-            (
-                req.tool_choice.is_some(),
-                capabilities.tool_choice,
-                "tool_choice",
-            ),
-            (
-                req.parallel_tool_calls.is_some(),
-                capabilities.parallel_tool_calls,
-                "parallel_tool_calls",
-            ),
-            (req.verbosity.is_some(), capabilities.verbosity, "verbosity"),
-        ] {
-            if configured && !supported {
-                return Err(LlmError::new(
-                    self.message(format_args!("does not support {name}")),
-                ));
-            }
-        }
         let payload = self.request_payload(&req, &capabilities)?;
+        crate::validate::validate_request_capabilities(&req, &capabilities)?;
         let _slot = self.acquire_request_slot().await?;
         let result = self
             .send(payload, &req.model, req.provider_web_search.is_some())
@@ -949,10 +915,8 @@ impl LlmProvider for HttpProvider {
         let capabilities = self.capabilities_for_model(&req.model);
         validate_multimodal_capabilities(&req, &capabilities)?;
         validate_structured_output_capabilities(&req, self.spec.api, &capabilities)?;
-        if !capabilities.streaming {
-            return Err(LlmError::new(self.message("does not support streaming")));
-        }
         let mut payload = self.request_payload(&req, &capabilities)?;
+        crate::validate::validate_request_capabilities(&req, &capabilities)?;
         payload["stream"] = Value::Bool(true);
         if self.spec.api == ApiFlavor::ChatCompletions {
             payload["stream_options"] = json!({ "include_usage": true });

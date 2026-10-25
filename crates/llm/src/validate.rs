@@ -273,3 +273,97 @@ fn valid_media_type(media_type: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'+' | b'.' | b'-'))
 }
+
+/// Revalidate the unchanged request on every declared route. Do not strip an
+/// unsupported parameter to make a fallback work. API-specific schema/payload
+/// validation remains the provider's responsibility.
+pub fn validate_route_capabilities(
+    provider: &dyn crate::LlmProvider,
+    req: &ChatRequest,
+) -> Result<(), LlmError> {
+    if let Some(error) = provider.configuration_error_for(&req.provider) {
+        return Err(LlmError::new(error));
+    }
+    let capabilities = provider
+        .model_capabilities_for(&req.provider, &req.model)
+        .ok_or_else(|| {
+            LlmError::new(format!("LLM provider `{}` is not registered", req.provider))
+        })?;
+    if req.cache_retention.is_some()
+        && provider
+            .prompt_cache_retention_for(&req.provider, &req.model)
+            .is_none()
+    {
+        return Err(LlmError::new(
+            "LLM route does not declare extended cache retention",
+        ));
+    }
+    validate_request_capabilities(req, &capabilities)
+}
+
+pub(crate) fn validate_request_capabilities(
+    req: &ChatRequest,
+    capabilities: &Capabilities,
+) -> Result<(), LlmError> {
+    validate_multimodal_capabilities(req, capabilities)?;
+    let native = native_response_schema(req).is_some();
+    for (required, supported, name) in [
+        (!req.tools.is_empty(), capabilities.tool_use, "tool_use"),
+        (native, capabilities.json_schema, "json_schema"),
+        (
+            native && !req.tools.is_empty(),
+            capabilities.structured_output_with_tools,
+            "structured_output_with_tools",
+        ),
+        (req.seed.is_some(), capabilities.seed, "seed"),
+        (req.stream, capabilities.streaming, "streaming"),
+        (
+            req.temperature.is_some(),
+            capabilities.temperature,
+            "temperature",
+        ),
+        (req.top_p.is_some(), capabilities.top_p, "top_p"),
+        (
+            !req.stop_sequences.is_empty(),
+            capabilities.stop_sequences,
+            "stop_sequences",
+        ),
+        (
+            req.tool_choice.is_some(),
+            capabilities.tool_choice,
+            "tool_choice",
+        ),
+        (
+            req.parallel_tool_calls.is_some(),
+            capabilities.parallel_tool_calls,
+            "parallel_tool_calls",
+        ),
+        (req.verbosity.is_some(), capabilities.verbosity, "verbosity"),
+        (
+            req.prompt_cache == crate::PromptCache::Auto,
+            capabilities.prompt_cache,
+            "prompt_cache",
+        ),
+        (
+            req.provider_web_search.is_some(),
+            capabilities.web_search,
+            "web_search",
+        ),
+    ] {
+        if required && !supported {
+            return Err(LlmError::new(format!(
+                "LLM route `{}/{}` does not support {name}",
+                req.provider, req.model
+            )));
+        }
+    }
+    if let Some(effort) = req.reasoning_effort
+        && !capabilities.reasoning_effort.contains(&effort)
+    {
+        return Err(LlmError::new(format!(
+            "LLM route `{}/{}` does not support reasoning_effort `{effort}`",
+            req.provider, req.model
+        )));
+    }
+    Ok(())
+}

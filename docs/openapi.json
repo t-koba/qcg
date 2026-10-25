@@ -1628,6 +1628,14 @@
               "null"
             ]
           },
+          "retry_decisions": {
+            "default": [],
+            "description": "Failed provider attempts, including retries preceding a successful call.",
+            "items": {
+              "$ref": "#/components/schemas/RetryDecision"
+            },
+            "type": "array"
+          },
           "seed": {
             "default": null,
             "format": "uint64",
@@ -2031,47 +2039,7 @@
         ],
         "type": "object"
       },
-      "LlmRouteFailedEventData": {
-        "additionalProperties": false,
-        "properties": {
-          "attempt": {
-            "format": "uint",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "fallback_index": {
-            "default": 0,
-            "description": "Zero-based index into the declared route list (0 is the primary route).",
-            "format": "uint",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "kind": {
-            "$ref": "#/components/schemas/LlmRouteFailureKind"
-          },
-          "model": {
-            "type": "string"
-          },
-          "provider": {
-            "type": "string"
-          },
-          "routes_total": {
-            "default": 0,
-            "description": "Number of declared routes available for this invocation.",
-            "format": "uint",
-            "minimum": 0,
-            "type": "integer"
-          }
-        },
-        "required": [
-          "provider",
-          "model",
-          "attempt",
-          "kind"
-        ],
-        "type": "object"
-      },
-      "LlmRouteFailureKind": {
+      "LlmErrorKind": {
         "oneOf": [
           {
             "enum": [
@@ -2102,6 +2070,58 @@
             "type": "object"
           }
         ]
+      },
+      "LlmRouteFailedEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "attempt": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "fallback_index": {
+            "default": 0,
+            "description": "Zero-based index into the declared route list (0 is the primary route).",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "fallback_taken": {
+            "default": false,
+            "description": "Whether this invocation advanced to the next declared route.",
+            "type": "boolean"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/LlmErrorKind"
+          },
+          "model": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "retry_decisions": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/RetryDecision"
+            },
+            "type": "array"
+          },
+          "routes_total": {
+            "default": 0,
+            "description": "Number of declared routes available for this invocation.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "provider",
+          "model",
+          "attempt",
+          "kind"
+        ],
+        "type": "object"
       },
       "LlmValidationFailedEventData": {
         "additionalProperties": false,
@@ -2548,6 +2568,14 @@
         ],
         "type": "object"
       },
+      "RequestDispatch": {
+        "enum": [
+          "not_sent",
+          "sent",
+          "unknown"
+        ],
+        "type": "string"
+      },
       "ResourceEventCacheStatus": {
         "enum": [
           "not_applicable",
@@ -2739,6 +2767,77 @@
           "low",
           "medium",
           "high"
+        ],
+        "type": "string"
+      },
+      "RetryAction": {
+        "enum": [
+          "fail_fast",
+          "retry",
+          "next_route"
+        ],
+        "type": "string"
+      },
+      "RetryDecision": {
+        "additionalProperties": false,
+        "description": "One failed provider attempt, including the effective bounded decision.",
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/RetryAction"
+          },
+          "attempt": {
+            "description": "One-based attempt within this route (not the fallback index). Null\nwhen gateway cancellation cannot know which router attempt is active.",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "facts": {
+            "$ref": "#/components/schemas/TransportFacts"
+          },
+          "guard": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RetryGuard"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A mechanism that overrode policy, if any."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/LlmErrorKind"
+          },
+          "requested": {
+            "$ref": "#/components/schemas/RetryAction"
+          },
+          "source": {
+            "description": "`default`, `rule:<zero-based index>`, or `gateway` for terminal guards.",
+            "type": "string"
+          },
+          "stream": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "kind",
+          "facts",
+          "stream",
+          "requested",
+          "action",
+          "source"
+        ],
+        "type": "object"
+      },
+      "RetryGuard": {
+        "enum": [
+          "attempt_limit",
+          "stream_emitted",
+          "terminal_error",
+          "circuit_open"
         ],
         "type": "string"
       },
@@ -4289,6 +4388,30 @@
           "none",
           "auto",
           "required"
+        ],
+        "type": "string"
+      },
+      "TransportFacts": {
+        "additionalProperties": false,
+        "properties": {
+          "dispatch": {
+            "$ref": "#/components/schemas/RequestDispatch"
+          },
+          "phase": {
+            "$ref": "#/components/schemas/TransportPhase"
+          }
+        },
+        "required": [
+          "phase",
+          "dispatch"
+        ],
+        "type": "object"
+      },
+      "TransportPhase": {
+        "enum": [
+          "connect",
+          "response",
+          "unknown"
         ],
         "type": "string"
       },

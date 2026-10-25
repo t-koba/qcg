@@ -350,6 +350,7 @@ mod tests {
                 cache_creation_input: 0,
             },
             cost_microusd: 0,
+            retry_decisions: Vec::new(),
             attempt: 0,
             turn: None,
             tokens_total: None,

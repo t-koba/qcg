@@ -17,8 +17,8 @@ use crate::provider::{
 use crate::search::SearchRuntime;
 use crate::types::{
     Capabilities, ChatRequest, ChatResponse, ChatStreamEvent, LlmError, LlmErrorKind,
-    is_retryable_llm_error,
 };
+use crate::{RetryAction, RetryObserver};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
@@ -313,12 +313,22 @@ impl LlmProvider for LlmRouter {
         &self,
         req: crate::DecisionRequest,
     ) -> Result<crate::DecisionResponse, LlmError> {
+        self.decide_observed(req, Arc::new(|_| {})).await
+    }
+
+    async fn decide_observed(
+        &self,
+        req: crate::DecisionRequest,
+        observer: RetryObserver,
+    ) -> Result<crate::DecisionResponse, LlmError> {
         req.validate()?;
         let provider = self
             .providers
             .get(&req.provider)
             .ok_or_else(|| LlmError::new("decision provider is not registered"))?;
-        for attempt in 1..=provider.retry_attempts().max(1) {
+        let max_attempts = provider.retry_attempts().max(1);
+        let mut decisions = Vec::new();
+        for attempt in 1..=max_attempts {
             let result = timeout(
                 Duration::from_secs(provider.timeout_seconds()),
                 provider.decide(req.clone()),
@@ -327,14 +337,25 @@ impl LlmProvider for LlmRouter {
             .map_err(|_| LlmError {
                 message: "decision request timed out".into(),
                 kind: LlmErrorKind::TimedOut,
+                ..Default::default()
             })
             .and_then(|result| result);
             match result {
-                Err(error)
-                    if attempt < provider.retry_attempts()
-                        && error.is_retryable()
-                        && error.kind != LlmErrorKind::CircuitOpen =>
-                {
+                Ok(response) => return Ok(response),
+                Err(mut error) => {
+                    let action = provider.retry_policy().observe_failure(
+                        &mut error,
+                        attempt,
+                        max_attempts,
+                        false,
+                        false,
+                        &observer,
+                    );
+                    decisions.append(&mut error.decisions);
+                    if action != RetryAction::Retry {
+                        error.decisions = decisions;
+                        return Err(error);
+                    }
                     sleep(retry_backoff(
                         attempt,
                         provider.retry_base_backoff(),
@@ -342,17 +363,24 @@ impl LlmProvider for LlmRouter {
                     ))
                     .await;
                 }
-                result => return result,
             }
         }
-        Err(LlmError::new("decision request exhausted its attempts"))
+        unreachable!("policy bounds retries")
     }
 
     async fn complete(&self, req: ChatRequest) -> Result<ChatResponse, LlmError> {
+        self.complete_observed(req, Arc::new(|_| {})).await
+    }
+
+    async fn complete_observed(
+        &self,
+        req: ChatRequest,
+        observer: RetryObserver,
+    ) -> Result<ChatResponse, LlmError> {
         let provider = self.providers.get(&req.provider).ok_or_else(|| {
             LlmError::new(format!("LLM provider `{}` is not registered", req.provider))
         })?;
-        complete_with_retry(provider.as_ref(), req).await
+        complete_with_retry_observed(provider.as_ref(), req, observer).await
     }
 
     async fn stream(
@@ -360,11 +388,21 @@ impl LlmProvider for LlmRouter {
         req: ChatRequest,
         events: mpsc::Sender<ChatStreamEvent>,
     ) -> Result<(), LlmError> {
+        self.stream_observed(req, events, Arc::new(|_| {})).await
+    }
+
+    async fn stream_observed(
+        &self,
+        req: ChatRequest,
+        events: mpsc::Sender<ChatStreamEvent>,
+        observer: RetryObserver,
+    ) -> Result<(), LlmError> {
         let provider = self.providers.get(&req.provider).ok_or_else(|| {
             LlmError::new(format!("LLM provider `{}` is not registered", req.provider))
         })?;
         let attempts = provider.stream_retry_attempts();
-        let mut attempt = 0_usize;
+        let mut attempt = 1_usize;
+        let mut decisions = Vec::new();
         loop {
             // Proxy the provider's events so a failure BEFORE the first
             // forwarded event can be retried without the consumer observing
@@ -394,19 +432,42 @@ impl LlmProvider for LlmRouter {
                     provider.timeout_seconds()
                 ),
                 kind: LlmErrorKind::TimedOut,
+                ..Default::default()
             });
             // The provider dropped its sender when it returned, so the
             // forwarder drains and exits; join before any retry so events
             // from a superseded attempt can never interleave.
             let _ = forwarder.await;
-            let error = match result {
+            let mut error = match result {
                 Ok(Ok(())) => return Ok(()),
                 Ok(Err(error)) => error,
                 Err(error) => error,
             };
-            if attempt >= attempts || delivered.load(Ordering::SeqCst) {
+            let emitted = delivered.load(Ordering::SeqCst);
+            let action = provider.retry_policy().observe_failure(
+                &mut error,
+                attempt,
+                attempts + 1,
+                true,
+                emitted,
+                &observer,
+            );
+            decisions.append(&mut error.decisions);
+            if action != RetryAction::Retry {
+                error.decisions = decisions;
                 return Err(error);
             }
+            sleep(retry_delay(
+                attempt,
+                provider.retry_base_backoff(),
+                provider.retry_rate_limit_floor(),
+                provider.retry_backoff_exponent_cap(),
+                matches!(
+                    error.kind,
+                    LlmErrorKind::HttpStatus(429) | LlmErrorKind::EmptyResponse
+                ),
+            ))
+            .await;
             attempt += 1;
         }
     }
@@ -436,13 +497,14 @@ fn candidate_paths(include_env: bool) -> Vec<Utf8PathBuf> {
     candidates
 }
 
-async fn complete_with_retry(
+async fn complete_with_retry_observed(
     provider: &dyn LlmProvider,
     req: ChatRequest,
+    observer: RetryObserver,
 ) -> Result<ChatResponse, LlmError> {
     let timeout_seconds = provider.timeout_seconds();
     let max_attempts = provider.retry_attempts().max(1);
-    let mut last_error = None;
+    let mut decisions = Vec::new();
     for attempt in 1..=max_attempts {
         let result = timeout(
             Duration::from_secs(timeout_seconds),
@@ -455,38 +517,40 @@ async fn complete_with_retry(
                 provider.id()
             ),
             kind: LlmErrorKind::TimedOut,
+            ..Default::default()
         })
         .and_then(|result| result);
         match result {
             Ok(response) => return Ok(response),
-            Err(error)
-                if attempt < max_attempts
-                    && is_retryable_llm_error(&error)
-                    && error.kind != LlmErrorKind::CircuitOpen =>
-            {
-                let slow_down = matches!(
-                    error.kind,
-                    LlmErrorKind::HttpStatus(429) | LlmErrorKind::EmptyResponse
+            Err(mut error) => {
+                let action = provider.retry_policy().observe_failure(
+                    &mut error,
+                    attempt,
+                    max_attempts,
+                    false,
+                    false,
+                    &observer,
                 );
-                last_error = Some(error);
+                decisions.append(&mut error.decisions);
+                if action != RetryAction::Retry {
+                    error.decisions = decisions;
+                    return Err(error);
+                }
                 sleep(retry_delay(
                     attempt,
                     provider.retry_base_backoff(),
                     provider.retry_rate_limit_floor(),
                     provider.retry_backoff_exponent_cap(),
-                    slow_down,
+                    matches!(
+                        error.kind,
+                        LlmErrorKind::HttpStatus(429) | LlmErrorKind::EmptyResponse
+                    ),
                 ))
                 .await;
             }
-            Err(error) => return Err(error),
         }
     }
-    Err(last_error.unwrap_or_else(|| {
-        LlmError::new(format!(
-            "LLM provider `{}` failed without an error",
-            provider.id()
-        ))
-    }))
+    unreachable!("policy bounds retries")
 }
 
 pub(crate) fn retry_backoff(attempt: usize, base: Duration, exponent_cap: u32) -> Duration {

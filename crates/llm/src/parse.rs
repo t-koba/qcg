@@ -460,22 +460,48 @@ pub(crate) fn parse_anthropic_response(value: Value) -> Result<ChatResponse, Llm
 }
 
 pub(crate) fn llm_http_error(error: reqwest::Error) -> LlmError {
-    if error.is_timeout() {
-        return LlmError {
-            message: "LLM provider request timed out".into(),
-            kind: LlmErrorKind::TimedOut,
-        };
-    }
-    if error.is_decode() {
-        return LlmError {
-            message: "LLM provider response could not be decoded".into(),
-            kind: LlmErrorKind::InvalidResponse,
-        };
-    }
+    use crate::{RequestDispatch, TransportFacts, TransportPhase};
+    // reqwest exposes connection establishment separately. A connect failure
+    // proves this HTTP request was not dispatched (including connect timeout).
+    // Generic request/body errors do NOT prove a reset, DNS cause, or dispatch.
+    let facts = if error.is_connect() {
+        TransportFacts {
+            phase: TransportPhase::Connect,
+            dispatch: RequestDispatch::NotSent,
+        }
+    } else if error.is_decode() || error.is_body() {
+        TransportFacts {
+            phase: TransportPhase::Response,
+            dispatch: RequestDispatch::Sent,
+        }
+    } else {
+        TransportFacts::default()
+    };
+    let (kind, message) = if error.is_timeout() {
+        (LlmErrorKind::TimedOut, "LLM provider request timed out")
+    } else if error.is_decode() {
+        (
+            LlmErrorKind::InvalidResponse,
+            "LLM provider response could not be decoded",
+        )
+    } else {
+        (LlmErrorKind::Network, "LLM provider request failed")
+    };
     LlmError {
-        message: "LLM provider request failed".into(),
-        kind: LlmErrorKind::Network,
+        kind,
+        message: message.into(),
+        facts,
+        ..Default::default()
     }
+}
+
+pub(crate) fn llm_response_error(error: reqwest::Error) -> LlmError {
+    let mut error = llm_http_error(error);
+    error.facts = crate::TransportFacts {
+        phase: crate::TransportPhase::Response,
+        dispatch: crate::RequestDispatch::Sent,
+    };
+    error
 }
 
 pub(crate) fn marker_line(prompt: &str, marker: &str) -> Option<String> {

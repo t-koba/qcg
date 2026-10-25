@@ -264,25 +264,15 @@ pub enum StopReason {
     Refusal,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LlmErrorKind {
-    HttpStatus(u16),
-    TimedOut,
-    Network,
-    EmptyResponse,
-    InvalidResponse,
-    PartialStream,
-    Canceled,
-    CircuitOpen,
-    Other,
-}
+pub use model::LlmErrorKind;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Default, thiserror::Error)]
 #[error("{message}")]
 pub struct LlmError {
     pub message: String,
     pub kind: LlmErrorKind,
+    pub facts: model::TransportFacts,
+    pub decisions: Vec<model::RetryDecision>,
 }
 
 impl LlmError {
@@ -290,6 +280,7 @@ impl LlmError {
         Self {
             message: message.into(),
             kind: LlmErrorKind::Other,
+            ..Default::default()
         }
     }
 
@@ -301,6 +292,11 @@ impl LlmError {
         Self {
             message: message.into(),
             kind: LlmErrorKind::HttpStatus(status),
+            facts: model::TransportFacts {
+                phase: model::TransportPhase::Response,
+                dispatch: model::RequestDispatch::Sent,
+            },
+            ..Default::default()
         }
     }
 
@@ -308,6 +304,11 @@ impl LlmError {
         Self {
             message: message.into(),
             kind: LlmErrorKind::InvalidResponse,
+            facts: model::TransportFacts {
+                phase: model::TransportPhase::Response,
+                dispatch: model::RequestDispatch::Sent,
+            },
+            ..Default::default()
         }
     }
 
@@ -315,6 +316,11 @@ impl LlmError {
         Self {
             message: message.into(),
             kind: LlmErrorKind::EmptyResponse,
+            facts: model::TransportFacts {
+                phase: model::TransportPhase::Response,
+                dispatch: model::RequestDispatch::Sent,
+            },
+            ..Default::default()
         }
     }
 }

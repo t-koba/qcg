@@ -1,6 +1,7 @@
 mod complete;
 mod cost;
 mod merge;
+mod retry;
 mod scan;
 mod types;
 
@@ -14,6 +15,8 @@ mod tests {
     mod cache_retention_cost;
     #[path = "context_exhaustion.rs"]
     mod context_exhaustion;
+    #[path = "retry_policy.rs"]
+    mod retry_policy;
     #[path = "tier_cost.rs"]
     mod tier_cost;
     #[path = "web_search_cost.rs"]
@@ -288,24 +291,35 @@ mod tests {
             Capabilities::default()
         }
 
+        fn capabilities_for(&self, provider: &str) -> Option<Capabilities> {
+            matches!(
+                provider,
+                "primary" | "fallback" | "final-failure" | "nonretryable"
+            )
+            .then(Capabilities::default)
+        }
+
         async fn complete(&self, req: ChatRequest) -> Result<ChatResponse, LlmError> {
             match req.provider.as_str() {
                 "primary" => {
                     return Err(LlmError {
                         message: "primary route timed out".into(),
                         kind: LlmErrorKind::TimedOut,
+                        ..Default::default()
                     });
                 }
                 "final-failure" => {
                     return Err(LlmError {
                         message: "final route returned a server error".into(),
                         kind: LlmErrorKind::HttpStatus(503),
+                        ..Default::default()
                     });
                 }
                 "nonretryable" => {
                     return Err(LlmError {
                         message: "route returned an invalid response".into(),
                         kind: LlmErrorKind::InvalidResponse,
+                        ..Default::default()
                     });
                 }
                 _ => {}

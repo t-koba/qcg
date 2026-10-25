@@ -122,8 +122,11 @@ Fields:
 - `timeout_seconds`: timeout for each completion attempt. The default is 120
   seconds; retryable failures may start another independently timed attempt.
 - `retry_attempts`: attempts per completion call including the first, 1 to 10.
-  The default is 3. Only retryable failures (timeouts, 5xx, 429, empty
-  responses) retry; other errors fail fast.
+  The default is 3. The provider `retry_policy` selects which failures retry
+  (by default timeouts, 5xx, 429, and empty responses); it cannot raise this bound.
+- `retry_policy.rules`: optional ordered transport-decision rules; see
+  [Transport retry and route policy](#transport-retry-and-route-policy).
+  Omission or an empty list uses the documented default.
 - `retry_base_backoff_ms`: base wait between retries in milliseconds, up to
   60000. The default is 200; waits grow exponentially from there.
 - `retry_rate_limit_floor_ms`: minimum wait per retry attempt for rate-limited
@@ -152,8 +155,10 @@ Fields:
   reasoning endpoints. It is rejected for other API flavors.
 - `stream_retry_attempts`: retry attempts for a stream that fails before
   delivering any event (default `0`, range `0..=3`). A retry is refused once
-  any delta was delivered, so two model responses can never interleave;
-  `0` surfaces the provider error immediately.
+  any event was delivered, so two model responses can never interleave.
+  `0` disallows same-route retries, but the policy can still select a declared
+  fallback before emission. Only policy-selected failures retry; unlike the
+  former blanket pre-emission retry, application/validation errors fail fast.
 - `prompt_cache_field`: prompt-cache mechanism for this row. `prompt_cache_key`
   is valid for `chat_completions` and `responses`; `cache_control` and
   `cache_control_auto` are valid for `anthropic_messages`. It is required
@@ -635,11 +640,109 @@ native schema mode only if the provider advertises both `json_schema` and
 same mandatory local validation and bounded correction loop. Selecting an
 explicit native mode for an unsupported combination fails before transport.
 
+### Transport retry and route policy
+
+Transport facts and decisions belong to each provider row in `providers.toml`,
+not to the generator's contract. The contract still exclusively declares the
+ordered `fallback_models`; policy cannot invent a route, grant authorization,
+change operation-completion/replay rules, or implement waiting/partial success.
+
+Each failed attempt has a structured `kind` (`network`, `timed_out`,
+`empty_response`, `invalid_response`, `circuit_open`, or `{ http_status = 503 }`,
+for example), `phase` (`connect`, `response`, `unknown`), and request `dispatch`
+(`not_sent`, `sent`, `unknown`). The adapter records `connect/not_sent` only
+when reqwest reports a connection-establishment failure. Redirects are disabled,
+so a failed redirected connection cannot hide an earlier dispatch. This includes
+connection refusal and connect timeout; qcg does not guess DNS/reset causes
+from error messages. Response reads/decoding, empty responses, and HTTP statuses
+are `response/sent`. A generic send error or the router's whole-attempt timeout
+is `unknown/unknown`: it does **not** prove that the request was never sent.
+`sent` is dispatch evidence, not proof of completion or billed usage.
+
+`retry_policy.rules` uses first-match order. Every omitted match field is a
+wildcard: `kind`, `phase`, `dispatch`, `stream` (boolean), `attempt_from`, and
+`attempt_through`. Attempt bounds are inclusive, positive, and one-based within
+the route, independent of the fallback index. A rule chooses `action`:
+
+- `fail_fast`: return the failure, without internal retry or route fallback.
+- `retry`: retry the same unchanged request on the same route, with the existing
+  timeout and bounded exponential backoff. At the attempt limit,
+  `on_exhausted` chooses `fail_fast` (the rule default) or `next_route`;
+  `on_exhausted = "retry"` is invalid.
+- `next_route`: skip remaining internal attempts and try only the next declared
+  route. With no route left the call fails. `llm.decide` has one declared route,
+  so this decision ends in failure, never an invented decision fallback.
+
+Unmatched failures use the built-in default: timeout, empty response, HTTP 429
+and 5xx retry within the bound, then select `next_route`. An open circuit selects
+`next_route` without another same-route attempt. All `network` failures fail fast,
+**including known pre-dispatch failures**: this preserves existing behavior and
+requires an explicit operator choice to add recovery. Ambiguous post-dispatch
+network failures are therefore never retried/fallen back by default. The legacy
+timeout default is retained even when dispatch is uncertain; operators who need
+stricter duplicate-request avoidance can override it with a fail-fast rule.
+Circuit failure counting remains based on its existing retryable-kind set;
+transport policy does not redefine circuit accounting.
+
+Example, appended inside one provider row (before the next `[[provider]]`):
+
+```toml
+# Opt in to declared fallback only for a proven pre-dispatch network failure.
+[[provider.retry_policy.rules]]
+kind = "network"
+phase = "connect"
+dispatch = "not_sent"
+action = "next_route"
+
+# Refuse uncertain timeout replay instead of the default bounded timeout retry.
+[[provider.retry_policy.rules]]
+kind = "timed_out"
+dispatch = "unknown"
+action = "fail_fast"
+
+# Alternatively select bounded retry with an explicit exhaustion disposition:
+[[provider.retry_policy.rules]]
+kind = { http_status = 503 }
+attempt_from = 1
+attempt_through = 10
+action = "retry"
+on_exhausted = "next_route"
+```
+
+`retry_attempts` still bounds completion/decision attempts including the first
+(default 3, maximum 10); `stream_retry_attempts` bounds *additional* stream
+attempts (default 0, maximum 3). Streaming retries now use the configured backoff
+and rate-limit/empty-response floor too. Cancellation drops attempts/backoff;
+a canceled call never retries or falls back. Circuit-open errors cannot be
+same-route retried. Application/configuration errors (`other`) and partial-stream
+failures cannot be made recoverable by a rule. No policy can retry or fall back
+after a stream event is forwarded, even when secret filtering has withheld the
+delta from the journal. A declared fallback receives the unchanged request:
+qcg rechecks the actual model's capabilities (including seed, effort, tools,
+structured output, streaming and media) and the provider's API-specific checks;
+it never silently removes an unsupported parameter.
+
+`llm_call.retry_decisions` retains failed attempts preceding a successful call,
+including decisions on the decision API. `llm_route_failed.retry_decisions`
+retains them for a failed route, and `fallback_taken` states whether this
+invocation advanced to another declared route. Each decision carries its kind,
+facts, attempt, stream flag, requested/effective actions, source (`default` or
+`rule:<zero-based index>`, or `gateway` for a gateway terminal guard), and any mechanism guard (`attempt_limit`,
+`circuit_open`, `terminal_error`, `stream_emitted`). A gateway cancellation uses
+a null attempt because cancellation during backoff versus an active attempt
+cannot be distinguished there; it never invents an additional dispatched attempt.
+These observation events
+follow the configured audit policy. They contain no request body, endpoint,
+credentials, or upstream error text. Successful calls still account usage once;
+failed attempts can incur unreported upstream usage, so retries/fallback are not
+an upstream spending guarantee.
+
 ### Budget and fallback policy guidance
 
 Mechanism enforces, policy chooses. qcg enforces run-wide `[budget]`
 (`max_steps`, `max_tokens`, `max_cost_usd`, `max_elapsed_seconds`), static
-ordered `fallback_models` (at most 8, retryable route failures only), and the
+ordered `fallback_models` (at most 8, only when provider policy selects
+`next_route`), and the
 streaming rule that route fallback is refused once the first delta is emitted
 (partial billing is then unavoidable). Unpriced routes account as zero and are
 flagged, since totals may understate spend. Chat token and cost ceilings use
