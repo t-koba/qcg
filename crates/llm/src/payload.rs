@@ -28,12 +28,7 @@ pub(crate) fn chat_completions_payload(
         ChatTokenLimitField::MaxCompletionTokens => "max_completion_tokens",
     };
     payload[token_limit_key] = json!(req.max_tokens);
-    if let Some(temperature) = req.temperature {
-        payload["temperature"] = json!(temperature);
-    }
-    if let Some(top_p) = req.top_p {
-        payload["top_p"] = json!(top_p);
-    }
+    sampling_payload(&mut payload, req);
     if !req.stop_sequences.is_empty() {
         payload["stop"] = json!(req.stop_sequences);
     }
@@ -80,12 +75,7 @@ pub(crate) fn responses_payload(
         "max_output_tokens": req.max_tokens,
         "store": false,
     });
-    if let Some(temperature) = req.temperature {
-        payload["temperature"] = json!(temperature);
-    }
-    if let Some(top_p) = req.top_p {
-        payload["top_p"] = json!(top_p);
-    }
+    sampling_payload(&mut payload, req);
     if let Some(effort) = req.reasoning_effort {
         payload["reasoning"] = json!({ "effort": effort });
         if !req.tools.is_empty() {
@@ -128,6 +118,15 @@ pub(crate) fn responses_payload(
         true,
     );
     payload
+}
+
+fn sampling_payload(payload: &mut Value, req: &ChatRequest) {
+    if let Some(temperature) = req.temperature {
+        payload["temperature"] = json!(temperature);
+    }
+    if let Some(top_p) = req.top_p {
+        payload["top_p"] = json!(top_p);
+    }
 }
 
 /// Shared OpenAI cache controls. Keep API-specific TTL support even when
@@ -247,12 +246,7 @@ pub(crate) fn anthropic_payload(
         // Both default to the 5-minute TTL and consume 2 of 4 slots.
         payload["cache_control"] = marker;
     }
-    if let Some(temperature) = req.temperature {
-        payload["temperature"] = json!(temperature);
-    }
-    if let Some(top_p) = req.top_p {
-        payload["top_p"] = json!(top_p);
-    }
+    sampling_payload(&mut payload, req);
     if !req.stop_sequences.is_empty() {
         payload["stop_sequences"] = json!(req.stop_sequences);
     }
@@ -666,7 +660,7 @@ pub(crate) fn openai_messages(req: &ChatRequest) -> Vec<Value> {
                 "content": message.content,
             })
         } else {
-            json!({ "role": message.role, "content": openai_message_content(message) })
+            json!({ "role": message.role, "content": openai_message_content(message, false) })
         }
     }));
     messages
@@ -688,50 +682,48 @@ fn message_content(
     Value::Array(parts)
 }
 
-fn openai_message_content(message: &ChatMessage) -> Value {
-    message_content(message, "text", |part| match part {
-        ChatContentPart::Text { text } => json!({ "type": "text", "text": text }),
+// Chat and Responses share audio encoding and content traversal, but use
+// different image/file envelopes and text discriminators.
+fn openai_message_content(message: &ChatMessage, responses: bool) -> Value {
+    let text_type = if responses { "input_text" } else { "text" };
+    message_content(message, text_type, |part| match part {
+        ChatContentPart::Text { text } => json!({ "type": text_type, "text": text }),
         ChatContentPart::InputImage {
             media_type,
             data,
             detail,
-        } => json!({
-            "type": "image_url",
-            "image_url": {
-                "url": data_url(media_type, data),
-                "detail": detail.unwrap_or(ImageDetail::Auto),
+        } => {
+            let url = data_url(media_type, data);
+            let detail = detail.unwrap_or(ImageDetail::Auto);
+            if responses {
+                json!({ "type": "input_image", "image_url": url, "detail": detail })
+            } else {
+                json!({ "type": "image_url", "image_url": { "url": url, "detail": detail } })
             }
-        }),
+        }
         ChatContentPart::InputAudio { media_type, data } => json!({
             "type": "input_audio",
-            "input_audio": {
-                "data": data,
-                "format": media_subtype(media_type),
-            }
+            "input_audio": { "data": data, "format": media_subtype(media_type) }
         }),
         ChatContentPart::InputFile {
             media_type,
             data,
             filename,
-        } => json!({
-            "type": "file",
-            "file": {
-                "filename": filename,
-                "file_data": data_url(media_type, data),
+        } => {
+            let file = json!({ "filename": filename, "file_data": data_url(media_type, data) });
+            if responses {
+                let mut file = file;
+                file["type"] = json!("input_file");
+                file
+            } else {
+                json!({ "type": "file", "file": file })
             }
-        }),
+        }
     })
 }
 
 pub(crate) fn openai_tool(tool: &ToolSpec) -> Value {
-    json!({
-        "type": "function",
-        "function": {
-            "name": tool.name,
-            "description": tool.description,
-            "parameters": tool.input_schema
-        }
-    })
+    json!({ "type": "function", "function": function_tool(tool) })
 }
 
 pub(crate) fn responses_input(req: &ChatRequest) -> Vec<Value> {
@@ -760,51 +752,25 @@ pub(crate) fn responses_input(req: &ChatRequest) -> Vec<Value> {
         } else {
             messages.push(json!({
                 "role": message.role,
-                "content": responses_message_content(message),
+                "content": openai_message_content(message, true),
             }));
         }
     }
     messages
 }
 
-fn responses_message_content(message: &ChatMessage) -> Value {
-    message_content(message, "input_text", |part| match part {
-        ChatContentPart::Text { text } => json!({ "type": "input_text", "text": text }),
-        ChatContentPart::InputImage {
-            media_type,
-            data,
-            detail,
-        } => json!({
-            "type": "input_image",
-            "image_url": data_url(media_type, data),
-            "detail": detail.unwrap_or(ImageDetail::Auto),
-        }),
-        ChatContentPart::InputAudio { media_type, data } => json!({
-            "type": "input_audio",
-            "input_audio": {
-                "data": data,
-                "format": media_subtype(media_type),
-            }
-        }),
-        ChatContentPart::InputFile {
-            media_type,
-            data,
-            filename,
-        } => json!({
-            "type": "input_file",
-            "file_data": data_url(media_type, data),
-            "filename": filename,
-        }),
-    })
-}
-
-fn responses_tool(tool: &ToolSpec) -> Value {
+fn function_tool(tool: &ToolSpec) -> Value {
     json!({
-        "type": "function",
         "name": tool.name,
         "description": tool.description,
         "parameters": tool.input_schema,
     })
+}
+
+fn responses_tool(tool: &ToolSpec) -> Value {
+    let mut tool = function_tool(tool);
+    tool["type"] = json!("function");
+    tool
 }
 
 pub(crate) fn anthropic_messages(req: &ChatRequest) -> Vec<Value> {

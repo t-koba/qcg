@@ -393,7 +393,7 @@ impl CatalogService {
         let mut statuses = Vec::new();
         let mut first_error: Option<String> = None;
         for source in &self.config.source {
-            match self.fetch_source(source).await {
+            let (fetched_at, error) = match self.fetch_source(source).await {
                 Ok(catalog) => {
                     for (provider, errors) in &catalog.model_errors {
                         tracing::warn!(provider = %provider, model_errors = ?errors, "unusable tier");
@@ -411,23 +411,19 @@ impl CatalogService {
                             .or_default()
                             .extend(errors);
                     }
-                    statuses.push(CatalogSourceStatus {
-                        kind: source.kind_name().to_string(),
-                        location: source.location().to_string(),
-                        fetched_at: catalog.fetched_at,
-                        error: None,
-                    });
+                    (catalog.fetched_at, None)
                 }
                 Err(error) => {
-                    statuses.push(CatalogSourceStatus {
-                        kind: source.kind_name().to_string(),
-                        location: source.location().to_string(),
-                        fetched_at: None,
-                        error: Some(error.clone()),
-                    });
-                    first_error.get_or_insert(error);
+                    first_error.get_or_insert_with(|| error.clone());
+                    (None, Some(error))
                 }
-            }
+            };
+            statuses.push(CatalogSourceStatus {
+                kind: source.kind_name().to_string(),
+                location: source.location().to_string(),
+                fetched_at,
+                error,
+            });
         }
         merged.fetched_at = Some(chrono::Utc::now().to_rfc3339());
         merged.fingerprint = Some(config_fingerprint(&self.config));
@@ -1127,29 +1123,19 @@ fn write_cache(config: &CatalogConfig, catalog: &ExternalCatalog) -> Result<(), 
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
 struct ModelsDevModel {
-    #[serde(default)]
     name: Option<String>,
-    #[serde(default)]
     reasoning: bool,
-    #[serde(default)]
     reasoning_options: Vec<ModelsDevReasoningOption>,
-    #[serde(default)]
     tool_call: bool,
-    #[serde(default)]
     structured_output: bool,
-    #[serde(default)]
     temperature: bool,
-    #[serde(default)]
     attachment: bool,
-    #[serde(default)]
     modalities: Option<ModelsDevModalities>,
-    #[serde(default)]
     limit: Option<ModelsDevLimit>,
-    #[serde(default)]
     cost: Option<ModelsDevCost>,
-    #[serde(default)]
     status: Option<String>,
 }
 

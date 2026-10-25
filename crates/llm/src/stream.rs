@@ -14,17 +14,18 @@ use crate::types::{ChatContent, ChatResponse, ChatStreamEvent, LlmError, StopRea
 /// on a fan-out chunk (many tool-call deltas in one SSE value) instead of
 /// failing. A full channel fails closed with a loud error; a closed
 /// receiver keeps its existing error.
-fn send_ingest_event(
-    events: &mpsc::Sender<ChatStreamEvent>,
-    event: ChatStreamEvent,
-) -> Result<(), LlmError> {
+fn send_text_delta(events: &mpsc::Sender<ChatStreamEvent>, text: &str) -> Result<(), LlmError> {
     use tokio::sync::mpsc::error::TrySendError;
-    events.try_send(event).map_err(|error| match error {
-        TrySendError::Closed(_) => LlmError::new("LLM stream receiver closed"),
-        TrySendError::Full(_) => {
-            LlmError::new("LLM provider stream fan-out exceeded the ingest channel capacity")
-        }
-    })
+    events
+        .try_send(ChatStreamEvent::TextDelta {
+            text: text.to_string(),
+        })
+        .map_err(|error| match error {
+            TrySendError::Closed(_) => LlmError::new("LLM stream receiver closed"),
+            TrySendError::Full(_) => {
+                LlmError::new("LLM provider stream fan-out exceeded the ingest channel capacity")
+            }
+        })
 }
 
 pub(crate) enum HttpStreamAccumulator {
@@ -84,6 +85,35 @@ struct PartialToolCall {
     arguments: String,
 }
 
+impl PartialToolCall {
+    fn finish(self, api: &str, allow_partial: bool) -> Result<(String, String, Value), LlmError> {
+        if self.id.is_empty() || self.name.is_empty() {
+            return Err(LlmError::invalid_response(format!(
+                "{api} stream returned an incomplete tool call"
+            )));
+        }
+        let args = serde_json::from_str(&self.arguments)
+            .or_else(|error| {
+                if allow_partial {
+                    Ok(Value::String(self.arguments)) // Retain partial arguments, never executable.
+                } else {
+                    Err(error)
+                }
+            })
+            .map_err(|_| {
+                LlmError::invalid_response(format!("{api} stream returned invalid tool arguments"))
+            })?;
+        Ok((self.id, self.name, args))
+    }
+}
+
+fn block_index(value: &Value) -> usize {
+    value
+        .get("index")
+        .and_then(Value::as_u64)
+        .unwrap_or_default() as usize
+}
+
 #[derive(Default)]
 pub(crate) struct ChatCompletionAccumulator {
     text: String,
@@ -123,12 +153,7 @@ impl ChatCompletionAccumulator {
             {
                 self.text.push_str(text);
                 self.refused |= is_refusal;
-                send_ingest_event(
-                    events,
-                    ChatStreamEvent::TextDelta {
-                        text: text.to_string(),
-                    },
-                )?;
+                send_text_delta(events, text)?;
             }
         }
         for call in delta
@@ -137,10 +162,7 @@ impl ChatCompletionAccumulator {
             .into_iter()
             .flatten()
         {
-            let index = call
-                .get("index")
-                .and_then(Value::as_u64)
-                .unwrap_or_default() as usize;
+            let index = block_index(call);
             let partial = self.tool_calls.entry(index).or_default();
             if let Some(id) = call.get("id").and_then(Value::as_str) {
                 partial.id.push_str(id);
@@ -166,21 +188,8 @@ impl ChatCompletionAccumulator {
             content.push(ChatContent::Text(self.text));
         }
         for (_, call) in self.tool_calls {
-            if call.id.is_empty() || call.name.is_empty() {
-                return Err(LlmError::invalid_response(
-                    "OpenAI-compatible stream returned an incomplete tool call",
-                ));
-            }
-            let args = serde_json::from_str(&call.arguments).map_err(|_| {
-                LlmError::invalid_response(
-                    "OpenAI-compatible stream returned invalid tool arguments",
-                )
-            })?;
-            content.push(ChatContent::ToolCall {
-                id: call.id,
-                name: call.name,
-                args,
-            });
+            let (id, name, args) = call.finish("OpenAI-compatible", false)?;
+            content.push(ChatContent::ToolCall { id, name, args });
         }
         if content.is_empty() {
             return Err(LlmError::invalid_response(
@@ -248,12 +257,7 @@ impl ResponsesAccumulator {
                 if let Some(text) = value.get("delta").and_then(Value::as_str)
                     && !text.is_empty()
                 {
-                    send_ingest_event(
-                        events,
-                        ChatStreamEvent::TextDelta {
-                            text: text.to_string(),
-                        },
-                    )?;
+                    send_text_delta(events, text)?;
                 }
                 Ok(None)
             }
@@ -346,10 +350,7 @@ impl AnthropicAccumulator {
                 }
             }
             Some("content_block_start") => {
-                let index = value
-                    .get("index")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_default() as usize;
+                let index = block_index(value);
                 let block = value.get("content_block").unwrap_or(&Value::Null);
                 if block.get("type").and_then(Value::as_str) == Some("tool_use") {
                     let partial = self.tool_calls.entry(index).or_default();
@@ -371,19 +372,11 @@ impl AnthropicAccumulator {
                     Some("text_delta") | Some("refusal_delta") => {
                         if let Some(text) = delta.get("text").and_then(Value::as_str) {
                             self.text.push_str(text);
-                            send_ingest_event(
-                                events,
-                                ChatStreamEvent::TextDelta {
-                                    text: text.to_string(),
-                                },
-                            )?;
+                            send_text_delta(events, text)?;
                         }
                     }
                     Some("input_json_delta") => {
-                        let index = value
-                            .get("index")
-                            .and_then(Value::as_u64)
-                            .unwrap_or_default() as usize;
+                        let index = block_index(value);
                         if let Some(json) = delta.get("partial_json").and_then(Value::as_str) {
                             self.tool_calls
                                 .entry(index)
@@ -432,31 +425,13 @@ impl AnthropicAccumulator {
             content.push(ChatContent::Text(self.text));
         }
         for (_, call) in self.tool_calls {
-            if call.id.is_empty() || call.name.is_empty() {
-                return Err(LlmError::invalid_response(
-                    "Anthropic stream returned an incomplete tool call",
-                ));
-            }
-            let args: Value = serde_json::from_str(&call.arguments)
-                .or_else(|error| {
-                    if stop == StopReason::ModelContextWindowExceeded {
-                        Ok(Value::String(call.arguments)) // Retain partial arguments, never executable.
-                    } else {
-                        Err(error)
-                    }
-                })
-                .map_err(|_| {
-                    LlmError::invalid_response("Anthropic stream returned invalid tool arguments")
-                })?;
-            if call.name == "response" {
+            let (id, name, args) =
+                call.finish("Anthropic", stop == StopReason::ModelContextWindowExceeded)?;
+            if name == "response" {
                 structured_response = true;
                 content.push(ChatContent::Text(args.to_string()));
             } else {
-                content.push(ChatContent::ToolCall {
-                    id: call.id,
-                    name: call.name,
-                    args,
-                });
+                content.push(ChatContent::ToolCall { id, name, args });
             }
         }
         if content.is_empty() && stop != StopReason::ModelContextWindowExceeded {
