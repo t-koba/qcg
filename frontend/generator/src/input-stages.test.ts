@@ -41,6 +41,13 @@ beforeEach(() => {
 });
 
 it("uses an active stage's default for a later stage on first render", async () => {
+  const evaluatedInputs: Record<string, unknown>[] = [];
+  vi.mocked(evalWhen).mockImplementation(async (expr, context) => {
+    evaluatedInputs.push({ ...context.inputs });
+    if (!expr) return true;
+    const key = /^inputs\.([A-Za-z0-9_]+)$/.exec(expr)?.[1];
+    return key !== undefined && context.inputs[key] === true;
+  });
   const store = storeWithStages([
     { id: "setup", fields: [field("enabled", true)] },
     { id: "details", when: "inputs.enabled", fields: [field("detail", "initial")] },
@@ -50,7 +57,7 @@ it("uses an active stage's default for a later stage on first render", async () 
 
   expect(store.activeFields.map(({ id }) => id)).toEqual(["enabled", "detail"]);
   expect(store.values).toEqual({ enabled: true, detail: "initial" });
-  expect(vi.mocked(evalWhen).mock.calls[1]?.[1].inputs).toEqual({ enabled: true });
+  expect(evaluatedInputs).toEqual([{}, { enabled: true }]);
 });
 
 it("does not apply an inactive stage's default to later conditions", async () => {
