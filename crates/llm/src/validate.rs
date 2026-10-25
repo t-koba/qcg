@@ -209,30 +209,20 @@ pub(crate) fn validate_multimodal_capabilities(
     capabilities: &Capabilities,
 ) -> Result<(), LlmError> {
     for part in req.messages.iter().flat_map(|message| &message.parts) {
-        let supported = match part {
-            ChatContentPart::Text { .. } => true,
-            ChatContentPart::InputImage { .. } => capabilities.image_input,
-            ChatContentPart::InputAudio { .. } => capabilities.audio_input,
-            ChatContentPart::InputFile { .. } => capabilities.file_input,
+        let (supported, capability) = match part {
+            ChatContentPart::Text { .. } => (true, "text_input"),
+            ChatContentPart::InputImage { .. } => (capabilities.image_input, "image_input"),
+            ChatContentPart::InputAudio { .. } => (capabilities.audio_input, "audio_input"),
+            ChatContentPart::InputFile { .. } => (capabilities.file_input, "file_input"),
         };
         if !supported {
             return Err(LlmError::new(format!(
-                "provider `{}` does not advertise support for `{}`",
-                req.provider,
-                content_part_capability(part)
+                "provider `{}` does not advertise support for `{capability}`",
+                req.provider
             )));
         }
     }
     Ok(())
-}
-
-fn content_part_capability(part: &ChatContentPart) -> &'static str {
-    match part {
-        ChatContentPart::Text { .. } => "text_input",
-        ChatContentPart::InputImage { .. } => "image_input",
-        ChatContentPart::InputAudio { .. } => "audio_input",
-        ChatContentPart::InputFile { .. } => "file_input",
-    }
 }
 
 fn valid_media_type(media_type: &str) -> bool {
