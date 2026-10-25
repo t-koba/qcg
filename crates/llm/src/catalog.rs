@@ -143,15 +143,6 @@ pub struct ExternalCatalog {
     model_errors: BTreeMap<String, Vec<String>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
-struct CachedCatalog {
-    fetched_at: Option<String>,
-    fingerprint: Option<String>,
-    providers: BTreeMap<String, BTreeMap<String, ModelSpec>>,
-    model_errors: BTreeMap<String, Vec<String>>,
-}
-
 #[derive(Debug, Clone, Default)]
 struct Snapshot {
     /// Provider id -> merged explicit + external models.
@@ -1007,7 +998,7 @@ fn load_cached_external(config: &CatalogConfig) -> (ExternalCatalog, Option<Stri
             );
         }
     };
-    match serde_json::from_slice::<CachedCatalog>(&bytes) {
+    match serde_json::from_slice::<ExternalCatalog>(&bytes) {
         Ok(cached) => {
             // Fingerprint gate (F09-02): a cache written under different
             // sources is not verified data for the current pins.
@@ -1018,15 +1009,7 @@ fn load_cached_external(config: &CatalogConfig) -> (ExternalCatalog, Option<Stri
                     Some("catalog cache is from different sources; ignoring".to_string()),
                 );
             }
-            (
-                ExternalCatalog {
-                    fetched_at: cached.fetched_at,
-                    fingerprint: cached.fingerprint,
-                    providers: cached.providers,
-                    model_errors: cached.model_errors,
-                },
-                None,
-            )
+            (cached, None)
         }
         Err(error) => (
             ExternalCatalog::default(),
@@ -1061,15 +1044,10 @@ fn write_cache(config: &CatalogConfig, catalog: &ExternalCatalog) -> Result<(), 
     };
     std::fs::create_dir_all(parent)
         .map_err(|error| format!("catalog cache directory could not be created: {error}"))?;
-    let cached = CachedCatalog {
-        fetched_at: catalog.fetched_at.clone(),
-        fingerprint: catalog
-            .fingerprint
-            .clone()
-            .or_else(|| Some(config_fingerprint(config))),
-        providers: catalog.providers.clone(),
-        model_errors: catalog.model_errors.clone(),
-    };
+    let mut cached = catalog.clone();
+    if cached.fingerprint.is_none() {
+        cached.fingerprint = Some(config_fingerprint(config));
+    }
     let bytes = serde_json::to_vec_pretty(&cached)
         .map_err(|error| format!("catalog cache is not serializable: {error}"))?;
     if bytes.len() > MODELS_DEV_BODY_LIMIT_BYTES {
