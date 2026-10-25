@@ -139,6 +139,9 @@ enabled = false
             assert_eq!(reread.step_summaries[path].reason.as_ref(), Some(detail));
             service.shutdown_active_runs().await.unwrap();
             drop(service);
+            // The terminal snapshot may precede the engine task's return;
+            // wait on the real store lock instead of racing its final owner drop.
+            wait_for_store_lock_release(root.join("runs")).await;
             let reopened = test_service(vec![root.join("generators")], root.join("runs"));
             let restored = reopened.snapshot(id).await.unwrap();
             assert_eq!(restored.step_summaries[path].reason.as_ref(), Some(detail));

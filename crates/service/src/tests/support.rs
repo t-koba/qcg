@@ -73,6 +73,25 @@ pub(crate) fn test_service(roots: Vec<Utf8PathBuf>, runs_dir: Utf8PathBuf) -> Lo
     try_service(roots, runs_dir).expect("service should initialize")
 }
 
+/// Waits for the exclusive service lock to become available after dropping
+/// the last expected service owner. The terminal snapshot can be visible
+/// before its engine task has returned and released the service's lock.
+pub(crate) async fn wait_for_store_lock_release(runs_dir: Utf8PathBuf) {
+    tokio::task::spawn_blocking(move || {
+        let lock_path = runs_dir.join(".service.lock");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path.as_std_path())
+            .expect("service lock file should exist");
+        file.lock()
+            .expect("service store lock should become available");
+        file.unlock().expect("test store lock should release");
+    })
+    .await
+    .expect("store lock waiter should complete");
+}
+
 pub(crate) async fn read_journal_string(service: &LocalService, id: String) -> String {
     use tokio::io::AsyncReadExt as _;
     let mut opened = service
