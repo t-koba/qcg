@@ -1,9 +1,8 @@
-use policy::is_safe_relative_path;
+use policy::is_safe_path_component;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Deserializer, Serialize, de::Error as DeError};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::borrow::Cow;
-use std::fmt;
 
 use super::encoding::{
     decode_base64, encode_base64, validate_base64_input_size_optional,
@@ -17,47 +16,24 @@ use super::encoding::{
 /// always take precedence. `None` means no size check.
 pub const MAX_FILE_INPUT_BYTES: usize = 16 * 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FileValueError {
+    #[error("{0}")]
     InvalidShape(String),
+    #[error("file name `{0}` is not a safe relative path component")]
     UnsafeName(String),
+    #[error("file value must set exactly one of `text` or `content_base64`")]
     MissingContent,
+    #[error("file value must set exactly one of `text` or `content_base64`")]
     MultipleContent,
+    #[error("invalid base64 file content: {0}")]
     InvalidBase64(String),
+    #[error("file content is too large: {actual_bytes} bytes exceeds {limit_bytes} bytes")]
     TooLarge {
         actual_bytes: usize,
         limit_bytes: usize,
     },
 }
-
-impl fmt::Display for FileValueError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidShape(message) => formatter.write_str(message),
-            Self::UnsafeName(name) => {
-                write!(
-                    formatter,
-                    "file name `{name}` is not a safe relative path component"
-                )
-            }
-            Self::MissingContent | Self::MultipleContent => {
-                formatter.write_str("file value must set exactly one of `text` or `content_base64`")
-            }
-            Self::InvalidBase64(message) => {
-                write!(formatter, "invalid base64 file content: {message}")
-            }
-            Self::TooLarge {
-                actual_bytes,
-                limit_bytes,
-            } => write!(
-                formatter,
-                "file content is too large: {actual_bytes} bytes exceeds {limit_bytes} bytes"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for FileValueError {}
 
 /// Canonical inline file input exchanged by the CLI, HTTP API, and engine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -114,6 +90,24 @@ impl<'de> Deserialize<'de> for FileValue {
     }
 }
 
+fn check_name(name: &str) -> Result<(), FileValueError> {
+    if !is_safe_path_component(name) {
+        return Err(FileValueError::UnsafeName(name.to_owned()));
+    }
+    Ok(())
+}
+
+fn string_field(object: &Map<String, Value>, key: &str) -> Result<Option<String>, FileValueError> {
+    object
+        .get(key)
+        .map(|value| {
+            value.as_str().map(str::to_string).ok_or_else(|| {
+                FileValueError::InvalidShape(format!("file input `{key}` must be a string"))
+            })
+        })
+        .transpose()
+}
+
 impl FileValue {
     pub fn from_text(
         name: impl Into<String>,
@@ -127,12 +121,7 @@ impl FileValue {
         text: impl Into<String>,
         max_bytes: Option<usize>,
     ) -> Result<Self, FileValueError> {
-        Self {
-            name: name.into(),
-            text: Some(text.into()),
-            content_base64: None,
-        }
-        .normalized_optional_limit(max_bytes)
+        Self::from_parts(name.into(), Some(text.into()), None, max_bytes)
     }
 
     pub fn from_text_with_limit(
@@ -153,12 +142,7 @@ impl FileValue {
         max_bytes: Option<usize>,
     ) -> Result<Self, FileValueError> {
         validate_decoded_size_optional_limit(bytes.len(), max_bytes)?;
-        Self {
-            name: name.into(),
-            text: None,
-            content_base64: Some(encode_base64(bytes)),
-        }
-        .normalized_optional_limit(max_bytes)
+        Self::from_parts(name.into(), None, Some(encode_base64(bytes)), max_bytes)
     }
 
     pub fn from_bytes_with_limit(
@@ -167,6 +151,20 @@ impl FileValue {
         max_bytes: usize,
     ) -> Result<Self, FileValueError> {
         Self::from_bytes_optional_limit(name, bytes, Some(max_bytes))
+    }
+
+    fn from_parts(
+        name: String,
+        text: Option<String>,
+        content_base64: Option<String>,
+        max_bytes: Option<usize>,
+    ) -> Result<Self, FileValueError> {
+        Self {
+            name,
+            text,
+            content_base64,
+        }
+        .normalized_optional_limit(max_bytes)
     }
 
     pub fn from_value(value: &Value) -> Result<Self, FileValueError> {
@@ -187,37 +185,12 @@ impl FileValue {
                 )));
             }
         }
-        let name = object
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                FileValueError::InvalidShape("file input `name` must be a string".into())
-            })?
-            .to_string();
-        let text = object
-            .get("text")
-            .map(|value| {
-                value.as_str().map(str::to_string).ok_or_else(|| {
-                    FileValueError::InvalidShape("file input `text` must be a string".into())
-                })
-            })
-            .transpose()?;
-        let content_base64 = object
-            .get("content_base64")
-            .map(|value| {
-                value.as_str().map(str::to_string).ok_or_else(|| {
-                    FileValueError::InvalidShape(
-                        "file input `content_base64` must be a string".into(),
-                    )
-                })
-            })
-            .transpose()?;
-        Self {
-            name,
-            text,
-            content_base64,
-        }
-        .normalized_optional_limit(max_bytes)
+        let name = string_field(object, "name")?.ok_or_else(|| {
+            FileValueError::InvalidShape("file input `name` must be a string".into())
+        })?;
+        let text = string_field(object, "text")?;
+        let content_base64 = string_field(object, "content_base64")?;
+        Self::from_parts(name, text, content_base64, max_bytes)
     }
 
     pub fn from_value_with_limit(value: &Value, max_bytes: usize) -> Result<Self, FileValueError> {
@@ -229,19 +202,8 @@ impl FileValue {
     }
 
     pub fn validate_optional_limit(&self, max_bytes: Option<usize>) -> Result<(), FileValueError> {
-        if !is_safe_relative_path(&self.name) || self.name.contains('/') {
-            return Err(FileValueError::UnsafeName(self.name.clone()));
-        }
-        match (&self.text, &self.content_base64) {
-            (Some(text), None) => validate_decoded_size_optional_limit(text.len(), max_bytes),
-            (None, Some(content_base64)) => {
-                validate_base64_input_size_optional(content_base64, max_bytes)?;
-                let bytes = decode_base64(content_base64)?;
-                validate_decoded_size_optional_limit(bytes.len(), max_bytes)
-            }
-            (None, None) => Err(FileValueError::MissingContent),
-            (Some(_), Some(_)) => Err(FileValueError::MultipleContent),
-        }
+        check_name(&self.name)?;
+        self.decoded_content(max_bytes).map(|_| ())
     }
 
     pub fn validate_with_limit(&self, max_bytes: usize) -> Result<(), FileValueError> {
@@ -256,10 +218,10 @@ impl FileValue {
         &self,
         max_bytes: Option<usize>,
     ) -> Result<Vec<u8>, FileValueError> {
-        self.validate_optional_limit(max_bytes)?;
-        match (&self.text, &self.content_base64) {
+        check_name(&self.name)?;
+        match (&self.text, self.decoded_content(max_bytes)?) {
             (Some(text), None) => Ok(text.as_bytes().to_vec()),
-            (None, Some(content_base64)) => decode_base64(content_base64),
+            (None, Some(bytes)) => Ok(bytes),
             _ => Err(FileValueError::MultipleContent),
         }
     }
@@ -268,25 +230,29 @@ impl FileValue {
         self.decode_optional_limit(Some(max_bytes))
     }
 
-    fn normalized_optional_limit(self, max_bytes: Option<usize>) -> Result<Self, FileValueError> {
-        let bytes = match (&self.text, &self.content_base64) {
+    /// Exclusive content after the limit checks: `None` is size-checked text,
+    /// `Some` the canonical re-encoding input for a base64 payload.
+    fn decoded_content(&self, max_bytes: Option<usize>) -> Result<Option<Vec<u8>>, FileValueError> {
+        match (&self.text, &self.content_base64) {
             (Some(text), None) => {
                 validate_decoded_size_optional_limit(text.len(), max_bytes)?;
-                None
+                Ok(None)
             }
             (None, Some(content_base64)) => {
                 validate_base64_input_size_optional(content_base64, max_bytes)?;
                 let bytes = decode_base64(content_base64)?;
                 validate_decoded_size_optional_limit(bytes.len(), max_bytes)?;
-                Some(bytes)
+                Ok(Some(bytes))
             }
-            (None, None) => return Err(FileValueError::MissingContent),
-            (Some(_), Some(_)) => return Err(FileValueError::MultipleContent),
-        };
-        if !is_safe_relative_path(&self.name) || self.name.contains('/') {
-            return Err(FileValueError::UnsafeName(self.name));
+            (None, None) => Err(FileValueError::MissingContent),
+            (Some(_), Some(_)) => Err(FileValueError::MultipleContent),
         }
-        Ok(match bytes {
+    }
+
+    fn normalized_optional_limit(self, max_bytes: Option<usize>) -> Result<Self, FileValueError> {
+        check_name(&self.name)?;
+        let canonical = self.decoded_content(max_bytes)?;
+        Ok(match canonical {
             Some(bytes) => Self {
                 name: self.name,
                 text: None,

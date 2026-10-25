@@ -1863,10 +1863,12 @@ dependencies = [
 name = "model"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "policy",
  "schemars",
  "serde",
  "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
