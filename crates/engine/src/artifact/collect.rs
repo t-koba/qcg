@@ -106,25 +106,15 @@ impl OutputLimits {
                 )));
             }
         }
+        let to_u64 = |name, value: Option<usize>| {
+            value
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|_| std::io::Error::other(format!("runtime.{name} does not fit in u64")))
+        };
         Ok(Self {
-            file_bytes: runtime
-                .output_file_limit_bytes
-                .map(|limit| {
-                    u64::try_from(limit).map_err(|_| {
-                        std::io::Error::other("runtime.output_file_limit_bytes does not fit in u64")
-                    })
-                })
-                .transpose()?,
-            total_bytes: runtime
-                .output_total_limit_bytes
-                .map(|limit| {
-                    u64::try_from(limit).map_err(|_| {
-                        std::io::Error::other(
-                            "runtime.output_total_limit_bytes does not fit in u64",
-                        )
-                    })
-                })
-                .transpose()?,
+            file_bytes: to_u64("output_file_limit_bytes", runtime.output_file_limit_bytes)?,
+            total_bytes: to_u64("output_total_limit_bytes", runtime.output_total_limit_bytes)?,
             artifact_count: runtime.output_artifact_limit,
         })
     }
