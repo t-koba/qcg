@@ -47,7 +47,7 @@ pub(crate) fn chat_completions_payload(
     }
     if !req.tools.is_empty() {
         payload["tools"] = Value::Array(req.tools.iter().map(openai_tool).collect());
-        payload["tool_choice"] = openai_chat_tool_choice(req.tool_choice.as_ref());
+        payload["tool_choice"] = openai_tool_choice(req.tool_choice.as_ref(), false);
         if let Some(parallel) = req.parallel_tool_calls {
             payload["parallel_tool_calls"] = json!(parallel);
         }
@@ -95,7 +95,7 @@ pub(crate) fn responses_payload(
     }
     if !req.tools.is_empty() {
         payload["tools"] = Value::Array(req.tools.iter().map(responses_tool).collect());
-        payload["tool_choice"] = responses_tool_choice(req.tool_choice.as_ref());
+        payload["tool_choice"] = openai_tool_choice(req.tool_choice.as_ref(), true);
         if let Some(parallel) = req.parallel_tool_calls {
             payload["parallel_tool_calls"] = json!(parallel);
         }
@@ -271,20 +271,15 @@ pub(crate) fn anthropic_payload(
     payload
 }
 
-fn openai_chat_tool_choice(choice: Option<&ToolChoice>) -> Value {
+/// Shared mode mapping; only the named-tool envelope differs by API.
+fn openai_tool_choice(choice: Option<&ToolChoice>, responses: bool) -> Value {
     match choice.unwrap_or(&ToolChoice::auto()) {
         ToolChoice::Mode(mode) => json!(mode),
+        ToolChoice::Tool { tool } if responses => json!({ "type": "function", "name": tool }),
         ToolChoice::Tool { tool } => json!({
             "type": "function",
             "function": { "name": tool }
         }),
-    }
-}
-
-fn responses_tool_choice(choice: Option<&ToolChoice>) -> Value {
-    match choice.unwrap_or(&ToolChoice::auto()) {
-        ToolChoice::Mode(mode) => json!(mode),
-        ToolChoice::Tool { tool } => json!({ "type": "function", "name": tool }),
     }
 }
 
