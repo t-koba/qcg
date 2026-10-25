@@ -140,9 +140,7 @@ pub struct ExternalCatalog {
     /// External provider key -> model id -> spec.
     #[serde(default)]
     providers: BTreeMap<String, BTreeMap<String, ModelSpec>>,
-    /// Provider key -> the models whose context tier schedule qcg could
-    /// not use, named by model. The model's flat rates stay in place and
-    /// the message stays visible, so tier pricing is never silently off.
+    /// Provider -> unusable model schedules; flat rates stay and failures remain visible.
     #[serde(default)]
     model_errors: BTreeMap<String, Vec<String>>,
 }
@@ -396,6 +394,9 @@ impl CatalogService {
         for source in &self.config.source {
             match self.fetch_source(source).await {
                 Ok(catalog) => {
+                    for (provider, errors) in &catalog.model_errors {
+                        tracing::warn!(provider = %provider, model_errors = ?errors, "unusable tier");
+                    }
                     for (provider, models) in catalog.providers {
                         let entry = merged.providers.entry(provider).or_default();
                         for (model, spec) in models {
@@ -1204,10 +1205,8 @@ struct ModelsDevCostBand {
     size: Option<u64>,
 }
 
-/// Maps the source's tiers onto the shared tier type. The source names a
-/// band by its kind and the size the band starts above, so qcg's threshold
-/// is one token past that size. A tier qcg cannot read or validate leaves
-/// the model's flat rates in place and is reported with the model.
+/// Maps source bands to shared tiers: context thresholds are one token past
+/// the published size; unusable schedules keep flat rates and report model IDs.
 fn map_models_dev_tiers(cost: Option<&ModelsDevCost>) -> Result<Vec<policy::CostTier>, String> {
     let mut mapped = Vec::new();
     for row in cost.into_iter().flat_map(|cost| cost.tiers.iter()) {
@@ -1281,9 +1280,8 @@ pub(crate) fn map_models_dev(text: &str) -> Result<ExternalCatalog, String> {
                 Vec::new()
             };
             let cost = model.cost.as_ref();
-            // A schedule qcg cannot use leaves the model's flat rates in
-            // place and is reported with the model it belongs to, so tier
-            // pricing is never silently off.
+            // Unusable schedules keep flat rates and are reported by model,
+            // so tier pricing is never silently off.
             let cost_tiers = match map_models_dev_tiers(cost) {
                 Ok(tiers) => tiers,
                 Err(reason) => {

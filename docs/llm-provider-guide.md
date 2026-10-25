@@ -376,9 +376,9 @@ ask that one definition.
 
 A context tier schedule the source publishes but qcg cannot read leaves the
 model's flat rates in place: qcg prices a request at a rate it read, never at
-one it guessed, and a third-party payload never removes a usable model. The
-dropped schedule is reported with the model it belongs to in the catalog
-view, so tier pricing being off is never silent.
+one it guessed, and a third-party payload never removes a usable model.
+The dropped schedule is logged as a warning naming the model and is reported
+with it in the provider catalog view; the model's flat rates remain.
 
 The `models_dev` source publishes a context band as `tier: {type, size}`:
 the kind of band and the size the band starts above. qcg reads the
