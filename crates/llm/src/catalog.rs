@@ -683,23 +683,23 @@ impl CatalogService {
         // rotation takes effect on the next call; never logged or returned
         // in errors.
         let mut active_credentials: Vec<String> = Vec::new();
-        if let Some(name) = &spec.api_key_env {
-            let value = std::env::var(name).map_err(|_| {
-                format!(
-                    "set `{name}` before listing models for provider `{}`",
-                    spec.id
-                )
-            })?;
-            active_credentials.push(value.clone());
-            request = attach_credential(request, spec.auth_header.as_deref(), &value)?;
-        } else if let Some(name) = &spec.api_key_file_env {
-            let path = std::env::var(name).map_err(|_| {
-                format!(
-                    "set `{name}` before listing models for provider `{}`",
-                    spec.id
-                )
-            })?;
-            let value = read_credential_file(Path::new(&path))?;
+        let credential = match credential_source {
+            Some(name) => {
+                let value = std::env::var(name).map_err(|_| {
+                    format!(
+                        "set `{name}` before listing models for provider `{}`",
+                        spec.id
+                    )
+                })?;
+                Some(if spec.api_key_env.is_some() {
+                    value
+                } else {
+                    read_credential_file(Path::new(&value))?
+                })
+            }
+            None => None,
+        };
+        if let Some(value) = credential {
             active_credentials.push(value.clone());
             request = attach_credential(request, spec.auth_header.as_deref(), &value)?;
         }
