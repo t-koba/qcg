@@ -31,13 +31,14 @@ struct DecisionReservationGuard {
     reservation: PendingReservation,
 }
 
-/// Mutable per-stream accumulators bundled so the event recorder
-/// stays within the argument limit as fields evolve.
-struct StreamAccumulator<'a> {
-    index: &'a mut usize,
-    pending: &'a mut String,
-    published_tail: &'a mut String,
-    response: &'a mut Option<ChatResponse>,
+/// Per-route stream state: unverified text stays pending, while the published
+/// tail retains the joint-scan window for boundary-spanning secrets.
+#[derive(Default)]
+struct StreamAccumulator {
+    index: usize,
+    pending: String,
+    published_tail: String,
+    response: Option<ChatResponse>,
 }
 
 impl Drop for DecisionReservationGuard {
@@ -552,14 +553,10 @@ impl<'a> LlmGateway<'a> {
         let (events, mut receiver) = tokio::sync::mpsc::channel(LLM_STREAM_CHANNEL_CAPACITY);
         let stream = self.provider.stream_observed(request, events, observer);
         tokio::pin!(stream);
-        let mut response = None;
-        let mut index = 0_usize;
-        // Unverified suffix withheld from publication so split secrets stay
-        // unrecoverable until the completed response passes its final scan.
-        // published_tail keeps the last holdback bytes of published text so
-        // secrets spanning a publish boundary are still detected.
-        let mut pending = String::new();
-        let mut published_tail = String::new();
+        let mut acc = StreamAccumulator::default();
+        let record = |event, acc: &mut StreamAccumulator| {
+            self.record_stream_event(node, &provider_id, &model_id, event, acc)
+        };
         loop {
             tokio::select! {
                 _ = self.cancellation.cancelled() => {
@@ -571,24 +568,13 @@ impl<'a> LlmGateway<'a> {
                 }
                 result = &mut stream => {
                     while let Ok(event) = receiver.try_recv() {
-                        self.record_stream_event(
-                            node,
-                            &provider_id,
-                            &model_id,
-                            event,
-                            &mut StreamAccumulator {
-                                index: &mut index,
-                                pending: &mut pending,
-                                published_tail: &mut published_tail,
-                                response: &mut response,
-                            },
-                        )?;
+                        record(event, &mut acc)?;
                     }
                     if let Err(error) = result {
-                        if index > 0 {
+                        if acc.index > 0 {
                             return Err(LlmError {
                                 message: format!(
-                                    "LLM stream failed after {index} emitted deltas; route fallback is unsafe: {error}"
+                                    "LLM stream failed after {} emitted deltas; route fallback is unsafe: {error}", acc.index
                                 ),
                                 kind: LlmErrorKind::PartialStream,
                 ..Default::default()
@@ -596,24 +582,13 @@ impl<'a> LlmGateway<'a> {
                         }
                         return Err(error);
                     }
-                    return response.ok_or_else(|| LlmError::new("LLM stream ended without a completed response"));
+                    return acc.response.ok_or_else(|| LlmError::new("LLM stream ended without a completed response"));
                 }
                 event = receiver.recv() => {
                     match event {
-                        Some(event) => self.record_stream_event(
-                            node,
-                            &provider_id,
-                            &model_id,
-                            event,
-                            &mut StreamAccumulator {
-                                index: &mut index,
-                                pending: &mut pending,
-                                published_tail: &mut published_tail,
-                                response: &mut response,
-                            },
-                        )?,
+                        Some(event) => record(event, &mut acc)?,
                         None => {
-                            return response.ok_or_else(|| LlmError::new("LLM stream channel closed before completion"));
+                            return acc.response.ok_or_else(|| LlmError::new("LLM stream channel closed before completion"));
                         }
                     }
                 }
@@ -621,22 +596,21 @@ impl<'a> LlmGateway<'a> {
         }
     }
 
-    /// Mutable per-stream accumulators bundled so the event recorder
-    /// stays within the argument limit as fields evolve.
+    /// Scan events before publication, withholding any unverified suffix.
     fn record_stream_event(
         &self,
         node: &NodeDef,
         provider: &str,
         model: &str,
         event: ChatStreamEvent,
-        acc: &mut StreamAccumulator<'_>,
+        acc: &mut StreamAccumulator,
     ) -> Result<(), LlmError> {
         match event {
             ChatStreamEvent::TextDelta { text } => {
                 if self.secrets.is_empty() {
                     self.scan_text(node, &text)
                         .map_err(|error| LlmError::new(error.to_string()))?;
-                    self.publish_delta(node, provider, model, &text, acc.index)?;
+                    self.publish_delta(node, provider, model, &text, &mut acc.index)?;
                     return Ok(());
                 }
                 // Buffered publication: only a prefix that no future text
@@ -651,7 +625,7 @@ impl<'a> LlmGateway<'a> {
                 acc.pending.push_str(&text);
                 let holdback = self.secrets.max_value_len().saturating_sub(1);
                 let mut window = acc.published_tail.clone();
-                window.push_str(acc.pending);
+                window.push_str(&acc.pending);
                 self.scan_text(node, &window)
                     .map_err(|error| LlmError::new(error.to_string()))?;
                 let mut publish_len = acc.pending.len().saturating_sub(holdback);
@@ -665,10 +639,10 @@ impl<'a> LlmGateway<'a> {
                 // Drain before I/O so a journal failure cannot double
                 // publish the same bytes on retry.
                 acc.pending.drain(..publish_len);
-                self.publish_delta(node, provider, model, &publish, acc.index)?;
+                self.publish_delta(node, provider, model, &publish, &mut acc.index)?;
                 acc.published_tail.push_str(&publish);
                 let trimmed = holdback_tail(acc.published_tail.as_str(), holdback);
-                *acc.published_tail = trimmed;
+                acc.published_tail = trimmed;
             }
             ChatStreamEvent::Completed {
                 response: completed,
@@ -685,15 +659,15 @@ impl<'a> LlmGateway<'a> {
                         .map_err(|error| LlmError::new(error.to_string()))?;
                     if !acc.pending.is_empty() {
                         let mut window = acc.published_tail.clone();
-                        window.push_str(acc.pending);
+                        window.push_str(&acc.pending);
                         self.scan_text(node, &window)
                             .map_err(|error| LlmError::new(error.to_string()))?;
-                        let flush = std::mem::take(acc.pending);
-                        self.publish_delta(node, provider, model, &flush, acc.index)?;
+                        let flush = std::mem::take(&mut acc.pending);
+                        self.publish_delta(node, provider, model, &flush, &mut acc.index)?;
                         acc.published_tail.clear();
                     }
                 }
-                *acc.response = Some(completed);
+                acc.response = Some(completed);
             }
         }
         Ok(())
