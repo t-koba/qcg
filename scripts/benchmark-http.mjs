@@ -149,6 +149,18 @@ async function subscription(base) {
   if (!terminal || buffer) throw new Error("stream did not complete cleanly");
   return { ms: performance.now() - start, bytes, events: count };
 }
+async function stop(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  const completion = once(child, "exit");
+  child.kill("SIGTERM");
+  const timeout = setTimeout(() => child.kill("SIGKILL"), 10000);
+  try {
+    await completion;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 try {
   for (const runs of [100, 1000, 10000]) {
     const directory = join(root, String(runs));
@@ -290,15 +302,11 @@ try {
         );
       }
     }
-    server.kill("SIGTERM");
-    await once(server, "exit");
+    await stop(server);
     server = null;
     await rm(directory, { recursive: true, force: true });
   }
 } finally {
-  if (server) {
-    server.kill("SIGKILL");
-    await once(server, "exit");
-  }
+  await stop(server);
   await rm(root, { recursive: true, force: true });
 }

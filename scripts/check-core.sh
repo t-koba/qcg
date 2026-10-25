@@ -152,7 +152,7 @@ if [[ "${BASH_SOURCE[0]:-}" != "${0}" ]]; then
 fi
 rm -f "$_qcg_test_time_artifact"
 
-node --test scripts/product.test.mjs scripts/capabilities.test.mjs scripts/spdx.test.mjs scripts/rust-line-budget.test.mjs scripts/check-core-timing-budget.test.mjs
+node --test scripts/product.test.mjs scripts/capabilities.test.mjs scripts/spdx.test.mjs scripts/rust-line-budget.test.mjs scripts/check-core-timing-budget.test.mjs scripts/benchmark-http.test.mjs
 node scripts/rust-line-budget.mjs
 cargo fmt --all -- --check
 bash scripts/check-generated-docs.sh
