@@ -49,24 +49,38 @@ fn resync_durable_state(
 /// The schema version a persisted state file declares, read from the raw
 /// bytes so a version this runtime does not implement is seen before the
 /// file is parsed as a state of this runtime.
-fn persisted_schema_version(bytes: &[u8]) -> Option<u64> {
+fn persisted_schema_version(bytes: &[u8]) -> Option<serde_json::Number> {
     serde_json::from_slice::<Value>(bytes)
         .ok()?
-        .get("schema_version")
-        .and_then(Value::as_u64)
+        .get("schema_version")?
+        .as_number()
+        .cloned()
 }
 
 /// Refuses to overwrite a state cache produced by a runtime with a schema
 /// this runtime does not understand. The state can be recomputed from the
-/// journal only when its schema is not newer than this runtime's.
+/// journal only when its schema is not newer than this runtime's. JSON
+/// integers above u64::MAX are represented by serde_json as f64, so they
+/// must be recognized before an as_u64-only check can mistake them for an
+/// absent version.
 fn ensure_supported_state_schema(bytes: &[u8]) -> Result<(), JournalError> {
-    if let Some(version) = persisted_schema_version(bytes)
-        && version > u64::from(crate::RUN_STATE_SCHEMA_VERSION)
-    {
-        return Err(JournalError::InvalidEvent(format!(
-            "unsupported state schema_version {version}; this runtime implements {}",
-            crate::RUN_STATE_SCHEMA_VERSION
-        )));
+    if let Some(version) = persisted_schema_version(bytes) {
+        let unsupported = match version.as_u64() {
+            Some(version) => version > u64::from(crate::RUN_STATE_SCHEMA_VERSION),
+            None => version
+                .as_f64()
+                .is_some_and(|version| version >= u64::MAX as f64),
+        };
+        if unsupported {
+            let version = version.as_u64().map_or_else(
+                || "outside u64 range".to_owned(),
+                |version| version.to_string(),
+            );
+            return Err(JournalError::InvalidEvent(format!(
+                "unsupported state schema_version {version}; this runtime implements {}",
+                crate::RUN_STATE_SCHEMA_VERSION
+            )));
+        }
     }
     Ok(())
 }
@@ -1504,6 +1518,42 @@ mod tests {
         );
         assert_eq!(
             std::fs::read(&state_path).expect("newer state must remain readable"),
+            original_state,
+            "open must refuse before replacing state.json with a recomputed cache"
+        );
+        std::fs::remove_dir_all(&dir).expect("test dir should be removed");
+    }
+
+    #[test]
+    fn opening_journal_refuses_out_of_range_state_schema_without_overwriting_it() {
+        let (dir, path) = marker_fail_dir("open-out-of-range-state-schema");
+        drop(JournalWriter::create(&path, "schema-run", false, None).expect("journal should open"));
+        let state_path =
+            persisted_state_with_schema_version(&dir, crate::RUN_STATE_SCHEMA_VERSION + 1);
+        let original = std::fs::read_to_string(&state_path).expect("state should be readable");
+        let old_version = format!("\"schema_version\":{}", crate::RUN_STATE_SCHEMA_VERSION + 1);
+        let oversized =
+            original.replacen(&old_version, "\"schema_version\":18446744073709551616", 1);
+        assert_ne!(
+            oversized, original,
+            "the state fixture must contain its schema version"
+        );
+        std::fs::write(&state_path, oversized.as_bytes())
+            .expect("oversized state should be written");
+        let original_state =
+            std::fs::read(&state_path).expect("oversized state should be readable");
+
+        let error = match JournalWriter::create(&path, "schema-run", false, None) {
+            Ok(_) => panic!("opening must refuse an out-of-range newer schema"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(&error, crate::JournalError::InvalidEvent(message)
+                if message.contains("unsupported state schema_version")),
+            "the refusal must identify the unsupported version: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&state_path).expect("state must remain readable"),
             original_state,
             "open must refuse before replacing state.json with a recomputed cache"
         );
