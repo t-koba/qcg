@@ -100,6 +100,9 @@ impl JournalReplay {
                 blobs.insert((path.clone(), digest.clone()));
             }
         }
+        for path in &self.state.removed_files {
+            paths.insert(camino::Utf8PathBuf::from(path));
+        }
         for path in self.state.latest_file_pins.keys() {
             paths.insert(camino::Utf8PathBuf::from(path));
         }
@@ -133,14 +136,16 @@ impl JournalReplay {
         // second open/hash of the same source (E06 handoff).
         let mut preverified: BTreeMap<String, String> = BTreeMap::new();
         for path in &paths {
+            let removed = self.state.removed_files.contains(path.as_str());
             let successful = successful_paths.contains(path);
             let has_latest_pin = self.state.latest_file_pins.contains_key(path.as_str());
             // Blobs are always verified, but the workspace projection is
             // only required for paths a successful step produced or a
             // latest pin names: requiring it for failed-only revisions
             // would reject a legitimate resume, while skipping a named
-            // latest pin would accept a phantom revision (E06).
-            if !successful && !has_latest_pin {
+            // latest pin would accept a phantom revision (E06). Recorded
+            // removals instead require an absent workspace projection.
+            if !successful && !has_latest_pin && !removed {
                 // Fail-closed for failed-only workspace bytes (E06): a
                 // failed step replays from its verified blob, but stray
                 // workspace bytes that match no journaled revision are
@@ -201,6 +206,16 @@ impl JournalReplay {
                     "cannot safely resume: output `{path}` is not a directly rooted regular file: {error}"
                 ))
             })?;
+            if removed {
+                match std::fs::symlink_metadata(&candidate) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    _ => {
+                        return Err(EngineError::Failed(format!(
+                            "cannot safely resume: removed output `{path}` is not absent"
+                        )));
+                    }
+                }
+            }
             let digest =
                 hash_file(&candidate, limits.output_file_limit_bytes).map_err(|error| {
                     // Mirror the blob-side distinction (E06): a missing
@@ -542,6 +557,60 @@ mod tests {
             &RuntimeLimits::default(),
             accounting,
         )
+    }
+
+    #[test]
+    fn only_a_recorded_removal_allows_a_missing_successful_output() {
+        let dirs = ReplayDirs::new("recorded-removal");
+        let bytes = b"producer output";
+        let sha = digest(bytes);
+        dirs.write_blob(&sha, bytes);
+        let mut state = RunState::default();
+        state.nodes.insert(
+            NodePath::root("producer"),
+            NodeOutcome::Success {
+                output: None,
+                files: vec![FilePin {
+                    path: "out.txt".into(),
+                    sha256: sha.clone(),
+                }],
+            },
+        );
+        state.latest_file_pins.insert("out.txt".into(), sha.clone());
+        state
+            .historical_file_pins
+            .insert("out.txt".into(), BTreeSet::from([sha.clone()]));
+        let mut replay = JournalReplay::from_state(state);
+        let error = verify_projection(&replay, &dirs, &ReplayDirs::new_accounting()).unwrap_err();
+        assert!(error.to_string().contains("is missing"), "{error}");
+        replay
+            .state
+            .apply(&serde_json::json!({
+                "t": "agent_file_changes", "seq": 1, "ts": "2026-07-05T00:00:00Z",
+                "run_id": "run-1", "trace_id": "trace-1", "span_id": "span-1", "node": "agent",
+                "removed_files": ["out.txt"], "written_files": []
+            }))
+            .unwrap();
+        assert!(!replay.state.latest_file_pins.contains_key("out.txt"));
+        let verified = verify_projection(&replay, &dirs, &ReplayDirs::new_accounting()).unwrap();
+        assert!(
+            verified.is_empty(),
+            "a removal grants no verified input bytes"
+        );
+        dirs.write_workspace("out.txt", bytes);
+        let error = verify_projection(&replay, &dirs, &ReplayDirs::new_accounting()).unwrap_err();
+        assert!(error.to_string().contains("is not absent"), "{error}");
+        std::fs::remove_file(dirs.workspace.join("out.txt")).unwrap();
+        // A tombstone never exempts immutable history from verification.
+        std::fs::remove_file(dirs.blob(&sha)).unwrap();
+        let error = verify_projection(&replay, &dirs, &ReplayDirs::new_accounting()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("historical blob for `out.txt` is missing"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(&dirs.root);
     }
 
     #[test]

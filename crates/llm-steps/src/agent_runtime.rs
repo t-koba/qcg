@@ -96,13 +96,13 @@ impl AgentWrites {
         node: &NodeDef,
         present_before: &BTreeSet<String>,
     ) -> Result<(), StepError> {
-        let removed: Vec<String> = self
-            .outputs
+        let removed: Vec<String> = present_before
             .iter()
-            .filter(|(path, resolved)| {
-                present_before.contains(path) && !ctx.run.fs.file_present(resolved)
+            .filter(|path| {
+                std::fs::symlink_metadata(ctx.run.fs.workspace().join(path))
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
             })
-            .map(|(path, _)| path.clone())
+            .cloned()
             .collect();
         if !removed.is_empty() {
             record_agent_file_changes(ctx, node, &removed, &[])?;
@@ -1436,10 +1436,19 @@ pub(crate) async fn execute_agent_tool(
             outcome
         }
         ToolDecl::Command { command, .. } => {
-            let present_before = writes.present(ctx);
-            let outcome = command::execute_command(ctx, node, call_id, command).await?;
+            let mut present_before = writes.present(ctx);
+            present_before.extend(
+                ctx.journal
+                    .state()
+                    .latest_file_pins
+                    .keys()
+                    .filter(|path| ctx.run.fs.file_present(&ctx.run.fs.workspace().join(path)))
+                    .cloned(),
+            );
+            let outcome = command::execute_command(ctx, node, call_id, command).await;
+            // Commands may remove files even when they fail or are canceled.
             writes.record_removals(ctx, node, &present_before)?;
-            Ok(outcome)
+            outcome
         }
         ToolDecl::Http { methods, hosts, .. } => {
             http::execute_http(ctx, node, name, call_id, args, methods, hosts).await

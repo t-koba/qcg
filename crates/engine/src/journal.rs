@@ -655,6 +655,14 @@ mod tests {
         let journal = JournalWriter::create(&path, "checkpoint-run", false, None).unwrap();
         journal
             .event(
+                "agent_file_changes",
+                json!({
+                    "node": "agent", "removed_files": ["out/note.txt"], "written_files": []
+                }),
+            )
+            .unwrap();
+        journal
+            .event(
                 "agent_checkpoint",
                 json!({
                     "node": "agent",
@@ -678,14 +686,11 @@ mod tests {
             .unwrap();
         assert!(journal.state().checkpoints.is_empty());
         // The removal the agent's tools made outlives the checkpoint it
-        // rode in: the engine clears the checkpoint when the step
+        // accompanies: the engine clears the checkpoint when the step
         // finishes, and a file the agent removed stays removed.
         assert_eq!(
-            journal
-                .state()
-                .removed_files
-                .get(&model::NodePath::root("agent")),
-            Some(&BTreeSet::from(["out/note.txt".to_string()])),
+            journal.state().removed_files,
+            BTreeSet::from(["out/note.txt".to_string()]),
             "the removal must outlive the checkpoint the engine cleared"
         );
         let _ = std::fs::remove_dir_all(dir);

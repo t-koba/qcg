@@ -190,7 +190,7 @@ Generated from the OpenAPI `RunEvent` schema. Every event uses the required enve
 
 ## Durability records
 
-`agent_file_changes` is a typed durable event emitted after agent removals and writes. Its `removed_files` and `written_files` are workspace-relative per-call facts folded into per-node run state; it never carries pending side-effect payloads. `tool_call` remains observation-only and is not the durability carrier.
+`agent_file_changes` is a typed durable event emitted after agent removals and writes. Its `removed_files` and `written_files` are workspace-relative per-call facts folded into run-wide removal state. The event retains the acting node attribution and never carries pending side-effect payloads. `tool_call` remains observation-only and is not the durability carrier. An agent command records run-pinned paths that were present before the call and absent afterwards, including earlier steps’ outputs. A removal retracts the latest workspace pin (not its immutable history); replay requires that recorded absence. Missing outputs without such a removal still refuse resume. Later recorded writes or output pins supersede a removal; continuation checkpoints do not overwrite these workspace facts.
 
 The following journal records are not typed `RunEvent` variants; they travel
 as opaque `Unknown` kinds and exist so restarts and shared-store peers resume

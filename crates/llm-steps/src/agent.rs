@@ -674,15 +674,8 @@ impl StepExecutor for LlmAgentStep {
         // Tracks attempt outputs; RunState carries removals across retries.
         // Unreported writes cannot be restored from pins.
         let mut written_files = AgentWrites::default();
-        // RunState folds checkpoint snapshots and per-call changes here.
-        written_files.restore_removals(
-            ctx.journal
-                .state()
-                .removed_files
-                .get(&NodePath::root(&node.id))
-                .cloned()
-                .unwrap_or_default(),
-        );
+        // RunState folds run-wide per-call changes here.
+        written_files.restore_removals(ctx.journal.state().removed_files);
         // A stored side effect resumes without an LLM round-trip so the
         // exact operation is re-guarded: an approved call executes, an
         // interrupted call is settled by its durable record (E07).
@@ -1739,8 +1732,7 @@ pub(crate) fn record_agent_checkpoint(
     // bytes; a redacted journal copy alone still fails closed.
     use crate::agent_runtime::{redact_messages_for_journal, redact_tool_call_for_journal};
     let mut journaled = checkpoint.clone();
-    let (root, folded) = (NodePath::root(&node.id), ctx.journal.state());
-    journaled.removed_files = folded.removed_files.get(&root).cloned().unwrap_or_default();
+    journaled.removed_files = ctx.journal.state().removed_files;
     if let Some(call) = checkpoint.pending_side_effect.as_ref() {
         journaled.pending_side_effect = Some(redact_tool_call_for_journal(tools, call));
         // Non-public continuation (F02): store the full call bound to this
@@ -2543,12 +2535,12 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_preserves_folded_removal_set_from_same_node_key() {
-        // The checkpoint carries the attempt's complete removal set: a
-        // removal folded from a prior agent_file_changes event for the
-        // same node must survive a later checkpoint that passes an empty
+    fn checkpoint_preserves_run_wide_folded_removal_set() {
+        // The checkpoint carries the run-wide removal set: a
+        // removal folded from a prior agent_file_changes event for
+        // another node must survive a later checkpoint that passes an empty
         // set, because record_agent_checkpoint stamps the authoritative
-        // root-node set from folded journal state.
+        // run-wide set from folded journal state.
         let run_id = format!("agent-checkpoint-removal-{}", std::process::id());
         let (_temp, journal, journal_path) = execute_level_journal("checkpoint-removal", &run_id);
         let root = journal_path.parent().expect("journal parent");
@@ -2589,14 +2581,14 @@ mod tests {
             .event(
                 "agent_file_changes",
                 json!({
-                    "node": "agent",
+                    "node": "other_agent",
                     "removed_files": ["out/note.txt"],
                     "written_files": [],
                 }),
             )
             .expect("removal should journal");
         assert_eq!(
-            journal.state().removed_files[&model::NodePath::root("agent")],
+            journal.state().removed_files,
             BTreeSet::from(["out/note.txt".to_string()]),
             "folded removal must be visible before the checkpoint"
         );
@@ -2622,7 +2614,7 @@ mod tests {
         record_agent_checkpoint(&ctx, &node, 1, "turn_completed", &checkpoint, &[])
             .expect("checkpoint should journal");
         assert_eq!(
-            journal.state().removed_files[&model::NodePath::root("agent")],
+            journal.state().removed_files,
             BTreeSet::from(["out/note.txt".to_string()]),
             "the checkpoint must preserve the folded removal"
         );

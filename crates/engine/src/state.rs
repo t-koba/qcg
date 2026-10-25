@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const RUN_STATE_SCHEMA_VERSION: u32 = 7;
+pub const RUN_STATE_SCHEMA_VERSION: u32 = 8;
 
 fn is_known_journal_event_kind(kind: &str) -> bool {
     api::is_known_run_event_kind(kind) || api::INTERNAL_RUN_EVENT_KINDS.contains(&kind)
@@ -133,8 +133,8 @@ pub struct RunState {
     pub(crate) unresolved_tasks: BTreeMap<String, Value>,
     /// Completed reports by foreach iteration; these grant no retry authority.
     pub(crate) foreach_reports: BTreeMap<String, Value>,
-    /// Agent removals outlive checkpoints and must be retained separately.
-    pub removed_files: BTreeMap<NodePath, BTreeSet<String>>,
+    /// Run-wide expected absences, recorded by durable agent file changes.
+    pub removed_files: BTreeSet<String>,
     pub budget: BudgetState,
     pub resource_pins: BTreeMap<String, String>,
     /// Journal-latest revision per path; resume checks workspace and immutable history,
@@ -218,7 +218,7 @@ impl Default for RunState {
             vars: ValueBag::default(),
             nodes: BTreeMap::new(),
             checkpoints: BTreeMap::new(),
-            removed_files: BTreeMap::new(),
+            removed_files: BTreeSet::new(),
             budget: BudgetState::default(),
             resource_pins: BTreeMap::new(),
             latest_file_pins: BTreeMap::new(),
@@ -753,7 +753,7 @@ impl RunState {
             "agent_file_changes" => {
                 let parsed =
                     api::RunEvent::from_flat(event).map_err(crate::JournalError::InvalidEvent)?;
-                let node = parsed.path.ok_or_else(|| {
+                parsed.path.ok_or_else(|| {
                     crate::JournalError::InvalidEvent("agent file changes require a node".into())
                 })?;
                 let api::RunEventData::AgentFileChanges(changes) = parsed.data else {
@@ -771,32 +771,21 @@ impl RunState {
                         "unsafe agent file-change path".into(),
                     ));
                 }
-                let removals = self.removed_files.entry(node).or_default();
-                removals.extend(changes.removed_files);
-                for path in changes.written_files {
-                    removals.remove(&path);
+                for path in changes.removed_files {
+                    self.latest_file_pins.remove(&path);
+                    self.removed_files.insert(path);
                 }
-                self.removed_files.retain(|_, paths| !paths.is_empty());
+                for path in changes.written_files {
+                    self.removed_files.remove(&path);
+                }
             }
             "agent_checkpoint" => {
                 if let (Some(path), Some(checkpoint)) = (
                     event.get("node").and_then(Value::as_str),
                     event.get("checkpoint").cloned(),
                 ) {
-                    if let Some(removed) = checkpoint.get("removed_files").and_then(Value::as_array)
-                    {
-                        let removals: BTreeSet<String> = removed
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_string)
-                            .collect();
-                        let node = NodePath::root(path);
-                        if removals.is_empty() {
-                            self.removed_files.remove(&node);
-                        } else {
-                            self.removed_files.insert(node, removals);
-                        }
-                    }
+                    // Checkpoints carry continuation data, not workspace truth.
+                    // Only file-change events and new pins supersede removals.
                     self.checkpoints.insert(NodePath::root(path), checkpoint);
                 }
             }
@@ -1307,7 +1296,7 @@ impl RunState {
             owner != path && !(succeeded && fact["node"].as_str() == Some(path))
         });
         if succeeded || suspended {
-            self.apply_workspace_file_pins(path, &files);
+            self.apply_workspace_file_pins(&files);
         }
         if suspended {
             self.install_interaction(event, status == "needs_confirm")?;
@@ -1352,16 +1341,12 @@ impl RunState {
     }
 
     /// Makes the attempt's revisions the workspace's latest ones.
-    fn apply_workspace_file_pins(&mut self, path: &str, files: &[crate::FilePin]) {
-        let node = NodePath::root(path);
+    fn apply_workspace_file_pins(&mut self, files: &[crate::FilePin]) {
         for pin in files {
             self.latest_file_pins
                 .insert(pin.path.to_string(), pin.sha256.clone());
-            if let Some(removals) = self.removed_files.get_mut(&node) {
-                removals.remove(pin.path.as_str());
-            }
+            self.removed_files.remove(pin.path.as_str());
         }
-        self.removed_files.retain(|_, set| !set.is_empty());
     }
 
     /// Counts one finished node execution. Interactions that suspend the
@@ -1775,10 +1760,7 @@ mod tests {
         state
             .apply(&change(2, vec!["out/note.txt"], vec![]))
             .expect("removal should fold before another checkpoint");
-        assert_eq!(
-            state.removed_files[&NodePath::root("agent")],
-            BTreeSet::from(["out/note.txt".into()])
-        );
+        assert_eq!(state.removed_files, BTreeSet::from(["out/note.txt".into()]));
         assert_eq!(
             state.checkpoints[&NodePath::root("agent")]["removed_files"],
             json!([])
@@ -1786,7 +1768,7 @@ mod tests {
         state
             .apply(&change(3, vec![], vec!["out/note.txt"]))
             .expect("later write should supersede removal");
-        assert!(!state.removed_files.contains_key(&NodePath::root("agent")));
+        assert!(state.removed_files.is_empty());
         assert_eq!(
             state.checkpoints[&NodePath::root("agent")]["removed_files"],
             json!([])
@@ -1806,59 +1788,45 @@ mod tests {
     }
 
     #[test]
-    fn a_removal_record_follows_the_agent_rule() {
-        // The record of what the agent removed follows the agent's own
-        // rule: a file it wrote again after removing it supersedes the
-        // removal, so the record must not keep a path the run holds.
+    fn run_wide_removals_retract_pins_and_only_writes_supersede_them() {
         let mut state = RunState::default();
-        let checkpoint = |seq: u64, removed: Value| {
-            json!({
-                "t": "agent_checkpoint",
-                "seq": seq,
-                "node": "agent",
-                "turn": 1,
-                "phase": "turn_completed",
-                "checkpoint": {"next_turn": 2, "removed_files": removed},
-            })
-        };
-        state
-            .apply(&checkpoint(1, json!(["out/note.txt"])))
-            .expect("the checkpoint should fold");
-        assert_eq!(
-            state.removed_files.get(&NodePath::root("agent")),
-            Some(&BTreeSet::from(["out/note.txt".to_string()])),
-            "the removal the agent made must be recorded"
-        );
-        // The checkpoint carries the attempt's complete removal set, so
-        // an empty set means the agent wrote the file again.
-        state
-            .apply(&checkpoint(2, json!([])))
-            .expect("the second checkpoint should fold");
-        assert_eq!(
-            state.removed_files.get(&NodePath::root("agent")),
-            None,
-            "a write supersedes the removal the agent made earlier"
-        );
-        // A step that reports the file as an output wrote it again, so
-        // the removal does not stand either.
-        state
-            .apply(&checkpoint(3, json!(["out/note.txt"])))
-            .expect("the third checkpoint should fold");
         state
             .apply(&json!({
-                "t": "step_finished",
-                "seq": 4,
-                "node": "agent",
-                "status": "success",
-                "files": [{"path": "out/note.txt", "sha256": "abc"}],
-                "failed_files": [],
+                "t": "step_finished", "seq": 1, "node": "producer", "status": "success",
+                "files": [{"path": "out/note.txt", "sha256": "abc"}], "failed_files": []
             }))
-            .expect("the finished step should fold");
-        assert_eq!(
-            state.removed_files.get(&NodePath::root("agent")),
-            None,
-            "a file the step reports as an output is not a removal"
-        );
+            .unwrap();
+        state
+            .apply(&json!({
+                "t": "agent_file_changes", "seq": 2, "ts": "2026-07-05T00:00:00Z",
+                "run_id": "run-1", "trace_id": "trace-1", "span_id": "span-2", "node": "agent",
+                "removed_files": ["out/note.txt"], "written_files": []
+            }))
+            .unwrap();
+        assert_eq!(state.removed_files, BTreeSet::from(["out/note.txt".into()]));
+        assert!(!state.latest_file_pins.contains_key("out/note.txt"));
+        assert!(state.historical_file_pins["out/note.txt"].contains("abc"));
+        // A stale checkpoint from any node cannot undo workspace facts.
+        for (seq, node, removed) in [
+            (3, "agent", json!([])),
+            (4, "other", json!(["out/stale.txt"])),
+        ] {
+            state
+                .apply(&json!({
+                    "t": "agent_checkpoint", "seq": seq, "node": node,
+                    "checkpoint": {"next_turn": 2, "removed_files": removed}
+                }))
+                .unwrap();
+        }
+        assert_eq!(state.removed_files, BTreeSet::from(["out/note.txt".into()]));
+        state
+            .apply(&json!({
+                "t": "step_finished", "seq": 5, "node": "another_writer", "status": "success",
+                "files": [{"path": "out/note.txt", "sha256": "def"}], "failed_files": []
+            }))
+            .unwrap();
+        assert!(state.removed_files.is_empty());
+        assert_eq!(state.latest_file_pins["out/note.txt"], "def");
     }
 
     #[test]

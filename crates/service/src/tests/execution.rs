@@ -1034,6 +1034,152 @@ done
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[tokio::test]
+async fn an_agent_command_removes_an_earlier_steps_pin_and_resumes_after_an_answer() {
+    // This file was already pinned by another node, not written by this agent.
+    let root = temp_run_dir("earlier-step-removed-file-resume");
+    let _ = std::fs::remove_dir_all(&root);
+    let generator = root.join("generator");
+    let runs = root.join("runs");
+    std::fs::create_dir_all(generator.join("prompts")).expect("generator dirs");
+    std::fs::write(
+        generator.join(contract::MANIFEST_FILE),
+        r#"
+[generator]
+id = "generator"
+name = "Generator"
+version = "0.1.0"
+
+[[flow]]
+id = "producer"
+type = "write"
+[flow.params]
+output_file = "out/note.txt"
+content = "scratch"
+
+[[flow]]
+id = "agent"
+needs = ["producer"]
+output = "agent_result"
+type = "llm.agent"
+
+[flow.params]
+max_iterations = 6
+max_tokens_total = 4096
+prompt = "prompts/agent.j2"
+
+[[flow.params.tools]]
+kind = "command"
+name = "remove_note"
+command = ["sh", "-c", "rm -f out/note.txt"]
+
+[[flow.params.tools]]
+kind = "ask_user"
+name = "ask_ok"
+
+[audit]
+level = "minimal"
+
+[llm]
+max_tokens = 256
+temperature = 0.0
+
+[llm.model]
+model = "fake"
+provider = "fake"
+
+[permissions]
+fs_read = []
+network = []
+commands = [{ bin = "sh", args = ["-c", "rm -f out/note.txt"], isolation = "trusted_host" }]
+side_effects = "allowed"
+side_effects_scope = "invocation"
+fs_write = ["workspace"]
+
+[permissions.containers]
+enabled = false"#,
+    )
+    .expect("generator manifest");
+    std::fs::write(
+        generator.join("prompts/agent.j2"),
+        r#"Remove the earlier output, then ask me before finishing.
+
+FAKE_TOOL_SEQUENCE: [{"name":"remove_note","args":{},"id":"call-1"},{"name":"ask_ok","args":{"question":"Continue?","options":["yes"]},"id":"call-2"}]
+FAKE_AGENT_FINAL:
+done
+"#,
+    )
+    .expect("prompt");
+    let service = test_service(vec![root.clone()], runs.clone());
+    let id = service
+        .start_run(StartRun {
+            generator_id: "generator".into(),
+            inputs: BTreeMap::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("agent run should start");
+    let waiting = wait_for_snapshot(&service, &id, RunStatus::Waiting).await;
+    let question = waiting.question.expect("the agent must ask the user");
+    let run_dir = service.run_dir_for(&id).await.expect("run dir");
+    let journal_path = run_meta_dir(&run_dir).join("journal.jsonl");
+    let waiting_state = engine::RunState::fold_journal(&journal_path).expect("waiting fold");
+    assert_eq!(
+        waiting_state.removed_files,
+        std::collections::BTreeSet::from(["out/note.txt".into()])
+    );
+    assert!(!waiting_state.latest_file_pins.contains_key("out/note.txt"));
+    assert_eq!(waiting_state.historical_file_pins["out/note.txt"].len(), 1);
+    let producer = &waiting_state.nodes[&model::NodePath::root("producer")];
+    assert!(
+        matches!(producer, engine::NodeOutcome::Success { files, .. } if files.len() == 1 && files[0].path == "out/note.txt")
+    );
+    assert!(!run_workspace_dir(&run_dir).join("out/note.txt").exists());
+    service
+        .answer(
+            id.clone(),
+            question.id.clone(),
+            AnswerPayload {
+                values: BTreeMap::from([("answer".into(), json!("yes"))]),
+            },
+        )
+        .await
+        .expect("the answer should be accepted");
+    let terminal = wait_for_terminal_snapshot(&service, &id).await;
+    // The removal must remain durable even with minimal observation audit.
+    let events =
+        crate::summaries::read_merged_events_from_meta(&run_meta_dir(&run_dir)).expect("journal");
+    assert_eq!(
+        terminal.state,
+        RunStatus::Succeeded,
+        "the run must succeed: {terminal:?}"
+    );
+    let final_state = engine::RunState::fold_journal(&journal_path).expect("resumed fold");
+    assert_eq!(final_state.removed_files, waiting_state.removed_files);
+    assert!(!final_state.latest_file_pins.contains_key("out/note.txt"));
+    assert!(final_state.checkpoints.is_empty());
+    assert_eq!(
+        final_state.node_executions.get("producer"),
+        Some(&1),
+        "the producer must be replayed, not executed again"
+    );
+    let removals: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event["t"] == "agent_file_changes" && event["removed_files"] == json!(["out/note.txt"])
+        })
+        .collect();
+    assert_eq!(
+        removals.len(),
+        1,
+        "the command must durably record the removal exactly once"
+    );
+    assert_eq!(removals[0]["node"], "agent");
+    assert!(!run_workspace_dir(&run_dir).join("out/note.txt").exists());
+    drop(service);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// The engine clears a node's checkpoint when the step finishes, but a
 /// removal the agent's own tools made outlives that checkpoint: the run's
 /// own state holds the removal, so the record is still there after the
@@ -1138,7 +1284,6 @@ done
             .is_some_and(|checkpoints| checkpoints.is_empty());
         let recorded = state
             .get("removed_files")
-            .and_then(|value| value.get("agent"))
             .and_then(Value::as_array)
             .is_some_and(|removals| {
                 removals
@@ -1159,7 +1304,6 @@ done
     );
     let removals: Vec<String> = state
         .get("removed_files")
-        .and_then(|value| value.get("agent"))
         .and_then(Value::as_array)
         .map(|removals| {
             removals
@@ -1318,7 +1462,6 @@ done
     assert!(
         state
             .get("removed_files")
-            .and_then(|files| files.get("agent"))
             .and_then(Value::as_array)
             .is_some_and(|files| files
                 .iter()
@@ -1434,7 +1577,6 @@ done
             .is_some();
         let removed = state
             .get("removed_files")
-            .and_then(|value| value.get("agent"))
             .and_then(Value::as_array)
             .is_some_and(|removals| {
                 removals
@@ -1455,7 +1597,6 @@ done
     );
     let removals: Vec<String> = state
         .get("removed_files")
-        .and_then(|value| value.get("agent"))
         .and_then(Value::as_array)
         .map(|removals| {
             removals

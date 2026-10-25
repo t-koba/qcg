@@ -1407,7 +1407,11 @@ mod tests {
             serde_json::to_value(crate::RunState::default()).expect("default state serializes");
         value["schema_version"] = json!(version);
         value["last_seq"] = json!(1);
-        value["removed_files"] = json!({"agent": ["out/stale.txt"]});
+        value["removed_files"] = if version < crate::RUN_STATE_SCHEMA_VERSION {
+            json!({"agent": ["out/stale.txt"]})
+        } else {
+            json!(["out/stale.txt"])
+        };
         std::fs::write(&path, serde_json::to_vec(&value).expect("state serializes"))
             .expect("state file should be written");
         camino::Utf8PathBuf::from_path_buf(path).expect("temporary path must be UTF-8")
@@ -1444,10 +1448,8 @@ mod tests {
         let adopted = super::resync_durable_state(&path, &current, JournalLimits::default(), 1)
             .expect("a state of this runtime's schema must be adopted");
         assert_eq!(
-            adopted.removed_files.get(&model::NodePath::root("agent")),
-            Some(&std::collections::BTreeSet::from([
-                "out/stale.txt".to_string()
-            ])),
+            adopted.removed_files,
+            std::collections::BTreeSet::from(["out/stale.txt".to_string()]),
             "a state of this runtime's schema is adopted as it stands"
         );
         let older = persisted_state_with_schema_version(&dir, crate::RUN_STATE_SCHEMA_VERSION - 1);
