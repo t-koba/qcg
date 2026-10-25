@@ -391,28 +391,20 @@ fn native_schema_node_compatible(
     if object.keys().any(|key| !SUPPORTED.contains(&key.as_str())) {
         return false;
     }
-    if object.get("type").is_some_and(|value| match value {
-        Value::String(kind) => !matches!(
-            kind.as_str(),
+    let supported_type = |kind: &str| {
+        matches!(
+            kind,
             "object" | "array" | "string" | "number" | "integer" | "boolean" | "null"
-        ),
+        )
+    };
+    if object.get("type").is_some_and(|value| match value {
+        Value::String(kind) => !supported_type(kind),
         Value::Array(kinds) => {
             kinds.len() != 2
                 || !kinds.iter().any(|kind| kind == "null")
-                || kinds.iter().any(|kind| {
-                    !kind.as_str().is_some_and(|kind| {
-                        matches!(
-                            kind,
-                            "object"
-                                | "array"
-                                | "string"
-                                | "number"
-                                | "integer"
-                                | "boolean"
-                                | "null"
-                        )
-                    })
-                })
+                || kinds
+                    .iter()
+                    .any(|kind| !kind.as_str().is_some_and(supported_type))
         }
         _ => true,
     }) {
@@ -423,30 +415,28 @@ fn native_schema_node_compatible(
         Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind == expected),
         _ => false,
     };
-    if (["properties", "required", "additionalProperties"]
-        .iter()
-        .any(|keyword| object.contains_key(*keyword))
-        && !allows_type("object"))
-        || (["items", "minItems", "maxItems"]
-            .iter()
-            .any(|keyword| object.contains_key(*keyword))
-            && !allows_type("array"))
-        || (["pattern", "format"]
-            .iter()
-            .any(|keyword| object.contains_key(*keyword))
-            && !allows_type("string"))
-        || ([
-            "minimum",
-            "maximum",
-            "exclusiveMinimum",
-            "exclusiveMaximum",
-            "multipleOf",
-        ]
-        .iter()
-        .any(|keyword| object.contains_key(*keyword))
-            && !allows_type("number")
-            && !allows_type("integer"))
-    {
+    const TYPE_KEYWORDS: &[(&[&str], &[&str])] = &[
+        (
+            &["properties", "required", "additionalProperties"],
+            &["object"],
+        ),
+        (&["items", "minItems", "maxItems"], &["array"]),
+        (&["pattern", "format"], &["string"]),
+        (
+            &[
+                "minimum",
+                "maximum",
+                "exclusiveMinimum",
+                "exclusiveMaximum",
+                "multipleOf",
+            ],
+            &["number", "integer"],
+        ),
+    ];
+    if TYPE_KEYWORDS.iter().any(|(keywords, types)| {
+        keywords.iter().any(|keyword| object.contains_key(*keyword))
+            && types.iter().all(|kind| !allows_type(kind))
+    }) {
         return false;
     }
     if object
@@ -600,14 +590,12 @@ fn strict_schema_node_compatible(schema: &Value) -> bool {
                         .all(|name| required.contains(name.as_str()))
                 }));
     object_is_closed
-        && object
-            .get("properties")
-            .and_then(Value::as_object)
-            .is_none_or(|properties| properties.values().all(strict_schema_node_compatible))
-        && object
-            .get("$defs")
-            .and_then(Value::as_object)
-            .is_none_or(|definitions| definitions.values().all(strict_schema_node_compatible))
+        && ["properties", "$defs"].iter().all(|keyword| {
+            object
+                .get(*keyword)
+                .and_then(Value::as_object)
+                .is_none_or(|children| children.values().all(strict_schema_node_compatible))
+        })
         && ["items", "additionalProperties"].iter().all(|keyword| {
             object
                 .get(*keyword)
