@@ -130,31 +130,25 @@ impl CatalogConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct ExternalCatalog {
-    #[serde(default)]
     fetched_at: Option<String>,
     /// Fingerprint of the source configuration this data was fetched under
     /// (F09-02). A cache entry from different sources is never treated as
     /// verified data for the current pins.
-    #[serde(default)]
     fingerprint: Option<String>,
     /// External provider key -> model id -> spec.
-    #[serde(default)]
     providers: BTreeMap<String, BTreeMap<String, ModelSpec>>,
     /// Provider -> unusable model schedules; flat rates stay and failures remain visible.
-    #[serde(default)]
     model_errors: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 struct CachedCatalog {
-    #[serde(default)]
     fetched_at: Option<String>,
-    #[serde(default)]
     fingerprint: Option<String>,
-    #[serde(default)]
     providers: BTreeMap<String, BTreeMap<String, ModelSpec>>,
-    #[serde(default)]
     model_errors: BTreeMap<String, Vec<String>>,
 }
 
