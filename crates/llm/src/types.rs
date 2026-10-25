@@ -295,40 +295,28 @@ impl LlmError {
         is_retryable_llm_error(self)
     }
 
-    pub(crate) fn http_status(status: u16, message: impl Into<String>) -> Self {
+    fn response_error(kind: LlmErrorKind, message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            kind: LlmErrorKind::HttpStatus(status),
+            kind,
             facts: model::TransportFacts {
                 phase: model::TransportPhase::Response,
                 dispatch: model::RequestDispatch::Sent,
             },
             ..Default::default()
         }
+    }
+
+    pub(crate) fn http_status(status: u16, message: impl Into<String>) -> Self {
+        Self::response_error(LlmErrorKind::HttpStatus(status), message)
     }
 
     pub(crate) fn invalid_response(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            kind: LlmErrorKind::InvalidResponse,
-            facts: model::TransportFacts {
-                phase: model::TransportPhase::Response,
-                dispatch: model::RequestDispatch::Sent,
-            },
-            ..Default::default()
-        }
+        Self::response_error(LlmErrorKind::InvalidResponse, message)
     }
 
     pub(crate) fn empty_response(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            kind: LlmErrorKind::EmptyResponse,
-            facts: model::TransportFacts {
-                phase: model::TransportPhase::Response,
-                dispatch: model::RequestDispatch::Sent,
-            },
-            ..Default::default()
-        }
+        Self::response_error(LlmErrorKind::EmptyResponse, message)
     }
 }
 
