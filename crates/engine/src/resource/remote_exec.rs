@@ -158,16 +158,13 @@ impl ResourceLoader for RemoteResourceLoader {
         resource: &ResourceDef,
         selector: Option<&ResourceSelector>,
     ) -> Result<String, ResourceError> {
-        let text = if let Some(path) = &resource.path {
-            let limits = single_resource_limits(name, resource)?;
-            read_to_string_bounded(
-                &resolve_resource_path(context, name, path)?,
-                limits.max_bytes,
-            )?
+        let limits = single_resource_limits(name, resource)?;
+        let path = if let Some(path) = &resource.path {
+            resolve_resource_path(context, name, path)?
         } else {
-            let limits = single_resource_limits(name, resource)?;
-            read_to_string_bounded(&snapshot_resource_path(context, name), limits.max_bytes)?
+            snapshot_resource_path(context, name)
         };
+        let text = read_to_string_bounded(&path, limits.max_bytes)?;
         if self.type_id() == "openapi" {
             select_openapi(name, &text, selector)
         } else if selector.is_some() {

@@ -146,47 +146,34 @@ impl ResourceLoader for DirResourceLoader {
         let root = resolve_resource_path(context, name, path)?;
         let limits = directory_limits(name, resource)?;
         match selector {
-            None => {
-                let (sha256, files) =
-                    hash_resource_dir(&root, limits).map_err(|source| ResourceError::Read {
-                        path: root.clone(),
-                        source,
-                    })?;
-                Ok(serde_json::to_string_pretty(&json!({
-                    "sha256": sha256,
-                    "files": files,
-                }))?)
-            }
+            None | Some(ResourceSelector::File { .. }) => {}
             Some(ResourceSelector::Named(selector))
-                if selector == "tree" || selector == "files" =>
-            {
-                let (sha256, files) =
-                    hash_resource_dir(&root, limits).map_err(|source| ResourceError::Read {
-                        path: root.clone(),
-                        source,
-                    })?;
-                Ok(serde_json::to_string_pretty(&json!({
-                    "sha256": sha256,
-                    "files": files,
-                }))?)
-            }
-            Some(ResourceSelector::File { path }) => {
-                hash_resource_dir(&root, limits).map_err(|source| ResourceError::Read {
-                    path: root.clone(),
-                    source,
-                })?;
-                let file = resolve_resource_file(name, &root, path)?;
-                read_to_string_bounded(&file, limits.max_selected_bytes)
-            }
+                if selector == "tree" || selector == "files" => {}
             Some(ResourceSelector::Named(selector)) => {
-                Err(ResourceError::UnsupportedNamedSelector {
+                return Err(ResourceError::UnsupportedNamedSelector {
                     resource: name.to_string(),
                     selector: selector.clone(),
-                })
+                });
             }
-            Some(_) => Err(ResourceError::UnsupportedSelector {
-                resource: name.to_string(),
-            }),
+            Some(_) => {
+                return Err(ResourceError::UnsupportedSelector {
+                    resource: name.to_string(),
+                });
+            }
+        }
+        let (sha256, files) =
+            hash_resource_dir(&root, limits).map_err(|source| ResourceError::Read {
+                path: root.clone(),
+                source,
+            })?;
+        if let Some(ResourceSelector::File { path }) = selector {
+            let file = resolve_resource_file(name, &root, path)?;
+            read_to_string_bounded(&file, limits.max_selected_bytes)
+        } else {
+            Ok(serde_json::to_string_pretty(&json!({
+                "sha256": sha256,
+                "files": files,
+            }))?)
         }
     }
 }
