@@ -13,8 +13,8 @@ use tokio::time::{Duration, sleep};
 use url::Url;
 
 use crate::config::{
-    credential_placeholder, interpolate_env, read_credential_file, validate_base_url,
-    validate_query_parameters,
+    BodyReadError, credential_placeholder, interpolate_env, read_body_bounded,
+    read_credential_file, validate_base_url, validate_query_parameters,
 };
 use crate::parse::{
     llm_http_error, llm_response_error, parse_anthropic_response, parse_chat_completions_response,
@@ -90,16 +90,8 @@ pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<
 /// Bounded read of a non-success response body for `error.code` inspection.
 /// Returns `None` when the body exceeds `limit`, fails to stream, or is not
 /// UTF-8, so the caller preserves current behavior without a code.
-async fn read_error_body_bounded(mut response: reqwest::Response, limit: usize) -> Option<String> {
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.ok()? {
-        let next_len = body.len().checked_add(chunk.len())?;
-        if next_len > limit {
-            return None;
-        }
-        body.extend_from_slice(&chunk);
-    }
-    String::from_utf8(body).ok()
+async fn read_error_body_bounded(response: reqwest::Response, limit: usize) -> Option<String> {
+    String::from_utf8(read_body_bounded(response, limit).await.ok()?).ok()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -615,34 +607,18 @@ impl HttpProvider {
                 status_u16,
                 format!("{} provider returned HTTP {}", self.spec.id, status_u16),
             );
-            if let Some(text) = read_error_body_bounded(response, inspect_limit).await {
-                if credential
+            // Malformed, non-UTF-8, oversized, or unrecognized bodies yield no
+            // code. Screening always finishes before any code is retained.
+            if let Some(text) = read_error_body_bounded(response, inspect_limit).await
+                && let Ok(value) = self.screened_json(&text, credential.as_deref(), "response")?
+                && let Some(code) = extract_provider_error_code(&value)
+            {
+                let leaks_credential = credential
                     .as_deref()
-                    .is_some_and(|key| !key.is_empty() && text.contains(key))
-                {
-                    return Err(LlmError::new(
-                        self.message("response contained its configured credential"),
-                    ));
+                    .is_some_and(|key| !key.is_empty() && code == key);
+                if !leaks_credential {
+                    error.provider_code = Some(code);
                 }
-                if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                    if credential.as_deref().is_some_and(|key| {
-                        !key.is_empty() && json_contains_string_fragment(&value, key)
-                    }) {
-                        return Err(LlmError::new(
-                            self.message("response contained its configured credential"),
-                        ));
-                    }
-                    if let Some(code) = extract_provider_error_code(&value) {
-                        let leaks_credential = credential
-                            .as_deref()
-                            .is_some_and(|key| !key.is_empty() && code == key);
-                        if !leaks_credential {
-                            error.provider_code = Some(code);
-                        }
-                    }
-                }
-                // Malformed JSON, non-UTF-8 (already `None`), oversized, or
-                // unrecognized shapes yield no code and preserve behavior.
             }
             error.retry_after_secs = retry_after_secs;
             return Err(error);
@@ -650,23 +626,56 @@ impl HttpProvider {
         Ok((response, credential))
     }
 
+    // Screening is independent of JSON validity: error bodies may be malformed,
+    // while success/SSE callers retain their distinct parse-error diagnostics.
+    fn screened_json(
+        &self,
+        text: &str,
+        credential: Option<&str>,
+        context: &str,
+    ) -> Result<Result<Value, serde_json::Error>, LlmError> {
+        let key = credential.filter(|key| !key.is_empty());
+        let reflected = || {
+            LlmError::new(self.message(format_args!(
+                "{context} contained its configured credential"
+            )))
+        };
+        if key.is_some_and(|key| text.contains(key)) {
+            return Err(reflected());
+        }
+        let parsed = serde_json::from_str(text);
+        if let Ok(value) = &parsed
+            && key.is_some_and(|key| json_contains_string_fragment(value, key))
+        {
+            return Err(reflected());
+        }
+        Ok(parsed)
+    }
+
+    fn prepare_request(&self, req: &ChatRequest) -> Result<Value, LlmError> {
+        validate_chat_request(req, self.spec.api)?;
+        let capabilities = self.capabilities_for_model(&req.model);
+        validate_multimodal_capabilities(req, &capabilities)?;
+        validate_structured_output_capabilities(req, self.spec.api, &capabilities)?;
+        let payload = self.request_payload(req, &capabilities)?;
+        crate::validate::validate_request_capabilities(req, &capabilities)?;
+        Ok(payload)
+    }
+
     async fn send_json(&self, payload: Value, model: &str) -> Result<Value, LlmError> {
-        let (mut response, credential) = self.send_request(payload, model).await?;
-        let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(llm_response_error)? {
-            let next_len = body.len().checked_add(chunk.len()).ok_or_else(|| {
-                LlmError::invalid_response(
+        let (response, credential) = self.send_request(payload, model).await?;
+        let body = read_body_bounded(response, self.response_body_limit_bytes)
+            .await
+            .map_err(|error| match error {
+                BodyReadError::Http(error) => llm_response_error(error),
+                BodyReadError::Overflow => LlmError::invalid_response(
                     self.message("response exceeded the configured body limit"),
-                )
-            })?;
-            if next_len > self.response_body_limit_bytes {
-                return Err(LlmError::invalid_response(format!(
+                ),
+                BodyReadError::Limit => LlmError::invalid_response(format!(
                     "{} provider response exceeded response_body_limit_bytes ({})",
                     self.spec.id, self.response_body_limit_bytes
-                )));
-            }
-            body.extend_from_slice(&chunk);
-        }
+                )),
+            })?;
         let body = String::from_utf8(body).map_err(|_| {
             LlmError::invalid_response(self.message("returned a response body that was not UTF-8"))
         })?;
@@ -675,26 +684,12 @@ impl HttpProvider {
                 self.message("returned an empty response body"),
             ));
         }
-        if credential
-            .as_deref()
-            .is_some_and(|key| !key.is_empty() && body.contains(key))
-        {
-            return Err(LlmError::new(
-                self.message("response contained its configured credential"),
-            ));
-        }
-        let value: Value = serde_json::from_str(&body).map_err(|error| {
-            LlmError::invalid_response(self.message(format_args!("returned invalid JSON: {error}")))
-        })?;
-        if credential
-            .as_deref()
-            .is_some_and(|key| !key.is_empty() && json_contains_string_fragment(&value, key))
-        {
-            return Err(LlmError::new(
-                self.message("response contained its configured credential"),
-            ));
-        }
-        Ok(value)
+        self.screened_json(&body, credential.as_deref(), "response")?
+            .map_err(|error| {
+                LlmError::invalid_response(
+                    self.message(format_args!("returned invalid JSON: {error}")),
+                )
+            })
     }
 
     async fn send_stream(
@@ -771,27 +766,13 @@ impl HttpProvider {
             if data.trim() == "[DONE]" {
                 break accumulator.finish()?;
             }
-            if credential
-                .as_deref()
-                .is_some_and(|key| !key.is_empty() && data.contains(key))
-            {
-                return Err(LlmError::new(
-                    self.message("stream contained its configured credential"),
-                ));
-            }
-            let value: Value = serde_json::from_str(&data).map_err(|_| {
-                LlmError::invalid_response(self.message("returned invalid JSON in its SSE stream"))
-            })?;
-            if let Some(key) = credential.as_deref().filter(|key| !key.is_empty()) {
-                // Decoded JSON inspection covers Unicode escapes and string
-                // fragmentation inside one chunk, including metadata (A08).
-                // Cross-chunk text reassembly is the gate's job below.
-                if json_contains_string_fragment(&value, key) {
-                    return Err(LlmError::new(
-                        self.message("stream contained its configured credential"),
-                    ));
-                }
-            }
+            let value = self
+                .screened_json(&data, credential.as_deref(), "stream")?
+                .map_err(|_| {
+                    LlmError::invalid_response(
+                        self.message("returned invalid JSON in its SSE stream"),
+                    )
+                })?;
             if value
                 .get("type")
                 .and_then(Value::as_str)
@@ -994,12 +975,7 @@ impl LlmProvider for HttpProvider {
     }
 
     async fn complete(&self, req: ChatRequest) -> Result<ChatResponse, LlmError> {
-        validate_chat_request(&req, self.spec.api)?;
-        let capabilities = self.capabilities_for_model(&req.model);
-        validate_multimodal_capabilities(&req, &capabilities)?;
-        validate_structured_output_capabilities(&req, self.spec.api, &capabilities)?;
-        let payload = self.request_payload(&req, &capabilities)?;
-        crate::validate::validate_request_capabilities(&req, &capabilities)?;
+        let payload = self.prepare_request(&req)?;
         let _slot = self.acquire_request_slot().await?;
         let result = self
             .send(payload, &req.model, req.provider_web_search.is_some())
@@ -1013,12 +989,7 @@ impl LlmProvider for HttpProvider {
         req: ChatRequest,
         events: mpsc::Sender<ChatStreamEvent>,
     ) -> Result<(), LlmError> {
-        validate_chat_request(&req, self.spec.api)?;
-        let capabilities = self.capabilities_for_model(&req.model);
-        validate_multimodal_capabilities(&req, &capabilities)?;
-        validate_structured_output_capabilities(&req, self.spec.api, &capabilities)?;
-        let mut payload = self.request_payload(&req, &capabilities)?;
-        crate::validate::validate_request_capabilities(&req, &capabilities)?;
+        let mut payload = self.prepare_request(&req)?;
         payload["stream"] = Value::Bool(true);
         if self.spec.api == ApiFlavor::ChatCompletions {
             payload["stream_options"] = json!({ "include_usage": true });

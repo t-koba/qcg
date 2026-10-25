@@ -1080,112 +1080,37 @@ impl LlmProvider for FakeLlmProvider {
                     .filter(|message| message.role == "tool")
                     .count();
                 if let Some(value) = values.get(completed_tools) {
-                    let name = value
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
-                    let args = value.get("args").cloned().unwrap_or_else(|| json!({}));
-                    // A scripted call may name its own id, so a script can
-                    // repeat a call id the way a model replay does. Without
-                    // one the id follows the turn, which is what a script
-                    // that never repeats a call id expects.
                     let id = value
                         .get("id")
                         .and_then(Value::as_str)
                         .map(str::to_string)
                         .unwrap_or_else(|| format!("fake-tool-{}", completed_tools + 1));
-                    return Ok(ChatResponse {
-                        content: vec![ChatContent::ToolCall { id, name, args }],
-                        usage: TokenUsage {
-                            input: first_prompt.len() as u64,
-                            output: 0,
-                            reasoning: 0,
-                            cached_input: 0,
-                            cache_creation_input: 0,
-                        },
-                        stop: StopReason::ToolUse,
-                        provider_state: None,
-                        web_search: None,
-                    });
+                    return Ok(Self::response(first_prompt, Self::tool(value, id)));
                 }
             }
             let text = marker_block(first_prompt, "FAKE_AGENT_FINAL:")
                 .or_else(|| marker_block(system, "FAKE_AGENT_FINAL:"))
                 .unwrap_or_else(|| "agent finished".into());
-            return Ok(ChatResponse {
-                content: vec![ChatContent::Text(text)],
-                usage: TokenUsage {
-                    input: first_prompt.len() as u64,
-                    output: 0,
-                    reasoning: 0,
-                    cached_input: 0,
-                    cache_creation_input: 0,
-                },
-                stop: StopReason::EndTurn,
-                provider_state: None,
-                web_search: None,
-            });
+            return Ok(Self::response(first_prompt, ChatContent::Text(text)));
         }
         if let Some(tool) =
             marker_line(prompt, "FAKE_TOOL:").or_else(|| marker_line(system, "FAKE_TOOL:"))
             && let Ok(value) = serde_json::from_str::<Value>(&tool)
         {
-            let name = value
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let args = value.get("args").cloned().unwrap_or_else(|| json!({}));
-            return Ok(ChatResponse {
-                content: vec![ChatContent::ToolCall {
-                    id: "fake-tool-1".into(),
-                    name,
-                    args,
-                }],
-                usage: TokenUsage {
-                    input: prompt.len() as u64,
-                    output: 0,
-                    reasoning: 0,
-                    cached_input: 0,
-                    cache_creation_input: 0,
-                },
-                stop: StopReason::ToolUse,
-                provider_state: None,
-                web_search: None,
-            });
+            let id = "fake-tool-1".to_string();
+            return Ok(Self::response(prompt, Self::tool(&value, id)));
         }
         if let Some(sequence) = marker_line(prompt, "FAKE_TOOL_SEQUENCE:")
             .or_else(|| marker_line(system, "FAKE_TOOL_SEQUENCE:"))
             && let Ok(values) = serde_json::from_str::<Vec<Value>>(&sequence)
             && let Some(value) = values.first()
         {
-            let name = value
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let args = value.get("args").cloned().unwrap_or_else(|| json!({}));
-            // A scripted call may name its own id, so a script can repeat
-            // a call id the way a model replay does.
             let id = value
                 .get("id")
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .unwrap_or_else(|| "fake-tool-1".to_string());
-            return Ok(ChatResponse {
-                content: vec![ChatContent::ToolCall { id, name, args }],
-                usage: TokenUsage {
-                    input: prompt.len() as u64,
-                    output: 0,
-                    reasoning: 0,
-                    cached_input: 0,
-                    cache_creation_input: 0,
-                },
-                stop: StopReason::ToolUse,
-                provider_state: None,
-                web_search: None,
-            });
+            return Ok(Self::response(prompt, Self::tool(value, id)));
         }
         let text = if let Some(sequence) = marker_line(prompt, "FAKE_JSON_SEQUENCE:")
             && let Ok(values) = serde_json::from_str::<Vec<Value>>(&sequence)
@@ -1221,18 +1146,38 @@ impl LlmProvider for FakeLlmProvider {
         } else {
             prompt.to_string()
         };
-        Ok(ChatResponse {
-            content: vec![ChatContent::Text(text)],
+        Ok(Self::response(prompt, ChatContent::Text(text)))
+    }
+}
+
+impl FakeLlmProvider {
+    fn tool(value: &Value, id: String) -> ChatContent {
+        ChatContent::ToolCall {
+            id,
+            name: value
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .into(),
+            args: value.get("args").cloned().unwrap_or_else(|| json!({})),
+        }
+    }
+
+    fn response(prompt: &str, content: ChatContent) -> ChatResponse {
+        let stop = if matches!(content, ChatContent::ToolCall { .. }) {
+            StopReason::ToolUse
+        } else {
+            StopReason::EndTurn
+        };
+        ChatResponse {
+            content: vec![content],
             usage: TokenUsage {
                 input: prompt.len() as u64,
-                output: 0,
-                reasoning: 0,
-                cached_input: 0,
-                cache_creation_input: 0,
+                ..Default::default()
             },
-            stop: StopReason::EndTurn,
+            stop,
             provider_state: None,
             web_search: None,
-        })
+        }
     }
 }

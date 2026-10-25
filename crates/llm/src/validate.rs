@@ -8,58 +8,45 @@ use crate::provider::ApiFlavor;
 use crate::types::{Capabilities, ChatContentPart, ChatRequest, LlmError};
 
 pub(crate) fn validate_chat_request(req: &ChatRequest, api: ApiFlavor) -> Result<(), LlmError> {
-    if api == ApiFlavor::SystemOne {
-        return Err(LlmError::new(
-            "system_one requires llm.decide, not a chat request",
-        ));
-    }
-    if req.max_tokens == 0 {
-        return Err(LlmError::new("max_tokens must be greater than zero"));
-    }
-    if req
-        .temperature
-        .is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value))
-    {
-        return Err(LlmError::new(
-            "temperature must be finite and between 0 and 2",
-        ));
-    }
-    if req
-        .top_p
-        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
-    {
-        return Err(LlmError::new("top_p must be finite and between 0 and 1"));
-    }
-    if req.temperature.is_some() && req.top_p.is_some() {
-        return Err(LlmError::new(
-            "temperature and top_p are mutually exclusive",
-        ));
-    }
-    if req.reasoning_effort.is_some() && (req.temperature.is_some() || req.top_p.is_some()) {
-        return Err(LlmError::new(
-            "temperature and top_p must be omitted when reasoning_effort is set",
-        ));
-    }
-    if req.reasoning_effort.is_some() && req.seed.is_some() {
-        return Err(LlmError::new(
-            "seed must be omitted when reasoning_effort is set",
-        ));
-    }
-    if req.stop_sequences.len() > 8
-        || req
-            .stop_sequences
-            .iter()
-            .any(|sequence| sequence.is_empty() || sequence.len() > 1_024)
-    {
-        return Err(LlmError::new(
-            "stop_sequences must contain at most 8 non-empty strings of at most 1024 bytes",
-        ));
-    }
-    if (req.tool_choice.is_some() || req.parallel_tool_calls.is_some()) && req.tools.is_empty() {
-        return Err(LlmError::new(
-            "tool_choice and parallel_tool_calls require at least one tool",
-        ));
-    }
+    reject_if(
+        api == ApiFlavor::SystemOne,
+        "system_one requires llm.decide, not a chat request",
+    )?;
+    reject_if(req.max_tokens == 0, "max_tokens must be greater than zero")?;
+    reject_if(
+        req.temperature
+            .is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value)),
+        "temperature must be finite and between 0 and 2",
+    )?;
+    reject_if(
+        req.top_p
+            .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)),
+        "top_p must be finite and between 0 and 1",
+    )?;
+    reject_if(
+        req.temperature.is_some() && req.top_p.is_some(),
+        "temperature and top_p are mutually exclusive",
+    )?;
+    reject_if(
+        req.reasoning_effort.is_some() && (req.temperature.is_some() || req.top_p.is_some()),
+        "temperature and top_p must be omitted when reasoning_effort is set",
+    )?;
+    reject_if(
+        req.reasoning_effort.is_some() && req.seed.is_some(),
+        "seed must be omitted when reasoning_effort is set",
+    )?;
+    reject_if(
+        req.stop_sequences.len() > 8
+            || req
+                .stop_sequences
+                .iter()
+                .any(|sequence| sequence.is_empty() || sequence.len() > 1_024),
+        "stop_sequences must contain at most 8 non-empty strings of at most 1024 bytes",
+    )?;
+    reject_if(
+        (req.tool_choice.is_some() || req.parallel_tool_calls.is_some()) && req.tools.is_empty(),
+        "tool_choice and parallel_tool_calls require at least one tool",
+    )?;
     if let Some(ToolChoice::Tool { tool }) = &req.tool_choice
         && (tool.trim().is_empty() || !req.tools.iter().any(|candidate| candidate.name == *tool))
     {
@@ -67,18 +54,16 @@ pub(crate) fn validate_chat_request(req: &ChatRequest, api: ApiFlavor) -> Result
             "tool_choice.tool must name one of the request tools",
         ));
     }
-    if api == ApiFlavor::AnthropicMessages
-        && req.response_schema.is_some()
-        && req.structured_output != StructuredOutputMode::Prompt
-        && req
-            .tool_choice
-            .as_ref()
-            .is_some_and(|choice| !matches!(choice, ToolChoice::Mode(ToolChoiceMode::Auto)))
-    {
-        return Err(LlmError::new(
-            "Anthropic native structured output owns tool_choice",
-        ));
-    }
+    reject_if(
+        api == ApiFlavor::AnthropicMessages
+            && req.response_schema.is_some()
+            && req.structured_output != StructuredOutputMode::Prompt
+            && req
+                .tool_choice
+                .as_ref()
+                .is_some_and(|choice| !matches!(choice, ToolChoice::Mode(ToolChoiceMode::Auto))),
+        "Anthropic native structured output owns tool_choice",
+    )?;
     if let Some(schema) = &req.response_schema {
         policy::compile_bounded_validator(schema)
             .map_err(|error| LlmError::new(format!("response_schema is invalid: {error}")))?;
@@ -98,14 +83,11 @@ pub(crate) fn validate_chat_request(req: &ChatRequest, api: ApiFlavor) -> Result
     }
     let mut tool_names = std::collections::BTreeSet::new();
     for tool in &req.tools {
-        if tool.name.trim().is_empty() {
-            return Err(LlmError::new("tool name must not be empty"));
-        }
-        if tool.name == "response" {
-            return Err(LlmError::new(
-                "tool name `response` is reserved for structured output",
-            ));
-        }
+        reject_if(tool.name.trim().is_empty(), "tool name must not be empty")?;
+        reject_if(
+            tool.name == "response",
+            "tool name `response` is reserved for structured output",
+        )?;
         if !tool_names.insert(tool.name.as_str()) {
             return Err(LlmError::new(format!(
                 "duplicate tool name `{}`",
@@ -115,25 +97,22 @@ pub(crate) fn validate_chat_request(req: &ChatRequest, api: ApiFlavor) -> Result
         validate_tool_input_schema(&tool.name, &tool.input_schema, api)?;
     }
     for message in &req.messages {
-        if message.provider_state.is_some() && api != ApiFlavor::Responses {
-            return Err(LlmError::new(
-                "provider state messages are only valid for the Responses API",
-            ));
-        }
-        if message.role == "tool" && message.tool_call_id.as_deref().is_none_or(str::is_empty) {
-            return Err(LlmError::new("tool result is missing its tool call id"));
-        }
-        if !message.parts.is_empty() && message.role != "user" {
-            return Err(LlmError::new(
-                "multimodal content parts are only valid on user messages",
-            ));
-        }
+        reject_if(
+            message.provider_state.is_some() && api != ApiFlavor::Responses,
+            "provider state messages are only valid for the Responses API",
+        )?;
+        reject_if(
+            message.role == "tool" && message.tool_call_id.as_deref().is_none_or(str::is_empty),
+            "tool result is missing its tool call id",
+        )?;
+        reject_if(
+            !message.parts.is_empty() && message.role != "user",
+            "multimodal content parts are only valid on user messages",
+        )?;
         for part in &message.parts {
             let (media_type, data) = match part {
                 ChatContentPart::Text { text } => {
-                    if text.is_empty() {
-                        return Err(LlmError::new("text content parts must not be empty"));
-                    }
+                    reject_if(text.is_empty(), "text content parts must not be empty")?;
                     continue;
                 }
                 ChatContentPart::InputImage {
@@ -144,11 +123,10 @@ pub(crate) fn validate_chat_request(req: &ChatRequest, api: ApiFlavor) -> Result
                     media_type, data, ..
                 } => (media_type, data),
             };
-            if !valid_media_type(media_type) || data.is_empty() {
-                return Err(LlmError::new(
-                    "multimodal content requires a valid MIME type and non-empty base64 data",
-                ));
-            }
+            reject_if(
+                !valid_media_type(media_type) || data.is_empty(),
+                "multimodal content requires a valid MIME type and non-empty base64 data",
+            )?;
             if api == ApiFlavor::AnthropicMessages
                 && matches!(part, ChatContentPart::InputAudio { .. })
             {
@@ -158,20 +136,17 @@ pub(crate) fn validate_chat_request(req: &ChatRequest, api: ApiFlavor) -> Result
             }
         }
         if !message.tool_calls.is_empty() {
-            if message.role != "assistant" {
-                return Err(LlmError::new(
-                    "tool calls must be carried by an assistant message",
-                ));
-            }
-            if message
-                .tool_calls
-                .iter()
-                .any(|call| call.id.is_empty() || call.name.is_empty())
-            {
-                return Err(LlmError::new(
-                    "assistant tool calls must include non-empty ids and names",
-                ));
-            }
+            reject_if(
+                message.role != "assistant",
+                "tool calls must be carried by an assistant message",
+            )?;
+            reject_if(
+                message
+                    .tool_calls
+                    .iter()
+                    .any(|call| call.id.is_empty() || call.name.is_empty()),
+                "assistant tool calls must include non-empty ids and names",
+            )?;
         }
     }
     Ok(())
@@ -211,24 +186,21 @@ pub(crate) fn validate_structured_output_capabilities(
         return Ok(());
     }
     let uses_native = native_response_schema(req).is_some();
-    if uses_native && !capabilities.json_schema {
-        return Err(LlmError::new(
-            "provider does not support native structured output",
-        ));
-    }
+    reject_if(
+        uses_native && !capabilities.json_schema,
+        "provider does not support native structured output",
+    )?;
     if req.tools.is_empty() {
         return Ok(());
     }
-    if uses_native && !capabilities.structured_output_with_tools {
-        return Err(LlmError::new(
-            "provider does not support native structured output with external tools",
-        ));
-    }
-    if uses_native && api == ApiFlavor::AnthropicMessages {
-        return Err(LlmError::new(
-            "Anthropic Messages cannot force response while external tools are available",
-        ));
-    }
+    reject_if(
+        uses_native && !capabilities.structured_output_with_tools,
+        "provider does not support native structured output with external tools",
+    )?;
+    reject_if(
+        uses_native && api == ApiFlavor::AnthropicMessages,
+        "Anthropic Messages cannot force response while external tools are available",
+    )?;
     Ok(())
 }
 
@@ -289,15 +261,13 @@ pub fn validate_route_capabilities(
         .ok_or_else(|| {
             LlmError::new(format!("LLM provider `{}` is not registered", req.provider))
         })?;
-    if req.cache_retention.is_some()
-        && provider
-            .prompt_cache_retention_for(&req.provider, &req.model)
-            .is_none()
-    {
-        return Err(LlmError::new(
-            "LLM route does not declare extended cache retention",
-        ));
-    }
+    reject_if(
+        req.cache_retention.is_some()
+            && provider
+                .prompt_cache_retention_for(&req.provider, &req.model)
+                .is_none(),
+        "LLM route does not declare extended cache retention",
+    )?;
     validate_request_capabilities(req, &capabilities)
 }
 
@@ -366,4 +336,13 @@ pub(crate) fn validate_request_capabilities(
         )));
     }
     Ok(())
+}
+
+// Keep validation order at the call sites; only the refusal mechanics are shared.
+fn reject_if(invalid: bool, message: &str) -> Result<(), LlmError> {
+    if invalid {
+        Err(LlmError::new(message))
+    } else {
+        Ok(())
+    }
 }

@@ -211,3 +211,29 @@ pub(crate) fn is_loopback_host(url: &Url) -> bool {
             .parse::<std::net::IpAddr>()
             .is_ok_and(|address| address.is_loopback())
 }
+
+// Collect a complete body or reject it; never expose an accepted JSON prefix
+// of an oversized response. Callers retain their own error classification.
+pub(crate) enum BodyReadError {
+    Http(reqwest::Error),
+    Overflow,
+    Limit,
+}
+
+pub(crate) async fn read_body_bounded(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, BodyReadError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(BodyReadError::Http)? {
+        let len = body
+            .len()
+            .checked_add(chunk.len())
+            .ok_or(BodyReadError::Overflow)?;
+        if len > limit {
+            return Err(BodyReadError::Limit);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}

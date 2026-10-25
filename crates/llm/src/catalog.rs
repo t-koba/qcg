@@ -7,7 +7,8 @@
 //! contract's permissions and the registry's transport policy.
 
 use crate::config::{
-    credential_placeholder, interpolate_env, read_credential_file, validate_base_url,
+    BodyReadError, credential_placeholder, interpolate_env, read_body_bounded,
+    read_credential_file, validate_base_url,
 };
 use crate::provider::{
     FakeLlmProvider, LlmProvider, ModelPricing, ModelSpec, ModelsDiscovery, ProviderSpec,
@@ -838,15 +839,14 @@ fn json_contains_credential(value: &Value, credential: &str) -> bool {
 }
 
 async fn read_bounded(response: reqwest::Response, limit: usize) -> Result<Vec<u8>, String> {
-    let mut body = Vec::new();
-    let mut response = response;
-    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
-        if body.len().saturating_add(chunk.len()) > limit {
-            return Err(format!("response exceeded {limit} bytes"));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+    read_body_bounded(response, limit)
+        .await
+        .map_err(|error| match error {
+            BodyReadError::Http(error) => error.to_string(),
+            BodyReadError::Limit | BodyReadError::Overflow => {
+                format!("response exceeded {limit} bytes")
+            }
+        })
 }
 
 fn provider_available(spec: &ProviderSpec) -> bool {

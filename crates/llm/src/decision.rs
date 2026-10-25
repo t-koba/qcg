@@ -46,22 +46,14 @@ impl DecisionRequest {
     /// `(false, None)`.
     pub fn payload_for(&self, model_in_body: bool, input_wrapper: DecisionInputWrapper) -> Value {
         let inner = json!({"state": self.state, "questions": self.questions});
-        match input_wrapper {
-            DecisionInputWrapper::None => {
-                let mut body = json!({"state": self.state, "questions": self.questions});
-                if model_in_body {
-                    body["model"] = json!(self.model);
-                }
-                body
-            }
-            DecisionInputWrapper::Input => {
-                let mut body = json!({"input": inner});
-                if model_in_body {
-                    body["model"] = json!(self.model);
-                }
-                body
-            }
+        let mut body = match input_wrapper {
+            DecisionInputWrapper::None => inner,
+            DecisionInputWrapper::Input => json!({"input": inner}),
+        };
+        if model_in_body {
+            body["model"] = json!(self.model);
         }
+        body
     }
 
     pub fn validate(&self) -> Result<(), LlmError> {
