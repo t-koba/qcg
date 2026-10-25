@@ -84,6 +84,54 @@ async fn elapsed_facts_survive_in_flight_settlement_and_interaction_in_both_mode
 }
 
 #[test]
+fn pre_start_elapsed_expiry_has_a_distinct_public_failure_reason() {
+    let used = std::time::Duration::from_secs(5);
+    let before_start =
+        failure_detail_for_error(&EngineError::Step(StepError::ElapsedExpiredBeforeStart {
+            limit_secs: 5,
+            used,
+        }));
+    let while_running = failure_detail_for_error(&EngineError::Step(StepError::ElapsedExceeded {
+        node: "work".into(),
+        limit_secs: 5,
+        used,
+    }));
+    assert_eq!(before_start.code, model::FailureCode::ElapsedExceeded);
+    assert_eq!(while_running.code, before_start.code);
+    assert!(
+        before_start
+            .message
+            .contains("expired before the next step could start")
+    );
+    assert!(
+        while_running
+            .message
+            .contains("step `work` exceeded the run elapsed limit")
+    );
+
+    let summary = api::RunFinishedEventData {
+        status: api::RunCompletionStatus::Failed,
+        reason: None,
+        failures: vec![api::RunNodeFailureEventData {
+            path: model::NodePath::root("runtime"),
+            failure: before_start,
+        }],
+        metrics: model::RunMetrics::default(),
+    };
+    let encoded = serde_json::to_value(summary).unwrap();
+    assert_eq!(
+        encoded["failures"][0]["failure"]["code"],
+        "elapsed_exceeded"
+    );
+    assert!(
+        encoded["failures"][0]["failure"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("expired before the next step could start")
+    );
+}
+
+#[test]
 fn elapsed_failure_projection_keeps_exact_components_without_nanosecond_overflow() {
     let used = std::time::Duration::new(u64::MAX - 1, 987654321);
     for error in [
