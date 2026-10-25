@@ -246,21 +246,19 @@ export class RunStore {
 
   async refreshActiveFields(): Promise<void> {
     const version = ++this.#fieldVersion;
-    const valuesSnapshot = { ...this.values };
+    const values = { ...this.values };
     const fields: InputField[] = [];
     for (const stage of this.detail?.inputs?.stages || []) {
-      if (await evalWhen(stage.when || undefined, { inputs: valuesSnapshot })) {
-        fields.push(...stage.fields);
+      if (!(await evalWhen(stage.when || undefined, { inputs: values }))) continue;
+      fields.push(...stage.fields);
+      for (const field of stage.fields) {
+        if (values[field.id] === undefined && field.default !== undefined && field.default !== null) {
+          values[field.id] = field.default;
+        }
       }
     }
     if (version !== this.#fieldVersion) return;
     this.activeFields = fields;
-    const values = { ...valuesSnapshot };
-    for (const field of fields) {
-      if (values[field.id] === undefined && field.default !== undefined && field.default !== null) {
-        values[field.id] = field.default;
-      }
-    }
     this.values = values;
   }
 

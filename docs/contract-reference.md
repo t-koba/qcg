@@ -248,7 +248,11 @@ Input field fields:
   changing the execution contract.
 
 Only active stages are resolved. A stage is active when `when` is absent or
-evaluates true.
+evaluates true. Stages are evaluated in declaration order: each `when` sees
+the current input values and defaults filled for earlier active stages. Only an
+active stage fills missing field defaults; an inactive stage contributes no
+fields or defaults during that resolution. The resulting input bag is also used
+when the active fields are validated.
 
 ## `[resources.<name>]`
 
