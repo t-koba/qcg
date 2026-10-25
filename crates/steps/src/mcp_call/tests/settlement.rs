@@ -521,6 +521,8 @@ async fn completed_result_survives_every_cleanup_disposition_and_replays_without
             .find(|record| record["t"] == "tool_call")
             .unwrap();
         assert_eq!(call["result"]["value"], raw);
+        assert_eq!(call["status"], "succeeded");
+        assert!(call["error"].is_null());
         assert_policy(&call, policy);
         drop(journal);
         // Reopen from disk: the external-operation guard returns the cached
@@ -657,6 +659,21 @@ fn execution_errors_keep_their_own_handling_including_optional_degradation() {
                 fact["cleanup_settlement"].is_null(),
                 "execution errors never select a cleanup policy"
             );
+            let audit = std::fs::read_to_string(harness.root.join("audit.jsonl")).unwrap();
+            let call: Value = audit
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .find(|record| record["t"] == "tool_call")
+                .unwrap();
+            assert_eq!(call["status"], if optional { "degraded" } else { "failed" });
+            assert_eq!(call["error"]["code"], "execution_failed");
+            assert!(
+                call["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("execution failed")
+            );
+            assert_eq!(call["cleanup_error"]["code"], "cleanup_failed");
         }
     }
 }
