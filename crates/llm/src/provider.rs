@@ -669,27 +669,26 @@ impl ProviderSpec {
                 )));
             }
         }
-        if self.timeout_seconds == Some(0) {
-            return Err(invalid("timeout_seconds must be greater than zero"));
-        }
-        if self.response_body_limit_bytes == Some(0) {
-            return Err(invalid(
-                "response_body_limit_bytes must be greater than zero",
-            ));
-        }
-        for (field, value) in [
-            ("max_concurrency", self.max_concurrency),
-            ("requests_per_minute", self.requests_per_minute),
-            ("circuit_breaker_failures", self.circuit_breaker_failures),
+        for (field, is_zero) in [
+            ("timeout_seconds", self.timeout_seconds == Some(0)),
+            (
+                "response_body_limit_bytes",
+                self.response_body_limit_bytes == Some(0),
+            ),
+            ("max_concurrency", self.max_concurrency == Some(0)),
+            ("requests_per_minute", self.requests_per_minute == Some(0)),
+            (
+                "circuit_breaker_failures",
+                self.circuit_breaker_failures == Some(0),
+            ),
+            (
+                "circuit_breaker_cooldown_seconds",
+                self.circuit_breaker_cooldown_seconds == Some(0),
+            ),
         ] {
-            if value == Some(0) {
+            if is_zero {
                 return Err(invalid(&format!("{field} must be greater than zero")));
             }
-        }
-        if self.circuit_breaker_cooldown_seconds == Some(0) {
-            return Err(invalid(
-                "circuit_breaker_cooldown_seconds must be greater than zero",
-            ));
         }
         validate_capabilities_for_api(&self.id, self.api, &self.capabilities)?;
         if self.chat_token_limit_field.is_some() && self.api != ApiFlavor::ChatCompletions {
