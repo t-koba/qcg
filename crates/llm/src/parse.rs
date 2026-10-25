@@ -11,6 +11,16 @@ fn required_text(field: Option<&Value>, message: &str) -> Result<String, LlmErro
         .map(str::to_owned)
 }
 
+/// Reads a required string identifier that cannot be empty.
+fn required_nonempty_text(field: Option<&Value>, message: &str) -> Result<String, LlmError> {
+    let value = required_text(field, message)?;
+    if value.is_empty() {
+        Err(LlmError::invalid_response(message))
+    } else {
+        Ok(value)
+    }
+}
+
 pub(crate) fn parse_chat_completions_response(value: Value) -> Result<ChatResponse, LlmError> {
     let message = value
         .get("choices")
@@ -74,15 +84,10 @@ pub(crate) fn parse_chat_completions_response(value: Value) -> Result<ChatRespon
 }
 
 fn parse_openai_tool_call(call: &Value) -> Result<ChatContent, LlmError> {
-    let id = required_text(
+    let id = required_nonempty_text(
         call.get("id"),
         "OpenAI-compatible tool call did not include id",
     )?;
-    if id.is_empty() {
-        return Err(LlmError::invalid_response(
-            "OpenAI-compatible tool call did not include id",
-        ));
-    }
     let function = call.get("function").ok_or_else(|| {
         LlmError::invalid_response("OpenAI-compatible tool call did not include function")
     })?;
@@ -151,15 +156,10 @@ pub(crate) fn parse_responses_response(
                 }
             }
             Some("function_call") => {
-                let id = required_text(
+                let id = required_nonempty_text(
                     item.get("call_id").or_else(|| item.get("id")),
                     "Responses API function_call did not include call_id",
                 )?;
-                if id.is_empty() {
-                    return Err(LlmError::invalid_response(
-                        "Responses API function_call did not include call_id",
-                    ));
-                }
                 let name = required_text(
                     item.get("name"),
                     "Responses API function_call did not include name",
@@ -394,12 +394,10 @@ pub(crate) fn parse_anthropic_response(value: Value) -> Result<ChatResponse, Llm
                 }
             }
             Some("tool_use") => {
-                let id = required_text(block.get("id"), "Anthropic tool_use did not include id")?;
-                if id.is_empty() {
-                    return Err(LlmError::invalid_response(
-                        "Anthropic tool_use did not include id",
-                    ));
-                }
+                let id = required_nonempty_text(
+                    block.get("id"),
+                    "Anthropic tool_use did not include id",
+                )?;
                 let name =
                     required_text(block.get("name"), "Anthropic tool_use did not include name")?;
                 let args = block.get("input").cloned().unwrap_or_else(|| json!({}));
