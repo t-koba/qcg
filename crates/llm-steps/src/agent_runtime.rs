@@ -3201,8 +3201,8 @@ mod approval_e2e {
             );
             assert_eq!(
                 writes.reported().len(),
-                2,
-                "the replayed call reports the write it replayed"
+                1,
+                "the cached replay does not duplicate the reported output path"
             );
         }
         let written = std::fs::read_to_string(harness.root.join("workspace/drafts/note.txt"))
