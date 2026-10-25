@@ -6,13 +6,14 @@
 #   [llm]
 #   model = { provider = "openai", model = "gpt-4.1-mini" }
 #
-# Remote providers below ship commented out. Enable one by deleting the
-# leading "# " from its block; the URLs are fixed constants, so uncommenting
-# is the only edit needed before setting the credential variable. Rows with
-# variable endpoints (Cloudflare) resolve placeholders such as
-# {CLOUDFLARE_ACCOUNT_ID} from the environment and fail validation while
-# they stay unresolved. Azure OpenAI takes its full endpoint root (including
-# /openai/v1) from AZURE_OPENAI_BASE_URL instead.
+# Most remote providers below ship commented out. The `typesafe` row is an
+# exception: it is registered by default, but connects only when selected by a
+# contract. Enable another provider by deleting the leading "# " from its
+# block. Most rows have a fixed default URL; any endpoint override or
+# credential variable is listed by the row. Cloudflare rows resolve
+# placeholders such as {CLOUDFLARE_ACCOUNT_ID} from the environment and fail
+# validation if any placeholder remains. Azure OpenAI takes its full endpoint
+# root, including /openai/v1, from AZURE_OPENAI_BASE_URL.
 #
 # Local endpoints (ollama, lmstudio, openai_client) are active by default and
 # only connect when a run reaches them. Ollama and LM Studio need no credential;
@@ -42,7 +43,8 @@
 #
 # Fields:
 #   id            unique provider id referenced by contracts
-#   api           chat_completions | responses | anthropic_messages
+#   api           chat_completions | responses | anthropic_messages |
+#                 system_one
 #   base_url      default endpoint root ({ENV_VAR} placeholders are resolved
 #                 from the environment and fail validation when unresolved)
 #   base_url_env  environment variable that overrides base_url
