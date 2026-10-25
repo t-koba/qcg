@@ -569,158 +569,107 @@ impl Engine {
         node_context.cmd = context.cmd.clone().with_cancellation(node_stop.clone());
         node_context.http = context.http.clone().with_cancellation(node_stop.clone());
         // Deadline arms share the admission-time limit; None is unconfigured and 0 is never inferred (E10/E11).
-        let attempt_execution = async {
+        let mut attempt_execution = Box::pin(async {
             let mut execution =
                 self.execute_node_after_budget(&node_context, journal, vars, budget, node);
-            if let Some(timeout_secs) = bounds.timeout_secs {
-                // On timeout the child is cancelled and the node gets a
-                // bounded grace period to settle cooperatively; only then
-                // is the future abandoned and the timeout recorded.
-                // Explicit wait and settlement live in this layer instead
-                // of a bare inner-future drop (A09). The grace wait is the
-                // shared `await_grace_settlement` helper so both deadline
-                // paths settle identically (E10).
-                tokio::select! {
-                    // The declared timeout wins a simultaneous completion so
-                    // the outcome is deterministic (E11).
-                    biased;
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
-                        node_stop.cancel();
-                        // Unified cancel-race entry (E11): a parent cancel
-                        // racing the deadline wins before cooperative grace,
-                        // via the single shared helper used by both deadline
-                        // paths.
-                        if grace_entry_parent_cancelled(context) {
-                            return Err(EngineError::Canceled);
-                        }
-                        match await_grace_settlement(&mut execution).await {
-                            // The deadline fired and is remembered by this
-                            // branch: a cooperative executor reports the
-                            // child-scope stop as cancellation, which
-                            // normalizes to TimedOut (retryable) unless an
-                            // actual parent cancel wins (C06). Passing the
-                            // raw cancellation through would misreport a
-                            // cooperative timeout as a user cancel and skip
-                            // the retry this policy declares.
-                            Some(result) => {
-                                if grace_entry_parent_cancelled(context) {
-                                    result
-                                } else if result
-                                    .as_ref()
-                                    .is_err_and(EngineError::is_canceled)
-                                {
-                                    Err(EngineError::Step(StepError::TimedOut {
-                                        node: node.id.clone(),
-                                        timeout_secs,
-                                    }))
-                                } else {
-                                    result
-                                }
-                            }
-                            None => {
-                                // A parent cancel racing the deadline wins:
-                                // reporting timeout for a canceled run
-                                // would misclassify the outcome.
-                                if grace_entry_parent_cancelled(context) {
-                                    Err(EngineError::Canceled)
-                                } else {
-                                    Err(EngineError::Step(StepError::TimedOut {
-                                        node: node.id.clone(),
-                                        timeout_secs,
-                                    }))
-                                }
-                            }
-                        }
-                    }
-                    result = &mut execution => result,
-                }
-            } else {
-                execution.await
-            }
-        };
-        let mut attempt_execution = Box::pin(attempt_execution);
-        // Run-wide elapsed deadline: stops the attempt with a distinct
-        // error (never retried, never reported as a node timeout) so the
-        // budget acts as a hard limit for any executor (E11).
-        if let Some(deadline) = context.elapsed_deadline {
+            let Some(timeout_secs) = bounds.timeout_secs else {
+                return execution.await;
+            };
+            // Cancel the child and await bounded cooperative settlement before abandoning it (A09/E10).
             tokio::select! {
-                // The deadline wins a simultaneous completion: the limit is
-                // hard, and cancellation is checked inside the deadline arm
-                // (E11).
+                // The declared timeout wins a simultaneous completion so
+                // the outcome is deterministic (E11).
                 biased;
-                _ = tokio::time::sleep_until(deadline.deadline) => {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
                     node_stop.cancel();
-                    // Same bounded cooperative grace and parent-cancel precedence as node timeouts.
+                    // Parent cancellation wins at grace entry for either deadline (E11).
                     if grace_entry_parent_cancelled(context) {
                         return Err(EngineError::Canceled);
                     }
-                    let Some(limit_secs) = bounds.elapsed_limit else {
-                        return Err(EngineError::Failed(
-                            "elapsed deadline fired without a configured elapsed limit".into(),
-                        ));
-                    };
-                    match await_grace_settlement(&mut attempt_execution).await {
-                        Some(result) => {
-                            if grace_entry_parent_cancelled(context) {
-                                return Err(EngineError::Canceled);
-                            }
-                            // Deliver grace-period interactions without restoring budget (E11).
-                            // Other late finishes lose to the hard run limit; retain any inner timeout too.
-                            let is_interaction = matches!(
-                                &result,
-                                Ok(StepOutcome::NeedsUser { .. })
-                                    | Ok(StepOutcome::NeedsConfirm { .. })
-                            );
-                            if is_interaction {
-                                // The marker records exhaustion beside the delivered interaction, not permission to resume.
-                                journal.event(
-                                    "elapsed_exceeded",
-                                    json!({
-                                        "node": node.id,
-                                        "limit_secs": limit_secs,
-                                        "exhaustion": model::BudgetExhaustion::elapsed(deadline.used(), limit_secs),
-                                        "during": "interaction",
-                                    }),
-                                )?;
-                                return result;
-                            }
-                            if let Err(EngineError::Step(StepError::TimedOut {
-                                timeout_secs: inner_timeout,
-                                ..
-                            })) = &result
-                            {
-                                journal.event(
-                                    "step_timeout",
-                                    json!({
-                                        "node": node.id,
-                                        "timeout_secs": inner_timeout,
-                                        "during": "elapsed",
-                                    }),
-                                )?;
-                            }
-                            Err(EngineError::Step(StepError::ElapsedExceeded {
-                                node: node.id.clone(),
-                                limit_secs,
-                                used: deadline.used(),
-                            }))
-                        }
-                        None => {
-                            if grace_entry_parent_cancelled(context) {
-                                Err(EngineError::Canceled)
-                            } else {
-                                Err(EngineError::Step(StepError::ElapsedExceeded {
-                                    node: node.id.clone(),
-                                    limit_secs,
-                                    used: deadline.used(),
-                                }))
-                            }
-                        }
+                    let result = await_grace_settlement(&mut execution).await;
+                    // Unlike elapsed expiry, a parent cancel preserves a settled node result.
+                    if grace_entry_parent_cancelled(context) {
+                        return result.unwrap_or(Err(EngineError::Canceled));
+                    }
+                    match result {
+                        Some(result) if !result.as_ref().is_err_and(EngineError::is_canceled) => result,
+                        // Cooperative child cancellation and grace expiry are retryable timeouts.
+                        _ => Err(EngineError::Step(StepError::TimedOut {
+                            node: node.id.clone(),
+                            timeout_secs,
+                        })),
                     }
                 }
-                result = &mut attempt_execution => result,
+                result = &mut execution => result,
             }
-        } else {
-            attempt_execution.await
+        });
+        // Run-wide elapsed deadline: stops the attempt with a distinct
+        // error (never retried, never reported as a node timeout) so the
+        // budget acts as a hard limit for any executor (E11).
+        let Some(deadline) = context.elapsed_deadline else {
+            return attempt_execution.await;
+        };
+        tokio::select! {
+            // The hard deadline wins simultaneous completion; cancellation is
+            // checked inside the deadline arm (E11).
+            biased;
+            _ = tokio::time::sleep_until(deadline.deadline) => {
+                node_stop.cancel();
+                // Same bounded cooperative grace and parent-cancel precedence as node timeouts.
+                if grace_entry_parent_cancelled(context) {
+                    return Err(EngineError::Canceled);
+                }
+                let Some(limit_secs) = bounds.elapsed_limit else {
+                    return Err(EngineError::Failed(
+                        "elapsed deadline fired without a configured elapsed limit".into(),
+                    ));
+                };
+                let result = await_grace_settlement(&mut attempt_execution).await;
+                if grace_entry_parent_cancelled(context) {
+                    return Err(EngineError::Canceled);
+                }
+                if let Some(result) = result {
+                    // Deliver grace-period interactions without restoring budget (E11).
+                    // Other late finishes lose to the hard run limit; retain any inner timeout too.
+                    if matches!(
+                        &result,
+                        Ok(StepOutcome::NeedsUser { .. })
+                            | Ok(StepOutcome::NeedsConfirm { .. })
+                    ) {
+                        // The marker records exhaustion beside the delivered interaction, not permission to resume.
+                        journal.event(
+                            "elapsed_exceeded",
+                            json!({
+                                "node": node.id,
+                                "limit_secs": limit_secs,
+                                "exhaustion": model::BudgetExhaustion::elapsed(deadline.used(), limit_secs),
+                                "during": "interaction",
+                            }),
+                        )?;
+                        return result;
+                    }
+                    if let Err(EngineError::Step(StepError::TimedOut {
+                        timeout_secs: inner_timeout,
+                        ..
+                    })) = &result
+                    {
+                        journal.event(
+                            "step_timeout",
+                            json!({
+                                "node": node.id,
+                                "timeout_secs": inner_timeout,
+                                "during": "elapsed",
+                            }),
+                        )?;
+                    }
+                }
+                Err(EngineError::Step(StepError::ElapsedExceeded {
+                    node: node.id.clone(),
+                    limit_secs,
+                    used: deadline.used(),
+                }))
+            }
+            result = &mut attempt_execution => result,
         }
     }
 
