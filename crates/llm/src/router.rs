@@ -351,17 +351,26 @@ impl LlmProvider for LlmRouter {
                         false,
                         &observer,
                     );
+                    let applied_after = error.decisions.last().and_then(|decision| {
+                        decision
+                            .retry_after_applied
+                            .then_some(decision.retry_after_secs)
+                            .flatten()
+                    });
                     decisions.append(&mut error.decisions);
                     if action != RetryAction::Retry {
                         error.decisions = decisions;
                         return Err(error);
                     }
-                    sleep(retry_backoff(
-                        attempt,
-                        provider.retry_base_backoff(),
-                        provider.retry_backoff_exponent_cap(),
-                    ))
-                    .await;
+                    let delay = crate::retry::effective_retry_delay(
+                        retry_backoff(
+                            attempt,
+                            provider.retry_base_backoff(),
+                            provider.retry_backoff_exponent_cap(),
+                        ),
+                        applied_after,
+                    );
+                    sleep(delay).await;
                 }
             }
         }
@@ -452,22 +461,31 @@ impl LlmProvider for LlmRouter {
                 emitted,
                 &observer,
             );
+            let applied_after = error.decisions.last().and_then(|decision| {
+                decision
+                    .retry_after_applied
+                    .then_some(decision.retry_after_secs)
+                    .flatten()
+            });
             decisions.append(&mut error.decisions);
             if action != RetryAction::Retry {
                 error.decisions = decisions;
                 return Err(error);
             }
-            sleep(retry_delay(
-                attempt,
-                provider.retry_base_backoff(),
-                provider.retry_rate_limit_floor(),
-                provider.retry_backoff_exponent_cap(),
-                matches!(
-                    error.kind,
-                    LlmErrorKind::HttpStatus(429) | LlmErrorKind::EmptyResponse
+            let delay = crate::retry::effective_retry_delay(
+                retry_delay(
+                    attempt,
+                    provider.retry_base_backoff(),
+                    provider.retry_rate_limit_floor(),
+                    provider.retry_backoff_exponent_cap(),
+                    matches!(
+                        error.kind,
+                        LlmErrorKind::HttpStatus(429) | LlmErrorKind::EmptyResponse
+                    ),
                 ),
-            ))
-            .await;
+                applied_after,
+            );
+            sleep(delay).await;
             attempt += 1;
         }
     }
@@ -531,22 +549,31 @@ async fn complete_with_retry_observed(
                     false,
                     &observer,
                 );
+                let applied_after = error.decisions.last().and_then(|decision| {
+                    decision
+                        .retry_after_applied
+                        .then_some(decision.retry_after_secs)
+                        .flatten()
+                });
                 decisions.append(&mut error.decisions);
                 if action != RetryAction::Retry {
                     error.decisions = decisions;
                     return Err(error);
                 }
-                sleep(retry_delay(
-                    attempt,
-                    provider.retry_base_backoff(),
-                    provider.retry_rate_limit_floor(),
-                    provider.retry_backoff_exponent_cap(),
-                    matches!(
-                        error.kind,
-                        LlmErrorKind::HttpStatus(429) | LlmErrorKind::EmptyResponse
+                let delay = crate::retry::effective_retry_delay(
+                    retry_delay(
+                        attempt,
+                        provider.retry_base_backoff(),
+                        provider.retry_rate_limit_floor(),
+                        provider.retry_backoff_exponent_cap(),
+                        matches!(
+                            error.kind,
+                            LlmErrorKind::HttpStatus(429) | LlmErrorKind::EmptyResponse
+                        ),
                     ),
-                ))
-                .await;
+                    applied_after,
+                );
+                sleep(delay).await;
             }
         }
     }

@@ -7,6 +7,31 @@ use std::sync::Arc;
 
 pub type RetryObserver = Arc<dyn Fn(&RetryDecision) + Send + Sync>;
 
+/// Longest provider `error.code` retained for policy matching. Raw bodies
+/// are never stored; longer or malformed codes are dropped.
+pub const MAX_PROVIDER_ERROR_CODE_LEN: usize = 64;
+
+/// Longest observed `Retry-After` delay retained or applied, in seconds.
+/// Existing backoff is unchanged; header delays require explicit rule opt-in.
+pub(crate) const MAX_RETRY_AFTER_SECS: u64 = 60;
+
+/// Returns the sanitized provider error code, or `None` when the raw value
+/// is missing, empty, oversized, or contains characters outside
+/// `A-Z a-z 0-9 . _ -`.
+pub(crate) fn sanitize_provider_error_code(raw: &str) -> Option<String> {
+    let code = raw.trim();
+    if code.is_empty() || code.len() > MAX_PROVIDER_ERROR_CODE_LEN {
+        return None;
+    }
+    if !code
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+    {
+        return None;
+    }
+    Some(code.to_string())
+}
+
 /// First matching rule wins; omitted match fields are wildcards. Empty rules
 /// use the documented default. Bounds and terminal guards cannot be bypassed.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -25,6 +50,16 @@ pub struct RetryRule {
     pub stream: Option<bool>,
     pub attempt_from: Option<usize>,
     pub attempt_through: Option<usize>,
+    /// Optional exact provider `error.code` to match. `None` (the default)
+    /// is a wildcard; `Some` matches only when the failure carries the same
+    /// sanitized code. Captured codes are inert unless a rule names them.
+    #[serde(default)]
+    pub provider_code: Option<String>,
+    /// Opt in to using the bounded `Retry-After` delay when this rule causes
+    /// a same-route retry. `false` (the default) preserves current backoff;
+    /// terminal guards and route fallbacks never wait.
+    #[serde(default)]
+    pub use_retry_after: bool,
     pub action: RetryAction,
     /// What a bounded retry does when its attempt allowance is exhausted.
     #[serde(default = "fail_fast")]
@@ -48,6 +83,17 @@ impl RetryPolicy {
             {
                 return Err("retry_policy requires positive ordered attempt bounds and on_exhausted = fail_fast or next_route".into());
             }
+            if let Some(code) = rule.provider_code.as_deref()
+                && sanitize_provider_error_code(code).is_none_or(|sanitized| sanitized != code)
+            {
+                return Err(
+                    "retry_policy provider_code must be 1..=64 ASCII alphanumeric, '.', '_' or '-'"
+                        .into(),
+                );
+            }
+            if rule.use_retry_after && rule.action != RetryAction::Retry {
+                return Err("retry_policy use_retry_after requires action = retry".into());
+            }
         }
         Ok(())
     }
@@ -61,6 +107,15 @@ impl RetryPolicy {
         emitted: bool,
     ) -> RetryDecision {
         use crate::LlmErrorKind;
+        // Public error facts may come from custom providers, not just HTTP.
+        // Sanitize before matching as well as before recording event facts.
+        let provider_code = error
+            .provider_code
+            .as_deref()
+            .and_then(sanitize_provider_error_code);
+        let retry_after_secs = error
+            .retry_after_secs
+            .map(|secs| secs.min(MAX_RETRY_AFTER_SECS));
         let matched = self.rules.iter().enumerate().find(|(_, rule)| {
             rule.kind.is_none_or(|v| v == error.kind)
                 && rule.phase.is_none_or(|v| v == error.facts.phase)
@@ -68,6 +123,10 @@ impl RetryPolicy {
                 && rule.stream.is_none_or(|v| v == stream)
                 && rule.attempt_from.is_none_or(|v| attempt >= v)
                 && rule.attempt_through.is_none_or(|v| attempt <= v)
+                && rule
+                    .provider_code
+                    .as_ref()
+                    .is_none_or(|want| provider_code.as_deref() == Some(want.as_str()))
         });
         let (requested, exhausted, source) = match matched {
             Some((index, rule)) => (rule.action, rule.on_exhausted, format!("rule:{index}")),
@@ -98,6 +157,9 @@ impl RetryPolicy {
             action: requested,
             source,
             guard: None,
+            provider_code,
+            retry_after_secs,
+            retry_after_applied: false,
         };
         if emitted {
             decision.action = RetryAction::FailFast;
@@ -116,8 +178,29 @@ impl RetryPolicy {
             decision.action = exhausted;
             decision.guard = Some(RetryGuard::AttemptLimit);
         }
+        // Record an applied delay only when this failure will actually retry;
+        // attempt limits, terminal guards, and route fallback do not sleep.
+        decision.retry_after_applied = decision.action == RetryAction::Retry
+            && matched.is_some_and(|(_, rule)| rule.use_retry_after)
+            && decision.retry_after_secs.is_some();
         decision
     }
+}
+
+/// Effective wait for one retry attempt: the computed backoff, raised to
+/// at least the observed `Retry-After` delay only when the matching rule
+/// opted in (`Some` delay). Without opt-in (`None`) the base delay is
+/// unchanged.
+pub(crate) fn effective_retry_delay(
+    base: std::time::Duration,
+    applied_after_secs: Option<u64>,
+) -> std::time::Duration {
+    if let Some(secs) = applied_after_secs {
+        return base.max(std::time::Duration::from_secs(
+            secs.min(MAX_RETRY_AFTER_SECS),
+        ));
+    }
+    base
 }
 
 impl RetryPolicy {

@@ -660,9 +660,10 @@ is `unknown/unknown`: it does **not** prove that the request was never sent.
 `sent` is dispatch evidence, not proof of completion or billed usage.
 
 `retry_policy.rules` uses first-match order. Every omitted match field is a
-wildcard: `kind`, `phase`, `dispatch`, `stream` (boolean), `attempt_from`, and
-`attempt_through`. Attempt bounds are inclusive, positive, and one-based within
-the route, independent of the fallback index. A rule chooses `action`:
+wildcard: `kind`, `phase`, `dispatch`, `stream` (boolean), `attempt_from`,
+`attempt_through`, and `provider_code`. Attempt bounds are inclusive, positive,
+and one-based within the route, independent of the fallback index. A rule
+chooses `action`:
 
 - `fail_fast`: return the failure, without internal retry or route fallback.
 - `retry`: retry the same unchanged request on the same route, with the existing
@@ -683,6 +684,26 @@ timeout default is retained even when dispatch is uncertain; operators who need
 stricter duplicate-request avoidance can override it with a fail-fast rule.
 Circuit failure counting remains based on its existing retryable-kind set;
 transport policy does not redefine circuit accounting.
+
+Non-success HTTP responses are inspected within a bounded prefix (at most
+8 KiB and never more than the configured `response_body_limit_bytes`). Only
+the supported `{"error":{"code":"..."}}` string shape is recognized, and only
+a sanitized code (`1..=64` ASCII `A-Z a-z 0-9 . _ -`) is retained. Raw bodies,
+endpoints, and credentials are never stored or surfaced; a body containing the
+configured credential fails closed without a code, and malformed, oversized,
+or unrecognized bodies yield no code. Capture alone is inert: it changes no
+default unless a provider rule explicitly names the same `provider_code`. No
+OpenAI-specific disposition is hardcoded for compatible endpoints; an
+exhaustion/quota code still follows the configured rule, including a
+`next_route` to a separately authorized route.
+
+`Retry-After` response headers are parsed boundedly (delta-seconds and
+HTTP-date forms, capped at 60 seconds; missing, invalid, or past values yield
+no delay). The parsed delay is recorded on the failure and the decision, but
+the router waits for it only when the matching rule sets
+`use_retry_after = true` and the effective action remains a same-route `retry`;
+otherwise current backoff and route behavior are unchanged. An applied delay
+never shortens the computed backoff: the router waits the maximum of the two.
 
 Example, appended inside one provider row (before the next `[[provider]]`):
 
@@ -707,6 +728,21 @@ attempt_from = 1
 attempt_through = 10
 action = "retry"
 on_exhausted = "next_route"
+
+# Distinguish identical 429s by bounded provider code: transient throttling
+# retries and honors Retry-After, while a configured quota code falls back.
+# This does not hardcode OpenAI semantics for other endpoints.
+[[provider.retry_policy.rules]]
+kind = { http_status = 429 }
+provider_code = "slow_down"
+use_retry_after = true
+action = "retry"
+on_exhausted = "next_route"
+
+[[provider.retry_policy.rules]]
+kind = { http_status = 429 }
+provider_code = "insufficient_quota"
+action = "next_route"
 ```
 
 `retry_attempts` still bounds completion/decision attempts including the first
@@ -727,7 +763,11 @@ including decisions on the decision API. `llm_route_failed.retry_decisions`
 retains them for a failed route, and `fallback_taken` states whether this
 invocation advanced to another declared route. Each decision carries its kind,
 facts, attempt, stream flag, requested/effective actions, source (`default` or
-`rule:<zero-based index>`, or `gateway` for a gateway terminal guard), and any mechanism guard (`attempt_limit`,
+`rule:<zero-based index>`, or `gateway` for a gateway terminal guard), the observed
+sanitized `provider_code` and bounded `retry_after_secs` when present, whether
+this decision applies the header delay (`retry_after_applied`, true only when a
+matching rule opts in and the effective action remains `retry`), and any
+mechanism guard (`attempt_limit`,
 `circuit_open`, `terminal_error`, `stream_emitted`). A gateway cancellation uses
 a null attempt because cancellation during backoff versus an active attempt
 cannot be distinguished there; it never invents an additional dispatched attempt.

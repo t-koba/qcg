@@ -66,6 +66,22 @@ pub struct RetryDecision {
     pub source: String,
     /// A mechanism that overrode policy, if any.
     pub guard: Option<RetryGuard>,
+    /// Sanitized provider `error.code` observed on this attempt, when any.
+    /// Bounded to 1..=64 ASCII `A-Z a-z 0-9 . _ -`; absent when no
+    /// code was present, malformed, oversized, or the body was unreadable.
+    /// Capture alone changes nothing: it is inert unless a provider rule
+    /// explicitly matches it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_code: Option<String>,
+    /// Bounded `Retry-After` delay observed on this attempt, in seconds.
+    /// Capped at 60; absent when missing, invalid, or in the past.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_secs: Option<u64>,
+    /// Whether this decision will apply the observed `Retry-After` delay.
+    /// True only when a matching rule opts in and the effective action still
+    /// retries; terminal guards and route fallbacks never wait.
+    #[serde(default)]
+    pub retry_after_applied: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

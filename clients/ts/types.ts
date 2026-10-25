@@ -2889,7 +2889,28 @@ export interface components {
             /** @description A mechanism that overrode policy, if any. */
             guard?: components["schemas"]["RetryGuard"] | null;
             kind: components["schemas"]["LlmErrorKind"];
+            /**
+             * @description Sanitized provider `error.code` observed on this attempt, when any.
+             *     Bounded to 1..=64 ASCII `A-Z a-z 0-9 . _ -`; absent when no
+             *     code was present, malformed, oversized, or the body was unreadable.
+             *     Capture alone changes nothing: it is inert unless a provider rule
+             *     explicitly matches it.
+             */
+            provider_code?: string | null;
             requested: components["schemas"]["RetryAction"];
+            /**
+             * @description Whether this decision will apply the observed `Retry-After` delay.
+             *     True only when a matching rule opts in and the effective action still
+             *     retries; terminal guards and route fallbacks never wait.
+             * @default false
+             */
+            retry_after_applied: boolean;
+            /**
+             * Format: uint64
+             * @description Bounded `Retry-After` delay observed on this attempt, in seconds.
+             *     Capped at 60; absent when missing, invalid, or in the past.
+             */
+            retry_after_secs?: number | null;
             /** @description `default`, `rule:<zero-based index>`, or `gateway` for terminal guards. */
             source: string;
             stream: boolean;

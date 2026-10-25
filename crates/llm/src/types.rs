@@ -273,6 +273,13 @@ pub struct LlmError {
     pub kind: LlmErrorKind,
     pub facts: model::TransportFacts,
     pub decisions: Vec<model::RetryDecision>,
+    /// Sanitized provider `error.code` for this failure, when a bounded
+    /// inspection of the error response observed one. Credential-free and
+    /// inert unless a provider retry rule explicitly matches it.
+    pub provider_code: Option<String>,
+    /// Bounded `Retry-After` delay observed on this failure, in seconds.
+    /// Capped at 60; `None` preserves current default backoff.
+    pub retry_after_secs: Option<u64>,
 }
 
 impl LlmError {

@@ -215,13 +215,18 @@ and decode as an empty array. Each entry contains `kind`, `facts.phase`
 (`connect`, `response`, `unknown`), `facts.dispatch` (`not_sent`, `sent`, `unknown`),
 `attempt` (one-based **within** the route), `stream`, `requested`/`action`
 (`fail_fast`, `retry`, `next_route`), `source` (`default`, `rule:<index>`, or
-`gateway` for a gateway terminal guard), and
+`gateway` for a gateway terminal guard),
+optional sanitized `provider_code` (bounded `error.code`, inert unless a rule
+matches it), optional bounded `retry_after_secs` (capped at 60), whether the
+decision applied the header delay (`retry_after_applied`, only when a matching
+rule opts in and the effective action remains `retry`), and
 nullable `guard` (`attempt_limit`, `circuit_open`, `terminal_error`,
 `stream_emitted`). Rule indexes are zero-based in the provider registry row.
 A gateway cancellation uses a null `attempt`: it cannot distinguish backoff
 from an active next attempt, and must not invent a dispatch count. A gateway
 partial-stream wrapper retains the router's attempt rather than adding one.
-The evidence never contains an error message, endpoint, request body, or secret.
+The evidence never contains an error message, endpoint, request body, raw body,
+or secret.
 
 `llm_route_failed.attempt` remains the one-based route position, not an internal
 transport-attempt count. `fallback_index` is its zero-based equivalent;

@@ -2811,8 +2811,29 @@
           "kind": {
             "$ref": "#/components/schemas/LlmErrorKind"
           },
+          "provider_code": {
+            "description": "Sanitized provider `error.code` observed on this attempt, when any.\nBounded to 1..=64 ASCII `A-Z a-z 0-9 . _ -`; absent when no\ncode was present, malformed, oversized, or the body was unreadable.\nCapture alone changes nothing: it is inert unless a provider rule\nexplicitly matches it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "requested": {
             "$ref": "#/components/schemas/RetryAction"
+          },
+          "retry_after_applied": {
+            "default": false,
+            "description": "Whether this decision will apply the observed `Retry-After` delay.\nTrue only when a matching rule opts in and the effective action still\nretries; terminal guards and route fallbacks never wait.",
+            "type": "boolean"
+          },
+          "retry_after_secs": {
+            "description": "Bounded `Retry-After` delay observed on this attempt, in seconds.\nCapped at 60; absent when missing, invalid, or in the past.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "source": {
             "description": "`default`, `rule:<zero-based index>`, or `gateway` for terminal guards.",

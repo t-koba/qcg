@@ -26,6 +26,7 @@ use crate::provider::{
     DEFAULT_RETRY_RATE_LIMIT_FLOOR_MS, LlmProvider, ModelPricing, PromptCacheField,
     PromptCacheRetention, ProviderSpec,
 };
+use crate::retry::MAX_RETRY_AFTER_SECS;
 use crate::stream::{HttpStreamAccumulator, json_contains_string_fragment};
 use crate::types::{
     CacheWritePolicy, Capabilities, ChatRequest, ChatResponse, ChatStreamEvent, LlmError,
@@ -37,6 +38,69 @@ use crate::validate::{
 };
 
 const DEFAULT_RESPONSE_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Bounded inspection budget for non-success error bodies. The structured
+/// `error.code` is recognized only within this prefix and within the
+/// configured `response_body_limit_bytes`; larger bodies yield no code.
+const ERROR_CODE_INSPECT_LIMIT_BYTES: usize = 8 * 1024;
+
+/// Returns the sanitized provider `error.code` from a parsed error body, or
+/// `None` when the supported `{"error":{"code":"..."}}` shape is absent or
+/// the code is malformed. Never retains the raw body.
+pub(crate) fn extract_provider_error_code(value: &serde_json::Value) -> Option<String> {
+    let raw = value.get("error")?.get("code")?.as_str()?;
+    crate::retry::sanitize_provider_error_code(raw)
+}
+
+/// Parses a bounded `Retry-After` delay from response headers. Supports
+/// delta-seconds and HTTP-date (IMF-fixdate) forms; values are capped at
+/// 60 seconds. Returns `None` for missing, invalid, past, or non-UTF-8
+/// headers so current backoff is preserved.
+pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let raw = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(secs) = raw.parse::<u64>() {
+        return Some(secs.min(MAX_RETRY_AFTER_SECS));
+    }
+    // HTTP-date form: delay until the advertised time, bounded and never
+    // negative. Past dates yield no delay so current behavior is preserved.
+    // IMF-fixdate (`... GMT`) is accepted via RFC 2822 and via an explicit
+    // GMT fallback so a different valid spelling cannot bypass the bound.
+    let timestamp = chrono::DateTime::parse_from_rfc2822(raw)
+        .map(|dt| dt.timestamp())
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(raw, "%a, %d %b %Y %H:%M:%S GMT")
+                .map(|naive| naive.and_utc().timestamp())
+        })
+        .ok()?;
+    let now = chrono::Utc::now().timestamp();
+    let delta = timestamp.saturating_sub(now);
+    if delta <= 0 {
+        return None;
+    }
+    Some((delta as u64).min(MAX_RETRY_AFTER_SECS))
+}
+
+/// Bounded read of a non-success response body for `error.code` inspection.
+/// Returns `None` when the body exceeds `limit`, fails to stream, or is not
+/// UTF-8, so the caller preserves current behavior without a code.
+async fn read_error_body_bounded(mut response: reqwest::Response, limit: usize) -> Option<String> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        let next_len = body.len().checked_add(chunk.len())?;
+        if next_len > limit {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).ok()
+}
 
 #[derive(Debug, thiserror::Error)]
 enum SseBodyError {
@@ -536,14 +600,52 @@ impl HttpProvider {
         let response = builder.send().await.map_err(llm_http_error)?;
         let status = response.status();
         if !status.is_success() {
-            return Err(LlmError::http_status(
-                status.as_u16(),
-                format!(
-                    "{} provider returned HTTP {}",
-                    self.spec.id,
-                    status.as_u16()
-                ),
-            ));
+            let status_u16 = status.as_u16();
+            // Bounded, credential-free inspection of the error response.
+            // Headers are read before the body is consumed; the body is
+            // inspected only within the configured body bound (capped at the
+            // error-code budget) and only the sanitized `error.code` string
+            // and bounded `Retry-After` delay are retained. Raw bodies and
+            // credentials are never stored or surfaced.
+            let retry_after_secs = parse_retry_after(response.headers());
+            let inspect_limit = self
+                .response_body_limit_bytes
+                .min(ERROR_CODE_INSPECT_LIMIT_BYTES);
+            let mut error = LlmError::http_status(
+                status_u16,
+                format!("{} provider returned HTTP {}", self.spec.id, status_u16),
+            );
+            if let Some(text) = read_error_body_bounded(response, inspect_limit).await {
+                if credential
+                    .as_deref()
+                    .is_some_and(|key| !key.is_empty() && text.contains(key))
+                {
+                    return Err(LlmError::new(
+                        self.message("response contained its configured credential"),
+                    ));
+                }
+                if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                    if credential.as_deref().is_some_and(|key| {
+                        !key.is_empty() && json_contains_string_fragment(&value, key)
+                    }) {
+                        return Err(LlmError::new(
+                            self.message("response contained its configured credential"),
+                        ));
+                    }
+                    if let Some(code) = extract_provider_error_code(&value) {
+                        let leaks_credential = credential
+                            .as_deref()
+                            .is_some_and(|key| !key.is_empty() && code == key);
+                        if !leaks_credential {
+                            error.provider_code = Some(code);
+                        }
+                    }
+                }
+                // Malformed JSON, non-UTF-8 (already `None`), oversized, or
+                // unrecognized shapes yield no code and preserve behavior.
+            }
+            error.retry_after_secs = retry_after_secs;
+            return Err(error);
         }
         Ok((response, credential))
     }
