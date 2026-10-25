@@ -200,7 +200,7 @@ fn open_no_follow_once(
         if read && write {
             flags |= libc::O_RDWR;
         } else if read {
-            flags |= libc::O_RDONLY;
+            flags |= libc::O_RDONLY | libc::O_NONBLOCK;
         } else {
             flags |= libc::O_WRONLY;
         }
@@ -234,8 +234,8 @@ fn open_no_follow_once(
             return Err(os);
         }
         // O_NOFOLLOW already refused a final-component symlink, but a FIFO,
-        // directory, or other non-regular file would still open: verify the
-        // opened description is a regular file and fail closed otherwise.
+        // directory, or other non-regular file can still open (O_NONBLOCK avoids
+        // waiting for a FIFO writer): verify the handle is regular or fail closed.
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: fd is a valid open descriptor from openat above.
         // Capture errno before closing: see the openat site above (E02).
@@ -903,7 +903,7 @@ fn read_bounded_idempotency_file(path: &camino::Utf8Path) -> BoundedRead {
     // and re-verifies immediately after open elsewhere, so a symlink swap
     // between a probe and the open cannot redirect the read (E02). A
     // symlink or non-regular file is planted damage, never a record, and a
-    // FIFO would block the open: all fail closed as unreadable.
+    // FIFO opens nonblocking on Unix: all fail closed as unreadable.
     let file = match open_no_follow(path, true, false, false, false) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1640,6 +1640,82 @@ mod tests {
     impl Drop for TempGuard {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(self.0.as_std_path());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_records_fail_closed_without_blocking() {
+        const CHILD_ROOT: &str = "QCG_IDEMPOTENCY_FIFO_TEST_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let runs_dir = Utf8PathBuf::from_path_buf(root.into()).expect("UTF-8 test root");
+            std::fs::create_dir_all(idempotency_dir(&runs_dir)).unwrap();
+            for (key, path) in [
+                ("ready-fifo", idempotency_path(&runs_dir, "ready-fifo")),
+                ("pending-fifo", pending_path(&runs_dir, "pending-fifo")),
+            ] {
+                let name = std::ffi::CString::new(path.as_str()).unwrap();
+                // No writer is ever opened: a blocking read-open cannot finish.
+                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                match read_bounded_idempotency_file(&path) {
+                    BoundedRead::Unreadable(error) => {
+                        assert!(error.contains("not a regular file"), "{error}");
+                    }
+                    _ => panic!("FIFO must be unreadable, not absent or a record"),
+                }
+                let error = claim_pending(&runs_dir, key, "digest", "run-A")
+                    .expect_err("claim must fail closed on a FIFO record");
+                assert_eq!(error.problem.status, 500);
+                assert!(error.problem.detail.contains("not a regular file"));
+                // The failed snapshot must release the shared admission lock.
+                assert!(matches!(
+                    claim_pending(&runs_dir, &format!("unrelated-{key}"), "digest", "run-B"),
+                    Ok(ClaimOutcome::Owner { .. })
+                ));
+            }
+            std::fs::write(runs_dir.join("checked"), b"ok").unwrap();
+            return;
+        }
+
+        // A regression may block inside openat while holding the claim lock.
+        // Only the child performs those calls; the parent owns cleanup and
+        // kills/reaps it on a short deadline, never stranding the test suite.
+        let runs_dir = temp_runs_dir("fifo-records");
+        let _guard = TempGuard(runs_dir.clone());
+        // libtest names omit the crate-name prefix from module_path!().
+        let name = concat!(
+            module_path!(),
+            "::fifo_records_fail_closed_without_blocking"
+        )
+        .split_once("::")
+        .unwrap()
+        .1;
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(CHILD_ROOT, runs_dir.as_str())
+            .spawn()
+            .expect("spawn isolated FIFO reader");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    assert!(status.success(), "FIFO child failed: {status}");
+                    assert!(
+                        runs_dir.join("checked").is_file(),
+                        "child must run the test"
+                    );
+                    break;
+                }
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+                result => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("FIFO child timed out or could not be polled: {result:?}");
+                }
+            }
         }
     }
 
