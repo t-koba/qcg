@@ -1171,6 +1171,18 @@ fn a_written_file_is_reported() {
     );
 }
 
+#[test]
+fn repeated_writes_report_the_last_resolved_path_once() {
+    let mut writes = AgentWrites::default();
+    writes.record_write("out/note.txt", Utf8PathBuf::from("resolved/first"));
+    writes.record_write("out/note.txt", Utf8PathBuf::from("resolved/last"));
+    assert_eq!(
+        writes.reported(),
+        vec![Utf8PathBuf::from("resolved/last")],
+        "each output path appears once with its last resolved location"
+    );
+}
+
 /// The agent may write a scratch file and remove it again with a command
 /// tool. A file the agent removed is not an output of the step, and the
 /// removal is a fact the product records rather than one it infers from

@@ -1474,6 +1474,27 @@ done
     let events =
         crate::summaries::read_merged_events_from_meta(&run_meta_dir(&run_dir)).expect("journal");
     assert_the_agent_wrote_and_removed_the_note(&events);
+    let finished = events
+        .iter()
+        .find(|event| {
+            event.get("t").and_then(Value::as_str) == Some("step_finished")
+                && event.get("node").and_then(Value::as_str) == Some("agent")
+        })
+        .expect("the agent step must finish");
+    let files = finished
+        .get("files")
+        .and_then(Value::as_array)
+        .expect("the agent step must journal its files");
+    assert_eq!(
+        files.len(),
+        1,
+        "the step reports each written path once: {files:?}"
+    );
+    assert_eq!(
+        files[0].get("path").and_then(Value::as_str),
+        Some("out/note.txt"),
+        "the journal records the path written twice exactly once"
+    );
     drop(service);
     let _ = std::fs::remove_dir_all(&root);
 }

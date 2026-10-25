@@ -43,11 +43,17 @@ pub(crate) struct AgentWrites {
 impl AgentWrites {
     pub(crate) fn record_write(&mut self, path: &str, resolved: Utf8PathBuf) {
         self.removed.remove(path);
-        self.outputs.push((path.to_string(), resolved));
+        self.record_output(path, resolved);
     }
 
     /// A replay returns a result without making a new workspace change.
     pub(crate) fn record_replay(&mut self, path: &str, resolved: Utf8PathBuf) {
+        self.record_output(path, resolved);
+    }
+
+    fn record_output(&mut self, path: &str, resolved: Utf8PathBuf) {
+        self.outputs
+            .retain(|(previous_path, _)| previous_path != path);
         self.outputs.push((path.to_string(), resolved));
     }
 
