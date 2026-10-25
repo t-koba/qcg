@@ -1,3 +1,5 @@
+//! Live stdio MCP integration tests against the spawned test server, including
+//! child startup and teardown. The feature gate keeps them out of default tests.
 #![cfg(feature = "mcp-test-server")]
 
 use mcp::{

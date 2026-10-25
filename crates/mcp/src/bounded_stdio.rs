@@ -320,6 +320,8 @@ mod tests {
         BoundedChildTransport::spawn(command, 1024).expect("shell transport should spawn")
     }
 
+    // Unix-only: process-group child reaping has no Windows counterpart, so
+    // this assertion is not registered on that platform.
     #[cfg(unix)]
     #[tokio::test]
     async fn close_reaps_a_gracefully_exited_child_without_descendants() {

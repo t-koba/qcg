@@ -164,14 +164,22 @@ python3 scripts/test-ci-job-minutes.py
 bash scripts/check-third-party-notices.sh
 # Clippy covers all targets here; the MSRV job keeps a separate plain workspace check.
 cargo clippy --workspace --all-targets --locked -- -D warnings
+# Default-feature behavior runs on every OS; platform/feature cfgs determine
+# which assertions register. The Linux-only additions below exercise real
+# transports.
 qcg_test_time "default workspace" cargo test --workspace --locked
-# These tests compile both the production library and tests for each feature set.
+# Compile and run feature-off variants on every OS. MCP covers the no-OAuth
+# configuration; server covers the no-CORS build (identical test names do not
+# imply identical compile-gated branches).
 qcg_test_time "MCP no-default" cargo test -p mcp --no-default-features --locked
 qcg_test_time "server no-default" cargo test -p server --no-default-features --locked
 bash scripts/check-fixtures.sh
 bash scripts/package-dist.sh --dry-run
 if [[ "$(uname -s)" == Linux ]]; then
+  # Feature-gated integration tests launch real stdio and streamable-HTTP
+  # servers, complementing the in-process transport/unit tests on all OSes.
   qcg_test_time "MCP live server" cargo test -p mcp --features mcp-test-server --locked
   qcg_test_time "MCP no-default live server" cargo test -p mcp --no-default-features --features mcp-test-server --locked
+  # Exercise the qcg serve binary over HTTP through a full run lifecycle.
   bash scripts/e2e-server-smoke.sh
 fi

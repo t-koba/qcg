@@ -229,6 +229,9 @@ async fn invalidation_delete_and_gc_share_stable_maintenance_coordination() {
     assert!(!root.join("success").exists());
 }
 
+// These safety checks reject corrupted, linked, and oversized records across
+// platforms. The symlink assertion is Unix-only; Windows has a separate open
+// path that checks reparse-point and link metadata on the opened handle.
 #[tokio::test]
 async fn invalidation_corrupt_linked_mismatched_and_oversized_records_fail_closed() {
     let root = temp_run_dir("invalidation-corrupt");

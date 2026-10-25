@@ -1,3 +1,5 @@
+//! Live streamable-HTTP MCP integration tests. The feature gate keeps these
+//! server-backed assertions out of the default test target.
 #![cfg(feature = "mcp-test-server")]
 
 use mcp::{

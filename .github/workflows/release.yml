@@ -7,6 +7,8 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Build and smoke-test installable archives on each release OS; these are
+  # artifact checks in addition to the push/PR verification workflow.
   bundle:
     name: Bundle (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -75,6 +77,8 @@ jobs:
             dist/*.spdx.json
             dist/SHA256SUMS-*
 
+  # Publishes the already verified bundle artifacts; validation belongs to
+  # the bundle job above.
   github-release:
     name: Publish GitHub Release
     needs: bundle

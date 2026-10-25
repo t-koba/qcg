@@ -1,7 +1,5 @@
 name: CI
 
-# Coverage inventory (docs only, no behavior): .github/CI-COVERAGE.md
-
 on:
   push:
     branches: [main, mizu]
@@ -9,6 +7,8 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Shared Rust and distribution checks run on each supported OS to exercise
+  # platform-specific filesystem/process behavior and bundle verification.
   rust:
     name: Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -95,6 +95,8 @@ jobs:
           path: target/qcg-test-time-${{ github.run_id }}-${{ github.run_attempt }}.md
           if-no-files-found: ignore
 
+  # Generated API/WASM, dependency audit, type/unit checks, and production
+  # build validate generated frontend inputs and production build outputs.
   demo-frontend:
     name: Demo frontend
     runs-on: ubuntu-latest
@@ -147,6 +149,8 @@ jobs:
         run: npm run check:api && npm run check && npm test && npm run build
         working-directory: frontend/generator
 
+  # Browser smoke against the real server covers both Vite-proxy and served
+  # assets modes; it complements the frontend's unit/build checks.
   e2e:
     name: Demo end-to-end
     needs: demo-frontend
@@ -188,6 +192,7 @@ jobs:
       - name: UI Playwright smoke
         run: node scripts/e2e-ui-playwright.mjs
 
+  # Compile-only minimum-toolchain floor; this job makes no runtime-test claim.
   msrv:
     name: Rust 1.99 MSRV
     runs-on: ubuntu-latest
@@ -207,6 +212,8 @@ jobs:
       - name: Check workspace
         run: cargo check --workspace --locked
 
+  # Dependency advisories, license/ban policy, and unused-dependency checks;
+  # these are supply-chain gates rather than product-behavior tests.
   security:
     name: Security and dependency policy
     runs-on: ubuntu-latest
