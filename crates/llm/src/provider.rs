@@ -351,7 +351,7 @@ impl ModelPricing {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelSpec {
     pub id: String,

@@ -591,20 +591,14 @@ impl CatalogService {
                                     existing.source = format!("{} + discovery", existing.source);
                                     continue;
                                 }
-                                None => CatalogModelView {
-                                    id: id.clone(),
-                                    label: None,
-                                    enabled: true,
-                                    source: "discovery".to_string(),
-                                    capabilities: spec.capabilities.clone(),
-                                    reasoning_effort: spec.capabilities.reasoning_effort.clone(),
-                                    input_cost_per_million_usd: None,
-                                    cache_creation_input_cost_per_million_usd: None,
-                                    cache_read_input_cost_per_million_usd: None,
-                                    output_cost_per_million_usd: None,
-                                    context_tokens: None,
-                                    max_output_tokens: None,
-                                },
+                                None => model_view(
+                                    &ModelSpec {
+                                        id: id.clone(),
+                                        ..ModelSpec::default()
+                                    },
+                                    "discovery",
+                                    &spec.capabilities,
+                                ),
                             };
                             models.insert(id, view);
                         }
@@ -864,20 +858,15 @@ fn fake_provider_view() -> CatalogProviderView {
         available: true,
         discovery: false,
         error: None,
-        models: vec![CatalogModelView {
-            id: "fake".to_string(),
-            label: Some("fake".to_string()),
-            enabled: true,
-            source: "built-in".to_string(),
-            capabilities: FakeLlmProvider.capabilities(),
-            reasoning_effort: FakeLlmProvider.capabilities().reasoning_effort,
-            input_cost_per_million_usd: None,
-            cache_creation_input_cost_per_million_usd: None,
-            cache_read_input_cost_per_million_usd: None,
-            output_cost_per_million_usd: None,
-            context_tokens: None,
-            max_output_tokens: None,
-        }],
+        models: vec![model_view(
+            &ModelSpec {
+                id: "fake".to_string(),
+                label: Some("fake".to_string()),
+                ..ModelSpec::default()
+            },
+            "built-in",
+            &FakeLlmProvider.capabilities(),
+        )],
     }
 }
 
