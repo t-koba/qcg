@@ -70,7 +70,9 @@ pub struct ServiceDeploymentPolicy {
     pub max_directory_scan_entries: usize,
     /// Shared-store abandoned-run rescan cadence, in seconds.
     pub shared_store_rescan_secs: u64,
-    /// Queued-run resumer cadence, in seconds.
+    /// Seconds between queued-run resumes. Includes retrying a pre-execution journal
+    /// observation failure without changing its nonterminal state or executing
+    /// until a later read succeeds.
     pub queued_resumer_secs: u64,
 }
 impl Default for ServiceDeploymentPolicy {

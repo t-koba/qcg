@@ -280,8 +280,9 @@ use of the same output directory.
   `SHARED_RESCAN_SECS` and `QUEUED_RESUMER_SECS` (default `5`, range
   `1..=3600`), `SHUTDOWN_DRAIN_SECS` (default `30`, range `1..=3600`) and
   `SHUTDOWN_SETTLE_SECS` (default `150`, range `1..=3600`): deployment
-  tuning for the live stream, shared-store cadence, directory scans, and the
-  graceful shutdown phases. Settle must be at least drain; out-of-range values
+  tuning for the live stream, shared-store cadence, directory scans, queued-run
+  recovery and journal-observation retry cadence, and the graceful shutdown
+  phases. Settle must be at least drain; out-of-range values
   refuse boot. Total shutdown time is the sum of the configured drain and
   settle phases (180 s by default; at most 7200 s).
 - `CONTAINER_CREATE_TIMEOUT_SECS` (default `600`),

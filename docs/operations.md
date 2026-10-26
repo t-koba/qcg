@@ -63,8 +63,11 @@ concurrent invocation targeting the same output directory. Direct (`qcg run`)
 executions share the process execution permits with API runs, and warn when
 their runs directory is owned by a live server, whose `max_active_runs`
 otherwise does not apply across processes. A periodic resumer retries queued
-runs that lost their engine task; queue admission time and position are
-visible on run snapshots while queued.
+runs that lost their engine task and runs whose pre-execution journal
+observation failed. Those runs remain nonterminal and fail closed: the engine
+does not execute or settle them until a later journal read succeeds.
+`QUEUED_RESUMER_SECS` controls the retry cadence (default 5 s, range 1..=3600).
+Queue admission time and position are visible on run snapshots while queued.
 
 ## Container daemon operation policy
 
