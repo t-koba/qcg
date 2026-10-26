@@ -834,10 +834,9 @@ impl ProviderSpec {
     /// when the model is not declared (generic OpenAI-compatible rows keep
     /// working with arbitrary model strings).
     pub fn capabilities_for_model(&self, id: &str) -> Capabilities {
-        match self.model(id) {
-            Some(model) => model.effective_capabilities(&self.capabilities),
-            None => self.capabilities.clone(),
-        }
+        self.model(id)
+            .map(|model| model.effective_capabilities(&self.capabilities))
+            .unwrap_or_else(|| self.capabilities.clone())
     }
 
     pub fn pricing_for_model(&self, id: &str) -> Option<ModelPricing> {
@@ -848,10 +847,9 @@ impl ProviderSpec {
     /// entry overrides the row when set, otherwise the row value applies
     /// (an operator claim for every model on the row).
     pub fn retention_for_model(&self, id: &str) -> Option<PromptCacheRetention> {
-        match self.model(id) {
-            Some(model) => model.prompt_cache_retention.or(self.prompt_cache_retention),
-            None => self.prompt_cache_retention,
-        }
+        self.model(id)
+            .and_then(|model| model.prompt_cache_retention)
+            .or(self.prompt_cache_retention)
     }
 
     /// Effective write-disable mechanism for one model: the model entry
