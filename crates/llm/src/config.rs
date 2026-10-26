@@ -64,15 +64,10 @@ pub(crate) fn interpolate_env(value: &str) -> Result<String, String> {
         if !is_env_name(name) {
             return Err(format!("invalid environment placeholder `{{{name}}}`"));
         }
-        match std::env::var(name) {
-            Ok(value) => {
-                result.push_str(&rest[..start]);
-                result.push_str(&value);
-            }
-            Err(_) => {
-                return Err(format!("set `{name}` before running the generator"));
-            }
-        }
+        let value = std::env::var(name)
+            .map_err(|_| format!("set `{name}` before running the generator"))?;
+        result.push_str(&rest[..start]);
+        result.push_str(&value);
         rest = &rest[end + 1..];
     }
     result.push_str(rest);
