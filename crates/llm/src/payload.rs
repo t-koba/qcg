@@ -20,9 +20,7 @@ pub(crate) fn chat_completions_payload(
         "model": req.model,
         "messages": openai_messages(req),
     });
-    if let Some(effort) = req.reasoning_effort {
-        payload["reasoning_effort"] = json!(effort);
-    }
+    set_optional(&mut payload, "reasoning_effort", req.reasoning_effort);
     let token_limit_key = match token_limit_field {
         ChatTokenLimitField::MaxTokens => "max_tokens",
         ChatTokenLimitField::MaxCompletionTokens => "max_completion_tokens",
@@ -32,9 +30,11 @@ pub(crate) fn chat_completions_payload(
     if !req.stop_sequences.is_empty() {
         payload["stop"] = json!(req.stop_sequences);
     }
-    if send_seed && let Some(seed) = req.seed {
-        payload["seed"] = json!(seed);
-    }
+    set_optional(
+        &mut payload,
+        "seed",
+        send_seed.then_some(req.seed).flatten(),
+    );
     if let Some((schema, strict)) = native_response_schema(req) {
         payload["response_format"] = json!({
             "type": "json_schema",
@@ -48,9 +48,7 @@ pub(crate) fn chat_completions_payload(
     if !req.tools.is_empty() {
         payload["tools"] = Value::Array(req.tools.iter().map(openai_tool).collect());
         payload["tool_choice"] = openai_tool_choice(req.tool_choice.as_ref(), false);
-        if let Some(parallel) = req.parallel_tool_calls {
-            payload["parallel_tool_calls"] = json!(parallel);
-        }
+        set_optional(&mut payload, "parallel_tool_calls", req.parallel_tool_calls);
     }
     openai_cache_policy(
         &mut payload,
@@ -96,9 +94,7 @@ pub(crate) fn responses_payload(
     if !req.tools.is_empty() {
         payload["tools"] = Value::Array(req.tools.iter().map(responses_tool).collect());
         payload["tool_choice"] = openai_tool_choice(req.tool_choice.as_ref(), true);
-        if let Some(parallel) = req.parallel_tool_calls {
-            payload["parallel_tool_calls"] = json!(parallel);
-        }
+        set_optional(&mut payload, "parallel_tool_calls", req.parallel_tool_calls);
     }
     if let Some(search) = &req.provider_web_search {
         // The hosted search is a provider-side tool, so it joins the same
@@ -121,11 +117,13 @@ pub(crate) fn responses_payload(
 }
 
 fn sampling_payload(payload: &mut Value, req: &ChatRequest) {
-    if let Some(temperature) = req.temperature {
-        payload["temperature"] = json!(temperature);
-    }
-    if let Some(top_p) = req.top_p {
-        payload["top_p"] = json!(top_p);
+    set_optional(payload, "temperature", req.temperature);
+    set_optional(payload, "top_p", req.top_p);
+}
+
+fn set_optional<T: serde::Serialize>(payload: &mut Value, field: &str, value: Option<T>) {
+    if let Some(value) = value {
+        payload[field] = json!(value);
     }
 }
 
@@ -180,9 +178,7 @@ fn provider_web_search_tool(search: &ProviderWebSearch) -> Value {
     if !filters.is_empty() {
         tool["filters"] = Value::Object(filters);
     }
-    if let Some(size) = search.search_context_size {
-        tool["search_context_size"] = json!(size);
-    }
+    set_optional(&mut tool, "search_context_size", search.search_context_size);
     if let Some(location) = &search.user_location {
         let mut value = json!({ "type": "approximate" });
         for (name, field) in [
