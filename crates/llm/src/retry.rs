@@ -1,4 +1,4 @@
-use crate::LlmError;
+use crate::{LlmError, LlmErrorKind};
 pub use model::{
     RequestDispatch, RetryAction, RetryDecision, RetryGuard, TransportFacts, TransportPhase,
 };
@@ -70,6 +70,13 @@ fn fail_fast() -> RetryAction {
     RetryAction::FailFast
 }
 
+fn is_terminal_error_kind(kind: LlmErrorKind) -> bool {
+    matches!(
+        kind,
+        LlmErrorKind::Canceled | LlmErrorKind::PartialStream | LlmErrorKind::Other
+    )
+}
+
 impl RetryPolicy {
     pub(crate) fn validate(&self) -> Result<(), String> {
         for rule in &self.rules {
@@ -106,7 +113,6 @@ impl RetryPolicy {
         stream: bool,
         emitted: bool,
     ) -> RetryDecision {
-        use crate::LlmErrorKind;
         // Public error facts may come from custom providers, not just HTTP.
         // Sanitize before matching as well as before recording event facts.
         let provider_code = error
@@ -164,10 +170,7 @@ impl RetryPolicy {
         if emitted {
             decision.action = RetryAction::FailFast;
             decision.guard = Some(RetryGuard::StreamEmitted);
-        } else if matches!(
-            error.kind,
-            LlmErrorKind::Canceled | LlmErrorKind::PartialStream | LlmErrorKind::Other
-        ) {
+        } else if is_terminal_error_kind(error.kind) {
             // Configuration/validation errors are not transport policy inputs.
             decision.action = RetryAction::FailFast;
             decision.guard = Some(RetryGuard::TerminalError);
@@ -225,12 +228,7 @@ impl LlmError {
     /// Router decisions take precedence; direct/custom providers retain the
     /// same default without creating undeclared routes.
     pub fn allows_next_route(&self) -> bool {
-        if matches!(
-            self.kind,
-            crate::LlmErrorKind::Canceled
-                | crate::LlmErrorKind::PartialStream
-                | crate::LlmErrorKind::Other
-        ) {
+        if is_terminal_error_kind(self.kind) {
             return false;
         }
         self.decisions.last().map_or_else(
