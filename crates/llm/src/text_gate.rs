@@ -27,17 +27,6 @@ pub(crate) struct SensitiveTextGate {
     unverified: String,
 }
 
-/// Greatest index at or below `index` that is a UTF-8 character boundary.
-/// (`str::floor_char_boundary` needs a newer MSRV than this crate allows.)
-fn floor_char_boundary(text: &str, index: usize) -> usize {
-    let bytes = text.as_bytes();
-    let mut index = index.min(bytes.len());
-    while index > 0 && index < bytes.len() && (bytes[index] >> 6) == 0b10 {
-        index -= 1;
-    }
-    index
-}
-
 impl SensitiveTextGate {
     pub(crate) fn new(key: Option<&str>) -> Self {
         match key.filter(|key| !key.is_empty()) {
@@ -66,10 +55,9 @@ impl SensitiveTextGate {
         }
         // Publish everything except the trailing holdback window, split on
         // a character boundary so multi-byte text never panics.
-        let publishable = floor_char_boundary(
-            &self.unverified,
-            self.unverified.len().saturating_sub(self.holdback),
-        );
+        let publishable = self
+            .unverified
+            .floor_char_boundary(self.unverified.len().saturating_sub(self.holdback));
         Ok(self.unverified.drain(..publishable).collect())
     }
 
