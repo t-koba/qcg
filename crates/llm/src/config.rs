@@ -1,5 +1,6 @@
 use policy::MAX_CREDENTIAL_FILE_BYTES;
 use policy::credential_like_name;
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs::File;
 #[cfg(unix)]
@@ -24,6 +25,31 @@ pub(crate) fn is_provider_id(id: &str) -> bool {
                 || character.is_ascii_digit()
                 || matches!(character, '.' | '_' | '-')
         })
+}
+
+/// Recursively scans JSON strings and keys, allowing exact-only short matches.
+pub(crate) fn json_contains_credential(
+    value: &Value,
+    credential: &str,
+    substring_threshold: usize,
+) -> bool {
+    match value {
+        Value::String(text) => {
+            if credential.len() < substring_threshold {
+                text == credential
+            } else {
+                text.contains(credential)
+            }
+        }
+        Value::Array(values) => values
+            .iter()
+            .any(|value| json_contains_credential(value, credential, substring_threshold)),
+        Value::Object(values) => values.iter().any(|(key, value)| {
+            (credential.len() >= substring_threshold && key.contains(credential))
+                || json_contains_credential(value, credential, substring_threshold)
+        }),
+        _ => false,
+    }
 }
 
 pub(crate) fn interpolate_env(value: &str) -> Result<String, String> {

@@ -13,8 +13,8 @@ use tokio::time::{Duration, sleep};
 use url::Url;
 
 use crate::config::{
-    BodyReadError, credential_placeholder, interpolate_env, read_body_bounded,
-    read_credential_file, validate_base_url, validate_query_parameters,
+    BodyReadError, credential_placeholder, interpolate_env, json_contains_credential,
+    read_body_bounded, read_credential_file, validate_base_url, validate_query_parameters,
 };
 use crate::parse::{
     llm_http_error, llm_response_error, parse_anthropic_response, parse_chat_completions_response,
@@ -27,7 +27,7 @@ use crate::provider::{
     PromptCacheRetention, ProviderSpec,
 };
 use crate::retry::MAX_RETRY_AFTER_SECS;
-use crate::stream::{HttpStreamAccumulator, json_contains_string_fragment};
+use crate::stream::HttpStreamAccumulator;
 use crate::types::{
     CacheWritePolicy, Capabilities, ChatRequest, ChatResponse, ChatStreamEvent, LlmError,
     LlmErrorKind, PromptCache,
@@ -655,7 +655,7 @@ impl HttpProvider {
         }
         let parsed = serde_json::from_str(text);
         if let Ok(value) = &parsed
-            && key.is_some_and(|key| json_contains_string_fragment(value, key))
+            && key.is_some_and(|key| json_contains_credential(value, key, 0))
         {
             return Err(reflected());
         }
@@ -792,9 +792,10 @@ impl HttpProvider {
         };
         if credential.as_deref().is_some_and(|key| {
             !key.is_empty()
-                && json_contains_string_fragment(
+                && json_contains_credential(
                     &serde_json::to_value(&response).unwrap_or(Value::Null),
                     key,
+                    0,
                 )
         }) {
             return Err(LlmError::new(
@@ -1368,14 +1369,14 @@ mod stream_credential_tests {
         // key. Cross-chunk reassembly is the text gate's job now.
         let first = json!({"delta": "sk-secret-"});
         let second = json!({"delta": "credential-12345"});
-        assert!(!json_contains_string_fragment(&first, key));
-        assert!(!json_contains_string_fragment(&second, key));
+        assert!(!json_contains_credential(&first, key, 0));
+        assert!(!json_contains_credential(&second, key, 0));
         // JSON-escaped reflection decodes before inspection.
         let escaped = serde_json::from_str::<Value>(
             r#"{"text": "prefix \u0073k-secret-credential-12345 suffix"}"#,
         )
         .unwrap();
-        assert!(json_contains_string_fragment(&escaped, key));
+        assert!(json_contains_credential(&escaped, key, 0));
     }
 }
 

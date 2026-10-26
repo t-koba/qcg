@@ -7,8 +7,8 @@
 //! contract's permissions and the registry's transport policy.
 
 use crate::config::{
-    BodyReadError, credential_placeholder, interpolate_env, read_body_bounded,
-    read_credential_file, validate_base_url,
+    BodyReadError, credential_placeholder, interpolate_env, json_contains_credential,
+    read_body_bounded, read_credential_file, validate_base_url,
 };
 use crate::provider::{
     FakeLlmProvider, LlmProvider, ModelPricing, ModelSpec, ModelsDiscovery, ProviderSpec,
@@ -786,31 +786,11 @@ fn credential_reflection(
         {
             return Some("response reflects the request credential");
         }
-        if json_contains_credential(decoded, credential) {
+        if json_contains_credential(decoded, credential, 8) {
             return Some("response reflects the request credential");
         }
     }
     None
-}
-
-fn json_contains_credential(value: &Value, credential: &str) -> bool {
-    match value {
-        Value::String(text) => {
-            if credential.len() < 8 {
-                text == credential
-            } else {
-                text.contains(credential)
-            }
-        }
-        Value::Array(items) => items
-            .iter()
-            .any(|item| json_contains_credential(item, credential)),
-        Value::Object(map) => map.iter().any(|(key, val)| {
-            (credential.len() >= 8 && key.contains(credential))
-                || json_contains_credential(val, credential)
-        }),
-        _ => false,
-    }
 }
 
 async fn read_bounded(response: reqwest::Response, limit: usize) -> Result<Vec<u8>, String> {
@@ -1948,6 +1928,18 @@ models_discovery = "openai"
                 .is_none(),
             "rotated credential must use the same path"
         );
+    }
+
+    #[test]
+    fn short_escaped_credentials_match_only_exact_json_values() {
+        let credential = ["secret".to_string()];
+        let fragment = br#"{"value":"prefix s\u0065cret suffix"}"#;
+        let decoded: Value = serde_json::from_slice(fragment).expect("fixture JSON");
+        assert!(credential_reflection(fragment, &decoded, &credential).is_none());
+
+        let exact = br#"{"value":"\u0073ecret"}"#;
+        let decoded: Value = serde_json::from_slice(exact).expect("fixture JSON");
+        assert!(credential_reflection(exact, &decoded, &credential).is_some());
     }
 
     #[test]

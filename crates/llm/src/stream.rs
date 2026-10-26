@@ -466,16 +466,3 @@ impl AnthropicAccumulator {
         })
     }
 }
-
-pub(crate) fn json_contains_string_fragment(value: &Value, fragment: &str) -> bool {
-    match value {
-        Value::String(value) => value.contains(fragment),
-        Value::Array(values) => values
-            .iter()
-            .any(|value| json_contains_string_fragment(value, fragment)),
-        Value::Object(values) => values.iter().any(|(key, value)| {
-            key.contains(fragment) || json_contains_string_fragment(value, fragment)
-        }),
-        Value::Null | Value::Bool(_) | Value::Number(_) => false,
-    }
-}
