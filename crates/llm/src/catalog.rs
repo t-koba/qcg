@@ -370,21 +370,19 @@ impl CatalogService {
         for source in &self.config.source {
             let (fetched_at, error) = match self.fetch_source(source).await {
                 Ok(catalog) => {
-                    for (provider, errors) in &catalog.model_errors {
+                    for (provider, errors) in catalog.model_errors {
                         tracing::warn!(provider = %provider, model_errors = ?errors, "unusable tier");
+                        merged
+                            .model_errors
+                            .entry(provider)
+                            .or_default()
+                            .extend(errors);
                     }
                     for (provider, models) in catalog.providers {
                         let entry = merged.providers.entry(provider).or_default();
                         for (model, spec) in models {
                             entry.entry(model).or_insert(spec);
                         }
-                    }
-                    for (provider, errors) in catalog.model_errors {
-                        merged
-                            .model_errors
-                            .entry(provider)
-                            .or_default()
-                            .extend(errors);
                     }
                     (catalog.fetched_at, None)
                 }
