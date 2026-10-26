@@ -2445,7 +2445,10 @@ export interface components {
              *     alone. Present only to make the TTL cost basis inspectable.
              */
             cache_write_policy?: components["schemas"]["CacheWritePolicy"] | null;
-            /** Format: uint64 */
+            /**
+             * Format: uint64
+             * @description Total estimated call cost, including any priced hosted-search charge.
+             */
             cost_microusd: number;
             /** Format: uint32 */
             max_tokens: number;
@@ -2506,8 +2509,7 @@ export interface components {
             /** @default null */
             verbosity: components["schemas"]["ResponseVerbosity"] | null;
             /**
-             * @description What the provider's hosted web search did in this call. Absent when
-             *     the request did not enable the hosted search.
+             * @description Hosted-search details; null when the request did not enable the tool.
              * @default null
              */
             web_search: components["schemas"]["WebSearchUsage"] | null;
@@ -3509,8 +3511,7 @@ export interface components {
         WebSearchUsage: {
             /**
              * Format: uint64
-             * @description The hosted calls the provider reported. Absent means unknown, which
-             *     is never zero.
+             * @description Provider-reported calls; null means unknown, never zero.
              * @default null
              */
             calls: number | null;
@@ -3518,8 +3519,7 @@ export interface components {
             citations: components["schemas"]["UrlCitation"][];
             /**
              * Format: uint64
-             * @description The hosted search charge in microusd. Absent means the run does not
-             *     price the search: unmetered, never free.
+             * @description Hosted search charge in microusd; null means unmetered, never free.
              * @default null
              */
             cost_microusd: number | null;
