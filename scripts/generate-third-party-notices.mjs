@@ -11,6 +11,12 @@ const entries = Object.entries(lock.packages ?? {})
   }))
   .sort((left, right) => `${left.name}@${left.version}`.localeCompare(`${right.name}@${right.version}`));
 
+const rustMetadata = cargoMetadata(true);
+const workspaceMembers = new Set(rustMetadata.workspace_members);
+const rustPackages = rustMetadata.packages
+  .filter(({ id }) => !workspaceMembers.has(id))
+  .sort((left, right) => left.name.localeCompare(right.name));
+
 const lines = [
   "THIRD-PARTY NOTICES",
   "",
@@ -18,7 +24,7 @@ const lines = [
   "Each package remains available under its own license.",
   "",
   "Rust packages (including build and verification dependencies):",
-  ...cargoMetadata(true).packages.sort((a,b)=>a.name.localeCompare(b.name)).map(pkg=>`- ${pkg.name}@${pkg.version} — ${pkg.license ?? "NOASSERTION"}`),
+  ...rustPackages.map((pkg) => `- ${pkg.name}@${pkg.version} — ${pkg.license ?? "NOASSERTION"}`),
   "",
   "npm packages:",
   ...entries.map(({ name, version, license }) => `- ${name}@${version} — ${license}`),
