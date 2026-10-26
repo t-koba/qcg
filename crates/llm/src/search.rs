@@ -420,28 +420,17 @@ fn validate_parameter_name(provider: &str, field: &str, value: &str) -> Result<(
 }
 
 fn validate_json_pointer(provider: &str, field: &str, value: &str) -> Result<(), String> {
-    if !value.starts_with('/') || value.split('/').skip(1).any(invalid_json_pointer_escape) {
+    if !value.starts_with('/')
+        || value
+            .split('~')
+            .skip(1)
+            .any(|suffix| !suffix.starts_with('0') && !suffix.starts_with('1'))
+    {
         return Err(format!(
             "search provider `{provider}` {field} must be an RFC 6901 JSON Pointer"
         ));
     }
     Ok(())
-}
-
-fn invalid_json_pointer_escape(token: &str) -> bool {
-    let bytes = token.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'~' {
-            if index + 1 >= bytes.len() || !matches!(bytes[index + 1], b'0' | b'1') {
-                return true;
-            }
-            index += 2;
-        } else {
-            index += 1;
-        }
-    }
-    false
 }
 
 #[cfg(test)]
