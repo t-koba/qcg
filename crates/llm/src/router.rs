@@ -145,10 +145,11 @@ impl LlmRouter {
     }
 
     fn from_str_at(text: &str, path: &Utf8Path) -> Result<Self, RegistryError> {
-        let file = ProvidersFile::parse(text).map_err(|message| RegistryError::Parse {
+        let parse_error = |message| RegistryError::Parse {
             path: path.to_path_buf(),
             message,
-        })?;
+        };
+        let file = ProvidersFile::parse(text).map_err(parse_error)?;
         let default_model = file
             .default
             .as_ref()
@@ -157,19 +158,10 @@ impl LlmRouter {
             .default
             .as_ref()
             .and_then(|default| default.search.clone());
-        let mcp = mcp::McpRuntime::from_specs_with_public_defaults(file.mcp_server).map_err(
-            |message| RegistryError::Parse {
-                path: path.to_path_buf(),
-                message,
-            },
-        )?;
+        let mcp = mcp::McpRuntime::from_specs_with_public_defaults(file.mcp_server)
+            .map_err(parse_error)?;
         let catalog =
-            CatalogService::new(file.provider.clone(), file.catalog).map_err(|message| {
-                RegistryError::Parse {
-                    path: path.to_path_buf(),
-                    message,
-                }
-            })?;
+            CatalogService::new(file.provider.clone(), file.catalog).map_err(parse_error)?;
         let mut router = Self {
             providers: BTreeMap::new(),
             default_model,
