@@ -10,9 +10,9 @@
 //!
 //! Guarantee: a credential occurrence is reported no later than the arrival
 //! of the chunk completing it, and none of its bytes publish before that
-//! decision. The gate retains only a bounded unverified suffix plus a
-//! bounded boundary window, so long streams stay flat in memory. All splits
-//! respect UTF-8 character boundaries (B05).
+//! decision. The gate retains only a bounded unverified suffix, which also
+//! serves as the boundary window. All splits respect UTF-8 character
+//! boundaries (B05).
 
 /// Credential holdback gate over one emitted text stream.
 #[derive(Debug, Default)]
@@ -22,10 +22,8 @@ pub(crate) struct SensitiveTextGate {
     /// Trailing bytes withheld from publication: `key.len() - 1`, so any
     /// occurrence completing later still has an unpublished byte.
     holdback: usize,
-    /// Last emitted bytes (up to `holdback`) retained so occurrences
-    /// spanning a push boundary are still detected.
-    tail: String,
-    /// Emitted but unpublished suffix.
+    /// Emitted but unpublished suffix; its trailing holdback is the
+    /// boundary window for detecting credentials across pushes.
     unverified: String,
 }
 
@@ -46,7 +44,6 @@ impl SensitiveTextGate {
             Some(key) => Self {
                 holdback: key.len().saturating_sub(1),
                 key: key.to_string(),
-                tail: String::new(),
                 unverified: String::new(),
             },
             None => Self::default(),
@@ -61,19 +58,12 @@ impl SensitiveTextGate {
         if self.key.is_empty() {
             return Ok(text.to_string());
         }
-        // Every occurrence ending in this push lies within the retained
-        // tail plus the new text; earlier-ending occurrences were checked
-        // on their own pushes. Either way a hit aborts before publishing.
-        self.tail.push_str(text);
-        if self.tail.contains(&self.key) {
+        // The withheld suffix is the boundary window: scan it with this
+        // push before publishing or draining any bytes.
+        self.unverified.push_str(text);
+        if self.unverified.contains(&self.key) {
             return Err(());
         }
-        // Retain only the trailing window for the next boundary check.
-        if self.tail.len() > self.holdback {
-            let cut = floor_char_boundary(&self.tail, self.tail.len() - self.holdback);
-            self.tail.drain(..cut);
-        }
-        self.unverified.push_str(text);
         // Publish everything except the trailing holdback window, split on
         // a character boundary so multi-byte text never panics.
         let publishable = floor_char_boundary(
@@ -85,11 +75,8 @@ impl SensitiveTextGate {
 
     /// Flushes the withheld suffix after the stream ends. Every occurrence
     /// ending anywhere in the emitted stream was already checked at push
-    /// time (each push scans the retained tail plus the new text), so the
-    /// withheld suffix alone is re-scanned defensively and returned as-is.
-    /// The retained tail is NOT concatenated: it overlaps the suffix over
-    /// the same emitted bytes, and scanning the junction would fabricate
-    /// strings that were never emitted (C07).
+    /// time (each push scans the withheld suffix plus new text), so the
+    /// suffix is re-scanned defensively and returned as-is.
     pub(crate) fn finish(self) -> Result<String, ()> {
         if self.key.is_empty() {
             return Ok(String::new());
@@ -196,9 +183,8 @@ mod tests {
 
     #[test]
     fn overlapping_suffix_is_not_double_counted() {
-        // C07: tail and unverified overlap over the same emitted bytes;
-        // finish must not concatenate them. key "aba" never occurs in
-        // the emitted "ba", so the stream must flush cleanly.
+        // C07: the withheld suffix is the complete boundary window.
+        // key "aba" never occurs in the emitted "ba", so it flushes cleanly.
         let mut gate = SensitiveTextGate::new(Some("aba"));
         let published = gate.push("ba").expect("clean text should clear");
         assert_eq!(published, "");
