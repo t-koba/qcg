@@ -314,10 +314,9 @@ impl CatalogService {
         model: &str,
     ) -> Option<crate::types::Capabilities> {
         let spec = self.specs.get(provider)?;
-        Some(match self.model_spec(provider, model) {
-            Some(model) => model.effective_capabilities(&spec.capabilities),
-            None => spec.capabilities.clone(),
-        })
+        self.model_spec(provider, model)
+            .map(|model| model.effective_capabilities(&spec.capabilities))
+            .or_else(|| Some(spec.capabilities.clone()))
     }
 
     pub fn model_pricing(&self, provider: &str, model: &str) -> Option<ModelPricing> {
@@ -1196,10 +1195,7 @@ pub(crate) fn map_models_dev(text: &str) -> Result<ExternalCatalog, String> {
                     Vec::new()
                 }
             };
-            let enabled = match model.status.as_deref() {
-                Some("deprecated") => Some(false),
-                _ => None,
-            };
+            let enabled = (model.status.as_deref() == Some("deprecated")).then_some(false);
             models.insert(
                 model_id.clone(),
                 ModelSpec {
