@@ -699,30 +699,26 @@ impl ProviderSpec {
             self.api != ApiFlavor::SystemOne && !decision_transport_is_default,
             "may only set `decision_input_wrapper`, `decision_model_in_body`, or `decision_response_wrapper` for system_one",
         )?;
-        if self.api == ApiFlavor::SystemOne && !self.decision_model_in_body {
-            let carries_model = self
-                .path_template
-                .as_deref()
-                .is_some_and(|template| template.contains("{model}"));
-            if !carries_model {
-                return Err(invalid(
-                    "with `decision_model_in_body = false` must set `path_template` containing `{model}`",
-                ));
-            }
-        }
-        match (self.capabilities.prompt_cache, self.prompt_cache_field) {
-            (true, None) => {
-                return Err(invalid(
-                    "must set `prompt_cache_field` when `capabilities.prompt_cache` is enabled",
-                ));
-            }
-            (false, Some(_)) => {
-                return Err(invalid(
-                    "may only set `prompt_cache_field` when `capabilities.prompt_cache` is enabled",
-                ));
-            }
-            (true, Some(field)) => {
-                let supported = matches!(
+        reject(
+            self.api == ApiFlavor::SystemOne
+                && !self.decision_model_in_body
+                && !self
+                    .path_template
+                    .as_deref()
+                    .is_some_and(|template| template.contains("{model}")),
+            "with `decision_model_in_body = false` must set `path_template` containing `{model}`",
+        )?;
+        reject(
+            self.capabilities.prompt_cache && self.prompt_cache_field.is_none(),
+            "must set `prompt_cache_field` when `capabilities.prompt_cache` is enabled",
+        )?;
+        reject(
+            !self.capabilities.prompt_cache && self.prompt_cache_field.is_some(),
+            "may only set `prompt_cache_field` when `capabilities.prompt_cache` is enabled",
+        )?;
+        if let Some(field) = self.prompt_cache_field {
+            reject(
+                !matches!(
                     (self.api, field),
                     (
                         ApiFlavor::ChatCompletions | ApiFlavor::Responses,
@@ -731,40 +727,30 @@ impl ProviderSpec {
                         ApiFlavor::AnthropicMessages,
                         PromptCacheField::CacheControl | PromptCacheField::CacheControlAuto
                     )
-                );
-                if !supported {
-                    return Err(invalid(
-                        "has a `prompt_cache_field` that is not valid for its api",
-                    ));
-                }
-            }
-            (false, None) => {}
+                ),
+                "has a `prompt_cache_field` that is not valid for its api",
+            )?;
         }
-        if let Some(retention) = self.prompt_cache_retention
-            && !retention.supports_api(self.api)
-        {
-            return Err(invalid(
-                "declares `prompt_cache_retention` that is not valid for its api",
-            ));
-        }
-        if self.prompt_cache_retention.is_some() && !self.capabilities.prompt_cache {
-            return Err(invalid(
-                "may only set `prompt_cache_retention` when `capabilities.prompt_cache` is enabled",
-            ));
-        }
+        reject(
+            self.prompt_cache_retention
+                .is_some_and(|retention| !retention.supports_api(self.api)),
+            "declares `prompt_cache_retention` that is not valid for its api",
+        )?;
+        reject(
+            self.prompt_cache_retention.is_some() && !self.capabilities.prompt_cache,
+            "may only set `prompt_cache_retention` when `capabilities.prompt_cache` is enabled",
+        )?;
         reject(
             self.prompt_cache_explicit_mode
                 && !matches!(self.api, ApiFlavor::ChatCompletions | ApiFlavor::Responses),
             "may only set `prompt_cache_explicit_mode` for chat_completions or responses",
         )?;
-        if self.api == ApiFlavor::ChatCompletions
-            && !self.capabilities.reasoning_effort.is_empty()
-            && self.chat_token_limit_field != Some(ChatTokenLimitField::MaxCompletionTokens)
-        {
-            return Err(invalid(
-                "must set `chat_token_limit_field = \"max_completion_tokens\"` when reasoning_effort is enabled",
-            ));
-        }
+        reject(
+            self.api == ApiFlavor::ChatCompletions
+                && !self.capabilities.reasoning_effort.is_empty()
+                && self.chat_token_limit_field != Some(ChatTokenLimitField::MaxCompletionTokens),
+            "must set `chat_token_limit_field = \"max_completion_tokens\"` when reasoning_effort is enabled",
+        )?;
         let mut model_ids = BTreeMap::new();
         for model in &self.models {
             model.validate(&self.id, self.api)?;
@@ -785,19 +771,17 @@ impl ProviderSpec {
                 ));
             }
         }
-        if self.api == ApiFlavor::ChatCompletions
-            && self.chat_token_limit_field != Some(ChatTokenLimitField::MaxCompletionTokens)
-            && self.models.iter().any(|model| {
-                !model
-                    .effective_capabilities(&self.capabilities)
-                    .reasoning_effort
-                    .is_empty()
-            })
-        {
-            return Err(invalid(
-                "must set `chat_token_limit_field = \"max_completion_tokens\"` when a declared model advertises reasoning_effort",
-            ));
-        }
+        reject(
+            self.api == ApiFlavor::ChatCompletions
+                && self.chat_token_limit_field != Some(ChatTokenLimitField::MaxCompletionTokens)
+                && self.models.iter().any(|model| {
+                    !model
+                        .effective_capabilities(&self.capabilities)
+                        .reasoning_effort
+                        .is_empty()
+                }),
+            "must set `chat_token_limit_field = \"max_completion_tokens\"` when a declared model advertises reasoning_effort",
+        )?;
         reject(
             self.catalog_id.as_deref().is_some_and(|catalog_id| {
                 catalog_id.trim().is_empty() || catalog_id.chars().any(char::is_control)
