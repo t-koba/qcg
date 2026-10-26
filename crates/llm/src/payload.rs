@@ -320,10 +320,9 @@ pub(crate) fn native_response_schema(req: &ChatRequest) -> Option<(&Value, bool)
         StructuredOutputMode::Prompt => None,
         StructuredOutputMode::NativeStrict => Some((schema, true)),
         StructuredOutputMode::NativeCompatible => Some((schema, false)),
-        StructuredOutputMode::Auto if native_schema_syntax_compatible(schema) => {
-            Some((schema, strict_schema_syntax_compatible(schema)))
+        StructuredOutputMode::Auto => {
+            native_schema_classification(schema).map(|strict| (schema, strict))
         }
-        StructuredOutputMode::Auto => None,
     }
 }
 
@@ -332,14 +331,22 @@ pub fn native_schema_compatible(schema: &Value) -> bool {
 }
 
 pub(crate) fn native_schema_syntax_compatible(schema: &Value) -> bool {
+    native_schema_analysis(schema, false).is_some()
+}
+
+fn native_schema_classification(schema: &Value) -> Option<bool> {
+    native_schema_analysis(schema, true)
+}
+
+fn native_schema_analysis(schema: &Value, classify_strict: bool) -> Option<bool> {
     let Value::Object(root) = schema else {
-        return false;
+        return None;
     };
     if root.get("type").and_then(Value::as_str) != Some("object") || root.contains_key("anyOf") {
-        return false;
+        return None;
     }
     let mut limits = NativeSchemaLimits::default();
-    native_schema_node_compatible(schema, 1, &mut limits)
+    native_schema_node_compatible(schema, 1, &mut limits, classify_strict)
 }
 
 #[derive(Default)]
@@ -353,13 +360,15 @@ fn native_schema_node_compatible(
     schema: &Value,
     depth: usize,
     limits: &mut NativeSchemaLimits,
-) -> bool {
+    classify_strict: bool,
+) -> Option<bool> {
     let Value::Object(object) = schema else {
-        return false;
+        return None;
     };
     if depth > 10 {
-        return false;
+        return None;
     }
+    let mut strict = classify_strict;
     const SUPPORTED: &[&str] = &[
         "$defs",
         "$ref",
@@ -384,7 +393,7 @@ fn native_schema_node_compatible(
         "type",
     ];
     if object.keys().any(|key| !SUPPORTED.contains(&key.as_str())) {
-        return false;
+        return None;
     }
     let supported_type = |kind: &str| {
         matches!(
@@ -403,7 +412,7 @@ fn native_schema_node_compatible(
         }
         _ => true,
     }) {
-        return false;
+        return None;
     }
     let allows_type = |expected: &str| match object.get("type") {
         Some(Value::String(kind)) => kind == expected,
@@ -432,7 +441,7 @@ fn native_schema_node_compatible(
         keywords.iter().any(|keyword| object.contains_key(*keyword))
             && types.iter().all(|kind| !allows_type(kind))
     }) {
-        return false;
+        return None;
     }
     if object
         .get("properties")
@@ -450,14 +459,14 @@ fn native_schema_node_compatible(
             .get("anyOf")
             .is_some_and(|value| !value.as_array().is_some_and(|items| !items.is_empty()))
     {
-        return false;
+        return None;
     }
     if object.get("$ref").is_some_and(|value| {
         !value
             .as_str()
             .is_some_and(|reference| reference.starts_with('#'))
     }) {
-        return false;
+        return None;
     }
     if object.get("format").is_some_and(|value| {
         !value.as_str().is_some_and(|format| {
@@ -475,14 +484,14 @@ fn native_schema_node_compatible(
             )
         })
     }) {
-        return false;
+        return None;
     }
     for key in ["properties", "$defs"] {
         if let Some(children) = object.get(key).and_then(Value::as_object) {
             if key == "properties" {
                 limits.properties = limits.properties.saturating_add(children.len());
                 if limits.properties > 5_000 {
-                    return false;
+                    return None;
                 }
             }
             limits.string_chars = limits.string_chars.saturating_add(
@@ -491,11 +500,9 @@ fn native_schema_node_compatible(
                     .map(|name| name.chars().count())
                     .sum::<usize>(),
             );
-            if !children
-                .values()
-                .all(|schema| native_schema_node_compatible(schema, depth + 1, limits))
-            {
-                return false;
+            for schema in children.values() {
+                strict &=
+                    native_schema_node_compatible(schema, depth + 1, limits, classify_strict)?;
             }
         }
     }
@@ -508,25 +515,24 @@ fn native_schema_node_compatible(
             .sum::<usize>();
         limits.string_chars = limits.string_chars.saturating_add(enum_string_chars);
         if limits.enum_values > 1_000 || (values.len() > 250 && enum_string_chars > 15_000) {
-            return false;
+            return None;
         }
     }
     if let Some(value) = object.get("const").and_then(Value::as_str) {
         limits.string_chars = limits.string_chars.saturating_add(value.chars().count());
     }
     if limits.string_chars > 120_000 {
-        return false;
+        return None;
     }
     if let Some(nested) = object.get("items")
         && !nested.is_boolean()
-        && !native_schema_node_compatible(nested, depth + 1, limits)
     {
-        return false;
+        strict &= native_schema_node_compatible(nested, depth + 1, limits, classify_strict)?;
     }
     if let Some(additional) = object.get("additionalProperties")
         && !additional.is_boolean()
     {
-        return false;
+        return None;
     }
     if let Some(required) = object.get("required").and_then(Value::as_array)
         && let Some(properties) = object.get("properties").and_then(Value::as_object)
@@ -535,71 +541,47 @@ fn native_schema_node_compatible(
             .filter_map(Value::as_str)
             .any(|name| !properties.contains_key(name))
     {
-        return false;
+        return None;
     }
-    object
-        .get("anyOf")
-        .and_then(Value::as_array)
-        .is_none_or(|schemas| {
-            schemas
-                .iter()
-                .all(|schema| native_schema_node_compatible(schema, depth + 1, limits))
-        })
-}
-
-pub fn strict_schema_compatible(schema: &Value) -> bool {
-    if !native_schema_compatible(schema) {
-        return false;
+    if let Some(schemas) = object.get("anyOf").and_then(Value::as_array) {
+        for schema in schemas {
+            strict &= native_schema_node_compatible(schema, depth + 1, limits, classify_strict)?;
+        }
     }
-    strict_schema_node_compatible(schema)
+    Some(
+        strict
+            && (!schema_allows_object(object)
+                || (object.get("additionalProperties").and_then(Value::as_bool) == Some(false)
+                    && object
+                        .get("properties")
+                        .and_then(Value::as_object)
+                        .is_none_or(|properties| {
+                            let required = object
+                                .get("required")
+                                .and_then(Value::as_array)
+                                .map(|required| {
+                                    required
+                                        .iter()
+                                        .filter_map(Value::as_str)
+                                        .collect::<std::collections::BTreeSet<_>>()
+                                })
+                                .unwrap_or_default();
+                            properties
+                                .keys()
+                                .all(|name| required.contains(name.as_str()))
+                        }))),
+    )
 }
 
 pub(crate) fn strict_schema_syntax_compatible(schema: &Value) -> bool {
-    native_schema_syntax_compatible(schema) && strict_schema_node_compatible(schema)
+    native_schema_classification(schema) == Some(true)
 }
 
-fn strict_schema_node_compatible(schema: &Value) -> bool {
-    // Callers gate on `native_schema_syntax_compatible` (objects only),
-    // but a non-object here refuses fail-closed instead of panicking.
-    let Some(object) = schema.as_object() else {
+pub fn strict_schema_compatible(schema: &Value) -> bool {
+    let Some(strict) = native_schema_classification(schema) else {
         return false;
     };
-    let object_is_closed = !schema_allows_object(object)
-        || (object.get("additionalProperties").and_then(Value::as_bool) == Some(false)
-            && object
-                .get("properties")
-                .and_then(Value::as_object)
-                .is_none_or(|properties| {
-                    let required = object
-                        .get("required")
-                        .and_then(Value::as_array)
-                        .map(|required| {
-                            required
-                                .iter()
-                                .filter_map(Value::as_str)
-                                .collect::<std::collections::BTreeSet<_>>()
-                        })
-                        .unwrap_or_default();
-                    properties
-                        .keys()
-                        .all(|name| required.contains(name.as_str()))
-                }));
-    object_is_closed
-        && ["properties", "$defs"].iter().all(|keyword| {
-            object
-                .get(*keyword)
-                .and_then(Value::as_object)
-                .is_none_or(|children| children.values().all(strict_schema_node_compatible))
-        })
-        && ["items", "additionalProperties"].iter().all(|keyword| {
-            object
-                .get(*keyword)
-                .is_none_or(|nested| nested.is_boolean() || strict_schema_node_compatible(nested))
-        })
-        && object
-            .get("anyOf")
-            .and_then(Value::as_array)
-            .is_none_or(|schemas| schemas.iter().all(strict_schema_node_compatible))
+    policy::compile_bounded_validator(schema).is_ok() && strict
 }
 
 fn schema_allows_object(schema: &serde_json::Map<String, Value>) -> bool {
