@@ -211,15 +211,13 @@ impl ChatCompletionAccumulator {
                 "OpenAI-compatible stream returned invalid usage",
             ));
         }
-        Ok(ChatResponse {
+        Ok(ChatResponse::new(
             content,
-            usage: self.usage.ok_or_else(|| {
+            self.usage.ok_or_else(|| {
                 LlmError::invalid_response("OpenAI-compatible stream did not include usage")
             })?,
             stop,
-            provider_state: None,
-            web_search: None,
-        })
+        ))
     }
 }
 
@@ -450,9 +448,9 @@ impl AnthropicAccumulator {
             ));
         }
         let stop = crate::parse::anthropic_structured_stop(stop, structured_response)?;
-        Ok(ChatResponse {
+        Ok(ChatResponse::new(
             content,
-            usage: TokenUsage {
+            TokenUsage {
                 output: self.output_tokens.ok_or_else(|| {
                     LlmError::invalid_response("Anthropic stream did not include output usage")
                 })?,
@@ -461,8 +459,6 @@ impl AnthropicAccumulator {
                 })?
             },
             stop,
-            provider_state: None,
-            web_search: None,
-        })
+        ))
     }
 }

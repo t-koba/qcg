@@ -74,13 +74,7 @@ pub(crate) fn parse_chat_completions_response(value: Value) -> Result<ChatRespon
             )));
         }
     };
-    Ok(ChatResponse {
-        content,
-        usage,
-        stop,
-        provider_state: None,
-        web_search: None,
-    })
+    Ok(ChatResponse::new(content, usage, stop))
 }
 
 fn parse_openai_tool_call(call: &Value) -> Result<ChatContent, LlmError> {
@@ -429,13 +423,7 @@ pub(crate) fn parse_anthropic_response(value: Value) -> Result<ChatResponse, Llm
         ));
     }
     let stop = anthropic_structured_stop(stop, structured_response)?;
-    Ok(ChatResponse {
-        content,
-        usage,
-        stop,
-        provider_state: None,
-        web_search: None,
-    })
+    Ok(ChatResponse::new(content, usage, stop))
 }
 
 pub(crate) fn llm_http_error(error: reqwest::Error) -> LlmError {

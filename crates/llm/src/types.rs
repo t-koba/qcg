@@ -207,6 +207,18 @@ pub struct ChatResponse {
     pub web_search: Option<ProviderWebSearchOutcome>,
 }
 
+impl ChatResponse {
+    pub(crate) fn new(content: Vec<ChatContent>, usage: TokenUsage, stop: StopReason) -> Self {
+        Self {
+            content,
+            usage,
+            stop,
+            provider_state: None,
+            web_search: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ChatStreamEvent {
