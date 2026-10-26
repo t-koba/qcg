@@ -122,12 +122,7 @@ pub(crate) fn parse_responses_response(
     for item in output_items.into_iter().flatten() {
         match item.get("type").and_then(Value::as_str) {
             Some("message") => {
-                for block in item
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                {
+                for block in message_content_blocks(item) {
                     match block.get("type").and_then(Value::as_str) {
                         Some("output_text") | Some("text") => {
                             if let Some(text) = block
@@ -235,6 +230,13 @@ pub(crate) fn parse_responses_response(
     })
 }
 
+fn message_content_blocks(item: &Value) -> impl Iterator<Item = &Value> {
+    item.get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+}
+
 /// True when an output item is a hosted web search call.
 pub(crate) fn is_web_search_call(item: &Value) -> bool {
     item.get("type").and_then(Value::as_str) == Some("web_search_call")
@@ -243,12 +245,7 @@ pub(crate) fn is_web_search_call(item: &Value) -> bool {
 /// Reads the citations one message output item carries.
 pub(crate) fn parse_message_citations(item: &Value) -> Result<Vec<UrlCitation>, LlmError> {
     let mut citations = Vec::new();
-    for block in item
-        .get("content")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
+    for block in message_content_blocks(item) {
         for annotation in block
             .get("annotations")
             .and_then(Value::as_array)
