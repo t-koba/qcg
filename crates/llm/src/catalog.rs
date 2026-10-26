@@ -254,14 +254,7 @@ impl CatalogService {
         let (external, cache_error) = load_cached_external(&config);
         let mut sources = Vec::new();
         if let Some(error) = cache_error {
-            sources.push(CatalogSourceStatus {
-                kind: "cache".to_string(),
-                location: cache_path(&config)
-                    .map(|path| path.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-                fetched_at: None,
-                error: Some(error),
-            });
+            sources.push(cache_status(&config, error));
         }
         let snapshot = Snapshot {
             models: BTreeMap::new(),
@@ -418,14 +411,7 @@ impl CatalogService {
                 Ok(()) => {}
                 Err(error) => {
                     cache_error = Some(error.clone());
-                    statuses.push(CatalogSourceStatus {
-                        kind: "cache".to_string(),
-                        location: cache_path(&self.config)
-                            .map(|path| path.to_string_lossy().into_owned())
-                            .unwrap_or_default(),
-                        fetched_at: None,
-                        error: Some(error),
-                    });
+                    statuses.push(cache_status(&self.config, error));
                 }
             }
         }
@@ -905,6 +891,17 @@ fn snapshot_stale(fetched_at: Option<&str>, refresh_seconds: u64) -> bool {
     };
     let age = chrono::Utc::now().signed_duration_since(fetched_at.with_timezone(&chrono::Utc));
     age.num_seconds() < 0 || age.num_seconds() as u64 > refresh_seconds
+}
+
+fn cache_status(config: &CatalogConfig, error: String) -> CatalogSourceStatus {
+    CatalogSourceStatus {
+        kind: "cache".to_string(),
+        location: cache_path(config)
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        fetched_at: None,
+        error: Some(error),
+    }
 }
 
 fn cache_path(config: &CatalogConfig) -> Option<PathBuf> {
