@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{RwLock, RwLockReadGuard};
 use std::time::Duration;
 
 const DISCOVERY_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
@@ -222,6 +222,12 @@ impl Default for CatalogService {
 }
 
 impl CatalogService {
+    fn read_snapshot(&self) -> RwLockReadGuard<'_, Snapshot> {
+        self.snapshot
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
     /// Catalog for `LlmRuntime::builtins` and unit tests: the synthetic
     /// `fake` provider only.
     pub fn empty() -> Self {
@@ -286,10 +292,7 @@ impl CatalogService {
     /// the current time on every read so staleness re-arises after the TTL
     /// even after a successful refresh; no stored bool can go stale.
     pub fn is_stale(&self) -> bool {
-        let snapshot = self
-            .snapshot
-            .read()
-            .unwrap_or_else(|error| error.into_inner());
+        let snapshot = self.read_snapshot();
         snapshot_stale(
             snapshot.external.fetched_at.as_deref(),
             self.config.refresh_seconds,
@@ -304,10 +307,7 @@ impl CatalogService {
 
     /// Merged model spec for run-time capability and pricing resolution.
     pub fn model_spec(&self, provider: &str, model: &str) -> Option<ModelSpec> {
-        let snapshot = self
-            .snapshot
-            .read()
-            .unwrap_or_else(|error| error.into_inner());
+        let snapshot = self.read_snapshot();
         snapshot
             .models
             .get(provider)
@@ -334,10 +334,7 @@ impl CatalogService {
 
     fn rebuild_models(&self) {
         let external = {
-            let snapshot = self
-                .snapshot
-                .read()
-                .unwrap_or_else(|error| error.into_inner());
+            let snapshot = self.read_snapshot();
             snapshot.external.clone()
         };
         let mut models = BTreeMap::new();
@@ -514,10 +511,7 @@ impl CatalogService {
             let _ = self.refresh().await;
         }
         let (fetched_at, sources, external) = {
-            let snapshot = self
-                .snapshot
-                .read()
-                .unwrap_or_else(|error| error.into_inner());
+            let snapshot = self.read_snapshot();
             (
                 snapshot.external.fetched_at.clone(),
                 snapshot.sources.clone(),
