@@ -578,10 +578,7 @@ pub(crate) fn strict_schema_syntax_compatible(schema: &Value) -> bool {
 }
 
 pub fn strict_schema_compatible(schema: &Value) -> bool {
-    let Some(strict) = native_schema_classification(schema) else {
-        return false;
-    };
-    policy::compile_bounded_validator(schema).is_ok() && strict
+    strict_schema_syntax_compatible(schema) && policy::compile_bounded_validator(schema).is_ok()
 }
 
 fn schema_allows_object(schema: &serde_json::Map<String, Value>) -> bool {
