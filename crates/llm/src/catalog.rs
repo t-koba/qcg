@@ -400,18 +400,14 @@ impl CatalogService {
         }
         merged.fetched_at = Some(chrono::Utc::now().to_rfc3339());
         merged.fingerprint = Some(config_fingerprint(&self.config));
-        let mut cache_error: Option<String> = None;
-        if first_error.is_none() {
-            // Persist before publishing so a crash cannot publish data the
-            // cache does not hold; a write failure is reported and keeps
-            // the previous snapshot instead of advertising fresh data.
-            match write_cache(&self.config, &merged) {
-                Ok(()) => {}
-                Err(error) => {
-                    cache_error = Some(error.clone());
-                    statuses.push(cache_status(&self.config, error));
-                }
-            }
+        // Persist before publishing so a crash cannot publish data the
+        // cache does not hold; a write failure is reported and keeps
+        // the previous snapshot instead of advertising fresh data.
+        if first_error.is_none()
+            && let Err(error) = write_cache(&self.config, &merged)
+        {
+            first_error = Some(error.clone());
+            statuses.push(cache_status(&self.config, error));
         }
         {
             let mut snapshot = self
@@ -421,18 +417,15 @@ impl CatalogService {
             // A failed source keeps the previous external data instead of
             // silently dropping metadata; the error stays visible.
             // Staleness recomputes from fetched_at on read (F09-01).
-            if first_error.is_none() && cache_error.is_none() {
+            if first_error.is_none() {
                 snapshot.external = merged.clone();
             }
             snapshot.sources = statuses;
         }
-        if first_error.is_none() && cache_error.is_none() {
+        if first_error.is_none() {
             self.rebuild_models();
         }
-        match first_error.or(cache_error) {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        first_error.map_or(Ok(()), Err)
     }
 
     async fn fetch_source(&self, source: &CatalogSourceSpec) -> Result<ExternalCatalog, String> {
