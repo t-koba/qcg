@@ -255,13 +255,9 @@ impl SearchProfile {
             None => spec.endpoint.clone(),
         };
         let endpoint = raw_endpoint.and_then(|raw| {
-            match validate_endpoint(&spec.id, &raw, spec.api_key_env.is_some()) {
-                Ok(url) => Some(url),
-                Err(error) => {
-                    config_errors.push(error);
-                    None
-                }
-            }
+            validate_endpoint(&spec.id, &raw, spec.api_key_env.is_some())
+                .map_err(|error| config_errors.push(error))
+                .ok()
         });
         if endpoint.is_none() && config_errors.is_empty() {
             let source = spec.endpoint_env.as_deref().unwrap_or("endpoint");
@@ -360,10 +356,7 @@ impl SearchRuntime {
             };
             format!("search provider `{id}` is not registered; {hint}")
         })?;
-        if let Some(error) = profile.configuration_error() {
-            return Err(error);
-        }
-        Ok(profile)
+        profile.configuration_error().map_or(Ok(profile), Err)
     }
 
     pub fn default_provider(&self) -> Option<&str> {
