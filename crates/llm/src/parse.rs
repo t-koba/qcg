@@ -472,20 +472,15 @@ pub(crate) fn marker_line(prompt: &str, marker: &str) -> Option<String> {
 
 pub(crate) fn marker_block(prompt: &str, marker: &str) -> Option<String> {
     let mut lines = prompt.lines();
-    while let Some(line) = lines.next() {
-        if let Some(first) = line.trim().strip_prefix(marker).map(str::trim) {
-            let mut value = first.to_owned();
-            let rest = lines.collect::<Vec<_>>().join("\n");
-            if !rest.trim().is_empty() {
-                if !value.is_empty() {
-                    value.push('\n');
-                }
-                value.push_str(&rest);
-            }
-            return Some(value);
-        }
+    let first = lines.find_map(|line| line.trim().strip_prefix(marker).map(str::trim))?;
+    let rest = lines.collect::<Vec<_>>().join("\n");
+    if rest.trim().is_empty() {
+        Some(first.to_owned())
+    } else if first.is_empty() {
+        Some(rest)
+    } else {
+        Some(format!("{first}\n{rest}"))
     }
-    None
 }
 
 pub(crate) fn parse_anthropic_stop_reason(reason: &str) -> Result<StopReason, LlmError> {
