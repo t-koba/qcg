@@ -711,30 +711,20 @@ impl HttpProvider {
     ) -> Result<(), LlmError> {
         let (response, credential) = self.send_request(payload, model).await?;
         let body = response.bytes_stream().scan(
-            (self.response_body_limit_bytes, false),
-            |(remaining, terminated), chunk| {
-                let item = if *terminated {
-                    None
-                } else {
-                    match chunk {
-                        Err(error) => {
-                            *terminated = true;
-                            Some(Err(SseBodyError::Http(error)))
-                        }
-                        Ok(chunk) if chunk.len() <= *remaining => {
-                            // Count all response-body bytes before the parser
-                            // can buffer them, including SSE framing/comments.
-                            *remaining -= chunk.len();
-                            Some(Ok(chunk))
-                        }
-                        Ok(_) => {
-                            // Reject the crossing chunk in full and terminate
-                            // the adapter after surfacing the explicit error.
-                            *terminated = true;
-                            Some(Err(SseBodyError::LimitExceeded))
-                        }
+            Some(self.response_body_limit_bytes),
+            |remaining, chunk| {
+                let item = remaining.take().map(|budget| match chunk {
+                    Ok(chunk) if chunk.len() <= budget => {
+                        // Count raw bytes before parsing, including SSE framing.
+                        *remaining = Some(budget - chunk.len());
+                        Ok(chunk)
                     }
-                };
+                    Ok(_) => {
+                        // Reject the crossing chunk in full before parsing.
+                        Err(SseBodyError::LimitExceeded)
+                    }
+                    Err(error) => Err(SseBodyError::Http(error)),
+                });
                 std::future::ready(item)
             },
         );
