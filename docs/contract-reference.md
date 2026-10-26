@@ -632,8 +632,8 @@ provider_web_search = { search_context_size = "medium", allowed_domains = ["exam
 - `search_context_size`: `low`, `medium` or `high`.
 - `user_location`: an approximate `country`, `region`, `city` and
   `timezone`.
-- `max_calls`: the bound on the hosted calls one request may make, 3 by
-  default and 1 at least.
+- `max_calls`: the bound on hosted search calls per request, 3 by default
+  and 1 at least. It does not limit local function-tool calls.
 
 The search runs at the provider, so it is not a local HTTP tool and the
 contract's network permissions do not govern it. The provider bills the
@@ -1632,6 +1632,7 @@ metadata. Update it with `qcg docs step-schemas`.
           "type": "array"
         },
         "max_calls": {
+          "description": "Hosted-search calls only; local function calls are excluded.",
           "minimum": 1,
           "type": "integer"
         },
@@ -2631,6 +2632,7 @@ metadata. Update it with `qcg docs step-schemas`.
           "type": "array"
         },
         "max_calls": {
+          "description": "Hosted-search calls only; local function calls are excluded.",
           "minimum": 1,
           "type": "integer"
         },
@@ -3254,6 +3256,7 @@ metadata. Update it with `qcg docs step-schemas`.
           "type": "array"
         },
         "max_calls": {
+          "description": "Hosted-search calls only; local function calls are excluded.",
           "minimum": 1,
           "type": "integer"
         },
@@ -3644,6 +3647,7 @@ metadata. Update it with `qcg docs step-schemas`.
           "type": "array"
         },
         "max_calls": {
+          "description": "Hosted-search calls only; local function calls are excluded.",
           "minimum": 1,
           "type": "integer"
         },
@@ -4036,6 +4040,7 @@ metadata. Update it with `qcg docs step-schemas`.
           "type": "array"
         },
         "max_calls": {
+          "description": "Hosted-search calls only; local function calls are excluded.",
           "minimum": 1,
           "type": "integer"
         },

@@ -14,6 +14,8 @@ fn run_event_reference_matches_generated_markdown() {
         .expect("run event reference must contain generated markers");
     let expected = format!("\n{}", api::run_event_reference_markdown());
     assert_eq!(block.trim_end(), expected.trim_end());
+    assert!(block.contains("`web_search` (`calls`, `cost_microusd`, `events`, `citations`)"));
+    assert!(docs.contains("web_search.calls * web_search_call_cost_usd"));
 }
 
 #[test]

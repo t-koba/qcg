@@ -1579,6 +1579,7 @@
             "description": "Requested cache write policy when non-default (`forbid` only).\nAbsent means the default `allow`: the request left provider caching\nalone. Present only to make the TTL cost basis inspectable."
           },
           "cost_microusd": {
+            "description": "Total estimated call cost, including any priced hosted-search charge.",
             "format": "uint64",
             "minimum": 0,
             "type": "integer"
@@ -1736,7 +1737,7 @@
               }
             ],
             "default": null,
-            "description": "What the provider's hosted web search did in this call. Absent when\nthe request did not enable the hosted search."
+            "description": "Hosted-search details; null when the request did not enable the tool."
           }
         },
         "required": [
@@ -4492,7 +4493,7 @@
         "properties": {
           "calls": {
             "default": null,
-            "description": "The hosted calls the provider reported. Absent means unknown, which\nis never zero.",
+            "description": "Provider-reported calls; null means unknown, never zero.",
             "format": "uint64",
             "minimum": 0,
             "type": [
@@ -4509,7 +4510,7 @@
           },
           "cost_microusd": {
             "default": null,
-            "description": "The hosted search charge in microusd. Absent means the run does not\nprice the search: unmetered, never free.",
+            "description": "Hosted search charge in microusd; null means unmetered, never free.",
             "format": "uint64",
             "minimum": 0,
             "type": [

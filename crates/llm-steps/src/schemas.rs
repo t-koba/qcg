@@ -175,7 +175,7 @@ pub(crate) fn provider_web_search_schema() -> Value {
                     "timezone": string_schema()
                 }
             },
-            "max_calls": { "type": "integer", "minimum": 1 }
+            "max_calls": { "type": "integer", "minimum": 1, "description": "Hosted-search calls only; local function calls are excluded." }
         }
     })
 }

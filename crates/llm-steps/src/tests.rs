@@ -2159,7 +2159,7 @@ name = "Schema Test"
 version = "0.1.0"
 
 [llm]
-model = {{ provider = "{provider}", model = "test" }}
+model = {{ provider = "{provider}", model = "test", web_search_call_cost_usd = 0.01 }}
 max_tokens = 2048
 
 [[flow]]
@@ -2199,13 +2199,12 @@ capabilities = { web_search = true }
     .into_runtime()
 }
 
-/// The request a node builds, with the context the step executor would use.
-fn request_for(
+/// Run a request- or route-builder against the context a step executor uses.
+fn with_test_context<R>(
     contract: &Contract,
-    node: &NodeDef,
-    runtime: &LlmRuntime,
     root: &std::path::Path,
-) -> Result<llm::ChatRequest, StepError> {
+    operation: impl FnOnce(&engine::StepContext<'_>) -> R,
+) -> R {
     let run_id = format!("web-search-{}", std::process::id());
     let run = engine::RunContext::for_tests(
         run_id.clone(),
@@ -2236,7 +2235,39 @@ fn request_for(
         vars: &mut vars,
         llm: None,
     };
-    crate::request::build_request(&ctx, node, runtime, "prompt".into(), None)
+    operation(&ctx)
+}
+
+/// The request a node builds, with the context the step executor would use.
+fn request_for(
+    contract: &Contract,
+    node: &NodeDef,
+    runtime: &LlmRuntime,
+    root: &std::path::Path,
+) -> Result<llm::ChatRequest, StepError> {
+    with_test_context(contract, root, |ctx| {
+        crate::request::build_request(ctx, node, runtime, "prompt".into(), None)
+    })
+}
+
+fn invocation_routes_for(
+    contract: &Contract,
+    node: &NodeDef,
+    request: &llm::ChatRequest,
+    root: &std::path::Path,
+) -> Result<Vec<contract::ModelRef>, StepError> {
+    with_test_context(contract, root, |ctx| {
+        crate::routes::invocation_routes(ctx, node, request, None, None)
+    })
+}
+
+#[test]
+fn provider_web_search_schema_states_the_hosted_only_call_cap() {
+    let schema = crate::schemas::provider_web_search_schema();
+    assert_eq!(
+        schema["properties"]["max_calls"]["description"],
+        "Hosted-search calls only; local function calls are excluded."
+    );
 }
 
 #[test]
@@ -2261,6 +2292,30 @@ fn the_provider_web_search_opt_in_reaches_the_request() {
         Some(model::SearchContextSize::Medium)
     );
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn contract_hosted_search_price_reaches_the_invocation_route() {
+    let root =
+        std::env::temp_dir().join(format!("provider-web-search-priced-{}", std::process::id()));
+    let contract = contract_with_provider_web_search(&root, "responses");
+    let node = contract
+        .manifest
+        .flow
+        .first()
+        .cloned()
+        .expect("flow should contain a node");
+    let request = request_for(
+        &contract,
+        &node,
+        &provider_web_search_runtime(),
+        &root.join("request"),
+    )
+    .expect("the request should build");
+    let routes = invocation_routes_for(&contract, &node, &request, &root.join("route"))
+        .expect("the invocation route should resolve");
+    assert_eq!(routes[0].web_search_call_cost_usd, Some(0.01));
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

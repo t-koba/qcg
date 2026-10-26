@@ -93,9 +93,8 @@ pub(crate) fn responses_payload(
         set_optional(&mut payload, "parallel_tool_calls", req.parallel_tool_calls);
     }
     if let Some(search) = &req.provider_web_search {
-        // The hosted search is a provider-side tool, so it joins the same
-        // `tools` array as the local function tools. The request-level
-        // `max_tool_calls` bounds the hosted calls it may make.
+        // Responses caps built-in calls, not custom functions; web_search is
+        // the only built-in tool qcg adds, so this stays hosted-search-only.
         let mut tools = payload["tools"].as_array().cloned().unwrap_or_default();
         tools.push(provider_web_search_tool(search));
         payload["tools"] = Value::Array(tools);

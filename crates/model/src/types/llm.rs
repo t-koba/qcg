@@ -114,12 +114,11 @@ pub struct ProviderWebSearch {
     pub search_context_size: Option<SearchContextSize>,
     /// Approximate location used to localize the hosted search.
     pub user_location: Option<UserLocation>,
-    /// Upper bound on the hosted calls one request may make.
+    /// Upper bound on hosted search calls per request, never local function calls.
     pub max_calls: u32,
 }
 
-/// The hosted search budget when a contract does not state one: the local
-/// `web.search` tool uses the same default.
+/// Default hosted-search cap; local `web.search` uses the same numeric default independently.
 pub const DEFAULT_PROVIDER_WEB_SEARCH_MAX_CALLS: u32 = 3;
 
 impl Default for ProviderWebSearch {

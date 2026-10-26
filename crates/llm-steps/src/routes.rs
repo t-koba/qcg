@@ -107,7 +107,7 @@ fn priced_route(
                     .as_ref()
                     .and_then(|pricing| pricing.output_cost_per_million_usd)
             }),
-        web_search_call_cost_usd: None,
+        web_search_call_cost_usd: contract.and_then(|pricing| pricing.web_search_call_cost_usd),
         cost_tiers,
     }
 }

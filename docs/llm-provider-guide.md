@@ -1413,9 +1413,12 @@ provider_web_search = { search_context_size = "medium", allowed_domains = ["exam
   default applies when the field is absent.
 - `user_location`: an approximate `country`, `region`, `city` and
   `timezone`.
-- `max_calls`: the bound on the hosted calls one request may make, 3 by
-  default. It travels as the request's `max_tool_calls`, so it bounds the
-  request's total tool calls, hosted and local alike.
+- `max_calls`: the bound on hosted search calls per request, 3 by default;
+  local function-tool calls do not consume this budget. It maps to Responses
+  `max_tool_calls`, which OpenAI defines over built-in tools only. qcg adds
+  `web_search` as the only built-in tool in this request; custom function tools
+  retain their separate local call limits. See the
+  [Responses API reference](https://platform.openai.com/docs/api-reference/responses/create).
 
 Permissions and networking: the search runs at the provider, so its egress
 is the provider's, not the generator's, and the contract's network
@@ -1424,15 +1427,17 @@ searched hosts.
 
 Usage and cost: the provider does not report how many hosted calls it made
 in its usage object. qcg derives the count from the `web_search_call` output
-items of the response and records it in the `llm_call` event, together with
-the search's actions and the URL citations the provider attached. A response
-that reports no output items leaves the count unknown, and unknown is never
-reported as zero. The provider bills the calls apart from the tokens, so a
-run that wants the whole bill metered prices them with
-`web_search_call_cost_usd` on the model's pricing row; without a price the
-search charge is recorded as unmetered rather than free, and a run whose
-cost budget requires pricing refuses the node instead of settling an
-unpriced search.
+items of the response and records it in the `llm_call.web_search` payload,
+together with the search actions and attached URL citations. No output items
+leaves the count unknown, never zero. OpenAI's public Responses pricing lists
+`web_search` at $10 per 1,000 calls ($0.01/call), with search-content tokens
+billed at model input rates. For that rate, set
+`web_search_call_cost_usd = 0.01` on the selected model's contract pricing
+row; configure token rates separately. qcg does not infer the hosted-search
+price: a missing price is recorded as unmetered, never free, and a run whose
+cost budget requires pricing refuses a reported positive search count without
+a price. Verify the effective rate against the
+[OpenAI API pricing](https://developers.openai.com/api/docs/pricing).
 
 ### Anthropic context-window terminal
 

@@ -157,7 +157,7 @@ Generated from the OpenAPI `RunEvent` schema. Every event uses the required enve
 | `repair_attempt_finished` | `attempt`, `status` |
 | `regenerate_attempt_started` | `attempt`, `max_attempts` |
 | `regenerate_attempt_finished` | `attempt`, `status` |
-| `llm_call` | `provider`, `model`, `max_tokens`, `tokens`, `cost_microusd` |
+| `llm_call` | `provider`, `model`, `max_tokens`, `tokens`, `cost_microusd`; optional: `web_search` (`calls`, `cost_microusd`, `events`, `citations`) |
 | `llm_delta` | `provider`, `model`, `index`, `text` |
 | `agent_checkpoint` | `turn`, `phase`, `checkpoint` |
 | `agent_file_changes` | `removed_files`, `written_files` |
@@ -266,7 +266,20 @@ microUSD = ordinary_input * input_cost_per_million_usd
          + cached_input * cache_read_input_cost_per_million_usd
          + cache_creation_input * cache_creation_input_cost_per_million_usd
          + output * output_cost_per_million_usd
+         + web_search.calls * web_search_call_cost_usd * 1_000_000
 ```
+
+The final term applies when a positive hosted-search call count and per-call
+price are both known. If no search was requested, omit the term; if the count
+is unknown or no price is configured, the search remains unmetered, never
+free. A run requiring pricing refuses a reported positive count without a
+price.
+
+When provider-hosted search was requested, `llm_call.web_search` carries
+`calls`, `cost_microusd`, `events`, and `citations`. A null call count means
+unknown, never zero; a null search `cost_microusd` means unmetered, never free.
+The search cost field is the hosted-search component of the total
+`llm_call.cost_microusd` shown above.
 
 Rates are USD per 1M tokens. On the base row, each omitted cache rate falls
 back to that row's ordinary input rate; explicit zero is honored. A tier row

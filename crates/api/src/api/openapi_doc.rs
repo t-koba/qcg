@@ -269,6 +269,10 @@ pub fn run_event_reference_markdown() -> String {
         markdown.push_str(&format!("| `{event}` | {fields}"));
         if event == "agent_failed" {
             markdown.push_str("; optional: `tool_call_id` (delegated calls only), `resource_exhaustion` (`{resource, used, allowed}`)");
+        } else if event == "llm_call" {
+            markdown.push_str(
+                "; optional: `web_search` (`calls`, `cost_microusd`, `events`, `citations`)",
+            );
         }
         markdown.push_str(" |\n");
     }
