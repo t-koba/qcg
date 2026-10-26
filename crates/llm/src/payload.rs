@@ -183,9 +183,7 @@ fn provider_web_search_tool(search: &ProviderWebSearch) -> Value {
             ("city", &location.city),
             ("timezone", &location.timezone),
         ] {
-            if let Some(field) = field {
-                value[name] = json!(field);
-            }
+            set_optional(&mut value, name, field.as_ref());
         }
         tool["user_location"] = value;
     }
