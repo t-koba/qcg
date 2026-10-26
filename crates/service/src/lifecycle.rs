@@ -853,7 +853,7 @@ impl LocalService {
         run_dir: &Utf8PathBuf,
     ) -> Result<(), ServiceError> {
         #[cfg(test)]
-        crate::tests::cancel_observation::fail_cancel_observation(run_dir, "drain")?;
+        crate::tests::cancel_observation::fail_observation(run_dir, "drain")?;
         let pending = list_pending_cancel_controls(run_dir)?;
         if pending.is_empty() {
             return Ok(());
@@ -1058,10 +1058,9 @@ impl LocalService {
                         // Running record with no live task is a spawn that
                         // never reached the engine (lease lost, shutdown
                         // refusal): it re-enters here so execution is
-                        // retried instead of parking forever. (Journal
-                        // failures no longer linger as Running: the spawn
-                        // marks the record failed-closed with an explicit
-                        // error (E03).)
+                        // retried instead of parking forever. Pre-execution
+                        // journal observation failures retain Queued state
+                        // and are retried here without starting the engine.
                         && ((record.state == RunStatus::Queued
                             && record.queued_at.is_none_or(|at| at <= cutoff))
                             || record.state == RunStatus::CancelRequested
@@ -1523,6 +1522,11 @@ impl LocalService {
                             let directory = run_dir.clone();
                             service
                                 .blocking_work(move || {
+                                    #[cfg(test)]
+                                    crate::tests::cancel_observation::fail_observation(
+                                        &directory,
+                                        "pre_state",
+                                    )?;
                                     crate::summaries::read_journal_events(&directory)
                                 })
                                 .await
@@ -1548,20 +1552,12 @@ impl LocalService {
                         }
                         Ok((state, values)) => (state, values),
                         Err(error) => {
-                            // Fail closed with an explicit error instead of
-                            // leaving the run Queued for the 5s/10s resumer
-                            // timers to retry blindly (E03). Memory reports
-                            // failure; the journal stays the truth, so a
-                            // restart re-derives from durable events and a
-                            // transient I/O failure heals instead of
-                            // lingering silently.
-                            tracing::error!(%error, run_id = %run_id, "pre-execution state fold failed; marking the run failed instead of lingering queued");
-                            record.state = RunStatus::Failed;
-                            record.preempted = false;
-                            record.question = None;
-                            record.confirm = None;
-                            drop(runs);
-                            service.inner.queue_notify.notify_waiters();
+                            // Observation failure is not a settled run failure.
+                            // Preserve the last-known state and interaction;
+                            // the configured queued resumer can reread later.
+                            // Never execute or append a terminal event while
+                            // journal truth is unavailable.
+                            tracing::error!(%error, run_id = %run_id, phase = "pre_execution_journal", "pre-execution journal observation failed; refusing execution and retaining retryable state");
                             return;
                         }
                     };

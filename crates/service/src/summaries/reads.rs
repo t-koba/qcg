@@ -222,7 +222,7 @@ fn truncate_to_last_non_canceled(path: &Utf8Path) -> Result<bool, ServiceError> 
 /// after conversion for non-owning peers.
 pub(crate) fn has_remote_cancel_request(run_dir: &Utf8Path) -> Result<bool, ServiceError> {
     #[cfg(test)]
-    crate::tests::cancel_observation::fail_cancel_observation(run_dir, "remote")?;
+    crate::tests::cancel_observation::fail_observation(run_dir, "remote")?;
     for event in read_journal_events(run_dir)? {
         if event.get("t").and_then(Value::as_str) == Some("user_cancel_requested") {
             return Ok(true);
