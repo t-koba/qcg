@@ -558,6 +558,9 @@ const MAX_STREAM_RETRY_ATTEMPTS: u32 = 3;
 impl ProviderSpec {
     pub(crate) fn validate(&self) -> Result<(), String> {
         let invalid = |message: &str| format!("provider `{}` {message}", self.id);
+        let reject = |condition: bool, message: &str| {
+            (!condition).then_some(()).ok_or_else(|| invalid(message))
+        };
         if !is_provider_id(&self.id) {
             return Err(format!(
                 "provider id `{}` must contain only lowercase ASCII letters, digits, `.`, `_`, or `-`",
@@ -588,11 +591,10 @@ impl ProviderSpec {
             .api_key_env
             .as_deref()
             .or(self.api_key_file_env.as_deref());
-        if self.auth_header.is_some() && !has_credential {
-            return Err(invalid(
-                "may not set `auth_header` without a credential source",
-            ));
-        }
+        reject(
+            self.auth_header.is_some() && !has_credential,
+            "may not set `auth_header` without a credential source",
+        )?;
         if let Some(header) = self.auth_header.as_deref()
             && reqwest::header::HeaderName::from_bytes(header.as_bytes()).is_err()
         {
@@ -623,17 +625,16 @@ impl ProviderSpec {
         self.retry_policy
             .validate()
             .map_err(|message| invalid(&message))?;
-        if let Some(attempts) = self.retry_attempts
-            && !(1..=10).contains(&attempts)
-        {
-            return Err(invalid("retry_attempts must be between 1 and 10"));
-        }
-        if self
-            .retry_base_backoff_ms
-            .is_some_and(|backoff| backoff > 60_000)
-        {
-            return Err(invalid("retry_base_backoff_ms must not exceed 60000"));
-        }
+        reject(
+            self.retry_attempts
+                .is_some_and(|attempts| !(1..=10).contains(&attempts)),
+            "retry_attempts must be between 1 and 10",
+        )?;
+        reject(
+            self.retry_base_backoff_ms
+                .is_some_and(|backoff| backoff > 60_000),
+            "retry_base_backoff_ms must not exceed 60000",
+        )?;
         if let Some(attempts) = self.stream_retry_attempts
             && attempts > MAX_STREAM_RETRY_ATTEMPTS
         {
@@ -641,21 +642,16 @@ impl ProviderSpec {
                 "stream_retry_attempts must be between 0 and {MAX_STREAM_RETRY_ATTEMPTS}"
             )));
         }
-        if self
-            .retry_rate_limit_floor_ms
-            .is_some_and(|floor| floor > 60_000)
-        {
-            return Err(invalid(
-                "retry_rate_limit_floor_ms must be between 0 and 60000",
-            ));
-        }
-        if let Some(cap) = self.retry_backoff_exponent_cap
-            && !(1..=16).contains(&cap)
-        {
-            return Err(invalid(
-                "retry_backoff_exponent_cap must be between 1 and 16",
-            ));
-        }
+        reject(
+            self.retry_rate_limit_floor_ms
+                .is_some_and(|floor| floor > 60_000),
+            "retry_rate_limit_floor_ms must be between 0 and 60000",
+        )?;
+        reject(
+            self.retry_backoff_exponent_cap
+                .is_some_and(|cap| !(1..=16).contains(&cap)),
+            "retry_backoff_exponent_cap must be between 1 and 16",
+        )?;
         for (field, name) in [
             ("base_url_env", self.base_url_env.as_deref()),
             ("api_key_env", self.api_key_env.as_deref()),
@@ -691,20 +687,18 @@ impl ProviderSpec {
             }
         }
         validate_capabilities_for_api(&self.id, self.api, &self.capabilities)?;
-        if self.chat_token_limit_field.is_some() && self.api != ApiFlavor::ChatCompletions {
-            return Err(invalid(
-                "may only set `chat_token_limit_field` for chat_completions",
-            ));
-        }
+        reject(
+            self.chat_token_limit_field.is_some() && self.api != ApiFlavor::ChatCompletions,
+            "may only set `chat_token_limit_field` for chat_completions",
+        )?;
         let decision_transport_is_default = self.decision_input_wrapper
             == DecisionInputWrapper::None
             && self.decision_model_in_body
             && self.decision_response_wrapper == DecisionResponseWrapper::Auto;
-        if self.api != ApiFlavor::SystemOne && !decision_transport_is_default {
-            return Err(invalid(
-                "may only set `decision_input_wrapper`, `decision_model_in_body`, or `decision_response_wrapper` for system_one",
-            ));
-        }
+        reject(
+            self.api != ApiFlavor::SystemOne && !decision_transport_is_default,
+            "may only set `decision_input_wrapper`, `decision_model_in_body`, or `decision_response_wrapper` for system_one",
+        )?;
         if self.api == ApiFlavor::SystemOne && !self.decision_model_in_body {
             let carries_model = self
                 .path_template
@@ -758,13 +752,11 @@ impl ProviderSpec {
                 "may only set `prompt_cache_retention` when `capabilities.prompt_cache` is enabled",
             ));
         }
-        if self.prompt_cache_explicit_mode
-            && !matches!(self.api, ApiFlavor::ChatCompletions | ApiFlavor::Responses)
-        {
-            return Err(invalid(
-                "may only set `prompt_cache_explicit_mode` for chat_completions or responses",
-            ));
-        }
+        reject(
+            self.prompt_cache_explicit_mode
+                && !matches!(self.api, ApiFlavor::ChatCompletions | ApiFlavor::Responses),
+            "may only set `prompt_cache_explicit_mode` for chat_completions or responses",
+        )?;
         if self.api == ApiFlavor::ChatCompletions
             && !self.capabilities.reasoning_effort.is_empty()
             && self.chat_token_limit_field != Some(ChatTokenLimitField::MaxCompletionTokens)
@@ -806,11 +798,12 @@ impl ProviderSpec {
                 "must set `chat_token_limit_field = \"max_completion_tokens\"` when a declared model advertises reasoning_effort",
             ));
         }
-        if let Some(catalog_id) = self.catalog_id.as_deref()
-            && (catalog_id.trim().is_empty() || catalog_id.chars().any(char::is_control))
-        {
-            return Err(invalid("catalog_id must be a non-empty identifier"));
-        }
+        reject(
+            self.catalog_id.as_deref().is_some_and(|catalog_id| {
+                catalog_id.trim().is_empty() || catalog_id.chars().any(char::is_control)
+            }),
+            "catalog_id must be a non-empty identifier",
+        )?;
         if let Some(base_url) = self.base_url.as_deref() {
             if let Some(name) = credential_placeholder(base_url, credential_source_env) {
                 return Err(invalid(&format!(
