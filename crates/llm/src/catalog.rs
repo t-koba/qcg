@@ -513,23 +513,16 @@ impl CatalogService {
             // field, external fills the gaps, so the view matches runtime.
             let external_models = external.providers.get(catalog_id);
             for model in &spec.models {
-                let merged = match external_models.and_then(|models| models.get(&model.id)) {
-                    Some(external_model) => merge_model(external_model, model),
-                    None => model.clone(),
-                };
-                let has_external =
-                    external_models.is_some_and(|models| models.contains_key(&model.id));
+                let (merged, source) =
+                    match external_models.and_then(|models| models.get(&model.id)) {
+                        Some(external_model) => {
+                            (merge_model(external_model, model), "explicit + external")
+                        }
+                        None => (model.clone(), "explicit"),
+                    };
                 models.insert(
                     model.id.clone(),
-                    model_view(
-                        &merged,
-                        if has_external {
-                            "explicit + external"
-                        } else {
-                            "explicit"
-                        },
-                        &spec.capabilities,
-                    ),
+                    model_view(&merged, source, &spec.capabilities),
                 );
             }
             if let Some(external_models) = external_models {
@@ -551,21 +544,21 @@ impl CatalogService {
                 match self.discover(spec).await {
                     Ok(discovered) => {
                         for id in discovered {
-                            let view = match models.get_mut(&id) {
-                                Some(existing) => {
+                            models
+                                .entry(id.clone())
+                                .and_modify(|existing| {
                                     existing.source = format!("{} + discovery", existing.source);
-                                    continue;
-                                }
-                                None => model_view(
-                                    &ModelSpec {
-                                        id: id.clone(),
-                                        ..ModelSpec::default()
-                                    },
-                                    "discovery",
-                                    &spec.capabilities,
-                                ),
-                            };
-                            models.insert(id, view);
+                                })
+                                .or_insert_with(|| {
+                                    model_view(
+                                        &ModelSpec {
+                                            id: id.clone(),
+                                            ..ModelSpec::default()
+                                        },
+                                        "discovery",
+                                        &spec.capabilities,
+                                    )
+                                });
                         }
                     }
                     Err(error) => errors.push(error),
