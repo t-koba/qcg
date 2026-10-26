@@ -21,6 +21,12 @@ fn required_nonempty_text(field: Option<&Value>, message: &str) -> Result<String
     }
 }
 
+fn push_nonempty_text(content: &mut Vec<ChatContent>, text: Option<&str>) {
+    if let Some(text) = text.filter(|text| !text.is_empty()) {
+        content.push(ChatContent::Text(text.to_string()));
+    }
+}
+
 pub(crate) fn parse_chat_completions_response(value: Value) -> Result<ChatResponse, LlmError> {
     let choice = value
         .get("choices")
@@ -34,11 +40,7 @@ pub(crate) fn parse_chat_completions_response(value: Value) -> Result<ChatRespon
             )
         })?;
     let mut content = Vec::new();
-    if let Some(text) = message.get("content").and_then(Value::as_str)
-        && !text.is_empty()
-    {
-        content.push(ChatContent::Text(text.to_string()));
-    }
+    push_nonempty_text(&mut content, message.get("content").and_then(Value::as_str));
     let refused = message
         .get("refusal")
         .and_then(Value::as_str)
@@ -110,11 +112,11 @@ pub(crate) fn parse_responses_response(
             .iter()
             .any(|item| item.get("type").and_then(Value::as_str) == Some("message"))
     });
-    if !has_message_items
-        && let Some(text) = value.get("output_text").and_then(Value::as_str)
-        && !text.is_empty()
-    {
-        content.push(ChatContent::Text(text.to_string()));
+    if !has_message_items {
+        push_nonempty_text(
+            &mut content,
+            value.get("output_text").and_then(Value::as_str),
+        );
     }
     let mut refused = false;
     for item in output_items.into_iter().flatten() {
@@ -123,14 +125,13 @@ pub(crate) fn parse_responses_response(
                 for block in message_content_blocks(item) {
                     match block.get("type").and_then(Value::as_str) {
                         Some("output_text") | Some("text") => {
-                            if let Some(text) = block
-                                .get("text")
-                                .or_else(|| block.get("content"))
-                                .and_then(Value::as_str)
-                                && !text.is_empty()
-                            {
-                                content.push(ChatContent::Text(text.to_string()));
-                            }
+                            push_nonempty_text(
+                                &mut content,
+                                block
+                                    .get("text")
+                                    .or_else(|| block.get("content"))
+                                    .and_then(Value::as_str),
+                            );
                         }
                         Some("refusal") => {
                             if let Some(text) = block.get("refusal").and_then(Value::as_str) {
@@ -376,11 +377,7 @@ pub(crate) fn parse_anthropic_response(value: Value) -> Result<ChatResponse, Llm
     for block in blocks {
         match block.get("type").and_then(Value::as_str) {
             Some("text") => {
-                if let Some(text) = block.get("text").and_then(Value::as_str)
-                    && !text.is_empty()
-                {
-                    content.push(ChatContent::Text(text.to_string()));
-                }
+                push_nonempty_text(&mut content, block.get("text").and_then(Value::as_str));
             }
             Some("tool_use") => {
                 let id = required_nonempty_text(
