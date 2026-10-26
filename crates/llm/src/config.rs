@@ -34,13 +34,8 @@ pub(crate) fn json_contains_credential(
     substring_threshold: usize,
 ) -> bool {
     match value {
-        Value::String(text) => {
-            if credential.len() < substring_threshold {
-                text == credential
-            } else {
-                text.contains(credential)
-            }
-        }
+        Value::String(text) if credential.len() < substring_threshold => text == credential,
+        Value::String(text) => text.contains(credential),
         Value::Array(values) => values
             .iter()
             .any(|value| json_contains_credential(value, credential, substring_threshold)),
