@@ -329,7 +329,7 @@ pub(crate) fn validate_request_capabilities(
 }
 
 // Keep validation order at the call sites; only the refusal mechanics are shared.
-fn reject_if(invalid: bool, message: &str) -> Result<(), LlmError> {
+pub(crate) fn reject_if(invalid: bool, message: &str) -> Result<(), LlmError> {
     if invalid {
         Err(LlmError::new(message))
     } else {

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::provider::{DecisionInputWrapper, DecisionResponseWrapper};
-use crate::{LlmError, TokenUsage};
+use crate::{LlmError, TokenUsage, validate::reject_if};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -57,62 +57,55 @@ impl DecisionRequest {
     }
 
     pub fn validate(&self) -> Result<(), LlmError> {
-        if self.provider.trim().is_empty()
-            || self.model.trim().is_empty()
-            || self.questions.is_empty()
-        {
-            return Err(LlmError::new(
-                "Decision provider, model and questions must not be empty",
-            ));
-        }
-        if !valid_content(&self.state) {
-            return Err(LlmError::new(
-                "Decision state must be a string, object or array",
-            ));
-        }
+        reject_if(
+            self.provider.trim().is_empty()
+                || self.model.trim().is_empty()
+                || self.questions.is_empty(),
+            "Decision provider, model and questions must not be empty",
+        )?;
+        reject_if(
+            !valid_content(&self.state),
+            "Decision state must be a string, object or array",
+        )?;
         for question in self.questions.values() {
             let instructions = match question {
                 DecisionQuestion::Noul {
                     instructions,
                     criteria,
                 } => {
-                    if criteria.as_ref().is_some_and(|criteria| {
-                        criteria.keys().any(|key| key != "true" && key != "false")
-                    }) {
-                        return Err(LlmError::new(
-                            "Decision noul criteria keys must be true or false",
-                        ));
-                    }
+                    reject_if(
+                        criteria.as_ref().is_some_and(|criteria| {
+                            criteria.keys().any(|key| key != "true" && key != "false")
+                        }),
+                        "Decision noul criteria keys must be true or false",
+                    )?;
                     instructions
                 }
                 DecisionQuestion::Choice {
                     instructions,
                     criteria,
                 } => {
-                    if !(2..=255).contains(&criteria.len()) {
-                        return Err(LlmError::new(
-                            "Decision choice requires between 2 and 255 options",
-                        ));
-                    }
+                    reject_if(
+                        !(2..=255).contains(&criteria.len()),
+                        "Decision choice requires between 2 and 255 options",
+                    )?;
                     instructions
                 }
                 DecisionQuestion::Score {
                     instructions,
                     criteria,
                 } => {
-                    if !(2..=255).contains(&criteria.len()) {
-                        return Err(LlmError::new(
-                            "Decision score requires between 2 and 255 levels",
-                        ));
-                    }
+                    reject_if(
+                        !(2..=255).contains(&criteria.len()),
+                        "Decision score requires between 2 and 255 levels",
+                    )?;
                     instructions
                 }
             };
-            if !valid_content(instructions) {
-                return Err(LlmError::new(
-                    "Decision instructions must be a string, object or array",
-                ));
-            }
+            reject_if(
+                !valid_content(instructions),
+                "Decision instructions must be a string, object or array",
+            )?;
         }
         Ok(())
     }
