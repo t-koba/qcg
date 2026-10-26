@@ -192,19 +192,14 @@ fn registry_owns_policy_and_rejects_invalid_rules() {
 
 #[tokio::test]
 async fn reqwest_connect_and_body_facts_are_not_inferred_from_messages() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()
         .unwrap();
-    let raw = client
-        .get(format!("http://{address}"))
-        .send()
-        .await
-        .unwrap_err();
+    // Port zero is never a listener port, avoiding a race where another
+    // parallel test rebinds a just-released ephemeral port.
+    let raw = client.get("http://127.0.0.1:0").send().await.unwrap_err();
     assert!(raw.is_connect());
     let mapped = llm_http_error(raw);
     assert_eq!(mapped.kind, LlmErrorKind::Network);
