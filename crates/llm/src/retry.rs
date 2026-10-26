@@ -20,16 +20,12 @@ pub(crate) const MAX_RETRY_AFTER_SECS: u64 = 60;
 /// `A-Z a-z 0-9 . _ -`.
 pub(crate) fn sanitize_provider_error_code(raw: &str) -> Option<String> {
     let code = raw.trim();
-    if code.is_empty() || code.len() > MAX_PROVIDER_ERROR_CODE_LEN {
-        return None;
-    }
-    if !code
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
-    {
-        return None;
-    }
-    Some(code.to_string())
+    (!code.is_empty()
+        && code.len() <= MAX_PROVIDER_ERROR_CODE_LEN
+        && code
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-'))
+    .then(|| code.to_owned())
 }
 
 /// First matching rule wins; omitted match fields are wildcards. Empty rules
@@ -198,12 +194,11 @@ pub(crate) fn effective_retry_delay(
     base: std::time::Duration,
     applied_after_secs: Option<u64>,
 ) -> std::time::Duration {
-    if let Some(secs) = applied_after_secs {
-        return base.max(std::time::Duration::from_secs(
+    applied_after_secs.map_or(base, |secs| {
+        base.max(std::time::Duration::from_secs(
             secs.min(MAX_RETRY_AFTER_SECS),
-        ));
-    }
-    base
+        ))
+    })
 }
 
 impl RetryPolicy {
