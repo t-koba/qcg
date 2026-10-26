@@ -30,11 +30,7 @@ pub(crate) fn chat_completions_payload(
     if !req.stop_sequences.is_empty() {
         payload["stop"] = json!(req.stop_sequences);
     }
-    set_optional(
-        &mut payload,
-        "seed",
-        send_seed.then_some(req.seed).flatten(),
-    );
+    set_optional(&mut payload, "seed", req.seed.filter(|_| send_seed));
     if let Some((schema, strict)) = native_response_schema(req) {
         payload["response_format"] = json!({
             "type": "json_schema",
