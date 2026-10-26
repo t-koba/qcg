@@ -22,10 +22,11 @@ fn required_nonempty_text(field: Option<&Value>, message: &str) -> Result<String
 }
 
 pub(crate) fn parse_chat_completions_response(value: Value) -> Result<ChatResponse, LlmError> {
-    let message = value
+    let choice = value
         .get("choices")
         .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
+        .and_then(|choices| choices.first());
+    let message = choice
         .and_then(|choice| choice.get("message"))
         .ok_or_else(|| {
             LlmError::invalid_response(
@@ -56,10 +57,7 @@ pub(crate) fn parse_chat_completions_response(value: Value) -> Result<ChatRespon
         ));
     }
     let usage = crate::usage::openai_usage(&value["usage"], true)?;
-    let finish_reason = value
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
+    let finish_reason = choice
         .and_then(|choice| choice.get("finish_reason"))
         .and_then(Value::as_str);
     let stop = match (finish_reason, refused.is_some()) {
