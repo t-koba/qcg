@@ -154,7 +154,9 @@ impl SearchProviderSpec {
             ));
         }
         for (header, value) in &self.headers {
-            if !valid_http_header_name(header) || value.contains(['\r', '\n']) {
+            if reqwest::header::HeaderName::from_bytes(header.as_bytes()).is_err()
+                || value.contains(['\r', '\n'])
+            {
                 return Err(invalid(&format!(
                     "has an invalid static HTTP header `{header}`"
                 )));
@@ -176,7 +178,7 @@ impl SearchProviderSpec {
         ) {
             (None, None, None) if self.auth_prefix.is_empty() => {}
             (Some(_), Some(header), None) => {
-                if !valid_http_header_name(header) {
+                if reqwest::header::HeaderName::from_bytes(header.as_bytes()).is_err() {
                     return Err(invalid(&format!("has an invalid auth_header `{header}`")));
                 }
                 if self.auth_prefix.contains(['\r', '\n']) {
@@ -440,30 +442,6 @@ fn invalid_json_pointer_escape(token: &str) -> bool {
         }
     }
     false
-}
-
-fn valid_http_header_name(value: &str) -> bool {
-    !value.is_empty()
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(
-                    byte,
-                    b'!' | b'#'
-                        | b'$'
-                        | b'%'
-                        | b'&'
-                        | b'\''
-                        | b'*'
-                        | b'+'
-                        | b'-'
-                        | b'.'
-                        | b'^'
-                        | b'_'
-                        | b'`'
-                        | b'|'
-                        | b'~'
-                )
-        })
 }
 
 #[cfg(test)]
