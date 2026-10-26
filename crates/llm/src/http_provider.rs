@@ -621,14 +621,8 @@ impl HttpProvider {
             // code. Screening always finishes before any code is retained.
             if let Some(text) = read_error_body_bounded(response, inspect_limit).await
                 && let Ok(value) = self.screened_json(&text, credential.as_deref(), "response")?
-                && let Some(code) = extract_provider_error_code(&value)
             {
-                let leaks_credential = credential
-                    .as_deref()
-                    .is_some_and(|key| !key.is_empty() && code == key);
-                if !leaks_credential {
-                    error.provider_code = Some(code);
-                }
+                error.provider_code = extract_provider_error_code(&value);
             }
             error.retry_after_secs = retry_after_secs;
             return Err(error);
