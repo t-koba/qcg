@@ -485,12 +485,11 @@ impl<'a> RetryState<'a> {
             emitted,
             &self.observer,
         );
-        let applied_after = error.decisions.last().and_then(|decision| {
-            decision
-                .retry_after_applied
-                .then_some(decision.retry_after_secs)
-                .flatten()
-        });
+        let applied_after = error
+            .decisions
+            .last()
+            .filter(|decision| decision.retry_after_applied)
+            .and_then(|decision| decision.retry_after_secs);
         self.decisions.append(&mut error.decisions);
         if action != RetryAction::Retry {
             error.decisions = std::mem::take(&mut self.decisions);

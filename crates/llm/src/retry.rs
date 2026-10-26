@@ -231,14 +231,13 @@ impl LlmError {
         if is_terminal_error_kind(self.kind) {
             return false;
         }
-        self.decisions.last().map_or_else(
-            || {
-                RetryPolicy::default()
-                    .decide(self, 1, 1, false, false)
-                    .action
-                    == RetryAction::NextRoute
-            },
-            |decision| decision.action == RetryAction::NextRoute,
-        )
+        if let Some(decision) = self.decisions.last() {
+            decision.action == RetryAction::NextRoute
+        } else {
+            RetryPolicy::default()
+                .decide(self, 1, 1, false, false)
+                .action
+                == RetryAction::NextRoute
+        }
     }
 }
