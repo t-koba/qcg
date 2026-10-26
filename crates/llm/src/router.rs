@@ -114,26 +114,19 @@ impl LlmRouter {
     }
 
     pub fn from_file(path: &Utf8Path) -> Result<Self, RegistryError> {
-        let mut file = File::open(path).map_err(|source| RegistryError::Read {
+        let read_error = |source| RegistryError::Read {
             path: path.to_path_buf(),
             source,
-        })?;
-        let metadata = file.metadata().map_err(|source| RegistryError::Read {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        };
+        let mut file = File::open(path).map_err(read_error)?;
+        let metadata = file.metadata().map_err(read_error)?;
         if !metadata.is_file() {
             return Err(RegistryError::Invalid {
                 message: format!("providers registry `{path}` is not a regular file"),
             });
         }
         let mut bytes = Vec::new();
-        file.by_ref()
-            .read_to_end(&mut bytes)
-            .map_err(|source| RegistryError::Read {
-                path: path.to_path_buf(),
-                source,
-            })?;
+        file.by_ref().read_to_end(&mut bytes).map_err(read_error)?;
         let text = String::from_utf8(bytes).map_err(|error| RegistryError::Invalid {
             message: format!("providers registry `{path}` is not valid UTF-8: {error}"),
         })?;
