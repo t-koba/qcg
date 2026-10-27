@@ -84,10 +84,9 @@ pub(crate) struct AdoptedRunIdentity<'a> {
 /// The ONE seed-from-snapshot function for every adoption path (E03):
 /// start, fork, live-hit verification, and rival-race fallback all derive
 /// the seed, queue instant, and identity proof from a single already-read
-/// snapshot instead of scanning per field. Callers with no snapshot yet
-/// (rival registered after the adoption read left it empty) materialize one
-/// via `materialize_adopt_snapshot_for_fallback` below, then call this —
-/// never a second per-field scan.
+/// snapshot instead of scanning per field. The live-hit verifier owns the
+/// rival-race fallback when the adoption read left its snapshot empty, then
+/// calls this with the single materialized snapshot.
 /// Seed from an adoption snapshot whose state was already folded by
 /// `try_adopt_run_dir_with_snapshot`: no second fold of the same events
 /// (E03).
@@ -308,12 +307,18 @@ fn seed_adopted_run_from_state(
 /// reuses its pre-folded state instead of rescanning or refolding. The
 /// rival-race fallback (empty snapshot) materializes one snapshot via a
 /// single read + fold, then calls the same ONE seed function above — no
-/// per-field scans, no duplicated 1-line delegations.
+/// per-field scans or duplicated fallback branches.
 fn verify_live_admission_from_snapshot(
     snapshot: &crate::run_dirs::AdoptSnapshot,
     expected: &AdoptedRunIdentity<'_>,
+    run_dir: &Utf8Path,
 ) -> Result<Option<AdoptedRunSeed>, ApiError> {
-    seed_adopted_run_from_snapshot(snapshot, expected)
+    if snapshot.is_empty() {
+        let fallback = materialize_adopt_snapshot_for_fallback(run_dir)?;
+        seed_adopted_run_from_snapshot(&fallback, expected)
+    } else {
+        seed_adopted_run_from_snapshot(snapshot, expected)
+    }
 }
 
 /// Derives the canonical fork inputs from one already-folded admission
@@ -359,7 +364,7 @@ fn resolve_fork_live_hit(
     let adopted_inputs = fork_checkpoint_inputs(snapshot, contract, source_id, request.at_seq)?;
     // The returned seed reuses the snapshot fold; converging callers only
     // need the identity proof, so the seed itself is not retained (E03).
-    verify_live_admission_from_snapshot(
+    seed_adopted_run_from_snapshot(
         snapshot,
         &AdoptedRunIdentity {
             inputs: &adopted_inputs,

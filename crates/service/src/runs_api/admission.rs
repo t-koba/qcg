@@ -329,12 +329,7 @@ impl LocalService {
                 answers: &req.answers,
                 confirmations: &req.confirmations,
             };
-            if adopt_snapshot.is_empty() {
-                let fallback = materialize_adopt_snapshot_for_fallback(&run_dir)?;
-                verify_live_admission_from_snapshot(&fallback, &identity)?;
-            } else {
-                verify_live_admission_from_snapshot(&adopt_snapshot, &identity)?;
-            }
+            verify_live_admission_from_snapshot(&adopt_snapshot, &identity, &run_dir)?;
             return Ok(run_id);
         }
         let inputs = canonical_inputs;
@@ -437,12 +432,7 @@ impl LocalService {
                     answers: &answers,
                     confirmations: &confirmations,
                 };
-                if adopt_snapshot.is_empty() {
-                    let fallback = materialize_adopt_snapshot_for_fallback(&run_dir)?;
-                    verify_live_admission_from_snapshot(&fallback, &identity)?;
-                } else {
-                    verify_live_admission_from_snapshot(&adopt_snapshot, &identity)?;
-                }
+                verify_live_admission_from_snapshot(&adopt_snapshot, &identity, &run_dir)?;
                 return Ok(run_id);
             }
             Err(ProbeRejection::Shutdown) => {
@@ -583,12 +573,7 @@ impl LocalService {
                     answers: &answers,
                     confirmations: &confirmations,
                 };
-                if adopt_snapshot.is_empty() {
-                    let fallback = materialize_adopt_snapshot_for_fallback(&run_dir)?;
-                    verify_live_admission_from_snapshot(&fallback, &identity)?;
-                } else {
-                    verify_live_admission_from_snapshot(&adopt_snapshot, &identity)?;
-                }
+                verify_live_admission_from_snapshot(&adopt_snapshot, &identity, &run_dir)?;
                 return Ok(run_id);
             }
             Ok(AdmissionVerdict::Inserted) => {}
@@ -942,12 +927,7 @@ impl LocalService {
                     answers: &fork_answers,
                     confirmations: &fork_confirmations,
                 };
-                if fork_snapshot.is_empty() {
-                    let fallback = materialize_adopt_snapshot_for_fallback(&run_dir)?;
-                    verify_live_admission_from_snapshot(&fallback, &identity)?;
-                } else {
-                    verify_live_admission_from_snapshot(&fork_snapshot, &identity)?;
-                }
+                verify_live_admission_from_snapshot(&fork_snapshot, &identity, &run_dir)?;
                 return Ok(run_id);
             }
             Err(ProbeRejection::Shutdown) => {
@@ -1088,12 +1068,7 @@ impl LocalService {
                     answers: &fork_answers,
                     confirmations: &fork_confirmations,
                 };
-                if fork_snapshot.is_empty() {
-                    let fallback = materialize_adopt_snapshot_for_fallback(&run_dir)?;
-                    verify_live_admission_from_snapshot(&fallback, &identity)?;
-                } else {
-                    verify_live_admission_from_snapshot(&fork_snapshot, &identity)?;
-                }
+                verify_live_admission_from_snapshot(&fork_snapshot, &identity, &run_dir)?;
                 return Ok(run_id);
             }
             Ok(AdmissionVerdict::Inserted) => {}
