@@ -493,11 +493,7 @@ impl LocalService {
         };
         for entry in read_dir {
             let entry = entry.map_err(|error| ApiError::internal(error.to_string()))?;
-            if entry
-                .file_name()
-                .to_str()
-                .is_some_and(crate::run_dirs::is_store_coordination_name)
-            {
+            if crate::run_dirs::is_coordination_entry(&entry) {
                 continue;
             }
             scanned = scanned.saturating_add(1);

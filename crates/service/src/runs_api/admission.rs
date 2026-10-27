@@ -13,6 +13,32 @@ fn verify_fork_source_identity(state: &engine::RunState, source_id: &str) -> Res
     }
 }
 
+/// Refused-admission shutdown with ownership cleanup: only this admission's own
+/// directory is removed, adopted ones survive. Cleanup failure is Internal (E03/E04).
+fn refused_shutdown(own_dir: Option<&Utf8Path>) -> Result<ApiError, ApiError> {
+    if let Some(dir) = own_dir {
+        std::fs::remove_dir_all(dir).map_err(api_internal)?;
+    }
+    Ok(ApiError::Unavailable {
+        detail: "server is shutting down".into(),
+    })
+}
+
+/// Capacity refusal with the same ownership rule; message identical across paths (E03).
+fn refused_capacity(
+    own_dir: Option<&Utf8Path>,
+    max_tracked_runs: usize,
+) -> Result<ApiError, ApiError> {
+    if let Some(dir) = own_dir {
+        std::fs::remove_dir_all(dir).map_err(api_internal)?;
+    }
+    Ok(ApiError::Unavailable {
+        detail: format!(
+            "run capacity is exhausted: {max_tracked_runs} non-terminal runs are already tracked"
+        ),
+    })
+}
+
 impl LocalService {
     /// Fails write-path API calls during shutdown (E05).
     pub(crate) fn ensure_running(&self) -> Result<(), ApiError> {
@@ -78,15 +104,7 @@ impl LocalService {
         }
         if runs.len() >= self.inner.max_tracked_runs {
             drop(runs);
-            if let Some(dir) = own_dir {
-                std::fs::remove_dir_all(dir).map_err(api_internal)?;
-            }
-            return Err(ApiError::Unavailable {
-                detail: format!(
-                    "run capacity is exhausted: {} non-terminal runs are already tracked",
-                    self.inner.max_tracked_runs
-                ),
-            });
+            return Err(refused_capacity(own_dir, self.inner.max_tracked_runs)?);
         }
         runs.insert(run_id, staged);
         Ok(AdmissionVerdict::Inserted)
@@ -436,29 +454,15 @@ impl LocalService {
                 return Ok(run_id);
             }
             Err(ProbeRejection::Shutdown) => {
-                // A shutdown that landed after preparation must not leave
-                // an empty directory behind: only directories this
-                // admission created are removed, and the run stays
-                // resumable nowhere (it never started) (E04).
-                if created_fresh {
-                    std::fs::remove_dir_all(&run_dir).map_err(api_internal)?;
-                }
-                return Err(ApiError::Unavailable {
-                    detail: "server is shutting down".into(),
-                });
+                return Err(refused_shutdown(
+                    created_fresh.then_some(run_dir.as_path()),
+                )?);
             }
             Err(ProbeRejection::Capacity) => {
-                // Only directories this admission created are removed: an
-                // adopted directory predates us and always survives (E03).
-                if created_fresh {
-                    std::fs::remove_dir_all(&run_dir).map_err(api_internal)?;
-                }
-                return Err(ApiError::Unavailable {
-                    detail: format!(
-                        "run capacity is exhausted: {} non-terminal runs are already tracked",
-                        self.inner.max_tracked_runs
-                    ),
-                });
+                return Err(refused_capacity(
+                    created_fresh.then_some(run_dir.as_path()),
+                    self.inner.max_tracked_runs,
+                )?);
             }
         }
         // All per-admission allocations happen after the probe, so rejected
@@ -931,29 +935,15 @@ impl LocalService {
                 return Ok(run_id);
             }
             Err(ProbeRejection::Shutdown) => {
-                // Same ownership rule as capacity below: a checkpoint copy
-                // this admission made is removed; an adopted one predates
-                // us and always survives (E03/E04).
-                if created_fresh {
-                    std::fs::remove_dir_all(&run_dir).map_err(api_internal)?;
-                }
-                return Err(ApiError::Unavailable {
-                    detail: "server is shutting down".into(),
-                });
+                return Err(refused_shutdown(
+                    created_fresh.then_some(run_dir.as_path()),
+                )?);
             }
             Err(ProbeRejection::Capacity) => {
-                // Only directories this admission created are removed: an
-                // adopted checkpoint copy predates us and always survives
-                // (E03).
-                if created_fresh {
-                    std::fs::remove_dir_all(&run_dir).map_err(api_internal)?;
-                }
-                return Err(ApiError::Unavailable {
-                    detail: format!(
-                        "run capacity is exhausted: {} non-terminal runs are already tracked",
-                        self.inner.max_tracked_runs
-                    ),
-                });
+                return Err(refused_capacity(
+                    created_fresh.then_some(run_dir.as_path()),
+                    self.inner.max_tracked_runs,
+                )?);
             }
         }
         // All per-admission allocations happen after the probe, so rejected

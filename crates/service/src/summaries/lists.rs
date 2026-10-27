@@ -19,21 +19,10 @@ pub fn list_run_summaries(
     let mut scanned = 0_usize;
     for entry in std::fs::read_dir(runs_dir)? {
         let entry = entry?;
-        // G03: coordination entries never consume the scan budget (see
-        // rehydrate_runs for the rationale).
-        if entry
-            .file_name()
-            .to_str()
-            .is_some_and(crate::run_dirs::is_store_coordination_name)
-        {
+        if crate::run_dirs::is_coordination_entry(&entry) {
             continue;
         }
-        scanned = scanned.saturating_add(1);
-        if scanned > max_scan_entries {
-            return Err(ServiceError::Invalid(format!(
-                "runs directory contains more than {max_scan_entries} entries"
-            )));
-        }
+        crate::run_dirs::bump_scan_count(&mut scanned, max_scan_entries)?;
         let path = Utf8PathBuf::from_path_buf(entry.path()).map_err(|path| {
             ServiceError::Invalid(format!("run path is not valid UTF-8: {}", path.display()))
         })?;
@@ -66,19 +55,10 @@ pub(crate) fn list_items_cached(
     let mut scanned = 0;
     for entry in std::fs::read_dir(runs_dir)? {
         let entry = entry?;
-        if entry
-            .file_name()
-            .to_str()
-            .is_some_and(crate::run_dirs::is_store_coordination_name)
-        {
+        if crate::run_dirs::is_coordination_entry(&entry) {
             continue;
         }
-        scanned += 1;
-        if scanned > cap {
-            return Err(ServiceError::Invalid(format!(
-                "runs directory contains more than {cap} entries"
-            )));
-        }
+        crate::run_dirs::bump_scan_count(&mut scanned, cap)?;
         let path = Utf8PathBuf::from_path_buf(entry.path())
             .map_err(|_| ServiceError::Invalid("run path is not UTF-8".into()))?;
         if !entry.file_type()?.is_dir() {

@@ -149,11 +149,7 @@ fn scan_runs(
         // bookkeeping) are skipped WITHOUT consuming the scan budget, so
         // lifetime admissions can never exhaust recovery. The name probe
         // uses the directory entry name only, never following links.
-        if entry
-            .file_name()
-            .to_str()
-            .is_some_and(crate::run_dirs::is_store_coordination_name)
-        {
+        if crate::run_dirs::is_coordination_entry(&entry) {
             continue;
         }
         scanned = scanned.saturating_add(1);

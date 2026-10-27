@@ -157,14 +157,9 @@ impl LocalService {
             {
                 record.cancellation.cancel();
                 record.state = RunStatus::Queued;
-                record.question = None;
-                record.confirm = None;
+                record.clear_prompt();
                 record.artifacts = None;
-                record
-                    .task
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .take()
+                record.take_task_slot()
             } else {
                 record.scheduler_yield.cancel();
                 // Leave the handle installed so user cancellation and shutdown

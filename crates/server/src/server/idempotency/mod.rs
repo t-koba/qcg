@@ -91,6 +91,22 @@ pub(crate) enum StartIdempotencyLookup {
     Absent,
 }
 
+/// Single snapshot fetch plus exact-body response for every idempotency replay path.
+/// All Ready replays and unkeyed executions serve the same bytes and validator,
+/// so they share one fetch-and-respond instead of repeating it per branch.
+async fn snapshot_response(
+    state: &Arc<AppState>,
+    run_id: String,
+    created: bool,
+) -> Result<Response, ApiHttpError> {
+    let snapshot = state
+        .service
+        .snapshot(run_id)
+        .await
+        .map_err(ApiHttpError::from_api)?;
+    respond_with_snapshot(snapshot, created)
+}
+
 /// Looks up an exact start replay or live claim before package preflight.
 /// Matching Pending requests must reach the normal waiter even if the source
 /// package has changed; absent/expired claims still require current-package
@@ -135,13 +151,9 @@ where
     };
 
     if let Some(run_id) = memory_run_id {
-        let snapshot = call
-            .state
-            .service
-            .snapshot(run_id)
+        return snapshot_response(call.state, run_id, call.created)
             .await
-            .map_err(ApiHttpError::from_api)?;
-        return respond_with_snapshot(snapshot, call.created).map(StartIdempotencyLookup::Ready);
+            .map(StartIdempotencyLookup::Ready);
     }
 
     // Check Ready before Pending, matching the normal peer-wait path.
@@ -155,13 +167,9 @@ where
         if record.digest != digest {
             return Err(idempotency_conflict());
         }
-        let snapshot = call
-            .state
-            .service
-            .snapshot(record.run_id)
+        return snapshot_response(call.state, record.run_id, call.created)
             .await
-            .map_err(ApiHttpError::from_api)?;
-        return respond_with_snapshot(snapshot, call.created).map(StartIdempotencyLookup::Ready);
+            .map(StartIdempotencyLookup::Ready);
     }
 
     if memory_pending {
@@ -188,13 +196,9 @@ where
         if record.digest != digest {
             return Err(idempotency_conflict());
         }
-        let snapshot = call
-            .state
-            .service
-            .snapshot(record.run_id)
+        return snapshot_response(call.state, record.run_id, call.created)
             .await
-            .map_err(ApiHttpError::from_api)?;
-        return respond_with_snapshot(snapshot, call.created).map(StartIdempotencyLookup::Ready);
+            .map(StartIdempotencyLookup::Ready);
     }
     Ok(StartIdempotencyLookup::Absent)
 }
@@ -236,12 +240,7 @@ where
         let run_id = execute(reserved_run_id.clone())
             .await
             .map_err(ApiHttpError::from_api)?;
-        let snapshot = state
-            .service
-            .snapshot(run_id)
-            .await
-            .map_err(ApiHttpError::from_api)?;
-        return respond_with_snapshot(snapshot, created);
+        return snapshot_response(state, run_id, created).await;
     };
     // Frozen boot policy: every prune, capacity, TTL, and expiry decision
     // below uses the values resolved once at boot and stored in AppState.
@@ -279,12 +278,7 @@ where
                         }
                         let run_id = record.run_id.clone();
                         drop(idempotency);
-                        let snapshot = state
-                            .service
-                            .snapshot(run_id)
-                            .await
-                            .map_err(ApiHttpError::from_api)?;
-                        return respond_with_snapshot(snapshot, created);
+                        return snapshot_response(state, run_id, created).await;
                     }
                     Some(IdempotencyEntry::Pending {
                         digest, completed, ..
@@ -452,12 +446,7 @@ where
                                 if digest != request_digest {
                                     return Err(idempotency_conflict());
                                 }
-                                let snapshot = state
-                                    .service
-                                    .snapshot(run_id)
-                                    .await
-                                    .map_err(ApiHttpError::from_api)?;
-                                return respond_with_snapshot(snapshot, created);
+                                return snapshot_response(state, run_id, created).await;
                             }
                             Reexamined::Pending { digest, waiter } => {
                                 let release = claim_owner.clone().zip(claim_generation);
@@ -807,12 +796,7 @@ where
     if let Some(completed) = completed {
         let _ = completed.send(true);
     }
-    let snapshot = state
-        .service
-        .snapshot(committed_run_id)
-        .await
-        .map_err(ApiHttpError::from_api)?;
-    respond_with_snapshot(snapshot, created)
+    snapshot_response(state, committed_run_id, created).await
 }
 
 /// Every observed Ready caches the original record, including its TTL anchor.
@@ -827,12 +811,7 @@ async fn replay_ready(
         .lock()
         .await
         .insert(record.key.clone(), IdempotencyEntry::ready(record));
-    let snapshot = state
-        .service
-        .snapshot(run_id)
-        .await
-        .map_err(ApiHttpError::from_api)?;
-    respond_with_snapshot(snapshot, created)
+    snapshot_response(state, run_id, created).await
 }
 
 pub(crate) fn idempotency_conflict() -> ApiHttpError {

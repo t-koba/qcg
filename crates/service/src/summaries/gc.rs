@@ -46,31 +46,15 @@ pub fn gc_run_directories(
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                scanned = scanned.saturating_add(1);
-                if scanned > max_scan_entries {
-                    return Err(ServiceError::Invalid(format!(
-                        "runs directory contains more than {max_scan_entries} entries"
-                    )));
-                }
+                crate::run_dirs::bump_scan_count(&mut scanned, max_scan_entries)?;
                 tracing::warn!(%error, "skipping unreadable runs-directory entry during retention GC");
                 continue;
             }
         };
-        // G03: coordination entries never consume the scan budget (see
-        // rehydrate_runs for the rationale).
-        if entry
-            .file_name()
-            .to_str()
-            .is_some_and(crate::run_dirs::is_store_coordination_name)
-        {
+        if crate::run_dirs::is_coordination_entry(&entry) {
             continue;
         }
-        scanned = scanned.saturating_add(1);
-        if scanned > max_scan_entries {
-            return Err(ServiceError::Invalid(format!(
-                "runs directory contains more than {max_scan_entries} entries"
-            )));
-        }
+        crate::run_dirs::bump_scan_count(&mut scanned, max_scan_entries)?;
         let path = match Utf8PathBuf::from_path_buf(entry.path()) {
             Ok(path) => path,
             Err(path) => {

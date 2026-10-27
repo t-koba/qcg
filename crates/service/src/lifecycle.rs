@@ -631,8 +631,7 @@ impl LocalService {
                     record.cancellation.cancel();
                     record.state = RunStatus::CancelRequested;
                     record.preempted = false;
-                    record.question = None;
-                    record.confirm = None;
+                    record.clear_prompt();
                     continue;
                 }
                 // Refresh pending prompts and durable HITL maps from the journal.
@@ -648,8 +647,7 @@ impl LocalService {
                     // when the journal has nothing to say. Nothing here stamps a
                     // fresh local time, so FIFO order is identical everywhere.
                     record.queued_at = journal_queued_at.or(record.queued_at);
-                    record.question = None;
-                    record.confirm = None;
+                    record.clear_prompt();
                 };
                 // An accepted cancel request survives prompt refreshes: the
                 // request stays accepted until a terminal outcome settles it.
@@ -756,13 +754,8 @@ impl LocalService {
             if let Some(record) = runs.get_mut(run_id) {
                 record.state = terminal_status(&terminal);
                 record.preempted = false;
-                record.question = None;
-                record.confirm = None;
-                record
-                    .task
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .take();
+                record.clear_prompt();
+                record.take_task_slot();
             }
             self.inner.queue_notify.notify_waiters();
             return;
@@ -809,13 +802,8 @@ impl LocalService {
                         record.state = settled_state;
                     }
                     record.preempted = false;
-                    record.question = None;
-                    record.confirm = None;
-                    record
-                        .task
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .take();
+                    record.clear_prompt();
+                    record.take_task_slot();
                 }
             }
             Err(error) => {
@@ -827,13 +815,8 @@ impl LocalService {
                     if !record.state.is_terminal() {
                         record.state = RunStatus::CancelRequested;
                     }
-                    record.question = None;
-                    record.confirm = None;
-                    record
-                        .task
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .take();
+                    record.clear_prompt();
+                    record.take_task_slot();
                 }
             }
         }
@@ -1271,8 +1254,7 @@ impl LocalService {
         {
             record.state = RunStatus::Failed;
             record.preempted = false;
-            record.question = None;
-            record.confirm = None;
+            record.clear_prompt();
         }
         self.inner.queue_notify.notify_waiters();
     }
@@ -1520,8 +1502,7 @@ impl LocalService {
                                 None => RunStatus::Canceled,
                             };
                             record.preempted = false;
-                            record.question = None;
-                            record.confirm = None;
+                            record.clear_prompt();
                             return;
                         }
                         Ok((state, values)) => (state, values),
@@ -1570,8 +1551,7 @@ impl LocalService {
                         if let Some(record) = runs.get_mut(&run_id) {
                             record.state = RunStatus::Failed;
                             record.preempted = false;
-                            record.question = None;
-                            record.confirm = None;
+                            record.clear_prompt();
                         }
                         drop(runs);
                         service.inner.queue_notify.notify_waiters();
@@ -2088,8 +2068,7 @@ impl LocalService {
         // what restarts and peers derive from the same journal (E03).
         record.queued_at = crate::summaries::read_last_queued_at(&record.run_dir)
             .or_else(|| Some(chrono::Utc::now()));
-        record.question = None;
-        record.confirm = None;
+        record.clear_prompt();
         record.artifacts = None;
         let cancellation = CancellationToken::new();
         record.cancellation = cancellation.clone();

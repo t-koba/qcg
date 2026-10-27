@@ -239,6 +239,22 @@ pub(crate) struct RunRecord {
     pub(crate) ephemeral: bool,
 }
 
+impl RunRecord {
+    /// Clears any pending prompt display; settlement and requeue share one path.
+    pub(crate) fn clear_prompt(&mut self) {
+        self.question = None;
+        self.confirm = None;
+    }
+
+    /// Takes the engine task handle; discarding callers drop it, owners join it.
+    pub(crate) fn take_task_slot(&self) -> Option<JoinHandle<()>> {
+        self.task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
 /// Open journal handle for constant-memory HTTP delivery. The configured
 /// total bound (when any) was already enforced against the file size before
 /// the first byte is served.

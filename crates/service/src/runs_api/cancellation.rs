@@ -69,8 +69,7 @@ impl LocalService {
             // and only a journaled terminal state reports `Canceled` (A02).
             record.state = RunStatus::CancelRequested;
             record.preempted = false;
-            record.question = None;
-            record.confirm = None;
+            record.clear_prompt();
             record.artifacts = None;
             if !engine_is_active {
                 let settled = record.clone();
@@ -79,11 +78,7 @@ impl LocalService {
                 // Single-writer rule: never append while the engine task is
                 // live. The owner task drains the mailbox and settles the
                 // journal after exiting (A01).
-                let task = record
-                    .task
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .take();
+                let task = record.take_task_slot();
                 (task, None)
             }
         };

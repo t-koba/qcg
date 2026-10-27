@@ -139,12 +139,7 @@ pub(crate) fn is_regular_file(path: &Utf8Path) -> Result<bool, ServiceError> {
 pub(crate) fn lock_runs_directory(runs_dir: &Utf8Path) -> Result<File, ServiceError> {
     std::fs::create_dir_all(runs_dir)?;
     let lock_path = runs_dir.join(".service.lock");
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)?;
+    let file = open_lock_file(&lock_path)?;
     match file.try_lock() {
         Ok(()) => {}
         Err(std::fs::TryLockError::WouldBlock) => {
@@ -164,12 +159,7 @@ pub(crate) fn lock_runs_directory(runs_dir: &Utf8Path) -> Result<File, ServiceEr
 pub(crate) fn lock_runs_directory_shared(runs_dir: &Utf8Path) -> Result<File, ServiceError> {
     std::fs::create_dir_all(runs_dir)?;
     let lock_path = runs_dir.join(".service.lock");
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)?;
+    let file = open_lock_file(&lock_path)?;
     match file.try_lock_shared() {
         Ok(()) => Ok(file),
         Err(std::fs::TryLockError::WouldBlock) => Err(ServiceError::Invalid(format!(
@@ -231,6 +221,37 @@ pub(crate) fn is_store_coordination_name(name: &str) -> bool {
     name.starts_with('.') || name == "idempotency"
 }
 
+/// Store-coordination entry probe (G03): coordination never consumes scan budgets.
+pub(crate) fn is_coordination_entry(entry: &std::fs::DirEntry) -> bool {
+    entry
+        .file_name()
+        .to_str()
+        .is_some_and(is_store_coordination_name)
+}
+
+/// Shared lock-file open for coordination locks: create without truncating, readable
+/// and writable for `flock` semantics. Error mapping matches direct `OpenOptions` use.
+fn open_lock_file(path: &Utf8Path) -> Result<std::fs::File, ServiceError> {
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(ServiceError::Io)
+}
+
+/// Advances a store scan budget after coordination skipping; every call counts one entry (G03).
+pub(crate) fn bump_scan_count(scanned: &mut usize, max: usize) -> Result<(), ServiceError> {
+    *scanned = scanned.saturating_add(1);
+    if *scanned > max {
+        return Err(ServiceError::Invalid(format!(
+            "runs directory contains more than {max} entries"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn try_lock_run_admission(
     run_dir: &Utf8Path,
 ) -> Result<Option<RunAdmissionLock>, ServiceError> {
@@ -290,12 +311,7 @@ fn try_lock_run_shard(run_dir: &Utf8Path, directory: &str) -> Result<Option<File
         .file_name()
         .ok_or_else(|| ServiceError::Invalid(format!("run directory `{run_dir}` has no name")))?;
     let shard = run_coordination_shard_index(run_id);
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(shards_dir.join(format!("shard-{shard:02x}.lock")))?;
+    let file = open_lock_file(&shards_dir.join(format!("shard-{shard:02x}.lock")))?;
     match file.try_lock() {
         Ok(()) => Ok(Some(file)),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
@@ -385,12 +401,7 @@ pub(crate) fn try_lock_run_execution(
 pub(crate) fn try_lock_existing_run_execution(
     run_dir: &Utf8Path,
 ) -> Result<Option<RunExecutionLock>, ServiceError> {
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(run_meta_dir(run_dir).join("execution.lock"))?;
+    let file = open_lock_file(&run_meta_dir(run_dir).join("execution.lock"))?;
     match file.try_lock() {
         Ok(()) => Ok(Some(RunExecutionLock(file))),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
@@ -470,12 +481,7 @@ pub fn try_lock_store_maintenance(
     runs_dir: &Utf8Path,
 ) -> Result<Option<StoreMaintenanceLock>, ServiceError> {
     std::fs::create_dir_all(runs_dir)?;
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(runs_dir.join(".maintenance.lock"))?;
+    let file = open_lock_file(&runs_dir.join(".maintenance.lock"))?;
     match file.try_lock() {
         Ok(()) => Ok(Some(StoreMaintenanceLock(file))),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
@@ -2447,12 +2453,7 @@ pub(crate) fn has_pending_cancel_control(run_dir: &Utf8Path) -> bool {
 pub(crate) fn lock_direct_run(metadata_dir: &Utf8Path) -> Result<File, ServiceError> {
     std::fs::create_dir_all(metadata_dir)?;
     let lock_path = metadata_dir.join(".run.lock");
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)?;
+    let file = open_lock_file(&lock_path)?;
     match file.try_lock() {
         Ok(()) => {}
         Err(std::fs::TryLockError::WouldBlock) => {

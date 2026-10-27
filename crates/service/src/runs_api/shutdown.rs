@@ -62,8 +62,7 @@ impl LocalService {
             let mut runs = self.inner.runs.write().await;
             if let Some(record) = runs.get_mut(id) {
                 record.state = RunStatus::Interrupted;
-                record.question = None;
-                record.confirm = None;
+                record.clear_prompt();
             }
         }
         Ok(())
@@ -120,8 +119,7 @@ impl LocalService {
                 // `Canceled` before that terminal outcome exists (A09).
                 record.state = RunStatus::CancelRequested;
                 record.preempted = false;
-                record.question = None;
-                record.confirm = None;
+                record.clear_prompt();
                 record.artifacts = None;
                 active.push((id.clone(), record.clone()));
             }
@@ -136,11 +134,7 @@ impl LocalService {
         let waits = active.into_iter().map(|(id, record)| {
             let service = service.clone();
             async move {
-                let handle_opt = record
-                    .task
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .take();
+                let handle_opt = record.take_task_slot();
                 let Some(handle) = handle_opt else {
                     service.settle_shutdown_without_task(&id, &record).await?;
                     return Ok::<(), ApiError>(());
@@ -221,8 +215,7 @@ impl LocalService {
                             let mut runs = service.inner.runs.write().await;
                             if let Some(record) = runs.get_mut(&id) {
                                 record.state = RunStatus::Interrupted;
-                                record.question = None;
-                                record.confirm = None;
+                                record.clear_prompt();
                             }
                         }
                         Ok::<(), ApiError>(())

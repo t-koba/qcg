@@ -160,8 +160,7 @@ impl LocalService {
                     record.answers.insert(question_id.clone(), answer.clone());
                     record.state = RunStatus::Queued;
                     record.queued_at = Some(queued_now);
-                    record.question = None;
-                    record.confirm = None;
+                    record.clear_prompt();
                     record.artifacts = None;
                     let cancellation = CancellationToken::new();
                     record.cancellation = cancellation.clone();
