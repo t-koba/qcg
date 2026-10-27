@@ -512,6 +512,147 @@ output_file = "context.txt""#,
     std::fs::remove_dir_all(fixture_root).expect("fixture directory should be removable");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn command_output_defaults_cover_check_and_exec_resource() {
+    let fixture = run_dir("output-default-fixture")
+        .parent()
+        .unwrap()
+        .join("generator");
+    std::fs::create_dir_all(&fixture).unwrap();
+    let script = "head -c 16777217 /dev/zero >&2; printf ok";
+    let base = format!(
+        r#"
+[generator]
+id = "output-default-fixture"
+version = "0.1.0"
+[permissions]
+fs_read = []
+network = []
+side_effects = "none"
+side_effects_scope = "invocation"
+fs_write = ["workspace"]
+commands = [{{ bin = "sh", args = ["-c", "{script}"], purpose = "test capture", isolation = "trusted_host" }}]
+[permissions.containers]
+enabled = false
+"#
+    );
+    let exec = format!(
+        r#"
+[resources.generated]
+type = "exec"
+[resources.generated.params]
+command = ["sh", "-c", "{script}"]
+{{max_bytes}}
+[[flow]]
+id = "write"
+type = "write"
+[flow.params]
+output_file = "result.txt"
+content = "ok"
+"#
+    );
+    let manifest = fixture.join(contract::MANIFEST_FILE);
+    std::fs::write(
+        &manifest,
+        format!("{base}{}", exec.replace("{max_bytes}", "")),
+    )
+    .unwrap();
+    let error = run_generator(
+        fixture.clone(),
+        "exec-default-refusal",
+        inputs([]),
+        answers([]),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("output exceeded limit"), "{error}");
+    std::fs::write(
+        &manifest,
+        format!(
+            "{base}{}",
+            exec.replace("{max_bytes}", "max_bytes = 16777219")
+        ),
+    )
+    .unwrap();
+    let run = run_generator(
+        fixture.clone(),
+        "exec-explicit-override",
+        inputs([]),
+        answers([]),
+    )
+    .await
+    .unwrap();
+    assert_file_eq(&run, "result.txt", "ok");
+    let check = format!(
+        r#"
+[[flow]]
+id = "check"
+type = "check.command"
+[flow.params]
+command = ["sh", "-c", "{script}"]
+"#
+    );
+    std::fs::write(&manifest, format!("{base}{check}")).unwrap();
+    let error = run_generator(
+        fixture.clone(),
+        "check-default-refusal",
+        inputs([]),
+        answers([]),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("output exceeded limit"), "{error}");
+    std::fs::write(
+        &manifest,
+        format!(
+            "{}{}",
+            base.replace("side_effects = \"none\"", "side_effects = \"allowed\""),
+            check.replace("check.command", "command")
+        ),
+    )
+    .unwrap();
+    let error = run_generator(
+        fixture.clone(),
+        "command-default-refusal",
+        inputs([]),
+        answers([]),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("output exceeded limit"), "{error}");
+    let short_base = base.replace(script, "printf abc");
+    let short_check = check.replace(script, "printf abc");
+    std::fs::write(
+        &manifest,
+        format!("{short_base}\n[runtime]\ncommand_output_limit_bytes = 2\n{short_check}"),
+    )
+    .unwrap();
+    let error = run_generator(
+        fixture.clone(),
+        "check-explicit-refusal",
+        inputs([]),
+        answers([]),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("output exceeded limit"), "{error}");
+    std::fs::write(
+        &manifest,
+        format!("{short_base}\n[runtime]\ncommand_output_limit_bytes = 3\n{short_check}"),
+    )
+    .unwrap();
+    run_generator(
+        fixture.clone(),
+        "check-explicit-success",
+        inputs([]),
+        answers([]),
+    )
+    .await
+    .unwrap();
+    std::fs::remove_dir_all(fixture).unwrap();
+}
+
 #[tokio::test]
 async fn llm_context_byte_limit_rejects_oversized_prompt() {
     let source = workspace_root().join("fixtures/generators/llm-context");

@@ -309,10 +309,12 @@ ignored.
 An `exec` resource is the stock declarative extension boundary for an external
 data source. It forbids `path` and `url`, requires
 `params.command = ["program", "arg", ...]`, and accepts an optional positive
-`params.max_bytes` (unbounded when omitted; otherwise checked against an
-explicit `runtime.command_output_limit_bytes` when one is set). The complete command shape must also be
-present in `permissions.commands`. qcg runs it through the ordinary isolated command
-gateway before the flow starts, bounds stdout, snapshots it under run metadata,
+`params.max_bytes`. It overrides the runtime default and, when an explicit
+`runtime.command_output_limit_bytes` is set, must not exceed it. Otherwise
+the runtime limit applies, defaulting to 16 MiB combined stdout and stderr.
+The complete command shape must also be present in `permissions.commands`.
+qcg runs it through the ordinary isolated command gateway before the flow
+starts, bounds the combined output, snapshots stdout under run metadata,
 checks `pin_sha256` when declared, and then exposes the immutable UTF-8 snapshot
 through ordinary resource context. Non-zero exit, non-UTF-8 output, permission
 denial, and limit violations fail explicitly.
@@ -4804,6 +4806,12 @@ fields are rejected when their structs define a closed schema.
    `journal_event_limit_bytes`, `journal_total_limit_bytes`,
    `journal_event_count_limit`,
    `state_limit_bytes`, `template_output_limit_bytes`, and `template_fuel`.
+   `command_output_limit_bytes` bounds combined stdout and stderr for each
+   ordinary command and check; omission uses 16 MiB. A limit violation fails
+   rather than silently truncating output. `exec` resources and command
+   guardrails may specify their own bounds, subject to an explicitly configured
+   runtime ceiling; declared tools have their own output bounds.
+   `command_input_limit_bytes` is a separate, explicit-only stdin bound.
    `http_body_limit_bytes` bounds one HTTP request body and one HTTP response
    body; omitted means the 16 MiB default, never an unbounded body.
    Template output is streamed through a bounded writer and each render gets a

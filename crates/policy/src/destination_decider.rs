@@ -51,10 +51,7 @@ pub fn decider_request_json(server: &str, tool: &str, hosts: &[String]) -> Vec<u
 /// allows. Unknown versions, missing or non-boolean `allow`, trailing
 /// garbage after the JSON document, and any failure all deny.
 pub fn decider_verdict_allows(status: i32, stdout: &[u8]) -> bool {
-    if status != 0 {
-        return false;
-    }
-    if stdout.len() > DECIDER_OUTPUT_LIMIT_BYTES {
+    if status != 0 || stdout.len() > DECIDER_OUTPUT_LIMIT_BYTES {
         return false;
     }
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(stdout) else {

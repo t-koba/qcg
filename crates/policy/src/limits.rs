@@ -56,6 +56,9 @@ pub const DEFAULT_MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 /// default bounds both directions of one HTTP exchange.
 pub const DEFAULT_HTTP_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
+/// Default combined stdout and stderr capture per command.
+pub const DEFAULT_COMMAND_OUTPUT_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+
 /// Hard cap for one run's observation stream when `[audit].max_bytes` is
 /// unset. The writer degrades instead of exceeding it, and every reader
 /// refuses a stream that already did, so an audit trail can never become the

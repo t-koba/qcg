@@ -583,7 +583,7 @@ impl Engine {
                 .with_bounds(CommandBounds {
                     timeout_seconds: contract.manifest.runtime.command_timeout_seconds,
                     input_limit_bytes: contract.manifest.runtime.command_input_limit_bytes,
-                    output_limit_bytes: contract.manifest.runtime.command_output_limit_bytes,
+                    output_limit_bytes: contract.manifest.runtime.command_output_limit(None),
                 })
                 // E13 snapshots live under the run metadata directory: allow
                 // static wildcards to match those run-private absolutes while

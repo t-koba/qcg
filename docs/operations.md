@@ -300,6 +300,11 @@ memory or disk. Minimum set:
   `template_context_limit_bytes`, `template_output_limit_bytes`,
   `state_limit_bytes`, plus `journal_event_limit_bytes`,
   `journal_total_limit_bytes`, and `journal_event_count_limit`.
+  Command stdout and stderr share a 16 MiB default capture limit;
+  `command_output_limit_bytes` overrides it. Exceeding the limit fails the
+  command rather than silently truncating it. The separate stdin limit remains
+  explicit-only. `exec` resource `params.max_bytes` overrides the command
+  default, subject to any explicit runtime output limit.
 - LLM nodes: `max_context_bytes` / `max_context_tokens`, and
   `max_media_bytes` when `params.media` is declared.
 - Resources: explicit `params` bounds (`max_bytes` for `file`, `url`,

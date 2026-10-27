@@ -337,6 +337,38 @@ async fn cancellation_stops_a_running_command() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn command_output_runtime_default_rejects_combined_streams_and_override_allows_them() {
+    let runtime = contract::RuntimeLimits::default();
+    let limit = policy::limits::DEFAULT_COMMAND_OUTPUT_LIMIT_BYTES;
+    let gateway = CmdGateway::new(Permissions::default(), temp_workspace());
+    let command = [
+        "sh".into(),
+        "-c".into(),
+        format!("head -c {} /dev/zero; printf x >&2", limit),
+    ];
+    let result = gateway
+        .run_trusted_process(&command, 30, runtime.command_output_limit(None))
+        .await;
+    assert!(matches!(
+        result,
+        Err(GatewayError::CommandOutputTooLarge { .. })
+    ));
+    let result = gateway
+        .run_trusted_process(&command, 30, runtime.command_output_limit(Some(limit + 1)))
+        .await
+        .unwrap();
+    assert_eq!(result.stdout_bytes.len(), limit);
+    assert_eq!(result.stderr_bytes, b"x");
+    let result = gateway
+        .run_trusted_process(&command, 30, None)
+        .await
+        .unwrap();
+    assert_eq!(result.stdout_bytes.len(), limit);
+    assert_eq!(result.stderr_bytes, b"x");
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn command_output_limit_stops_stdout_overflow_during_read() {
     let gateway = CmdGateway::new(Permissions::default(), temp_workspace());
     let result = gateway

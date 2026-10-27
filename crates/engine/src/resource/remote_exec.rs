@@ -45,10 +45,8 @@ impl ResourceLoader for ExecResourceLoader {
     ) -> Result<ResourceSnapshot, EngineError> {
         let params = exec_resource_params(name, resource)
             .map_err(|error| EngineError::Failed(error.to_string()))?;
-        let max_bytes =
-            params
-                .max_bytes
-                .or(context.contract.manifest.runtime.command_output_limit_bytes);
+        let runtime = &context.contract.manifest.runtime;
+        let max_bytes = runtime.command_output_limit(params.max_bytes);
         let output = context
             .cmd
             .run_with_limits(
@@ -104,10 +102,8 @@ impl ResourceLoader for ExecResourceLoader {
             });
         }
         let params = exec_resource_params(name, resource)?;
-        let max_bytes =
-            params
-                .max_bytes
-                .or(context.contract.manifest.runtime.command_output_limit_bytes);
+        let runtime = &context.contract.manifest.runtime;
+        let max_bytes = runtime.command_output_limit(params.max_bytes);
         read_to_string_bounded(&snapshot_resource_path(context, name), max_bytes)
     }
 }

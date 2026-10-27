@@ -267,7 +267,7 @@ pub struct RuntimeLimits {
     /// Explicit max only. `None` means no mechanistic limit.
     #[serde(default)]
     pub command_input_limit_bytes: Option<usize>,
-    /// Explicit max only. `None` means no mechanistic limit.
+    /// Omission uses the 16 MiB combined stdout/stderr policy default.
     #[serde(default)]
     pub command_output_limit_bytes: Option<usize>,
     #[serde(default = "default_timeout_seconds")]
@@ -334,6 +334,15 @@ pub struct RuntimeLimits {
 }
 
 impl RuntimeLimits {
+    /// Resolve an optional command-specific override, then the runtime limit.
+    pub fn command_output_limit(&self, override_limit: Option<usize>) -> Option<usize> {
+        Some(
+            override_limit
+                .or(self.command_output_limit_bytes)
+                .unwrap_or(policy::limits::DEFAULT_COMMAND_OUTPUT_LIMIT_BYTES),
+        )
+    }
+
     /// The effective HTTP body limit: the contract's explicit value when
     /// set, otherwise `policy::DEFAULT_HTTP_BODY_LIMIT_BYTES`. Omitted
     /// never means an unbounded body.
@@ -400,6 +409,23 @@ impl Default for RunBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_output_limit_resolves_default_and_overrides() {
+        let omitted: RuntimeLimits = toml::from_str("").unwrap();
+        let default = policy::limits::DEFAULT_COMMAND_OUTPUT_LIMIT_BYTES;
+        assert_eq!(default, 16 * 1024 * 1024);
+        assert_eq!(omitted.command_output_limit_bytes, None);
+        assert_eq!(omitted.command_output_limit(None), Some(default));
+        assert_eq!(
+            omitted.command_output_limit(Some(default + 1)),
+            Some(default + 1)
+        );
+        let explicit: RuntimeLimits = toml::from_str("command_output_limit_bytes = 42").unwrap();
+        assert_eq!(explicit.command_output_limit(None), Some(42));
+        assert_eq!(explicit.command_output_limit(Some(12)), Some(12));
+        assert_eq!(omitted.command_input_limit_bytes, None);
+    }
 
     #[test]
     fn the_http_body_limit_has_a_default() {

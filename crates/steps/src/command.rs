@@ -288,7 +288,7 @@ impl StepExecutor for CommandStep {
                         .run_with_limits_and_stdin(
                             &command,
                             ctx.run.contract.manifest.runtime.command_timeout_seconds,
-                            ctx.run.contract.manifest.runtime.command_output_limit_bytes,
+                            ctx.run.contract.manifest.runtime.command_output_limit(None),
                             input.as_deref(),
                         )
                         .await
@@ -348,8 +348,8 @@ impl StepExecutor for CommandStep {
             // full native `CommandOutput` (see `finish_external_operation`
             // above) so a same-invocation resend replays the identical
             // tail. The user-visible output here carries stdout/stderr up
-            // to the configured `command_output_limit_bytes` (never
-            // unbounded); journaled `tool_call` events carry a further
+            // to the effective combined command output limit;
+            // journaled `tool_call` events carry a further
             // 32 KiB truncated copy via `bounded_event_value`.
             CommandResultMode::Process => Ok(StepOutcome::success(Some(json!({
                 "status": output.status,

@@ -329,9 +329,7 @@ impl CommandGuardrail {
         let timeout_seconds = params
             .timeout_seconds
             .unwrap_or(runtime.command_timeout_seconds);
-        let output_limit_bytes = params
-            .output_limit_bytes
-            .or(runtime.command_output_limit_bytes);
+        let output_limit_bytes = runtime.command_output_limit(params.output_limit_bytes);
         let output = ctx
             .run
             .cmd
