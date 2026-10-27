@@ -5,6 +5,7 @@ use axum::http::{HeaderValue, StatusCode, header};
 #[derive(Debug)]
 pub(crate) struct ApiHttpError {
     pub(crate) problem: Box<ProblemDetails>,
+    pub(crate) location: Option<HeaderValue>,
 }
 
 impl ApiHttpError {
@@ -167,6 +168,7 @@ impl ApiHttpError {
     ) -> Self {
         let code = code.into();
         Self {
+            location: None,
             problem: Box::new(ProblemDetails {
                 problem_type: format!("https://example.invalid/problems/{code}"),
                 title: title.into(),
@@ -191,6 +193,9 @@ impl axum::response::IntoResponse for ApiHttpError {
         let status =
             StatusCode::from_u16(self.problem.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let mut response = (status, Json(self.problem)).into_response();
+        if let Some(location) = self.location {
+            response.headers_mut().insert(header::LOCATION, location);
+        }
         response.headers_mut().insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/problem+json"),

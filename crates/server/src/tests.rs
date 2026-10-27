@@ -2577,3 +2577,285 @@ async fn invalidation_http_has_delete_auth_parity_and_immutable_json_record() {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[tokio::test]
+async fn created_snapshot_byte_errors_keep_location_for_start_and_fork() {
+    use axum::response::IntoResponse;
+    let workspace = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let runs = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+        .unwrap()
+        .join(format!("created-location-{}", uuid::Uuid::now_v7()));
+    let service =
+        crate::test_service(workspace.join("fixtures/generators"), runs.clone(), None).unwrap();
+    let mut state = test_state(
+        service,
+        runs.clone(),
+        None,
+        tokio_util::sync::CancellationToken::new(),
+    );
+    state.artifact_limits.max_bytes = Some(1);
+    let state = Arc::new(state);
+    let request = StartRun {
+        generator_id: "hello-template".into(),
+        inputs: BTreeMap::from([("name".into(), json!("test"))]),
+        ..Default::default()
+    };
+    let mut headers = HeaderMap::new();
+    add_package_identity_header(&mut headers, &state.service, "hello-template").await;
+    let mut locations = Vec::new();
+    for keyed in [false, true] {
+        let mut h = headers.clone();
+        if keyed {
+            h.insert(IDEMPOTENCY_HEADER, HeaderValue::from_static("byte-start"));
+        }
+        let mut first_location = String::new();
+        for _ in 0..if keyed { 2 } else { 1 } {
+            let err = start_run(State(state.clone()), h.clone(), Json(request.clone()))
+                .await
+                .expect_err("snapshot byte cap");
+            assert_eq!(err.problem.status, 413);
+            assert_eq!(err.problem.code, "payload_too_large");
+            let response = err.into_response();
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                "application/problem+json"
+            );
+            let location = response.headers()[header::LOCATION]
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert!(location.starts_with("/api/runs/"));
+            if first_location.is_empty() {
+                first_location = location;
+            } else {
+                assert_eq!(location, first_location);
+            }
+        }
+        locations.push(first_location);
+    }
+    assert_eq!(state.service.list_run_items().await.unwrap().len(), 2);
+    let source = locations[0].strip_prefix("/api/runs/").unwrap().to_string();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if state
+                .service
+                .snapshot(source.clone())
+                .await
+                .unwrap()
+                .state
+                .is_terminal()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("source should finish");
+    for keyed in [false, true] {
+        let mut h = HeaderMap::new();
+        if keyed {
+            h.insert(IDEMPOTENCY_HEADER, HeaderValue::from_static("byte-fork"));
+        }
+        let mut first_location = String::new();
+        for _ in 0..if keyed { 2 } else { 1 } {
+            let err = fork_run(
+                State(state.clone()),
+                h.clone(),
+                Path(source.clone()),
+                Json(ForkRun {
+                    at_seq: 1,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect_err("fork snapshot byte cap");
+            assert_eq!(err.problem.status, 413);
+            assert_eq!(err.problem.code, "payload_too_large");
+            let response = err.into_response();
+            let location = response.headers()[header::LOCATION]
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert!(location.starts_with("/api/runs/"));
+            if first_location.is_empty() {
+                first_location = location;
+            } else {
+                assert_eq!(location, first_location);
+            }
+        }
+        locations.push(first_location);
+    }
+    assert_eq!(state.service.list_run_items().await.unwrap().len(), 4);
+    for location in &locations {
+        let id = location.strip_prefix("/api/runs/").unwrap();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if state
+                    .service
+                    .snapshot(id.to_string())
+                    .await
+                    .unwrap()
+                    .state
+                    .is_terminal()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("created run should finish");
+    }
+    let _ = std::fs::remove_dir_all(&runs);
+}
+
+#[tokio::test]
+async fn created_snapshot_entry_errors_keep_location_on_start_and_fork_replay() {
+    use axum::response::IntoResponse;
+    let workspace = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let runs = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+        .unwrap()
+        .join(format!("created-entries-{}", uuid::Uuid::now_v7()));
+    let service =
+        crate::test_service(workspace.join("fixtures/generators"), runs.clone(), None).unwrap();
+    let state = test_state(
+        service,
+        runs.clone(),
+        None,
+        tokio_util::sync::CancellationToken::new(),
+    );
+    let state = Arc::new(state);
+    let request = StartRun {
+        generator_id: "hello-template".into(),
+        inputs: BTreeMap::from([("name".into(), json!("test"))]),
+        ..Default::default()
+    };
+    let mut start_headers = HeaderMap::new();
+    add_package_identity_header(&mut start_headers, &state.service, "hello-template").await;
+    start_headers.insert(IDEMPOTENCY_HEADER, HeaderValue::from_static("entry-start"));
+    let start = start_run(
+        State(state.clone()),
+        start_headers.clone(),
+        Json(request.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(start.status(), StatusCode::CREATED);
+    let start_location = start.headers()[header::LOCATION]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let source = start_location
+        .strip_prefix("/api/runs/")
+        .unwrap()
+        .to_string();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if state
+                .service
+                .snapshot(source.clone())
+                .await
+                .unwrap()
+                .state
+                .is_terminal()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("source should finish");
+    let mut fork_headers = HeaderMap::new();
+    fork_headers.insert(IDEMPOTENCY_HEADER, HeaderValue::from_static("entry-fork"));
+    let fork_body = ForkRun {
+        at_seq: 1,
+        ..Default::default()
+    };
+    let fork = fork_run(
+        State(state.clone()),
+        fork_headers.clone(),
+        Path(source.clone()),
+        Json(fork_body.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fork.status(), StatusCode::CREATED);
+    let fork_location = fork.headers()[header::LOCATION]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let fork_id = fork_location
+        .strip_prefix("/api/runs/")
+        .unwrap()
+        .to_string();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if state
+                .service
+                .snapshot(fork_id.clone())
+                .await
+                .unwrap()
+                .state
+                .is_terminal()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("fork should finish");
+    // A zero-entry test override makes both settled, cached manifests overflow.
+    // A fresh state also exercises the durable Ready replay path.
+    let mut limited = test_state(
+        state.service.clone(),
+        runs.clone(),
+        None,
+        tokio_util::sync::CancellationToken::new(),
+    );
+    limited.artifact_limits.max_entries = Some(0);
+    let state = Arc::new(limited);
+    for _ in 0..2 {
+        let start_error = start_run(
+            State(state.clone()),
+            start_headers.clone(),
+            Json(request.clone()),
+        )
+        .await
+        .expect_err("entry cap on start replay");
+        let fork_error = fork_run(
+            State(state.clone()),
+            fork_headers.clone(),
+            Path(source.clone()),
+            Json(fork_body.clone()),
+        )
+        .await
+        .expect_err("entry cap on fork replay");
+        for (error, location) in [(start_error, &start_location), (fork_error, &fork_location)] {
+            assert_eq!(error.problem.status, 422);
+            assert_eq!(error.problem.code, "validation_failed");
+            assert_eq!(error.problem.errors[0].field, "artifacts");
+            let response = error.into_response();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(
+                response.headers()[header::LOCATION].to_str().unwrap(),
+                location
+            );
+        }
+    }
+    assert_eq!(state.service.list_run_items().await.unwrap().len(), 2);
+    let _ = std::fs::remove_dir_all(&runs);
+}

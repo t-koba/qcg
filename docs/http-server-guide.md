@@ -341,7 +341,10 @@ covered by this profile; the bundle is tracked separately. Snapshots bound raw
 `outputs.json` before deserialization and the complete `RunSnapshot` JSON before
 buffering, preserving exact-body `ETag`/`304`, `201` status/`Location`, and
 idempotent key-to-run replay without truncation (`413` before headers/body when
-over; manifest entry overflows use `422` on field `artifacts`).
+over; manifest entry overflows use `422` on field `artifacts`). If a start
+or fork has created a run but its snapshot fails, the error response (including
+`413` or `422`) includes `Location: /api/runs/{run_id}`. A keyed retry
+retains that same run identity and does not create another run.
 
 ## Shutdown behavior
 
