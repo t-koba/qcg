@@ -25,9 +25,9 @@ pub struct ServerConfig {
     /// Explicit override. Omitted means `policy::DEFAULT_MAX_REQUEST_BYTES`
     /// (Axum's 2 MiB secure default), never unlimited.
     pub max_request_bytes: Option<usize>,
-    /// Explicit max only. Omitted means no mechanistic limit.
+    /// Dedicated-route default (16 MiB); bundle/generic service stay explicit-only.
     pub max_artifact_bytes: Option<u64>,
-    /// Explicit max only. Omitted means no mechanistic limit.
+    /// Dedicated-route default (1,000 entries); bundle/generic stay explicit-only.
     pub max_artifact_entries: Option<usize>,
     /// Omitted uses `policy::DEFAULT_MAX_ASSET_BYTES` (16 MiB), not unlimited.
     pub max_asset_bytes: Option<usize>,

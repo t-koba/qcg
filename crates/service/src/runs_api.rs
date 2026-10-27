@@ -7,7 +7,7 @@
 //! queue cache to `queue_cache.rs` with no behavior change.
 use crate::artifacts::{
     api_bad_request, api_internal, api_not_found, check_verified_artifact_hashes,
-    collect_verified_artifacts, is_safe_run_id,
+    collect_verified_with_limits, is_safe_run_id,
 };
 use crate::lifecycle::SpawnRun;
 use crate::run_dirs::{
@@ -26,7 +26,7 @@ use api::{RunEvent, RunEventData};
 use camino::{Utf8Path, Utf8PathBuf};
 use contract::{Contract, ContractError, validate_form_values};
 use engine::RunState;
-use engine::{JournalLimits, read_output_manifest, resolve_artifact_path};
+use engine::{JournalLimits, resolve_artifact_path};
 use futures_util::{StreamExt as _, stream::BoxStream};
 use model::{FailureCode, FailureDetail, OutputArtifact, OutputManifest};
 use serde_json::{Value, json};

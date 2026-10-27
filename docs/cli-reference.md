@@ -342,7 +342,11 @@ use of the same output directory.
   Unset means no mechanistic limit.
 - `MAX_REQUEST_BYTES` (default `2097152`, 2 MiB): whole-request-body limit
   for `qcg serve`. Omitted means the default, never unlimited.
-- `MAX_ARTIFACT_BYTES`, `MAX_ARTIFACT_ENTRIES`: explicit maxima for
-  artifact ZIP output bytes and entry count. Unset means no mechanistic limit.
+- `MAX_ARTIFACT_BYTES`, `MAX_ARTIFACT_ENTRIES`: explicit maxima for the
+  dedicated artifact responses (`artifacts`, single `artifacts/{path}`, and
+  `artifacts.zip`). Unset means the provisional dedicated default (16 MiB,
+  1,000 entries) for those three routes only, never unlimited. Larger explicit
+  values are honored. Other routes (`bundle`, snapshots, run-list) are not
+  covered; producer `output_*` limits and direct CLI behavior are unchanged.
 - `MAX_ASSET_BYTES` (default `16777216`, 16 MiB): maximum bytes for one served
   generator package asset. Omitted means the hard default, never unlimited.

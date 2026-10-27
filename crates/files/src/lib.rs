@@ -41,17 +41,17 @@ pub fn read_nofollow_bounded(
     read_capped(open_read_nofollow(path)?, path, max_bytes)
 }
 
-fn read_capped(file: File, path: &Utf8Path, max_bytes: Option<usize>) -> std::io::Result<Vec<u8>> {
+fn read_capped(
+    mut file: File,
+    path: &Utf8Path,
+    max_bytes: Option<usize>,
+) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     match max_bytes {
         None => {
-            use std::io::Read as _;
-            let mut file = file;
             file.read_to_end(&mut bytes)?;
         }
         Some(limit) => {
-            use std::io::Read as _;
-            let file = file;
             file.take(limit.saturating_add(1) as u64)
                 .read_to_end(&mut bytes)?;
             if bytes.len() > limit {
@@ -64,19 +64,9 @@ fn read_capped(file: File, path: &Utf8Path, max_bytes: Option<usize>) -> std::io
     Ok(bytes)
 }
 
-/// Streams a file through SHA-256, enforcing an explicit size cap only when
-/// set. Returns the hex digest and byte count. On Unix the file is opened
-/// with `O_NOFOLLOW` and the handle is hashed, so a terminal symlink is
-/// refused instead of followed (E06). On non-Unix the leaf is probed with
-/// `symlink_metadata` first and refused when it is a link; the check is
-/// best-effort there and callers must treat the platform as fail-closed.
-/// SHA256 streaming core over an already-opened handle (E15): the single
-/// home for handle hashing so pack (`package_cmd`), unpack-verify
-/// (`package`), and path hashing cannot drift between three loops. Counts
-/// bytes with checked arithmetic and fails closed past `max_bytes`
-/// (`None` means unbounded; the caller must have bounded the handle
-/// another way then). The limit error is built by `on_limit` so each
-/// caller keeps its own path-aware message without string matching.
+/// Streams SHA-256 over an opened handle, returning the digest and byte count.
+/// Reads at most one byte beyond `max_bytes`; `None` is unbounded. The
+/// `on_limit` callback supplies caller-specific, path-aware errors.
 pub fn hash_opened_file_sha256(
     file: &mut File,
     max_bytes: Option<u64>,
@@ -86,7 +76,13 @@ pub fn hash_opened_file_sha256(
     let mut total = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
-        let read = file.read(&mut buffer)?;
+        // Read at most one overflow byte beyond the configured bound.
+        let window = max_bytes
+            .map_or(buffer.len() as u64, |limit| {
+                limit.saturating_sub(total).saturating_add(1)
+            })
+            .min(buffer.len() as u64) as usize;
+        let read = file.read(&mut buffer[..window])?;
         if read == 0 {
             break;
         }
@@ -103,6 +99,7 @@ pub fn hash_opened_file_sha256(
     Ok((hex::encode(digest.finalize()), total))
 }
 
+/// Opens a regular file without following a terminal symlink, then hashes it.
 pub fn hash_file_sha256(path: &Utf8Path, max_bytes: Option<u64>) -> std::io::Result<(String, u64)> {
     let mut file = open_read_nofollow(path)?;
     hash_opened_file_sha256(&mut file, max_bytes, |limit| {

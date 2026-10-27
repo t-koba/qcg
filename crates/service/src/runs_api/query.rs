@@ -1,6 +1,7 @@
 //! Query operations.
 use super::*;
 use crate::ServiceError;
+use crate::package::ArtifactZipLimits;
 
 fn step_summaries_from_nodes(
     nodes: &std::collections::BTreeMap<model::NodePath, engine::NodeOutcome>,
@@ -128,7 +129,7 @@ impl LocalService {
                     .map(|value| RunEvent::from_flat(value).map_err(ServiceError::Invalid))
                     .collect::<Result<Vec<_>, _>>()?;
                 let verified = if artifacts.is_some() {
-                    collect_verified_artifacts(&directory)?
+                    collect_verified_with_limits(&directory, &ArtifactZipLimits::default())?
                 } else {
                     Vec::new()
                 };

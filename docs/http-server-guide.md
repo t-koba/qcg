@@ -293,6 +293,50 @@ Unsatisfiable ranges return `416` with `Content-Range: bytes */size`.
 Unsupported units and multipart ranges fall back to the complete representation.
 The complete file is verified before delivering a successful range response.
 
+### Dedicated artifact response bounds (provisional)
+
+`GET /api/runs/{id}/artifacts`, `GET /api/runs/{id}/artifacts/{path...}`, and
+`GET /api/runs/{id}/artifacts.zip` share a server-only provisional profile of
+16 MiB and 1,000 entries. These are provisional product-policy defaults,
+not customer-calibrated values, a p95 target, or a 64-MiB peak-RSS or
+concurrency guarantee. No aggregate or concurrent memory envelope is
+claimed: each buffered body has its own per-request ceiling, and concurrent
+requests each enforce their own ceiling.
+
+Explicit `--max-artifact-bytes` (`MAX_ARTIFACT_BYTES`) and
+`--max-artifact-entries` (`MAX_ARTIFACT_ENTRIES`) remain authoritative,
+including values larger than the provisional default. Omitted means the
+provisional default for these three routes only, never unlimited.
+
+Enforcement order: raw `outputs.json` bytes are capped before deserialization
+using the opened file's metadata for the exact stable size (a concurrent
+growth fails closed instead of reporting `cap+1` as the exact size; the raw
+and entry bounds constrain aggregate metadata/path work, without a separate
+per-path or aggregate-memory guarantee); directory-inclusive entry counts
+(`directories + files`, so nested `a/b/c` counts 3) are enforced
+incrementally as unique prefixes are inserted and return before
+hashing/streaming; the single-file size admission runs before
+`If-None-Match`/`304` and `Range` handling while preserving the exact ETag,
+conditional, `Range`, and file-verification semantics; the ZIP path caps raw
+manifest, total source bytes, and directory-inclusive entry count before
+hashing (hashes bounded by admitted `bytes+1`) and streaming (copies bounded
+by `bytes+1` with length recheck so growth cannot complete successfully), and
+caps final compressed bytes. The normalized list body size is tracked exactly
+(total attempted bytes, not `limit+1`). Nothing silently truncates: list and
+single-file byte admissions fail before headers with `413 Payload Too Large`
+(`payload_too_large`) and exact stable sizes; manifest entry-count failures on
+those routes use `422` (`validation_failed`, field `artifacts`), never byte
+fields. ZIP is streamed after `200` headers, so raw-manifest, source-byte,
+entry-count, verification, or final-byte failures surface as body stream
+errors (logged by the server), not `413`/`422` responses or successful
+truncation. Treat any body error as failure; for cap errors, use a larger
+explicit override or a smaller artifact set, while verification/I/O errors
+may require repairing the artifact source.
+
+Out of scope here: `GET /api/runs/{id}/bundle`, run snapshots, run-list
+summaries, and start/fork/idempotency metadata are not covered by this
+profile; they are tracked separately.
+
 ## Shutdown behavior
 
 On `SIGINT`/`SIGTERM` the server stops accepting mutating requests with

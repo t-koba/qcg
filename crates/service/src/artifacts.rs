@@ -1,16 +1,15 @@
 use crate::package::ArtifactZipLimits;
 use crate::summaries::{run_meta_dir, run_workspace_dir};
 use crate::types::ServiceError;
-use api::RunEvent;
-use api::{ApiError, RunSnapshot};
+use api::{ApiError, RunEvent, RunSnapshot};
 use camino::{Utf8Path, Utf8PathBuf};
-use engine::{read_output_manifest, resolve_artifact_path};
+use engine::resolve_artifact_path;
 use model::OutputManifest;
 use policy::is_safe_path_component;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read as _, Write};
 use zip::write::SimpleFileOptions;
 
 pub fn read_artifacts_zip(run_dir: &Utf8Path) -> Result<Vec<u8>, ServiceError> {
@@ -36,10 +35,28 @@ pub struct VerifiedArtifact {
     pub sha256: String,
 }
 
-pub(crate) fn collect_verified_artifacts(
+pub(crate) fn collect_verified_with_limits(
     run_dir: &Utf8Path,
+    limits: &ArtifactZipLimits,
 ) -> Result<Vec<VerifiedArtifact>, ServiceError> {
-    let manifest: OutputManifest = read_output_manifest(&run_meta_dir(run_dir))?;
+    let manifest: OutputManifest = match limits.max_bytes {
+        Some(limit) => {
+            let capped = usize::try_from(limit)
+                .map_err(|_| ServiceError::Invalid("artifact manifest limit overflowed".into()))?;
+            let raw =
+                files::read_bounded(&run_meta_dir(run_dir).join("outputs.json"), Some(capped))?;
+            serde_json::from_slice(&raw).map_err(ServiceError::Json)?
+        }
+        None => engine::read_output_manifest(&run_meta_dir(run_dir))?,
+    };
+    if let Some(limit) = limits.max_entries
+        && manifest.artifacts.len() > limit
+    {
+        return Err(ServiceError::Invalid(format!(
+            "artifact entries exceed limit: {} > {limit}",
+            manifest.artifacts.len()
+        )));
+    }
     let mut verified = Vec::new();
     for artifact in &manifest.artifacts {
         let fs_path = resolve_artifact_path(&run_workspace_dir(run_dir), &artifact.path)?;
@@ -64,7 +81,8 @@ pub(crate) fn check_verified_artifact_hashes(
     verified: &[VerifiedArtifact],
 ) -> Result<(), ServiceError> {
     for artifact in verified {
-        let (actual_sha256, _) = files::hash_file_sha256(&artifact.fs_path, None)?;
+        let (actual_sha256, _) =
+            files::hash_file_sha256(&artifact.fs_path, Some(artifact.bytes.saturating_add(1)))?;
         if actual_sha256 != artifact.sha256 {
             return Err(ServiceError::Invalid(format!(
                 "artifact `{}` sha256 mismatch: manifest={}, actual={actual_sha256}",
@@ -80,22 +98,10 @@ pub fn write_artifacts_zip_stream_with_limits<W: Write>(
     writer: W,
     limits: &ArtifactZipLimits,
 ) -> Result<(), ServiceError> {
-    write_artifacts_zip_stream_bounded(
-        run_dir,
-        CountingWriter::new(writer, limits.max_bytes),
-        limits,
-    )
-}
-
-fn write_artifacts_zip_stream_bounded<W: Write>(
-    run_dir: &Utf8Path,
-    writer: CountingWriter<W>,
-    limits: &ArtifactZipLimits,
-) -> Result<(), ServiceError> {
-    let verified = collect_verified_artifacts(run_dir)?;
+    let verified = collect_verified_with_limits(run_dir, limits)?;
     let total_bytes = verified
         .iter()
-        .try_fold(0_u64, |total, artifact| total.checked_add(artifact.bytes))
+        .try_fold(0_u64, |t, a| t.checked_add(a.bytes))
         .ok_or_else(|| ServiceError::Invalid("artifact zip size overflowed".into()))?;
     if let Some(limit) = limits.max_bytes
         && total_bytes > limit
@@ -104,28 +110,33 @@ fn write_artifacts_zip_stream_bounded<W: Write>(
             "artifact zip source bytes exceed limit: {total_bytes} > {limit}"
         )));
     }
-    check_verified_artifact_hashes(&verified)?;
     let workspace = run_workspace_dir(run_dir);
+    if limits
+        .max_entries
+        .is_some_and(|limit| verified.len() > limit)
+    {
+        return Err(ServiceError::Invalid(
+            "artifact zip entries exceed limit".into(),
+        ));
+    }
     let mut directories = BTreeSet::new();
     for artifact in &verified {
         let mut parent = Utf8Path::new(&artifact.path).parent();
         while let Some(directory) = parent.filter(|directory| !directory.as_str().is_empty()) {
             directories.insert(directory.to_path_buf());
+            if limits
+                .max_entries
+                .is_some_and(|limit| directories.len().saturating_add(verified.len()) > limit)
+            {
+                return Err(ServiceError::Invalid(
+                    "artifact zip entries exceed limit".into(),
+                ));
+            }
             parent = directory.parent();
         }
     }
-    let entry_count = directories
-        .len()
-        .checked_add(verified.len())
-        .ok_or_else(|| ServiceError::Invalid("artifact zip entry count overflowed".into()))?;
-    if let Some(limit) = limits.max_entries
-        && entry_count > limit
-    {
-        return Err(ServiceError::Invalid(format!(
-            "artifact zip entries exceed limit: {entry_count} > {limit}"
-        )));
-    }
-    let mut zip = zip::ZipWriter::new_stream(writer);
+    check_verified_artifact_hashes(&verified)?;
+    let mut zip = zip::ZipWriter::new_stream(CountingWriter::new(writer, limits.max_bytes));
     for directory in directories {
         let metadata = std::fs::metadata(workspace.join(&directory))?;
         zip.add_directory(
@@ -136,10 +147,12 @@ fn write_artifacts_zip_stream_bounded<W: Write>(
     }
     for artifact in verified {
         let metadata = std::fs::metadata(&artifact.fs_path)?;
-        let mut file = File::open(&artifact.fs_path)?;
+        let mut file = File::open(&artifact.fs_path)?.take(artifact.bytes.saturating_add(1));
         zip.start_file(artifact.path, artifact_zip_options(&metadata, false)?)
             .map_err(artifact_zip_error)?;
-        std::io::copy(&mut file, &mut zip)?;
+        if std::io::copy(&mut file, &mut zip)? != artifact.bytes {
+            return Err(ServiceError::Invalid("artifact bytes mismatch".into()));
+        }
     }
     let writer = zip.finish().map_err(artifact_zip_error)?.into_inner();
     if writer.exceeded {
@@ -253,15 +266,15 @@ pub fn write_run_bundle_stream_with_limits<W: Write>(
     Ok(())
 }
 
-struct CountingWriter<W> {
-    inner: W,
-    written: u64,
+pub(crate) struct CountingWriter<W> {
+    pub(crate) inner: W,
+    pub(crate) written: u64,
     limit: Option<u64>,
-    exceeded: bool,
+    pub(crate) exceeded: bool,
 }
 
 impl<W> CountingWriter<W> {
-    fn new(inner: W, limit: Option<u64>) -> Self {
+    pub(crate) fn new(inner: W, limit: Option<u64>) -> Self {
         Self {
             inner,
             written: 0,
@@ -273,31 +286,18 @@ impl<W> CountingWriter<W> {
 
 impl<W: Write> Write for CountingWriter<W> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        let Some(limit) = self.limit else {
-            self.inner.write_all(bytes)?;
-            self.written =
-                self.written
-                    .checked_add(u64::try_from(bytes.len()).map_err(|_| {
-                        std::io::Error::other("artifact zip output size overflowed")
-                    })?)
-                    .ok_or_else(|| std::io::Error::other("artifact zip output size overflowed"))?;
-            return Ok(bytes.len());
+        let remaining = match self.limit {
+            Some(limit) => usize::try_from(limit.saturating_sub(self.written))
+                .map_err(|_| std::io::Error::other("artifact zip output size overflowed"))?
+                .min(bytes.len()),
+            None => bytes.len(),
         };
-        let remaining = usize::try_from(limit.saturating_sub(self.written))
-            .map_err(|_| std::io::Error::other("artifact zip output size overflowed"))?
-            .min(bytes.len());
-        if remaining > 0 {
-            self.inner.write_all(&bytes[..remaining])?;
-            self.written =
-                self.written
-                    .checked_add(u64::try_from(remaining).map_err(|_| {
-                        std::io::Error::other("artifact zip output size overflowed")
-                    })?)
-                    .ok_or_else(|| std::io::Error::other("artifact zip output size overflowed"))?;
-        }
-        if remaining < bytes.len() {
-            self.exceeded = true;
-        }
+        self.inner.write_all(&bytes[..remaining])?;
+        self.written = self
+            .written
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| std::io::Error::other("artifact zip output size overflowed"))?;
+        self.exceeded |= remaining < bytes.len();
         Ok(bytes.len())
     }
 

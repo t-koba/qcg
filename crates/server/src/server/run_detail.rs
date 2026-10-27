@@ -532,16 +532,15 @@ pub(crate) async fn run_artifacts(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, ApiHttpError> {
-    let artifacts = state
+    let body = state
         .service
-        .artifacts(id.clone())
+        .artifacts_json(id.clone(), &state.artifact_limits)
         .await
         .map_err(ApiHttpError::from_api)?;
     // The validator is the exact body digest: the artifact set can change
     // (files appear or are invalidated) without the run's own sequence
     // moving, so a seq-only ETag would return a stale 304 (E16). Single
     // entry point computes the digest once from the served bytes.
-    let body = serde_json::to_vec(&artifacts).map_err(ApiHttpError::internal)?;
     conditional_response(&headers, body, "application/json")
 }
 
@@ -764,9 +763,23 @@ pub(crate) async fn read_artifact(
     let logged_id = id.clone();
     let (artifact, resolved) = state
         .service
-        .read_artifact(id, path)
+        .read_artifact_with_limits(id, path, &state.artifact_limits)
         .await
         .map_err(ApiHttpError::from_api)?;
+    // Verify size via metadata before allocating, then bound the read by
+    // the manifest size + 1 so a swapped larger file never forces excess
+    // allocation before the configured limits are enforced (C05).
+    let metadata = tokio::fs::metadata(&resolved)
+        .await
+        .map_err(ApiHttpError::internal)?;
+    if let Some(limit) = state.artifact_limits.effective().max_bytes
+        && metadata.len() > limit
+    {
+        return Err(ApiHttpError::from_api(api::ApiError::TooLarge {
+            actual_bytes: metadata.len() as usize,
+            limit_bytes: limit as usize,
+        }));
+    }
     // Strong validator from the manifest sha256 (E16): the content is
     // verified byte-for-byte against this digest before delivery, so the
     // ETag names the exact bytes served. Weak comparison still applies, and
@@ -794,12 +807,6 @@ pub(crate) async fn read_artifact(
             }
         }
     }
-    // Verify size via metadata before allocating, then bound the read by
-    // the manifest size + 1 so a swapped larger file never forces excess
-    // allocation before the configured limits are enforced (C05).
-    let metadata = tokio::fs::metadata(&resolved)
-        .await
-        .map_err(ApiHttpError::internal)?;
     if metadata.len() != artifact.bytes {
         return Err(ApiHttpError::internal(format!(
             "artifact `{}` bytes mismatch: manifest={}, actual={}",
@@ -807,14 +814,6 @@ pub(crate) async fn read_artifact(
             artifact.bytes,
             metadata.len()
         )));
-    }
-    if let Some(limit) = state.artifact_limits.max_bytes
-        && metadata.len() > limit
-    {
-        return Err(ApiHttpError::from_api(api::ApiError::TooLarge {
-            actual_bytes: metadata.len() as usize,
-            limit_bytes: limit as usize,
-        }));
     }
     // Streamed verification on the open file description (constant
     // memory): hash and length are checked before delivery, then the SAME
@@ -933,7 +932,7 @@ pub(crate) async fn read_artifacts_zip(
         .run_dir_for(&id)
         .await
         .map_err(ApiHttpError::from_api)?;
-    let limits = state.artifact_limits;
+    let limits = state.artifact_limits.effective();
     let (sender, receiver) = mpsc::channel::<Result<Vec<u8>, io::Error>>(4);
     // Tied to shutdown and client disconnect and joined (E05): aborts on
     // shutdown instead of continuing detached, aborts when the client
@@ -948,6 +947,7 @@ pub(crate) async fn read_artifacts_zip(
         if let Err(error) =
             service::write_artifacts_zip_stream_with_limits(&run_dir, writer, &limits)
         {
+            tracing::warn!(%error, "artifacts zip stream failed");
             // Best-effort by necessity: a failed send means the receiver
             // was dropped (client disconnected or shutdown), so no consumer
             // remains. Logged, never silently dropped (E05).
@@ -1747,7 +1747,11 @@ mod tests {
         .expect("run should settle");
         let (artifact, resolved) = state
             .service
-            .read_artifact(run_id.clone(), "README.md".to_string())
+            .read_artifact_with_limits(
+                run_id.clone(),
+                "README.md".to_string(),
+                &state.artifact_limits,
+            )
             .await
             .expect("artifact should resolve");
         // 200 delivery carries the manifest sha256 as the strong ETag.
@@ -1907,6 +1911,394 @@ mod tests {
             .expect("{name} body must close promptly at shutdown")
             .expect("{name} body should be readable");
         }
+        let _ = std::fs::remove_dir_all(&runs);
+    }
+    #[tokio::test]
+    async fn dedicated_list_and_single_bounds_reject_before_conditionals() {
+        use axum::extract::{Path, State};
+        use axum::http::{HeaderMap, StatusCode, header};
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::sync::Arc;
+        let runs = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .expect("tempdir must be UTF-8")
+            .join(format!("dedicated-bounds-{}", uuid::Uuid::now_v7()));
+        let _ = std::fs::remove_dir_all(&runs);
+        std::fs::create_dir_all(&runs).expect("runs dir");
+        let workspace = camino::Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .expect("workspace root")
+            .to_path_buf();
+        let service =
+            crate::test_service(workspace.join("fixtures/generators"), runs.clone(), None)
+                .expect("service");
+        let run_id = "bounds-run".to_string();
+        let run_dir = runs.join(&run_id);
+        std::fs::create_dir_all(run_dir.join("meta")).expect("meta");
+        std::fs::create_dir_all(run_dir.join("workspace")).expect("workspace");
+        std::fs::write(run_dir.join("meta/journal.jsonl"), "").expect("journal");
+        let payload = vec![b'y'; 2048];
+        std::fs::write(run_dir.join("workspace/large.bin"), &payload).expect("artifact file");
+        let digest = {
+            use sha2::Digest as _;
+            hex::encode(sha2::Sha256::digest(&payload))
+        };
+        let manifest = serde_json::json!({
+            "artifacts": [{ "path": "large.bin", "sha256": digest, "bytes": 2048, "label": "Large", "required": true }]
+        });
+        std::fs::write(
+            run_dir.join("meta/outputs.json"),
+            serde_json::to_vec(&manifest).expect("manifest"),
+        )
+        .expect("manifest write");
+        let raw = std::fs::read(run_dir.join("meta/outputs.json")).unwrap();
+        let normalized =
+            serde_json::to_vec(&serde_json::from_slice::<model::OutputManifest>(&raw).unwrap())
+                .unwrap();
+        assert!(normalized.len() > raw.len());
+        let make_state = |limits: service::ArtifactZipLimits| {
+            Arc::new(crate::server::config::AppState {
+                service: service.clone(),
+                runs_dir: runs.clone(),
+                oauth_origin: None,
+                oauth_allowed_origins: BTreeSet::new(),
+                oauth_callback_url: None,
+                idempotency: tokio::sync::Mutex::new(BTreeMap::new()),
+                idempotency_ttl: policy::IDEMPOTENCY_TTL,
+                idempotency_max_entries: policy::IDEMPOTENCY_MAX_ENTRIES,
+                api_token_digest: None,
+                artifact_limits: limits,
+                asset_limit: None,
+                max_request_bytes: None,
+                metrics_policy: crate::server::MetricsPolicy::default(),
+                shutdown: tokio_util::sync::CancellationToken::new(),
+            })
+        };
+        let ok_state = make_state(service::ArtifactZipLimits::default());
+        let ok_list = run_artifacts(
+            State(ok_state.clone()),
+            Path(run_id.clone()),
+            HeaderMap::new(),
+        )
+        .await
+        .expect("default list must succeed");
+        assert_eq!(ok_list.status(), StatusCode::OK);
+        for (limit, succeeds) in [
+            (normalized.len(), true),
+            (normalized.len() - 1, false),
+            (raw.len() - 1, false),
+        ] {
+            let limited = make_state(service::ArtifactZipLimits {
+                max_bytes: Some(limit as u64),
+                max_entries: None,
+            });
+            let result =
+                run_artifacts(State(limited), Path(run_id.clone()), HeaderMap::new()).await;
+            assert_eq!(result.is_ok(), succeeds, "list cap {limit}");
+            if let Err(error) = result {
+                assert_eq!(error.problem.status, 413);
+            }
+        }
+        std::fs::write(run_dir.join("meta/outputs.json"), &normalized).unwrap();
+        let raw_exact = make_state(service::ArtifactZipLimits {
+            max_bytes: Some(normalized.len() as u64),
+            max_entries: None,
+        });
+        assert_eq!(
+            run_artifacts(State(raw_exact), Path(run_id.clone()), HeaderMap::new())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        std::fs::write(run_dir.join("meta/outputs.json"), &raw).unwrap();
+        let entry_limited = make_state(service::ArtifactZipLimits {
+            max_bytes: None,
+            max_entries: Some(0),
+        });
+        let entry_err = run_artifacts(
+            State(entry_limited.clone()),
+            Path(run_id.clone()),
+            HeaderMap::new(),
+        )
+        .await
+        .expect_err("zero entry cap must refuse the list");
+        assert_eq!(entry_err.problem.status, 422);
+        let byte_limited = make_state(service::ArtifactZipLimits {
+            max_bytes: Some(1024),
+            max_entries: None,
+        });
+        let strong = format!("\"{digest}\"");
+        let mut precond = HeaderMap::new();
+        precond.insert(header::IF_NONE_MATCH, strong.parse().expect("etag"));
+        precond.insert(header::RANGE, "bytes=0-99".parse().expect("range"));
+        let single_err = read_artifact(
+            State(byte_limited.clone()),
+            Path((run_id.clone(), "large.bin".to_string())),
+            precond,
+        )
+        .await
+        .expect_err("over-limit single file must refuse before 304/Range");
+        assert_eq!(
+            single_err.problem.status, 413,
+            "must be 413, not 304 or 206"
+        );
+        let mut conditional = HeaderMap::new();
+        conditional.insert(header::IF_NONE_MATCH, strong.parse().unwrap());
+        std::fs::write(run_dir.join("meta/outputs.json"), serde_json::to_vec(&serde_json::json!({
+            "artifacts": [{ "path": "large.bin", "sha256": digest, "bytes": 1, "label": "Large", "required": true }]
+        })).unwrap()).unwrap();
+        let actual_err = read_artifact(
+            State(byte_limited.clone()),
+            Path((run_id.clone(), "large.bin".to_string())),
+            conditional,
+        )
+        .await
+        .expect_err("actual full size must be checked before 304");
+        assert_eq!(actual_err.problem.status, 413);
+        let mismatch_conditional = make_state(service::ArtifactZipLimits {
+            max_bytes: Some(4096),
+            max_entries: None,
+        });
+        let mut mismatch_etag = HeaderMap::new();
+        mismatch_etag.insert(header::IF_NONE_MATCH, strong.parse().unwrap());
+        assert_eq!(
+            read_artifact(
+                State(mismatch_conditional),
+                Path((run_id.clone(), "large.bin".to_string())),
+                mismatch_etag,
+            )
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::NOT_MODIFIED,
+            "in-cap manifest mismatch keeps the pre-existing conditional response semantics"
+        );
+        std::fs::write(run_dir.join("meta/outputs.json"), raw).unwrap();
+        let larger = make_state(service::ArtifactZipLimits {
+            max_bytes: Some(4096),
+            max_entries: Some(10),
+        });
+        let ok_single = read_artifact(
+            State(larger.clone()),
+            Path((run_id.clone(), "large.bin".to_string())),
+            HeaderMap::new(),
+        )
+        .await
+        .expect("explicit larger override must admit the file");
+        assert_eq!(ok_single.status(), StatusCode::OK);
+        let mut valid_range = HeaderMap::new();
+        valid_range.insert(header::RANGE, "bytes=0-1".parse().unwrap());
+        let partial = read_artifact(
+            State(larger.clone()),
+            Path((run_id.clone(), "large.bin".to_string())),
+            valid_range,
+        )
+        .await
+        .expect("in-limit range must remain available");
+        assert_eq!(partial.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            partial.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 0-1/2048"
+        );
+        assert_eq!(
+            axum::body::to_bytes(partial.into_body(), 16)
+                .await
+                .expect("partial body"),
+            &payload[..2]
+        );
+        let mut range = HeaderMap::new();
+        range.insert(header::RANGE, "bytes=0-1".parse().unwrap());
+        let error = read_artifact(
+            State(byte_limited.clone()),
+            Path((run_id.clone(), "large.bin".to_string())),
+            range,
+        )
+        .await
+        .expect_err("range must not bypass full-file bound");
+        assert_eq!(error.problem.status, 413);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(run_dir.join("workspace/large.bin"))
+            .unwrap();
+        file.set_len(16 * 1024 * 1024 + 1).unwrap();
+        let digest = {
+            use sha2::Digest as _;
+            hex::encode(sha2::Sha256::digest(
+                std::fs::read(run_dir.join("workspace/large.bin")).unwrap(),
+            ))
+        };
+        let strong = format!("\"{digest}\"");
+        let artifact = serde_json::json!({"path":"large.bin", "sha256":digest, "bytes":16 * 1024 * 1024 + 1, "label":"Large", "required":true});
+        std::fs::write(
+            run_dir.join("meta/outputs.json"),
+            serde_json::to_vec(&serde_json::json!({"artifacts":[artifact.clone()]})).unwrap(),
+        )
+        .unwrap();
+        let mut condition = HeaderMap::new();
+        condition.insert(header::IF_NONE_MATCH, strong.parse().unwrap());
+        assert_eq!(
+            read_artifact(
+                State(ok_state.clone()),
+                Path((run_id.clone(), "large.bin".to_string())),
+                condition.clone()
+            )
+            .await
+            .unwrap_err()
+            .problem
+            .status,
+            413
+        );
+        let overridden = make_state(service::ArtifactZipLimits {
+            max_bytes: Some(16 * 1024 * 1024 + 1),
+            max_entries: Some(1001),
+        });
+        assert_eq!(
+            read_artifact(
+                State(overridden.clone()),
+                Path((run_id.clone(), "large.bin".to_string())),
+                condition
+            )
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::NOT_MODIFIED
+        );
+        assert_eq!(
+            read_artifact(
+                State(overridden.clone()),
+                Path((run_id.clone(), "large.bin".to_string())),
+                HeaderMap::new()
+            )
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::OK
+        );
+        std::fs::write(
+            run_dir.join("meta/outputs.json"),
+            serde_json::to_vec(&serde_json::json!({"artifacts":vec![artifact;1001]})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            run_artifacts(State(ok_state), Path(run_id.clone()), HeaderMap::new())
+                .await
+                .unwrap_err()
+                .problem
+                .status,
+            422
+        );
+        assert_eq!(
+            run_artifacts(State(overridden), Path(run_id.clone()), HeaderMap::new())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let _ = std::fs::remove_dir_all(&runs);
+    }
+
+    #[tokio::test]
+    async fn dedicated_zip_stream_overrun_is_a_body_error_not_truncation() {
+        use axum::extract::{Path, State};
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::sync::Arc;
+        let runs = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .expect("tempdir must be UTF-8")
+            .join(format!("dedicated-zip-stream-{}", uuid::Uuid::now_v7()));
+        let _ = std::fs::remove_dir_all(&runs);
+        std::fs::create_dir_all(&runs).expect("runs dir");
+        let workspace = camino::Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .expect("workspace root")
+            .to_path_buf();
+        let service =
+            crate::test_service(workspace.join("fixtures/generators"), runs.clone(), None)
+                .expect("service");
+        let run_id = "zip-stream-run".to_string();
+        let run_dir = runs.join(&run_id);
+        std::fs::create_dir_all(run_dir.join("meta")).expect("meta");
+        std::fs::create_dir_all(run_dir.join("workspace")).expect("workspace");
+        std::fs::write(run_dir.join("meta/journal.jsonl"), "").expect("journal");
+        let mut payload = vec![0u8; 4096];
+        let mut st: u32 = 0x9e3779b9;
+        for b in payload.iter_mut() {
+            st = st.wrapping_mul(1103515245).wrapping_add(12345);
+            *b = (st >> 16) as u8;
+        }
+        std::fs::write(run_dir.join("workspace/a.bin"), &payload).expect("artifact");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(
+                run_dir.join("workspace/a.bin"),
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .expect("mode");
+        }
+        let digest = {
+            use sha2::Digest as _;
+            hex::encode(sha2::Sha256::digest(&payload))
+        };
+        let manifest = serde_json::json!({
+            "artifacts": [{ "path": "a.bin", "sha256": digest, "bytes": 4096, "label": "A", "required": true }]
+        });
+        std::fs::write(
+            run_dir.join("meta/outputs.json"),
+            serde_json::to_vec(&manifest).expect("manifest"),
+        )
+        .expect("manifest write");
+        let mut probe = std::io::Cursor::new(Vec::new());
+        let full = service::write_artifacts_zip_stream_with_limits(
+            &run_dir,
+            &mut probe,
+            &service::ArtifactZipLimits {
+                max_bytes: None,
+                max_entries: None,
+            },
+        );
+        assert!(
+            full.is_ok(),
+            "full zip must succeed to size the overrun cap"
+        );
+        let full_bytes = service::read_artifacts_zip_with_limits(
+            &run_dir,
+            &service::ArtifactZipLimits {
+                max_bytes: None,
+                max_entries: None,
+            },
+        )
+        .expect("full bytes");
+        let capped = (full_bytes.len() - 1) as u64;
+        let state = Arc::new(crate::server::config::AppState {
+            service: service.clone(),
+            runs_dir: runs.clone(),
+            oauth_origin: None,
+            oauth_allowed_origins: BTreeSet::new(),
+            oauth_callback_url: None,
+            idempotency: tokio::sync::Mutex::new(BTreeMap::new()),
+            idempotency_ttl: policy::IDEMPOTENCY_TTL,
+            idempotency_max_entries: policy::IDEMPOTENCY_MAX_ENTRIES,
+            api_token_digest: None,
+            artifact_limits: service::ArtifactZipLimits {
+                max_bytes: Some(capped),
+                max_entries: None,
+            },
+            asset_limit: None,
+            max_request_bytes: None,
+            metrics_policy: crate::server::MetricsPolicy::default(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        });
+        let response = read_artifacts_zip(State(state.clone()), Path(run_id.clone()))
+            .await
+            .expect("zip handler sends headers before the stream fails");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        assert!(
+            body.is_err(),
+            "crossing the cap after headers must be a body stream error, not truncated 200"
+        );
         let _ = std::fs::remove_dir_all(&runs);
     }
 }

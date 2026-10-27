@@ -54,6 +54,18 @@ pub struct ArtifactZipLimits {
     pub max_bytes: Option<u64>,
     pub max_entries: Option<usize>,
 }
+/// Provisional dedicated-artifact profile (product policy, not customer data).
+pub const DEDICATED_ARTIFACT_MAX_BYTES: u64 = 16 * 1024 * 1024;
+pub const DEDICATED_ARTIFACT_MAX_ENTRIES: usize = 1000;
+impl ArtifactZipLimits {
+    /// Fill omitted caps for dedicated HTTP routes; explicit values win.
+    pub fn effective(self) -> Self {
+        Self {
+            max_bytes: Some(self.max_bytes.unwrap_or(DEDICATED_ARTIFACT_MAX_BYTES)),
+            max_entries: Some(self.max_entries.unwrap_or(DEDICATED_ARTIFACT_MAX_ENTRIES)),
+        }
+    }
+}
 
 /// Opens the package archive without following a terminal symlink: the
 /// archive bytes define every mode and hash below, so a swapped link must
