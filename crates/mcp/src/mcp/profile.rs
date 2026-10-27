@@ -3,8 +3,6 @@ use crate::bounded_http::BoundedHttpClient;
 #[cfg(feature = "mcp-oauth")]
 use async_trait::async_trait;
 #[cfg(feature = "mcp-oauth")]
-use keyring::Entry;
-#[cfg(feature = "mcp-oauth")]
 use reqwest::redirect::Policy;
 #[cfg(feature = "mcp-oauth")]
 use rmcp::transport::auth::{
@@ -142,7 +140,6 @@ impl CredentialGuard {
         }
     }
 }
-
 #[cfg(feature = "mcp-oauth")]
 #[async_trait]
 impl CredentialStore for ProfileCredentialStore {
@@ -173,7 +170,6 @@ impl CredentialStore for ProfileCredentialStore {
 pub(crate) struct KeyringCredentialStore {
     account: String,
 }
-
 #[cfg(feature = "mcp-oauth")]
 impl KeyringCredentialStore {
     pub(crate) fn new(account: impl Into<String>) -> Self {
@@ -182,72 +178,76 @@ impl KeyringCredentialStore {
         }
     }
 }
-
 #[cfg(feature = "mcp-oauth")]
-pub(crate) fn keyring_store_error(context: &'static str, error: keyring::Error) -> AuthError {
-    // Keyring errors carry OS/store diagnostics only, never OAuth tokens, so
-    // the underlying message is safe to surface next to stable operator
-    // guidance. Keep the prefix stable: `auth_error` surfaces it verbatim.
+pub(crate) fn keyring_store_error(context: &'static str, error: keyring_store::Error) -> AuthError {
+    // Keyring errors carry no tokens; keep the prefix stable for `auth_error`.
     AuthError::CredentialStoreError(format!(
         "OS keyring unavailable ({context}): {error}; authorize from the loopback Connections panel on a host with an unlocked OS keyring, or set oauth_store=\"memory\" for ephemeral process-local credentials"
     ))
 }
-
+#[cfg(feature = "mcp-oauth")]
+pub(crate) fn decode_load_result(
+    secret: Result<Vec<u8>, keyring_store::Error>,
+) -> Result<Option<StoredCredentials>, AuthError> {
+    match secret {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| AuthError::InternalError(error.to_string())),
+        Err(keyring_store::Error::NoEntry) => Ok(None),
+        Err(error) => Err(keyring_store_error("load", error)),
+    }
+}
+#[cfg(feature = "mcp-oauth")]
+pub(crate) fn decode_clear_result(
+    result: Result<(), keyring_store::Error>,
+) -> Result<(), AuthError> {
+    match result {
+        Ok(()) | Err(keyring_store::Error::NoEntry) => Ok(()),
+        Err(error) => Err(keyring_store_error("clear", error)),
+    }
+}
 #[cfg(feature = "mcp-oauth")]
 #[async_trait]
 impl CredentialStore for KeyringCredentialStore {
     async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
         let account = self.account.clone();
         tokio::task::spawn_blocking(move || {
-            let entry = Entry::new(KEYRING_SERVICE, &account)
+            let entry = keyring_store::open(KEYRING_SERVICE, &account)
                 .map_err(|error| keyring_store_error("open", error))?;
-            match entry.get_secret() {
-                Ok(secret) => serde_json::from_slice(&secret)
-                    .map(Some)
-                    .map_err(|error| AuthError::InternalError(error.to_string())),
-                Err(keyring::Error::NoEntry) => Ok(None),
-                Err(error) => Err(keyring_store_error("load", error)),
-            }
+            decode_load_result(entry.get_secret())
         })
         .await
         .map_err(|error| AuthError::InternalError(error.to_string()))?
     }
-
     async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
         let account = self.account.clone();
         let secret = serde_json::to_vec(&credentials)
             .map_err(|error| AuthError::InternalError(error.to_string()))?;
         tokio::task::spawn_blocking(move || {
-            Entry::new(KEYRING_SERVICE, &account)
+            keyring_store::open(KEYRING_SERVICE, &account)
                 .and_then(|entry| entry.set_secret(&secret))
                 .map_err(|error| keyring_store_error("save", error))
         })
         .await
         .map_err(|error| AuthError::InternalError(error.to_string()))?
     }
-
     async fn clear(&self) -> Result<(), AuthError> {
         let account = self.account.clone();
         tokio::task::spawn_blocking(move || {
-            let entry = Entry::new(KEYRING_SERVICE, &account)
+            let entry = keyring_store::open(KEYRING_SERVICE, &account)
                 .map_err(|error| keyring_store_error("open", error))?;
-            match entry.delete_credential() {
-                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-                Err(error) => Err(keyring_store_error("clear", error)),
-            }
+            decode_clear_result(entry.delete_credential())
         })
         .await
         .map_err(|error| AuthError::InternalError(error.to_string()))?
     }
 }
-
 #[cfg(feature = "mcp-oauth")]
 pub(crate) struct PendingAuthorization {
     pub(crate) server_id: String,
     pub(crate) state: OAuthState,
     pub(crate) expires_at: Instant,
 }
-
 #[cfg(feature = "mcp-oauth")]
 #[derive(Debug)]
 pub(crate) struct AllowedOAuthHttpClient {

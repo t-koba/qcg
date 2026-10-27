@@ -10,6 +10,7 @@ members = [
   "crates/service",
   "crates/llm",
   "crates/mcp",
+  "crates/keyring-store",
   "crates/llm-steps",
   "crates/server",
   "crates/policy",

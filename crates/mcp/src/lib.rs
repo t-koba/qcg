@@ -502,10 +502,69 @@ mod tests {
 
     #[cfg(feature = "mcp-oauth")]
     #[test]
+    fn keyring_phase_contexts_preserve_open_for_entry_creation() {
+        // Synthetic errors only: never touches the real OS keyring.
+        // Entry-creation (open) failures must stay distinct from operation
+        // failures, and only operation-phase NoEntry is a clean miss.
+        for context in ["open", "load", "clear", "save"] {
+            let message = match keyring_store_error(context, keyring_store::Error::NoEntry) {
+                rmcp::transport::auth::AuthError::CredentialStoreError(message) => message,
+                other => panic!("{context} must use CredentialStoreError: {other:?}"),
+            };
+            assert!(message.contains(&format!("({context})")), "{message}");
+            assert!(message.contains("OS keyring unavailable"), "{message}");
+            assert!(message.contains("oauth_store"), "{message}");
+        }
+        // Open-phase NoEntry stays an error (never a clean miss).
+        let open_missing = match keyring_store_error("open", keyring_store::Error::NoEntry) {
+            rmcp::transport::auth::AuthError::CredentialStoreError(message) => message,
+            other => panic!("open NoEntry must stay an error: {other:?}"),
+        };
+        assert!(open_missing.contains("(open)"), "{open_missing}");
+        // Operation-phase mapping is the shipped mapping under test.
+        assert!(
+            decode_load_result(Err(keyring_store::Error::NoEntry))
+                .expect("access-phase NoEntry must be clean")
+                .is_none()
+        );
+        assert!(decode_clear_result(Err(keyring_store::Error::NoEntry)).is_ok());
+        assert!(decode_clear_result(Ok(())).is_ok());
+        let load_failed = decode_load_result(Err(keyring_store::Error::NoDefaultStore))
+            .expect_err("store failure must stay an error");
+        let load_message = match load_failed {
+            rmcp::transport::auth::AuthError::CredentialStoreError(message) => message,
+            other => panic!("load must use CredentialStoreError: {other:?}"),
+        };
+        assert!(load_message.contains("(load)"), "{load_message}");
+        assert!(!load_message.contains("(open)"), "{load_message}");
+        let clear_failed = decode_clear_result(Err(keyring_store::Error::NoDefaultStore))
+            .expect_err("store failure must stay an error");
+        let clear_message = match clear_failed {
+            rmcp::transport::auth::AuthError::CredentialStoreError(message) => message,
+            other => panic!("clear must use CredentialStoreError: {other:?}"),
+        };
+        assert!(clear_message.contains("(clear)"), "{clear_message}");
+        assert!(!clear_message.contains("(open)"), "{clear_message}");
+        // StoredCredentials JSON round-trips through the load decoder.
+        let stored = rmcp::transport::auth::StoredCredentials::new(
+            "phase-test-client".into(),
+            None,
+            Vec::new(),
+            None,
+        );
+        let secret = serde_json::to_vec(&stored).expect("stored credentials encode");
+        let decoded = decode_load_result(Ok(secret))
+            .expect("valid secret must decode")
+            .expect("valid secret must be present");
+        assert_eq!(decoded.client_id, "phase-test-client");
+    }
+
+    #[cfg(feature = "mcp-oauth")]
+    #[test]
     fn keyring_unavailable_stays_actionable_while_protocol_errors_stay_opaque() {
         // NoDefaultStore is the headless failure: no unlocked default
         // collection exists, so the store is unavailable (not a clean miss).
-        let store_error = keyring_store_error("open", keyring::Error::NoDefaultStore);
+        let store_error = keyring_store_error("open", keyring_store::Error::NoDefaultStore);
         let message = match store_error {
             rmcp::transport::auth::AuthError::CredentialStoreError(message) => message,
             other => panic!("keyring unavailable must use CredentialStoreError: {other:?}"),

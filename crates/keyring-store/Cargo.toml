@@ -1,0 +1,9 @@
+[package]
+name = "keyring-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+keyring.workspace = true

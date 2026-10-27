@@ -15,7 +15,7 @@ required-features = ["mcp-test-server"]
 
 [features]
 default = ["mcp-oauth"]
-mcp-oauth = ["dep:keyring", "dep:oauth2", "rmcp/auth"]
+mcp-oauth = ["dep:keyring-store", "dep:oauth2", "rmcp/auth"]
 mcp-test-server = [
     "rmcp/server",
     "rmcp/transport-io",
@@ -27,7 +27,7 @@ async-trait.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
 http.workspace = true
-keyring = { workspace = true, optional = true }
+keyring-store = { path = "../keyring-store", optional = true }
 libc.workspace = true
 oauth2 = { workspace = true, optional = true }
 pin-project-lite.workspace = true
