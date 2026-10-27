@@ -330,16 +330,10 @@ fn with_parent_fd<T>(
     };
     let mut current: Option<PinnedDir> = None;
     for part in parents {
-        let next = match current.as_ref() {
-            Some(fd) => pinned_subdir(fd, part, true)?,
-            None => pinned_subdir(root, part, true)?,
-        };
-        current = Some(next);
+        let base: &PinnedDir = current.as_ref().unwrap_or(root);
+        current = Some(pinned_subdir(base, part, true)?);
     }
-    match current.as_ref() {
-        Some(fd) => op(fd, leaf),
-        None => op(root, leaf),
-    }
+    op(current.as_ref().unwrap_or(root), leaf)
 }
 
 /// Stages one file under a pinned parent fd with its final mode applied
@@ -1000,12 +994,12 @@ pub fn package_identity_sha256(
         digest.update(path_len.to_le_bytes());
         digest.update(path_bytes);
         digest.update([if entry.is_dir { 1 } else { 0 }]);
-        digest.update(entry.mode.to_le_bytes());
+        digest.update(explicit_source_mode(&entry.metadata, entry.is_dir).to_le_bytes());
         if entry.is_dir {
             continue;
         }
 
-        digest.update(entry.size.to_le_bytes());
+        digest.update(entry.metadata.len().to_le_bytes());
         let mut file = files::open_read_nofollow(&entry.path).map_err(|_error| {
             if std::fs::symlink_metadata(&entry.path)
                 .is_ok_and(|metadata| metadata.file_type().is_symlink())
@@ -1050,7 +1044,7 @@ pub fn package_identity_sha256(
             digest.update(&buffer[..read_len]);
         }
         let after = file.metadata().map_err(ServiceError::Io)?;
-        if file_bytes != entry.size || !identity_metadata_matches(entry, &after, false) {
+        if file_bytes != entry.metadata.len() || !identity_metadata_matches(entry, &after, false) {
             return Err(ServiceError::Invalid(
                 "a package file changed while its identity was computed".into(),
             ));
@@ -1078,17 +1072,7 @@ struct IdentityEntry {
     path: Utf8PathBuf,
     relative: String,
     is_dir: bool,
-    mode: u32,
-    size: u64,
-    modified: std::time::SystemTime,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(unix)]
-    change_time: i64,
-    #[cfg(unix)]
-    change_time_nsec: i64,
+    metadata: std::fs::Metadata,
 }
 
 fn collect_identity_entries(
@@ -1169,58 +1153,41 @@ fn collect_identity_entries(
                 )));
             }
         }
-        let modified = metadata.modified().map_err(ServiceError::Io)?;
-        #[cfg(unix)]
-        let (device, inode, change_time, change_time_nsec) = {
-            use std::os::unix::fs::MetadataExt as _;
-            (
-                metadata.dev(),
-                metadata.ino(),
-                metadata.ctime(),
-                metadata.ctime_nsec(),
-            )
-        };
+        // Fail closed when mtime is unavailable so later comparisons have a
+        // stable snapshot to compare against.
+        metadata.modified().map_err(ServiceError::Io)?;
         entries.push(IdentityEntry {
             path: entry.path().to_path_buf(),
             relative,
             is_dir,
-            mode: explicit_source_mode(&metadata, is_dir),
-            size,
-            modified,
-            #[cfg(unix)]
-            device,
-            #[cfg(unix)]
-            inode,
-            #[cfg(unix)]
-            change_time,
-            #[cfg(unix)]
-            change_time_nsec,
+            metadata,
         });
     }
     entries.sort_by(|left, right| left.relative.cmp(&right.relative));
     Ok(entries)
 }
 
-fn identity_metadata_matches(
-    entry: &IdentityEntry,
-    metadata: &std::fs::Metadata,
+fn metadata_identity_matches(
     is_dir: bool,
+    left: &std::fs::Metadata,
+    right: &std::fs::Metadata,
 ) -> bool {
-    if metadata.is_dir() != is_dir
-        || (!is_dir && !metadata.is_file())
-        || explicit_source_mode(metadata, is_dir) != entry.mode
-        || (!is_dir && metadata.len() != entry.size)
-        || metadata.modified().ok() != Some(entry.modified)
+    if left.is_dir() != is_dir
+        || right.is_dir() != is_dir
+        || (!is_dir && (!left.is_file() || !right.is_file()))
+        || explicit_source_mode(left, is_dir) != explicit_source_mode(right, is_dir)
+        || (!is_dir && left.len() != right.len())
+        || left.modified().ok() != right.modified().ok()
     {
         return false;
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        if metadata.dev() != entry.device
-            || metadata.ino() != entry.inode
-            || metadata.ctime() != entry.change_time
-            || metadata.ctime_nsec() != entry.change_time_nsec
+        if left.dev() != right.dev()
+            || left.ino() != right.ino()
+            || left.ctime() != right.ctime()
+            || left.ctime_nsec() != right.ctime_nsec()
         {
             return false;
         }
@@ -1228,25 +1195,18 @@ fn identity_metadata_matches(
     true
 }
 
+fn identity_metadata_matches(
+    entry: &IdentityEntry,
+    metadata: &std::fs::Metadata,
+    is_dir: bool,
+) -> bool {
+    is_dir == entry.is_dir && metadata_identity_matches(is_dir, &entry.metadata, metadata)
+}
+
 fn identity_entries_match(left: &IdentityEntry, right: &IdentityEntry) -> bool {
     left.relative == right.relative
         && left.is_dir == right.is_dir
-        && left.mode == right.mode
-        && left.size == right.size
-        && left.modified == right.modified
-        && {
-            #[cfg(unix)]
-            {
-                left.device == right.device
-                    && left.inode == right.inode
-                    && left.change_time == right.change_time
-                    && left.change_time_nsec == right.change_time_nsec
-            }
-            #[cfg(not(unix))]
-            {
-                true
-            }
-        }
+        && metadata_identity_matches(left.is_dir, &left.metadata, &right.metadata)
 }
 
 pub fn copy_dir_all(
@@ -1343,7 +1303,7 @@ pub fn copy_dir_all(
             {
                 let dest = target.join(rel);
                 ensure_plain_dir(&dest)?;
-                apply_restored_mode(&dest, explicit_source_dir_mode(&source_metadata))?;
+                apply_restored_mode(&dest, explicit_source_mode(&source_metadata, true))?;
             }
             continue;
         }
@@ -1422,57 +1382,28 @@ pub fn copy_dir_all(
 }
 
 /// Derives the explicit source mode for a copied entry. Unix preserves the
-/// source permission bits (sanitized on apply); non-Unix synthesizes from
-/// the read-only flag so the mode stays explicit (E15-8, platform limit E15-3).
-fn explicit_source_mode(metadata: &std::fs::Metadata, is_dir: bool) -> u32 {
-    if is_dir {
-        explicit_source_dir_mode(metadata)
-    } else {
-        explicit_source_file_mode(metadata)
-    }
-}
-
-/// Explicit directory handling: the source directory bits round-trip so a
-/// copied tree stays traversable exactly like its source (E15).
+/// source permission bits (sanitized on apply) so directories stay
+/// traversable and files keep owner executability; the sanitizer at apply
+/// time strips only the dangerous bits (E15).
 /// Non-Unix limitation (E15-3): Windows has no POSIX mode bits, so the mode
-/// is synthesized from the read-only flag (0o555 when read-only, 0o755
-/// otherwise). Exact group/other bits do not round-trip there.
-fn explicit_source_dir_mode(metadata: &std::fs::Metadata) -> u32 {
+/// is synthesized from the read-only flag: directories use 0o555/0o755 and
+/// files degrade to 0o444/0o644, so packaged scripts may lose their exec bit
+/// there and exact group/other bits do not round-trip. Callers restoring on
+/// non-Unix warn when exec bits are dropped instead of degrading silently.
+fn explicit_source_mode(metadata: &std::fs::Metadata, is_dir: bool) -> u32 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
+        let _ = is_dir;
         metadata.permissions().mode() & 0o777
     }
     #[cfg(not(unix))]
     {
-        if metadata.permissions().readonly() {
-            0o555
-        } else {
-            0o755
-        }
-    }
-}
-
-/// Explicit file handling: on Unix the source file bits round-trip
-/// (including owner executability) so scripts stay executable; the
-/// sanitizer at apply time strips only the dangerous bits (E15).
-/// Non-Unix limitation (E15-3): Windows exposes only the read-only flag,
-/// so the mode degrades to 0o444 (read-only) or 0o644 (writable) and owner
-/// executability is NOT preserved. Packaged scripts may lose their exec
-/// bit there; callers restoring on non-Unix warn when exec bits are
-/// dropped instead of degrading silently.
-fn explicit_source_file_mode(metadata: &std::fs::Metadata) -> u32 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        metadata.permissions().mode() & 0o777
-    }
-    #[cfg(not(unix))]
-    {
-        if metadata.permissions().readonly() {
-            0o444
-        } else {
-            0o644
+        match (is_dir, metadata.permissions().readonly()) {
+            (true, true) => 0o555,
+            (true, false) => 0o755,
+            (false, true) => 0o444,
+            (false, false) => 0o644,
         }
     }
 }
