@@ -167,21 +167,7 @@ impl LocalService {
                     record.cancellation = cancellation.clone();
                     record.scheduler_yield = CancellationToken::new();
                     record.preempted = false;
-                    AnswerDecision::Spawn(Box::new(crate::lifecycle::SpawnRun {
-                        run_id: id.clone(),
-                        contract: record.contract.clone(),
-                        inputs: record.inputs.clone(),
-                        run_dir: record.run_dir.clone(),
-                        events: record.events.clone(),
-                        answers: record.answers.clone(),
-                        confirmations: record.confirmations.clone(),
-                        // The answer was just journaled above: no admission
-                        // snapshot exists, so the spawn reads the journal
-                        // once (E03).
-                        journal_snapshot: None,
-                        cancellation,
-                        task: record.task.clone(),
-                    }))
+                    AnswerDecision::Spawn(Box::new(SpawnRun::from_record(id.clone(), record)))
                 }
             }
         };
@@ -351,21 +337,7 @@ impl LocalService {
                 record.cancellation = cancellation.clone();
                 record.scheduler_yield = CancellationToken::new();
                 record.preempted = false;
-                AfterLock::Spawn(Box::new(SpawnRun {
-                    run_id: id.clone(),
-                    contract: record.contract.clone(),
-                    inputs: record.inputs.clone(),
-                    run_dir: record.run_dir.clone(),
-                    events: record.events.clone(),
-                    answers: record.answers.clone(),
-                    confirmations: record.confirmations.clone(),
-                    // The decision was just journaled above: no admission
-                    // snapshot exists, so the spawn reads the journal once
-                    // (E03).
-                    journal_snapshot: None,
-                    cancellation,
-                    task: record.task.clone(),
-                }))
+                AfterLock::Spawn(Box::new(SpawnRun::from_record(id.clone(), record)))
             }
         };
         match after {

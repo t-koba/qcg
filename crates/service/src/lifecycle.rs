@@ -1000,20 +1000,7 @@ impl LocalService {
                             || record.state == RunStatus::CancelRequested)
                         && !crate::types::task_slot_is_live(&record.task)
                 })
-                .map(|(run_id, record)| SpawnRun {
-                    run_id: run_id.clone(),
-                    contract: record.contract.clone(),
-                    inputs: record.inputs.clone(),
-                    run_dir: record.run_dir.clone(),
-                    events: record.events.clone(),
-                    answers: record.answers.clone(),
-                    confirmations: record.confirmations.clone(),
-                    // Recovery has no admission snapshot: the spawn reads
-                    // the journal once (E03).
-                    journal_snapshot: None,
-                    cancellation: record.cancellation.clone(),
-                    task: Arc::clone(&record.task),
-                })
+                .map(|(run_id, record)| SpawnRun::from_record(run_id.clone(), record))
                 .collect::<Vec<_>>()
         };
         for run in recovered {
@@ -1066,20 +1053,7 @@ impl LocalService {
                             || record.state == RunStatus::CancelRequested
                             || record.state == RunStatus::Running)
                 })
-                .map(|(run_id, record)| SpawnRun {
-                    run_id: run_id.clone(),
-                    contract: record.contract.clone(),
-                    inputs: record.inputs.clone(),
-                    run_dir: record.run_dir.clone(),
-                    events: record.events.clone(),
-                    answers: record.answers.clone(),
-                    confirmations: record.confirmations.clone(),
-                    // The resumer has no admission snapshot: the spawn reads
-                    // the journal once (E03).
-                    journal_snapshot: None,
-                    cancellation: record.cancellation.clone(),
-                    task: Arc::clone(&record.task),
-                })
+                .map(|(run_id, record)| SpawnRun::from_record(run_id.clone(), record))
                 .collect::<Vec<_>>()
         };
         for run in stuck {
@@ -2121,20 +2095,7 @@ impl LocalService {
         record.cancellation = cancellation.clone();
         record.scheduler_yield = CancellationToken::new();
         record.preempted = false;
-        let request = SpawnRun {
-            run_id: run_id.to_string(),
-            contract: record.contract.clone(),
-            inputs: record.inputs.clone(),
-            run_dir: record.run_dir.clone(),
-            events: record.events.clone(),
-            answers: record.answers.clone(),
-            confirmations: record.confirmations.clone(),
-            // Requeue re-drives from durable answers: no admission snapshot
-            // exists, so the spawn reads the journal once (E03).
-            journal_snapshot: None,
-            cancellation,
-            task: record.task.clone(),
-        };
+        let request = SpawnRun::from_record(run_id.to_string(), record);
         drop(runs);
         // Detached, never awaited: this runs inside the finishing engine
         // task that itself holds the execution lease, so awaiting the
@@ -2416,6 +2377,25 @@ pub(crate) struct SpawnRun {
     pub(crate) journal_snapshot: Option<Vec<Value>>,
     pub(crate) cancellation: CancellationToken,
     pub(crate) task: Arc<Mutex<Option<JoinHandle<()>>>>,
+}
+
+impl SpawnRun {
+    /// No-snapshot resumes, recoveries, and requeues read the journal once.
+    /// Cloned handles retain their original identity.
+    pub(crate) fn from_record(run_id: String, record: &RunRecord) -> Self {
+        Self {
+            run_id,
+            contract: record.contract.clone(),
+            inputs: record.inputs.clone(),
+            run_dir: record.run_dir.clone(),
+            events: record.events.clone(),
+            answers: record.answers.clone(),
+            confirmations: record.confirmations.clone(),
+            journal_snapshot: None,
+            cancellation: record.cancellation.clone(),
+            task: Arc::clone(&record.task),
+        }
+    }
 }
 
 #[cfg(test)]

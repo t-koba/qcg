@@ -329,21 +329,7 @@ impl LocalService {
                 return Ok(());
             };
             self.clone()
-                .spawn_engine_run(SpawnRun {
-                    run_id: id.to_string(),
-                    contract: record.contract.clone(),
-                    inputs: record.inputs.clone(),
-                    run_dir: record.run_dir.clone(),
-                    events: record.events.clone(),
-                    answers: record.answers.clone(),
-                    confirmations: record.confirmations.clone(),
-                    // The requeue event was just journaled above: no
-                    // admission snapshot exists, so the spawn reads the
-                    // journal once (E03).
-                    journal_snapshot: None,
-                    cancellation: record.cancellation.clone(),
-                    task: Arc::clone(&record.task),
-                })
+                .spawn_engine_run(SpawnRun::from_record(id.to_string(), record))
                 .await;
         }
         self.inner.queue_notify.notify_waiters();

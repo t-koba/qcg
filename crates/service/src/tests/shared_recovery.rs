@@ -283,3 +283,31 @@ async fn supervisor_restarts_panicked_and_early_exit_workers() {
         handle.await.unwrap().unwrap();
     }
 }
+
+#[tokio::test]
+async fn spawn_projection_preserves_record_fields_and_shared_handles() {
+    let root = temp_run_dir("spawn-projection");
+    let _guard = TempGuard(root.clone());
+    let mut record = crate::tests::support::synthetic_hitl_record(&root, "source");
+    record
+        .inputs
+        .insert("input".into(), serde_json::json!({"x": 1}));
+    record
+        .answers
+        .insert("question".into(), serde_json::json!("yes"));
+    record.confirmations.insert("confirmation".into(), true);
+    let spawn = crate::lifecycle::SpawnRun::from_record("resume".into(), &record);
+    assert_eq!(spawn.run_id, "resume");
+    assert_eq!(spawn.contract.root, record.contract.root);
+    assert_eq!(spawn.contract.sha256, record.contract.sha256);
+    assert_eq!(spawn.inputs, record.inputs);
+    assert_eq!(spawn.run_dir, record.run_dir);
+    assert_eq!(spawn.answers, record.answers);
+    assert_eq!(spawn.confirmations, record.confirmations);
+    assert!(spawn.journal_snapshot.is_none());
+    assert!(spawn.events.same_channel(&record.events));
+    assert!(std::sync::Arc::ptr_eq(&spawn.task, &record.task));
+    assert!(!record.cancellation.is_cancelled());
+    spawn.cancellation.cancel();
+    assert!(record.cancellation.is_cancelled());
+}
