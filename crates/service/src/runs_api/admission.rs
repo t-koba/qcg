@@ -40,6 +40,124 @@ fn refused_capacity(
 }
 
 impl LocalService {
+    /// Complete start/fork admission after the allocation-free probe (E03).
+    /// The channel predates the journal append. Only the registered winner
+    /// spawns, sharing exactly the registered task slot and cancellation token.
+    async fn finish_prepared_admission(
+        &self,
+        run_id: String,
+        staged: RunRecord,
+        snapshot: crate::run_dirs::AdoptSnapshot,
+        created_fresh: bool,
+        queued_payload: Option<Value>,
+    ) -> Result<String, ApiError> {
+        let adopted = snapshot.adopted;
+        let is_fork = staged.parent_run_id.is_some();
+        // Adopted retries supply no payload: their run_queued is already
+        // durable. Only fresh forks retain a copy for the spawn snapshot.
+        let fork_payload = if is_fork {
+            queued_payload.clone()
+        } else {
+            None
+        };
+        if let Some(payload) = queued_payload
+            && let Err(error) = write_run_event(&staged, "run_queued", payload)
+        {
+            // Remove only this admission's own directory, never an adopted or
+            // retained incomplete fork directory (or its cancel mailbox).
+            if created_fresh && let Err(cleanup_error) = std::fs::remove_dir_all(&staged.run_dir) {
+                let directory = if is_fork { "fork" } else { "fresh run" };
+                return Err(api_internal(format!(
+                    "{error}; failed to clean {directory} directory: {cleanup_error}"
+                )));
+            }
+            return Err(api_internal(error));
+        }
+        // Registration clones the staged values for the map; the originals
+        // below are handed to the engine with the same shared channel/slot.
+        // The losing admission discards its channel/token/task: substituting
+        // them for the winner's would orphan the registered engine (E03).
+        match self
+            .register_admission(
+                run_id.clone(),
+                staged.clone(),
+                created_fresh.then_some(staged.run_dir.as_path()),
+            )
+            .await
+        {
+            Ok(AdmissionVerdict::Converged) => {
+                // A rival may have registered after an empty adoption read;
+                // verification reuses the snapshot or falls back once (E03).
+                let identity = AdoptedRunIdentity {
+                    inputs: &staged.inputs,
+                    contract_sha256: &staged.contract_sha256,
+                    package_sha256: staged.package_sha256.as_deref(),
+                    priority: staged.priority,
+                    parent: staged.parent_run_id.as_deref(),
+                    answers: &staged.answers,
+                    confirmations: &staged.confirmations,
+                };
+                verify_live_admission_from_snapshot(&snapshot, &identity, &staged.run_dir)?;
+                return Ok(run_id);
+            }
+            Ok(AdmissionVerdict::Inserted) => {}
+            Err(error @ ApiError::Unavailable { .. }) => {
+                // A fresh request reported refused must not run on next boot
+                // just because its run_queued append preceded shutdown (E05).
+                if !adopted {
+                    Self::settle_refused_admission(&staged.run_dir).await;
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        }
+        // Registration hands off without holding the run-map lock across
+        // spawn's execution-lease wait. A racing resumer shares the registered
+        // task slot; the execution-lease loser leaves it untouched (E03).
+        let journal_snapshot = if adopted {
+            Some(snapshot.events)
+        } else if let Some(mut payload) = fork_payload {
+            // Fresh forks append their own admission to the copied checkpoint
+            // in memory: the fork-aware fold sees the child's ceiling without
+            // a second journal read. Reusing the durable payload keeps every
+            // admission field identical; only the event envelope is added.
+            let mut events = snapshot.events;
+            let next_seq = events
+                .iter()
+                .filter_map(|event| event.get("seq").and_then(Value::as_u64))
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
+            payload["t"] = json!("run_queued");
+            payload["ts"] = json!(chrono::Utc::now().to_rfc3339());
+            payload["seq"] = json!(next_seq);
+            payload["trace_id"] = json!(api::trace_id_for_run(&run_id));
+            payload["span_id"] = json!(api::span_id_for_seq(next_seq));
+            events.push(payload);
+            Some(events)
+        } else {
+            // Fresh starts read their just-written journal in spawn (E03).
+            None
+        };
+        self.clone()
+            .spawn_engine_run(SpawnRun {
+                run_id: run_id.clone(),
+                contract: staged.contract,
+                inputs: staged.inputs,
+                run_dir: staged.run_dir,
+                events: staged.events,
+                answers: staged.answers,
+                confirmations: staged.confirmations,
+                journal_snapshot,
+                cancellation: staged.cancellation,
+                task: staged.task,
+            })
+            .await;
+        self.inner.queue_notify.notify_waiters();
+        self.preempt_for_priority(staged.priority).await;
+        Ok(run_id)
+    }
+
     /// Fails write-path API calls during shutdown (E05).
     pub(crate) fn ensure_running(&self) -> Result<(), ApiError> {
         if self.is_shutting_down() {
@@ -478,154 +596,67 @@ impl LocalService {
         let (events, _) =
             broadcast::channel(self.inner.deployment_policy.live_event_channel_capacity);
         let mut staged = RunRecord {
-            contract: contract.clone(),
             contract_sha256: contract.sha256.clone(),
+            contract,
             package_sha256: Some(package_sha256.clone()),
-            inputs: inputs.clone(),
-            answers: answers.clone(),
-            confirmations: confirmations.clone(),
+            inputs,
+            answers,
+            confirmations,
             priority,
             parent_run_id: None,
             preempted: false,
             state: RunStatus::Queued,
-            run_dir: run_dir.clone(),
+            run_dir,
             artifacts: None,
             question: None,
             confirm: None,
-            events: events.clone(),
-            cancellation: cancellation.clone(),
+            events,
+            cancellation,
             scheduler_yield: CancellationToken::new(),
-            task: task.clone(),
+            task,
             queued_at: None,
             owner_id: self.inner.owner_id.clone(),
             ephemeral: false,
         };
         let effective = crate::types::ResolvedExecutionPolicy::resolve(
-            contract.manifest.budget.max_steps,
+            staged.contract.manifest.budget.max_steps,
             self.max_total_steps(),
             self.inner.deployment_policy.max_parallel_steps,
         );
-        // Fresh admissions stamp one durable instant explicitly so memory
-        // and journal share it without a second scan; adopted retries reuse
-        // their seed instant (E03). Fork fresh already does the same.
+        // Fresh admissions share one durable queue instant with memory;
+        // adopted retries retain the instant from their single snapshot (E03).
         let fresh_queued_at = (!adopted).then(chrono::Utc::now);
-        // An adopted retry already carries its run_queued event; appending
-        // another would fork the journal.
-        if !adopted
-            && let Err(error) = write_run_event(
-                &staged,
-                "run_queued",
-                json!({
-                    "run_id": &run_id,
-                    "generator": format!("{}@{}", contract.manifest.generator.id, contract.manifest.generator.version),
-                    "generator_path": &generator_path,
-                    "package_sha256": &package_sha256,
-                    "contract_sha256": &contract.sha256,
-                    "inputs": &inputs,
-                    "answers": &answers,
-                    "confirmations": &confirmations,
-                    "schema_version": api::JOURNAL_SCHEMA_VERSION,
-                    "elapsed_budget_mode": self.inner.deployment_policy.elapsed_budget_mode,
-                    "retention_days": contract.manifest.retention.days,
-                    "priority": priority,
-                    "parent_run_id": Value::Null,
-                    "labels": &req.labels,
-                    "audit_raise": req.audit_level,
-                    "effective_max_total_steps": effective.max_total_steps,
-                    "effective_policy_origin": effective.origin,
-                    "queued_at": fresh_queued_at.map(|at| at.to_rfc3339()),
-                }),
-            )
-        {
-            // `created_fresh` is set only when this admission prepared an
-            // empty directory, so removal cannot destroy foreign data (E03).
-            // Cleanup failures propagate alongside the write failure instead
-            // of leaking the directory silently (E05).
-            if created_fresh && let Err(cleanup_error) = std::fs::remove_dir_all(&run_dir) {
-                return Err(api_internal(format!(
-                    "{error}; failed to clean fresh run directory: {cleanup_error}"
-                )));
-            }
-            return Err(api_internal(error));
-        }
-        // Memory observes the same durable admission instant as restarts and
-        // peers: fresh reuses the explicit instant above, adopted reuses its
-        // seed. No second scan exists on either path (E03).
-        staged.queued_at = adopted_queued_at.or(fresh_queued_at);
-        // Phase 2b: only the inserting admission spawns. A converged rival
-        // re-verifies identity and returns: spawning with the loser's
-        // staged channel and token would diverge from the registered
-        // record, and the owner or the resumer already drives it (E03).
-        // The loser's staged channel/token/task are discarded by design
-        // (E03): deferring allocation until after register would break the
-        // channel-predates-journal invariant for fresh admissions
-        // (`write_run_event` needs `record.events`), and only the adopted
-        // no-write path could defer — one channel plus one token per rare
-        // race is not worth the divergent path.
-        match self
-            .register_admission(
-                run_id.to_string(),
-                staged,
-                created_fresh.then_some(run_dir.as_path()),
-            )
-            .await
-        {
-            Ok(AdmissionVerdict::Converged) => {
-                // Reuse the adoption snapshot when it exists; a rival that
-                // registered after our adoption read leaves it empty, in
-                // which case fall back to a fresh read (E03).
-                let identity = AdoptedRunIdentity {
-                    inputs: &inputs,
-                    contract_sha256: &contract.sha256,
-                    package_sha256: Some(&package_sha256),
-                    priority,
-                    parent: None,
-                    answers: &answers,
-                    confirmations: &confirmations,
-                };
-                verify_live_admission_from_snapshot(&adopt_snapshot, &identity, &run_dir)?;
-                return Ok(run_id);
-            }
-            Ok(AdmissionVerdict::Inserted) => {}
-            Err(error @ ApiError::Unavailable { .. }) => {
-                // A shutdown that landed after our journal write would leave
-                // a Queued journal for a request we report as refused, which
-                // would then run on the next boot by surprise (E05). Settle
-                // our own fresh admission as interrupted when we wrote it.
-                if !adopted {
-                    Self::settle_refused_admission(&run_dir).await;
-                }
-                return Err(error);
-            }
-            Err(error) => return Err(error),
-        }
-        // Registration hands off directly to spawn_engine_run: a racing
-        // resumer either observes the registered record (and its handle)
-        // or wins the execution lease first, in which case the loser
-        // leaves the shared slot untouched (E03). (The spawn itself may
-        // await on lease contention inside; the handoff holds no lock
-        // across it.)
-        self.clone()
-            .spawn_engine_run(SpawnRun {
-                run_id: run_id.clone(),
-                contract,
-                inputs,
-                run_dir,
-                events,
-                answers,
-                confirmations,
-                // Adopted retries carry the adoption snapshot so the spawn
-                // reuses it instead of re-reading the journal; fresh
-                // admissions just wrote their run_queued event, so the
-                // spawn reads the journal once (E03).
-                journal_snapshot: adopted.then(|| adopt_snapshot.events.clone()),
-                cancellation,
-                task,
+        let queued_payload = (!adopted).then(|| {
+            json!({
+                "run_id": &run_id,
+                "generator": format!("{}@{}", staged.contract.manifest.generator.id, staged.contract.manifest.generator.version),
+                "generator_path": &generator_path,
+                "package_sha256": &package_sha256,
+                "contract_sha256": &staged.contract.sha256,
+                "inputs": &staged.inputs,
+                "answers": &staged.answers,
+                "confirmations": &staged.confirmations,
+                "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                "elapsed_budget_mode": self.inner.deployment_policy.elapsed_budget_mode,
+                "retention_days": staged.contract.manifest.retention.days,
+                "priority": staged.priority,
+                "parent_run_id": &staged.parent_run_id,
+                "labels": &req.labels,
+                "audit_raise": req.audit_level,
+                "effective_max_total_steps": effective.max_total_steps,
+                "effective_policy_origin": effective.origin,
+                "queued_at": fresh_queued_at.map(|at| at.to_rfc3339()),
             })
-            .await;
-        self.inner.queue_notify.notify_waiters();
-        self.preempt_for_priority(priority).await;
-        Ok(run_id.to_string())
+        });
+        staged.queued_at = adopted_queued_at.or(fresh_queued_at);
+        self.finish_prepared_admission(
+            run_id,
+            staged,
+            adopt_snapshot,
+            created_fresh,
+            queued_payload,
+        )
+        .await
     }
 
     pub async fn fork_run(&self, source_id: &str, request: ForkRun) -> Result<String, ApiError> {
@@ -949,190 +980,58 @@ impl LocalService {
         let (events, _) =
             broadcast::channel(self.inner.deployment_policy.live_event_channel_capacity);
         let mut staged = RunRecord {
-            contract: contract.clone(),
             contract_sha256: contract.sha256.clone(),
+            contract,
             package_sha256: Some(package_sha256.clone()),
-            inputs: inputs.clone(),
-            answers: fork_answers.clone(),
-            confirmations: fork_confirmations.clone(),
+            inputs,
+            answers: fork_answers,
+            confirmations: fork_confirmations,
             priority: request.priority.unwrap_or(0),
             parent_run_id: Some(source_id.to_string()),
             preempted: false,
             state: RunStatus::Queued,
-            run_dir: run_dir.clone(),
+            run_dir,
             artifacts: None,
             question: None,
             confirm: None,
-            events: events.clone(),
-            cancellation: cancellation.clone(),
+            events,
+            cancellation,
             scheduler_yield: CancellationToken::new(),
-            task: task.clone(),
+            task,
             queued_at: None,
             owner_id: self.inner.owner_id.clone(),
             ephemeral: false,
         };
-        // One durable instant shared by the journal and memory: fresh forks
-        // stamp it explicitly so the post-write memory needs no second scan
-        // and the single pre-write snapshot stays the only journal read
-        // (E03). Adopted retries reuse their seed instant below.
-        let fresh_queued_at = (!adopted).then(chrono::Utc::now);
-        // Fork admissions record the same effective policy as start
-        // admissions so execution reuses the journaled value instead of
-        // re-resolving under a possibly changed ceiling (E04).
         let fork_effective = crate::types::ResolvedExecutionPolicy::resolve(
-            contract.manifest.budget.max_steps,
+            staged.contract.manifest.budget.max_steps,
             self.max_total_steps(),
             self.inner.deployment_policy.max_parallel_steps,
         );
-        // An adopted retry already carries its run_queued event; appending
-        // another would fork the journal.
-        // KEEP IN SYNC (E03): this durable `run_queued` payload and the
-        // synthesized in-memory tail at spawn below must carry identical
-        // admission fields (generator/inputs/answers/confirmations/queued_at
-        // /effective_*). A future `RunEvent` required field must be added to
-        // both; the envelope (t/ts/seq/trace_id/span_id) is synthesis-only
-        // (`JournalWriter` supplies it for the durable write).
-        if !adopted
-            && let Err(error) = write_run_event(
-                &staged,
-                "run_queued",
-                json!({
-                    "run_id": &run_id,
-                    "generator": format!("{}@{}", contract.manifest.generator.id, contract.manifest.generator.version),
-                    "generator_path": &generator_path,
-                    "package_sha256": &package_sha256,
-                    "contract_sha256": &contract.sha256,
-                    "inputs": &staged.inputs,
-                    "answers": &staged.answers,
-                    "confirmations": &staged.confirmations,
-                    "schema_version": api::JOURNAL_SCHEMA_VERSION,
-                    "elapsed_budget_mode": fork_elapsed_mode,
-                    "retention_days": contract.manifest.retention.days,
-                    "priority": staged.priority,
-                    "parent_run_id": source_id,
-                    "queued_at": fresh_queued_at.map(|at| at.to_rfc3339()),
-                    "effective_max_total_steps": fork_effective.max_total_steps,
-                    "effective_policy_origin": fork_effective.origin,
-                }),
-            )
-        {
-            // Remove only a directory this admission created, never a retained
-            // incomplete directory or its mailbox. Cleanup failures propagate
-            // with the write failure instead of leaking silently (E05).
-            if created_fresh && let Err(cleanup_error) = std::fs::remove_dir_all(&run_dir) {
-                return Err(api_internal(format!(
-                    "{error}; failed to clean fork directory: {cleanup_error}"
-                )));
-            }
-            return Err(api_internal(error));
-        }
-        // Memory observes the same durable admission instant as restarts and
-        // peers. Adopted seeds carry their snapshot instant; fresh forks
-        // reuse the explicit instant durably written above, so neither path
-        // re-scans the journal (E03).
-        staged.queued_at = adopted_queued_at.or(fresh_queued_at);
-        // Phase 2b: only the inserting admission spawns. A converged rival
-        // re-verifies identity and returns without spawning (E03).
-        match self
-            .register_admission(
-                run_id.to_string(),
-                staged,
-                created_fresh.then_some(run_dir.as_path()),
-            )
-            .await
-        {
-            Ok(AdmissionVerdict::Converged) => {
-                // Reuse the single admission snapshot when it exists; fall
-                // back to a fresh read when a rival registered after our
-                // snapshot read left it empty (E03).
-                let identity = AdoptedRunIdentity {
-                    inputs: &inputs,
-                    contract_sha256: &contract.sha256,
-                    package_sha256: Some(&package_sha256),
-                    priority: request.priority.unwrap_or(0),
-                    parent: Some(source_id),
-                    answers: &fork_answers,
-                    confirmations: &fork_confirmations,
-                };
-                verify_live_admission_from_snapshot(&fork_snapshot, &identity, &run_dir)?;
-                return Ok(run_id);
-            }
-            Ok(AdmissionVerdict::Inserted) => {}
-            Err(error @ ApiError::Unavailable { .. }) => {
-                if !adopted {
-                    Self::settle_refused_admission(&run_dir).await;
-                }
-                return Err(error);
-            }
-            Err(error) => return Err(error),
-        }
-        // Registration hands off directly to spawn_engine_run; the handoff
-        // holds no lock across the spawn's internal lease wait (E03).
-        let fork_priority = request.priority.unwrap_or(0);
-        // Single-read spawn (E03): the admission snapshot above is the only
-        // journal read. Adopted retries reuse it directly; fresh forks
-        // synthesize their own `run_queued` in-memory (same fields as the
-        // durable write above, appended last with the next seq) so the spawn
-        // observes the fork's own admission without a second disk read.
-        // KEEP IN SYNC (E03): the synthesized admission fields below must
-        // match the durable payload above; a future `RunEvent` required
-        // field must be added to both.
-        // `for_execution` is fork-aware (last `run_queued` after every
-        // `run_forked` wins), so the synthesized tail resolves to the fork's
-        // ceiling, never the source's. The synthesized event carries a valid
-        // `seq`/`ts`/`trace_id`/`span_id` so `RunEvent::from_flat` and the
-        // fold accept it exactly like the durable event.
-        let spawn_snapshot: Vec<Value> = if adopted {
-            fork_snapshot.events.clone()
-        } else {
-            let mut synthesized = fork_snapshot.events.clone();
-            let next_seq = synthesized
-                .iter()
-                .filter_map(|event| event.get("seq").and_then(Value::as_u64))
-                .max()
-                .unwrap_or(0)
-                .saturating_add(1);
-            synthesized.push(json!({
-                "t": "run_queued",
-                "ts": chrono::Utc::now().to_rfc3339(),
-                "seq": next_seq,
-                "run_id": run_id.as_str(),
-                "trace_id": api::trace_id_for_run(&run_id),
-                "span_id": api::span_id_for_seq(next_seq),
-                "generator": format!("{}@{}", contract.manifest.generator.id, contract.manifest.generator.version),
+        // Fresh admissions share one durable queue instant with memory;
+        // adopted retries retain the instant from their single snapshot (E03).
+        let fresh_queued_at = (!adopted).then(chrono::Utc::now);
+        let queued_payload = (!adopted).then(|| {
+            json!({
+                "run_id": &run_id,
+                "generator": format!("{}@{}", staged.contract.manifest.generator.id, staged.contract.manifest.generator.version),
                 "generator_path": &generator_path,
                 "package_sha256": &package_sha256,
-                "contract_sha256": &contract.sha256,
-                "inputs": &inputs,
-                "answers": &fork_answers,
-                "confirmations": &fork_confirmations,
+                "contract_sha256": &staged.contract.sha256,
+                "inputs": &staged.inputs,
+                "answers": &staged.answers,
+                "confirmations": &staged.confirmations,
                 "schema_version": api::JOURNAL_SCHEMA_VERSION,
-                    "elapsed_budget_mode": fork_elapsed_mode,
-                "retention_days": contract.manifest.retention.days,
-                "priority": fork_priority,
-                "parent_run_id": source_id,
+                "elapsed_budget_mode": fork_elapsed_mode,
+                "retention_days": staged.contract.manifest.retention.days,
+                "priority": staged.priority,
+                "parent_run_id": &staged.parent_run_id,
                 "queued_at": fresh_queued_at.map(|at| at.to_rfc3339()),
                 "effective_max_total_steps": fork_effective.max_total_steps,
                 "effective_policy_origin": fork_effective.origin,
-            }));
-            synthesized
-        };
-        self.clone()
-            .spawn_engine_run(SpawnRun {
-                run_id: run_id.clone(),
-                contract,
-                inputs,
-                run_dir,
-                events,
-                answers: fork_answers,
-                confirmations: fork_confirmations,
-                journal_snapshot: Some(spawn_snapshot),
-                cancellation,
-                task,
             })
-            .await;
-        self.inner.queue_notify.notify_waiters();
-        self.preempt_for_priority(fork_priority).await;
-        Ok(run_id.to_string())
+        });
+        staged.queued_at = adopted_queued_at.or(fresh_queued_at);
+        self.finish_prepared_admission(run_id, staged, fork_snapshot, created_fresh, queued_payload)
+            .await
     }
 }
