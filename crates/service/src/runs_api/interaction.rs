@@ -162,8 +162,7 @@ impl LocalService {
                     record.queued_at = Some(queued_now);
                     record.clear_prompt();
                     record.artifacts = None;
-                    let cancellation = CancellationToken::new();
-                    record.cancellation = cancellation.clone();
+                    record.cancellation = CancellationToken::new();
                     record.scheduler_yield = CancellationToken::new();
                     record.preempted = false;
                     AnswerDecision::Spawn(Box::new(SpawnRun::from_record(id.clone(), record)))
@@ -332,8 +331,7 @@ impl LocalService {
                 record.queued_at = Some(queued_now);
                 record.confirm = None;
                 record.artifacts = None;
-                let cancellation = CancellationToken::new();
-                record.cancellation = cancellation.clone();
+                record.cancellation = CancellationToken::new();
                 record.scheduler_yield = CancellationToken::new();
                 record.preempted = false;
                 AfterLock::Spawn(Box::new(SpawnRun::from_record(id.clone(), record)))

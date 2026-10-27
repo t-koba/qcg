@@ -307,12 +307,7 @@ impl engine::RunSnapshotSource for ServiceSnapshotSource {
             fold_run_state(&run_dir)
                 .ok()?
                 .terminal
-                .map(|terminal| match terminal {
-                    engine::TerminalState::Succeeded => RunStatus::Succeeded,
-                    engine::TerminalState::Failed => RunStatus::Failed,
-                    engine::TerminalState::Canceled => RunStatus::Canceled,
-                    engine::TerminalState::Interrupted => RunStatus::Interrupted,
-                })
+                .map(|terminal| crate::lifecycle::terminal_status(&terminal))
                 .unwrap_or(RunStatus::Queued),
         )
     }

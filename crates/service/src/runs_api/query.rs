@@ -9,21 +9,16 @@ fn step_summaries_from_nodes(
     nodes
         .iter()
         .map(|(path, outcome)| {
-            let summary = match outcome {
-                engine::NodeOutcome::Success { .. } => api::StepSummary {
-                    status: api::StepSummaryStatus::Success,
-                    reason: None,
-                },
-                engine::NodeOutcome::Failed { reason } => api::StepSummary {
-                    status: api::StepSummaryStatus::Failed,
-                    reason: Some(reason.clone()),
-                },
-                engine::NodeOutcome::Skipped { reason } => api::StepSummary {
-                    status: api::StepSummaryStatus::Skipped,
-                    reason: Some(reason.clone()),
-                },
+            let (status, reason) = match outcome {
+                engine::NodeOutcome::Success { .. } => (api::StepSummaryStatus::Success, None),
+                engine::NodeOutcome::Failed { reason } => {
+                    (api::StepSummaryStatus::Failed, Some(reason.clone()))
+                }
+                engine::NodeOutcome::Skipped { reason } => {
+                    (api::StepSummaryStatus::Skipped, Some(reason.clone()))
+                }
             };
-            (path.to_string(), summary)
+            (path.to_string(), api::StepSummary { status, reason })
         })
         .collect()
 }
@@ -219,12 +214,7 @@ impl LocalService {
         let state = disk_state
             .terminal
             .as_ref()
-            .map(|terminal| match terminal {
-                engine::TerminalState::Succeeded => RunStatus::Succeeded,
-                engine::TerminalState::Failed => RunStatus::Failed,
-                engine::TerminalState::Canceled => RunStatus::Canceled,
-                engine::TerminalState::Interrupted => RunStatus::Interrupted,
-            })
+            .map(crate::lifecycle::terminal_status)
             .or_else(|| memory.as_ref().map(|record| record.state))
             .unwrap_or(RunStatus::Queued);
         let contract_sha256 = match memory.as_ref() {
@@ -603,12 +593,7 @@ impl LocalService {
             state: state
                 .terminal
                 .as_ref()
-                .map(|terminal| match terminal {
-                    engine::TerminalState::Succeeded => RunStatus::Succeeded,
-                    engine::TerminalState::Failed => RunStatus::Failed,
-                    engine::TerminalState::Canceled => RunStatus::Canceled,
-                    engine::TerminalState::Interrupted => RunStatus::Interrupted,
-                })
+                .map(crate::lifecycle::terminal_status)
                 .or(memory_state)
                 .unwrap_or(RunStatus::Queued),
             metrics: metrics.clone(),

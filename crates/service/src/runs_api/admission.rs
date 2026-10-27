@@ -110,6 +110,28 @@ impl LocalService {
         Ok(AdmissionVerdict::Inserted)
     }
 
+    /// H01: cancellable admission-shard acquisition shared by start and fork.
+    /// Shard contention is physical, not a same-run conflict: distinct ids
+    /// sharing one of the 64 shards wait cancellably for the shard, and the
+    /// semantic duplicate is decided after acquisition via adoption/identity
+    /// checks. Shutdown during the wait refuses without starting work, and
+    /// the live-hit path is re-checked under the lock so a racing drain is
+    /// never missed (H01-03/E05).
+    pub(super) async fn acquire_admission_shard(
+        &self,
+        run_dir: &Utf8Path,
+    ) -> Result<crate::run_dirs::RunAdmissionLock, ApiError> {
+        match crate::run_dirs::lock_run_admission(run_dir, &self.inner.shutdown)
+            .await
+            .map_err(api_internal)?
+        {
+            Some(lock) => Ok(lock),
+            None => Err(ApiError::Unavailable {
+                detail: "server is shutting down".into(),
+            }),
+        }
+    }
+
     /// Settles a fresh admission journal refused at registration (shutdown
     /// or capacity race after our `run_queued` write) as interrupted so the
     /// next boot sees a terminal outcome instead of running a request we
@@ -295,24 +317,8 @@ impl LocalService {
             return Err(api_bad_request(format!("run id `{run_id}` is not allowed")));
         }
         let run_dir = self.inner.runs_dir.join(&run_id);
-        // H01: shard contention is physical, not a same-run conflict.
-        // Distinct ids sharing one of the 64 shards wait cancellably for
-        // the shard; the semantic same-run duplicate is decided after
-        // acquisition via the adoption/identity checks below. Shutdown
-        // during the wait refuses without starting any work (H01-03).
-        // The live-hit fast path is re-checked under this lock so a drain
-        // racing the check cannot be missed (E05).
-        let _admission = match crate::run_dirs::lock_run_admission(&run_dir, &self.inner.shutdown)
-            .await
-            .map_err(api_internal)?
-        {
-            Some(lock) => lock,
-            None => {
-                return Err(ApiError::Unavailable {
-                    detail: "server is shutting down".into(),
-                });
-            }
-        };
+        // H01: cancellable shard wait shared with fork (see helper).
+        let _admission = self.acquire_admission_shard(&run_dir).await?;
         // Adoption snapshot first: one journal read serves the live-hit
         // verification, the seed, and the queue instant below. The live
         // check reuses this snapshot instead of rescanning, so each
@@ -730,18 +736,8 @@ impl LocalService {
             return Err(api_bad_request(format!("run id `{run_id}` is not allowed")));
         }
         let run_dir = self.inner.runs_dir.join(&run_id);
-        // H01: same cancellable shard wait as start admissions (see above).
-        let _admission = match crate::run_dirs::lock_run_admission(&run_dir, &self.inner.shutdown)
-            .await
-            .map_err(api_internal)?
-        {
-            Some(lock) => lock,
-            None => {
-                return Err(ApiError::Unavailable {
-                    detail: "server is shutting down".into(),
-                });
-            }
-        };
+        // H01: cancellable shard wait shared with start (see helper).
+        let _admission = self.acquire_admission_shard(&run_dir).await?;
         // Re-checked under the admission lock so a drain racing the first
         // probe cannot be missed (E05).
         let adopt_snapshot = crate::run_dirs::try_adopt_run_dir_with_snapshot(&run_dir, &run_id)

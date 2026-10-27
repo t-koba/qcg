@@ -40,7 +40,7 @@ fn recovery_retry_delay(interval: std::time::Duration, failures: u32) -> std::ti
 /// Maps a durable terminal outcome to its display status. Every memory
 /// convergence from journal truth goes through this one mapping so peers
 /// never disagree on what a terminal journal means (B10).
-fn terminal_status(terminal: &engine::TerminalState) -> RunStatus {
+pub(crate) fn terminal_status(terminal: &engine::TerminalState) -> RunStatus {
     match terminal {
         engine::TerminalState::Succeeded => RunStatus::Succeeded,
         engine::TerminalState::Failed => RunStatus::Failed,
@@ -2070,8 +2070,7 @@ impl LocalService {
             .or_else(|| Some(chrono::Utc::now()));
         record.clear_prompt();
         record.artifacts = None;
-        let cancellation = CancellationToken::new();
-        record.cancellation = cancellation.clone();
+        record.cancellation = CancellationToken::new();
         record.scheduler_yield = CancellationToken::new();
         record.preempted = false;
         let request = SpawnRun::from_record(run_id.to_string(), record);
