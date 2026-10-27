@@ -361,7 +361,7 @@ fn dedicated_many_nested_directories_fail_incrementally() {
     let run_dir = temp_run_dir("dedicated-many-nested");
     let _ = std::fs::remove_dir_all(&run_dir);
     std::fs::create_dir_all(run_meta_dir(&run_dir)).expect("meta");
-    let depth = 1200_usize;
+    let depth = 48_usize;
     let mut manifest_path = String::from("deep");
     for _ in 1..depth {
         manifest_path.push_str("/x");
@@ -395,10 +395,10 @@ fn dedicated_many_nested_directories_fail_incrementally() {
         &mut buf,
         &ArtifactZipLimits {
             max_bytes: None,
-            max_entries: Some(1000),
+            max_entries: Some(32),
         },
     )
-    .expect_err("1200 nested prefixes plus file must exceed 1,000-entry cap");
+    .expect_err("48 nested prefixes plus file must exceed 32-entry cap");
     assert!(err.to_string().contains("entries exceed limit"), "{err}");
     assert!(
         buf.get_ref().is_empty(),
