@@ -99,12 +99,12 @@ async fn snapshot_response(
     run_id: String,
     created: bool,
 ) -> Result<Response, ApiHttpError> {
-    let snapshot = state
+    let body = state
         .service
-        .snapshot(run_id)
+        .snapshot_json(run_id.clone(), &state.artifact_limits)
         .await
         .map_err(ApiHttpError::from_api)?;
-    respond_with_snapshot(snapshot, created)
+    respond_with_snapshot(body, run_id, created)
 }
 
 /// Looks up an exact start replay or live claim before package preflight.

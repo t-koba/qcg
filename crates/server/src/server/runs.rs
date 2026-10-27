@@ -1,5 +1,5 @@
 use anyhow::Result;
-use api::{ForkRun, RunListQuery, RunListResponse, RunSnapshot, StartRun};
+use api::{ForkRun, RunListQuery, RunListResponse, StartRun};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -212,16 +212,13 @@ fn reviewed_package_sha256(headers: &HeaderMap) -> Result<String, ApiHttpError> 
 }
 
 pub(crate) fn respond_with_snapshot(
-    snapshot: RunSnapshot,
+    body: Vec<u8>,
+    run_id: String,
     created: bool,
 ) -> Result<Response, ApiHttpError> {
     if created {
-        return created_run_response(snapshot);
+        return created_run_response(body, run_id);
     }
-    // Mutation replays carry the same exact-body validator as the
-    // conditional GET so a client can condition its next read on the
-    // returned ETag instead of re-fetching blindly (E16).
-    let body = serde_json::to_vec(&snapshot).map_err(ApiHttpError::internal)?;
     json_response_with_etag(StatusCode::OK, body, None)
 }
 pub(crate) async fn fork_run(
@@ -263,8 +260,13 @@ pub(crate) async fn fork_run(
     .await
 }
 
-pub(crate) fn created_run_response(snapshot: RunSnapshot) -> Result<Response, ApiHttpError> {
-    let location = format!("/api/runs/{}", snapshot.run_id);
-    let body = serde_json::to_vec(&snapshot).map_err(ApiHttpError::internal)?;
-    json_response_with_etag(StatusCode::CREATED, body, Some(location))
+pub(crate) fn created_run_response(
+    body: Vec<u8>,
+    run_id: String,
+) -> Result<Response, ApiHttpError> {
+    json_response_with_etag(
+        StatusCode::CREATED,
+        body,
+        Some(format!("/api/runs/{run_id}")),
+    )
 }

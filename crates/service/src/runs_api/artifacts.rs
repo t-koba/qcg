@@ -61,6 +61,79 @@ impl LocalService {
         }
         Ok(body.inner)
     }
+    pub async fn snapshot_json(
+        &self,
+        id: String,
+        limits: &crate::package::ArtifactZipLimits,
+    ) -> Result<Vec<u8>, ApiError> {
+        let eff = limits.effective();
+        let limit = usize::try_from(eff.max_bytes.unwrap()).map_err(api_internal)?;
+        let entries = eff.max_entries.unwrap();
+        let memory = self.inner.runs.read().await.get(&id).cloned();
+        let run_dir = match &memory {
+            Some(r) => r.run_dir.clone(),
+            None => self.run_dir_for(&id).await?,
+        };
+        let artifacts = match memory.as_ref().and_then(|r| r.artifacts.clone()) {
+            Some(m) => {
+                if m.artifacts.len() > entries {
+                    return Err(ApiError::invalid_field(
+                        "artifacts",
+                        "artifact count exceeds limit",
+                    ));
+                }
+                Some(m)
+            }
+            None => {
+                let path = run_meta_dir(&run_dir).join("outputs.json");
+                match std::fs::File::open(&path) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => return Err(api_internal(e)),
+                    Ok(f) => {
+                        let staged = f.metadata().map_err(api_internal)?.len();
+                        if staged > limit as u64 {
+                            return Err(ApiError::TooLarge {
+                                actual_bytes: staged as usize,
+                                limit_bytes: limit,
+                            });
+                        }
+                        let raw = files::read_bounded(&path, Some(limit)).map_err(api_internal)?;
+                        let m: OutputManifest =
+                            serde_json::from_slice(&raw).map_err(api_internal)?;
+                        if m.artifacts.len() > entries {
+                            return Err(ApiError::invalid_field(
+                                "artifacts",
+                                "artifact count exceeds limit",
+                            ));
+                        }
+                        Some(m)
+                    }
+                }
+            }
+        };
+        let view = self.read_view(run_dir.clone()).await?;
+        let snapshot = self
+            .assemble_snapshot_from_read(
+                id,
+                memory,
+                &run_dir,
+                SnapshotRead {
+                    events: &view.events,
+                    state: &view.state,
+                },
+                artifacts,
+            )
+            .await?;
+        let mut body = crate::artifacts::CountingWriter::new(Vec::new(), Some(limit as u64));
+        serde_json::to_writer(&mut body, &snapshot).map_err(api_internal)?;
+        if body.exceeded {
+            return Err(ApiError::TooLarge {
+                actual_bytes: body.written as usize,
+                limit_bytes: limit,
+            });
+        }
+        Ok(body.inner)
+    }
     pub async fn read_artifact_with_limits(
         &self,
         id: String,

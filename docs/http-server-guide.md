@@ -293,20 +293,22 @@ Unsatisfiable ranges return `416` with `Content-Range: bytes */size`.
 Unsupported units and multipart ranges fall back to the complete representation.
 The complete file is verified before delivering a successful range response.
 
-### Dedicated artifact response bounds (provisional)
+### Artifact and run-snapshot response bounds (provisional)
 
-`GET /api/runs/{id}/artifacts`, `GET /api/runs/{id}/artifacts/{path...}`, and
-`GET /api/runs/{id}/artifacts.zip` share a server-only provisional profile of
-16 MiB and 1,000 entries. These are provisional product-policy defaults,
-not customer-calibrated values, a p95 target, or a 64-MiB peak-RSS or
-concurrency guarantee. No aggregate or concurrent memory envelope is
-claimed: each buffered body has its own per-request ceiling, and concurrent
-requests each enforce their own ceiling.
+`GET /api/runs/{id}/artifacts`, `GET /api/runs/{id}/artifacts/{path...}`,
+`GET /api/runs/{id}/artifacts.zip`, `GET /api/runs/{id}`, and idempotent
+`POST /api/runs` / `POST /api/runs/{id}/fork` snapshot responses share a
+server-only provisional profile of 16 MiB and 1,000 entries. These are
+provisional product-policy defaults, not customer-calibrated values, a p95
+target, or a 64-MiB peak-RSS or concurrency guarantee. No aggregate or
+concurrent memory envelope is claimed: each buffered body has its own
+per-request ceiling, and concurrent requests each enforce their own ceiling.
 
 Explicit `--max-artifact-bytes` (`MAX_ARTIFACT_BYTES`) and
 `--max-artifact-entries` (`MAX_ARTIFACT_ENTRIES`) remain authoritative,
 including values larger than the provisional default. Omitted means the
-provisional default for these three routes only, never unlimited.
+provisional default for these snapshot and dedicated artifact routes only,
+never unlimited. No new flags are introduced.
 
 Enforcement order: raw `outputs.json` bytes are capped before deserialization
 using the opened file's metadata for the exact stable size (a concurrent
@@ -333,9 +335,13 @@ truncation. Treat any body error as failure; for cap errors, use a larger
 explicit override or a smaller artifact set, while verification/I/O errors
 may require repairing the artifact source.
 
-Out of scope here: `GET /api/runs/{id}/bundle`, run snapshots, run-list
-summaries, and start/fork/idempotency metadata are not covered by this
-profile; they are tracked separately.
+Out of scope here: `GET /api/runs/{id}/bundle` preparation/delivery and
+`GET /api/runs` summaries (`RunListItem` carries no `OutputManifest`) are not
+covered by this profile; the bundle is tracked separately. Snapshots bound raw
+`outputs.json` before deserialization and the complete `RunSnapshot` JSON before
+buffering, preserving exact-body `ETag`/`304`, `201` status/`Location`, and
+idempotent key-to-run replay without truncation (`413` before headers/body when
+over; manifest entry overflows use `422` on field `artifacts`).
 
 ## Shutdown behavior
 

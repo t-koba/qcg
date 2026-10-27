@@ -495,3 +495,202 @@ fn dedicated_zip_source_growth_cannot_finish_successfully() {
     assert!(writer.changed);
     let _ = std::fs::remove_dir_all(&run_dir);
 }
+
+#[tokio::test]
+async fn snapshot_json_checks_cached_entries_and_bounds_complete_body() {
+    use api::StartRun;
+    use camino::Utf8PathBuf;
+    use std::collections::BTreeMap;
+    let root = temp_run_dir("snapshot-cached-body");
+    let _ = std::fs::remove_dir_all(&root);
+    let generators =
+        Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+    let service = test_service(vec![generators], root.join("runs"));
+    let id = service
+        .start_run(StartRun {
+            generator_id: "hello-template".into(),
+            inputs: BTreeMap::from([("name".into(), serde_json::json!("test"))]),
+            ..Default::default()
+        })
+        .await
+        .expect("run should start");
+    let terminal = wait_for_terminal_snapshot(&service, &id).await;
+    assert!(terminal.state.is_terminal());
+    let cached_entries = terminal
+        .artifacts
+        .as_ref()
+        .expect("terminal run should cache manifest")
+        .artifacts
+        .len();
+    assert!(cached_entries > 0);
+    service
+        .snapshot_json(
+            id.clone(),
+            &ArtifactZipLimits {
+                max_bytes: None,
+                max_entries: Some(cached_entries),
+            },
+        )
+        .await
+        .expect("exact cached entry limit must pass");
+    let cached_err = service
+        .snapshot_json(
+            id.clone(),
+            &ArtifactZipLimits {
+                max_bytes: None,
+                max_entries: Some(cached_entries - 1),
+            },
+        )
+        .await
+        .expect_err("cached entry overflow must fail");
+    assert!(
+        matches!(cached_err, api::ApiError::Invalid { .. }),
+        "{cached_err}"
+    );
+    let body = service
+        .snapshot_json(id.clone(), &ArtifactZipLimits::default())
+        .await
+        .expect("default snapshot body should succeed");
+    assert!(!body.is_empty());
+    let exact = ArtifactZipLimits {
+        max_bytes: Some(body.len() as u64),
+        max_entries: None,
+    };
+    let exact_body = service
+        .snapshot_json(id.clone(), &exact)
+        .await
+        .expect("exact body limit must pass");
+    assert_eq!(exact_body, body);
+    let over = ArtifactZipLimits {
+        max_bytes: Some((body.len() - 1) as u64),
+        max_entries: None,
+    };
+    let over_err = service
+        .snapshot_json(id.clone(), &over)
+        .await
+        .expect_err("body over limit must fail");
+    assert!(
+        matches!(over_err, api::ApiError::TooLarge { .. }),
+        "{over_err}"
+    );
+    let unbounded = service
+        .snapshot(id.clone())
+        .await
+        .expect("unbounded snapshot stays available");
+    assert_eq!(unbounded.run_id, id);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn snapshot_json_bounds_disk_manifest_and_preserves_absent() {
+    use api::StartRun;
+    use camino::Utf8PathBuf;
+    use std::collections::BTreeMap;
+    let root = temp_run_dir("snapshot-disk-manifest");
+    let _ = std::fs::remove_dir_all(&root);
+    let generators =
+        Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+    let service = test_service(vec![generators], root.join("runs"));
+    let id = service
+        .start_run(StartRun {
+            generator_id: "hello-template".into(),
+            inputs: BTreeMap::from([("name".into(), serde_json::json!("test"))]),
+            ..Default::default()
+        })
+        .await
+        .expect("run should start");
+    wait_for_terminal_snapshot(&service, &id).await;
+    {
+        let mut map = service.inner.runs.write().await;
+        if let Some(record) = map.get_mut(&id) {
+            record.artifacts = None;
+        }
+    }
+    let run_dir = service.run_dir_for(&id).await.expect("run dir");
+    let raw =
+        std::fs::read(run_meta_dir(&run_dir).join("outputs.json")).expect("manifest should exist");
+    assert!(!raw.is_empty());
+    let disk_entries = serde_json::from_slice::<model::OutputManifest>(&raw)
+        .expect("manifest JSON")
+        .artifacts
+        .len();
+    assert!(disk_entries > 0);
+    service
+        .snapshot_json(
+            id.clone(),
+            &ArtifactZipLimits {
+                max_bytes: None,
+                max_entries: Some(disk_entries),
+            },
+        )
+        .await
+        .expect("exact disk entry limit must pass");
+    let over_raw = ArtifactZipLimits {
+        max_bytes: Some((raw.len() - 1) as u64),
+        max_entries: None,
+    };
+    let raw_err = service
+        .snapshot_json(id.clone(), &over_raw)
+        .await
+        .expect_err("short raw limit must fail");
+    assert!(
+        matches!(raw_err, api::ApiError::TooLarge { .. }),
+        "{raw_err}"
+    );
+    let invalid_raw = vec![b'x'; 512];
+    std::fs::write(run_meta_dir(&run_dir).join("outputs.json"), &invalid_raw)
+        .expect("invalid manifest write");
+    let short = ArtifactZipLimits {
+        max_bytes: Some(511),
+        max_entries: None,
+    };
+    let short_err = service
+        .snapshot_json(id.clone(), &short)
+        .await
+        .expect_err("oversized invalid raw must fail before deserialization");
+    assert!(
+        matches!(short_err, api::ApiError::TooLarge { .. }),
+        "{short_err}"
+    );
+    let exact_invalid = ArtifactZipLimits {
+        max_bytes: Some(512),
+        max_entries: None,
+    };
+    let json_err = service
+        .snapshot_json(id.clone(), &exact_invalid)
+        .await
+        .expect_err("exact invalid raw must reach deserialization");
+    assert!(
+        matches!(json_err, api::ApiError::Internal { .. }),
+        "{json_err}"
+    );
+    std::fs::write(run_meta_dir(&run_dir).join("outputs.json"), &raw).expect("manifest restore");
+    let entry_err = service
+        .snapshot_json(
+            id.clone(),
+            &ArtifactZipLimits {
+                max_bytes: None,
+                max_entries: Some(disk_entries - 1),
+            },
+        )
+        .await
+        .expect_err("disk entry overflow must fail");
+    assert!(
+        matches!(entry_err, api::ApiError::Invalid { .. }),
+        "{entry_err}"
+    );
+    std::fs::remove_file(run_meta_dir(&run_dir).join("outputs.json")).expect("manifest removal");
+    let absent_body = service
+        .snapshot_json(id.clone(), &ArtifactZipLimits::default())
+        .await
+        .expect("absent manifest must stay None");
+    let absent: api::RunSnapshot =
+        serde_json::from_slice(&absent_body).expect("snapshot body should deserialize");
+    assert!(absent.artifacts.is_none());
+    let unbounded = service
+        .snapshot(id.clone())
+        .await
+        .expect("unbounded absent stays None");
+    assert!(unbounded.artifacts.is_none());
+    let _ = std::fs::remove_dir_all(&root);
+}

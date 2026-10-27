@@ -23,18 +23,12 @@ pub(crate) async fn run_snapshot(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, ApiHttpError> {
-    let snapshot = state
+    // Bounded snapshot body shares the dedicated 16 MiB/1,000 profile; over-limit fails 413 before ETag/304.
+    let body = state
         .service
-        .snapshot(id)
+        .snapshot_json(id, &state.artifact_limits)
         .await
         .map_err(ApiHttpError::from_api)?;
-    // The validator is the exact body digest: the whole snapshot
-    // serializes into it (run/contract/generator identity, seq, state,
-    // queue_position, metrics, queued_at, priority, parent, question,
-    // confirm, and artifacts), so any visible field moves the validator
-    // and a seq-only ETag could never return a stale 304 (E16). Single
-    // entry point computes the digest once from the served bytes.
-    let body = serde_json::to_vec(&snapshot).map_err(ApiHttpError::internal)?;
     conditional_response(&headers, body, "application/json")
 }
 
@@ -2298,6 +2292,305 @@ mod tests {
         assert!(
             body.is_err(),
             "crossing the cap after headers must be a body stream error, not truncated 200"
+        );
+        let _ = std::fs::remove_dir_all(&runs);
+    }
+
+    #[tokio::test]
+    async fn snapshot_get_rejects_oversize_before_conditional_304() {
+        use axum::extract::{Path, State};
+        use axum::http::{HeaderMap, StatusCode, header};
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::sync::Arc;
+        let workspace = camino::Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace")
+            .to_path_buf();
+        let runs = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .expect("tempdir")
+            .join(format!("snapshot-get-{}", uuid::Uuid::now_v7()));
+        let _ = std::fs::remove_dir_all(&runs);
+        let service =
+            crate::test_service(workspace.join("fixtures/generators"), runs.clone(), None)
+                .expect("service");
+        let make_state = |limits: service::ArtifactZipLimits| {
+            Arc::new(crate::server::config::AppState {
+                service: service.clone(),
+                runs_dir: runs.clone(),
+                oauth_origin: None,
+                oauth_allowed_origins: BTreeSet::new(),
+                oauth_callback_url: None,
+                idempotency: tokio::sync::Mutex::new(BTreeMap::new()),
+                idempotency_ttl: policy::IDEMPOTENCY_TTL,
+                idempotency_max_entries: policy::IDEMPOTENCY_MAX_ENTRIES,
+                api_token_digest: None,
+                artifact_limits: limits,
+                asset_limit: None,
+                max_request_bytes: None,
+                metrics_policy: crate::server::MetricsPolicy::default(),
+                shutdown: tokio_util::sync::CancellationToken::new(),
+            })
+        };
+        let state = make_state(service::ArtifactZipLimits::default());
+        let run_id = state
+            .service
+            .start_run(api::StartRun {
+                generator_id: "hello-template".into(),
+                inputs: BTreeMap::from([("name".into(), serde_json::json!("test"))]),
+                ..Default::default()
+            })
+            .await
+            .expect("run should start");
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let snap = state
+                    .service
+                    .snapshot(run_id.clone())
+                    .await
+                    .expect("snapshot");
+                if snap.state.is_terminal() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("run should settle");
+        let response = run_snapshot(State(state.clone()), Path(run_id.clone()), HeaderMap::new())
+            .await
+            .expect("snapshot get should succeed");
+        assert_eq!(response.status(), StatusCode::OK);
+        let etag = response
+            .headers()
+            .get(header::ETAG)
+            .expect("snapshot must carry ETag")
+            .to_str()
+            .expect("ETag ASCII")
+            .to_string();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("snapshot body readable");
+        assert!(!body.is_empty());
+        let mut conditional = HeaderMap::new();
+        conditional.insert(header::IF_NONE_MATCH, etag.parse().expect("etag"));
+        let not_modified = run_snapshot(
+            State(state.clone()),
+            Path(run_id.clone()),
+            conditional.clone(),
+        )
+        .await
+        .expect("conditional snapshot should respond");
+        assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
+        let exact_state = make_state(service::ArtifactZipLimits {
+            max_bytes: Some(body.len() as u64),
+            max_entries: None,
+        });
+        let exact = run_snapshot(
+            State(exact_state.clone()),
+            Path(run_id.clone()),
+            HeaderMap::new(),
+        )
+        .await
+        .expect("exact body limit must pass");
+        assert_eq!(exact.status(), StatusCode::OK);
+        let not_modified_exact = run_snapshot(
+            State(exact_state.clone()),
+            Path(run_id.clone()),
+            conditional.clone(),
+        )
+        .await
+        .expect("exact conditional must be 304");
+        assert_eq!(not_modified_exact.status(), StatusCode::NOT_MODIFIED);
+        let over_state = make_state(service::ArtifactZipLimits {
+            max_bytes: Some((body.len() - 1) as u64),
+            max_entries: None,
+        });
+        let over_err = run_snapshot(
+            State(over_state.clone()),
+            Path(run_id.clone()),
+            HeaderMap::new(),
+        )
+        .await
+        .expect_err("over-limit snapshot body must fail");
+        assert_eq!(over_err.problem.status, 413);
+        let over_conditional_err = run_snapshot(
+            State(over_state.clone()),
+            Path(run_id.clone()),
+            conditional.clone(),
+        )
+        .await
+        .expect_err("over-limit must reject before 304");
+        assert_eq!(over_conditional_err.problem.status, 413);
+        let entry_state = make_state(service::ArtifactZipLimits {
+            max_bytes: None,
+            max_entries: Some(0),
+        });
+        let entry_err = run_snapshot(State(entry_state), Path(run_id.clone()), HeaderMap::new())
+            .await
+            .expect_err("entry overflow must fail");
+        assert_eq!(entry_err.problem.status, 422);
+        let _ = std::fs::remove_dir_all(&runs);
+    }
+
+    #[tokio::test]
+    async fn snapshot_start_and_fork_replay_converge_without_duplicate() {
+        use axum::extract::{Path, State};
+        use axum::http::{HeaderMap, HeaderValue, StatusCode};
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::sync::Arc;
+        let workspace = camino::Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace")
+            .to_path_buf();
+        let runs = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .expect("tempdir")
+            .join(format!("snapshot-replay-{}", uuid::Uuid::now_v7()));
+        let _ = std::fs::remove_dir_all(&runs);
+        let service =
+            crate::test_service(workspace.join("fixtures/generators"), runs.clone(), None)
+                .expect("service");
+        let state = Arc::new(crate::server::config::AppState {
+            service: service.clone(),
+            runs_dir: runs.clone(),
+            oauth_origin: None,
+            oauth_allowed_origins: BTreeSet::new(),
+            oauth_callback_url: None,
+            idempotency: tokio::sync::Mutex::new(BTreeMap::new()),
+            idempotency_ttl: policy::IDEMPOTENCY_TTL,
+            idempotency_max_entries: policy::IDEMPOTENCY_MAX_ENTRIES,
+            api_token_digest: None,
+            artifact_limits: service::ArtifactZipLimits::default(),
+            asset_limit: None,
+            max_request_bytes: None,
+            metrics_policy: crate::server::MetricsPolicy::default(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        });
+        let request = api::StartRun {
+            generator_id: "hello-template".into(),
+            inputs: BTreeMap::from([("name".into(), serde_json::json!("test"))]),
+            ..Default::default()
+        };
+        let detail = state
+            .service
+            .describe("hello-template")
+            .await
+            .expect("detail");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            policy::IDEMPOTENCY_HEADER,
+            HeaderValue::from_static("snapshot-once"),
+        );
+        headers.insert(
+            "x-qcg-package-sha256",
+            HeaderValue::from_str(&detail.package_sha256).expect("package header"),
+        );
+        let first = crate::server::runs::start_run(
+            State(Arc::clone(&state)),
+            headers.clone(),
+            axum::Json(request.clone()),
+        )
+        .await
+        .expect("first start should succeed");
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first_location = first
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("create must carry Location")
+            .to_str()
+            .expect("location ASCII")
+            .to_string();
+        assert!(first.headers().contains_key(axum::http::header::ETAG));
+        let second = crate::server::runs::start_run(
+            State(Arc::clone(&state)),
+            headers.clone(),
+            axum::Json(request.clone()),
+        )
+        .await
+        .expect("replay must converge");
+        assert_eq!(second.status(), StatusCode::CREATED);
+        assert_eq!(
+            second
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .expect("replay location")
+                .to_str()
+                .expect("ASCII"),
+            first_location
+        );
+        assert!(second.headers().contains_key(axum::http::header::ETAG));
+        assert_eq!(
+            state.service.list_run_items().await.expect("list").len(),
+            1,
+            "replay must not execute a duplicate run"
+        );
+        let source_id = first_location
+            .rsplit('/')
+            .next()
+            .expect("run id")
+            .to_string();
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let snap = state
+                    .service
+                    .snapshot(source_id.clone())
+                    .await
+                    .expect("snapshot");
+                if snap.state.is_terminal() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("source should settle");
+        let fork_body = api::ForkRun {
+            at_seq: 1,
+            ..Default::default()
+        };
+        let mut fork_headers = HeaderMap::new();
+        fork_headers.insert(
+            policy::IDEMPOTENCY_HEADER,
+            HeaderValue::from_static("snapshot-fork-once"),
+        );
+        let first_fork = crate::server::runs::fork_run(
+            State(Arc::clone(&state)),
+            fork_headers.clone(),
+            Path(source_id.clone()),
+            axum::Json(fork_body.clone()),
+        )
+        .await
+        .expect("first fork should succeed");
+        assert_eq!(first_fork.status(), StatusCode::CREATED);
+        let fork_location = first_fork
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("fork location")
+            .to_str()
+            .expect("ASCII")
+            .to_string();
+        let second_fork = crate::server::runs::fork_run(
+            State(Arc::clone(&state)),
+            fork_headers.clone(),
+            Path(source_id.clone()),
+            axum::Json(fork_body),
+        )
+        .await
+        .expect("fork replay must converge");
+        assert_eq!(
+            second_fork
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .expect("fork replay location")
+                .to_str()
+                .expect("ASCII"),
+            fork_location
+        );
+        assert_eq!(
+            state.service.list_run_items().await.expect("list").len(),
+            2,
+            "fork replay must not duplicate"
         );
         let _ = std::fs::remove_dir_all(&runs);
     }
