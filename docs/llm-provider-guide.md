@@ -239,6 +239,19 @@ Fields:
   describe transport mechanisms; generator and node policy never belongs in
   this registry.
 
+### ChatGPT subscription authentication
+
+The provider schema does not currently implement Sign in with ChatGPT. An
+OpenAI API key is a separate, metered API billing path, not a ChatGPT
+subscription credential. qcg does not send subscription-authenticated
+Responses requests: the SIWC preview route requires `store = false` and
+`stream = true` but does not support `max_output_tokens`, which qcg requires
+to enforce its per-request generation bound. Keep subscription inference
+unavailable until the documented route supports a compatible bound; never
+remove the cap or fall back to a metered key. See OpenAI's [SIWC preview
+limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations)
+and [API billing](https://openai.com/api/pricing/).
+
 REST search profiles use the same registry and loading rules as LLM rows:
 
 - `id`: unique profile identifier referenced by a `web.search` tool.
