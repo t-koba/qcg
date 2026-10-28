@@ -262,15 +262,21 @@ impl<'a> LlmGateway<'a> {
             let route = self
                 .selected_route(routes, provider, model)
                 .ok_or_else(|| unpriced("has no priced entry"))?;
-            // Reserve at the dearest rate across all context tiers and
-            // input categories: neither tier nor cache split is known yet.
-            let mut rates = policy::max_cost_rates(&route.rates(), &route.cost_tiers);
-            if let Some(multiplier) =
-                self.cache_write_multiplier(provider, model, request.cache_retention)
-            {
+            // Reserve at the dearest rate: tier and cache split are unknown.
+            let base = route.rates();
+            let ttl = self.cache_write_multiplier(provider, model, request.cache_retention);
+            for tier in std::iter::once(None).chain(route.cost_tiers.iter().map(Some)) {
+                let row = base.resolve(tier);
+                if self.budget.require_pricing
+                    && (row.cache_read.is_none() || (ttl.is_none() && row.cache_creation.is_none()))
+                {
+                    return Err(unpriced("lacks cache input pricing in a base or tier row"));
+                }
+            }
+            let mut rates = policy::max_cost_rates(&base, &route.cost_tiers);
+            if let Some(multiplier) = ttl {
                 // A cache price cannot price a TTL write. Require ordinary
                 // input pricing in every tier, not just the maximum row.
-                let base = route.rates();
                 for tier in std::iter::once(None).chain(route.cost_tiers.iter().map(Some)) {
                     let input = base.resolve(tier).input.ok_or_else(|| {
                         unpriced("lacks ordinary input pricing for extended cache TTL")

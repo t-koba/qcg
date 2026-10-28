@@ -198,6 +198,175 @@ async fn an_unpriced_ttl_input_rate_refuses_dispatch_even_with_priced_cache_rate
     }
 }
 
+#[tokio::test]
+async fn required_pricing_accepts_ttl_derived_creation_rate() {
+    // A missing explicit cache-creation rate is valid when an Extended TTL
+    // derives the write price from ordinary input; require_pricing must not
+    // reject that derived rate in post-response accounting or preflight.
+    for (mechanism, factor) in [
+        (PromptCacheRetention::Ttl1h, 2.0),
+        (PromptCacheRetention::Ttl12h, 2.5),
+    ] {
+        for tier in [false, true] {
+            let mut route = pricing();
+            route.cache_creation_input_cost_per_million_usd = None;
+            if tier {
+                route.cost_tiers[0].cache_creation_input_cost_per_million_usd = None;
+            } else {
+                route.cost_tiers.clear();
+            }
+            let (input, read, output) = if tier {
+                (5.0, 0.5, 6.0)
+            } else {
+                (2.0, 0.25, 3.0)
+            };
+            let creation = input * factor;
+            let expected =
+                (400_000.0 * input + 400_000.0 * read + 200_000.0 * creation + 10.0 * output)
+                    as u64;
+            // Post-response accounting without a cost cap.
+            {
+                let dir = test_dir("retention-required-ttl");
+                let journal = test_journal(&dir, &uuid::Uuid::now_v7().to_string());
+                let secrets = SecretStore::default();
+                let provider = Arc::new(RetentionProvider {
+                    mechanism,
+                    calls: AtomicUsize::new(0),
+                });
+                let mut gateway = test_gateway(provider.clone(), &secrets, &journal);
+                gateway.budget.require_pricing = true;
+                let usage = TokenUsage {
+                    input: 1_000_000,
+                    cached_input: 400_000,
+                    cache_creation_input: 200_000,
+                    output: 10,
+                    reasoning: 0,
+                };
+                let cost = gateway
+                    .cost_microusd(
+                        &test_node(),
+                        &[route.clone()],
+                        "tier",
+                        "test",
+                        &usage,
+                        Some(CacheRetention::Extended),
+                        None,
+                    )
+                    .expect("TTL-derived creation must satisfy required pricing");
+                assert_eq!(cost, expected, "{mechanism:?}, tier={tier}");
+                gateway
+                    .complete(&test_node(), request(true), &[route.clone()], |_| json!({}))
+                    .await
+                    .expect("TTL-derived creation must pass without a cap");
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(journal.state().budget.cost_microusd, expected);
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            // Preflight with an enforced cost cap must see the same derived rate.
+            {
+                let dir = test_dir("retention-required-ttl-cap");
+                let journal = test_journal(&dir, &uuid::Uuid::now_v7().to_string());
+                let secrets = SecretStore::default();
+                let provider = Arc::new(RetentionProvider {
+                    mechanism,
+                    calls: AtomicUsize::new(0),
+                });
+                let mut gateway = test_gateway(provider.clone(), &secrets, &journal);
+                gateway.budget.max_cost_microusd = Some(u64::MAX);
+                gateway.budget.require_pricing = true;
+                gateway
+                    .complete(&test_node(), request(true), &[route], |_| json!({}))
+                    .await
+                    .expect("TTL preflight must not refuse the derived rate");
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(journal.state().budget.cost_microusd, expected);
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+    // A tier-selected TTL derives the write price even when neither the tier
+    // nor the base row names a creation rate.
+    {
+        let dir = test_dir("retention-required-ttl-tier");
+        let journal = test_journal(&dir, &uuid::Uuid::now_v7().to_string());
+        let secrets = SecretStore::default();
+        let provider = Arc::new(RetentionProvider {
+            mechanism: PromptCacheRetention::Ttl1h,
+            calls: AtomicUsize::new(0),
+        });
+        let mut gateway = test_gateway(provider.clone(), &secrets, &journal);
+        gateway.budget.require_pricing = true;
+        let mut route = pricing();
+        route.input_cost_per_million_usd = None;
+        route.cache_read_input_cost_per_million_usd = None;
+        route.cache_creation_input_cost_per_million_usd = None;
+        route.output_cost_per_million_usd = None;
+        route.cost_tiers[0].cache_creation_input_cost_per_million_usd = None;
+        let usage = TokenUsage {
+            input: 1_000_000,
+            cached_input: 400_000,
+            cache_creation_input: 200_000,
+            output: 10,
+            reasoning: 0,
+        };
+        assert!(
+            gateway
+                .cost_microusd(
+                    &test_node(),
+                    &[route.clone()],
+                    "tier",
+                    "test",
+                    &usage,
+                    None,
+                    None
+                )
+                .is_err(),
+            "tier creation without a TTL must stay unpriced"
+        );
+        let cost = gateway
+            .cost_microusd(
+                &test_node(),
+                &[route],
+                "tier",
+                "test",
+                &usage,
+                Some(CacheRetention::Extended),
+                None,
+            )
+            .expect("tier TTL must derive creation from tier input");
+        assert_eq!(cost, 4_200_060);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    // Preflight without a TTL still refuses a truly unpriced creation row.
+    {
+        let dir = test_dir("retention-required-no-ttl");
+        let journal = test_journal(&dir, &uuid::Uuid::now_v7().to_string());
+        let secrets = SecretStore::default();
+        let provider = Arc::new(RetentionProvider {
+            mechanism: PromptCacheRetention::Ttl1h,
+            calls: AtomicUsize::new(0),
+        });
+        let mut gateway = test_gateway(provider.clone(), &secrets, &journal);
+        gateway.budget.require_pricing = true;
+        gateway.budget.max_cost_microusd = Some(u64::MAX);
+        let mut route = pricing();
+        route.input_cost_per_million_usd = None;
+        route.cache_creation_input_cost_per_million_usd = None;
+        route.cost_tiers.clear();
+        let result = gateway
+            .complete(&test_node(), request(false), &[route], |_| json!({}))
+            .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("lacks cache input pricing")
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
 #[test]
 fn billing_metadata_follows_the_router_and_model_override() {
     let router = llm::LlmRouter::parse_text(

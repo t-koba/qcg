@@ -76,13 +76,19 @@ Fields:
   to the field required by the selected API.
 - `cache_read_input_cost_per_million_usd` /
   `cache_creation_input_cost_per_million_usd` on `model`: optional USD/1M
-  rates for cache reads and cache creation. Missing rates use the selected
-  pricing row's ordinary input rate; explicit zero is valid. Explicit contract
-  rates override catalog prices field by field; unspecified fields may use the
-  catalog's matching model price. `require_pricing` still requires ordinary
-  input/output prices only. Budgets are estimates, not invoices, especially
-  when rates for actual token categories are unset. No vendor discounts or
-  TTL-specific prices are inferred. See [usage and cost accounting](run-event-reference.md).
+  rates for cache reads and cache creation. Missing base cache rates use the
+  base pricing row's ordinary input rate; explicit zero is valid. Explicit
+  contract rates override catalog prices field by field; unspecified fields may
+  use the catalog's matching model price. `require_pricing` requires ordinary
+  input/output prices and resolved cache prices for any nonzero cache usage;
+  an Extended TTL derives the creation price from ordinary input, so that
+  derived price satisfies the requirement. With an enforced cost cap, required
+  pricing also checks cache reads in every reachable row—and cache creation
+  where no TTL-derived price applies—before dispatch; a maximum across tiers
+  cannot fill an unpriced row. With `require_pricing: false`, missing
+  cache prices still contribute zero. Budgets are estimates, not invoices.
+  No provider-specific discounts or separate TTL rate schedules are inferred; extended writes use the configured input-rate multiplier.
+  See [usage and cost accounting](run-event-reference.md).
 - `cost_tiers` on `model`: optional context tiers. Each tier names
   `threshold_tokens` (the prompt input from which the tier applies) and the
   rates that price a request at that tier:
