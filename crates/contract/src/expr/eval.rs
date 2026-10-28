@@ -352,11 +352,10 @@ fn extreme(items: &[Value], name: &str, wanted: std::cmp::Ordering) -> Result<Va
     Ok(selected.cloned().unwrap_or(Value::Null))
 }
 
-/// The scalar types the ordering functions accept: a value of another type
-/// has no order, so it is refused explicitly. The rule lives here so
-/// `sort`, `min` and `max` cannot drift apart.
+/// A scalar is orderable if the shared comparison accepts it against itself.
+/// `compare_json_scalar` owns the supported types for `sort`, `min` and `max`.
 fn is_orderable_scalar(value: &Value) -> bool {
-    matches!(value, Value::Number(_) | Value::String(_) | Value::Bool(_))
+    compare_json_scalar(value, value).is_some()
 }
 
 /// The error the ordering functions refuse an array with.

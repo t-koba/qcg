@@ -363,6 +363,72 @@ mod tests {
     }
 
     #[test]
+    fn ordering_functions_share_array_validation_and_empty_behavior() {
+        for name in ["sort", "min", "max"] {
+            assert_eq!(
+                eval_value(&format!("{name}([])")),
+                if name == "sort" {
+                    json!([])
+                } else {
+                    Value::Null
+                }
+            );
+            for items in [
+                "[null]",
+                "[[]]",
+                "[inputs.nested]",
+                "[1, 'a']",
+                "[true, 1]",
+                "['a', false]",
+            ] {
+                let case = format!("{name}({items})");
+                assert!(value_bag().eval_value(&case).is_err(), "{case}");
+            }
+        }
+        assert_eq!(
+            eval_value("sort([true, false, true])"),
+            json!([false, true, true])
+        );
+    }
+
+    #[test]
+    fn ordering_accepts_numeric_singletons_at_representation_boundaries() {
+        // Without arbitrary_precision, Number holds i64/u64 or finite f64.
+        // Self-comparison must accept every representation, including floats
+        // outside exact_integer's range, subnormals and signed zero.
+        let mut values = vec![json!(i64::MIN), json!(u64::MAX)];
+        for number in [
+            -f64::MAX,
+            f64::MAX,
+            -2.0_f64.powi(127),
+            2.0_f64.powi(127),
+            f64::MIN_POSITIVE,
+            f64::from_bits(1),
+            -f64::from_bits(1),
+            -0.0,
+            0.0,
+            0.5,
+        ] {
+            values.push(serde_json::Number::from_f64(number).unwrap().into());
+        }
+        for number in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(serde_json::Number::from_f64(number).is_none());
+        }
+        for value in values {
+            let bag = ValueBag::with_inputs(BTreeMap::from([("number".into(), value.clone())]));
+            for name in ["sort", "min", "max"] {
+                let case = format!("{name}([inputs.number])");
+                let expected = if name == "sort" {
+                    json!([value])
+                } else {
+                    value.clone()
+                };
+                assert_eq!(bag.eval_value(&case).unwrap(), expected, "{case}: {value}");
+            }
+        }
+    }
+
+    #[test]
     fn min_and_max_choose_an_element_exactly() {
         // The reduction compares the values as they are, so two distinct
         // large integers are not rounded into one, and the result is an
