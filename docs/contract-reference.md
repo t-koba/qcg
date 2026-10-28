@@ -4548,7 +4548,13 @@ token, and tool-call budgets. `retryable` is true only while the failure is reco
 and every relevant parent and specialist bound permits another invocation. Token, tool-call, iteration,
 validation, provider, guardrail, and tool failures have distinct codes.
 Run-wide budget exhaustion and cancellation always propagate; contracts cannot
-override these execution boundaries.
+override these execution boundaries. Resuming a run also requires the exact
+contract digest recorded in its journal. A changed digest, including changed
+resource limits, is refused before further execution; qcg has no supported
+same-run budget-amendment mechanism, and this refusal does not reset spent
+accounting or authorize continuation under new limits. A future amendment
+requires an explicit, authenticated host-authorization mechanism; caller-supplied
+contract changes are not authorization.
 
 `max_tool_calls_total` bounds all tool calls made by one `llm.agent` node and
 defaults to `32` when omitted.
