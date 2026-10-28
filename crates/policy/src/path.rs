@@ -14,10 +14,10 @@ use camino::Utf8Path;
 /// Device names Windows cannot represent as files. Matching is
 /// case-insensitive against the stem before the first `.`, because
 /// `NUL.txt` is the `NUL` device on Windows.
-const WINDOWS_RESERVED_STEMS: [&str; 24] = [
+const WINDOWS_RESERVED_STEMS: [&str; 30] = [
     "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "COM1", "COM2", "COM3", "COM4", "COM5",
     "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8",
-    "LPT9",
+    "LPT9", "COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³",
 ];
 
 /// Characters Win32 forbids in a file name, apart from the colon and
@@ -225,6 +225,25 @@ mod tests {
         }
         for good in ["a/normal.txt", "a.b", "console.log", "auxiliary/data.txt"] {
             assert!(is_safe_relative_path(good), "{good:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_superscript_windows_device_stems() {
+        for stem in [
+            "COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³", "cOm¹", "lPt³",
+        ] {
+            for path in [
+                stem.to_owned(),
+                format!("{stem}.txt"),
+                format!("a/{stem}.log.gz"),
+            ] {
+                assert!(!is_safe_relative_path(&path), "{path:?}");
+                assert!(!is_safe_glob_pattern(&path), "{path:?}");
+                if !path.contains('/') {
+                    assert!(!is_safe_path_component(&path), "{path:?}");
+                }
+            }
         }
     }
 

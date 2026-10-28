@@ -478,9 +478,18 @@ both the logical secret name and its environment-variable name. Treat any
 contract requesting a sensitive variable as code requesting that credential;
 deny it unless the package and intended output are trusted.
 
-Safe relative paths reject empty paths, absolute paths, NUL bytes, backslashes,
-`.` / `..`, and empty components. Directory-backed assets are canonicalized
-and must remain below the canonical generator root, including through symlinks.
+Safe relative paths are non-empty, relative, and slash-separated. They reject
+absolute paths, NUL bytes, backslashes, `.` / `..` and empty components,
+colons (including ADS and drive forms), control bytes (`0x00`–`0x1F` and `0x7F`),
+and components ending in a dot or space. Win32-reserved characters
+(`<`, `>`, `"`, `|`, `*`, `?`) and device stems are forbidden. Device stems
+are matched ASCII-case-insensitively before the first dot, including extension
+forms: `CON`, `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`, `COM1`–`COM9`,
+`LPT1`–`LPT9`, `COM¹`, `COM²`, `COM³`, `LPT¹`, `LPT²`, and `LPT³`.
+Safe relative glob patterns follow the same rules except that `*` and `?`
+are allowed as wildcards within components; concrete paths forbid both.
+Directory-backed assets are canonicalized and must remain below the canonical
+generator root, including through symlinks.
 
 ## Shutdown and restart semantics
 
