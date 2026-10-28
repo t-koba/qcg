@@ -8,7 +8,6 @@ use model::OutputManifest;
 use policy::is_safe_path_component;
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
-use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{Cursor, Read as _, Write};
 use zip::write::SimpleFileOptions;
@@ -58,6 +57,7 @@ pub(crate) fn collect_verified_with_limits(
             manifest.artifacts.len()
         )));
     }
+    engine::validate_output_manifest_paths(&manifest)?;
     let mut verified = Vec::new();
     for artifact in &manifest.artifacts {
         let fs_path = resolve_artifact_path(&run_workspace_dir(run_dir), &artifact.path)?;
@@ -112,11 +112,13 @@ pub fn write_artifacts_zip_stream_with_limits<W: Write>(
         )));
     }
     let workspace = run_workspace_dir(run_dir);
-    let mut directories = BTreeSet::new();
+    let mut directories = std::collections::BTreeMap::new();
     for artifact in &verified {
         let mut parent = Utf8Path::new(&artifact.path).parent();
         while let Some(directory) = parent.filter(|directory| !directory.as_str().is_empty()) {
-            directories.insert(directory.to_path_buf());
+            directories
+                .entry(policy::path_collision_key(directory.as_str()))
+                .or_insert_with(|| directory.to_path_buf());
             if limits
                 .max_entries
                 .is_some_and(|limit| directories.len().saturating_add(verified.len()) > limit)
@@ -128,6 +130,7 @@ pub fn write_artifacts_zip_stream_with_limits<W: Write>(
             parent = directory.parent();
         }
     }
+    let directories: std::collections::BTreeSet<_> = directories.into_values().collect();
     check_verified_artifact_hashes(&verified)?;
     let mut zip = zip::ZipWriter::new_stream(CountingWriter::new(writer, limits.max_bytes));
     for directory in directories {

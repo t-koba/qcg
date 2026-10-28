@@ -51,14 +51,8 @@ pub(crate) async fn write_zip_atomic(
     Ok(())
 }
 
-/// Opens a zip source file without following a terminal symlink
-/// (E13o). The pre-check denies a symlink fail-closed; the authoritative
-/// open uses `O_NOFOLLOW` on Unix via `files::open_read_nofollow` with an
-/// `fstat` type check on the opened handle, so a symlink swapped in
-/// between the pre-check and the open fails instead of being followed.
-/// Non-Unix has no `O_NOFOLLOW` handle: the pre-plus-post check is
-/// best-effort there and documented as such. A symlink is denied, never
-/// silently skipped.
+/// Denies terminal symlinks, including swaps, via `open_read_nofollow` and
+/// opened-handle type checks (E13o). Non-Unix pre/post checks are best-effort.
 fn open_zip_source_nofollow(
     node_id: &str,
     path: &camino::Utf8Path,
@@ -80,11 +74,7 @@ fn open_zip_source_nofollow(
         Err(error) => return Err(StepError::failed(node_id, error.to_string())),
     }
     let file = files::open_read_nofollow(path).step_err(node_id)?;
-    if file
-        .metadata()
-        .map(|metadata| !metadata.is_file())
-        .unwrap_or(true)
-    {
+    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
         return Err(StepError::failed(
             node_id,
             format!("zip source `{path}` is not a regular file"),
@@ -101,7 +91,7 @@ pub(crate) fn build_zip<W: std::io::Write + std::io::Seek>(
     count_limit: Option<usize>,
     writer: W,
 ) -> Result<(), StepError> {
-    let mut writer = zip::ZipWriter::new(writer);
+    let mut entries = Vec::new();
     let mut input_bytes = 0_usize;
     // Deny a terminal symlink at the source root itself (fail-closed).
     if std::fs::symlink_metadata(source_path)
@@ -113,6 +103,36 @@ pub(crate) fn build_zip<W: std::io::Write + std::io::Seek>(
             format!("zip source `{source_path}` is a symbolic link; refusing"),
         ));
     }
+    if source_path.is_dir() {
+        for entry in WalkDir::new(source_path).min_depth(1) {
+            let entry = entry.step_err(node_id)?;
+            if let Some(limit) = count_limit
+                && entries.len() >= limit
+            {
+                return Err(StepError::failed(
+                    node_id,
+                    format!("zip source contains more than {limit} entries"),
+                ));
+            }
+            let name = policy::portable_relative_path(
+                entry.path().strip_prefix(source_path).step_err(node_id)?,
+            );
+            entries.push((name, entry));
+        }
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+    }
+    policy::path::validate_path_tree_set(
+        entries
+            .iter()
+            .filter(|(_, e)| e.path() != target_path)
+            .map(|(p, e)| (p.as_str(), e.file_type().is_dir())),
+    )
+    .step_err(node_id)?;
+    if source_path.is_file() {
+        policy::path::validate_path_tree_set([(source_path.file_name().unwrap_or(""), false)])
+            .step_err(node_id)?;
+    }
+    let mut writer = zip::ZipWriter::new(writer);
     if source_path.is_file() {
         if count_limit == Some(0) {
             return Err(StepError::failed(
@@ -136,27 +156,11 @@ pub(crate) fn build_zip<W: std::io::Write + std::io::Seek>(
             node_id,
         )?;
     } else if source_path.is_dir() {
-        let mut entries = Vec::new();
-        for entry in WalkDir::new(source_path).min_depth(1) {
-            let entry = entry.step_err(node_id)?;
-            if let Some(limit) = count_limit
-                && entries.len() >= limit
-            {
-                return Err(StepError::failed(
-                    node_id,
-                    format!("zip source contains more than {limit} entries"),
-                ));
-            }
-            entries.push(entry);
-        }
-        entries.sort_by(|left, right| left.path().cmp(right.path()));
-        for entry in entries {
+        for (entry_name, entry) in entries {
             let path = entry.path().to_path_buf();
             if path == target_path {
                 continue;
             }
-            let rel = path.strip_prefix(source_path).step_err(node_id)?;
-            let entry_name = policy::portable_relative_path(rel);
             let metadata = entry.metadata().step_err(node_id)?;
             // E13o: symlinks are denied fail-closed, never silently skipped.
             if entry.file_type().is_symlink() {
@@ -274,4 +278,46 @@ pub(crate) fn zip_entry_options(
         options.unix_permissions(files::sanitize_mode_bits(metadata.permissions().mode()))
     };
     Ok(options)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    #[test]
+    fn zip_path_sets_reject_before_emitting_headers() {
+        let root = camino::Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("zip-path-sets-{}", uuid::Uuid::now_v7())),
+        )
+        .unwrap();
+        for pair in [
+            ["Report.md", "report.md"],
+            ["Maße", "MASSE"],
+            ["é", "e\u{301}"],
+            ["A", "a/x"],
+            ["A/x", "a/y"],
+        ] {
+            std::fs::create_dir_all(&root).unwrap();
+            for name in pair {
+                let path = root.join(name);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, b"x").unwrap();
+            }
+            let mut out = std::io::Cursor::new(Vec::new());
+            assert!(build_zip("zip", &root, &root.join("skip"), None, Some(8), &mut out).is_err());
+            assert!(
+                out.into_inner().is_empty(),
+                "no header or drop finalization"
+            );
+            std::fs::remove_dir_all(&root).unwrap();
+        }
+        std::fs::create_dir_all(root.join("shared")).unwrap();
+        std::fs::write(root.join("shared/x"), b"x").unwrap();
+        std::fs::write(root.join("shared/y"), b"y").unwrap();
+        let mut out = std::io::Cursor::new(Vec::new());
+        build_zip("zip", &root, &root.join("skip"), None, Some(8), &mut out).unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(out.into_inner())).unwrap();
+        assert_eq!(zip.by_name("shared/x").unwrap().size(), 1);
+        assert_eq!(zip.by_name("shared/y").unwrap().size(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

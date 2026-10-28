@@ -2,7 +2,6 @@ use crate::{FieldType, InputField};
 use model::{FileValue, FileValueError};
 use policy::{is_safe_glob_pattern, is_safe_relative_path};
 use serde_json::Value;
-use std::collections::BTreeSet;
 
 use super::contract::ContractError;
 use super::llm::RuntimeLimits;
@@ -13,52 +12,13 @@ pub(crate) struct AssetRule;
 
 impl AssetRule {
     pub(crate) fn validate(&self, manifest: &Manifest) -> Result<(), ContractError> {
-        let mut paths = BTreeSet::new();
-        for path in &manifest.assets.files {
+        let paths = manifest.assets.files.iter().chain(&manifest.assets.dirs);
+        for path in paths.clone() {
             validate_asset_path(path)?;
-            if !paths.insert(path.clone()) {
-                return Err(ContractError::Invalid(format!(
-                    "duplicate asset file `{path}`"
-                )));
-            }
         }
-        let mut dirs = BTreeSet::new();
-        for dir in &manifest.assets.dirs {
-            validate_asset_path(dir)?;
-            if !dirs.insert(dir.clone()) {
-                return Err(ContractError::Invalid(format!(
-                    "duplicate asset directory `{dir}`"
-                )));
-            }
-            if manifest.assets.files.iter().any(|file| {
-                file == dir
-                    || file
-                        .strip_prefix(dir)
-                        .is_some_and(|suffix| suffix.starts_with('/'))
-                    || dir
-                        .strip_prefix(file)
-                        .is_some_and(|suffix| suffix.starts_with('/'))
-            }) {
-                return Err(ContractError::Invalid(format!(
-                    "asset directory `{dir}` overlaps an asset file"
-                )));
-            }
-        }
-        for dir in &manifest.assets.dirs {
-            if manifest.assets.dirs.iter().any(|other| {
-                other != dir
-                    && (dir
-                        .strip_prefix(other)
-                        .is_some_and(|suffix| suffix.starts_with('/'))
-                        || other
-                            .strip_prefix(dir)
-                            .is_some_and(|suffix| suffix.starts_with('/')))
-            }) {
-                return Err(ContractError::Invalid(format!(
-                    "asset directory `{dir}` overlaps another asset directory"
-                )));
-            }
-        }
+        // Declared directories reserve their whole subtree, unlike archive directories.
+        policy::path::validate_path_tree_set(paths.map(|p| (p.as_str(), false)))
+            .map_err(|error| ContractError::Invalid(error.to_string()))?;
         Ok(())
     }
 }

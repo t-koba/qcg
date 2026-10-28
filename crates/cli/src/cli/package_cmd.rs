@@ -9,6 +9,9 @@ use std::io::Write;
 use std::time::SystemTime;
 use zip::write::SimpleFileOptions;
 
+const SBOM_PATH: &str = "SBOM.spdx.json";
+const PROVENANCE_PATH: &str = "PROVENANCE.intoto.json";
+
 struct PackageFileEntry {
     archive_path: String,
     source_path: Utf8PathBuf,
@@ -22,8 +25,6 @@ pub(crate) fn package(
     output: &Utf8Path,
     limits: &service::PackageLimits,
 ) -> Result<()> {
-    const SBOM_PATH: &str = "SBOM.spdx.json";
-    const PROVENANCE_PATH: &str = "PROVENANCE.intoto.json";
     let root = dunce::canonicalize(dir)
         .with_context(|| format!("failed to canonicalize package input `{dir}`"))?;
     let output_absolute = if output.is_absolute() {
@@ -333,8 +334,13 @@ fn write_package_archive(
     provenance: &[u8],
     max_bytes: Option<u64>,
 ) -> Result<()> {
-    const SBOM_PATH: &str = "SBOM.spdx.json";
-    const PROVENANCE_PATH: &str = "PROVENANCE.intoto.json";
+    policy::path::validate_path_tree_set(
+        directories
+            .iter()
+            .map(|(p, _)| (p.as_str(), true))
+            .chain(entries.iter().map(|e| (e.archive_path.as_str(), false)))
+            .chain([(SBOM_PATH, false), (PROVENANCE_PATH, false)]),
+    )?;
     let mut zip = zip::ZipWriter::new(file);
     for (name, metadata) in directories {
         zip.add_directory(format!("{name}/"), package_zip_options(metadata, true)?)?;
@@ -352,8 +358,7 @@ fn write_package_archive(
             );
         }
     }
-    // Deterministic SBOM/provenance mtime so archive hashes are stable
-    // across builds (E15-7). 2020-01-01 is inside the ZIP DateTime range.
+    // Stable SBOM/provenance mtime (2020-01-01, within ZIP range) (E15-7).
     let generated_options = generated_package_zip_options(deterministic_package_time())?;
     for (name, bytes) in [(SBOM_PATH, sbom), (PROVENANCE_PATH, provenance)] {
         zip.start_file(name, generated_options)?;
@@ -363,12 +368,9 @@ fn write_package_archive(
     Ok(())
 }
 
-/// Fixed generation timestamp for SBOM/provenance entries so repeated packs
-/// of identical inputs hash identically (E15-7).
+/// Fixed SBOM/provenance timestamp for deterministic archives (E15-7).
 fn deterministic_package_time() -> SystemTime {
-    // 2020-01-01T00:00:00Z as Unix seconds.
-    const DETERMINISTIC_EPOCH_SECS: u64 = 1_577_836_800;
-    SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(DETERMINISTIC_EPOCH_SECS)
+    SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800) // 2020-01-01 UTC
 }
 
 fn package_zip_options(metadata: &std::fs::Metadata, directory: bool) -> Result<SimpleFileOptions> {
@@ -497,6 +499,47 @@ fn copy_file_with_sha256<W: Write>(
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn package_path_sets_reject_collisions_without_replacing_output() {
+        let root = Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("package-path-sets-{}", uuid::Uuid::now_v7())),
+        )
+        .unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let _guard = TempGuard(root.clone());
+        let input = root.join("input");
+        let output = root.join("out.pkg");
+        for pair in [
+            ["Report.md", "report.md"],
+            ["Maße", "MASSE"],
+            ["é", "e\u{301}"],
+            ["A", "a/x"],
+            ["A/x", "a/y"],
+            ["sbom.spdx.json", "other"],
+        ] {
+            std::fs::create_dir_all(&input).unwrap();
+            std::fs::write(
+                input.join(contract::MANIFEST_FILE),
+                "[generator]\nid = \"test\"\nname = \"Test\"\nversion = \"1.0.0\"\n",
+            )
+            .unwrap();
+            for name in pair {
+                let path = input.join(name);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, b"x").unwrap();
+            }
+            std::fs::write(&output, b"unchanged").unwrap();
+            assert!(
+                package(&input, &output, &service::PackageLimits::default()).is_err(),
+                "{pair:?}"
+            );
+            assert_eq!(std::fs::read(&output).unwrap(), b"unchanged");
+            std::fs::remove_dir_all(&input).unwrap();
+        }
+    }
+
     // Every test in this module is Unix-gated (executable-bit behavior),
     // so the parent import is Unix-only too.
     #[cfg(unix)]

@@ -81,9 +81,11 @@ pub fn collect_outputs(
             insert_artifact(&mut artifacts, &mut accounting, artifact)?;
         }
     }
-    Ok(OutputManifest {
+    let outputs = OutputManifest {
         artifacts: artifacts.into_values().collect(),
-    })
+    };
+    super::validate_output_manifest_paths(&outputs)?;
+    Ok(outputs)
 }
 
 #[derive(Clone, Copy)]

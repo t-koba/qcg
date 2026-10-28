@@ -122,6 +122,12 @@ impl JournalReplay {
                 )));
             }
         }
+        policy::path::validate_path_tree_set(
+            self.state
+                .latest_file_pins
+                .keys()
+                .map(|p| (p.as_str(), false)),
+        )?;
         // Per-digest in-memory cache for this resume: the same immutable
         // blob is hashed once even when many paths or revisions name it
         // (E06). The cache holds digests verified during this call only.

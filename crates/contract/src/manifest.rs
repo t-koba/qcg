@@ -21,6 +21,31 @@ pub use tools::*;
 pub use validate::*;
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn asset_path_sets_reject_collisions_and_reserved_subtrees() {
+        let mut manifest = manifest_with_llm_settings("");
+        for pair in [
+            ["Report.md", "report.md"],
+            ["Maße", "MASSE"],
+            ["é", "e\u{301}"],
+            ["A", "a/x"],
+        ] {
+            manifest.assets.files = pair.map(String::from).to_vec();
+            assert!(assets::AssetRule.validate(&manifest).is_err(), "{pair:?}");
+        }
+        manifest.assets.files = vec!["A/x".into(), "a/y".into()];
+        assert!(assets::AssetRule.validate(&manifest).is_err());
+        manifest.assets.files = vec!["a/x".into(), "a/y".into()];
+        for dirs in [vec!["a".into()], vec!["A/x".into()]] {
+            manifest.assets.dirs = dirs;
+            assert!(assets::AssetRule.validate(&manifest).is_err());
+        }
+        manifest.assets.files.clear();
+        manifest.assets.dirs = vec!["é".into(), "e\u{301}/child".into()];
+        assert!(assets::AssetRule.validate(&manifest).is_err());
+    }
+
     use super::*;
     use crate::{
         AgentFailureAction, AgentFailureCode, AssetSpec, FieldType, GeneratorMeta, InputField,

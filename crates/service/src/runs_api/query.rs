@@ -185,14 +185,8 @@ impl LocalService {
                 let mut verified = Vec::new();
                 if let Some(m) = &manifest {
                     check_bundle_limits(0, m.artifacts.len(), &limits)?;
-                    let mut paths = std::collections::BTreeSet::new();
+                    engine::validate_output_manifest_paths(m)?;
                     for artifact in &m.artifacts {
-                        if !paths.insert(&artifact.path) {
-                            return Err(ServiceError::Invalid(format!(
-                                "output manifest contains duplicate artifact `{}`",
-                                artifact.path
-                            )));
-                        }
                         let fp =
                             resolve_artifact_path(&run_workspace_dir(&directory), &artifact.path)?;
                         let len = std::fs::metadata(&fp)?.len();
@@ -265,11 +259,17 @@ impl LocalService {
             .and_then(|n| n.checked_add(usize::from(audit_len.is_some())))
             .and_then(|n| n.checked_add(verified.len()))
             .ok_or_else(|| api_internal("bundle entries overflow"))?;
-        let mut directories = std::collections::BTreeSet::from([Utf8PathBuf::from("artifacts")]);
+        let mut directories = std::collections::BTreeMap::from([(
+            "artifacts".to_owned(),
+            Utf8PathBuf::from("artifacts"),
+        )]);
         for artifact in &verified {
             let mut parent = Utf8Path::new(&artifact.path).parent();
             while let Some(dir) = parent.filter(|d| !d.as_str().is_empty()) {
-                directories.insert(Utf8PathBuf::from("artifacts").join(dir));
+                let path = Utf8PathBuf::from("artifacts").join(dir);
+                directories
+                    .entry(policy::path_collision_key(path.as_str()))
+                    .or_insert(path);
                 let entries = base_entries
                     .checked_add(directories.len())
                     .ok_or_else(|| api_internal("bundle entries overflow"))?;
@@ -277,6 +277,8 @@ impl LocalService {
                 parent = dir.parent();
             }
         }
+        let mut directories: Vec<_> = directories.into_values().collect();
+        directories.sort();
         let entry_count = base_entries
             .checked_add(directories.len())
             .ok_or_else(|| api_internal("bundle entries overflow"))?;
@@ -308,7 +310,7 @@ impl LocalService {
             journal_len,
             audit_len,
             verified,
-            directories: directories.into_iter().collect(),
+            directories,
         })
     }
 

@@ -1,15 +1,11 @@
 use camino::Utf8Path;
 use contract::RuntimeLimits;
 use model::OutputManifest;
-use std::collections::BTreeSet;
 use std::io::{self, Read as _, Write as _};
 
 use super::collect::OutputLimits;
 
-pub fn write_output_manifest(
-    workspace: &Utf8Path,
-    manifest: &OutputManifest,
-) -> Result<(), std::io::Error> {
+pub fn write_output_manifest(workspace: &Utf8Path, manifest: &OutputManifest) -> io::Result<()> {
     write_output_manifest_with_limits(workspace, manifest, &RuntimeLimits::default())
 }
 
@@ -17,9 +13,10 @@ pub fn write_output_manifest_with_limits(
     workspace: &Utf8Path,
     manifest: &OutputManifest,
     runtime: &RuntimeLimits,
-) -> Result<(), std::io::Error> {
+) -> io::Result<()> {
     let limits = OutputLimits::from_runtime(runtime)?;
     validate_output_manifest(manifest, limits)?;
+    let path = workspace.join("outputs.json");
     match limits.file_bytes {
         Some(limit) => {
             let mut writer = BoundedManifestWriter::new(
@@ -33,32 +30,28 @@ pub fn write_output_manifest_with_limits(
                     io::Error::other(error)
                 }
             })?;
-            let path = workspace.join("outputs.json");
             files::write_file_atomic(&path, |file| file.write_all(writer.bytes()))?;
-            Ok(())
         }
         None => {
-            let path = workspace.join("outputs.json");
             files::write_file_atomic(&path, |file| {
                 serde_json::to_writer_pretty(file, manifest).map_err(std::io::Error::other)
             })?;
-            Ok(())
         }
     }
+    Ok(())
 }
 
-pub fn read_output_manifest(workspace: &Utf8Path) -> Result<OutputManifest, std::io::Error> {
+pub fn read_output_manifest(workspace: &Utf8Path) -> io::Result<OutputManifest> {
     read_output_manifest_with_limits(workspace, &RuntimeLimits::default())
 }
 
 pub fn read_output_manifest_with_limits(
     workspace: &Utf8Path,
     runtime: &RuntimeLimits,
-) -> Result<OutputManifest, std::io::Error> {
+) -> io::Result<OutputManifest> {
     let limits = OutputLimits::from_runtime(runtime)?;
-    let path = workspace.join("outputs.json");
-    let file = std::fs::File::open(&path)?;
-    if let Some(limit) = limits.file_bytes {
+    let file = std::fs::File::open(workspace.join("outputs.json"))?;
+    let manifest = if let Some(limit) = limits.file_bytes {
         let mut bytes = Vec::new();
         let mut limited = file.take(limit.saturating_add(1));
         std::io::Read::read_to_end(&mut limited, &mut bytes)?;
@@ -67,15 +60,23 @@ pub fn read_output_manifest_with_limits(
                 "outputs.json exceeds {limit} bytes"
             )));
         }
-        return serde_json::from_slice(&bytes).map_err(std::io::Error::other);
+        serde_json::from_slice(&bytes)
+    } else {
+        serde_json::from_reader(file)
     }
-    serde_json::from_reader(file).map_err(std::io::Error::other)
+    .map_err(std::io::Error::other)?;
+    validate_output_manifest(&manifest, limits)?;
+    Ok(manifest)
 }
 
-fn validate_output_manifest(
-    manifest: &OutputManifest,
-    limits: OutputLimits,
-) -> Result<(), std::io::Error> {
+pub fn validate_output_manifest_paths(manifest: &OutputManifest) -> io::Result<()> {
+    policy::path::validate_path_tree_set(
+        manifest.artifacts.iter().map(|a| (a.path.as_str(), false)),
+    )
+    .map_err(|e| io::Error::other(format!("unsafe or duplicate artifact paths: {e}")))
+}
+
+fn validate_output_manifest(manifest: &OutputManifest, limits: OutputLimits) -> io::Result<()> {
     if let Some(limit) = limits.artifact_count
         && manifest.artifacts.len() > limit
     {
@@ -83,15 +84,9 @@ fn validate_output_manifest(
             "output artifact count exceeds {limit}"
         )));
     }
-    let mut paths = BTreeSet::new();
+    validate_output_manifest_paths(manifest)?;
     let mut total = 0_u64;
     for artifact in &manifest.artifacts {
-        if !paths.insert(&artifact.path) {
-            return Err(io::Error::other(format!(
-                "output manifest contains duplicate artifact `{}`",
-                artifact.path
-            )));
-        }
         if let Some(limit) = limits.file_bytes
             && artifact.bytes > limit
         {

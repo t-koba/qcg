@@ -1,69 +1,95 @@
-//! Platform-independent path safety predicates. Paths are persisted in
-//! contracts and journals and may be consumed on another host, so these
-//! checks never depend on the local filesystem.
-//!
-//! A safe relative path is non-empty, relative, slash-separated, and names
-//! no form a Windows host cannot represent: no ADS or drive colon, no
-//! backslash, no control byte, no trailing dot or space, no reserved device
-//! stem, and none of the characters Win32 forbids in a file name (`<`, `>`,
-//! `"`, `|`, `?`, `*`). A glob pattern is the same shape, except that a
-//! component may hold the `*` and `?` wildcards.
-
+//! Persisted paths are host-independent; set keys use conservative NFD/full Unicode case-fold/NFD.
+//! Safe paths are nonempty relative slash paths excluding ADS/drive colons, backslashes, controls, trailing dots/spaces, reserved stems and Win32 `< > " | ? *`; globs also allow `*` and `?`.
 use camino::Utf8Path;
 
-/// Device names Windows cannot represent as files. Matching is
-/// case-insensitive against the stem before the first `.`, because
-/// `NUL.txt` is the `NUL` device on Windows.
+/// Canonical caseless key: NFD/full Unicode case-fold/NFD; conservative, not exact NTFS/APFS emulation.
+pub fn path_collision_key(path: &str) -> String {
+    use unicode_normalization::UnicodeNormalization as _;
+    let nfd = path.nfd().collect::<String>();
+    let folded = unicase::UniCase::unicode(nfd).to_folded_case();
+    folded.nfd().collect()
+}
+
+/// Validates concrete path entries, preserving spelling and rejecting equivalent names or file parents.
+pub fn validate_path_set<'a>(
+    entries: impl IntoIterator<Item = (&'a str, bool)>,
+) -> std::io::Result<()> {
+    validate_path_set_inner(entries, false)
+}
+
+/// Validates a path set including implicit parents, preserving one spelling per directory.
+pub fn validate_path_tree_set<'a>(
+    entries: impl IntoIterator<Item = (&'a str, bool)>,
+) -> std::io::Result<()> {
+    validate_path_set_inner(entries, true)
+}
+
+fn validate_path_set_inner<'a>(
+    entries: impl IntoIterator<Item = (&'a str, bool)>,
+    tree: bool,
+) -> std::io::Result<()> {
+    let mut paths = entries
+        .into_iter()
+        .map(|(p, d)| (path_collision_key(p), p, d))
+        .collect::<Vec<_>>();
+    if paths.iter().any(|(_, p, _)| !is_safe_relative_path(p)) {
+        return Err(std::io::Error::other("unsafe or colliding path set"));
+    }
+    paths.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    for pair in paths.windows(2) {
+        let (lk, lp, _) = &pair[0];
+        let (rk, rp, _) = &pair[1];
+        let alias = tree
+            && lk
+                .split('/')
+                .zip(lp.split('/'))
+                .zip(rk.split('/').zip(rp.split('/')))
+                .take_while(|((left, _), (right, _))| left == right)
+                .any(|((_, left), (_, right))| left != right);
+        if lk == rk || alias {
+            return Err(std::io::Error::other("unsafe or colliding path set"));
+        }
+    }
+    for (key, _, _) in &paths {
+        let mut parent = key.as_str();
+        while let Some((prefix, _)) = parent.rsplit_once('/') {
+            if let Ok(index) = paths.binary_search_by(|entry| entry.0.as_str().cmp(prefix))
+                && !paths[index].2
+            {
+                return Err(std::io::Error::other("path set uses a file as a directory"));
+            }
+            parent = prefix;
+        }
+    }
+    Ok(())
+}
+
 const WINDOWS_RESERVED_STEMS: [&str; 30] = [
     "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "COM1", "COM2", "COM3", "COM4", "COM5",
     "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8",
     "LPT9", "COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³",
 ];
 
-/// Characters Win32 forbids in a file name, apart from the colon and
-/// the backslash that are refused separately. A path that names one
-/// cannot exist on a Windows host, so a contract, journal or archive
-/// entry carrying it is not portable. The `?` and `*` wildcards are
-/// forbidden in a file name too, but only a glob pattern may hold them.
-const WIN32_FORBIDDEN_CHARS: [char; 4] = ['<', '>', '"', '|'];
-
-/// Validates one component against the module-level portable-path rules.
 fn is_portable_component(part: &str, wildcards_allowed: bool) -> bool {
-    if part.is_empty() || part == "." || part == ".." {
-        return false;
-    }
-    if part.contains(':') {
-        return false;
-    }
-    if part.ends_with('.') || part.ends_with(' ') {
-        return false;
-    }
-    if part.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
-        return false;
-    }
-    if part.contains(WIN32_FORBIDDEN_CHARS) || (!wildcards_allowed && part.contains(['?', '*'])) {
-        return false;
-    }
-    let stem = part.split('.').next().unwrap_or(part);
-    if WINDOWS_RESERVED_STEMS
-        .iter()
-        .any(|reserved| stem.eq_ignore_ascii_case(reserved))
+    if part.is_empty()
+        || part == "."
+        || part == ".."
+        || part.contains(':')
+        || part.ends_with(['.', ' '])
+        || part.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
+        || part.contains(['<', '>', '"', '|'])
+        || (!wildcards_allowed && part.contains(['?', '*']))
     {
         return false;
     }
-    true
+    let stem = part.split('.').next().unwrap_or(part);
+    !WINDOWS_RESERVED_STEMS
+        .iter()
+        .any(|reserved| stem.eq_ignore_ascii_case(reserved))
 }
 
-fn is_safe_relative(path: &str, wildcards_allowed: bool) -> bool {
-    let bytes = path.as_bytes();
-    !path.is_empty()
-        && !path.starts_with('/')
-        && !(bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
-        && !path.contains('\\')
-        && !path.contains('\0')
-        && !path
-            .split('/')
-            .any(|part| !is_portable_component(part, wildcards_allowed))
+fn is_safe_relative(path: &str, w: bool) -> bool {
+    !path.contains('\\') && path.split('/').all(|p| is_portable_component(p, w))
 }
 
 /// Returns whether `path` is a portable concrete relative path.
@@ -71,8 +97,7 @@ pub fn is_safe_relative_path(path: &str) -> bool {
     is_safe_relative(path, false)
 }
 
-/// Returns whether `pattern` is a portable relative glob.
-/// The module documentation describes the wildcard and component rules.
+/// Returns whether `pattern` is a portable relative glob (see module rules).
 pub fn is_safe_glob_pattern(pattern: &str) -> bool {
     is_safe_relative(pattern, true)
 }
@@ -84,36 +109,89 @@ pub fn is_safe_path_component(path: &str) -> bool {
 /// Joins path components with `/` for archive entries and manifests.
 pub fn portable_relative_path(path: &Utf8Path) -> String {
     path.components()
-        .map(|component| component.as_str())
+        .map(|c| c.as_str())
         .collect::<Vec<_>>()
         .join("/")
 }
 
-/// Normalizes an fs tool `path_prefix` to its slash-trimmed safe form.
-/// Returns `None` when the prefix is not a safe relative path.
+/// Normalizes a safe fs `path_prefix` by trimming one trailing slash.
 pub fn normalize_path_prefix(prefix: &str) -> Option<&str> {
     let normalized = prefix.strip_suffix('/').unwrap_or(prefix);
     is_safe_relative_path(normalized).then_some(normalized)
 }
 
-/// Returns whether `path` stays within `prefix` on component boundaries.
-/// Both sides must be safe relative paths; `path == prefix` counts as
-/// within. String-prefix matches that split a component (e.g.
-/// `outcome.txt` under `out`) are rejected, as is any unsafe path.
+/// Tests safe component-boundary containment; equality counts, while unsafe or split-prefix paths fail.
 pub fn path_is_within_prefix(path: &str, prefix: &str) -> bool {
     let Some(prefix) = normalize_path_prefix(prefix) else {
         return false;
     };
-    is_safe_relative_path(path)
-        && (path == prefix
-            || path
-                .strip_prefix(prefix)
-                .is_some_and(|suffix| suffix.starts_with('/')))
+    let suffix = path.strip_prefix(prefix);
+    is_safe_relative_path(path) && suffix.is_some_and(|s| s.is_empty() || s.starts_with('/'))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_trees_reject_aliasing_implicit_parents() {
+        for entries in [
+            vec![("A/x", false), ("a/y", false)],
+            vec![("A", true), ("a/x", false)],
+            vec![("A/B/x", false), ("a/C/y", false)],
+            vec![("é/x", false), ("e\u{301}/y", false)],
+            vec![("Maße/x", false), ("MASSE/y", false)],
+        ] {
+            assert!(validate_path_tree_set(entries).is_err());
+        }
+        for entries in [
+            vec![("A/x", false), ("A/y", false)],
+            vec![("A", true), ("A/x", false), ("A/y", false)],
+            vec![("A/B/x", false), ("A/C/y", false)],
+        ] {
+            validate_path_tree_set(entries).unwrap();
+        }
+        assert!(validate_path_set([("A/x", false), ("a/y", false)]).is_ok());
+    }
+
+    #[test]
+    fn path_sets_use_canonical_full_fold_and_component_prefixes() {
+        for (a, b) in [
+            ("Report.md", "report.md"),
+            ("Maße", "MASSE"),
+            ("é.txt", "e\u{301}.txt"),
+            ("A/ß", "a/SS"),
+            ("α\u{345}\u{301}", "α\u{301}\u{345}"),
+        ] {
+            assert_eq!(path_collision_key(a), path_collision_key(b), "{a} {b}");
+            assert!(validate_path_set([(a, false), (b, false)]).is_err());
+            assert!(validate_path_set([(b, true), (a, false)]).is_err());
+            assert!(validate_path_set([(a, true), (b, true)]).is_err());
+        }
+        for entries in [
+            vec![("A", false), ("a/x", false)],
+            vec![("a/x", true), ("A", false)],
+            vec![("Maße", false), ("MASSE/x", false)],
+            vec![("é", false), ("e\u{301}/x", true)],
+            vec![("a", false), ("a-b", false), ("a/b", false)],
+        ] {
+            assert!(validate_path_set(entries).is_err());
+        }
+        for entries in [
+            vec![],
+            vec![("A/x", false), ("a/y", false)],
+            vec![("A", true), ("a/x", false), ("A/y", false)],
+            vec![("a", false), ("ab/x", false)],
+            vec![("é/x", false), ("e\u{301}/y", false)],
+            vec![("e", false), ("é", false)],
+            vec![("Ａ", false), ("A", false)],
+        ] {
+            validate_path_set(entries).unwrap();
+        }
+        assert!(validate_path_set([("same", false), ("same", false)]).is_err());
+        assert!(validate_path_set([("same", true), ("same", true)]).is_err());
+        assert!(validate_path_set([("NUL", false)]).is_err());
+    }
 
     #[test]
     fn rejects_traversal_and_absolute_forms() {

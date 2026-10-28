@@ -2161,9 +2161,26 @@ mod tests {
             .status(),
             StatusCode::OK
         );
+        let empty_digest = {
+            use sha2::Digest as _;
+            hex::encode(sha2::Sha256::digest(b""))
+        };
+        let many_artifacts = (0..1001)
+            .map(|index| {
+                let path = format!("empty-{index}.bin");
+                std::fs::write(run_dir.join("workspace").join(&path), []).unwrap();
+                serde_json::json!({
+                    "path": path,
+                    "sha256": empty_digest,
+                    "bytes": 0,
+                    "label": "Empty",
+                    "required": true
+                })
+            })
+            .collect::<Vec<_>>();
         std::fs::write(
             run_dir.join("meta/outputs.json"),
-            serde_json::to_vec(&serde_json::json!({"artifacts":vec![artifact;1001]})).unwrap(),
+            serde_json::to_vec(&serde_json::json!({"artifacts": many_artifacts})).unwrap(),
         )
         .unwrap();
         assert_eq!(

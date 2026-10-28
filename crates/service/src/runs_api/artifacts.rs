@@ -42,6 +42,7 @@ impl LocalService {
                 "artifact count exceeds limit",
             ));
         }
+        engine::validate_output_manifest_paths(&manifest).map_err(api_internal)?;
         Ok((manifest, run_dir))
     }
     pub async fn artifacts_json(
@@ -78,15 +79,7 @@ impl LocalService {
         #[cfg(test)]
         crate::tests::terminal_manifest::after_first_read(&run_dir);
         let artifacts = match memory.as_ref().and_then(|r| r.artifacts.clone()) {
-            Some(m) => {
-                if m.artifacts.len() > entries {
-                    return Err(ApiError::invalid_field(
-                        "artifacts",
-                        "artifact count exceeds limit",
-                    ));
-                }
-                Some(m)
-            }
+            Some(m) => Some(m),
             None => {
                 let path = run_meta_dir(&run_dir).join("outputs.json");
                 match std::fs::File::open(&path) {
@@ -103,17 +96,20 @@ impl LocalService {
                         let raw = files::read_bounded(&path, Some(limit)).map_err(api_internal)?;
                         let m: OutputManifest =
                             serde_json::from_slice(&raw).map_err(api_internal)?;
-                        if m.artifacts.len() > entries {
-                            return Err(ApiError::invalid_field(
-                                "artifacts",
-                                "artifact count exceeds limit",
-                            ));
-                        }
                         Some(m)
                     }
                 }
             }
         };
+        if let Some(m) = &artifacts {
+            if m.artifacts.len() > entries {
+                return Err(ApiError::invalid_field(
+                    "artifacts",
+                    "artifact count exceeds limit",
+                ));
+            }
+            engine::validate_output_manifest_paths(m).map_err(api_internal)?;
+        }
         #[cfg(test)]
         crate::tests::terminal_manifest::after_first_read(&run_dir);
         let snapshot = self

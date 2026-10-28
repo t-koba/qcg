@@ -2,7 +2,7 @@ use crate::{FilePin, ResourceSnapshot, RunState};
 use camino::Utf8PathBuf;
 use contract::RuntimeLimits;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -127,21 +127,14 @@ pub(crate) fn pin_files(
             path.display()
         ))
     })?;
-    files
+    let relative_paths = files
         .iter()
         .map(|path| {
-            // Refuse symlink outputs at pin time, symmetric with resume
-            // verification: pinning through a link while resume refuses it
-            // would create pins that can never resume (E06).
             if is_symlink_no_follow(path)? {
                 return Err(EngineError::Failed(format!(
                     "step output `{path}` is a symbolic link"
                 )));
             }
-            // A reported output the workspace does not hold means the
-            // workspace lost a file the step produced. Fail loudly and
-            // name the file, so the operator sees which output is gone
-            // rather than a bare I/O error.
             let canonical_path = dunce::canonicalize(path).map_err(|error| {
                 EngineError::Failed(format!(
                     "step output `{path}` is not in the workspace: {error}"
@@ -172,12 +165,15 @@ pub(crate) fn pin_files(
                     "step output `{relative}` escapes the workspace"
                 )));
             }
-            // Journaled pins must use portable separators on every
-            // platform: resume validation only accepts slash-separated
-            // paths, so a natively-separated pin could never resume (E06).
-            let relative =
-                camino::Utf8PathBuf::from(policy::portable_relative_path(relative));
-            let source = workspace.join(&relative);
+            // Journaled pins use portable slash separators on every platform.
+            Ok(Utf8PathBuf::from(policy::portable_relative_path(relative)))
+        })
+        .collect::<Result<Vec<_>, EngineError>>()?;
+    policy::path::validate_path_tree_set(relative_paths.iter().map(|p| (p.as_str(), false)))?;
+    let pins = relative_paths
+        .iter()
+        .map(|relative| {
+            let source = workspace.join(relative);
             let digest = hash_file(&source, limits.output_file_limit_bytes)?;
             let previous = {
                 let mut accounting = accounting.lock().map_err(|error| {
@@ -185,7 +181,7 @@ pub(crate) fn pin_files(
                         "checkpoint accounting mutex was poisoned: {error}"
                     ))
                 })?;
-                accounting.record(&relative, digest.bytes, limits)?
+                accounting.record(relative, digest.bytes, limits)?
             };
             if let Err(error) = persist_checkpoint_blob(
                 metadata,
@@ -199,7 +195,7 @@ pub(crate) fn pin_files(
                          original persist error: {error}"
                     ))
                 })?;
-                accounting.rollback(&relative, digest.bytes, previous);
+                accounting.rollback(relative, digest.bytes, previous);
                 return Err(error);
             }
             Ok(FilePin {
@@ -207,7 +203,8 @@ pub(crate) fn pin_files(
                 sha256: digest.sha256,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, EngineError>>()?;
+    Ok(pins)
 }
 
 /// Pins the files one attempt produced. Every site that journals an
@@ -231,7 +228,8 @@ pub(crate) fn existing_regular_files(
     files: Vec<Utf8PathBuf>,
 ) -> Result<Vec<Utf8PathBuf>, EngineError> {
     let mut existing = Vec::with_capacity(files.len());
-    for path in files {
+    let mut seen = BTreeSet::new();
+    for path in files.into_iter().filter(|path| seen.insert(path.clone())) {
         match std::fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_file() => existing.push(path),
             Ok(_) => {
@@ -284,14 +282,9 @@ fn persist_checkpoint_blob(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(EngineError::Io(error)),
     }
-    // Publish through the shared sidecar writer: owner-only staging created
-    // with O_EXCL, a symlink refused at the destination, an atomic rename, and
-    // a parent directory sync. The previous hand-rolled temp-plus-rename left
-    // its temp name behind whenever the copy failed and had no owner-only
-    // guarantee. A writer that publishes the same digest inside the race
-    // window is now simply overwritten with identical verified content instead
-    // of failing the run; genuinely divergent content is still refused by the
-    // digest check above before staging starts.
+    // Shared atomic sidecar staging: owner-only, no symlink destination,
+    // rename + parent sync. Concurrent identical digests are safe to replace;
+    // divergent content is rejected by the digest check above.
     files::write_file_atomic(&destination, |file| {
         // Open without following a terminal symlink, matching the hash
         // above: a link swapped in after verification is refused instead
@@ -502,4 +495,45 @@ pub(crate) fn verify_resource_pins(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TempGuard(Utf8PathBuf);
+
+    impl Drop for TempGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn pin_files_reject_collisions_before_checkpoint_writes() {
+        let root = Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("engine-pin-collision-{}", uuid::Uuid::now_v7())),
+        )
+        .unwrap();
+        let _guard = TempGuard(root.clone());
+        let workspace = root.join("workspace");
+        let metadata = root.join("meta");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&metadata).unwrap();
+        let file = workspace.join("same.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let accounting = Arc::new(Mutex::new(CheckpointAccounting::default()));
+        assert!(
+            pin_files(
+                &workspace,
+                &metadata,
+                &[file.clone(), file],
+                &RuntimeLimits::default(),
+                &accounting,
+            )
+            .is_err()
+        );
+        assert!(!metadata.join("checkpoint-blobs").exists());
+        assert_eq!(accounting.lock().unwrap().total_bytes, 0);
+    }
 }

@@ -1,12 +1,9 @@
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use contract::{Contract, NodeDef, ToolBackendKind, ToolWorkspace};
-use engine::{StepContext, StepError, StepExecutor, StepOutcome};
+use engine::{ResultExt, StepContext, StepError, StepExecutor, StepOutcome};
 use model::Finding;
-use policy::{
-    is_safe_relative_path, params_schema, string_array_schema, string_schema,
-    validate_bounded_json_schema,
-};
+use policy::{params_schema, string_array_schema, string_schema, validate_bounded_json_schema};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -591,15 +588,10 @@ fn resolve_command_result_files(
             format!("structured returned more than {MAX_COMMAND_RESULT_FILES} files"),
         ));
     }
-    let mut seen = std::collections::BTreeSet::new();
+    policy::path::validate_path_tree_set(files.iter().map(|p| (p.as_str(), false)))
+        .step_err(&node.id)?;
     let mut resolved = Vec::with_capacity(files.len());
     for file in files {
-        if !is_safe_relative_path(file) || !seen.insert(file.clone()) {
-            return Err(StepError::failed(
-                &node.id,
-                format!("structured returned an unsafe or duplicate file path `{file}`"),
-            ));
-        }
         let path = ctx.run.fs.resolve_read(file).map_err(|error| {
             StepError::failed(
                 &node.id,

@@ -495,7 +495,7 @@ fn invalid_zip(error: rawzip::Error) -> ServiceError {
     ServiceError::Invalid(format!("invalid package ZIP: {error}"))
 }
 
-/// Validate all raw records without allocating an inventory. The EOCD/ZIP64
+/// Validate raw records and their namespace before extraction mutates the target. The EOCD/ZIP64
 /// hint is a gate, not a trusted iterator length; duplicates count separately.
 /// Extraction makes a second streaming pass with the same parser and handle.
 fn validate_entry_count<R: rawzip::ReaderAt>(
@@ -515,13 +515,19 @@ fn validate_entry_count<R: rawzip::ReaderAt>(
     };
     check(archive.entries_hint())?;
     let mut count = 0_u64;
+    let mut paths = Vec::new();
     let mut entries = archive.entries(buffer);
-    while entries.next_entry().map_err(invalid_zip)?.is_some() {
+    while let Some(header) = entries.next_entry().map_err(invalid_zip)? {
         count = count
             .checked_add(1)
             .ok_or_else(|| ServiceError::Invalid("archive entry count overflowed".into()))?;
         check(count)?;
+        let rel = package_entry_path(header.file_path().as_bytes())?;
+        if !rel.as_str().is_empty() {
+            paths.push((rel, header.is_dir()));
+        }
     }
+    policy::path::validate_path_tree_set(paths.iter().map(|(p, d)| (p.as_str(), *d)))?;
     if count != archive.entries_hint() {
         return Err(ServiceError::Invalid(format!(
             "archive entry count mismatch: {count} != {}",
@@ -614,7 +620,6 @@ pub fn unpack_package(
     let archive = rawzip::ZipArchive::from_file(file, &mut buffer).map_err(invalid_zip)?;
     validate_entry_count(&archive, &mut buffer, limits.max_entries)?;
     let mut unpacked_bytes = 0_u64;
-    let mut paths = BTreeSet::new();
     // Pin the target directory once (Unix): every parent creation and file
     // staging below runs relative to this fd (E15).
     #[cfg(unix)]
@@ -624,11 +629,6 @@ pub fn unpack_package(
         let rel = package_entry_path(header.file_path().as_bytes())?;
         if rel.as_str().is_empty() {
             continue;
-        }
-        if !paths.insert(rel.clone()) {
-            return Err(ServiceError::Invalid(format!(
-                "archive contains duplicate path `{rel}`"
-            )));
         }
         // Inspect the raw type bits too: a non-Unix creator must not hide a
         // symlink behind rawzip's synthesized DOS/default permissions.
@@ -1103,11 +1103,6 @@ fn collect_identity_entries(
             continue;
         }
         let relative = portable_relative_path(relative_path);
-        if !is_safe_relative_path(&relative) {
-            return Err(ServiceError::Invalid(
-                "package source contains an unsafe relative path".into(),
-            ));
-        }
         let file_type = entry.file_type();
         if file_type.is_symlink() {
             return Err(ServiceError::Invalid(
@@ -1164,6 +1159,7 @@ fn collect_identity_entries(
         });
     }
     entries.sort_by(|left, right| left.relative.cmp(&right.relative));
+    policy::path::validate_path_tree_set(entries.iter().map(|e| (e.relative.as_str(), e.is_dir)))?;
     Ok(entries)
 }
 
@@ -1214,6 +1210,7 @@ pub fn copy_dir_all(
     target: &Utf8Path,
     limits: &PackageLimits,
 ) -> Result<(), ServiceError> {
+    collect_identity_entries(source, limits)?;
     let mut entry_count = 0_usize;
     let mut copied_bytes = 0_u64;
     // Pin the target once (Unix): destination parents and file staging run
@@ -1478,11 +1475,6 @@ fn verify_package_inventory(root: &Utf8Path, limits: &PackageLimits) -> Result<(
             .get("fileName")
             .and_then(|value| value.as_str())
             .ok_or_else(|| ServiceError::Invalid("package SBOM fileName is required".into()))?;
-        if !is_safe_relative_path(path) {
-            return Err(ServiceError::Invalid(format!(
-                "package SBOM contains unsafe path `{path}`"
-            )));
-        }
         let sha256 = file
             .pointer("/checksums/0/checksumValue")
             .and_then(|value| value.as_str())
@@ -1518,6 +1510,8 @@ fn verify_package_inventory(root: &Utf8Path, limits: &PackageLimits) -> Result<(
             )));
         }
     }
+    policy::path::validate_path_tree_set(expected.keys().map(|p| (p.as_str(), false)))?;
+    let mut namespace = Vec::new();
     let mut actual = BTreeSet::new();
     let mut walked = 0_usize;
     // Single walk: each file is opened once (O_NOFOLLOW, fail-closed on a
@@ -1542,14 +1536,17 @@ fn verify_package_inventory(root: &Utf8Path, limits: &PackageLimits) -> Result<(
                 entry.path()
             )));
         }
-        if !entry.file_type().is_file() {
-            continue;
-        }
         let path = entry.path().to_path_buf();
         let relative = portable_relative_path(
             path.strip_prefix(root)
                 .map_err(|error| ServiceError::Invalid(error.to_string()))?,
         );
+        if !relative.is_empty() {
+            namespace.push((relative.clone(), entry.file_type().is_dir()));
+        }
+        if !entry.file_type().is_file() {
+            continue;
+        }
         if matches!(
             relative.as_str(),
             "SBOM.spdx.json" | "PROVENANCE.intoto.json"
@@ -1589,6 +1586,7 @@ fn verify_package_inventory(root: &Utf8Path, limits: &PackageLimits) -> Result<(
             )));
         }
     }
+    policy::path::validate_path_tree_set(namespace.iter().map(|(p, d)| (p.as_str(), *d)))?;
     for missing in expected.keys() {
         if !actual.contains(missing) {
             return Err(ServiceError::Invalid(format!(
@@ -1643,6 +1641,125 @@ fn hash_opened_file(file: &mut File) -> Result<String, ServiceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unpack_path_sets_reject_before_target_mutation() {
+        use std::io::Write as _;
+        let root = temp_dir("path-set-archives");
+        std::fs::create_dir_all(root.join("out")).unwrap();
+        let _guard = TempGuard(root.clone());
+        let target = root.join("out");
+        std::fs::write(target.join("sentinel"), b"unchanged").unwrap();
+        for pair in [
+            ["Report.md", "report.md"],
+            ["Maße", "MASSE"],
+            ["é", "e\u{301}"],
+            ["A", "a/x"],
+            ["a/x", "A"],
+            ["A/x", "a/y"],
+        ] {
+            let archive = root.join("in.zip");
+            let mut zip = zip::ZipWriter::new(File::create(&archive).unwrap());
+            for name in pair {
+                zip.start_file(
+                    name,
+                    zip::write::SimpleFileOptions::default().unix_permissions(0o644),
+                )
+                .unwrap();
+                zip.write_all(b"x").unwrap();
+            }
+            zip.finish().unwrap();
+            assert!(
+                unpack_package(&archive, &target, &PackageLimits::default()).is_err(),
+                "{pair:?}"
+            );
+            assert_eq!(std::fs::read_dir(&target).unwrap().count(), 1);
+            assert_eq!(
+                std::fs::read(target.join("sentinel")).unwrap(),
+                b"unchanged"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unpack_rejects_equivalent_directory_spellings_before_target_mutation() {
+        use std::io::Write as _;
+        let root = temp_dir("shared-folded-archive-dirs");
+        let _guard = TempGuard(root.clone());
+        let archive = root.join("in.zip");
+        let target = root.join("out");
+        std::fs::create_dir_all(&target).unwrap();
+        let options = zip::write::SimpleFileOptions::default();
+        let mut writer = zip::ZipWriter::new(File::create(&archive).unwrap());
+        for directory in ["A/", "a/"] {
+            writer
+                .add_directory(directory, options.unix_permissions(0o755))
+                .unwrap();
+        }
+        let sha_x = hex::encode(Sha256::digest(b"x"));
+        let sha_y = hex::encode(Sha256::digest(b"y"));
+        for (name, body) in [("A/x", b"x".as_slice()), ("a/y", b"y".as_slice())] {
+            writer
+                .start_file(name, options.unix_permissions(0o644))
+                .unwrap();
+            writer.write_all(body).unwrap();
+        }
+        let sbom = test_sbom(vec![
+            test_sbom_file("A/x", &sha_x, 0o644),
+            test_sbom_file("a/y", &sha_y, 0o644),
+        ]);
+        finish_archive(writer, options, &sbom);
+        assert!(unpack_package(&archive, &target, &PackageLimits::default()).is_err());
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn package_walk_path_sets_reject_identity_inventory_and_copy() {
+        let root = temp_dir("path-set-walks");
+        std::fs::create_dir_all(&root).unwrap();
+        let _guard = TempGuard(root.clone());
+        let source = root.join("in");
+        let target = root.join("out");
+        std::fs::create_dir_all(&target).unwrap();
+        for pair in [
+            ["Report.md", "report.md"],
+            ["Maße", "MASSE"],
+            ["é", "e\u{301}"],
+            ["A", "a/x"],
+            ["A/x", "a/y"],
+        ] {
+            std::fs::create_dir_all(&source).unwrap();
+            for name in pair {
+                let path = source.join(name);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, b"x").unwrap();
+            }
+            assert!(package_identity_sha256(&source, &PackageLimits::default()).is_err());
+            assert!(copy_dir_all(&source, &target, &PackageLimits::default()).is_err());
+            assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+            let sha = hex::encode(Sha256::digest(b"x"));
+            std::fs::write(
+                source.join("SBOM.spdx.json"),
+                test_sbom(
+                    pair.iter()
+                        .map(|p| test_sbom_file(p, &sha, 0o644))
+                        .collect(),
+                )
+                .to_string(),
+            )
+            .unwrap();
+            std::fs::write(
+                source.join("PROVENANCE.intoto.json"),
+                r#"{"_type":"https://in-toto.io/Statement/v1"}"#,
+            )
+            .unwrap();
+            assert!(verify_package_inventory(&source, &PackageLimits::default()).is_err());
+            std::fs::remove_dir_all(&source).unwrap();
+        }
+    }
+
     use sha2::{Digest, Sha256};
 
     /// One entry of a [`test_sbom`] `files` list: the archived name, the

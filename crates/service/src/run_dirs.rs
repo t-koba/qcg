@@ -657,6 +657,7 @@ fn populate_checkpoint_fork(
             }
         }
     }
+    policy::path::validate_path_tree_set(latest_files.keys().map(|p| (p.as_str(), false)))?;
     // Fresh target workspace, but every nested parent is still validated
     // level by level: a pre-planted symlink inside the fresh tree must not
     // redirect blob copies outside (strongest isolation, same invariant as

@@ -1618,13 +1618,9 @@ command = ["sh", "-c", "sleep 30"]"#,
         .expect("the engine task should go live");
         service.abort_all_engine_tasks();
         drop(service);
-        // Bounded polling wait (E05): a contended skip inside the abort
-        // path is not a true leak, and the two are indistinguishable
-        // without waiting — the reacquire below is the assertion, the
-        // sleep is only its settle window, not a latency bound.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        try_single_run_service(&generators, &runs)
-            .expect("the run-store lock must be reacquirable after abort cleanup");
+        // Cancellation and task-drop cleanup are asynchronous; bounded
+        // constructor polling separates delayed release from a retained lock.
+        let _reacquired = acquire_store_after_release(&generators, &runs).await;
     }
 
     #[tokio::test]

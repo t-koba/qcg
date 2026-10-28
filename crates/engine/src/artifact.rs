@@ -9,6 +9,63 @@ pub use resolve::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn collision_manifest(paths: &[&str]) -> OutputManifest {
+        serde_json::from_value(serde_json::json!({"artifacts": paths.iter().map(|p|
+            serde_json::json!({"path": p, "sha256": "unused", "bytes": 1, "label": p,
+                "required": true})).collect::<Vec<_>>()}))
+        .unwrap()
+    }
+
+    #[test]
+    fn output_manifest_path_sets_validate_on_write_and_both_reads() {
+        let root = temp_workspace().join(format!("path-sets-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        for pair in [
+            ["Report.md", "report.md"],
+            ["Maße", "MASSE"],
+            ["é", "e\u{301}"],
+            ["A", "a/x"],
+            ["A/x", "a/y"],
+        ] {
+            let manifest = collision_manifest(&pair);
+            std::fs::write(root.join("outputs.json"), b"unchanged").unwrap();
+            assert!(write_output_manifest(&root, &manifest).is_err());
+            assert_eq!(
+                std::fs::read(root.join("outputs.json")).unwrap(),
+                b"unchanged"
+            );
+            std::fs::write(
+                root.join("outputs.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            assert!(read_output_manifest(&root).is_err());
+            assert!(
+                read_output_manifest_with_limits(
+                    &root,
+                    &RuntimeLimits {
+                        output_file_limit_bytes: Some(4096),
+                        ..RuntimeLimits::default()
+                    }
+                )
+                .is_err()
+            );
+        }
+        let manifest = collision_manifest(&["A/x", "A/y", "é", "e"]);
+        write_output_manifest(&root, &manifest).unwrap();
+        let loaded = read_output_manifest(&root).unwrap();
+        assert_eq!(
+            loaded
+                .artifacts
+                .iter()
+                .map(|a| a.path.as_str())
+                .collect::<Vec<_>>(),
+            ["A/x", "A/y", "é", "e"]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     use camino::Utf8PathBuf;
     use contract::RuntimeLimits;
     use model::{OutputArtifact, OutputManifest};
@@ -97,6 +154,72 @@ mod tests {
         let loaded = read_output_manifest(&workspace).unwrap();
         assert_eq!(loaded.artifacts[0].path, "done.txt");
         assert_eq!(loaded.artifacts[0].mime.as_deref(), Some("text/plain"));
+    }
+
+    #[test]
+    fn output_manifest_reads_preserve_artifact_limits() {
+        let workspace = temp_workspace().join(format!("read-limits-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let two = collision_manifest(&["one", "two"]);
+        std::fs::write(
+            workspace.join("outputs.json"),
+            serde_json::to_vec(&two).unwrap(),
+        )
+        .unwrap();
+        let error = read_output_manifest_with_limits(
+            &workspace,
+            &RuntimeLimits {
+                output_artifact_limit: Some(1),
+                ..RuntimeLimits::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("output artifact count exceeds 1")
+        );
+        let error = read_output_manifest_with_limits(
+            &workspace,
+            &RuntimeLimits {
+                output_total_limit_bytes: Some(1),
+                ..RuntimeLimits::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("output bytes exceed 1"));
+
+        let large = OutputManifest {
+            artifacts: vec![OutputArtifact {
+                path: "large.bin".into(),
+                sha256: "unused".into(),
+                bytes: 1025,
+                label: "Large".into(),
+                required: true,
+                mime: None,
+                description: String::new(),
+                preview: model::ArtifactPreview::None,
+            }],
+        };
+        std::fs::write(
+            workspace.join("outputs.json"),
+            serde_json::to_vec(&large).unwrap(),
+        )
+        .unwrap();
+        let error = read_output_manifest_with_limits(
+            &workspace,
+            &RuntimeLimits {
+                output_file_limit_bytes: Some(1024),
+                ..RuntimeLimits::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("output artifact `large.bin` exceeds 1024 bytes")
+        );
+        std::fs::remove_dir_all(workspace).unwrap();
     }
 
     #[test]

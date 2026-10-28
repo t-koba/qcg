@@ -161,7 +161,7 @@ fn raw_duplicate_names_consume_budget_before_duplicate_rejection() {
         assert_entry_limit(&bytes, 1);
         for limit in [Some(2), None] {
             let (error, _) = unpack(&bytes, limit);
-            assert!(error.contains("duplicate path `same`"), "{error}");
+            assert!(error.contains("unsafe or colliding path set"), "{error}");
         }
         // The actual counter must include duplicates even when the hint lies.
         assert_entry_limit(&inventory(&["same", "same"], 1, zip64), 1);
