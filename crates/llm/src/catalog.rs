@@ -140,7 +140,39 @@ pub struct ExternalCatalog {
     /// External provider key -> model id -> spec.
     providers: BTreeMap<String, BTreeMap<String, ModelSpec>>,
     /// Provider -> model id -> unusable schedule advisories; flat rates stay.
-    model_errors: BTreeMap<String, BTreeMap<String, Vec<String>>>,
+    #[serde(deserialize_with = "deserialize_model_errors")]
+    model_errors: ModelErrors,
+}
+
+type ModelErrors = BTreeMap<String, BTreeMap<String, Vec<String>>>;
+
+// Old caches grouped advisories by provider; retain the full text per model.
+fn deserialize_model_errors<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<ModelErrors, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Warnings {
+        Current(ModelErrors),
+        Legacy(BTreeMap<String, Vec<String>>),
+    }
+    match Warnings::deserialize(deserializer)? {
+        Warnings::Current(providers) => Ok(providers),
+        Warnings::Legacy(providers) => {
+            let mut migrated = ModelErrors::new();
+            for (provider, warnings) in providers {
+                let models = migrated.entry(provider).or_default();
+                for warning in warnings {
+                    let (model, _) = warning
+                        .strip_prefix("model `")
+                        .and_then(|text| text.split_once("`: "))
+                        .ok_or_else(|| serde::de::Error::custom("invalid legacy model advisory"))?;
+                    models.entry(model.to_owned()).or_default().push(warning);
+                }
+            }
+            Ok(migrated)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -233,40 +265,32 @@ impl CatalogService {
     /// Catalog for `LlmRuntime::builtins` and unit tests: the synthetic
     /// `fake` provider only.
     pub fn empty() -> Self {
-        Self::build(Vec::new(), None).expect("an empty catalog is valid")
+        Self::new(Vec::new(), None).expect("an empty catalog is valid")
     }
 
     pub fn new(specs: Vec<ProviderSpec>, config: Option<CatalogConfig>) -> Result<Self, String> {
-        Self::build(specs, config)
-    }
-
-    fn build(specs: Vec<ProviderSpec>, config: Option<CatalogConfig>) -> Result<Self, String> {
-        if let Some(config) = &config {
-            config.validate()?;
-        }
         let config = config.unwrap_or_default();
+        config.validate()?;
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| format!("model catalog HTTP client failed: {error}"))?;
-        let mut by_id = BTreeMap::new();
-        for spec in specs {
-            by_id.insert(spec.id.clone(), spec);
-        }
         let (external, cache_error) = load_cached_external(&config);
         let mut sources = Vec::new();
         if let Some(error) = cache_error {
             sources.push(cache_status(&config, error));
         }
-        let snapshot = Snapshot {
-            models: BTreeMap::new(),
-            sources,
-            external,
-        };
         let service = Self {
-            specs: by_id,
+            specs: specs
+                .into_iter()
+                .map(|spec| (spec.id.clone(), spec))
+                .collect(),
             config,
-            snapshot: RwLock::new(snapshot),
+            snapshot: RwLock::new(Snapshot {
+                models: BTreeMap::new(),
+                sources,
+                external,
+            }),
             client,
         };
         service.rebuild_models();
@@ -327,10 +351,7 @@ impl CatalogService {
     }
 
     fn rebuild_models(&self) {
-        let external = {
-            let snapshot = self.read_snapshot();
-            snapshot.external.clone()
-        };
+        let external = self.read_snapshot().external.clone();
         let mut models = BTreeMap::new();
         for (provider_id, spec) in &self.specs {
             let catalog_id = spec.catalog_id.as_deref().unwrap_or(provider_id);
@@ -590,10 +611,8 @@ impl CatalogService {
         let has_credential = credential_source.is_some();
         let raw_base_url = match spec.base_url_env.as_deref() {
             Some(name) => match std::env::var(name) {
-                Ok(value) => value,
-                Err(std::env::VarError::NotPresent) => spec.base_url.clone().ok_or_else(|| {
-                    format!("provider `{}` has no base URL for discovery", spec.id)
-                })?,
+                Ok(value) => Some(value),
+                Err(std::env::VarError::NotPresent) => None,
                 Err(std::env::VarError::NotUnicode(_)) => {
                     return Err(format!(
                         "provider `{}` base URL environment variable `{name}` is not valid UTF-8",
@@ -601,11 +620,10 @@ impl CatalogService {
                     ));
                 }
             },
-            None => spec
-                .base_url
-                .clone()
-                .ok_or_else(|| format!("provider `{}` has no base URL for discovery", spec.id))?,
-        };
+            None => None,
+        }
+        .or_else(|| spec.base_url.clone())
+        .ok_or_else(|| format!("provider `{}` has no base URL for discovery", spec.id))?;
         if credential_placeholder(&raw_base_url, credential_source).is_some() {
             return Err(format!(
                 "provider `{}` base URL must not interpolate a credential",
@@ -743,12 +761,9 @@ fn credential_reflection(
             continue;
         }
         // Raw-byte check covers JSON-escaped reflections.
-        if let Ok(text) = std::str::from_utf8(raw)
-            && text.contains(credential)
+        if std::str::from_utf8(raw).is_ok_and(|text| text.contains(credential))
+            || json_contains_credential(decoded, credential, 8)
         {
-            return Some("response reflects the request credential");
-        }
-        if json_contains_credential(decoded, credential, 8) {
             return Some("response reflects the request credential");
         }
     }
@@ -823,46 +838,35 @@ fn model_view(
 /// Field-level overlay: explicit registry declarations win over external
 /// metadata, and unspecified fields inherit from the external entry.
 fn merge_model(base: &ModelSpec, over: &ModelSpec) -> ModelSpec {
-    ModelSpec {
-        id: over.id.clone(),
-        label: over.label.clone().or_else(|| base.label.clone()),
-        capabilities: over
-            .capabilities
-            .clone()
-            .or_else(|| base.capabilities.clone()),
-        reasoning_effort: over
-            .reasoning_effort
-            .clone()
-            .or_else(|| base.reasoning_effort.clone()),
-        input_cost_per_million_usd: over
-            .input_cost_per_million_usd
-            .or(base.input_cost_per_million_usd),
-        cache_creation_input_cost_per_million_usd: over
-            .cache_creation_input_cost_per_million_usd
-            .or(base.cache_creation_input_cost_per_million_usd),
-        cache_read_input_cost_per_million_usd: over
-            .cache_read_input_cost_per_million_usd
-            .or(base.cache_read_input_cost_per_million_usd),
-        output_cost_per_million_usd: over
-            .output_cost_per_million_usd
-            .or(base.output_cost_per_million_usd),
-        prompt_cache_retention: over.prompt_cache_retention.or(base.prompt_cache_retention),
-        prompt_cache_explicit_mode: over
-            .prompt_cache_explicit_mode
-            .or(base.prompt_cache_explicit_mode),
-        // A tier list is a whole price schedule: a registry row that
-        // declares its own tiers replaces the external one outright;
-        // otherwise the external tiers are inherited, with the registry's
-        // pinned rates carried into them as a contract pin does.
-        cost_tiers: if over.cost_tiers.is_empty() {
-            policy::carry_pinned_rates(&base.cost_tiers, &over.rates())
-        } else {
-            over.cost_tiers.clone()
-        },
-        context_tokens: over.context_tokens.or(base.context_tokens),
-        max_output_tokens: over.max_output_tokens.or(base.max_output_tokens),
-        enabled: over.enabled.or(base.enabled),
+    macro_rules! overlay {
+        ($($field:ident),* $(,)?) => {
+            ModelSpec {
+                $($field: over.$field.as_ref().or(base.$field.as_ref()).cloned(),)*
+                id: over.id.clone(),
+                // A registry schedule replaces the external one; otherwise
+                // registry rate pins carry into the inherited schedule.
+                cost_tiers: if over.cost_tiers.is_empty() {
+                    policy::carry_pinned_rates(&base.cost_tiers, &over.rates())
+                } else {
+                    over.cost_tiers.clone()
+                },
+            }
+        };
     }
+    overlay!(
+        label,
+        capabilities,
+        reasoning_effort,
+        input_cost_per_million_usd,
+        cache_creation_input_cost_per_million_usd,
+        cache_read_input_cost_per_million_usd,
+        output_cost_per_million_usd,
+        prompt_cache_retention,
+        prompt_cache_explicit_mode,
+        context_tokens,
+        max_output_tokens,
+        enabled,
+    )
 }
 
 fn snapshot_stale(fetched_at: Option<&str>, refresh_seconds: u64) -> bool {
@@ -1070,9 +1074,7 @@ struct ModelsDevModalities {
 
 #[derive(Debug, Deserialize)]
 struct ModelsDevLimit {
-    #[serde(default)]
     context: Option<u64>,
-    #[serde(default)]
     output: Option<u64>,
 }
 
@@ -1289,6 +1291,8 @@ mod tests {
         assert_eq!(plain.cache_read_input_cost_per_million_usd, None);
         assert_eq!(plain.cache_creation_input_cost_per_million_usd, None);
         assert_eq!(plain.output_cost_per_million_usd, Some(2.0));
+        assert_eq!(plain.context_tokens, None);
+        assert_eq!(plain.max_output_tokens, None);
     }
 
     #[test]
@@ -2099,6 +2103,248 @@ label = "Explicit label"
             runtime_pricing.cache_creation_input_cost_per_million_usd
         );
         assert_eq!(model.label.as_deref(), Some("Explicit label"));
+    }
+
+    #[tokio::test]
+    async fn legacy_advisory_cache_survives_an_unavailable_source() {
+        let dir = temp_catalog_dir("legacy-advisory");
+        let cache = dir.join("cache.json");
+        let mut config = file_source_config(&cache, &dir.join("unavailable.json"));
+        let warning = "model `cached`: its context tier schedule could not be used (a tier qcg cannot read), so its flat rates apply";
+        let old_cache = serde_json::json!({
+            "fetched_at": (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339(),
+            "fingerprint": config_fingerprint(&config),
+            "providers": {"openai": {"cached": {
+                "id": "cached", "label": "Cached model",
+                "input_cost_per_million_usd": 3.0,
+                "output_cost_per_million_usd": 12.0,
+                "cache_read_input_cost_per_million_usd": 0.0,
+                "cache_creation_input_cost_per_million_usd": 4.0
+            }}},
+            "model_errors": {"openai": [warning]}
+        });
+        std::fs::write(&cache, serde_json::to_vec(&old_cache).unwrap()).unwrap();
+        let file = ProvidersFile::parse(
+            r#"
+[[provider]]
+id = "custom"
+catalog_id = "openai"
+api = "chat_completions"
+base_url = "https://example.test/v1"
+"#,
+        )
+        .unwrap();
+        let service = CatalogService::new(file.provider, Some(config.clone())).unwrap();
+        assert!(
+            service.read_snapshot().sources.is_empty(),
+            "cache must load without error"
+        );
+        assert!(service.is_stale());
+        // A failed refresh must retain the old data and its original age.
+        let view = service.view(true).await;
+        assert!(view.stale);
+        assert_eq!(view.sources.len(), 1);
+        assert!(
+            view.sources[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("could not be read")
+        );
+        let provider = view.providers.iter().find(|p| p.id == "custom").unwrap();
+        assert!(provider.error.is_none());
+        let model = provider.models.iter().find(|m| m.id == "cached").unwrap();
+        assert_eq!(model.warning.as_deref(), Some(warning));
+        assert_eq!(model.label.as_deref(), Some("Cached model"));
+        let spec = service.model_spec("custom", "cached").unwrap();
+        assert!(spec.cost_tiers.is_empty());
+        let pricing = service.model_pricing("custom", "cached").unwrap();
+        assert_eq!(pricing.input_cost_per_million_usd, Some(3.0));
+        assert_eq!(pricing.output_cost_per_million_usd, Some(12.0));
+        assert_eq!(pricing.cache_read_input_cost_per_million_usd, Some(0.0));
+        assert_eq!(pricing.cache_creation_input_cost_per_million_usd, Some(4.0));
+        assert_eq!(
+            model.input_cost_per_million_usd,
+            pricing.input_cost_per_million_usd
+        );
+        assert_eq!(
+            model.output_cost_per_million_usd,
+            pricing.output_cost_per_million_usd
+        );
+        let (loaded, error) = load_cached_external(&config);
+        assert!(error.is_none());
+        let current = serde_json::to_value(&loaded).unwrap();
+        assert_eq!(
+            current["model_errors"],
+            serde_json::json!({"openai": {"cached": [warning]}})
+        );
+        assert_eq!(
+            current["providers"],
+            serde_json::json!({"openai": {"cached": spec}})
+        );
+        let reloaded: ExternalCatalog = serde_json::from_value(current).unwrap();
+        assert_eq!(reloaded.model_errors, loaded.model_errors);
+        // Migration never bypasses verification under different sources.
+        config.source[0].sha256 = Some("0".repeat(64));
+        let (ignored, error) = load_cached_external(&config);
+        assert!(ignored.providers.is_empty());
+        assert!(error.unwrap().contains("different sources"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn advisory_cache_shapes_preserve_messages_and_reject_corruption() {
+        let first = "model `one`: first advisory";
+        let second = "model `two`: second advisory";
+        let third = "model `one`: another advisory";
+        let old: ExternalCatalog = serde_json::from_value(serde_json::json!({
+            "model_errors": {"p": [first, second, third], "empty": []}
+        }))
+        .unwrap();
+        assert_eq!(old.model_errors["p"]["one"], [first, third]);
+        assert_eq!(old.model_errors["p"]["two"], [second]);
+        assert!(old.model_errors["empty"].is_empty());
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"model_errors": {}}),
+        ] {
+            assert!(
+                serde_json::from_value::<ExternalCatalog>(value)
+                    .unwrap()
+                    .model_errors
+                    .is_empty()
+            );
+        }
+        for errors in [
+            serde_json::json!({"p": ["unattributed advisory"]}),
+            serde_json::json!({"p": [3]}),
+            serde_json::json!({"p": {"one": [3]}}),
+            serde_json::Value::Null,
+        ] {
+            assert!(
+                serde_json::from_value::<ExternalCatalog>(
+                    serde_json::json!({"model_errors": errors})
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_base_url_fallback_keeps_missing_and_nonunicode_distinct() {
+        if env_process::isolated() {
+            return;
+        }
+        const NAME: &str = "QCG_TEST_CATALOG_BASE_URL_FALLBACK";
+        let file = ProvidersFile::parse(
+            r#"
+[[provider]]
+id = "p"
+api = "chat_completions"
+base_url = "https://example.test/v1"
+"#,
+        )
+        .unwrap();
+        let service = CatalogService::empty();
+        let mut spec = file.provider[0].clone();
+        spec.base_url_env = Some(NAME.into());
+        unsafe {
+            std::env::remove_var(NAME);
+        }
+        // Stop at URL validation, before any network request.
+        spec.base_url = Some("not a URL".into());
+        assert!(
+            service
+                .discover_openai(&spec)
+                .await
+                .unwrap_err()
+                .contains("base URL is invalid")
+        );
+        spec.base_url = None;
+        assert!(
+            service
+                .discover_openai(&spec)
+                .await
+                .unwrap_err()
+                .contains("has no base URL")
+        );
+        unsafe {
+            std::env::set_var(NAME, "not a URL");
+        }
+        assert!(
+            service
+                .discover_openai(&spec)
+                .await
+                .unwrap_err()
+                .contains("base URL is invalid")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            unsafe {
+                std::env::set_var(NAME, std::ffi::OsString::from_vec(vec![0xff]));
+            }
+            // Non-Unicode must not silently fall back to the registry URL.
+            spec.base_url = Some("not a URL".into());
+            assert!(
+                service
+                    .discover_openai(&spec)
+                    .await
+                    .unwrap_err()
+                    .contains("not valid UTF-8")
+            );
+        }
+        unsafe {
+            std::env::remove_var(NAME);
+        }
+    }
+
+    #[test]
+    fn every_optional_model_field_obeys_the_same_overlay_precedence() {
+        let base: ModelSpec = serde_json::from_value(serde_json::json!({
+            "id": "base", "label": "External", "capabilities": {"tool_use": true},
+            "reasoning_effort": ["high"],
+            "input_cost_per_million_usd": 1.0, "output_cost_per_million_usd": 2.0,
+            "cache_read_input_cost_per_million_usd": 0.1,
+            "cache_creation_input_cost_per_million_usd": 3.0,
+            "prompt_cache_retention": "retention_24h", "prompt_cache_explicit_mode": true,
+            "context_tokens": 1000, "max_output_tokens": 100, "enabled": true
+        }))
+        .unwrap();
+        let replacements = serde_json::json!({
+            "label": "Explicit", "capabilities": {"tool_use": false},
+            "reasoning_effort": [],
+            "input_cost_per_million_usd": 0.0, "output_cost_per_million_usd": 0.0,
+            "cache_read_input_cost_per_million_usd": 0.0,
+            "cache_creation_input_cost_per_million_usd": 0.0,
+            "prompt_cache_retention": "ttl_12h", "prompt_cache_explicit_mode": false,
+            "context_tokens": 2000, "max_output_tokens": 200, "enabled": false
+        });
+        let inherited = serde_json::to_value(merge_model(
+            &base,
+            &ModelSpec {
+                id: "explicit".into(),
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+        let mut expected = serde_json::to_value(&base).unwrap();
+        expected["id"] = "explicit".into();
+        assert_eq!(inherited, expected);
+        for (field, value) in replacements.as_object().unwrap() {
+            let mut over = serde_json::json!({"id": "explicit"});
+            over[field] = value.clone();
+            let over: ModelSpec = serde_json::from_value(over).unwrap();
+            let declared = serde_json::to_value(&over).unwrap();
+            let mut expected = expected.clone();
+            // Capabilities have their own defaults; compare the full parsed field.
+            expected[field] = declared[field].clone();
+            assert_eq!(
+                serde_json::to_value(merge_model(&base, &over)).unwrap(),
+                expected,
+                "{field}"
+            );
+        }
     }
 
     fn file_source_config(cache: &std::path::Path, source: &std::path::Path) -> CatalogConfig {
