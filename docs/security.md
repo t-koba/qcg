@@ -488,6 +488,18 @@ forms: `CON`, `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`, `COM1`–`COM9`,
 `LPT1`–`LPT9`, `COM¹`, `COM²`, `COM³`, `LPT¹`, `LPT²`, and `LPT³`.
 Safe relative glob patterns follow the same rules except that `*` and `?`
 are allowed as wildcards within components; concrete paths forbid both.
+
+Where qcg validates a set or tree of concrete paths (for example output
+manifests, package assets, and archive entries), it compares whole paths using
+a conservative key: NFD normalization, full Unicode case-folding, then NFD
+normalization again. Two whole paths with the same key are rejected (for
+example, `Maße` and `MASSE`). Tree validation additionally compares shared
+components, including implicit parent directories, and rejects aliases such as
+`A/x` alongside `a/y`; shared parents with identical spelling remain valid.
+This rule is intentionally conservative and is not exact NTFS, APFS, or other
+filesystem emulation. It detects collisions only: accepted path spelling is
+preserved rather than rewritten.
+
 Directory-backed assets are canonicalized and must remain below the canonical
 generator root, including through symlinks.
 
