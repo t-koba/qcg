@@ -82,10 +82,11 @@ Fields:
   use the catalog's matching model price. `require_pricing` requires ordinary
   input/output prices and resolved cache prices for any nonzero cache usage;
   an Extended TTL derives the creation price from ordinary input, so that
-  derived price satisfies the requirement. With an enforced cost cap, required
-  pricing also checks cache reads in every reachable row—and cache creation
-  where no TTL-derived price applies—before dispatch; a maximum across tiers
-  cannot fill an unpriced row. With `require_pricing: false`, missing
+  derived price satisfies the requirement. Before dispatch, even without a cost
+  cap or known cache usage, required pricing checks resolved cache reads and
+  creation in every reachable base/tier row. A configured Extended TTL may
+  derive creation pricing instead, but then ordinary input pricing must exist
+  in every row. A maximum across tiers cannot fill an unpriced row. With `require_pricing: false`, missing
   cache prices still contribute zero. Budgets are estimates, not invoices.
   No provider-specific discounts or separate TTL rate schedules are inferred; extended writes use the configured input-rate multiplier.
   See [usage and cost accounting](run-event-reference.md).

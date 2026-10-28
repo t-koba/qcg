@@ -248,6 +248,13 @@ impl LlmProvider for CountingCacheProvider {
     }
     async fn complete(&self, request: ChatRequest) -> Result<ChatResponse, LlmError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if request.model == "unavailable" {
+            return Err(LlmError {
+                kind: LlmErrorKind::TimedOut,
+                message: "primary route unavailable".into(),
+                ..Default::default()
+            });
+        }
         let mut response = CacheMeteredProvider.complete(request).await?;
         response.usage = self.usage.clone();
         Ok(response)
@@ -276,7 +283,12 @@ async fn required_cache_pricing_is_checked_per_row_before_dispatch() {
         (Some(0.5), None, true),
         (None, Some(4.0), true),
     ] {
-        for require_pricing in [true, false] {
+        for (require_pricing, cap) in [
+            (true, None),
+            (true, Some(10_000_000)),
+            (false, None),
+            (false, Some(10_000_000)),
+        ] {
             let dir = test_dir("unpriced-cache-admission");
             let journal = test_journal(&dir, &format!("cache-{}", uuid::Uuid::now_v7()));
             let secrets = SecretStore::default();
@@ -302,7 +314,7 @@ async fn required_cache_pricing_is_checked_per_row_before_dispatch() {
                 CancellationToken::new(),
                 LlmCostBudget {
                     max_tokens: None,
-                    max_cost_microusd: Some(10_000_000),
+                    max_cost_microusd: cap,
                     require_pricing,
                 },
                 vec![],
@@ -330,13 +342,20 @@ async fn required_cache_pricing_is_checked_per_row_before_dispatch() {
                 journal.state().budget.llm_calls,
                 u64::from(!require_pricing)
             );
+            let events = std::fs::read_to_string(dir.join("journal.jsonl")).unwrap();
+            assert_eq!(
+                events.lines().any(|line| {
+                    serde_json::from_str::<serde_json::Value>(line).unwrap()["t"] == "llm_call"
+                }),
+                !require_pricing
+            );
             let _ = std::fs::remove_dir_all(dir);
         }
     }
 }
 
 #[tokio::test]
-async fn required_cache_pricing_rejects_used_unpriced_categories_without_a_cost_cap() {
+async fn required_cache_pricing_preflights_even_unused_categories_without_a_cost_cap() {
     for (read, creation) in [(40, 0), (0, 20), (40, 20), (0, 0)] {
         for base_input in [None, Some(2.0)] {
             for require_pricing in [true, false] {
@@ -369,17 +388,30 @@ async fn required_cache_pricing_rejects_used_unpriced_categories_without_a_cost_
                 );
                 let mut request = test_request();
                 request.provider = "cache-metered".into();
+                let actual_cost = gateway.cost_microusd(
+                    &test_node(),
+                    &[route.clone()],
+                    "cache-metered",
+                    "test",
+                    &provider.usage,
+                    None,
+                    None,
+                );
+                assert_eq!(
+                    actual_cost.is_err(),
+                    require_pricing && base_input.is_none() && read + creation > 0
+                );
                 let result = gateway
                     .complete(&test_node(), request, &[route], |_| json!({}))
                     .await;
-                let unpriced_usage = require_pricing && base_input.is_none() && read + creation > 0;
+                let unpriced_route = require_pricing && base_input.is_none();
                 let budget = journal.state().budget;
-                if unpriced_usage {
+                if unpriced_route {
                     assert!(
                         result
                             .unwrap_err()
                             .to_string()
-                            .contains("incomplete pricing")
+                            .contains("lacks cache input pricing")
                     );
                     assert_eq!(
                         budget.llm_calls, 0,
@@ -394,7 +426,7 @@ async fn required_cache_pricing_rejects_used_unpriced_categories_without_a_cost_
                             .any(|event| event["t"] == "llm_call")
                     );
                 } else {
-                    result.expect("unused cache categories and optional pricing remain supported");
+                    result.expect("base-input fallback and optional pricing remain supported");
                     assert_eq!(budget.llm_calls, 1);
                     // Cache fallback inherits base input (2), never tier input (5).
                     let expected = (100 - read - creation) * 5
@@ -402,9 +434,77 @@ async fn required_cache_pricing_rejects_used_unpriced_categories_without_a_cost_
                         + (read + creation) * if base_input.is_some() { 2 } else { 0 };
                     assert_eq!(budget.cost_microusd, expected);
                 }
-                assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert_eq!(
+                    provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+                    usize::from(!unpriced_route)
+                );
                 let _ = std::fs::remove_dir_all(dir);
             }
+        }
+    }
+}
+
+#[tokio::test]
+async fn required_cache_pricing_preflights_fallback_before_dispatch() {
+    for require_pricing in [true, false] {
+        for cap in [None, Some(10_000_000)] {
+            let dir = test_dir("unpriced-fallback-cache");
+            let journal = test_journal(&dir, &uuid::Uuid::now_v7().to_string());
+            let secrets = SecretStore::default();
+            let provider = Arc::new(CountingCacheProvider {
+                calls: Default::default(),
+                usage: TokenUsage {
+                    input: 100,
+                    output: 10,
+                    cached_input: 40,
+                    cache_creation_input: 20,
+                    reasoning: 0,
+                },
+            });
+            let gateway = LlmGateway::new(
+                provider.clone(),
+                &secrets,
+                &journal,
+                CancellationToken::new(),
+                LlmCostBudget {
+                    max_tokens: None,
+                    max_cost_microusd: cap,
+                    require_pricing,
+                },
+                vec![],
+            );
+            let mut primary = cache_pricing(None, None);
+            primary.model = "unavailable".into();
+            let mut request = test_request();
+            request.provider = primary.provider.clone();
+            request.model = primary.model.clone();
+            let result = gateway
+                .complete(
+                    &test_node(),
+                    request,
+                    &[primary, tier_without_base_input_pricing()],
+                    |_| json!({}),
+                )
+                .await;
+            if require_pricing {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("lacks cache input pricing")
+                );
+            } else {
+                result.expect("optional pricing still dispatches the fallback");
+            }
+            assert_eq!(
+                provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+                if require_pricing { 1 } else { 2 }
+            );
+            assert_eq!(
+                journal.state().budget.llm_calls,
+                u64::from(!require_pricing)
+            );
+            let _ = std::fs::remove_dir_all(dir);
         }
     }
 }

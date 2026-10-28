@@ -285,7 +285,11 @@ Rates are USD per 1M tokens. On the base row, each omitted cache rate falls
 back to that row's ordinary input rate; explicit zero is honored. A tier row
 inherits the base row's cache rate instead (see below). `require_pricing`
 requires ordinary input/output rates and resolved cache rates for any nonzero
-cache usage; an Extended TTL derives the creation price from ordinary input.
+cache usage. Before dispatch, even without a cost cap, required pricing
+checks cache-read and cache-creation completeness in every reachable base/tier
+row. A configured Extended TTL may derive creation pricing from ordinary
+input, provided every row has that input price; tier maxima cannot hide an
+unpriced row. Post-response checks remain defensive.
 Totals remain estimates,
 not provider invoices, especially unless all actual categories are configured.
 No provider-specific discounts or separate TTL rate schedules are inferred; extended writes use the configured input-rate multiplier. Admission reservations

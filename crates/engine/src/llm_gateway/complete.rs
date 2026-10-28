@@ -224,16 +224,17 @@ impl<'a> LlmGateway<'a> {
     /// rate prices the estimate; input bytes/4 is not a worst-case bound:
     /// token-dense input can exceed it, a pricier fallback route can exceed
     /// the initial-route price, and retries can incur unreported usage.
-    /// Unknown pricing with an enforced cost cap fails closed here instead
-    /// of spending blindly. Do not treat the reservation as an upstream
-    /// spending guarantee; caps are enforced post-hoc from reported usage.
+    /// Required cache pricing is checked before dispatch; unknown pricing
+    /// with a cost cap also fails closed. Reservations cannot guarantee
+    /// upstream spend; caps remain post-hoc.
     fn estimate_reservation(
         &self,
         node: &NodeDef,
         request: &ChatRequest,
         routes: &[ModelRef],
     ) -> Result<Option<PendingReservation>, StepError> {
-        if self.budget.max_tokens.is_none() && self.budget.max_cost_microusd.is_none() {
+        let bounded = self.budget.max_tokens.is_some() || self.budget.max_cost_microusd.is_some();
+        if !bounded && !self.budget.require_pricing {
             return Ok(None);
         }
         // Non-finite floats (NaN temperature and friends) fail
@@ -247,16 +248,15 @@ impl<'a> LlmGateway<'a> {
         let input_est = (prompt_bytes as u64).div_ceil(4);
         let max_output = u64::from(request.max_tokens);
         let tokens = input_est.saturating_add(max_output);
-        let mut cost_microusd = 0_u64;
-        if self.budget.max_cost_microusd.is_some() {
+        let mut cost_microusd = 0;
+        // Required cache completeness is independent of reservation limits.
+        if self.budget.require_pricing || self.budget.max_cost_microusd.is_some() {
             let provider = &request.provider;
             let model = &request.model;
             let unpriced = |detail: &str| {
                 StepError::failed(
                     &node.id,
-                    format!(
-                        "model `{provider}/{model}` {detail} while budget.max_cost_usd is enforced; refusing blind spend"
-                    ),
+                    format!("model `{provider}/{model}` {detail}; refusing blind spend"),
                 )
             };
             let route = self
@@ -272,19 +272,18 @@ impl<'a> LlmGateway<'a> {
                 {
                     return Err(unpriced("lacks cache input pricing in a base or tier row"));
                 }
-            }
-            let mut rates = policy::max_cost_rates(&base, &route.cost_tiers);
-            if let Some(multiplier) = ttl {
-                // A cache price cannot price a TTL write. Require ordinary
-                // input pricing in every tier, not just the maximum row.
-                for tier in std::iter::once(None).chain(route.cost_tiers.iter().map(Some)) {
-                    let input = base.resolve(tier).input.ok_or_else(|| {
+                // TTL writes require ordinary input in each row, not a cache price.
+                if let Some(multiplier) = ttl {
+                    let input = row.input.ok_or_else(|| {
                         unpriced("lacks ordinary input pricing for extended cache TTL")
                     })?;
                     if !input.is_finite() || input < 0.0 || !(input * multiplier).is_finite() {
                         return Err(StepError::failed(&node.id, "invalid model pricing"));
                     }
                 }
+            }
+            let mut rates = policy::max_cost_rates(&base, &route.cost_tiers);
+            if let Some(multiplier) = ttl {
                 rates.cache_creation = rates.input.map(|input| input * multiplier);
             }
             let (Some(input_rate), Some(output)) = (rates.max_input_rate(), rates.output) else {
@@ -296,10 +295,11 @@ impl<'a> LlmGateway<'a> {
             {
                 return Err(StepError::failed(&node.id, "invalid model pricing"));
             }
-            cost_microusd =
-                ((input_est as f64 * input_rate) + (max_output as f64 * output)).ceil() as u64;
+            cost_microusd = self.budget.max_cost_microusd.map_or(0, |_| {
+                ((input_est as f64 * input_rate) + (max_output as f64 * output)).ceil() as u64
+            });
         }
-        Ok(Some(PendingReservation {
+        Ok(bounded.then_some(PendingReservation {
             tokens,
             cost_microusd,
         }))
@@ -370,6 +370,9 @@ impl<'a> LlmGateway<'a> {
             routed_request.provider.clone_from(provider);
             routed_request.model.clone_from(model);
             self.scan_request(node, &routed_request)?;
+            if attempt > 0 && self.budget.require_pricing {
+                self.estimate_reservation(node, &routed_request, routes)?;
+            }
             let trace = RetryTrace::default();
             let validation = if attempt == 0 {
                 Ok(())

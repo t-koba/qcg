@@ -338,9 +338,11 @@ Fields:
   `cache_creation_input_cost_per_million_usd`: optional cache input unit prices
   (USD/1M). Each defaults to the ordinary input rate when omitted; explicit
   zero is preserved. These rates flow through the catalog and per-call pricing.
-  No vendor prices or cache TTL tiers are built in. `require_pricing` continues
-  to require ordinary input/output rates only; costs remain estimates, not
-  invoices, particularly unless all actual categories have configured rates.
+  No vendor prices or cache TTL tiers are built in. `require_pricing` requires
+  ordinary input/output rates and checks resolved cache-read and cache-creation
+  pricing in every reachable base/tier row before dispatch, even without a cost
+  cap. A configured Extended TTL may derive creation pricing from ordinary input
+  only if every row has an input price. Costs remain estimates, not invoices.
 - `cost_tiers`: optional context tiers, the same shape the contract's
   `model.cost_tiers` uses. A tier names `threshold_tokens` and the rates that
   price a request whose whole prompt input reaches that threshold. A rate the
