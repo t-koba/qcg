@@ -11,6 +11,7 @@ pub(crate) mod providers;
 pub(crate) mod retention_gc;
 pub(crate) mod shared_subscribe;
 pub(crate) mod support;
+pub(crate) mod terminal_manifest;
 
 pub(crate) mod scheduling;
 

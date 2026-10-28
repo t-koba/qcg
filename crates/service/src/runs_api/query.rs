@@ -157,6 +157,8 @@ impl LocalService {
                     .iter()
                     .map(|v| RunEvent::from_flat(v).map_err(ServiceError::Invalid))
                     .collect::<Result<Vec<_>, _>>()?;
+                #[cfg(test)]
+                crate::tests::terminal_manifest::after_first_read(&directory);
                 let out_path = meta.join("outputs.json");
                 let mut manifest_len = 0;
                 let manifest: Option<OutputManifest> = match std::fs::File::open(&out_path) {
@@ -173,6 +175,8 @@ impl LocalService {
                         Some(serde_json::from_slice(&raw).map_err(ServiceError::Json)?)
                     }
                 };
+                #[cfg(test)]
+                crate::tests::terminal_manifest::after_first_read(&directory);
                 let audit_len = match std::fs::File::open(meta.join("audit.jsonl")) {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                     Err(e) => return Err(ServiceError::Io(e)),
@@ -315,6 +319,8 @@ impl LocalService {
             None => self.run_dir_for(&id).await?,
         };
         let view = self.read_view(run_dir.clone()).await?; // Read before outputs.json for terminal consistency.
+        #[cfg(test)]
+        crate::tests::terminal_manifest::after_first_read(&run_dir);
         let directory = run_dir.clone();
         let artifacts = match memory.as_ref().and_then(|record| record.artifacts.clone()) {
             Some(artifacts) => Some(artifacts),
@@ -323,6 +329,8 @@ impl LocalService {
                     .await?
             }
         };
+        #[cfg(test)]
+        crate::tests::terminal_manifest::after_first_read(&run_dir);
         let journal_events = &view.events;
         self.assemble_snapshot_from_read(
             id,

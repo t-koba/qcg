@@ -75,6 +75,8 @@ impl LocalService {
             None => self.run_dir_for(&id).await?,
         };
         let view = self.read_view(run_dir.clone()).await?; // Read before outputs.json for terminal consistency.
+        #[cfg(test)]
+        crate::tests::terminal_manifest::after_first_read(&run_dir);
         let artifacts = match memory.as_ref().and_then(|r| r.artifacts.clone()) {
             Some(m) => {
                 if m.artifacts.len() > entries {
@@ -112,6 +114,8 @@ impl LocalService {
                 }
             }
         };
+        #[cfg(test)]
+        crate::tests::terminal_manifest::after_first_read(&run_dir);
         let snapshot = self
             .assemble_snapshot_from_read(
                 id,

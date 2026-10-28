@@ -3,6 +3,64 @@ use crate::*;
 use serde_json::json;
 use std::io::Cursor;
 
+fn write_running_run(runs: &camino::Utf8Path, id: &str) -> camino::Utf8PathBuf {
+    let directory = runs.join(id);
+    let meta = run_meta_dir(&directory);
+    std::fs::create_dir_all(&meta).expect("run metadata should be created");
+    engine::JournalWriter::create(&meta.join("journal.jsonl"), id, false, None)
+        .expect("journal should be created")
+        .event(
+            "run_started",
+            json!({
+                "generator": "demo@1.0.0", "generator_path": "demo", "contract_sha256": "test",
+                "inputs": {}, "resource_hashes": [], "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
+            }),
+        )
+        .expect("run should be active");
+    directory
+}
+
+#[tokio::test]
+async fn snapshots_read_journal_and_manifest_across_a_forced_publication() {
+    for endpoint in ["snapshot", "snapshot_json", "bundle"] {
+        let root = temp_run_dir(&format!("manifest-order-{endpoint}"));
+        std::fs::create_dir_all(&root).expect("test root should be created");
+        let _guard = TempGuard(root.clone());
+        let runs = root.join("runs");
+        let generators =
+            camino::Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+        let service = test_service(vec![generators], runs.clone());
+        let id = format!("manifest-order-{endpoint}");
+        let directory = write_running_run(&runs, &id);
+        crate::tests::terminal_manifest::arm(&directory);
+        let snapshot = match endpoint {
+            "snapshot" => service.snapshot(id).await.expect("snapshot should succeed"),
+            "snapshot_json" => serde_json::from_slice(
+                &service
+                    .snapshot_json(id, &ArtifactZipLimits::default())
+                    .await
+                    .expect("snapshot JSON should succeed"),
+            )
+            .expect("snapshot JSON should decode"),
+            _ => {
+                let parts = service
+                    .run_bundle_parts(&id, &ArtifactZipLimits::default())
+                    .await
+                    .expect("bundle preparation should succeed");
+                assert!(parts.outputs_bytes.is_some(), "manifest should be included");
+                serde_json::from_slice(&parts.snapshot_bytes)
+                    .expect("bundle snapshot should decode")
+            }
+        };
+        assert_eq!(snapshot.state, api::RunStatus::Queued, "{endpoint}");
+        assert!(
+            snapshot.artifacts.is_some(),
+            "{endpoint} should include the published manifest"
+        );
+    }
+}
+
 #[test]
 fn artifact_zip_rejects_sources_above_limit() {
     let run_dir = temp_run_dir("zip-limit");
