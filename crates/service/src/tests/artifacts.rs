@@ -515,7 +515,14 @@ async fn snapshot_json_checks_cached_entries_and_bounds_complete_body() {
         .await
         .expect("run should start");
     let terminal = wait_for_terminal_snapshot(&service, &id).await;
-    assert!(terminal.state.is_terminal());
+    let run_dir = service.run_dir_for(&id).await.expect("run dir");
+    let journal = std::fs::read_to_string(run_meta_dir(&run_dir).join("journal.jsonl"))
+        .expect("run journal should be available");
+    assert_eq!(
+        terminal.state,
+        api::RunStatus::Succeeded,
+        "run must succeed before checking cached artifacts; journal:\n{journal}"
+    );
     let cached_entries = terminal
         .artifacts
         .as_ref()
