@@ -383,16 +383,16 @@ field by field. For a request, explicit contract rates likewise override the
 effective catalog model field by field. The cost meter then selects one pricing
 row among matching invocation routes and contract model entries: the first
 complete input/output row wins; if none is complete, the first matching partial
-row applies. It never mixes rates between those candidate rows. Missing cache
-rates fall back to ordinary input from that selected row; explicit zero is
-preserved.
+row applies. It never mixes rates between those candidate rows. An absent
+cache rate in the selected base row falls back to that base row's ordinary
+input rate when present; explicit zero is preserved.
 
-The rate rules live with the contract's model reference, so every caller
-resolves prices the same way: a configured price must be finite and
-non-negative (the manifest rejects it, and the runtime refuses to bill it),
-and an absent cache rate bills at the ordinary input rate. The manifest
-check, the cost meter, the pre-call reservation and the CLI's rate display all
-ask that one definition.
+Configured prices must be finite and non-negative (the manifest rejects
+invalid prices, and the runtime refuses to bill them). `ModelRef::invalid_price`
+validates base-row and web-search rates; `policy::validate_cost_tiers` validates
+tier schedules. Tier rates are resolved by `policy::CostRates::resolve`:
+absent tier cache rates inherit the base row's resolved cache rate, never the
+tier's own input rate.
 
 A context tier schedule the source publishes but qcg cannot read leaves the
 model's flat rates in place: qcg prices a request at a rate it read, never at

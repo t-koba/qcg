@@ -210,10 +210,8 @@ pub struct ModelRef {
 }
 
 impl ModelRef {
-    /// The first configured price that is not finite and non-negative, named
-    /// by its field. `None` when every configured price is valid. This is the
-    /// one definition of the price rule: the manifest check, the runtime cost
-    /// meter and the decision path all ask this method.
+    /// The first non-finite or negative base-row/web-search rate, named by field.
+    /// `None` when valid; tier schedules use [`policy::validate_cost_tiers`].
     pub fn invalid_price(&self) -> Option<&'static str> {
         self.rates().invalid_rate().or_else(|| {
             self.web_search_call_cost_usd
