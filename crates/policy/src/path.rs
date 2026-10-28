@@ -27,19 +27,7 @@ const WINDOWS_RESERVED_STEMS: [&str; 30] = [
 /// forbidden in a file name too, but only a glob pattern may hold them.
 const WIN32_FORBIDDEN_CHARS: [char; 4] = ['<', '>', '"', '|'];
 
-fn equals_ignore_ascii_case(left: &str, right: &str) -> bool {
-    left.len() == right.len()
-        && left
-            .bytes()
-            .zip(right.bytes())
-            .all(|(left, right)| left.to_ascii_uppercase() == right)
-}
-
-/// Returns whether a single `/`-separated component survives Win32
-/// normalization unchanged: no ADS/drive colon, no stripped trailing
-/// dot/space, no reserved device stem, no control bytes, and no
-/// character Win32 forbids in a file name. A glob pattern may hold
-/// the `*` and `?` wildcards; a concrete path may not.
+/// Validates one component against the module-level portable-path rules.
 fn is_portable_component(part: &str, wildcards_allowed: bool) -> bool {
     if part.is_empty() || part == "." || part == ".." {
         return false;
@@ -59,15 +47,13 @@ fn is_portable_component(part: &str, wildcards_allowed: bool) -> bool {
     let stem = part.split('.').next().unwrap_or(part);
     if WINDOWS_RESERVED_STEMS
         .iter()
-        .any(|reserved| equals_ignore_ascii_case(stem, reserved))
+        .any(|reserved| stem.eq_ignore_ascii_case(reserved))
     {
         return false;
     }
     true
 }
 
-/// The shared shape of a safe relative path: non-empty, relative,
-/// slash-separated, and free of the forms a Windows host cannot hold.
 fn is_safe_relative(path: &str, wildcards_allowed: bool) -> bool {
     let bytes = path.as_bytes();
     !path.is_empty()
@@ -80,17 +66,13 @@ fn is_safe_relative(path: &str, wildcards_allowed: bool) -> bool {
             .any(|part| !is_portable_component(part, wildcards_allowed))
 }
 
-/// Returns whether `path` is a safe, non-empty, relative slash-separated
-/// path that names a file every host can hold.
+/// Returns whether `path` is a portable concrete relative path.
 pub fn is_safe_relative_path(path: &str) -> bool {
     is_safe_relative(path, false)
 }
 
-/// Returns whether `pattern` is a safe relative glob pattern: the rules
-/// of a safe relative path, except that a component may hold the `*` and
-/// `?` wildcards. The characters Win32 forbids in a file name stay
-/// forbidden, so a pattern cannot name a file a Windows host cannot
-/// hold.
+/// Returns whether `pattern` is a portable relative glob.
+/// The module documentation describes the wildcard and component rules.
 pub fn is_safe_glob_pattern(pattern: &str) -> bool {
     is_safe_relative(pattern, true)
 }
