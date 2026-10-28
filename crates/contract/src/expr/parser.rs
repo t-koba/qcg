@@ -44,6 +44,7 @@ impl ExpressionNode {
                         // double path would round a large literal into a
                         // different number before any comparison sees it.
                         if let Value::Number(number) = &value
+                            && (number.is_i64() || number.is_u64())
                             && let Some(exact) = exact_integer(number)
                             && let Some(negated) = exact.checked_neg()
                         {
@@ -59,11 +60,9 @@ impl ExpressionNode {
                             // type cannot hold exactly is refused rather
                             // than rounded, as an integer literal above
                             // that range is refused.
-                            if number.is_i64() || number.is_u64() {
-                                return Err(format!(
-                                    "unary - of `{number}` has no exact integer representation"
-                                ));
-                            }
+                            return Err(format!(
+                                "unary - of `{number}` has no exact integer representation"
+                            ));
                         }
                         number_value(-as_number(&value, "unary -")?)
                     }

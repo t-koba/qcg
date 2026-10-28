@@ -474,11 +474,31 @@ mod tests {
     }
 
     #[test]
+    fn the_unary_minus_preserves_number_representation() {
+        for (expression, expected, is_float) in [
+            ("-3", -3.0, false),
+            ("-3.0", -3.0, true),
+            ("-3.5", -3.5, true),
+            ("-0.0", -0.0, true),
+        ] {
+            let value = eval_value(expression);
+            let number = value.as_number().expect("negation returns a number");
+            assert_eq!(number.is_f64(), is_float, "{expression}");
+            assert_eq!(number.is_i64(), !is_float, "{expression}");
+            assert!(!number.is_u64(), "{expression}");
+            let actual = number.as_f64().expect("number fits a double");
+            assert_eq!(actual, expected, "{expression}");
+            assert!(actual.is_sign_negative(), "{expression}");
+            if !is_float {
+                assert_eq!(number.as_i64(), Some(-3));
+            }
+        }
+    }
+
+    #[test]
     fn the_unary_minus_does_not_overflow_on_the_largest_negative_number() {
-        // The largest magnitude a double holds exactly as an integer is
-        // -2^127, which has no positive counterpart in the exact integer
-        // path; negating it must fall back to the double path instead of
-        // overflowing.
+        // A float at -2^127 must stay on the float path: its positive
+        // counterpart cannot fit in i128, but is a finite double.
         let mut inputs = BTreeMap::new();
         inputs.insert(
             "huge".into(),
