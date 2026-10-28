@@ -6,19 +6,7 @@ use std::sync::{Arc, PoisonError};
 /// Queue order: higher priority first, then earlier admission, then run id.
 /// Waiting behind a higher-priority run is normal scheduling, not starvation
 /// of equals: equal priorities keep FIFO order.
-fn queue_order<'a>(
-    record: &'a RunRecord,
-    run_id: &'a str,
-) -> (
-    std::cmp::Reverse<i32>,
-    bool,
-    Option<chrono::DateTime<chrono::Utc>>,
-    &'a str,
-) {
-    queue_key(record.priority, record.queued_at, run_id)
-}
-
-/// Shared queue-sort key used by [`queue_order`] and the snapshot queue
+/// Shared queue-sort key used by [`queue_head`] and the snapshot queue
 /// position merge in `runs_api`, so the two can never sort differently
 /// (E12/E16).
 pub(crate) fn queue_key(
@@ -45,7 +33,7 @@ pub(crate) fn queue_key(
 pub(crate) fn queue_head(runs: &BTreeMap<String, RunRecord>) -> Option<String> {
     runs.iter()
         .filter(|(_, record)| record.state == RunStatus::Queued)
-        .min_by(|left, right| queue_order(left.1, left.0).cmp(&queue_order(right.1, right.0)))
+        .min_by_key(|(run_id, record)| queue_key(record.priority, record.queued_at, run_id))
         .map(|(run_id, _)| run_id.clone())
 }
 
