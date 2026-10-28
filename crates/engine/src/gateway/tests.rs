@@ -259,39 +259,17 @@ fn command_plan_uses_the_same_runtime_limits_as_execution() {
 #[tokio::test]
 async fn workspace_relative_command_resolves_against_the_declared_workspace() {
     let test_executable = std::env::current_exe().expect("current test executable should resolve");
-    #[cfg(unix)]
-    let workspace_parent = test_executable
-        .parent()
-        .expect("test executable should have a parent directory")
-        .to_path_buf();
-    #[cfg(not(unix))]
-    let workspace_parent = std::path::PathBuf::from(temp_workspace().as_str());
-    let workspace = workspace_parent.join(format!(
-        "relative-command-{}",
-        uuid::Uuid::now_v7().as_simple()
-    ));
-    std::fs::create_dir_all(&workspace).expect("test workspace should be created");
-    let executable_name = if cfg!(windows) {
-        "local-command.exe"
-    } else {
-        "local-command"
-    };
-    let executable = workspace.join(executable_name);
-    #[cfg(unix)]
-    {
-        // Avoid a writable copy fd that a parallel fork could inherit before exec (ETXTBSY).
-        use std::os::unix::fs::MetadataExt as _;
-        std::fs::hard_link(&test_executable, &executable)
-            .expect("test executable should be hard-linked into the workspace");
-        let source =
-            std::fs::metadata(&test_executable).expect("test executable metadata should load");
-        let linked =
-            std::fs::metadata(&executable).expect("workspace executable metadata should load");
-        assert_eq!((source.dev(), source.ino()), (linked.dev(), linked.ino()));
-    }
-    #[cfg(not(unix))]
-    std::fs::copy(&test_executable, &executable)
-        .expect("test executable should be copied into the workspace");
+    let executable_name = test_executable
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("current test executable name should be UTF-8");
+    let workspace = Utf8PathBuf::from_path_buf(
+        test_executable
+            .parent()
+            .expect("test executable should have a parent directory")
+            .to_path_buf(),
+    )
+    .expect("test workspace path should be UTF-8");
     let bin = format!("./{executable_name}");
     let mut permissions = Permissions::default();
     permissions.commands.push(CommandPermission {
@@ -302,17 +280,13 @@ async fn workspace_relative_command_resolves_against_the_declared_workspace() {
         image: None,
     });
 
-    let output = CmdGateway::new(
-        permissions,
-        Utf8PathBuf::from_path_buf(workspace.clone()).expect("test workspace path should be UTF-8"),
-    )
-    .run_with_limits(&[bin, "--list".into()], 30, Some(1024 * 1024))
-    .await
-    .expect("workspace-relative executable should run");
+    let output = CmdGateway::new(permissions, workspace)
+        .run_with_limits(&[bin, "--list".into()], 30, Some(1024 * 1024))
+        .await
+        .expect("workspace-relative executable should run");
 
     assert_eq!(output.status, 0);
     assert!(output.stdout.contains("workspace_relative_command"));
-    std::fs::remove_dir_all(workspace).expect("test workspace should be removed");
 }
 
 #[test]
