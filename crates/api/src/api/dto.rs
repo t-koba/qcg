@@ -397,6 +397,9 @@ pub struct LlmCatalogProvider {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LlmCatalogModel {
     pub id: String,
+    /// Model-specific advisory; not a provider failure.
+    #[serde(default)]
+    pub warning: Option<String>,
     #[serde(default)]
     pub label: Option<String>,
     pub enabled: bool,

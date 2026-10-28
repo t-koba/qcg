@@ -230,6 +230,7 @@ impl StepExecutor for LlmCatalogStep {
                                 "label": model.label.clone().unwrap_or_else(|| model.id.clone()),
                                 "metadata": {
                                     "source": model.source,
+                                    "warning": model.warning,
                                     "enabled": model.enabled,
                                     "reasoning_effort": model.reasoning_effort
                                         .iter()
@@ -264,6 +265,7 @@ impl StepExecutor for LlmCatalogStep {
                             "error": selected.error,
                             "models": models.iter().map(|model| json!({
                                 "id": model.id,
+                                "warning": model.warning,
                                 "label": model.label,
                                 "enabled": model.enabled,
                                 "source": model.source,

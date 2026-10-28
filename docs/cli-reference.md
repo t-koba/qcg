@@ -57,10 +57,10 @@ JSON event output go to stdout.
 - `qcg list [--generators-dir dir]` lists available packages from the installed
   directory and the bundled generator directory. Installed IDs take precedence.
 - `qcg models [--json] [--refresh]` lists the selectable LLM providers, models,
-  reasoning efforts, prices, and limits derived from `providers.toml`, the
-  optional external catalog, and per-provider discovery. `--refresh` re-fetches
-  external catalog sources first; stale or failed sources are reported on
-  stderr. Credentials are never printed.
+  reasoning efforts, prices, limits, and per-model warnings derived from
+  `providers.toml`, the optional external catalog, and per-provider discovery.
+  `--refresh` re-fetches external catalog sources first; stale or failed sources
+  are reported on stderr. Credentials are never printed.
 - `qcg eval <generator> --suite suite.json [--output .data/evals]
   [--runs-dir .data/runs] [--baseline REPORT_JSON] [--json]` executes isolated
   cases and optional repeated seed variations. Assertions cover artifacts,

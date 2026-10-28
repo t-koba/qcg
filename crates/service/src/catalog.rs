@@ -179,6 +179,7 @@ fn map_llm_catalog(view: llm::CatalogView) -> LlmCatalogResponse {
                     .into_iter()
                     .map(|model| LlmCatalogModel {
                         id: model.id,
+                        warning: model.warning,
                         label: model.label,
                         enabled: model.enabled,
                         source: model.source,
@@ -217,5 +218,49 @@ fn map_llm_catalog(view: llm::CatalogView) -> LlmCatalogResponse {
                     .collect(),
             })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_warning_is_preserved_in_catalog_response() {
+        let warning = "external tier schedule could not be used".to_string();
+        let response = map_llm_catalog(llm::CatalogView {
+            fetched_at: None,
+            stale: false,
+            sources: Vec::new(),
+            providers: vec![llm::CatalogProviderView {
+                id: "openai".into(),
+                label: None,
+                available: true,
+                discovery: false,
+                error: None,
+                models: vec![llm::CatalogModelView {
+                    id: "tiered-model".into(),
+                    warning: Some(warning.clone()),
+                    label: None,
+                    enabled: true,
+                    source: "external".into(),
+                    capabilities: llm::Capabilities::default(),
+                    reasoning_effort: Vec::new(),
+                    input_cost_per_million_usd: None,
+                    cache_creation_input_cost_per_million_usd: None,
+                    cache_read_input_cost_per_million_usd: None,
+                    output_cost_per_million_usd: None,
+                    context_tokens: None,
+                    max_output_tokens: None,
+                }],
+            }],
+        });
+
+        let provider = &response.providers[0];
+        assert!(provider.error.is_none());
+        assert_eq!(
+            provider.models[0].warning.as_deref(),
+            Some(warning.as_str())
+        );
     }
 }

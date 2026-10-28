@@ -139,8 +139,8 @@ pub struct ExternalCatalog {
     fingerprint: Option<String>,
     /// External provider key -> model id -> spec.
     providers: BTreeMap<String, BTreeMap<String, ModelSpec>>,
-    /// Provider -> unusable model schedules; flat rates stay and failures remain visible.
-    model_errors: BTreeMap<String, Vec<String>>,
+    /// Provider -> model id -> unusable schedule advisories; flat rates stay.
+    model_errors: BTreeMap<String, BTreeMap<String, Vec<String>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -181,6 +181,8 @@ pub struct CatalogProviderView {
 #[derive(Debug, Clone, Serialize)]
 pub struct CatalogModelView {
     pub id: String,
+    /// Advisory metadata (for example, an unusable external tier schedule).
+    pub warning: Option<String>,
     pub label: Option<String>,
     pub enabled: bool,
     /// `explicit`, `external`, or `discovery`.
@@ -371,11 +373,10 @@ impl CatalogService {
                 Ok(catalog) => {
                     for (provider, errors) in catalog.model_errors {
                         tracing::warn!(provider = %provider, model_errors = ?errors, "unusable tier");
-                        merged
-                            .model_errors
-                            .entry(provider)
-                            .or_default()
-                            .extend(errors);
+                        let entry = merged.model_errors.entry(provider).or_default();
+                        for (model, warnings) in errors {
+                            entry.entry(model).or_default().extend(warnings);
+                        }
                     }
                     for (provider, models) in catalog.providers {
                         let entry = merged.providers.entry(provider).or_default();
@@ -522,14 +523,7 @@ impl CatalogService {
                         .or_insert_with(|| model_view(model, "external", &spec.capabilities));
                 }
             }
-            // A model whose context tier schedule qcg could not use keeps
-            // its flat rates; the error names the model, so a request that
-            // a tier would have priced is never metered silently.
-            let mut errors = external
-                .model_errors
-                .get(catalog_id)
-                .cloned()
-                .unwrap_or_default();
+            let mut error = None;
             if spec.models_discovery.is_some() {
                 match self.discover(spec).await {
                     Ok(discovered) => {
@@ -551,7 +545,12 @@ impl CatalogService {
                                 });
                         }
                     }
-                    Err(error) => errors.push(error),
+                    Err(reason) => error = Some(reason),
+                }
+            }
+            for (id, warnings) in external.model_errors.get(catalog_id).into_iter().flatten() {
+                if let Some(model) = models.get_mut(id) {
+                    model.warning = Some(warnings.join("; "));
                 }
             }
             providers.push(CatalogProviderView {
@@ -559,7 +558,7 @@ impl CatalogService {
                 label: None,
                 available: provider_available(spec),
                 discovery: spec.models_discovery.is_some(),
-                error: (!errors.is_empty()).then(|| errors.join("; ")),
+                error,
                 models: models.into_values().collect(),
             });
         }
@@ -806,6 +805,7 @@ fn model_view(
     let effective = model.effective_capabilities(provider_capabilities);
     CatalogModelView {
         id: model.id.clone(),
+        warning: None,
         label: model.label.clone(),
         enabled: model.is_enabled(),
         source: source.to_string(),
@@ -1149,7 +1149,6 @@ pub(crate) fn map_models_dev(text: &str) -> Result<ExternalCatalog, String> {
     let providers: BTreeMap<String, ModelsDevProvider> = serde_json::from_str(text)
         .map_err(|error| format!("models.dev catalog is not valid JSON: {error}"))?;
     let mut mapped = ExternalCatalog::default();
-    let mut model_errors: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (provider_id, provider) in providers {
         let mut models = BTreeMap::new();
         for (model_id, model) in provider.models {
@@ -1186,8 +1185,10 @@ pub(crate) fn map_models_dev(text: &str) -> Result<ExternalCatalog, String> {
             let cost_tiers = match map_models_dev_tiers(cost) {
                 Ok(tiers) => tiers,
                 Err(reason) => {
-                    model_errors
+                    mapped.model_errors
                         .entry(provider_id.clone())
+                        .or_default()
+                        .entry(model_id.clone())
                         .or_default()
                         .push(format!(
                             "model `{model_id}`: its context tier schedule could not be used ({reason}), so its flat rates apply"
@@ -1218,7 +1219,6 @@ pub(crate) fn map_models_dev(text: &str) -> Result<ExternalCatalog, String> {
         }
         mapped.providers.insert(provider_id, models);
     }
-    mapped.model_errors = model_errors;
     Ok(mapped)
 }
 
@@ -1453,12 +1453,12 @@ mod tests {
         assert_eq!(other.output_cost_per_million_usd, Some(2.0));
         // A model the source gives no context band for is reported, so
         // tier pricing being off is never silent.
-        let errors = &catalog.model_errors["openai"];
+        let warnings = &catalog.model_errors["openai"]["other-band"];
         assert!(
-            errors
+            warnings
                 .iter()
-                .any(|error| error.contains("model `other-band`")),
-            "the error names the model: {errors:?}"
+                .any(|warning| warning.contains("model `other-band`")),
+            "the warning stays keyed to its model: {warnings:?}"
         );
     }
 
@@ -1469,14 +1469,15 @@ mod tests {
         assert!(unreadable.cost_tiers.is_empty());
         assert_eq!(unreadable.input_cost_per_million_usd, Some(1.0));
         assert_eq!(unreadable.output_cost_per_million_usd, Some(2.0));
-        let errors = &catalog.model_errors["openai"];
+        let warnings = &catalog.model_errors["openai"]["unreadable"];
         assert!(
-            errors
+            warnings
                 .iter()
-                .any(|error| error.contains("model `unreadable`")),
-            "the error names the model: {errors:?}"
+                .any(|warning| warning.contains("model `unreadable`")),
+            "the warning stays keyed to its model: {warnings:?}"
         );
-        // A model whose schedule qcg could read carries no error.
+        assert!(!catalog.model_errors["openai"].contains_key("tiered"));
+        // A provider whose schedule qcg could read carries no warning.
         assert!(!catalog.model_errors.contains_key("anthropic"));
     }
 
@@ -1551,7 +1552,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_dropped_tier_schedule_is_reported_with_its_provider() {
+    async fn a_dropped_tier_schedule_is_a_model_warning_not_provider_error() {
         use crate::provider::ProvidersFile;
         let file = ProvidersFile::parse(
             r#"
@@ -1568,12 +1569,26 @@ base_url = "https://example.test/v1"
                 .snapshot
                 .write()
                 .unwrap_or_else(|error| error.into_inner());
-            let mut model_errors = BTreeMap::new();
-            model_errors.insert(
-                "openai".to_string(),
-                vec!["model `gpt-5`: its context tier schedule could not be used (a tier qcg cannot read), so its flat rates apply".to_string()],
+            snapshot.external.providers.insert(
+                "openai".into(),
+                BTreeMap::from([(
+                    "gpt-5".into(),
+                    ModelSpec {
+                        id: "gpt-5".into(),
+                        ..Default::default()
+                    },
+                )]),
             );
-            snapshot.external.model_errors = model_errors;
+            snapshot.external.model_errors.insert(
+                "openai".into(),
+                BTreeMap::from([(
+                    "gpt-5".into(),
+                    vec![
+                        "tier schedule could not be used (unreadable tier)".into(),
+                        "flat rates remain active".into(),
+                    ],
+                )]),
+            );
         }
         let view = service.view(false).await;
         let provider = view
@@ -1581,10 +1596,44 @@ base_url = "https://example.test/v1"
             .iter()
             .find(|provider| provider.id == "openai")
             .expect("provider view");
-        let error = provider.error.as_deref().expect("the error is visible");
         assert!(
-            error.contains("model `gpt-5`"),
-            "the error names the model: {error}"
+            provider.error.is_none(),
+            "model advisory is not a provider failure"
+        );
+        let model = provider
+            .models
+            .iter()
+            .find(|model| model.id == "gpt-5")
+            .expect("the affected model remains visible");
+        let warning = model.warning.as_deref().expect("model warning is visible");
+        assert!(warning.contains("unreadable tier"), "{warning}");
+        assert!(warning.contains("flat rates remain active"), "{warning}");
+    }
+
+    #[tokio::test]
+    async fn provider_discovery_failure_remains_in_provider_error() {
+        use crate::provider::ProvidersFile;
+        let file = ProvidersFile::parse(
+            r#"
+[[provider]]
+id = "openai"
+api = "chat_completions"
+base_url = "http://127.0.0.1:1/v1"
+models_discovery = "openai"
+"#,
+        )
+        .expect("registry must parse");
+        let service = CatalogService::new(file.provider, None).expect("catalog service");
+        let provider = service
+            .view(false)
+            .await
+            .providers
+            .into_iter()
+            .find(|provider| provider.id == "openai")
+            .expect("provider view");
+        assert!(
+            provider.error.is_some(),
+            "the genuine discovery failure must remain visible"
         );
     }
 

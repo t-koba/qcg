@@ -762,12 +762,11 @@ fn resolve_api_token(explicit: Option<String>) -> anyhow::Result<Option<String>>
 }
 
 fn print_llm_catalog(catalog: &api::LlmCatalogResponse) {
-    println!("provider\tmodel\tenabled\tavailable\tefforts\tinput\toutput\tcontext\tsource");
-    let price = |value: Option<f64>| {
-        value
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "-".to_string())
-    };
+    println!(
+        "provider\tmodel\tenabled\tavailable\tefforts\tinput\toutput\tcontext\tsource\twarning"
+    );
+    let price =
+        |value: Option<f64>| value.map_or_else(|| "-".to_string(), |value| value.to_string());
     for provider in &catalog.providers {
         for model in &provider.models {
             let efforts = if model.reasoning_effort.is_empty() {
@@ -780,7 +779,7 @@ fn print_llm_catalog(catalog: &api::LlmCatalogResponse) {
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".to_string());
             println!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 provider.id,
                 model.id,
                 model.enabled,
@@ -789,7 +788,8 @@ fn print_llm_catalog(catalog: &api::LlmCatalogResponse) {
                 price(model.input_cost_per_million_usd),
                 price(model.output_cost_per_million_usd),
                 context,
-                model.source
+                model.source,
+                model.warning.as_deref().unwrap_or("-")
             );
         }
         if let Some(error) = &provider.error {

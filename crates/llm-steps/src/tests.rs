@@ -1,3 +1,4 @@
+mod catalog_step;
 use super::*;
 use api::{GuardrailErrorKind, ToolCallError, ToolCallErrorCode, ToolCallPhase, ToolCallStatus};
 use camino::Utf8PathBuf;

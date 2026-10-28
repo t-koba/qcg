@@ -397,8 +397,11 @@ tier's own input rate.
 A context tier schedule the source publishes but qcg cannot read leaves the
 model's flat rates in place: qcg prices a request at a rate it read, never at
 one it guessed, and a third-party payload never removes a usable model.
-The dropped schedule is logged as a warning naming the model and is reported
-with it in the provider catalog view; the model's flat rates remain.
+The dropped schedule is logged as a warning naming the model and is exposed in
+that model's optional `warning` field in the API catalog, `qcg models`, and
+`llm.catalog select=models` output. It does not populate the provider's `error`;
+that field remains for provider-level failures such as model-discovery errors.
+The model's flat rates remain.
 
 The `models_dev` source publishes a context band as `tier: {type, size}`:
 the kind of band and the size the band starts above. qcg reads the

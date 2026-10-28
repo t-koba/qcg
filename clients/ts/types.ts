@@ -2569,6 +2569,11 @@ export interface components {
              *     are joined with ` + `).
              */
             source: string;
+            /**
+             * @description Model-specific advisory; not a provider failure.
+             * @default null
+             */
+            warning: string | null;
         };
         /** LlmCatalogProvider */
         LlmCatalogProvider: {

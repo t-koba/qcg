@@ -1891,6 +1891,14 @@
           "source": {
             "description": "`built-in`, `explicit`, `external`, or `discovery` (combined sources\nare joined with ` + `).",
             "type": "string"
+          },
+          "warning": {
+            "default": null,
+            "description": "Model-specific advisory; not a provider failure.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
