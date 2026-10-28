@@ -72,6 +72,7 @@ require_path "providers.toml"
 require_path "README.md"
 require_path "PROJECT.md"
 require_path "THIRD-PARTY-NOTICES"
+require_path "QCG-TERMS-STATUS.md"
 
 if [ "$dry_run" = "true" ]; then
   echo "bundle dry-run ok"
@@ -124,6 +125,7 @@ cp README.md "$staging/share/${product_id}/"
 cp PROJECT.md "$staging/share/${product_id}/"
 cp providers.toml "$staging/share/${product_id}/providers.toml"
 cp THIRD-PARTY-NOTICES "$staging/share/${product_id}/"
+cp QCG-TERMS-STATUS.md "$staging/share/${product_id}/"
 node scripts/generate-sbom.mjs "$staging/share/${product_id}/SBOM.spdx.json"
 mkdir -p "$staging/share/${product_id}/docs"
 for document in "${public_docs[@]}"; do

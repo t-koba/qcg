@@ -21,7 +21,11 @@ const valid = () => ({
   documentNamespace: "https://example.com/revision/target/digest",
   creationInfo: { created: "2026-10-02T00:00:00Z" },
   packages: [
-    { SPDXID: "SPDXRef-Product" },
+    {
+      SPDXID: "SPDXRef-Product",
+      licenseDeclared: "NOASSERTION",
+      packageComment: "qcg's own terms are not yet declared.",
+    },
     {
       SPDXID: "SPDXRef-Rust",
       externalRefs: [{ referenceLocator: "pkg:cargo/example@1" }],
@@ -63,8 +67,15 @@ test("generated Cargo and npm SBOM has no dangling relationships", () => {
       [join(root, "scripts/generate-sbom.mjs"), output],
       { cwd: root },
     );
-    assert.doesNotThrow(() =>
-      verifySpdx(JSON.parse(readFileSync(output, "utf8"))),
+    const sbom = JSON.parse(readFileSync(output, "utf8"));
+    assert.doesNotThrow(() => verifySpdx(sbom));
+    const product = sbom.packages.find(
+      (pkg) => pkg.SPDXID === "SPDXRef-Product",
+    );
+    assert.equal(product.licenseDeclared, "NOASSERTION");
+    assert.equal(
+      product.packageComment,
+      "qcg's own terms are not yet declared.",
     );
   } finally {
     rmSync(directory, { recursive: true, force: true });

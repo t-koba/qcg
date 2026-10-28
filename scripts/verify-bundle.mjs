@@ -6,6 +6,7 @@ for (const name of [
   "README.md",
   "PROJECT.md",
   "THIRD-PARTY-NOTICES",
+  "QCG-TERMS-STATUS.md",
   "SBOM.spdx.json",
   "providers.toml",
   "docs/agent-mcp-verification.md",
@@ -41,6 +42,11 @@ for (const file of markdown) {
 }
 const sbom = JSON.parse(readFileSync(join(root, "SBOM.spdx.json"), "utf8"));
 verifySpdx(sbom);
+if (
+  readFileSync(join(root, "QCG-TERMS-STATUS.md"), "utf8").trim() !==
+  sbom.packages.find((pkg) => pkg.SPDXID === "SPDXRef-Product").packageComment
+)
+  throw new Error("bundle terms status disagrees with SBOM metadata");
 const ui = join(root, "generators/generator/ui");
 for (const match of readFileSync(join(ui, "index.html"), "utf8").matchAll(
   /(?:src|href)="([^"#]+)"/g,

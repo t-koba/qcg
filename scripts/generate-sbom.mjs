@@ -18,6 +18,9 @@ const packageMetadata = new Map(
   [...metadata.packages, ...wasmMetadata.packages].map((pkg) => [pkg.id, pkg]),
 );
 const product = resolveProduct(metadata, process.env.PRODUCT_ID || "qcg");
+const termsStatus = metadata.metadata?.qcg?.terms_status;
+if (termsStatus !== "not yet declared")
+  throw new Error("qcg terms status must be explicit in workspace metadata");
 const lock = JSON.parse(
   readFileSync("frontend/generator/package-lock.json", "utf8"),
 );
@@ -40,6 +43,7 @@ const packages = [
     filesAnalyzed: false,
     licenseConcluded: "NOASSERTION",
     licenseDeclared: "NOASSERTION",
+    packageComment: `qcg's own terms are ${termsStatus}.`,
   },
 ];
 const relationships = [

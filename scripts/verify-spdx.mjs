@@ -17,6 +17,14 @@ export function verifySpdx(sbom) {
   for (const edge of sbom.relationships)
     if (!ids.has(edge.spdxElementId) || !ids.has(edge.relatedSpdxElement))
       throw new Error("dangling SPDX relationship");
+  const product = sbom.packages.find(
+    (pkg) => pkg.SPDXID === "SPDXRef-Product",
+  );
+  if (
+    product?.licenseDeclared !== "NOASSERTION" ||
+    product?.packageComment !== "qcg's own terms are not yet declared."
+  )
+    throw new Error("qcg terms status must remain explicit without a license claim");
   if (
     !sbom.relationships.some(
       (edge) =>

@@ -29,6 +29,9 @@ rust-version = "1.99"
 version = "0.1.0"
 publish = false
 
+[workspace.metadata.qcg]
+terms_status = "not yet declared"
+
 [workspace.dependencies]
 anyhow = "1"
 async-trait = "0.1"

@@ -3,7 +3,9 @@
 ## Distribution layout
 
 Keep `bin/qcg` next to `share/qcg/`. The bundle contains the `generator` demo,
-unified provider registry, documentation, third-party notices, and SBOM. The
+unified provider registry, documentation, third-party notices, qcg terms-status
+notice, and SBOM. qcg's own terms are not yet declared; the status notice and
+product metadata in the SBOM state this without declaring a license. The
 registry contains LLM `[[provider]]` rows, REST search `[[search_provider]]`
 rows, and generic `[[mcp_server]]` rows. Test fixtures and frontend source are
 not distributed.
