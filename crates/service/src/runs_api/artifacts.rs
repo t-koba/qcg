@@ -74,6 +74,7 @@ impl LocalService {
             Some(r) => r.run_dir.clone(),
             None => self.run_dir_for(&id).await?,
         };
+        let view = self.read_view(run_dir.clone()).await?; // Read before outputs.json for terminal consistency.
         let artifacts = match memory.as_ref().and_then(|r| r.artifacts.clone()) {
             Some(m) => {
                 if m.artifacts.len() > entries {
@@ -111,7 +112,6 @@ impl LocalService {
                 }
             }
         };
-        let view = self.read_view(run_dir.clone()).await?;
         let snapshot = self
             .assemble_snapshot_from_read(
                 id,

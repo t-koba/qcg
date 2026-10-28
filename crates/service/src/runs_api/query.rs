@@ -120,23 +120,7 @@ impl LocalService {
         let (manifest, manifest_len, journal_len, audit_len, disk_state, journal_events, verified) =
             self.blocking_work(move || {
                 let meta = run_meta_dir(&directory);
-                let out_path = meta.join("outputs.json");
-                let mut manifest_len = 0;
-                let manifest: Option<OutputManifest> = match std::fs::File::open(&out_path) {
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                    Err(e) => return Err(ServiceError::Io(e)),
-                    Ok(mut f) => {
-                        let len = f.metadata().map_err(ServiceError::Io)?.len();
-                        check_bundle_limits(len, 0, &limits)?;
-                        manifest_len = len;
-                        let len = usize::try_from(len)
-                            .map_err(|_| ServiceError::Invalid("bundle size overflow".into()))?;
-                        let mut raw = vec![0; len];
-                        f.read_exact(&mut raw)?;
-                        Some(serde_json::from_slice(&raw).map_err(ServiceError::Json)?)
-                    }
-                };
-                let j_path = meta.join("journal.jsonl");
+                let j_path = meta.join("journal.jsonl"); // Read before outputs.json: terminal implies outputs are published.
                 let j_len = std::fs::File::open(&j_path)
                     .map_err(ServiceError::Io)?
                     .metadata()
@@ -173,6 +157,22 @@ impl LocalService {
                     .iter()
                     .map(|v| RunEvent::from_flat(v).map_err(ServiceError::Invalid))
                     .collect::<Result<Vec<_>, _>>()?;
+                let out_path = meta.join("outputs.json");
+                let mut manifest_len = 0;
+                let manifest: Option<OutputManifest> = match std::fs::File::open(&out_path) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => return Err(ServiceError::Io(e)),
+                    Ok(mut f) => {
+                        let len = f.metadata().map_err(ServiceError::Io)?.len();
+                        check_bundle_limits(len, 0, &limits)?;
+                        manifest_len = len;
+                        let len = usize::try_from(len)
+                            .map_err(|_| ServiceError::Invalid("bundle size overflow".into()))?;
+                        let mut raw = vec![0; len];
+                        f.read_exact(&mut raw)?;
+                        Some(serde_json::from_slice(&raw).map_err(ServiceError::Json)?)
+                    }
+                };
                 let audit_len = match std::fs::File::open(meta.join("audit.jsonl")) {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                     Err(e) => return Err(ServiceError::Io(e)),
@@ -314,6 +314,7 @@ impl LocalService {
             Some(record) => record.run_dir.clone(),
             None => self.run_dir_for(&id).await?,
         };
+        let view = self.read_view(run_dir.clone()).await?; // Read before outputs.json for terminal consistency.
         let directory = run_dir.clone();
         let artifacts = match memory.as_ref().and_then(|record| record.artifacts.clone()) {
             Some(artifacts) => Some(artifacts),
@@ -322,7 +323,6 @@ impl LocalService {
                     .await?
             }
         };
-        let view = self.read_view(run_dir.clone()).await?;
         let journal_events = &view.events;
         self.assemble_snapshot_from_read(
             id,
