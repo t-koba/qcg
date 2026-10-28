@@ -6,6 +6,8 @@ use camino::{Utf8Path, Utf8PathBuf};
 use engine::resolve_artifact_path;
 use model::OutputManifest;
 use policy::is_safe_path_component;
+use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{Cursor, Read as _, Write};
@@ -110,14 +112,6 @@ pub fn write_artifacts_zip_stream_with_limits<W: Write>(
         )));
     }
     let workspace = run_workspace_dir(run_dir);
-    if limits
-        .max_entries
-        .is_some_and(|limit| verified.len() > limit)
-    {
-        return Err(ServiceError::Invalid(
-            "artifact zip entries exceed limit".into(),
-        ));
-    }
     let mut directories = BTreeSet::new();
     for artifact in &verified {
         let mut parent = Utf8Path::new(&artifact.path).parent();
@@ -147,17 +141,22 @@ pub fn write_artifacts_zip_stream_with_limits<W: Write>(
     for artifact in verified {
         let metadata = std::fs::metadata(&artifact.fs_path)?;
         let mut file = File::open(&artifact.fs_path)?.take(artifact.bytes.saturating_add(1));
-        zip.start_file(artifact.path, artifact_zip_options(&metadata, false)?)
+        zip.start_file(&artifact.path, artifact_zip_options(&metadata, false)?)
             .map_err(artifact_zip_error)?;
-        if std::io::copy(&mut file, &mut zip)? != artifact.bytes {
-            return Err(ServiceError::Invalid("artifact bytes mismatch".into()));
-        }
+        copy_verified_artifact(&mut file, &mut zip, &artifact)?;
     }
+    finish_artifact_archive(zip, "artifact zip")
+}
+
+fn finish_artifact_archive<W: Write>(
+    zip: zip::ZipWriter<zip::write::StreamWriter<CountingWriter<W>>>,
+    label: &str,
+) -> Result<(), ServiceError> {
     let writer = zip.finish().map_err(artifact_zip_error)?.into_inner();
     if writer.exceeded {
         let detail = match writer.limit {
-            Some(limit) => format!("artifact zip output exceeds {limit} bytes"),
-            None => "artifact zip output exceeded its bound".to_string(),
+            Some(limit) => format!("{label} output exceeds {limit} bytes"),
+            None => format!("{label} output exceeded its bound"),
         };
         return Err(ServiceError::Invalid(detail));
     }
@@ -191,28 +190,20 @@ pub fn write_run_bundle_stream_with_limits<W: Write>(
             .map_err(artifact_zip_error)?;
         zip.write_all(bytes)?;
     }
-    zip.start_file("journal.jsonl", bundle_entry_options(false))
-        .map_err(artifact_zip_error)?;
+    for (name, path, len) in std::iter::once(("journal", parts.journal.clone(), parts.journal_len))
+        .chain(
+            parts
+                .audit_len
+                .map(|len| ("audit", parts.journal.with_file_name("audit.jsonl"), len)),
+        )
     {
-        let file = File::open(&parts.journal)?;
-        let mut src = file.take(parts.journal_len);
-        if std::io::copy(&mut src, &mut zip)? != parts.journal_len {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "journal shorter than prepared length",
-            )
-            .into());
-        }
-    }
-    if let Some(audit_len) = parts.audit_len {
-        zip.start_file("audit.jsonl", bundle_entry_options(false))
+        zip.start_file(format!("{name}.jsonl"), bundle_entry_options(false))
             .map_err(artifact_zip_error)?;
-        let file = File::open(parts.journal.with_file_name("audit.jsonl"))?;
-        let mut src = file.take(audit_len);
-        if std::io::copy(&mut src, &mut zip)? != audit_len {
+        let mut src = File::open(path)?.take(len);
+        if std::io::copy(&mut src, &mut zip)? != len {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
-                "audit shorter than prepared length",
+                format!("{name} shorter than prepared length"),
             )
             .into());
         }
@@ -229,23 +220,54 @@ pub fn write_run_bundle_stream_with_limits<W: Write>(
             bundle_entry_options(false),
         )
         .map_err(artifact_zip_error)?;
-        if std::io::copy(&mut src, &mut zip)? != artifact.bytes {
+        copy_verified_artifact(&mut src, &mut zip, artifact)?;
+    }
+    finish_artifact_archive(zip, "run bundle")
+}
+
+// The abort flag also blocks ZipWriter's implicit finalization on drop.
+fn copy_verified_artifact<W: Write>(
+    mut src: impl std::io::Read,
+    zip: &mut zip::ZipWriter<zip::write::StreamWriter<CountingWriter<W>>>,
+    artifact: &VerifiedArtifact,
+) -> Result<(), ServiceError> {
+    let result = (|| {
+        let mut hash = Sha256::new();
+        let mut copied = 0_u64;
+        let mut buffer = [0; 8192];
+        loop {
+            let count = match src.read(&mut buffer) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
+            if count == 0 {
+                break;
+            }
+            zip.write_all(&buffer[..count])?;
+            hash.update(&buffer[..count]);
+            copied += count as u64;
+        }
+        if copied < artifact.bytes {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "artifact shorter than prepared length",
             )
             .into());
         }
+        if copied != artifact.bytes || hex::encode(hash.finalize()) != artifact.sha256 {
+            return Err(ServiceError::Invalid(
+                "streamed artifact bytes mismatch or sha256 mismatch".into(),
+            ));
+        }
+        Ok(())
+    })();
+    if result.is_err()
+        && let Some(writer) = zip.get_ref()
+    {
+        writer.get_ref().aborted.set(true);
+        tracing::warn!("streamed artifact verification/copy failed; archive aborted");
     }
-    let writer = zip.finish().map_err(artifact_zip_error)?.into_inner();
-    if writer.exceeded {
-        let detail = match writer.limit {
-            Some(limit) => format!("run bundle output exceeds {limit} bytes"),
-            None => "run bundle output exceeded its bound".to_string(),
-        };
-        return Err(ServiceError::Invalid(detail));
-    }
-    Ok(())
+    result
 }
 
 pub(crate) fn json_size<T: serde::Serialize>(value: &T) -> Result<u64, ServiceError> {
@@ -280,6 +302,7 @@ pub(crate) struct CountingWriter<W> {
     pub(crate) written: u64,
     limit: Option<u64>,
     pub(crate) exceeded: bool,
+    aborted: Cell<bool>,
 }
 
 impl<W> CountingWriter<W> {
@@ -289,12 +312,16 @@ impl<W> CountingWriter<W> {
             written: 0,
             limit,
             exceeded: false,
+            aborted: Cell::new(false),
         }
     }
 }
 
 impl<W: Write> Write for CountingWriter<W> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.aborted.get() {
+            return Err(std::io::Error::other("artifact archive aborted"));
+        }
         let remaining = match self.limit {
             Some(limit) => usize::try_from(limit.saturating_sub(self.written))
                 .map_err(|_| std::io::Error::other("artifact zip output size overflowed"))?
@@ -323,16 +350,8 @@ fn artifact_zip_options(
     metadata: &std::fs::Metadata,
     directory: bool,
 ) -> Result<SimpleFileOptions, ServiceError> {
-    let compression = if directory {
-        zip::CompressionMethod::Stored
-    } else {
-        zip::CompressionMethod::Deflated
-    };
-    // The archive carries POSIX modes even on non-Unix hosts; force the
-    // creator-system marker so readers honor those explicit bits.
-    let mut options = SimpleFileOptions::default()
-        .system(zip::System::Unix)
-        .compression_method(compression);
+    // Share the explicit platform/compression defaults, then apply source metadata.
+    let mut options = bundle_entry_options(directory);
     let modified = metadata.modified()?;
     let modified = chrono::DateTime::<chrono::Utc>::from(modified).naive_utc();
     let modified = zip::DateTime::try_from(modified).map_err(|error| {

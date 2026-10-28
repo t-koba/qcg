@@ -1190,3 +1190,116 @@ fn bundle_footer_cap_includes_footer() {
     assert_eq!(buf.len() as u64, full_len - 1);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[tokio::test]
+async fn bundle_same_length_mutation_after_preparation_aborts_archive() {
+    use api::StartRun;
+    use camino::Utf8PathBuf;
+    use std::collections::BTreeMap;
+    let root = temp_run_dir("bundle-streamed-digest");
+    let generators =
+        Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+    let service = test_service(vec![generators], root.join("runs"));
+    let id = service
+        .start_run(StartRun {
+            generator_id: "hello-template".into(),
+            inputs: BTreeMap::from([("name".into(), json!("test"))]),
+            ..Default::default()
+        })
+        .await
+        .expect("run should start");
+    wait_for_terminal_snapshot(&service, &id).await;
+    let parts = service
+        .run_bundle_parts(&id, &ArtifactZipLimits::default())
+        .await
+        .expect("preparation must verify original digest");
+    let artifact = parts.verified.first().expect("generated artifact");
+    let original = std::fs::read(&artifact.fs_path).expect("original content");
+    assert!(!original.is_empty());
+    let mut full = Vec::new();
+    write_run_bundle_stream_with_limits(&parts, &mut full, &ArtifactZipLimits::default())
+        .expect("unchanged prepared bundle must succeed");
+    zip::ZipArchive::new(Cursor::new(full)).expect("valid unmodified archive");
+
+    let mut changed = original.clone();
+    changed[0] ^= 1;
+    std::fs::write(&artifact.fs_path, &changed).expect("same-length mutation");
+    assert_eq!(changed.len() as u64, artifact.bytes);
+    let mut partial = Vec::new();
+    let error =
+        write_run_bundle_stream_with_limits(&parts, &mut partial, &ArtifactZipLimits::default())
+            .expect_err("streamed content must match the prepared manifest digest");
+    assert!(error.to_string().contains("sha256 mismatch"), "{error}");
+    assert!(!partial.is_empty(), "failure occurs after streaming starts");
+    assert!(
+        zip::ZipArchive::new(Cursor::new(partial)).is_err(),
+        "even ZipWriter::drop must not finalize a mismatched archive"
+    );
+
+    std::fs::write(&artifact.fs_path, original).expect("restore original");
+    let mut restored = Vec::new();
+    write_run_bundle_stream_with_limits(&parts, &mut restored, &ArtifactZipLimits::default())
+        .expect("restored digest must succeed");
+    zip::ZipArchive::new(Cursor::new(restored)).expect("valid restored archive");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn dedicated_zip_same_length_mutation_after_preflight_aborts_archive() {
+    struct MutateOnWrite {
+        path: camino::Utf8PathBuf,
+        output: Vec<u8>,
+        changed: bool,
+    }
+    impl std::io::Write for MutateOnWrite {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if !self.changed {
+                // The first ZIP header is emitted only after the hash preflight.
+                std::fs::write(&self.path, b"ho")?;
+                self.changed = true;
+            }
+            self.output.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let run_dir = temp_run_dir("dedicated-streamed-digest");
+    std::fs::create_dir_all(run_workspace_dir(&run_dir)).expect("workspace");
+    std::fs::create_dir_all(run_meta_dir(&run_dir)).expect("metadata");
+    let path = run_workspace_dir(&run_dir).join("artifact.txt");
+    std::fs::write(&path, b"hi").expect("original content");
+    let digest = {
+        use sha2::Digest as _;
+        hex::encode(sha2::Sha256::digest(b"hi"))
+    };
+    std::fs::write(
+        run_meta_dir(&run_dir).join("outputs.json"),
+        serde_json::to_vec(&json!({
+            "artifacts": [{"path": "artifact.txt", "sha256": digest, "bytes": 2,
+                "label": "Artifact", "required": true}]
+        }))
+        .expect("manifest"),
+    )
+    .expect("write manifest");
+    let full = read_artifacts_zip(&run_dir).expect("original artifact must pass");
+    zip::ZipArchive::new(Cursor::new(full)).expect("valid unmodified archive");
+    let mut writer = MutateOnWrite {
+        path,
+        output: Vec::new(),
+        changed: false,
+    };
+    let error = write_artifacts_zip_stream_with_limits(
+        &run_dir,
+        &mut writer,
+        &ArtifactZipLimits::default(),
+    )
+    .expect_err("same-length mutation after preflight must fail");
+    assert!(error.to_string().contains("sha256 mismatch"), "{error}");
+    assert!(writer.changed);
+    assert!(!writer.output.is_empty());
+    assert!(zip::ZipArchive::new(Cursor::new(writer.output)).is_err());
+    let _ = std::fs::remove_dir_all(run_dir);
+}
