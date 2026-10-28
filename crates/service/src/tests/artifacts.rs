@@ -694,3 +694,499 @@ async fn snapshot_json_bounds_disk_manifest_and_preserves_absent() {
     assert!(unbounded.artifacts.is_none());
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn bundle_metadata_count_reports_1048595() {
+    let payload = "x".repeat(1_048_593);
+    let value = serde_json::Value::String(payload);
+    let count = crate::artifacts::json_size(&value).expect("nonallocating metadata count");
+    assert_eq!(count, 1_048_595);
+    let exact = ArtifactZipLimits {
+        max_bytes: Some(count),
+        max_entries: None,
+    };
+    crate::artifacts::check_bundle_limits(count, 0, &exact).expect("exact count passes");
+    let err = crate::artifacts::check_bundle_limits(
+        count,
+        0,
+        &ArtifactZipLimits {
+            max_bytes: Some(count - 1),
+            max_entries: None,
+        },
+    )
+    .expect_err("over count must fail before buffering");
+    match err {
+        crate::types::ServiceError::TooLarge { actual, limit } => {
+            assert_eq!(actual, 1_048_595);
+            assert_eq!(limit, 1_048_594);
+        }
+        other => panic!("expected TooLarge, got {other}"),
+    }
+}
+
+#[tokio::test]
+async fn bundle_aggregate_bytes_bound() {
+    use api::StartRun;
+    use camino::Utf8PathBuf;
+    use std::collections::BTreeMap;
+    let root = temp_run_dir("bundle-aggregate");
+    let _ = std::fs::remove_dir_all(&root);
+    let generators =
+        Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+    let service = test_service(vec![generators], root.join("runs"));
+    let id = service
+        .start_run(StartRun {
+            generator_id: "hello-template".into(),
+            inputs: BTreeMap::from([("name".into(), serde_json::json!("test"))]),
+            ..Default::default()
+        })
+        .await
+        .expect("run should start");
+    wait_for_terminal_snapshot(&service, &id).await;
+    let unlimited = service
+        .run_bundle_parts(&id, &ArtifactZipLimits::default())
+        .await
+        .expect("unbounded bundle should prepare");
+    let mut full = Vec::new();
+    write_run_bundle_stream_with_limits(&unlimited, &mut full, &ArtifactZipLimits::default())
+        .expect("unbounded stream should succeed");
+    assert!(!full.is_empty());
+    let manifest_len = std::fs::metadata(
+        run_meta_dir(&service.run_dir_for(&id).await.expect("run dir")).join("outputs.json"),
+    )
+    .expect("raw manifest length")
+    .len();
+    let total = manifest_len
+        + unlimited.snapshot_bytes.len() as u64
+        + unlimited.inputs_bytes.len() as u64
+        + unlimited
+            .outputs_bytes
+            .as_ref()
+            .map_or(0, |b| b.len() as u64)
+        + unlimited.journal_len
+        + unlimited.audit_len.unwrap_or(0)
+        + unlimited.verified.iter().map(|a| a.bytes).sum::<u64>();
+    assert_eq!(
+        unlimited.source_bytes, total,
+        "all preparation sources counted exactly"
+    );
+    let exact = ArtifactZipLimits {
+        max_bytes: Some(unlimited.source_bytes),
+        max_entries: None,
+    };
+    service
+        .run_bundle_parts(&id, &exact)
+        .await
+        .expect("exact aggregate must pass");
+    let over = ArtifactZipLimits {
+        max_bytes: Some(total.saturating_sub(1)),
+        max_entries: None,
+    };
+    let err = service
+        .run_bundle_parts(&id, &over)
+        .await
+        .expect_err("aggregate over must fail");
+    assert!(matches!(err, api::ApiError::TooLarge { .. }), "{err}");
+    assert!(
+        (full.len() as u64) < total,
+        "compressed archive is smaller than its sources"
+    );
+    let mut denied = Vec::new();
+    let err = write_run_bundle_stream_with_limits(&unlimited, &mut denied, &over)
+        .expect_err("stricter writer must recheck aggregate even with compression");
+    assert!(matches!(err, ServiceError::TooLarge { .. }), "{err}");
+    assert!(denied.is_empty(), "writer preflight emits no bytes");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn bundle_entry_exact_and_over_with_empty_audit() {
+    use api::StartRun;
+    use camino::Utf8PathBuf;
+    use std::collections::BTreeMap;
+    let root = temp_run_dir("bundle-empty-audit");
+    let _ = std::fs::remove_dir_all(&root);
+    let generators =
+        Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+    let service = test_service(vec![generators], root.join("runs"));
+    let id = service
+        .start_run(StartRun {
+            generator_id: "hello-template".into(),
+            inputs: BTreeMap::from([("name".into(), serde_json::json!("test"))]),
+            ..Default::default()
+        })
+        .await
+        .expect("run should start");
+    wait_for_terminal_snapshot(&service, &id).await;
+    let run_dir = service.run_dir_for(&id).await.expect("run dir");
+    std::fs::write(run_meta_dir(&run_dir).join("audit.jsonl"), "").expect("empty audit present");
+    let prepared = service
+        .run_bundle_parts(&id, &ArtifactZipLimits::default())
+        .await
+        .expect("empty audit should prepare");
+    assert_eq!(
+        prepared.audit_len,
+        Some(0),
+        "empty present audit must pin Some(0)"
+    );
+    let entries = 2
+        + usize::from(prepared.outputs_bytes.is_some())
+        + 1
+        + 1
+        + prepared.directories.len()
+        + prepared.verified.len();
+    let exact = ArtifactZipLimits {
+        max_bytes: None,
+        max_entries: Some(entries),
+    };
+    service
+        .run_bundle_parts(&id, &exact)
+        .await
+        .expect("exact entry with empty audit must pass");
+    let over = ArtifactZipLimits {
+        max_bytes: None,
+        max_entries: Some(entries - 1),
+    };
+    let err = service
+        .run_bundle_parts(&id, &over)
+        .await
+        .expect_err("entry over with empty audit must fail");
+    assert!(matches!(err, api::ApiError::Invalid { .. }), "{err}");
+    let mut denied = Vec::new();
+    let err = write_run_bundle_stream_with_limits(&prepared, &mut denied, &over)
+        .expect_err("stricter writer must recheck directory-inclusive entries");
+    assert!(matches!(err, ServiceError::ArtifactEntries), "{err}");
+    assert!(denied.is_empty(), "writer preflight emits no bytes");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn bundle_override_and_cli_default_preservation() {
+    use crate::package::{DEDICATED_ARTIFACT_MAX_BYTES, DEDICATED_ARTIFACT_MAX_ENTRIES};
+    assert_eq!(DEDICATED_ARTIFACT_MAX_BYTES, 16 * 1024 * 1024);
+    assert_eq!(DEDICATED_ARTIFACT_MAX_ENTRIES, 1000);
+    assert_eq!(ArtifactZipLimits::default().max_bytes, None);
+    assert_eq!(ArtifactZipLimits::default().max_entries, None);
+    let base = ArtifactZipLimits::default().effective();
+    assert_eq!(base.max_bytes, Some(DEDICATED_ARTIFACT_MAX_BYTES));
+    assert_eq!(base.max_entries, Some(DEDICATED_ARTIFACT_MAX_ENTRIES));
+    let larger = ArtifactZipLimits {
+        max_bytes: Some(32 * 1024 * 1024),
+        max_entries: Some(2000),
+    }
+    .effective();
+    assert_eq!(larger.max_bytes, Some(32 * 1024 * 1024));
+    assert_eq!(larger.max_entries, Some(2000));
+}
+
+#[tokio::test]
+async fn bundle_hash_fails_before_headers() {
+    use api::StartRun;
+    use camino::Utf8PathBuf;
+    use std::collections::BTreeMap;
+    let root = temp_run_dir("bundle-hash-preheader");
+    let _ = std::fs::remove_dir_all(&root);
+    let generators =
+        Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+    let service = test_service(vec![generators], root.join("runs"));
+    let id = service
+        .start_run(StartRun {
+            generator_id: "hello-template".into(),
+            inputs: BTreeMap::from([("name".into(), serde_json::json!("test"))]),
+            ..Default::default()
+        })
+        .await
+        .expect("run should start");
+    wait_for_terminal_snapshot(&service, &id).await;
+    let run_dir = service.run_dir_for(&id).await.expect("run dir");
+    let mut manifest: model::OutputManifest = serde_json::from_slice(
+        &std::fs::read(run_meta_dir(&run_dir).join("outputs.json")).expect("manifest"),
+    )
+    .expect("manifest json");
+    assert!(!manifest.artifacts.is_empty());
+    let first = &mut manifest.artifacts[0];
+    let fs_path = run_workspace_dir(&run_dir).join(&first.path);
+    let nested = run_workspace_dir(&run_dir).join("a/b/c.txt");
+    std::fs::create_dir_all(nested.parent().expect("parent")).expect("nested directory");
+    std::fs::rename(&fs_path, &nested).expect("move artifact");
+    first.path = "a/b/c.txt".into();
+    let manifest_path = run_meta_dir(&run_dir).join("outputs.json");
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest).expect("serialize"),
+    )
+    .expect("manifest");
+    let prepared = service
+        .run_bundle_parts(&id, &ArtifactZipLimits::default())
+        .await
+        .expect("valid nested artifact");
+    // A bad digest is deliberately present: bounds must win before hash I/O.
+    manifest.artifacts[0].sha256 = "0".repeat(64);
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest).expect("serialize"),
+    )
+    .expect("manifest");
+    let bytes_err = service
+        .run_bundle_parts(
+            &id,
+            &ArtifactZipLimits {
+                max_bytes: Some(prepared.source_bytes - 1),
+                max_entries: None,
+            },
+        )
+        .await
+        .expect_err("aggregate admission precedes hashes");
+    assert!(
+        matches!(bytes_err, api::ApiError::TooLarge { .. }),
+        "{bytes_err}"
+    );
+    let entries_err = service
+        .run_bundle_parts(
+            &id,
+            &ArtifactZipLimits {
+                max_bytes: None,
+                max_entries: Some(prepared.entry_count - 1),
+            },
+        )
+        .await
+        .expect_err("directory-inclusive admission precedes hashes");
+    assert!(
+        matches!(entries_err, api::ApiError::Invalid { field: Some(ref field), .. }
+        if field == "artifacts"),
+        "{entries_err}"
+    );
+    let count_err = service
+        .run_bundle_parts(
+            &id,
+            &ArtifactZipLimits {
+                max_bytes: None,
+                max_entries: Some(0),
+            },
+        )
+        .await
+        .expect_err("manifest artifact count precedes hashes");
+    assert!(
+        matches!(count_err, api::ApiError::Invalid { .. }),
+        "{count_err}"
+    );
+    let hash_err = service
+        .run_bundle_parts(&id, &ArtifactZipLimits::default())
+        .await
+        .expect_err("hash mismatch must fail before headers");
+    assert!(
+        hash_err.to_string().contains("sha256 mismatch"),
+        "{hash_err}"
+    );
+    // The single raw parse must not admit duplicate paths, even with no limits.
+    manifest.artifacts.push(manifest.artifacts[0].clone());
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest).expect("serialize"),
+    )
+    .expect("manifest");
+    let duplicate_err = service
+        .run_bundle_parts(&id, &ArtifactZipLimits::default())
+        .await
+        .expect_err("duplicate manifest paths must fail preflight before hashing");
+    assert!(
+        duplicate_err.to_string().contains("duplicate artifact"),
+        "{duplicate_err}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn bundle_manifest_and_journal_too_large() {
+    use api::StartRun;
+    use camino::Utf8PathBuf;
+    use std::collections::BTreeMap;
+    let root = temp_run_dir("bundle-too-large");
+    let _ = std::fs::remove_dir_all(&root);
+    let generators =
+        Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+    let service = test_service(vec![generators], root.join("runs"));
+    let id = service
+        .start_run(StartRun {
+            generator_id: "hello-template".into(),
+            inputs: BTreeMap::from([("name".into(), serde_json::json!("test"))]),
+            ..Default::default()
+        })
+        .await
+        .expect("run should start");
+    wait_for_terminal_snapshot(&service, &id).await;
+    let run_dir = service.run_dir_for(&id).await.expect("run dir");
+    let raw = std::fs::read(run_meta_dir(&run_dir).join("outputs.json")).expect("manifest raw");
+    assert!(!raw.is_empty());
+    let short = ArtifactZipLimits {
+        max_bytes: Some((raw.len() - 1) as u64),
+        max_entries: None,
+    };
+    let err = service
+        .run_bundle_parts(&id, &short)
+        .await
+        .expect_err("short manifest must be TooLarge");
+    assert!(matches!(err, api::ApiError::TooLarge { .. }), "{err}");
+    let j_len = std::fs::metadata(run_meta_dir(&run_dir).join("journal.jsonl"))
+        .expect("journal meta")
+        .len();
+    assert!(
+        (raw.len() as u64) < j_len - 1,
+        "journal cap must admit the raw manifest"
+    );
+    let j_short = ArtifactZipLimits {
+        max_bytes: Some(j_len - 1),
+        max_entries: None,
+    };
+    let j_err = service
+        .run_bundle_parts(&id, &j_short)
+        .await
+        .expect_err("short journal must be TooLarge");
+    assert!(matches!(j_err, api::ApiError::TooLarge { .. }), "{j_err}");
+    // Default CLI ZIP limits are unbounded, but engine journal limits remain active.
+    std::fs::write(
+        run_meta_dir(&run_dir).join("journal.jsonl"),
+        vec![b'x'; engine::JournalLimits::default().max_event_bytes.unwrap() + 1],
+    )
+    .expect("oversized journal event");
+    let event_err = service
+        .run_bundle_parts(&id, &ArtifactZipLimits::default())
+        .await
+        .expect_err("default journal event bound must survive unbounded ZIP policy");
+    assert!(
+        event_err.to_string().contains("event exceeds"),
+        "{event_err}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn bundle_source_growth_pinning() {
+    use api::StartRun;
+    use camino::Utf8PathBuf;
+    use std::collections::BTreeMap;
+    use std::io::Write as _;
+    let root = temp_run_dir("bundle-growth");
+    let _ = std::fs::remove_dir_all(&root);
+    let generators =
+        Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+    let service = test_service(vec![generators], root.join("runs"));
+    let id = service
+        .start_run(StartRun {
+            generator_id: "hello-template".into(),
+            inputs: BTreeMap::from([("name".into(), serde_json::json!("test"))]),
+            ..Default::default()
+        })
+        .await
+        .expect("run should start");
+    wait_for_terminal_snapshot(&service, &id).await;
+    let run_dir = service.run_dir_for(&id).await.expect("run dir");
+    std::fs::write(run_meta_dir(&run_dir).join("audit.jsonl"), "audit0\n").expect("audit");
+    // Engine scanning tolerates a torn final line and reports every byte consumed.
+    let journal = run_meta_dir(&run_dir).join("journal.jsonl");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&journal)
+        .expect("journal")
+        .write_all(b"{\"unfinished\":")
+        .expect("torn final event");
+    let parts = service
+        .run_bundle_parts(&id, &ArtifactZipLimits::default())
+        .await
+        .expect("bundle should prepare");
+    assert_eq!(
+        parts.journal_len,
+        std::fs::metadata(&journal).unwrap().len()
+    );
+    let mut sources = vec![
+        ("journal.jsonl".to_string(), parts.journal.clone()),
+        (
+            "audit.jsonl".to_string(),
+            parts.journal.with_file_name("audit.jsonl"),
+        ),
+    ];
+    sources.extend(
+        parts
+            .verified
+            .iter()
+            .map(|a| (format!("artifacts/{}", a.path), a.fs_path.clone())),
+    );
+    let pinned: Vec<_> = sources
+        .iter()
+        .map(|(name, path)| (name.clone(), std::fs::read(path).expect("pinned content")))
+        .collect();
+    for (_, path) in &sources {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .expect("append source")
+            .write_all(b"appended bytes must not enter ZIP")
+            .expect("growth");
+    }
+    let mut buf = Vec::new();
+    write_run_bundle_stream_with_limits(&parts, &mut buf, &ArtifactZipLimits::default())
+        .expect("appends must not affect pinned streams");
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(buf)).expect("finished ZIP");
+    for (name, bytes) in &pinned {
+        use std::io::Read as _;
+        let mut entry = zip.by_name(name).expect("source entry");
+        assert_eq!(entry.size(), bytes.len() as u64, "{name}");
+        let mut actual = Vec::new();
+        entry.read_to_end(&mut actual).expect("read entry");
+        assert_eq!(&actual, bytes, "{name} must exclude appended bytes");
+    }
+    // A shortened source is a real post-header I/O failure, not validation.
+    for ((_, path), (_, bytes)) in sources.iter().zip(&pinned) {
+        std::fs::write(path, []).expect("truncate source");
+        let err =
+            write_run_bundle_stream_with_limits(&parts, Vec::new(), &ArtifactZipLimits::default())
+                .expect_err("short read must fail streaming");
+        assert!(
+            matches!(err, ServiceError::Io(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof),
+            "{err}"
+        );
+        std::fs::write(path, bytes).expect("restore pinned source");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn bundle_footer_cap_includes_footer() {
+    let root = temp_run_dir("bundle-footer");
+    std::fs::create_dir_all(&root).expect("temp dir");
+    let journal = root.join("journal.jsonl");
+    std::fs::write(&journal, []).expect("empty journal");
+    let parts = RunBundleParts {
+        source_bytes: 4,
+        entry_count: 3,
+        snapshot_bytes: b"{}".to_vec(),
+        inputs_bytes: b"{}".to_vec(),
+        outputs_bytes: None,
+        journal,
+        journal_len: 0,
+        audit_len: None,
+        verified: vec![],
+        directories: vec![],
+    };
+    let mut full = Vec::new();
+    write_run_bundle_stream_with_limits(&parts, &mut full, &ArtifactZipLimits::default())
+        .expect("full bundle should succeed");
+    let full_len = full.len() as u64;
+    assert!(
+        full_len - 1 > parts.source_bytes,
+        "source admission must pass"
+    );
+    let mut buf = Vec::new();
+    let err = write_run_bundle_stream_with_limits(
+        &parts,
+        &mut buf,
+        &ArtifactZipLimits {
+            max_bytes: Some(full_len - 1),
+            max_entries: None,
+        },
+    )
+    .expect_err("footer-inclusive cap must fail at full-1");
+    assert!(err.to_string().contains("exceeds"), "{err}");
+    assert_eq!(buf.len() as u64, full_len - 1);
+    let _ = std::fs::remove_dir_all(&root);
+}

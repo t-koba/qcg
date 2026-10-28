@@ -62,12 +62,12 @@ pub(crate) async fn read_run_bundle(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiHttpError> {
+    let limits = state.artifact_limits.effective();
     let parts = state
         .service
-        .run_bundle_parts(&id)
+        .run_bundle_parts(&id, &limits)
         .await
         .map_err(ApiHttpError::from_api)?;
-    let limits = state.artifact_limits;
     let (sender, receiver) = mpsc::channel::<Result<Vec<u8>, io::Error>>(4);
     // Tied to shutdown and client disconnect and joined (E05): the blocking
     // zip writer aborts on shutdown instead of continuing detached, aborts
@@ -83,15 +83,7 @@ pub(crate) async fn read_run_bundle(
         let writer = ChannelWriter {
             sender: sender.clone(),
         };
-        if let Err(error) = service::write_run_bundle_stream_with_limits(
-            &parts.snapshot,
-            &parts.inputs,
-            &parts.journal,
-            parts.outputs.as_ref(),
-            &parts.verified,
-            writer,
-            &limits,
-        ) {
+        if let Err(error) = service::write_run_bundle_stream_with_limits(&parts, writer, &limits) {
             // Best-effort by necessity: the receiver is gone only when the
             // client disconnected or shutdown closed the stream, so no
             // consumer remains to observe the error. It is logged, never
@@ -2592,6 +2584,136 @@ mod tests {
             2,
             "fork replay must not duplicate"
         );
+        let _ = std::fs::remove_dir_all(&runs);
+    }
+
+    #[tokio::test]
+    async fn bundle_http_default_reject_override_pass_cli_unbounded() {
+        use axum::extract::{Path, State};
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::sync::Arc;
+        let workspace = camino::Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace")
+            .to_path_buf();
+        let runs = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .expect("tempdir")
+            .join(format!("bundle-http-{}", uuid::Uuid::now_v7()));
+        let _ = std::fs::remove_dir_all(&runs);
+        let service =
+            crate::test_service(workspace.join("fixtures/generators"), runs.clone(), None)
+                .expect("service");
+        let run_id = service
+            .start_run(api::StartRun {
+                generator_id: "hello-template".into(),
+                inputs: BTreeMap::from([("name".into(), serde_json::json!("test"))]),
+                ..Default::default()
+            })
+            .await
+            .expect("run should start");
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let snap = service.snapshot(run_id.clone()).await.expect("snapshot");
+                if snap.state.is_terminal() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("run should settle");
+        let run_dir = service.run_dir_for(&run_id).await.expect("run dir");
+        let big = vec![b'x'; 16 * 1024 * 1024 + 1];
+        std::fs::write(service::run_workspace_dir(&run_dir).join("big.bin"), &big).expect("big");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(
+                service::run_workspace_dir(&run_dir).join("big.bin"),
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .expect("mode");
+        }
+        let digest = {
+            use sha2::Digest as _;
+            hex::encode(sha2::Sha256::digest(&big))
+        };
+        let mut manifest: model::OutputManifest = serde_json::from_slice(
+            &std::fs::read(service::run_meta_dir(&run_dir).join("outputs.json")).expect("manifest"),
+        )
+        .expect("manifest json");
+        manifest.artifacts.push(model::OutputArtifact {
+            path: "big.bin".into(),
+            sha256: digest,
+            bytes: big.len() as u64,
+            label: "Big".into(),
+            required: true,
+            mime: None,
+            description: String::new(),
+            preview: Default::default(),
+        });
+        std::fs::write(
+            service::run_meta_dir(&run_dir).join("outputs.json"),
+            serde_json::to_vec(&manifest).expect("manifest write"),
+        )
+        .expect("manifest update");
+        drop(big);
+        let make_state = |limits: service::ArtifactZipLimits| {
+            Arc::new(crate::server::config::AppState {
+                service: service.clone(),
+                runs_dir: runs.clone(),
+                oauth_origin: None,
+                oauth_allowed_origins: BTreeSet::new(),
+                oauth_callback_url: None,
+                idempotency: tokio::sync::Mutex::new(BTreeMap::new()),
+                idempotency_ttl: policy::IDEMPOTENCY_TTL,
+                idempotency_max_entries: policy::IDEMPOTENCY_MAX_ENTRIES,
+                api_token_digest: None,
+                artifact_limits: limits,
+                asset_limit: None,
+                max_request_bytes: None,
+                metrics_policy: crate::server::MetricsPolicy::default(),
+                shutdown: tokio_util::sync::CancellationToken::new(),
+            })
+        };
+        let default_state = make_state(service::ArtifactZipLimits::default());
+        let default_err = read_run_bundle(State(default_state), Path(run_id.clone()))
+            .await
+            .expect_err("default 16MiB must reject >16MiB bundle");
+        assert_eq!(default_err.problem.status, 413);
+        let entry_state = make_state(service::ArtifactZipLimits {
+            max_bytes: Some(32 * 1024 * 1024),
+            max_entries: Some(0),
+        });
+        let entry_err = read_run_bundle(State(entry_state), Path(run_id.clone()))
+            .await
+            .expect_err("entry admission must reject before headers");
+        assert_eq!(entry_err.problem.status, 422);
+        let override_state = make_state(service::ArtifactZipLimits {
+            max_bytes: Some(32 * 1024 * 1024),
+            max_entries: Some(2000),
+        });
+        let ok = read_run_bundle(State(override_state), Path(run_id.clone()))
+            .await
+            .expect("32MiB override must pass");
+        assert_eq!(ok.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(ok.into_body(), usize::MAX)
+            .await
+            .expect("drain");
+        assert!(!body.is_empty(), "override body must drain");
+        let cli_parts = service
+            .run_bundle_parts(&run_id, &service::ArtifactZipLimits::default())
+            .await
+            .expect("CLI unbounded must prepare");
+        let mut cli_buf = Vec::new();
+        service::write_run_bundle_stream_with_limits(
+            &cli_parts,
+            &mut cli_buf,
+            &service::ArtifactZipLimits::default(),
+        )
+        .expect("CLI unbounded must stream");
+        assert!(!cli_buf.is_empty(), "CLI body must drain");
         let _ = std::fs::remove_dir_all(&runs);
     }
 }

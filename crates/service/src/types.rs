@@ -1,7 +1,7 @@
 use crate::artifacts::VerifiedArtifact;
 use crate::queue::PriorityPermits;
 use crate::summaries::fold_run_state;
-use api::{ApiError, RunSnapshot, RunStatus};
+use api::{ApiError, RunStatus};
 use api::{ConfirmSpec, FormSpec, RunEvent};
 use camino::Utf8PathBuf;
 use contract::Contract;
@@ -103,6 +103,10 @@ impl Default for ServiceDeploymentPolicy {
 pub enum ServiceError {
     #[error("{0}")]
     Invalid(String),
+    #[error("artifact count exceeds limit")]
+    ArtifactEntries,
+    #[error("payload is too large: {actual} > {limit} bytes")]
+    TooLarge { actual: usize, limit: usize },
     /// A journal check-and-append precondition lost a race. Carried typed
     /// (never string-matched) so rejection classifiers cannot mistake other
     /// journal failures for a lost race.
@@ -117,7 +121,16 @@ pub enum ServiceError {
 }
 impl From<ServiceError> for ApiError {
     fn from(error: ServiceError) -> Self {
-        Self::internal(error.to_string())
+        match error {
+            ServiceError::TooLarge { actual, limit } => Self::TooLarge {
+                actual_bytes: actual,
+                limit_bytes: limit,
+            },
+            ServiceError::ArtifactEntries => {
+                Self::invalid_field("artifacts", "artifact count exceeds limit")
+            }
+            other => Self::internal(other.to_string()),
+        }
     }
 }
 impl ServiceDeploymentPolicy {
@@ -275,14 +288,19 @@ pub struct JournalStream {
     pub audit_limit: Option<usize>,
 }
 
-/// Owned inputs for a self-contained run bundle export.
+/// Prepared bundle with pinned source lengths for streaming.
 #[derive(Debug, Clone)]
 pub struct RunBundleParts {
-    pub snapshot: RunSnapshot,
-    pub inputs: BTreeMap<String, Value>,
-    pub journal: Utf8PathBuf,
-    pub outputs: Option<OutputManifest>,
-    pub verified: Vec<VerifiedArtifact>,
+    pub(crate) source_bytes: u64,
+    pub(crate) entry_count: usize,
+    pub(crate) snapshot_bytes: Vec<u8>,
+    pub(crate) inputs_bytes: Vec<u8>,
+    pub(crate) outputs_bytes: Option<Vec<u8>>,
+    pub(crate) journal: Utf8PathBuf,
+    pub(crate) journal_len: u64,
+    pub(crate) audit_len: Option<u64>,
+    pub(crate) verified: Vec<VerifiedArtifact>,
+    pub(crate) directories: Vec<Utf8PathBuf>,
 }
 
 /// Exposes sibling run states to engine `await` nodes: live memory first,

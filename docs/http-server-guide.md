@@ -296,13 +296,15 @@ The complete file is verified before delivering a successful range response.
 ### Artifact and run-snapshot response bounds (provisional)
 
 `GET /api/runs/{id}/artifacts`, `GET /api/runs/{id}/artifacts/{path...}`,
-`GET /api/runs/{id}/artifacts.zip`, `GET /api/runs/{id}`, and idempotent
-`POST /api/runs` / `POST /api/runs/{id}/fork` snapshot responses share a
-server-only provisional profile of 16 MiB and 1,000 entries. These are
-provisional product-policy defaults, not customer-calibrated values, a p95
+`GET /api/runs/{id}/artifacts.zip`, `GET /api/runs/{id}/bundle`,
+`GET /api/runs/{id}`, and idempotent `POST /api/runs` / `POST /api/runs/{id}/fork`
+snapshot responses share a server-only provisional profile of 16 MiB and 1,000 entries.
+These are provisional product-policy defaults, not customer-calibrated values, a p95
 target, or a 64-MiB peak-RSS or concurrency guarantee. No aggregate or
 concurrent memory envelope is claimed: each buffered body has its own
 per-request ceiling, and concurrent requests each enforce their own ceiling.
+Direct CLI export (`qcg runs export`) uses the unbounded default and never applies
+the provisional profile; only HTTP applies `artifact_limits.effective()`.
 
 Explicit `--max-artifact-bytes` (`MAX_ARTIFACT_BYTES`) and
 `--max-artifact-entries` (`MAX_ARTIFACT_ENTRIES`) remain authoritative,
@@ -335,9 +337,34 @@ truncation. Treat any body error as failure; for cap errors, use a larger
 explicit override or a smaller artifact set, while verification/I/O errors
 may require repairing the artifact source.
 
-Out of scope here: `GET /api/runs/{id}/bundle` preparation/delivery and
-`GET /api/runs` summaries (`RunListItem` carries no `OutputManifest`) are not
-covered by this profile; the bundle is tracked separately. Snapshots bound raw
+Bundle preparation/delivery shares the same provisional profile but enforces
+it before headers: raw `outputs.json` is capped before deserialization, parsed
+once from exactly the length stat’d on its open handle (short reads fail),
+checked for duplicate artifact paths, and moved/reused with no clone. Journal
+scanning retains the engine’s default event/count/total bounds and torn-final-line
+tolerance, with a stricter route total cap applied before deserialization; its
+consumed byte count pins the archived prefix. Exact serialized metadata lengths
+are counted through a nonallocating sink before buffering, then summed with
+source bytes, including raw `outputs.json`, overflow-safely. Aggregate bytes, artifact count and
+incremental directory-inclusive entry checks all complete before artifact
+hashing. All blocking FS/read/hash work runs in `blocking_work`.
+
+A private prepared state pins journal/audit/artifact lengths and streams each
+with `take(length)` (including empty-but-present audit), excluding appended
+bytes; a short read fails the body stream with an I/O error. The writer
+rechecks the prepared aggregate and entry count against its supplied limits
+before emitting any ZIP bytes; no mutable public preflight bypass exists.
+Explicit `u64` to `usize` conversions fail closed. Hashes fail before headers,
+with no duplicate hash or metadata serialization after headers. The final ZIP
+cap includes the footer and never reports a truncated archive as success.
+Only final archive overruns and actual writer/stream errors may occur
+post-header (as body stream errors, not `413`/`422`). Raw-manifest, journal and
+aggregate byte admissions return `413`; entry admissions return `422`
+(`validation_failed`, field `artifacts`). Verification and preparation I/O
+failures also precede headers and retain their normal error classifications.
+
+Out of scope here: `GET /api/runs` summaries (`RunListItem` carries no `OutputManifest`)
+are not covered by this profile. Snapshots bound raw
 `outputs.json` before deserialization and the complete `RunSnapshot` JSON before
 buffering, preserving exact-body `ETag`/`304`, `201` status/`Location`, and
 idempotent key-to-run replay without truncation (`413` before headers/body when
@@ -387,9 +414,13 @@ The run list, cost metrics, and single-artifact bodies carry validators
 (exact-body digest, or manifest sha256 for artifacts); the bounded journal
 snapshot carries an exact-body validator and the unbounded live tail carries
 a weak revision validator over (size + mtime), so both journal shapes are
-conditional. The generator catalog and streaming archives (artifact zip, run
-bundle) carry no validator and always return `200`: hashing the full archive
-upfront would defeat streaming. For streams the snapshot or
+conditional. The generator catalog and the artifact zip carry no validator and always return
+`200` headers (cap failures surface as body stream errors): hashing the full
+archive upfront would defeat streaming. The run bundle carries no validator;
+successful preparation returns `200` with a streaming body, while bundle bounds
+(raw manifest, journal, aggregate, entries, hashes) fail before headers with
+`413`/`422`; only the final archive overrun and writer/stream errors occur
+post-header as body errors. For streams the snapshot or
 artifact-list validator is the queue-revision alternative: conditional reads
 apply to snapshots, the run list, cost metrics, single artifacts, the
 artifact inventory, bounded and unbounded journal reads, and mutation responses.

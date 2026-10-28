@@ -148,16 +148,13 @@ async fn invalidation_is_success_only_immutable_and_visible_to_cached_peers() {
             .as_ref(),
         Some(&record)
     );
-    assert_eq!(
-        owner
-            .run_bundle_parts("success")
-            .await
-            .unwrap()
-            .snapshot
-            .invalidation
-            .as_ref(),
-        Some(&record)
-    );
+    let bundle_parts = owner
+        .run_bundle_parts("success", &ArtifactZipLimits::default())
+        .await
+        .unwrap();
+    let bundle_snapshot: api::RunSnapshot =
+        serde_json::from_slice(&bundle_parts.snapshot_bytes).unwrap();
+    assert_eq!(bundle_snapshot.invalidation.as_ref(), Some(&record));
     assert_eq!(
         std::fs::read(root.join("success/meta/journal.jsonl")).unwrap(),
         journal

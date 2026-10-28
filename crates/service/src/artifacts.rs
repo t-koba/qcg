@@ -1,13 +1,12 @@
 use crate::package::ArtifactZipLimits;
 use crate::summaries::{run_meta_dir, run_workspace_dir};
 use crate::types::ServiceError;
-use api::{ApiError, RunEvent, RunSnapshot};
+use api::{ApiError, RunEvent};
 use camino::{Utf8Path, Utf8PathBuf};
 use engine::resolve_artifact_path;
 use model::OutputManifest;
 use policy::is_safe_path_component;
-use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{Cursor, Read as _, Write};
 use zip::write::SimpleFileOptions;
@@ -172,88 +171,71 @@ fn artifact_zip_error(error: zip::result::ZipError) -> ServiceError {
     }
 }
 
-/// Write a self-contained run bundle: snapshot, inputs, journal, outputs,
-/// and verified artifacts. Meta files stream through the same output cap as
-/// artifacts; entry counts cover every zip entry.
+/// Recheck prepared admission against caller limits, then stream pinned lengths.
 pub fn write_run_bundle_stream_with_limits<W: Write>(
-    snapshot: &RunSnapshot,
-    inputs: &BTreeMap<String, Value>,
-    journal: &Utf8Path,
-    outputs: Option<&OutputManifest>,
-    verified: &[VerifiedArtifact],
+    parts: &crate::types::RunBundleParts,
     writer: W,
     limits: &ArtifactZipLimits,
 ) -> Result<(), ServiceError> {
-    let mut meta = vec![
-        (
-            "snapshot.json".to_string(),
-            serde_json::to_vec_pretty(snapshot).map_err(ServiceError::Json)?,
-        ),
-        (
-            "inputs.json".to_string(),
-            serde_json::to_vec_pretty(inputs).map_err(ServiceError::Json)?,
-        ),
-    ];
-    if let Some(outputs) = outputs {
-        meta.push((
-            "outputs.json".to_string(),
-            serde_json::to_vec_pretty(outputs).map_err(ServiceError::Json)?,
-        ));
-    }
-    let mut directories = BTreeSet::from([Utf8PathBuf::from("artifacts")]);
-    for artifact in verified {
-        let mut parent = Utf8Path::new(&artifact.path).parent();
-        while let Some(directory) = parent.filter(|directory| !directory.as_str().is_empty()) {
-            directories.insert(Utf8PathBuf::from("artifacts").join(directory));
-            parent = directory.parent();
-        }
-    }
-    let audit_path = journal.with_file_name("audit.jsonl");
-    let audit_present = audit_path.exists();
-    let entry_count = meta
-        .len()
-        .checked_add(1)
-        .and_then(|count| count.checked_add(usize::from(audit_present)))
-        .and_then(|count| count.checked_add(directories.len()))
-        .and_then(|count| count.checked_add(verified.len()))
-        .ok_or_else(|| ServiceError::Invalid("run bundle entry count overflowed".into()))?;
-    if let Some(limit) = limits.max_entries
-        && entry_count > limit
-    {
-        return Err(ServiceError::Invalid(format!(
-            "run bundle entries exceed limit: {entry_count} > {limit}"
-        )));
-    }
+    check_bundle_limits(parts.source_bytes, parts.entry_count, limits)?;
     let mut zip = zip::ZipWriter::new_stream(CountingWriter::new(writer, limits.max_bytes));
-    for (name, bytes) in &meta {
+    let mut metas = vec![
+        ("snapshot.json", &parts.snapshot_bytes),
+        ("inputs.json", &parts.inputs_bytes),
+    ];
+    if let Some(bytes) = &parts.outputs_bytes {
+        metas.push(("outputs.json", bytes));
+    }
+    for (name, bytes) in metas {
         zip.start_file(name, bundle_entry_options(false))
             .map_err(artifact_zip_error)?;
         zip.write_all(bytes)?;
     }
+    zip.start_file("journal.jsonl", bundle_entry_options(false))
+        .map_err(artifact_zip_error)?;
     {
-        let mut journal_file = File::open(journal)?;
-        zip.start_file("journal.jsonl", bundle_entry_options(false))
-            .map_err(artifact_zip_error)?;
-        std::io::copy(&mut journal_file, &mut zip)?;
+        let file = File::open(&parts.journal)?;
+        let mut src = file.take(parts.journal_len);
+        if std::io::copy(&mut src, &mut zip)? != parts.journal_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "journal shorter than prepared length",
+            )
+            .into());
+        }
     }
-    if audit_present {
-        let mut audit_file = File::open(&audit_path)?;
+    if let Some(audit_len) = parts.audit_len {
         zip.start_file("audit.jsonl", bundle_entry_options(false))
             .map_err(artifact_zip_error)?;
-        std::io::copy(&mut audit_file, &mut zip)?;
+        let file = File::open(parts.journal.with_file_name("audit.jsonl"))?;
+        let mut src = file.take(audit_len);
+        if std::io::copy(&mut src, &mut zip)? != audit_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "audit shorter than prepared length",
+            )
+            .into());
+        }
     }
-    for directory in directories {
-        zip.add_directory(format!("{directory}/"), bundle_entry_options(true))
+    for dir in &parts.directories {
+        zip.add_directory(format!("{dir}/"), bundle_entry_options(true))
             .map_err(artifact_zip_error)?;
     }
-    for artifact in verified {
-        let mut file = File::open(&artifact.fs_path)?;
+    for artifact in &parts.verified {
+        let file = File::open(&artifact.fs_path)?;
+        let mut src = file.take(artifact.bytes);
         zip.start_file(
             format!("artifacts/{}", artifact.path),
             bundle_entry_options(false),
         )
         .map_err(artifact_zip_error)?;
-        std::io::copy(&mut file, &mut zip)?;
+        if std::io::copy(&mut src, &mut zip)? != artifact.bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "artifact shorter than prepared length",
+            )
+            .into());
+        }
     }
     let writer = zip.finish().map_err(artifact_zip_error)?.into_inner();
     if writer.exceeded {
@@ -262,6 +244,33 @@ pub fn write_run_bundle_stream_with_limits<W: Write>(
             None => "run bundle output exceeded its bound".to_string(),
         };
         return Err(ServiceError::Invalid(detail));
+    }
+    Ok(())
+}
+
+pub(crate) fn json_size<T: serde::Serialize>(value: &T) -> Result<u64, ServiceError> {
+    let mut out = CountingWriter::new(std::io::sink(), None);
+    serde_json::to_writer_pretty(&mut out, value)?;
+    Ok(out.written)
+}
+
+pub(crate) fn check_bundle_limits(
+    bytes: u64,
+    entries: usize,
+    limits: &ArtifactZipLimits,
+) -> Result<(), ServiceError> {
+    if let Some(limit) = limits.max_bytes
+        && bytes > limit
+    {
+        return Err(ServiceError::TooLarge {
+            actual: usize::try_from(bytes)
+                .map_err(|_| ServiceError::Invalid("bundle size overflow".into()))?,
+            limit: usize::try_from(limit)
+                .map_err(|_| ServiceError::Invalid("bundle limit overflow".into()))?,
+        });
+    }
+    if limits.max_entries.is_some_and(|limit| entries > limit) {
+        return Err(ServiceError::ArtifactEntries);
     }
     Ok(())
 }

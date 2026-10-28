@@ -490,17 +490,15 @@ async fn run_async() -> Result<std::process::ExitCode> {
             } => {
                 let deployment = CliDeployment::defaults(providers_path.clone());
                 let service = local_cli_service(Utf8PathBuf::new(), runs_dir, deployment)?;
-                let parts = service.run_bundle_parts(&id).await?;
+                let parts = service
+                    .run_bundle_parts(&id, &service::ArtifactZipLimits::default())
+                    .await?;
                 let output =
                     output.unwrap_or_else(|| Utf8PathBuf::from(format!("{id}-bundle.zip")));
                 let file = std::fs::File::create(&output)
                     .with_context(|| format!("failed to create bundle `{output}`"))?;
                 service::write_run_bundle_stream_with_limits(
-                    &parts.snapshot,
-                    &parts.inputs,
-                    &parts.journal,
-                    parts.outputs.as_ref(),
-                    &parts.verified,
+                    &parts,
                     file,
                     &service::ArtifactZipLimits::default(),
                 )?;

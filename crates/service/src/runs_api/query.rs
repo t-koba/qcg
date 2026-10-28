@@ -102,36 +102,122 @@ impl LocalService {
         Ok(())
     }
 
-    /// Gather the bundle inputs, verifying artifacts. Works for active runs.
-    /// One journal read plus one manifest read serve the snapshot, the
-    /// inputs, and the verified set: the bundle never re-reads what the
-    /// snapshot already observed (E16).
-    pub async fn run_bundle_parts(&self, id: &str) -> Result<RunBundleParts, ApiError> {
+    /// Bounded bundle preparation before headers: capped manifest/journal,
+    /// pinned lengths, hashes, and serialized metadata.
+    pub async fn run_bundle_parts(
+        &self,
+        id: &str,
+        limits: &ArtifactZipLimits,
+    ) -> Result<RunBundleParts, ApiError> {
         let memory = self.inner.runs.read().await.get(id).cloned();
         let run_dir = match &memory {
             Some(record) => record.run_dir.clone(),
             None => self.run_dir_for(id).await?,
         };
         let directory = run_dir.clone();
-        let (artifacts, journal_events, disk_state, verified) = self
-            .blocking_read(move || {
-                let artifacts = read_optional_output_manifest(&directory)?;
-                let values = crate::summaries::read_journal_events(&directory)?;
-                let disk_state = RunState::fold_values(&values)
-                    .map_err(|error| ServiceError::Invalid(error.to_string()))?;
-                let events = values
-                    .iter()
-                    .map(|value| RunEvent::from_flat(value).map_err(ServiceError::Invalid))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let verified = if artifacts.is_some() {
-                    collect_verified_with_limits(&directory, &ArtifactZipLimits::default())?
-                } else {
-                    Vec::new()
+        let limits = *limits;
+        use std::io::Read as _;
+        let (manifest, manifest_len, journal_len, audit_len, disk_state, journal_events, verified) =
+            self.blocking_work(move || {
+                let meta = run_meta_dir(&directory);
+                let out_path = meta.join("outputs.json");
+                let mut manifest_len = 0;
+                let manifest: Option<OutputManifest> = match std::fs::File::open(&out_path) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => return Err(ServiceError::Io(e)),
+                    Ok(mut f) => {
+                        let len = f.metadata().map_err(ServiceError::Io)?.len();
+                        check_bundle_limits(len, 0, &limits)?;
+                        manifest_len = len;
+                        let len = usize::try_from(len)
+                            .map_err(|_| ServiceError::Invalid("bundle size overflow".into()))?;
+                        let mut raw = vec![0; len];
+                        f.read_exact(&mut raw)?;
+                        Some(serde_json::from_slice(&raw).map_err(ServiceError::Json)?)
+                    }
                 };
-                check_verified_artifact_hashes(&verified)?;
-                Ok((artifacts, events, disk_state, verified))
+                let j_path = meta.join("journal.jsonl");
+                let j_len = std::fs::File::open(&j_path)
+                    .map_err(ServiceError::Io)?
+                    .metadata()
+                    .map_err(ServiceError::Io)?
+                    .len();
+                check_bundle_limits(j_len, 0, &limits)?;
+                let mut journal_limits = JournalLimits::default();
+                if let Some(cap) = limits.max_bytes {
+                    let cap = usize::try_from(cap)
+                        .map_err(|_| ServiceError::Invalid("bundle limit overflow".into()))?;
+                    journal_limits.max_total_bytes =
+                        Some(journal_limits.max_total_bytes.map_or(cap, |l| l.min(cap)));
+                }
+                let scan = engine::read_journal_values(&j_path, journal_limits).map_err(|e| {
+                    if let engine::JournalError::LimitExceeded {
+                        resource: "total journal",
+                        actual,
+                        limit,
+                    } = &e
+                        && limits.max_bytes == Some(*limit as u64)
+                    {
+                        return ServiceError::TooLarge {
+                            actual: *actual,
+                            limit: *limit,
+                        };
+                    }
+                    ServiceError::Invalid(e.to_string())
+                })?;
+                let j_len = scan.stats.bytes as u64;
+                let vals = scan.events;
+                let disk_state = RunState::fold_values(&vals)
+                    .map_err(|e| ServiceError::Invalid(e.to_string()))?;
+                let events = vals
+                    .iter()
+                    .map(|v| RunEvent::from_flat(v).map_err(ServiceError::Invalid))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let audit_len = match std::fs::File::open(meta.join("audit.jsonl")) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => return Err(ServiceError::Io(e)),
+                    Ok(f) => Some(f.metadata().map_err(ServiceError::Io)?.len()),
+                };
+                let mut verified = Vec::new();
+                if let Some(m) = &manifest {
+                    check_bundle_limits(0, m.artifacts.len(), &limits)?;
+                    let mut paths = std::collections::BTreeSet::new();
+                    for artifact in &m.artifacts {
+                        if !paths.insert(&artifact.path) {
+                            return Err(ServiceError::Invalid(format!(
+                                "output manifest contains duplicate artifact `{}`",
+                                artifact.path
+                            )));
+                        }
+                        let fp =
+                            resolve_artifact_path(&run_workspace_dir(&directory), &artifact.path)?;
+                        let len = std::fs::metadata(&fp)?.len();
+                        if len != artifact.bytes {
+                            return Err(ServiceError::Invalid(format!(
+                                "artifact `{}` bytes mismatch: manifest={}, actual={len}",
+                                artifact.path, artifact.bytes
+                            )));
+                        }
+                        verified.push(crate::artifacts::VerifiedArtifact {
+                            path: artifact.path.clone(),
+                            fs_path: fp,
+                            bytes: artifact.bytes,
+                            sha256: artifact.sha256.clone(),
+                        });
+                    }
+                }
+                Ok((
+                    manifest,
+                    manifest_len,
+                    j_len,
+                    audit_len,
+                    disk_state,
+                    events,
+                    verified,
+                ))
             })
-            .await?;
+            .await
+            .map_err(ApiError::from)?;
         let inputs = crate::summaries::run_identity_event(&run_dir, &journal_events)
             .map_err(api_internal)?
             .1
@@ -146,16 +232,79 @@ impl LocalService {
                     events: &journal_events,
                     state: &disk_state,
                 },
-                artifacts.clone(),
+                manifest,
             )
             .await?;
+        let outputs_len = snapshot
+            .artifacts
+            .as_ref()
+            .map(json_size)
+            .transpose()
+            .map_err(ApiError::from)?
+            .unwrap_or(0);
+        let lengths = [
+            json_size(&snapshot).map_err(ApiError::from)?,
+            json_size(&inputs).map_err(ApiError::from)?,
+            outputs_len,
+            manifest_len,
+            journal_len,
+            audit_len.unwrap_or(0),
+        ];
+        let total = lengths
+            .into_iter()
+            .chain(verified.iter().map(|a| a.bytes))
+            .try_fold(0_u64, |sum, len| sum.checked_add(len))
+            .ok_or_else(|| api_internal("bundle size overflow"))?;
+        check_bundle_limits(total, 0, &limits).map_err(ApiError::from)?;
+        let base_entries = 3_usize
+            .checked_add(usize::from(snapshot.artifacts.is_some()))
+            .and_then(|n| n.checked_add(usize::from(audit_len.is_some())))
+            .and_then(|n| n.checked_add(verified.len()))
+            .ok_or_else(|| api_internal("bundle entries overflow"))?;
+        let mut directories = std::collections::BTreeSet::from([Utf8PathBuf::from("artifacts")]);
+        for artifact in &verified {
+            let mut parent = Utf8Path::new(&artifact.path).parent();
+            while let Some(dir) = parent.filter(|d| !d.as_str().is_empty()) {
+                directories.insert(Utf8PathBuf::from("artifacts").join(dir));
+                let entries = base_entries
+                    .checked_add(directories.len())
+                    .ok_or_else(|| api_internal("bundle entries overflow"))?;
+                check_bundle_limits(total, entries, &limits).map_err(ApiError::from)?;
+                parent = dir.parent();
+            }
+        }
+        let entry_count = base_entries
+            .checked_add(directories.len())
+            .ok_or_else(|| api_internal("bundle entries overflow"))?;
+        check_bundle_limits(total, entry_count, &limits).map_err(ApiError::from)?;
+        // Only admitted sources may incur hash I/O; return the same private state.
+        let verified = self
+            .blocking_work(move || {
+                check_verified_artifact_hashes(&verified)?;
+                Ok(verified)
+            })
+            .await
+            .map_err(ApiError::from)?;
+        let snapshot_bytes = serde_json::to_vec_pretty(&snapshot).map_err(api_internal)?;
+        let inputs_bytes = serde_json::to_vec_pretty(&inputs).map_err(api_internal)?;
+        let outputs_bytes = snapshot
+            .artifacts
+            .as_ref()
+            .map(serde_json::to_vec_pretty)
+            .transpose()
+            .map_err(api_internal)?;
         let journal = run_meta_dir(&run_dir).join("journal.jsonl");
         Ok(RunBundleParts {
-            snapshot,
-            inputs,
+            source_bytes: total,
+            entry_count,
+            snapshot_bytes,
+            inputs_bytes,
+            outputs_bytes,
             journal,
-            outputs: artifacts,
+            journal_len,
+            audit_len,
             verified,
+            directories: directories.into_iter().collect(),
         })
     }
 
@@ -295,8 +444,13 @@ impl LocalService {
         // disk-only snapshots never trigger another scan of the journal.
         let (journal_priority, journal_parent) =
             (disk_state.priority, disk_state.parent_run_id.clone());
+        let directory = run_dir.to_owned();
+        let invalidation = self
+            .blocking_work(move || crate::invalidation::read_invalidation(&directory))
+            .await
+            .map_err(ApiError::from)?;
         Ok(RunSnapshot {
-            invalidation: crate::invalidation::read_invalidation(run_dir).map_err(api_internal)?,
+            invalidation,
             run_id: id,
             state,
             seq: disk_state.last_seq,

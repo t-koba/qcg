@@ -2193,20 +2193,12 @@ async fn run_bundle_contains_snapshot_journal_and_artifacts() {
         RunStatus::Succeeded
     );
     let parts = service
-        .run_bundle_parts(&id)
+        .run_bundle_parts(&id, &ArtifactZipLimits::default())
         .await
         .expect("bundle parts should assemble");
     let mut bundle = Vec::new();
-    write_run_bundle_stream_with_limits(
-        &parts.snapshot,
-        &parts.inputs,
-        &parts.journal,
-        parts.outputs.as_ref(),
-        &parts.verified,
-        &mut bundle,
-        &ArtifactZipLimits::default(),
-    )
-    .expect("bundle should write");
+    write_run_bundle_stream_with_limits(&parts, &mut bundle, &ArtifactZipLimits::default())
+        .expect("bundle should write");
     let mut archive =
         zip::ZipArchive::new(std::io::Cursor::new(bundle)).expect("bundle should be a valid zip");
     let mut names = archive
