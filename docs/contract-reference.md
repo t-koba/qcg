@@ -690,7 +690,14 @@ into equality, so two distinct integers above 2^53 stay distinct, and an
 integer equals a float only when the float denotes the same number. The
 exactness holds while the value fits the JSON number type - an integer up
 to 2^64-1 - and an integer literal above that is refused rather than
-stated approximately. The binary arithmetic operators (`+`, `-`, `*`, `/`,
+stated approximately. This evaluator guarantee is distinct from JSON consumer
+precision: the wire representation remains a JSON number, but JavaScript's
+`JSON.parse` converts numbers to IEEE-754 binary64, which guarantees exact
+representation of every integer only within ±(2^53 - 1). Above that range,
+distinct integer tokens can round to the same value. The generated TypeScript
+client uses `JSON.parse`; consumers that need larger exact integers must
+preserve the JSON number token or use another exact representation.
+The binary arithmetic operators (`+`, `-`, `*`, `/`,
 `%`) and `sum` work in floating point, so their results are floats even
 when their operands were integers. Unary minus negates integer operands
 exactly; an integer whose negation the JSON number type cannot hold
