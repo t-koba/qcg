@@ -17,7 +17,7 @@ pub fn validate_path_set<'a>(
     validate_path_set_inner(entries, false)
 }
 
-/// Validates a path set including implicit parents, preserving one spelling per directory.
+/// Validates path trees by components, preserving one spelling per directory including implicit parents.
 pub fn validate_path_tree_set<'a>(
     entries: impl IntoIterator<Item = (&'a str, bool)>,
 ) -> std::io::Result<()> {
@@ -35,7 +35,7 @@ fn validate_path_set_inner<'a>(
     if paths.iter().any(|(_, p, _)| !is_safe_relative_path(p)) {
         return Err(std::io::Error::other("unsafe or colliding path set"));
     }
-    paths.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    paths.sort_unstable_by(|a, b| a.0.split('/').cmp(b.0.split('/')));
     for pair in paths.windows(2) {
         let (lk, lp, _) = &pair[0];
         let (rk, rp, _) = &pair[1];
@@ -52,13 +52,13 @@ fn validate_path_set_inner<'a>(
     }
     for (key, _, _) in &paths {
         let mut parent = key.as_str();
-        while let Some((prefix, _)) = parent.rsplit_once('/') {
-            if let Ok(index) = paths.binary_search_by(|entry| entry.0.as_str().cmp(prefix))
+        while let Some((p, _)) = parent.rsplit_once('/') {
+            if let Ok(index) = paths.binary_search_by(|e| e.0.split('/').cmp(p.split('/')))
                 && !paths[index].2
             {
                 return Err(std::io::Error::other("path set uses a file as a directory"));
             }
-            parent = prefix;
+            parent = p;
         }
     }
     Ok(())
@@ -152,6 +152,29 @@ mod tests {
             validate_path_tree_set(entries).unwrap();
         }
         assert!(validate_path_set([("A/x", false), ("a/y", false)]).is_ok());
+    }
+
+    #[test]
+    fn path_trees_reject_nonadjacent_explicit_parent_aliases() {
+        let orders = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        for entries in [
+            [("A", true), ("a-b", false), ("a/x", false)],
+            [("A/B", true), ("a/b-", false), ("a/b/x", false)],
+        ] {
+            for order in orders {
+                let entries = order.map(|index| entries[index]);
+                assert!(validate_path_tree_set(entries).is_err());
+            }
+        }
+        validate_path_tree_set([("A", true), ("A/x", false), ("A-b", false)]).unwrap();
+        validate_path_tree_set([("A/B", true), ("A/B/x", false), ("A/B-", false)]).unwrap();
     }
 
     #[test]
