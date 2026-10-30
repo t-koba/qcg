@@ -3250,13 +3250,12 @@ images = ["images:alpine@sha256:{0}"]
         DEFAULT_MAX_TRACKED_RUNS,
         RunStoreMode::Exclusive,
         ServiceDeploymentPolicy {
-            container_timeouts: policy::ContainerTimeouts::from_seconds([1; 4]).unwrap(),
+            container_timeouts: policy::ContainerTimeouts::from_seconds([30, 30, 1, 30]).unwrap(),
             ..ServiceDeploymentPolicy::default()
         },
     )
     .unwrap();
     daemon.mode("hang-admin");
-    let start = std::time::Instant::now();
     let error = service
         .run_generator_path(DirectRun {
             generator_path: generator,
@@ -3270,12 +3269,14 @@ images = ["images:alpine@sha256:{0}"]
         })
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("discover-pool"), "{error}");
-    assert!(start.elapsed() < std::time::Duration::from_secs(4));
+    // The eight-second fake hang must end via the configured one-second
+    // deadline, not natural exit or the default admin budget. End-to-end
+    // timing also includes cleanup and (below) scheduler/journal latency.
+    let timeout = "discover-pool timed out after 1s";
+    assert!(error.to_string().contains(timeout), "{error}");
     assert!(daemon.log().contains("delete -f"));
 
     daemon.mode("hang-admin");
-    let start = std::time::Instant::now();
     let id = service
         .start_run(StartRun {
             generator_id: "daemon-test".into(),
@@ -3286,12 +3287,8 @@ images = ["images:alpine@sha256:{0}"]
         .unwrap();
     let terminal = wait_for_terminal_snapshot(&service, &id).await;
     assert_eq!(terminal.state, RunStatus::Failed);
-    assert!(start.elapsed() < std::time::Duration::from_secs(4));
-    assert!(
-        read_journal_string(&service, id)
-            .await
-            .contains("discover-pool")
-    );
+    let journal = read_journal_string(&service, id).await;
+    assert!(journal.contains(timeout), "{journal}");
     assert!(daemon.log().contains("delete -f"));
 }
 

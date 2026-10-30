@@ -765,18 +765,24 @@ mod daemon_policy_tests {
             permissions,
             Utf8PathBuf::from_path_buf(daemon.root.clone()).unwrap(),
         )
-        .with_container_timeouts(policy::ContainerTimeouts::from_seconds([1; 4]).unwrap());
+        .with_container_timeouts(policy::ContainerTimeouts::from_seconds([30, 30, 30, 1]).unwrap());
         let image = format!("images:alpine@sha256:{}", "a".repeat(64));
         let argv = vec!["echo".to_string()];
-        for (mode, stage) in [
-            ("hang-admin", "discover-pool"),
-            ("hang-init", "init"),
-            ("hang-start", "start"),
-            ("hang-probe", "wait-ready"),
+        // Only the target budget is short: a slow preceding command must not
+        // masquerade as the target timeout. Start and probe share a budget;
+        // allow three seconds for their client startup (the fixture has
+        // measured 444ms under load), still below the eight-second fake hang.
+        for (mode, stage, seconds, budget) in [
+            ("hang-admin", "discover-pool", [30, 30, 1, 30], 1),
+            ("hang-init", "init", [1, 30, 30, 30], 1),
+            ("hang-start", "start", [30, 3, 30, 30], 3),
+            ("hang-probe", "wait-ready", [30, 3, 30, 30], 3),
         ] {
             daemon.mode(mode);
-            let start = std::time::Instant::now();
-            let error = gateway
+            let target = gateway
+                .clone()
+                .with_container_timeouts(policy::ContainerTimeouts::from_seconds(seconds).unwrap());
+            let error = target
                 .run_container_workload(
                     ContainerWorkload {
                         image: &image,
@@ -790,12 +796,13 @@ mod daemon_policy_tests {
                 )
                 .await
                 .unwrap_err();
-            assert!(error.to_string().contains(stage), "{mode}: {error}");
-            assert!(start.elapsed() < Duration::from_secs(4), "{mode}");
+            // An exact timeout diagnostic distinguishes deadline enforcement
+            // from natural fake-client exit, without timing unrelated stages.
+            let timeout = format!("{stage} timed out after {budget}s");
+            assert!(error.to_string().contains(&timeout), "{mode}: {error}");
             assert!(daemon.log().contains("delete -f"));
         }
         daemon.mode("hang-stop");
-        let start = std::time::Instant::now();
         gateway
             .run_container_workload(
                 ContainerWorkload {
@@ -810,13 +817,18 @@ mod daemon_policy_tests {
             )
             .await
             .unwrap();
-        assert!(start.elapsed() < Duration::from_secs(4));
-        assert!(daemon.log().contains("delete -f"));
+        // Measure only stop -> removal, not provisioning/workload scheduling.
+        // The existing bound separates the frozen 1s stop budget from the 8s hang.
+        let gap = daemon.gap_between("stop ", "delete -f").unwrap();
+        assert!(
+            gap < super::daemon_policy_test_support::STOP_TIMEOUT_GAP_BOUND,
+            "{gap:?}"
+        );
 
         let mut permissions = Permissions::default();
         permissions.containers.runtime = Some(contract::ContainerRuntime::Docker);
         let docker = CmdGateway::new(permissions, gateway.workspace.clone())
-            .with_container_timeouts(gateway.container_timeouts);
+            .with_container_timeouts(policy::ContainerTimeouts::from_seconds([1; 4]).unwrap());
         daemon.mode("docker-workload");
         let start = std::time::Instant::now();
         docker
