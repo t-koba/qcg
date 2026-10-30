@@ -61,6 +61,19 @@ JSON event output go to stdout.
   `providers.toml`, the optional external catalog, and per-provider discovery.
   `--refresh` re-fetches external catalog sources first; stale or failed sources
   are reported on stderr. Credentials are never printed.
+  Flat price fields remain base rates (USD/1M tokens). The human
+  `cost_tiers(input/read/create/output USD/1M)` column lists the ordered effective
+  schedule as `>=threshold:input/cache-read/cache-creation/output`, separated by
+  `;` (for example, `>=200000:6/0/3/4`). `-` means unresolved or no schedule;
+  `0` is a known zero rate. `--json` uses the API model's `cost_tiers` array
+  (`[]` when absent), with `threshold_tokens` and four nullable
+  `*_cost_per_million_usd` rates; inherited rates are already resolved.
+  The greatest threshold T with T <= whole prompt input selects one row to price
+  the whole request, not just tokens above T. Input includes the disjoint
+  cache-read and cache-creation subsets; output does not choose the tier.
+  This catalog schedule is not a contract-specific final quote: contract rate
+  pins and schedule replacements, and configured cache TTL adjustments, still
+  apply (see [provider pricing](llm-provider-guide.md#model-catalog)).
 - `qcg eval <generator> --suite suite.json [--output .data/evals]
   [--runs-dir .data/runs] [--baseline REPORT_JSON] [--json]` executes isolated
   cases and optional repeated seed variations. Assertions cover artifacts,

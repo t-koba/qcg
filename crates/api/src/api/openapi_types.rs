@@ -3,10 +3,10 @@ use serde_json::{Value, json};
 
 use super::dto::{
     AnswerPayload, ConfirmDecision, ForkRun, ForkStatePatch, GeneratorDetail, GeneratorSummary,
-    InvalidateRun, LlmCatalogCapabilities, LlmCatalogModel, LlmCatalogProvider, LlmCatalogResponse,
-    LlmCatalogSource, McpAuthorizationStart, McpServerList, McpServerSummary, ProblemDetails,
-    RunCostMetrics, RunInvalidation, RunListItem, RunListOrder, RunListResponse, RunSnapshot,
-    StartRun, StepSummary, StepSummaryStatus,
+    InvalidateRun, LlmCatalogCapabilities, LlmCatalogCostTier, LlmCatalogModel, LlmCatalogProvider,
+    LlmCatalogResponse, LlmCatalogSource, McpAuthorizationStart, McpServerList, McpServerSummary,
+    ProblemDetails, RunCostMetrics, RunInvalidation, RunListItem, RunListOrder, RunListResponse,
+    RunSnapshot, StartRun, StepSummary, StepSummaryStatus,
 };
 use super::openapi_doc::{insert_schema, openapi_paths};
 use crate::events::RunEvent;
@@ -72,6 +72,7 @@ pub fn openapi_components() -> Value {
     insert_schema::<GeneratorDetail>(&mut schemas, "GeneratorDetail");
     insert_schema::<LlmCatalogSource>(&mut schemas, "LlmCatalogSource");
     insert_schema::<LlmCatalogCapabilities>(&mut schemas, "LlmCatalogCapabilities");
+    insert_schema::<LlmCatalogCostTier>(&mut schemas, "LlmCatalogCostTier");
     insert_schema::<LlmCatalogModel>(&mut schemas, "LlmCatalogModel");
     insert_schema::<LlmCatalogProvider>(&mut schemas, "LlmCatalogProvider");
     insert_schema::<LlmCatalogResponse>(&mut schemas, "LlmCatalogResponse");

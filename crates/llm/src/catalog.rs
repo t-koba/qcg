@@ -210,6 +210,16 @@ pub struct CatalogProviderView {
     pub models: Vec<CatalogModelView>,
 }
 
+/// Effective request rates (USD/1M tokens) at an inclusive prompt-input threshold.
+#[derive(Debug, Clone, Serialize)]
+pub struct CatalogCostTierView {
+    pub threshold_tokens: u64,
+    pub input_cost_per_million_usd: Option<f64>,
+    pub cache_read_input_cost_per_million_usd: Option<f64>,
+    pub cache_creation_input_cost_per_million_usd: Option<f64>,
+    pub output_cost_per_million_usd: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CatalogModelView {
     pub id: String,
@@ -225,6 +235,7 @@ pub struct CatalogModelView {
     pub cache_creation_input_cost_per_million_usd: Option<f64>,
     pub cache_read_input_cost_per_million_usd: Option<f64>,
     pub output_cost_per_million_usd: Option<f64>,
+    pub cost_tiers: Vec<CatalogCostTierView>,
     pub context_tokens: Option<u64>,
     pub max_output_tokens: Option<u64>,
 }
@@ -830,6 +841,20 @@ fn model_view(
         cache_creation_input_cost_per_million_usd: model.cache_creation_input_cost_per_million_usd,
         cache_read_input_cost_per_million_usd: model.cache_read_input_cost_per_million_usd,
         output_cost_per_million_usd: model.output_cost_per_million_usd,
+        cost_tiers: model
+            .cost_tiers
+            .iter()
+            .map(|tier| {
+                let rates = model.rates().resolve(Some(tier));
+                CatalogCostTierView {
+                    threshold_tokens: tier.threshold_tokens,
+                    input_cost_per_million_usd: rates.input,
+                    cache_read_input_cost_per_million_usd: rates.cache_read,
+                    cache_creation_input_cost_per_million_usd: rates.cache_creation,
+                    output_cost_per_million_usd: rates.output,
+                }
+            })
+            .collect(),
         context_tokens: model.context_tokens,
         max_output_tokens: model.max_output_tokens,
     }
@@ -1486,6 +1511,57 @@ mod tests {
     }
 
     #[test]
+    fn catalog_tiers_show_effective_rates_at_inclusive_thresholds() {
+        let catalog = map_models_dev(MODELS_DEV_TIER_FIXTURE).unwrap();
+        let mut model = catalog.providers["openai"]["short-band"].clone();
+        model.cost_tiers[0].cache_read_input_cost_per_million_usd = Some(0.0);
+        let view = model_view(&model, "external", &Default::default());
+        assert_eq!(view.input_cost_per_million_usd, Some(3.0));
+        assert_eq!(view.cache_creation_input_cost_per_million_usd, None);
+        let tier = &view.cost_tiers[0];
+        assert_eq!(tier.threshold_tokens, 128_001);
+        assert_eq!(tier.input_cost_per_million_usd, Some(6.0));
+        assert_eq!(tier.cache_read_input_cost_per_million_usd, Some(0.0));
+        // Missing tier cache price falls back to base input, NOT tier input.
+        assert_eq!(tier.cache_creation_input_cost_per_million_usd, Some(3.0));
+        assert_eq!(tier.output_cost_per_million_usd, Some(12.0));
+        let below = model.rates().resolve(policy::select_cost_tier(
+            &model.cost_tiers,
+            tier.threshold_tokens - 1,
+        ));
+        let at = model.rates().resolve(policy::select_cost_tier(
+            &model.cost_tiers,
+            tier.threshold_tokens,
+        ));
+        assert_eq!(below.input, view.input_cost_per_million_usd);
+        assert_eq!(at.input, tier.input_cost_per_million_usd);
+        assert_eq!(at.cache_read, tier.cache_read_input_cost_per_million_usd);
+        assert_eq!(
+            at.cache_creation,
+            tier.cache_creation_input_cost_per_million_usd
+        );
+        assert_eq!(at.output, tier.output_cost_per_million_usd);
+
+        model.input_cost_per_million_usd = None;
+        model.output_cost_per_million_usd = None;
+        model.cost_tiers[0].output_cost_per_million_usd = None;
+        let json =
+            serde_json::to_value(model_view(&model, "external", &Default::default())).unwrap();
+        assert!(json["cost_tiers"][0]["cache_creation_input_cost_per_million_usd"].is_null());
+        assert!(json["cost_tiers"][0]["output_cost_per_million_usd"].is_null());
+        assert_eq!(
+            json["cost_tiers"][0]["cache_read_input_cost_per_million_usd"],
+            0.0
+        );
+        model.cost_tiers.clear();
+        assert!(
+            model_view(&model, "external", &Default::default())
+                .cost_tiers
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn a_registry_pinned_rate_prices_every_inherited_tier() {
         let catalog = map_models_dev(MODELS_DEV_TIER_FIXTURE).expect("fixture must map");
         let external = catalog.providers["openai"]["tiered"].clone();
@@ -1521,6 +1597,14 @@ mod tests {
         );
         assert_eq!(merged.cost_tiers[0].output_cost_per_million_usd, Some(4.0));
         assert_eq!(merged.cost_tiers[0].threshold_tokens, 272_001);
+        let view = model_view(&merged, "explicit + external", &Default::default());
+        assert_eq!(view.input_cost_per_million_usd, Some(0.5));
+        let tier = &view.cost_tiers[0];
+        assert_eq!(tier.threshold_tokens, 272_001);
+        assert_eq!(tier.input_cost_per_million_usd, Some(0.5));
+        assert_eq!(tier.cache_read_input_cost_per_million_usd, Some(0.2));
+        assert_eq!(tier.cache_creation_input_cost_per_million_usd, Some(2.5));
+        assert_eq!(tier.output_cost_per_million_usd, Some(4.0));
     }
 
     #[test]
@@ -1553,6 +1637,15 @@ mod tests {
         assert_eq!(merged.cost_tiers.len(), 1);
         assert_eq!(merged.cost_tiers[0].threshold_tokens, 100_000);
         assert_eq!(merged.cost_tiers[0].input_cost_per_million_usd, Some(3.0));
+        let view = model_view(&merged, "explicit + external", &Default::default());
+        assert_eq!(view.input_cost_per_million_usd, Some(1.0));
+        assert_eq!(view.cost_tiers.len(), 1);
+        let tier = &view.cost_tiers[0];
+        assert_eq!(tier.threshold_tokens, 100_000);
+        assert_eq!(tier.input_cost_per_million_usd, Some(3.0));
+        assert_eq!(tier.cache_read_input_cost_per_million_usd, Some(0.1));
+        assert_eq!(tier.cache_creation_input_cost_per_million_usd, Some(1.25));
+        assert_eq!(tier.output_cost_per_million_usd, Some(2.0));
     }
 
     #[tokio::test]

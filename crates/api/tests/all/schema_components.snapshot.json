@@ -63,6 +63,7 @@
   "LaggedEventData",
   "LlmCallEventData",
   "LlmCatalogCapabilities",
+  "LlmCatalogCostTier",
   "LlmCatalogModel",
   "LlmCatalogProvider",
   "LlmCatalogResponse",

@@ -2,8 +2,8 @@ use crate::artifacts::{api_bad_request, api_internal, api_not_found};
 use crate::package::{PackageLimits, package_identity_sha256};
 use crate::types::LocalService;
 use api::{
-    ApiError, GeneratorDetail, GeneratorSummary, LlmCatalogCapabilities, LlmCatalogModel,
-    LlmCatalogProvider, LlmCatalogResponse, LlmCatalogSource,
+    ApiError, GeneratorDetail, GeneratorSummary, LlmCatalogCapabilities, LlmCatalogCostTier,
+    LlmCatalogModel, LlmCatalogProvider, LlmCatalogResponse, LlmCatalogSource,
 };
 use camino::Utf8PathBuf;
 use contract::{Contract, PackagePathError};
@@ -194,6 +194,19 @@ fn map_llm_catalog(view: llm::CatalogView) -> LlmCatalogResponse {
                         cache_read_input_cost_per_million_usd: model
                             .cache_read_input_cost_per_million_usd,
                         output_cost_per_million_usd: model.output_cost_per_million_usd,
+                        cost_tiers: model
+                            .cost_tiers
+                            .into_iter()
+                            .map(|tier| LlmCatalogCostTier {
+                                threshold_tokens: tier.threshold_tokens,
+                                input_cost_per_million_usd: tier.input_cost_per_million_usd,
+                                cache_read_input_cost_per_million_usd: tier
+                                    .cache_read_input_cost_per_million_usd,
+                                cache_creation_input_cost_per_million_usd: tier
+                                    .cache_creation_input_cost_per_million_usd,
+                                output_cost_per_million_usd: tier.output_cost_per_million_usd,
+                            })
+                            .collect(),
                         context_tokens: model.context_tokens,
                         max_output_tokens: model.max_output_tokens,
                         capabilities: LlmCatalogCapabilities {
@@ -226,7 +239,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn model_warning_is_preserved_in_catalog_response() {
+    fn model_warning_and_effective_tiers_are_preserved_in_catalog_response() {
         let warning = "external tier schedule could not be used".to_string();
         let response = map_llm_catalog(llm::CatalogView {
             fetched_at: None,
@@ -250,11 +263,43 @@ mod tests {
                     cache_creation_input_cost_per_million_usd: None,
                     cache_read_input_cost_per_million_usd: None,
                     output_cost_per_million_usd: None,
+                    cost_tiers: vec![llm::CatalogCostTierView {
+                        threshold_tokens: 200_000,
+                        input_cost_per_million_usd: Some(6.0),
+                        cache_read_input_cost_per_million_usd: Some(0.0),
+                        cache_creation_input_cost_per_million_usd: Some(3.0),
+                        output_cost_per_million_usd: None,
+                    }],
                     context_tokens: None,
                     max_output_tokens: None,
                 }],
             }],
         });
+
+        let mut json = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            json["providers"][0]["models"][0]["cost_tiers"],
+            serde_json::json!([{
+                "threshold_tokens": 200_000,
+                "input_cost_per_million_usd": 6.0,
+                "cache_read_input_cost_per_million_usd": 0.0,
+                "cache_creation_input_cost_per_million_usd": 3.0,
+                "output_cost_per_million_usd": null
+            }])
+        );
+        let roundtrip: LlmCatalogResponse = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(roundtrip).unwrap(), json);
+        // Old servers omit the new field; new clients accept that as no tiers.
+        json["providers"][0]["models"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("cost_tiers");
+        let legacy: LlmCatalogResponse = serde_json::from_value(json).unwrap();
+        assert!(legacy.providers[0].models[0].cost_tiers.is_empty());
+        assert_eq!(
+            serde_json::to_value(legacy).unwrap()["providers"][0]["models"][0]["cost_tiers"],
+            serde_json::json!([])
+        );
 
         let provider = &response.providers[0];
         assert!(provider.error.is_none());

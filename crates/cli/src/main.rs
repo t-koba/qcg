@@ -762,12 +762,34 @@ fn resolve_api_token(explicit: Option<String>) -> anyhow::Result<Option<String>>
     Ok(Some(token))
 }
 
+fn format_catalog_cost_tiers(tiers: &[api::LlmCatalogCostTier]) -> String {
+    if tiers.is_empty() {
+        return "-".into();
+    }
+    tiers
+        .iter()
+        .map(|tier| {
+            format!(
+                ">={}:{}/{}/{}/{}",
+                tier.threshold_tokens,
+                catalog_price(tier.input_cost_per_million_usd),
+                catalog_price(tier.cache_read_input_cost_per_million_usd),
+                catalog_price(tier.cache_creation_input_cost_per_million_usd),
+                catalog_price(tier.output_cost_per_million_usd),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn catalog_price(value: Option<f64>) -> String {
+    value.map_or_else(|| "-".to_string(), |value| value.to_string())
+}
+
 fn print_llm_catalog(catalog: &api::LlmCatalogResponse) {
     println!(
-        "provider\tmodel\tenabled\tavailable\tefforts\tinput\toutput\tcontext\tsource\twarning"
+        "provider\tmodel\tenabled\tavailable\tefforts\tinput\toutput\tcontext\tsource\twarning\tcost_tiers(input/read/create/output USD/1M)"
     );
-    let price =
-        |value: Option<f64>| value.map_or_else(|| "-".to_string(), |value| value.to_string());
     for provider in &catalog.providers {
         for model in &provider.models {
             let efforts = if model.reasoning_effort.is_empty() {
@@ -780,17 +802,18 @@ fn print_llm_catalog(catalog: &api::LlmCatalogResponse) {
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".to_string());
             println!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 provider.id,
                 model.id,
                 model.enabled,
                 provider.available,
                 efforts,
-                price(model.input_cost_per_million_usd),
-                price(model.output_cost_per_million_usd),
+                catalog_price(model.input_cost_per_million_usd),
+                catalog_price(model.output_cost_per_million_usd),
                 context,
                 model.source,
-                model.warning.as_deref().unwrap_or("-")
+                model.warning.as_deref().unwrap_or("-"),
+                format_catalog_cost_tiers(&model.cost_tiers)
             );
         }
         if let Some(error) = &provider.error {

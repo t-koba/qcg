@@ -56,3 +56,27 @@ fn cache_creation_usage_is_reported_in_event_schema_and_roundtrips() {
         );
     }
 }
+
+#[test]
+fn catalog_tier_schedule_schema_is_typed_nullable_and_defaults_empty() {
+    let components = api::openapi_components();
+    let schedule = &components["schemas"]["LlmCatalogModel"]["properties"]["cost_tiers"];
+    assert_eq!(schedule["default"], serde_json::json!([]));
+    assert_eq!(
+        schedule["items"]["$ref"],
+        "#/components/schemas/LlmCatalogCostTier"
+    );
+    let tier = &components["schemas"]["LlmCatalogCostTier"];
+    assert_eq!(tier["properties"]["threshold_tokens"]["type"], "integer");
+    for field in [
+        "input_cost_per_million_usd",
+        "cache_read_input_cost_per_million_usd",
+        "cache_creation_input_cost_per_million_usd",
+        "output_cost_per_million_usd",
+    ] {
+        assert_eq!(
+            tier["properties"][field]["type"],
+            serde_json::json!(["number", "null"])
+        );
+    }
+}

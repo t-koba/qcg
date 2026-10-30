@@ -1814,6 +1814,50 @@
         "title": "LlmCatalogCapabilities",
         "type": "object"
       },
+      "LlmCatalogCostTier": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Effective rates in USD/1M tokens, after catalog inheritance and registry pins.\nThe greatest threshold <= whole prompt input selects a row for the whole request.",
+        "properties": {
+          "cache_creation_input_cost_per_million_usd": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "cache_read_input_cost_per_million_usd": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "input_cost_per_million_usd": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "output_cost_per_million_usd": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "threshold_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "threshold_tokens"
+        ],
+        "title": "LlmCatalogCostTier",
+        "type": "object"
+      },
       "LlmCatalogModel": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
@@ -1842,6 +1886,14 @@
               "integer",
               "null"
             ]
+          },
+          "cost_tiers": {
+            "default": [],
+            "description": "Effective catalog schedule, not a contract-specific final quote. Empty for no tiers.\nFlat price fields above remain base rates; null tier rates are unresolved, not free.",
+            "items": {
+              "$ref": "#/components/schemas/LlmCatalogCostTier"
+            },
+            "type": "array"
           },
           "enabled": {
             "type": "boolean"

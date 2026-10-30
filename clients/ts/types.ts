@@ -2531,6 +2531,23 @@ export interface components {
             top_p: boolean;
             verbosity: boolean;
         };
+        /**
+         * LlmCatalogCostTier
+         * @description Effective rates in USD/1M tokens, after catalog inheritance and registry pins.
+         *     The greatest threshold <= whole prompt input selects a row for the whole request.
+         */
+        LlmCatalogCostTier: {
+            /** Format: double */
+            cache_creation_input_cost_per_million_usd?: number | null;
+            /** Format: double */
+            cache_read_input_cost_per_million_usd?: number | null;
+            /** Format: double */
+            input_cost_per_million_usd?: number | null;
+            /** Format: double */
+            output_cost_per_million_usd?: number | null;
+            /** Format: uint64 */
+            threshold_tokens: number;
+        };
         /** LlmCatalogModel */
         LlmCatalogModel: {
             /** Format: double */
@@ -2543,6 +2560,12 @@ export interface components {
              * @default null
              */
             context_tokens: number | null;
+            /**
+             * @description Effective catalog schedule, not a contract-specific final quote. Empty for no tiers.
+             *     Flat price fields above remain base rates; null tier rates are unresolved, not free.
+             * @default []
+             */
+            cost_tiers: components["schemas"]["LlmCatalogCostTier"][];
             enabled: boolean;
             id: string;
             /**

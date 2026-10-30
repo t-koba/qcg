@@ -394,6 +394,17 @@ pub struct LlmCatalogProvider {
     pub models: Vec<LlmCatalogModel>,
 }
 
+/// Effective rates in USD/1M tokens, after catalog inheritance and registry pins.
+/// The greatest threshold <= whole prompt input selects a row for the whole request.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LlmCatalogCostTier {
+    pub threshold_tokens: u64,
+    pub input_cost_per_million_usd: Option<f64>,
+    pub cache_read_input_cost_per_million_usd: Option<f64>,
+    pub cache_creation_input_cost_per_million_usd: Option<f64>,
+    pub output_cost_per_million_usd: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LlmCatalogModel {
     pub id: String,
@@ -414,6 +425,10 @@ pub struct LlmCatalogModel {
     pub cache_read_input_cost_per_million_usd: Option<f64>,
     #[serde(default)]
     pub output_cost_per_million_usd: Option<f64>,
+    /// Effective catalog schedule, not a contract-specific final quote. Empty for no tiers.
+    /// Flat price fields above remain base rates; null tier rates are unresolved, not free.
+    #[serde(default)]
+    pub cost_tiers: Vec<LlmCatalogCostTier>,
     #[serde(default)]
     pub context_tokens: Option<u64>,
     #[serde(default)]

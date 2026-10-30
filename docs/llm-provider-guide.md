@@ -442,6 +442,27 @@ metadata and reports fetch errors.
 prices, and limits. Credentials and environment-variable values are never
 returned.
 
+Each model exposes `cost_tiers` in threshold order (`[]` for no schedule).
+Each row has `threshold_tokens` and nullable `input_cost_per_million_usd`,
+`cache_read_input_cost_per_million_usd`,
+`cache_creation_input_cost_per_million_usd`, and `output_cost_per_million_usd`
+(USD/1M tokens). These are effective catalog rates after the registry overlay:
+missing tier categories inherit their base rate, missing base cache rates fall
+back to base input (never tier input), explicit zero stays zero, and unresolved
+rates are `null`. The existing flat fields remain base rates, not the rates of
+any selected tier. The human CLI uses a compact
+`>=threshold:input/cache-read/cache-creation/output` column, with `;` between
+rows and `-` for unresolved rates or no schedule.
+
+The greatest threshold T for which T <= whole prompt input selects the row
+that prices the **whole request**, not just tokens above the threshold. Prompt
+input includes both disjoint cached subsets (cache-read and cache-creation),
+not just uncached input; output tokens do not choose the tier. The catalog
+schedule is not a contract-specific final quote: contract rate pins carry into
+inherited tiers, a contract's own schedule replaces the catalog schedule, and
+configured cache TTL adjustments still apply. Costs remain estimates, not
+invoices.
+
 ## MCP server profiles
 
 An `[[mcp_server]]` row describes one generic MCP endpoint. The registry owns
