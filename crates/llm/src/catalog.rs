@@ -139,14 +139,14 @@ pub struct ExternalCatalog {
     fingerprint: Option<String>,
     /// External provider key -> model id -> spec.
     providers: BTreeMap<String, BTreeMap<String, ModelSpec>>,
-    /// Provider -> model id -> unusable schedule advisories; flat rates stay.
+    /// Provider -> model id -> unusable external schedule advisories.
     #[serde(deserialize_with = "deserialize_model_errors")]
     model_errors: ModelErrors,
 }
 
 type ModelErrors = BTreeMap<String, BTreeMap<String, Vec<String>>>;
 
-// Old caches grouped advisories by provider; retain the full text per model.
+// Old caches grouped advisories by provider; retain their advisories per model.
 fn deserialize_model_errors<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<ModelErrors, D::Error> {
@@ -156,8 +156,8 @@ fn deserialize_model_errors<'de, D: serde::Deserializer<'de>>(
         Current(ModelErrors),
         Legacy(BTreeMap<String, Vec<String>>),
     }
-    match Warnings::deserialize(deserializer)? {
-        Warnings::Current(providers) => Ok(providers),
+    let mut providers = match Warnings::deserialize(deserializer)? {
+        Warnings::Current(providers) => providers,
         Warnings::Legacy(providers) => {
             let mut migrated = ModelErrors::new();
             for (provider, warnings) in providers {
@@ -170,9 +170,20 @@ fn deserialize_model_errors<'de, D: serde::Deserializer<'de>>(
                     models.entry(model.to_owned()).or_default().push(warning);
                 }
             }
-            Ok(migrated)
+            migrated
+        }
+    };
+    for warning in providers
+        .values_mut()
+        .flat_map(|models| models.values_mut())
+        .flatten()
+    {
+        // Registry or contract tiers may price requests instead of flat rates.
+        if let Some(text) = warning.strip_suffix(", so its flat rates apply") {
+            warning.truncate(text.len());
         }
     }
+    Ok(providers)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1218,7 +1229,7 @@ pub(crate) fn map_models_dev(text: &str) -> Result<ExternalCatalog, String> {
                         .entry(model_id.clone())
                         .or_default()
                         .push(format!(
-                            "model `{model_id}`: its context tier schedule could not be used ({reason}), so its flat rates apply"
+                            "model `{model_id}`: its context tier schedule could not be used ({reason})"
                         ));
                     Vec::new()
                 }
@@ -1657,6 +1668,11 @@ mod tests {
 id = "openai"
 api = "chat_completions"
 base_url = "https://example.test/v1"
+[[provider.models]]
+id = "unreadable"
+[[provider.models.cost_tiers]]
+threshold_tokens = 100_000
+input_cost_per_million_usd = 3.0
 "#,
         )
         .expect("registry must parse");
@@ -1666,26 +1682,7 @@ base_url = "https://example.test/v1"
                 .snapshot
                 .write()
                 .unwrap_or_else(|error| error.into_inner());
-            snapshot.external.providers.insert(
-                "openai".into(),
-                BTreeMap::from([(
-                    "gpt-5".into(),
-                    ModelSpec {
-                        id: "gpt-5".into(),
-                        ..Default::default()
-                    },
-                )]),
-            );
-            snapshot.external.model_errors.insert(
-                "openai".into(),
-                BTreeMap::from([(
-                    "gpt-5".into(),
-                    vec![
-                        "tier schedule could not be used (unreadable tier)".into(),
-                        "flat rates remain active".into(),
-                    ],
-                )]),
-            );
+            snapshot.external = map_models_dev(MODELS_DEV_TIER_FIXTURE).unwrap();
         }
         let view = service.view(false).await;
         let provider = view
@@ -1700,11 +1697,21 @@ base_url = "https://example.test/v1"
         let model = provider
             .models
             .iter()
-            .find(|model| model.id == "gpt-5")
+            .find(|model| model.id == "unreadable")
             .expect("the affected model remains visible");
-        let warning = model.warning.as_deref().expect("model warning is visible");
-        assert!(warning.contains("unreadable tier"), "{warning}");
-        assert!(warning.contains("flat rates remain active"), "{warning}");
+        assert_eq!(
+            model.warning.as_deref(),
+            Some(
+                "model `unreadable`: its context tier schedule could not be used (a tier qcg cannot read)"
+            )
+        );
+        assert_eq!(model.source, "explicit + external");
+        assert_eq!(model.input_cost_per_million_usd, Some(1.0));
+        assert_eq!(model.cost_tiers.len(), 1);
+        let tier = &model.cost_tiers[0];
+        assert_eq!(tier.threshold_tokens, 100_000);
+        assert_eq!(tier.input_cost_per_million_usd, Some(3.0));
+        assert_eq!(tier.output_cost_per_million_usd, Some(2.0));
     }
 
     #[tokio::test]
@@ -2203,7 +2210,9 @@ label = "Explicit label"
         let dir = temp_catalog_dir("legacy-advisory");
         let cache = dir.join("cache.json");
         let mut config = file_source_config(&cache, &dir.join("unavailable.json"));
-        let warning = "model `cached`: its context tier schedule could not be used (a tier qcg cannot read), so its flat rates apply";
+        let warning =
+            "model `cached`: its context tier schedule could not be used (a tier qcg cannot read)";
+        let old_warning = format!("{warning}, so its flat rates apply");
         let old_cache = serde_json::json!({
             "fetched_at": (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339(),
             "fingerprint": config_fingerprint(&config),
@@ -2214,7 +2223,7 @@ label = "Explicit label"
                 "cache_read_input_cost_per_million_usd": 0.0,
                 "cache_creation_input_cost_per_million_usd": 4.0
             }}},
-            "model_errors": {"openai": [warning]}
+            "model_errors": {"openai": [old_warning]}
         });
         std::fs::write(&cache, serde_json::to_vec(&old_cache).unwrap()).unwrap();
         let file = ProvidersFile::parse(
@@ -2290,13 +2299,20 @@ base_url = "https://example.test/v1"
         let first = "model `one`: first advisory";
         let second = "model `two`: second advisory";
         let third = "model `one`: another advisory";
-        let old: ExternalCatalog = serde_json::from_value(serde_json::json!({
-            "model_errors": {"p": [first, second, third], "empty": []}
-        }))
-        .unwrap();
-        assert_eq!(old.model_errors["p"]["one"], [first, third]);
-        assert_eq!(old.model_errors["p"]["two"], [second]);
-        assert!(old.model_errors["empty"].is_empty());
+        let obsolete = format!("{first}, so its flat rates apply");
+        let similar = "model `one`: unchanged, so its flat rates apply here";
+        for errors in [
+            serde_json::json!({"p": [obsolete, second, third, similar], "empty": []}),
+            serde_json::json!({"p": {"one": [obsolete, third, similar], "two": [second]}, "empty": {}}),
+        ] {
+            let loaded: ExternalCatalog = serde_json::from_value(serde_json::json!({
+                "model_errors": errors
+            }))
+            .unwrap();
+            assert_eq!(loaded.model_errors["p"]["one"], [first, third, similar]);
+            assert_eq!(loaded.model_errors["p"]["two"], [second]);
+            assert!(loaded.model_errors["empty"].is_empty());
+        }
         for value in [
             serde_json::json!({}),
             serde_json::json!({"model_errors": {}}),
