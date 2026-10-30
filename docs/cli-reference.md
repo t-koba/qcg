@@ -241,6 +241,73 @@ run has a UUID-based ID and separate `meta/journal.jsonl`
 and `workspace/` paths. Direct `qcg run --output` invocations reject concurrent
 use of the same output directory.
 
+## ChatGPT subscription credentials (standalone)
+
+```sh
+qcg auth login --account work
+qcg auth status --account work
+qcg auth status --account work --refresh
+qcg auth logout --account work
+qcg auth logout --account work --local
+qcg auth logout --account work --forget
+```
+
+Every operation requires an explicit local account label (1–128 bytes); there is
+no default account, automatic account discovery, token export or API-key fallback.
+Labels select independent OS-keyring entries, not provider account names. Login
+prints an authorization URL to open manually in a browser and waits up to five
+minutes on `http://localhost:1455/auth/callback` (IPv4 loopback listener). It uses
+OpenAI discovery, authorization code + S256 PKCE, and signed OIDC validation
+(state, nonce, issuer, audience and expiry, plus access-token hash when present).
+The first registration uses `dynamic_agent_client` with a stable host ID and
+`agent_name_hint=qcg`; the callback must supply the issued client ID. Later login
+uses the selected entry's client ID, accepts an omitted callback client ID,
+rejects a mismatched ID or a different authenticated subject, and omits the
+registration-only `agent_name_hint`. qcg does not retain email or ID-token login
+hints; account/workspace selection stays in the provider's browser UI. To use
+another account, choose another label.
+
+`status` is local-only and reports expiry, not provider validity or account/model
+eligibility. `status --refresh` contacts OpenAI only when the access token expires
+within 60 seconds (or has expired). Code exchange and refresh send
+`resource=https://api.openai.com/v1`. A successful refresh must return a distinct
+replacement refresh token; otherwise the stored reauthentication marker remains, and qcg will
+not replay the potentially consumed token. qcg uses `expires_in` for expiry; it does
+not interpret the provider's `earliest_refresh_at` extension. Refresh ID tokens, if
+present, are validated; an omitted nonce is allowed only on refresh, and a nonce
+that is present must match the original sign-in.
+
+Opaque credential records and the stable host ID live only in the OS keyring
+(service `qcg.chatgpt.oauth`). A locked or unavailable keyring fails closed; there
+is no plaintext or in-memory fallback. Non-secret advisory lock files live under
+`$XDG_STATE_HOME/qcg/auth`, defaulting to `$HOME/.local/state/qcg/auth` on Unix,
+and `%LOCALAPPDATA%/qcg/auth` on Windows. All processes using these keyring entries
+must use the same state directory on a filesystem with reliable advisory locks;
+do not remove lock files while qcg is running. Each account operation takes its
+cross-process lock before reading credentials and holds it through persistence
+(lock wait limit: six minutes). Refresh persists an in-progress marker before the
+request, and a rotated refresh token before final validation/commit. Interrupted,
+rejected or unconfirmed refreshes require explicit login rather than replaying a
+possibly consumed token. A keyring write failure cannot guarantee recovery of a
+provider-rotated token; the durable marker prevents reuse and requires sign-in.
+
+`logout` attempts RFC 7009 revocation before clearing the local tokens. It still
+clears them if discovery or revocation fails and reports **remote revocation not
+confirmed**. A pending refresh marker also makes revocation unconfirmed even if
+HTTP 200 is returned: the stored token may have been consumed before its rotated
+replacement was saved. `--local` skips network access and also makes no remote
+claim. By
+default it retains the issued client ID and OIDC subject mapping plus the stable
+host ID for later reauthorization. It does not retain email or ID-token hints.
+`--forget` also deletes the client/account mapping. Logout does not log out
+the browser or revoke other sessions. Provider/callback text,
+credential values and keyring error details are not included in errors or logs.
+
+This lifecycle does **not** enable subscription inference. Stored credentials
+are not evidence of model/account eligibility, and the existing metered API-key
+path is unchanged. Only offline mocks have been tested, not real accounts. See
+[subscription limits](llm-provider-guide.md#chatgpt-subscription-authentication).
+
 ## Environment variables
 
 - `RUST_LOG`: tracing filter, for example `qcg=debug,engine=trace`.

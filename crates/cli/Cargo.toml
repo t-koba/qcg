@@ -25,11 +25,13 @@ api = { path = "../api" }
 contract = { path = "../contract" }
 engine = { path = "../engine" }
 files = { path = "../files" }
+keyring-store = { path = "../keyring-store" }
 service = { path = "../service" }
 policy = { path = "../policy" }
 server = { path = "../server" }
 model = { path = "../model" }
 reqwest.workspace = true
+openidconnect.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true

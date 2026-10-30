@@ -133,6 +133,7 @@ async fn run_async() -> Result<std::process::ExitCode> {
     init_tracing(cli.verbose, cli.log_format);
     let providers_path = cli.providers.clone();
     match cli.command {
+        Command::Auth { command } => cli::auth::run(command).await?,
         Command::New { path, id, force } => {
             new_generator(&path, id.as_deref(), force)?;
         }

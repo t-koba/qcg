@@ -33,6 +33,11 @@ pub(crate) enum LogFormat {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Manage standalone ChatGPT subscription credentials (not inference).
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
     /// Create a minimal generator skeleton. Mechanism only: a valid qcg.toml.
     /// Policy content (prompts, schemas, budgets) stays with the author.
     New {
@@ -442,4 +447,31 @@ pub(crate) enum DocsCommand {
     StepSchemas,
     RunEvents,
     Openapi,
+}
+
+/// Account labels explicitly select isolated credential entries; there is no default account.
+#[derive(Debug, Subcommand)]
+pub(crate) enum AuthCommand {
+    /// Sign in, or reauthenticate an existing account label.
+    Login {
+        #[arg(long)]
+        account: String,
+    },
+    /// Inspect local expiry; optionally refresh when within 60 seconds of expiry.
+    Status {
+        #[arg(long)]
+        account: String,
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Clear local credentials and attempt remote revocation unless --local.
+    Logout {
+        #[arg(long)]
+        account: String,
+        #[arg(long)]
+        local: bool,
+        /// Also delete the saved client/account registration mapping.
+        #[arg(long)]
+        forget: bool,
+    },
 }

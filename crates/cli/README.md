@@ -25,3 +25,20 @@ Initial endpoint support is unchanged: registry indexes use `file://` or
 `https://`, direct remote packages allow `http://` and `https://`, and trace
 exports use the operator-supplied endpoint. These transport defaults do not
 change the service's package limits or the run's HTTP-step policies.
+
+## Standalone subscription authentication
+
+`src/cli/auth.rs` and its private `auth/oauth.rs` adapter own the ChatGPT
+credential lifecycle. They are deliberately separate from the general CLI HTTP
+client and from API-key provider routing. OAuth HTTP uses reqwest 0.13 through
+openidconnect 4.0.1's HTTP interface (no library-default HTTP client), with a
+30-second request timeout, no redirects, same-issuer-origin endpoints and a
+256 KiB response-body bound enforced on advertised and streamed bytes.
+Callback requests have an 8 KiB bound and a five-second read timeout.
+
+See [CLI authentication](../../docs/cli-reference.md#chatgpt-subscription-credentials-standalone)
+for explicit account selection, keyring persistence, callback, refresh and logout
+behavior. `cargo test -p cli --bin qcg cli::auth --locked --offline` uses only
+loopback protocol mocks and a memory credential store; the ignored `lock_child`
+test is invoked by the cross-process-lock test as a subprocess helper. No tests
+contact OpenAI, use real credentials or establish subscription eligibility.

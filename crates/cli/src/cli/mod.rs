@@ -1,5 +1,6 @@
 pub(crate) mod args;
 pub(crate) mod artifacts;
+pub(crate) mod auth;
 pub(crate) mod dev;
 pub(crate) mod eval;
 pub(crate) mod gc;

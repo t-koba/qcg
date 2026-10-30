@@ -241,8 +241,11 @@ Fields:
 
 ### ChatGPT subscription authentication
 
-The provider schema does not currently implement Sign in with ChatGPT. An
-OpenAI API key is a separate, metered API billing path, not a ChatGPT
+The standalone `qcg auth login`, `qcg auth status`, and `qcg auth logout`
+commands manage Sign in with ChatGPT credentials in the OS keyring; each requires
+`--account <label>`. See the [CLI credential lifecycle](cli-reference.md#chatgpt-subscription-credentials-standalone).
+This is not an inference provider or an eligibility check. The provider schema
+does not accept these credentials. An OpenAI API key is a separate, metered API billing path, not a ChatGPT
 subscription credential. qcg does not send subscription-authenticated
 Responses requests: the SIWC preview route requires `store = false` and
 `stream = true` but does not support `max_output_tokens`, which qcg requires
