@@ -76,8 +76,7 @@ impl CatalogSourceSpec {
     pub fn location(&self) -> &str {
         self.url
             .as_deref()
-            .or(self.file.as_deref())
-            .unwrap_or("<unset>")
+            .unwrap_or(self.file.as_deref().unwrap_or("<unset>"))
     }
 
     pub fn kind_name(&self) -> &'static str {
@@ -179,9 +178,7 @@ fn deserialize_model_errors<'de, D: serde::Deserializer<'de>>(
         .flatten()
     {
         // Registry or contract tiers may price requests instead of flat rates.
-        if let Some(text) = warning.strip_suffix(", so its flat rates apply") {
-            warning.truncate(text.len());
-        }
+        warning.truncate(warning.trim_end_matches(", so its flat rates apply").len());
     }
     Ok(providers)
 }
@@ -520,12 +517,9 @@ impl CatalogService {
             .map_err(|error| format!("catalog fetch `{url}` failed: {error}"))
     }
 
-    /// Builds the serializable catalog view. Discovery runs on demand and is
-    /// merged over the explicit and cached metadata for selection only.
-    /// Display and runtime share the same field-level overlay (F09-04):
-    /// explicit declarations win per field, unspecified fields inherit the
-    /// external entry, so shown capabilities/pricing equal execution-time
-    /// resolution.
+    /// Builds the view; discovery overlays explicit/cached metadata on demand
+    /// for selection only. F09-04 gives explicit values precedence, fills gaps
+    /// externally, and keeps displayed pricing/capabilities aligned with runtime.
     pub async fn view(&self, refresh: bool) -> CatalogView {
         if refresh {
             let _ = self.refresh().await;
@@ -766,12 +760,9 @@ fn attach_credential(
     }
 }
 
-/// Screens a discovery response for credential reflection (F03). Checks the
-/// raw response bytes (covers JSON-escaped reflections) and every decoded
-/// key/value string before the ids reach the public view. Returns a generic
-/// reason without echoing the secret. Short credentials (< 8 chars) are
-/// still checked for exact id equality to avoid substring false positives
-/// on tiny values while catching direct echo.
+/// Screens raw (including escaped) and decoded discovery responses before
+/// exposing ids; returns a generic, secret-free reason. Short credentials are
+/// checked exactly to avoid substring false positives while catching echoes.
 fn credential_reflection(
     raw: &[u8],
     decoded: &Value,
@@ -1168,8 +1159,7 @@ fn map_models_dev_tiers(cost: Option<&ModelsDevCost>) -> Result<Vec<policy::Cost
     if mapped.is_empty() && cost.is_some_and(|cost| !cost.tiers.is_empty()) {
         return Err("the source names no context tier band".to_string());
     }
-    // The source's order is not guaranteed; the rules assume increasing
-    // thresholds.
+    // Sort source tiers because validation assumes increasing thresholds.
     mapped.sort_by_key(|tier| tier.threshold_tokens);
     policy::validate_cost_tiers(&mapped).map_err(|error| error.to_string())?;
     Ok(mapped)
