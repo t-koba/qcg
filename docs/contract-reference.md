@@ -4884,6 +4884,10 @@ fields are rejected when their structs define a closed schema.
    `max_cost_usd` are enforced at attempt entry (`StepContext::step_checkpoint`)
    plus per-tool-call checkpoints inside agent execution (never mid-token-stream,
    but checked on every tool call boundary as well as every attempt start) (E11).
+   Token and cost budgets are local controls, not provider-enforced caps;
+   estimated admission and post-hoc reported-usage accounting cannot guarantee
+   that actual provider usage or charges stay below the declared ceilings. See
+   [provider budget guidance](llm-provider-guide.md#budget-and-fallback-policy-guidance).
    Plan estimates (`--plan --diff` forecast/`estimates` in `crates/cli/src/cli/plan.rs`,
    FOREIGN) report these declared budgets read-only and enforce nothing themselves:
    they must be presented with the enforcement strengths above (elapsed is a hard
