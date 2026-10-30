@@ -9,6 +9,15 @@ ignore = [
   { id = "RUSTSEC-2026-0371", reason = "zbus_names 4.3.4 is required by keyring 4.2.0's Linux Secret Service backend; maintenance-only notice, no compatible upstream migration release yet." },
   { id = "RUSTSEC-2026-0370", reason = "zvariant 5.15.0 is required by keyring 4.2.0's Linux Secret Service backend; maintenance-only notice, no compatible upstream migration release yet." },
   { id = "RUSTSEC-2026-0372", reason = "zvariant_derive 5.15.0 is required by keyring 4.2.0's Linux Secret Service backend; maintenance-only notice, no compatible upstream migration release yet." },
+  # These are use-site exceptions, not patched crates. The CLI's only RSA/EC
+  # use is public ID-token verification through openidconnect. In
+  # crates/cli/src/cli/auth/oauth.rs, clients have no secret and token
+  # validation uses id_token_verifier / claims; qcg passes or stores no RSA/EC
+  # private key and performs no secret-key
+  # signing/decryption. Reassess if auth adds private-key operations or the
+  # dependency chain changes; remove when a compatible fixed chain is available.
+  { id = "RUSTSEC-2023-0071", reason = "Marvin affects RSA private-key timing. qcg's only rsa consumer is CLI openidconnect ID-token verification using public issuer keys; no RSA private key is held or used. Reassess if auth adds private-key operations or the dependency path changes." },
+  { id = "RUSTSEC-2026-0387", reason = "Affected crypto-bigint operations leak secret integers through timing. qcg's only crypto-bigint consumer is CLI openidconnect EC ID-token verification using public issuer keys and signatures; qcg has no EC private key or secret-integer arithmetic. Reassess if this use changes or a compatible fixed chain becomes available." },
 ]
 
 [bans]
