@@ -8,8 +8,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 struct Fixture(Utf8PathBuf);
 impl Fixture {
     fn new() -> Self {
@@ -71,18 +69,31 @@ fn file_url(path: &Utf8PathBuf) -> String {
     format!("file://{}", path.as_str().replace('\\', "/"))
 }
 
-// One bounded loopback response; never contacts a registry or provider.
-fn serve(response: Vec<u8>) -> (String, thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let url = format!("http://{}/package.pkg", listener.local_addr().unwrap());
-    let task = thread::spawn(move || {
+// One bounded loopback response; never contacts a registry or provider. The
+// test thread services the listener while the CLI child runs, avoiding extra
+// server threads on resource-limited CI runners.
+struct LoopbackServer {
+    listener: TcpListener,
+    response: Vec<u8>,
+}
+
+impl LoopbackServer {
+    fn run(self, mut command: Command) -> Output {
+        let mut child = command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        let mut socket = loop {
-            match listener.accept() {
-                Ok((socket, _)) => break socket,
+        let (mut socket, _) = loop {
+            match self.listener.accept() {
+                Ok(socket) => break socket,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(Instant::now() < deadline, "no install request received");
+                    if child.try_wait().unwrap().is_some() || Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let output = child.wait_with_output().unwrap();
+                        panic!("no install request received: {}", stderr(&output));
+                    }
                     thread::sleep(Duration::from_millis(5));
                 }
                 Err(error) => panic!("{error}"),
@@ -101,9 +112,24 @@ fn serve(response: Vec<u8>) -> (String, thread::JoinHandle<()>) {
             request.push(byte[0]);
             assert!(request.len() < 8192);
         }
-        socket.write_all(&response).unwrap();
-    });
-    (url, task)
+        socket.write_all(&self.response).unwrap();
+        drop(socket);
+        child.wait_with_output().unwrap()
+    }
+}
+
+fn serve(response: Vec<u8>) -> (String, LoopbackServer) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/package.pkg", listener.local_addr().unwrap());
+    (url, LoopbackServer { listener, response })
+}
+
+fn run(mut command: Command, server: Option<LoopbackServer>) -> Output {
+    match server {
+        Some(server) => server.run(command),
+        None => command.output().unwrap(),
+    }
 }
 
 fn chunked(bytes: &[u8]) -> Vec<u8> {
@@ -120,7 +146,6 @@ fn chunked(bytes: &[u8]) -> Vec<u8> {
 
 #[test]
 fn install_archive_boundary_and_flag_env_precedence_for_local_and_http() {
-    let _serial = TEST_LOCK.lock().unwrap();
     let fixture = Fixture::new();
     let source = fixture.0.join("source");
     std::fs::create_dir(&source).unwrap();
@@ -142,51 +167,45 @@ fn install_archive_boundary_and_flag_env_precedence_for_local_and_http() {
     let bytes = std::fs::read(&archive).unwrap();
     let digest = hex::encode(Sha256::digest(&bytes));
     let size = bytes.len() as u64;
-    for transport in ["path", "file", "http"] {
-        // Omitted default, exact/lower flag and env limits, and flag-over-env.
-        for (flag, env, success) in [
-            (None, None, true),
-            (Some(size), None, true),
-            (Some(size - 1), None, false),
-            (None, Some(size), true),
-            (None, Some(size - 1), false),
-            (Some(size), Some(size - 1), true),
-        ] {
-            let (source, server) = match transport {
-                "http" => {
-                    let (url, task) = serve(chunked(&bytes));
-                    (url, Some(task))
-                }
-                "file" => (file_url(&archive), None),
-                _ => (archive.to_string(), None),
-            };
-            let mut command = fixture.install(&source, &digest);
-            if let Some(limit) = flag {
-                command.args(["--max-archive-bytes", &limit.to_string()]);
+    for (transport, flag, env, success) in [
+        ("path", None, None, true),
+        ("file", Some(size), None, true),
+        ("http", None, Some(size), true),
+        ("path", Some(size - 1), None, false),
+        ("file", None, Some(size - 1), false),
+        ("http", Some(size - 1), None, false),
+        ("path", Some(size), Some(size - 1), true),
+    ] {
+        let (source, server) = match transport {
+            "http" => {
+                let (url, server) = serve(chunked(&bytes));
+                (url, Some(server))
             }
-            if let Some(limit) = env {
-                command.env("PACKAGE_MAX_ARCHIVE_BYTES", limit.to_string());
-            }
-            let output = command.output().unwrap();
-            if let Some(server) = server {
-                server.join().unwrap();
-            }
-            assert_eq!(
-                output.status.success(),
-                success,
-                "{transport} {flag:?} {env:?}: {}",
-                stderr(&output)
-            );
-            if !success {
-                assert!(stderr(&output).contains("exceeds"), "{}", stderr(&output));
-            }
+            "file" => (file_url(&archive), None),
+            _ => (archive.to_string(), None),
+        };
+        let mut command = fixture.install(&source, &digest);
+        if let Some(limit) = flag {
+            command.args(["--max-archive-bytes", &limit.to_string()]);
+        }
+        if let Some(limit) = env {
+            command.env("PACKAGE_MAX_ARCHIVE_BYTES", limit.to_string());
+        }
+        let output = run(command, server);
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{transport} {flag:?} {env:?}: {}",
+            stderr(&output)
+        );
+        if !success {
+            assert!(stderr(&output).contains("exceeds"), "{}", stderr(&output));
         }
     }
 }
 
 #[test]
 fn default_archive_transport_boundary_and_raised_override() {
-    let _serial = TEST_LOCK.lock().unwrap();
     let fixture = Fixture::new();
     let archive = fixture.0.join("oversize.pkg");
     let limit = service::DEFAULT_PACKAGE_MAX_ARCHIVE_BYTES;
@@ -207,15 +226,13 @@ fn default_archive_transport_boundary_and_raised_override() {
                 if size == limit {
                     response.resize(response.len() + size as usize, 0);
                 }
-                let (url, task) = serve(response);
-                (url, Some(task))
+                let (url, server) = serve(response);
+                (url, Some(server))
             } else {
                 (archive.to_string(), None)
             };
-            let output = fixture.install(&source, &"0".repeat(64)).output().unwrap();
-            if let Some(server) = server {
-                server.join().unwrap();
-            }
+            let command = fixture.install(&source, &"0".repeat(64));
+            let output = run(command, server);
             assert!(!output.status.success());
             let expected = if size == limit {
                 "SHA-256 mismatch"
