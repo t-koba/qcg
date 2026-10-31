@@ -181,50 +181,60 @@ pub fn write_run_bundle_stream_with_limits<W: Write>(
 ) -> Result<(), ServiceError> {
     check_bundle_limits(parts.source_bytes, parts.entry_count, limits)?;
     let mut zip = zip::ZipWriter::new_stream(CountingWriter::new(writer, limits.max_bytes));
-    let mut metas = vec![
-        ("snapshot.json", &parts.snapshot_bytes),
-        ("inputs.json", &parts.inputs_bytes),
-    ];
-    if let Some(bytes) = &parts.outputs_bytes {
-        metas.push(("outputs.json", bytes));
-    }
-    for (name, bytes) in metas {
-        zip.start_file(name, bundle_entry_options(false))
-            .map_err(artifact_zip_error)?;
-        zip.write_all(bytes)?;
-    }
-    for (name, path, len) in std::iter::once(("journal", parts.journal.clone(), parts.journal_len))
-        .chain(
-            parts
-                .audit_len
-                .map(|len| ("audit", parts.journal.with_file_name("audit.jsonl"), len)),
-        )
-    {
-        zip.start_file(format!("{name}.jsonl"), bundle_entry_options(false))
-            .map_err(artifact_zip_error)?;
-        let mut src = File::open(path)?.take(len);
-        if std::io::copy(&mut src, &mut zip)? != len {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!("{name} shorter than prepared length"),
-            )
-            .into());
+    let result: Result<(), ServiceError> = (|| {
+        let mut metas = vec![
+            ("snapshot.json", &parts.snapshot_bytes),
+            ("inputs.json", &parts.inputs_bytes),
+        ];
+        if let Some(bytes) = &parts.outputs_bytes {
+            metas.push(("outputs.json", bytes));
         }
-    }
-    for dir in &parts.directories {
-        zip.add_directory(format!("{dir}/"), bundle_entry_options(true))
+        for (name, bytes) in metas {
+            zip.start_file(name, bundle_entry_options(false))
+                .map_err(artifact_zip_error)?;
+            zip.write_all(bytes)?;
+        }
+        for (name, path, len) in
+            std::iter::once(("journal", parts.journal.clone(), parts.journal_len)).chain(
+                parts
+                    .audit_len
+                    .map(|len| ("audit", parts.journal.with_file_name("audit.jsonl"), len)),
+            )
+        {
+            zip.start_file(format!("{name}.jsonl"), bundle_entry_options(false))
+                .map_err(artifact_zip_error)?;
+            let mut src = File::open(path)?.take(len);
+            if std::io::copy(&mut src, &mut zip)? != len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("{name} shorter than prepared length"),
+                )
+                .into());
+            }
+        }
+        for dir in &parts.directories {
+            zip.add_directory(format!("{dir}/"), bundle_entry_options(true))
+                .map_err(artifact_zip_error)?;
+        }
+        for artifact in &parts.verified {
+            let file = File::open(&artifact.fs_path)?;
+            let mut src = file.take(artifact.bytes);
+            zip.start_file(
+                format!("artifacts/{}", artifact.path),
+                bundle_entry_options(false),
+            )
             .map_err(artifact_zip_error)?;
+            copy_verified_artifact(&mut src, &mut zip, artifact)?;
+        }
+        Ok(())
+    })();
+    // Block implicit finalization for every failed bundle entry, not only artifacts.
+    if result.is_err()
+        && let Some(writer) = zip.get_ref()
+    {
+        writer.get_ref().aborted.set(true);
     }
-    for artifact in &parts.verified {
-        let file = File::open(&artifact.fs_path)?;
-        let mut src = file.take(artifact.bytes);
-        zip.start_file(
-            format!("artifacts/{}", artifact.path),
-            bundle_entry_options(false),
-        )
-        .map_err(artifact_zip_error)?;
-        copy_verified_artifact(&mut src, &mut zip, artifact)?;
-    }
+    result?;
     finish_artifact_archive(zip, "run bundle")
 }
 
@@ -325,23 +335,38 @@ impl<W: Write> Write for CountingWriter<W> {
         if self.aborted.get() {
             return Err(std::io::Error::other("artifact archive aborted"));
         }
-        let remaining = match self.limit {
-            Some(limit) => usize::try_from(limit.saturating_sub(self.written))
-                .map_err(|_| std::io::Error::other("artifact zip output size overflowed"))?
-                .min(bytes.len()),
-            None => bytes.len(),
-        };
-        self.inner.write_all(&bytes[..remaining])?;
-        self.written = self
-            .written
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| std::io::Error::other("artifact zip output size overflowed"))?;
-        self.exceeded |= remaining < bytes.len();
-        Ok(bytes.len())
+        // Any write error aborts the stream so `ZipWriter::drop` cannot
+        // retry finalization after an explicit `zip.finish()` failure.
+        let result: std::io::Result<usize> = (|| {
+            let remaining = match self.limit {
+                Some(limit) => usize::try_from(limit.saturating_sub(self.written))
+                    .map_err(|_| std::io::Error::other("artifact zip output size overflowed"))?
+                    .min(bytes.len()),
+                None => bytes.len(),
+            };
+            self.inner.write_all(&bytes[..remaining])?;
+            self.written = self
+                .written
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| std::io::Error::other("artifact zip output size overflowed"))?;
+            self.exceeded |= remaining < bytes.len();
+            Ok(bytes.len())
+        })();
+        if result.is_err() {
+            self.aborted.set(true);
+        }
+        result
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
+        if self.aborted.get() {
+            return Err(std::io::Error::other("artifact archive aborted"));
+        }
+        let result = self.inner.flush();
+        if result.is_err() {
+            self.aborted.set(true);
+        }
+        result
     }
 }
 

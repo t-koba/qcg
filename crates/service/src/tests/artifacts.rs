@@ -1203,12 +1203,21 @@ async fn bundle_source_growth_pinning() {
     // A shortened source is a real post-header I/O failure, not validation.
     for ((_, path), (_, bytes)) in sources.iter().zip(&pinned) {
         std::fs::write(path, []).expect("truncate source");
+        let mut buf = Vec::new();
         let err =
-            write_run_bundle_stream_with_limits(&parts, Vec::new(), &ArtifactZipLimits::default())
+            write_run_bundle_stream_with_limits(&parts, &mut buf, &ArtifactZipLimits::default())
                 .expect_err("short read must fail streaming");
         assert!(
             matches!(err, ServiceError::Io(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof),
             "{err}"
+        );
+        assert!(
+            !buf.is_empty(),
+            "failure must occur after ZIP output begins"
+        );
+        assert!(
+            zip::ZipArchive::new(std::io::Cursor::new(buf)).is_err(),
+            "short source must not leave a finalized ZIP"
         );
         std::fs::write(path, bytes).expect("restore pinned source");
     }
@@ -1253,6 +1262,92 @@ fn bundle_footer_cap_includes_footer() {
     .expect_err("footer-inclusive cap must fail at full-1");
     assert!(err.to_string().contains("exceeds"), "{err}");
     assert_eq!(buf.len() as u64, full_len - 1);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn bundle_finalize_failure_aborts_without_retry() {
+    use std::io::Write as _;
+    struct FailOnceFinalize {
+        output: Vec<u8>,
+        fail_at: u64,
+        bytes_written: u64,
+        failed: bool,
+        writes_after_fail: usize,
+    }
+    impl std::io::Write for FailOnceFinalize {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if !self.failed && self.bytes_written + bytes.len() as u64 > self.fail_at {
+                self.failed = true;
+                return Err(std::io::Error::other("injected finalize failure"));
+            }
+            if self.failed {
+                self.writes_after_fail += 1;
+            }
+            self.output.extend_from_slice(bytes);
+            self.bytes_written += bytes.len() as u64;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let root = temp_run_dir("bundle-finalize-abort");
+    std::fs::create_dir_all(&root).expect("temp dir");
+    let journal = root.join("journal.jsonl");
+    std::fs::write(&journal, []).expect("empty journal");
+    let parts = RunBundleParts {
+        source_bytes: 4,
+        entry_count: 3,
+        snapshot_bytes: b"{}".to_vec(),
+        inputs_bytes: b"{}".to_vec(),
+        outputs_bytes: None,
+        journal,
+        journal_len: 0,
+        audit_len: None,
+        verified: vec![],
+        directories: vec![],
+    };
+    let mut full = Vec::new();
+    write_run_bundle_stream_with_limits(&parts, &mut full, &ArtifactZipLimits::default())
+        .expect("baseline bundle must succeed");
+    zip::ZipArchive::new(Cursor::new(&full)).expect("baseline must be a valid ZIP");
+    let full_len = full.len() as u64;
+    assert!(full_len > 50, "baseline must span entries and footer");
+    // Fail the write that completes the footer; later writes would succeed.
+    let mut sink = FailOnceFinalize {
+        output: Vec::new(),
+        fail_at: full_len - 5,
+        bytes_written: 0,
+        failed: false,
+        writes_after_fail: 0,
+    };
+    let err = write_run_bundle_stream_with_limits(&parts, &mut sink, &ArtifactZipLimits::default())
+        .expect_err("finalize failure must fail the bundle");
+    assert!(
+        err.to_string().contains("injected finalize failure"),
+        "{err}"
+    );
+    assert!(sink.failed, "failure must occur during finalization");
+    assert_eq!(
+        sink.writes_after_fail, 0,
+        "aborted stream must block Drop retry writes"
+    );
+    assert!(
+        !sink.output.is_empty(),
+        "failure must occur after ZIP output begins"
+    );
+    assert!(
+        zip::ZipArchive::new(Cursor::new(&sink.output)).is_err(),
+        "failed bundle must not leave a finalized ZIP"
+    );
+    // The sink would accept further writes, so the missing retry is the abort.
+    sink.write_all(b"more")
+        .expect("fail-once sink must accept writes after its single failure");
+    assert_eq!(
+        sink.writes_after_fail, 1,
+        "sink must record the would-be retry write"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
