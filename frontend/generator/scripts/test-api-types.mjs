@@ -1,5 +1,5 @@
 // Bidirectional structural parity, not a text snapshot: every legacy public
-// export is checked, including the populated operationId mutation. No network.
+// export is checked against a frozen pre-migration fixture. No network.
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
@@ -12,8 +12,8 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const spec = JSON.parse(readFileSync(resolve(root, 'docs/openapi.json')));
 const directory = mkdtempSync(resolve(tmpdir(), 'qcg-api-parity-'));
 try {
-  writeFileSync(resolve(directory, 'baseline.ts'), await openapiTypes(spec));
-  writeFileSync(resolve(directory, 'canonical.ts'), readFileSync(resolve(root, 'clients/ts/types.ts')));
+  writeFileSync(resolve(directory, 'baseline.ts'), readFileSync(resolve(root, 'frontend/generator/testdata/legacy-api-types.ts')));
+  writeFileSync(resolve(directory, 'canonical.ts'), await openapiTypes(spec));
   const mutated = structuredClone(spec);
   const op = mutated.paths['/healthz'].get;
   op.operationId = 'probeHealth';
@@ -30,25 +30,26 @@ import type * as M from './mutated';
 type Assert<T extends true> = T;
 type Bi<A, B> = [A] extends [B] ? [B] extends [A] ? true : false : false;
 type Baseline = [Assert<Bi<A.paths, B.paths>>,
-  Assert<Bi<Omit<A.components, 'securitySchemes'>, Omit<B.components, 'securitySchemes'>>>,
-  Assert<Bi<A.webhooks, B.webhooks>>, Assert<Bi<A.$defs, B.$defs>>, Assert<Bi<A.operations, B.operations>>,
-  Assert<Bi<A.components['securitySchemes']['bearerAuth'], Bearer>>];
+  Assert<Bi<A.components, LegacyComponents>>,
+  Assert<Bi<A.webhooks, B.webhooks>>, Assert<Bi<A.$defs, B.$defs>>, Assert<Bi<A.operations, B.operations>>];
 type Probe = { label: string; free?: unknown };
-type Bearer = { type: 'http'; scheme: string };
-type Old = A.paths['/healthz']['get'];
+// The legacy generator omitted securitySchemes entirely. Check the complete
+// added section independently, rather than excluding it from component parity.
+type SecuritySchemes = { bearerAuth: { type: 'http'; scheme: string } };
+type LegacyComponents = B.components & { securitySchemes: SecuritySchemes };
+type Old = B.paths['/healthz']['get'];
 type Operation = Omit<Old, 'parameters' | 'responses'> & {
   parameters: { query: { mode: 'brief' | 'full' }; header?: never; path?: never; cookie?: never };
   responses: Omit<Old['responses'], 200> & {
     200: Omit<Old['responses'][200], 'content'> & { content: { 'application/json': Probe } };
   };
 };
-type Paths = Omit<A.paths, '/healthz'> & { '/healthz': Omit<A.paths['/healthz'], 'get'> & { get: Operation } };
-type Components = Omit<A.components, 'schemas' | 'securitySchemes'> & {
-  schemas: A.components['schemas'] & { MigrationProbe: Probe };
-  securitySchemes: { bearerAuth: Bearer };
+type Paths = Omit<B.paths, '/healthz'> & { '/healthz': Omit<B.paths['/healthz'], 'get'> & { get: Operation } };
+type Components = Omit<LegacyComponents, 'schemas'> & {
+  schemas: B.components['schemas'] & { MigrationProbe: Probe };
 };
 type Mutation = [Assert<Bi<Paths, M.paths>>, Assert<Bi<Components, M.components>>,
-  Assert<Bi<A.webhooks, M.webhooks>>, Assert<Bi<A.$defs, M.$defs>>, Assert<Bi<{probeHealth: Operation}, M.operations>>];
+  Assert<Bi<B.webhooks, M.webhooks>>, Assert<Bi<B.$defs, M.$defs>>, Assert<Bi<{probeHealth: Operation}, M.operations>>];
 `);
   execFileSync(process.execPath, [resolve(root, 'frontend/generator/node_modules/typescript/bin/tsc'),
     '--noEmit', '--strict', '--target', 'ES2022', '--module', 'ESNext', '--moduleResolution', 'bundler', '--lib', 'ES2022,DOM',
@@ -69,4 +70,4 @@ type Mutation = [Assert<Bi<Paths, M.paths>>, Assert<Bi<Components, M.components>
     await assert.rejects(() => openapiTypes(unsupported), /Unsupported OpenAPI/, name);
   }
 } finally { rmSync(directory, { recursive: true, force: true }); }
-console.log('All five exports: baseline and synthetic mutation parity; strict SDK/API-client compilation; explicit rejection passed');
+console.log('All five exports: frozen legacy baseline and synthetic mutation parity; complete security schemes; strict SDK/API-client compilation; explicit rejection passed');

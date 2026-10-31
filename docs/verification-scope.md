@@ -69,10 +69,15 @@ headers/pathItems fail explicitly before generation. They are not silently erase
 or replaced with `unknown`; expanding this subset requires a compatibility review.
 
 `npm run test:api` checks bidirectional structural parity for all five exports
-against the checked-in baseline and against an independently described synthetic
-mutation (operation ID, required enum query, referenced response, defaulted field
-and boolean-true field). It also compiles the SDK and frontend API client under
-strict TypeScript and tests unsupported-input rejection. `check-sdk.sh` checks
+against `frontend/generator/testdata/legacy-api-types.ts`, copied verbatim from
+the pre-migration declarations, not regenerated with Hey API. The legacy generator
+omitted `securitySchemes`; the complete added section is checked against an
+explicit test-only expectation, without excluding it from component parity. A
+synthetic mutation (operation ID, required enum query, referenced response,
+defaulted field and boolean-true field) derives its expected unchanged shapes
+from the legacy fixture, including the prior `/healthz` operation. It also compiles
+the SDK and frontend API client under strict TypeScript and tests unsupported-input
+rejection. `check-sdk.sh` checks
 SDK freshness and every SDK TypeScript file; `npm run check:api` independently
 regenerates the server OpenAPI and shared types. The required online audit and
 full frontend checks/build remain CI gates; local offline generation is not
