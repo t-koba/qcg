@@ -8,9 +8,9 @@ per-day job-minutes.
 Method (also printed into the report):
 - Per-job durations come from exact ``started_at``/``completed_at`` stamps,
   summed over all attempts via ``GET .../runs/{id}/jobs?filter=all``.
-- Never-started jobs (``skipped``, or ``cancelled`` / ``neutral`` with no
-  timestamps) count as 0 s. Any other missing or
-  inconsistent timestamp fails the report instead of guessing.
+- Skipped jobs count as 0 s regardless of timestamp fields. Never-started
+  ``cancelled`` / ``neutral`` jobs with no timestamps also count as 0 s.
+  Any other missing or inconsistent timestamp fails the report instead of guessing.
 - The UTC-day cohort keeps each completed run once (deduped by run id),
   filters client-side to the source run's UTC ``created_at`` date and branch,
   and sums all job attempts per run.
@@ -89,9 +89,7 @@ def job_seconds(job):
     started = job.get("started_at")
     completed = job.get("completed_at")
     if conclusion == "skipped":
-        if started is None and completed is None:
-            return 0.0
-        raise ReportError("skipped job %r unexpectedly has timestamps" % (name,))
+        return 0.0  # skipped jobs consume no runner time, even with API timestamps
     if started is None and completed is None and conclusion in ("cancelled", "neutral"):
         return 0.0  # never started: no runner time consumed
     if started is None or completed is None:
@@ -427,7 +425,7 @@ def render_markdown(ctx):
     lines.append("")
     lines.append("## Method")
     lines.append("")
-    lines.append("- Exact `started_at` → `completed_at` per job row across all attempts (`filter=all`); skipped / never-started jobs count 0 s; any other missing or inconsistent timestamp fails the report instead of guessing.")
+    lines.append("- Exact `started_at` → `completed_at` per job row across all attempts (`filter=all`); skipped jobs count 0 s regardless of timestamp fields; cancelled / neutral jobs count 0 s only when both timestamps are absent; any other missing or inconsistent timestamp fails the report instead of guessing.")
     lines.append("- Day cohort: completed runs on the same branch whose UTC `created_at` date equals `%s`; each run counted once; all job attempts included." % ctx["day"])
     lines.append("- Token read only from `GH_TOKEN`/`GITHUB_TOKEN`; never printed. API parameters URL-encoded; list endpoints paginated via `Link: rel=\"next\"` with bounded retries on 429/5xx.")
     lines.append("- Generated at %s." % ctx["generated_at"])

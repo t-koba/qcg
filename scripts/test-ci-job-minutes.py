@@ -69,7 +69,7 @@ SOURCE_RUN = {
 SOURCE_JOBS = [
     job("Rust (ubuntu-latest)", "2026-10-22T01:03:00Z", "2026-10-22T01:16:32.500Z"),
     job("Rust (macos-latest)", "2026-10-22T01:03:01Z", "2026-10-22T01:20:00Z"),
-    job("skipped-thing", None, None, conclusion="skipped"),
+    job("skipped-thing", "2026-10-22T01:03:00Z", None, conclusion="skipped"),
     job("cancelled-early", None, None, conclusion="cancelled"),
     job("flaky", "2026-10-22T01:03:00Z", "2026-10-22T01:05:00Z", conclusion="failure", attempt=1),
     job("flaky", "2026-10-22T01:10:00Z", "2026-10-22T01:13:00Z", conclusion="success", attempt=2),
@@ -147,21 +147,28 @@ class ReporterTests(unittest.TestCase):
         seconds = reporter.job_seconds(SOURCE_JOBS[0])
         self.assertAlmostEqual(seconds, 812.5, places=3)
 
-    def test_job_seconds_skipped_and_no_start_zero(self):
-        self.assertEqual(reporter.job_seconds(SOURCE_JOBS[2]), 0.0)
-        self.assertEqual(reporter.job_seconds(SOURCE_JOBS[3]), 0.0)
+    def test_job_seconds_skipped_timestamps_zero(self):
+        start, end = "2026-10-22T01:00:00Z", "2026-10-22T01:00:01Z"
+        for started, completed in ((None, None), (start, None), (None, end), (start, end)):
+            with self.subTest(started=started, completed=completed):
+                self.assertEqual(
+                    reporter.job_seconds(job("skip", started, completed, conclusion="skipped")), 0.0
+                )
+
+    def test_job_seconds_never_started_zero(self):
+        for conclusion in ("cancelled", "neutral"):
+            with self.subTest(conclusion=conclusion):
+                self.assertEqual(reporter.job_seconds(job("x", None, None, conclusion=conclusion)), 0.0)
 
     def test_job_seconds_missing_or_inconsistent_fails_closed(self):
+        start, end = "2026-10-22T01:04:00Z", "2026-10-22T01:05:00Z"
+        for conclusion in ("success", "cancelled", "neutral"):
+            for started, completed in ((None, end), (start, None), (end, start)):
+                with self.subTest(conclusion=conclusion, started=started, completed=completed):
+                    with self.assertRaises(reporter.ReportError):
+                        reporter.job_seconds(job("x", started, completed, conclusion=conclusion))
         with self.assertRaises(reporter.ReportError):
-            reporter.job_seconds(job("x", None, "2026-10-22T01:04:00Z"))
-        with self.assertRaises(reporter.ReportError):
-            reporter.job_seconds(job("x", "2026-10-22T01:04:00Z", None))
-        with self.assertRaises(reporter.ReportError):
-            reporter.job_seconds(job("x", "2026-10-22T01:05:00Z", "2026-10-22T01:04:00Z"))
-        with self.assertRaises(reporter.ReportError):
-            reporter.job_seconds(job("skip", "2026-10-22T01:00:00Z", "2026-10-22T01:00:01Z", conclusion="skipped"))
-        with self.assertRaises(reporter.ReportError):
-            reporter.job_seconds(job("cancelled", "2026-10-22T01:00:00Z", None, conclusion="cancelled"))
+            reporter.job_seconds(job("x", None, None))
 
     def test_pagination_independent_parsing(self):
         base = "https://api.github.com/repos/o/r/actions/runs/1/jobs?filter=all&per_page=100"
