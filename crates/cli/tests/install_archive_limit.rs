@@ -8,6 +8,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct Fixture(Utf8PathBuf);
 impl Fixture {
     fn new() -> Self {
@@ -29,6 +31,12 @@ impl Fixture {
             "PACKAGE_MAX_METADATA_BYTES",
             "PACKAGE_MAX_ENTRIES",
             "PACKAGE_MAX_BYTES",
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
         ] {
             command.env_remove(name);
         }
@@ -57,6 +65,10 @@ impl Drop for Fixture {
 
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn file_url(path: &Utf8PathBuf) -> String {
+    format!("file://{}", path.as_str().replace('\\', "/"))
 }
 
 // One bounded loopback response; never contacts a registry or provider.
@@ -108,6 +120,7 @@ fn chunked(bytes: &[u8]) -> Vec<u8> {
 
 #[test]
 fn install_archive_boundary_and_flag_env_precedence_for_local_and_http() {
+    let _serial = TEST_LOCK.lock().unwrap();
     let fixture = Fixture::new();
     let source = fixture.0.join("source");
     std::fs::create_dir(&source).unwrap();
@@ -144,7 +157,7 @@ fn install_archive_boundary_and_flag_env_precedence_for_local_and_http() {
                     let (url, task) = serve(chunked(&bytes));
                     (url, Some(task))
                 }
-                "file" => (format!("file://{archive}"), None),
+                "file" => (file_url(&archive), None),
                 _ => (archive.to_string(), None),
             };
             let mut command = fixture.install(&source, &digest);
@@ -173,6 +186,7 @@ fn install_archive_boundary_and_flag_env_precedence_for_local_and_http() {
 
 #[test]
 fn default_archive_transport_boundary_and_raised_override() {
+    let _serial = TEST_LOCK.lock().unwrap();
     let fixture = Fixture::new();
     let archive = fixture.0.join("oversize.pkg");
     let limit = service::DEFAULT_PACKAGE_MAX_ARCHIVE_BYTES;
