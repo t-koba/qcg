@@ -394,6 +394,14 @@ row applies. It never mixes rates between those candidate rows. An absent
 cache rate in the selected base row falls back to that base row's ordinary
 input rate when present; explicit zero is preserved.
 
+The commented `openrouter` template is a generic Chat Completions route, not an
+upstream endpoint pin. qcg neither selects nor records the OpenRouter endpoint
+or service tier that served the request. Because a model can have differently
+priced upstream endpoints, a configured provider/model rate and `require_pricing`
+only establish qcg's estimate inputs; they do not establish the rate OpenRouter
+billed. `budget.max_cost_usd` uses that estimate and is not an upstream spend
+guarantee.
+
 Configured prices must be finite and non-negative (the manifest rejects
 invalid prices, and the runtime refuses to bill them). `ModelRef::invalid_price`
 validates base-row and web-search rates; `policy::validate_cost_tiers` validates
