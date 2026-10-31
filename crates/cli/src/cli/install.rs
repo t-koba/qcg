@@ -220,14 +220,8 @@ pub(crate) async fn install(
     limits: &service::PackageLimits,
 ) -> Result<String> {
     reap_stale_install_tmps(generators_dir)?;
-    // Classify URL sources before filesystem metadata: on Windows, URL
-    // strings containing `:` are invalid paths and must not abort dispatch.
-    let source_is_path_or_url = source.starts_with("file://")
-        || source.starts_with("http://")
-        || source.starts_with("https://")
-        || path_exists(Utf8Path::new(source))?;
     if let Some((id, requirement)) = crate::registry::split_id_source(source)
-        && !source_is_path_or_url
+        && !path_exists(Utf8Path::new(source))?
     {
         let requirement = semver::VersionReq::parse(&requirement)
             .with_context(|| format!("version requirement `{requirement}` is invalid"))?;
