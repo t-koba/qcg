@@ -498,7 +498,11 @@ components, including implicit parent directories, and rejects aliases such as
 `A/x` alongside `a/y`; shared parents with identical spelling remain valid.
 This rule is intentionally conservative and is not exact NTFS, APFS, or other
 filesystem emulation. It detects collisions only: accepted path spelling is
-preserved rather than rewritten.
+preserved rather than rewritten. Qcg's relative-path checks impose no
+component-name or full-path length limit; the target OS and filesystem may
+still reject a path that passes these checks. Total-path support also depends
+on the configured workspace root and host settings, so paths must fit the
+limits of every target environment.
 
 Directory-backed assets are canonicalized and must remain below the canonical
 generator root, including through symlinks.
