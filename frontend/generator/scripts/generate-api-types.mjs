@@ -3,6 +3,8 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { openapiTypes } from "./openapi-types.mjs";
+
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const uiRoot = resolve(root, "frontend/generator");
 const outDir = resolve(process.argv[2] ?? resolve(uiRoot, "src/api"));
@@ -21,12 +23,7 @@ const openapi = execFileSync("cargo", ["run", "-q", "-p", "cli", "--locked", "--
   encoding: "utf8",
 });
 writeFileSync(openapiPath, openapi);
-execFileSync("npx", ["openapi-typescript", openapiPath, "-o", typesPath], {
-  cwd: uiRoot,
-  stdio: "inherit",
-  // Windows spawns .cmd shims only through a shell (same as generate-sdk.mjs).
-  shell: process.platform === "win32",
-});
+writeFileSync(typesPath, await openapiTypes(JSON.parse(openapi)));
 if (!temporaryOutput) {
   writeFileSync(
     resolve(uiRoot, "src/api/types.d.ts"),

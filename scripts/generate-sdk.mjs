@@ -7,10 +7,11 @@
 // generated file is checked in and CI re-runs this script to prove it is
 // current (scripts/check-sdk.sh).
 
-import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { openapiTypes } from "../frontend/generator/scripts/openapi-types.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const spec = JSON.parse(readFileSync(resolve(root, "docs/openapi.json"), "utf8"));
@@ -1054,16 +1055,7 @@ ${pinned.map(pyOperation).join("\n\n")}
 
 mkdirSync(resolve(outRoot, "ts"), { recursive: true });
 mkdirSync(resolve(outRoot, "python"), { recursive: true });
-execFileSync(
-  // Windows spawns .cmd shims only through a shell.
-  "npx",
-  ["openapi-typescript", "../../docs/openapi.json", "-o", resolve(outRoot, "ts/types.ts")],
-  {
-    cwd: resolve(root, "frontend/generator"),
-    stdio: "inherit",
-    shell: process.platform === "win32",
-  },
-);
+writeFileSync(resolve(outRoot, "ts/types.ts"), await openapiTypes(spec));
 writeFileSync(resolve(outRoot, "ts/client.ts"), ts.trimEnd() + "\n");
 writeFileSync(resolve(outRoot, "python/qcg_client.py"), py);
 writeFileSync(

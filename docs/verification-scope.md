@@ -38,11 +38,45 @@ success advances accepted records without resending the complete batch, as
 required by the [OTLP specification](https://opentelemetry.io/docs/specs/otlp/#partial-success).
 
 npm verification includes development dependencies. Vite/Vitest/esbuild/
-Playwright/openapi-typescript execute on developer or CI machines. Svelte
+Playwright/Hey API execute on developer or CI machines. Svelte
 runtime and compiled application/WASM ship in the SPA; the build tools and
 Node modules do not ship as server endpoints. `npm audit --audit-level=moderate`
 is a required gate, with the lockfile reviewed instead of force-upgrading
 outside parent compatibility constraints.
+
+## OpenAPI declaration generation
+
+Both API generation entry points use `frontend/generator/scripts/openapi-types.mjs`:
+unmodified `@hey-api/openapi-ts` 0.97.1 translates schemas, then qcg adapts its
+TypeScript AST into the legacy `paths`, `webhooks`, `components`, `$defs` and
+`operations` exports. TypeScript is pinned to 5.9.3; the 7.x peer is incompatible
+with this generator's `NewLineKind.LineFeed` usage. Generated declarations carry
+no runtime dependency. SDK method names and runtime readers remain separately
+pinned by `scripts/generate-sdk.mjs`.
+
+The adapter accepts qcg's OpenAPI 3.1 subset: local component schema/response
+references, the configured HTTP bearer security scheme, inline query/header/path/cookie
+parameters, request bodies, response headers/media, operation IDs, primitive/object/array schemas, nullable type
+unions, enums/constants and `oneOf`/`anyOf`. Defaulted properties remain required;
+boolean-true schemas and unconstrained media remain `unknown`; binary strings
+remain `string`. Validation-only bounds, patterns, formats and negated `required`
+constraints are not runtime validators (nor were they in the legacy types).
+Security/server/description metadata does not contribute declaration fields.
+Unknown keywords, external/unresolved references, boolean-false schemas,
+`allOf`/conditionals/discriminators, path-level parameters, nonempty webhooks,
+root `$defs`, non-bearer security schemes, and component parameters/requestBodies/
+headers/pathItems fail explicitly before generation. They are not silently erased
+or replaced with `unknown`; expanding this subset requires a compatibility review.
+
+`npm run test:api` checks bidirectional structural parity for all five exports
+against the checked-in baseline and against an independently described synthetic
+mutation (operation ID, required enum query, referenced response, defaulted field
+and boolean-true field). It also compiles the SDK and frontend API client under
+strict TypeScript and tests unsupported-input rejection. `check-sdk.sh` checks
+SDK freshness and every SDK TypeScript file; `npm run check:api` independently
+regenerates the server OpenAPI and shared types. The required online audit and
+full frontend checks/build remain CI gates; local offline generation is not
+security-advisory evidence.
 
 ## Test maintenance policy
 

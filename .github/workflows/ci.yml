@@ -146,7 +146,7 @@ jobs:
         working-directory: frontend/generator
 
       - name: Check demo
-        run: npm run check:vendor && npm run check:api && npm run check && npm test && npm run build
+        run: npm run test:api && npm run check:api && npm run check && npm test && npm run build
         working-directory: frontend/generator
 
   # Browser smoke against the real server covers both Vite-proxy and served
