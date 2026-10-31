@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 struct SearchProvider {
     calls: Option<u64>,
     omit_usage: bool,
+    reject_response: bool,
+    unsafe_search_field: Option<&'static str>,
     requests: AtomicUsize,
 }
 
@@ -24,7 +26,7 @@ impl LlmProvider for SearchProvider {
     }
     async fn complete(&self, request: ChatRequest) -> Result<ChatResponse, LlmError> {
         self.requests.fetch_add(1, Ordering::SeqCst);
-        let web_search = request
+        let mut web_search = request
             .provider_web_search
             .filter(|_| !self.omit_usage)
             .map(|_| ProviderWebSearchOutcome {
@@ -42,17 +44,52 @@ impl LlmProvider for SearchProvider {
                     end_index: Some(6),
                 }],
             });
+        if let Some(outcome) = &mut web_search {
+            match self.unsafe_search_field {
+                Some("events") => outcome.events[0].queries.push("secret-value".into()),
+                Some("citations") => outcome.citations[0].title = Some("secret-value".into()),
+                _ => {}
+            }
+        }
         Ok(ChatResponse {
-            content: vec![ChatContent::Text("ok".into())],
+            content: vec![ChatContent::Text(
+                if self.reject_response && !request.stream {
+                    "secret-value"
+                } else {
+                    "ok"
+                }
+                .into(),
+            )],
             usage: TokenUsage {
                 input: 100,
                 output: 10,
                 ..Default::default()
             },
             stop: StopReason::EndTurn,
-            provider_state: None,
+            provider_state: (self.reject_response && request.stream)
+                .then(|| json!({"opaque": "secret-value"})),
             web_search,
         })
+    }
+
+    async fn stream(
+        &self,
+        request: ChatRequest,
+        events: tokio::sync::mpsc::Sender<llm::ChatStreamEvent>,
+    ) -> Result<(), LlmError> {
+        let response = self.complete(request).await?;
+        for event in [
+            llm::ChatStreamEvent::TextDelta {
+                text: "verified prefix; held tail".into(),
+            },
+            llm::ChatStreamEvent::Completed { response },
+        ] {
+            events
+                .send(event)
+                .await
+                .map_err(|_| LlmError::new("closed"))?;
+        }
+        Ok(())
     }
 }
 
@@ -382,4 +419,122 @@ async fn an_unpriced_hosted_search_is_unmetered_not_free() {
         "an unpriced search is unmetered, never free: {event}"
     );
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Rejected payloads must not discard a completed call's billable usage.
+/// Exercise both the ordinary response scan and the stream's final gate;
+/// TextDelta rejection before Completed deliberately remains out of scope.
+#[tokio::test]
+async fn secret_rejected_completions_account_safely_and_block_unresolved_search_replay() {
+    for stream in [false, true] {
+        for (calls, price, omit_usage) in [
+            (None, Some(0.5), false),
+            (None, Some(0.5), true),
+            (Some(2), None, false),
+            (Some(2), Some(0.5), false),
+        ] {
+            for unsafe_search_field in [None, Some("events"), Some("citations")] {
+                let dir = test_dir("search-secret-rejected");
+                let run_id = format!("search-secret-rejected-{}", uuid::Uuid::now_v7());
+                let journal = test_journal(&dir, &run_id);
+                let secrets = test_secret_store();
+                let provider = Arc::new(SearchProvider {
+                    calls,
+                    omit_usage,
+                    reject_response: true,
+                    unsafe_search_field,
+                    ..Default::default()
+                });
+                let mut gateway = test_gateway(provider.clone(), &secrets, &journal);
+                gateway.budget.require_pricing = true;
+                let mut request = search_request();
+                request.stream = stream;
+                let error = gateway
+                    .complete(&test_node(), request, &[search_pricing(price)], |_| {
+                        json!({})
+                    })
+                    .await
+                    .expect_err("a secret payload must fail even with known search pricing");
+                assert!(error.to_string().contains("secret `token`"), "{error}");
+                let text = persisted_text(&dir);
+                assert!(!text.contains("secret-value"));
+                let events: Vec<serde_json::Value> = text
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| event["t"] == "llm_call")
+                        .count(),
+                    1
+                );
+                assert!(!events.iter().any(|event| event["t"] == "llm_route_failed"));
+                let event = llm_call_event(&dir);
+                assert!(event.get("content").is_none());
+                assert!(event.get("provider_state").is_none());
+                let search_cost = calls
+                    .zip(price)
+                    .map(|(n, p)| (n as f64 * p * 1_000_000.0) as u64);
+                assert_eq!(
+                    event["cost_microusd"],
+                    110 + search_cost.unwrap_or_default()
+                );
+                assert_eq!(event["web_search"]["calls"], json!(calls));
+                assert_eq!(event["web_search"]["cost_microusd"], json!(search_cost));
+                for field in ["events", "citations"] {
+                    let value = event["web_search"].get(field);
+                    if !omit_usage && unsafe_search_field == Some(field) {
+                        assert!(value.is_none(), "unsafe {field} must be omitted");
+                    } else {
+                        assert!(value.unwrap().is_array(), "safe {field} must be retained");
+                    }
+                }
+                let deltas: String = events
+                    .iter()
+                    .filter(|event| event["t"] == "llm_delta")
+                    .map(|event| event["text"].as_str().unwrap())
+                    .collect();
+                if stream {
+                    let text = "verified prefix; held tail";
+                    let holdback = secrets.max_value_len() - 1;
+                    assert_eq!(deltas, &text[..text.len() - holdback]);
+                } else {
+                    assert!(deltas.is_empty());
+                }
+                let replay = crate::RunState::fold_journal(&dir.join("journal.jsonl")).unwrap();
+                for state in [journal.state(), replay] {
+                    assert_eq!(state.budget.unresolved_search_cost, search_cost.is_none());
+                    assert_eq!(
+                        (
+                            state.budget.tokens_input,
+                            state.budget.tokens_output,
+                            state.budget.cost_microusd,
+                            state.budget.llm_calls
+                        ),
+                        (100, 10, 110 + search_cost.unwrap_or_default(), 1)
+                    );
+                }
+                drop(gateway);
+                drop(journal);
+                if search_cost.is_none() {
+                    let resumed = test_journal(&dir, &run_id);
+                    let mut gateway = test_gateway(provider.clone(), &secrets, &resumed);
+                    gateway.budget.require_pricing = true;
+                    let mut request = search_request();
+                    request.provider_web_search = None;
+                    let error = gateway
+                        .complete(&test_node(), request, &[search_pricing(Some(0.5))], |_| {
+                            json!({})
+                        })
+                        .await
+                        .unwrap_err();
+                    assert!(error.to_string().contains("unresolved hosted search cost"));
+                    assert_eq!(resumed.state().budget.llm_calls, 1);
+                }
+                assert_eq!(provider.requests.load(Ordering::SeqCst), 1);
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
+    }
 }

@@ -423,9 +423,6 @@ impl<'a> LlmGateway<'a> {
         }
         let (provider_id, model_id, response, retry_decisions) =
             response.ok_or_else(|| StepError::failed(&node.id, "no LLM route was available"))?;
-        if response.stop != llm::StopReason::ModelContextWindowExceeded {
-            self.scan_response(node, &response)?;
-        }
         let usage = response.usage.clone();
         // A requested search remains visible even if the provider omitted usage.
         let web_search = response.web_search.clone().or_else(|| {
@@ -477,23 +474,29 @@ impl<'a> LlmGateway<'a> {
         // Hosted-search usage carries a provider-specific count and charge;
         // unknown or unpriced usage remains unmetered, never free.
         if let Some(outcome) = &web_search {
-            event["web_search"] = json!({
-                "calls": outcome.calls,
-                "cost_microusd": search_cost,
-                "events": outcome.events,
-                "citations": outcome.citations,
-            });
+            event["web_search"] = json!({"calls": outcome.calls, "cost_microusd": search_cost});
+            // Omit secret-bearing strings without dropping numeric accounting.
+            for (field, v) in [
+                ("events", json!(outcome.events)),
+                ("citations", json!(outcome.citations)),
+            ] {
+                if self.assert_value_absent(node, &v).is_ok() {
+                    event["web_search"][field] = v;
+                }
+            }
         }
         merge_event_extra(&mut event, event_extra(&response.usage));
         event["retry_decisions"] = json!(retry_decisions);
         self.journal.event("llm_call", event).step_err(&node.id)?;
+        // Rejected payloads are still billable; report the scan after journaling.
+        if response.stop != llm::StopReason::ModelContextWindowExceeded {
+            self.scan_response(node, &response)?;
+        }
         if self.budget.require_pricing && web_search.is_some() && search_cost.is_none() {
-            let detail = match web_search_calls {
-                None => "unknown billable hosted search usage",
-                Some(_) => {
-                    "billable hosted search units without a `web_search_call_cost_usd` price"
-                }
-            };
+            let detail = web_search_calls.map_or(
+                "unknown billable hosted search usage",
+                |_| "billable hosted search units without a `web_search_call_cost_usd` price",
+            );
             return Err(StepError::failed(
                 &node.id,
                 format!("model `{provider_id}/{model_id}` has {detail} for the run cost budget"),
@@ -680,13 +683,13 @@ impl<'a> LlmGateway<'a> {
                 if !self.secrets.is_empty()
                     && completed.stop != llm::StopReason::ModelContextWindowExceeded
                 {
-                    // Final gate before the withheld suffix becomes visible.
-                    // A rejection here publishes nothing further, and the
-                    // already-visible prefixes were each verified jointly
-                    // with their predecessors, so no recoverable secret is
-                    // left behind.
-                    self.scan_response(node, &completed)
-                        .map_err(|error| LlmError::new(error.to_string()))?;
+                    // Final gate: withheld suffix stays unpublished and visible
+                    // prefixes were jointly verified, so nothing recoverable remains.
+                    // Rejected completions still need accounting via the common path.
+                    if self.scan_response(node, &completed).is_err() {
+                        acc.response = Some(completed);
+                        return Ok(());
+                    }
                     if !acc.pending.is_empty() {
                         let mut window = acc.published_tail.clone();
                         window.push_str(&acc.pending);
