@@ -11,9 +11,8 @@ pub type RetryObserver = Arc<dyn Fn(&RetryDecision) + Send + Sync>;
 /// are never stored; longer or malformed codes are dropped.
 pub const MAX_PROVIDER_ERROR_CODE_LEN: usize = 64;
 
-/// Longest observed `Retry-After` delay retained or applied, in seconds.
-/// Existing backoff is unchanged; header delays require explicit rule opt-in.
-pub(crate) const MAX_RETRY_AFTER_SECS: u64 = 60;
+/// Default policy ceiling for the `Retry-After` delay candidate, in seconds.
+const DEFAULT_MAX_RETRY_AFTER_SECS: u64 = 60;
 
 /// Returns the sanitized provider error code, or `None` when the raw value
 /// is missing, empty, oversized, or contains characters outside
@@ -30,11 +29,22 @@ pub(crate) fn sanitize_provider_error_code(raw: &str) -> Option<String> {
 
 /// First matching rule wins; omitted match fields are wildcards. Empty rules
 /// use the documented default. Bounds and terminal guards cannot be bypassed.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct RetryPolicy {
-    #[serde(default)]
+    /// Maximum header-derived delay candidate; zero disables its delay contribution.
+    /// Does not limit ordinary backoff. Omitted configurations default to 60.
+    pub max_retry_after_secs: u64,
     pub rules: Vec<RetryRule>,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retry_after_secs: DEFAULT_MAX_RETRY_AFTER_SECS,
+            rules: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,9 +125,9 @@ impl RetryPolicy {
             .provider_code
             .as_deref()
             .and_then(sanitize_provider_error_code);
-        let retry_after_secs = error
-            .retry_after_secs
-            .map(|secs| secs.min(MAX_RETRY_AFTER_SECS));
+        let retry_after_observed_secs = error.retry_after_secs;
+        let retry_after_secs =
+            retry_after_observed_secs.map(|secs| secs.min(self.max_retry_after_secs));
         let matched = self.rules.iter().enumerate().find(|(_, rule)| {
             rule.kind.is_none_or(|v| v == error.kind)
                 && rule.phase.is_none_or(|v| v == error.facts.phase)
@@ -160,6 +170,7 @@ impl RetryPolicy {
             source,
             guard: None,
             provider_code,
+            retry_after_observed_secs,
             retry_after_secs,
             retry_after_applied: false,
         };
@@ -184,24 +195,7 @@ impl RetryPolicy {
             && decision.retry_after_secs.is_some();
         decision
     }
-}
 
-/// Effective wait for one retry attempt: the computed backoff, raised to
-/// at least the observed `Retry-After` delay only when the matching rule
-/// opted in (`Some` delay). Without opt-in (`None`) the base delay is
-/// unchanged.
-pub(crate) fn effective_retry_delay(
-    base: std::time::Duration,
-    applied_after_secs: Option<u64>,
-) -> std::time::Duration {
-    applied_after_secs.map_or(base, |secs| {
-        base.max(std::time::Duration::from_secs(
-            secs.min(MAX_RETRY_AFTER_SECS),
-        ))
-    })
-}
-
-impl RetryPolicy {
     pub(crate) fn observe_failure(
         &self,
         error: &mut LlmError,
@@ -216,6 +210,41 @@ impl RetryPolicy {
         observer(&decision);
         error.decisions.push(decision);
         action
+    }
+}
+
+/// Effective wait for one retry attempt: the computed backoff, raised to
+/// at least the policy-bounded `Retry-After` candidate only when the matching rule
+/// opted in (`Some` delay). Without opt-in (`None`) the base delay is
+/// unchanged.
+pub(crate) fn effective_retry_delay(
+    base: std::time::Duration,
+    applied_after_secs: Option<u64>,
+) -> std::time::Duration {
+    applied_after_secs.map_or(base, |secs| base.max(std::time::Duration::from_secs(secs)))
+}
+
+/// Largest single timer wait issued for a retry delay.
+///
+/// This is an implementation detail, not a policy cap: larger totals are
+/// honored by sleeping in chunks. Thirty days sits well below the timer
+/// `tokio::time::sleep`'s far-future substitution (~30 years), so each
+/// chunk remains directly schedulable on supported platforms. No total-delay
+/// cap is introduced.
+pub(crate) const MAX_RETRY_SLEEP_CHUNK: std::time::Duration =
+    std::time::Duration::from_secs(30 * 24 * 60 * 60);
+
+/// Waits for at least `total` using bounded timer chunks.
+///
+/// Each chunk is fully awaited before subtracting, so scheduling delays cannot
+/// shorten the total; dropping the future cancels the in-flight chunk promptly
+/// like a single `sleep`.
+pub(crate) async fn sleep_retry_delay(total: std::time::Duration) {
+    let mut remaining = total;
+    while !remaining.is_zero() {
+        let chunk = remaining.min(MAX_RETRY_SLEEP_CHUNK);
+        tokio::time::sleep(chunk).await;
+        remaining -= chunk;
     }
 }
 

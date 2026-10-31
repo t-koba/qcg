@@ -6,7 +6,7 @@ use std::io::Read;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
-use tokio::time::{Duration, sleep, timeout};
+use tokio::time::{Duration, timeout};
 
 use crate::catalog::CatalogService;
 use crate::http_provider::HttpProvider;
@@ -510,7 +510,8 @@ impl<'a> RetryState<'a> {
                     LlmErrorKind::HttpStatus(429) | LlmErrorKind::EmptyResponse
                 ),
         );
-        sleep(crate::retry::effective_retry_delay(delay, applied_after)).await;
+        crate::retry::sleep_retry_delay(crate::retry::effective_retry_delay(delay, applied_after))
+            .await;
         Ok(())
     }
 }

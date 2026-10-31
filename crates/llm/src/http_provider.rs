@@ -26,7 +26,6 @@ use crate::provider::{
     DEFAULT_RETRY_RATE_LIMIT_FLOOR_MS, LlmProvider, ModelPricing, PromptCacheField,
     PromptCacheRetention, ProviderSpec,
 };
-use crate::retry::MAX_RETRY_AFTER_SECS;
 use crate::stream::HttpStreamAccumulator;
 use crate::types::{
     CacheWritePolicy, Capabilities, ChatRequest, ChatResponse, ChatStreamEvent, LlmError,
@@ -52,10 +51,9 @@ pub(crate) fn extract_provider_error_code(value: &serde_json::Value) -> Option<S
     crate::retry::sanitize_provider_error_code(raw)
 }
 
-/// Parses a bounded `Retry-After` delay from response headers. Supports
-/// delta-seconds and HTTP-date (IMF-fixdate) forms; values are capped at
-/// 60 seconds. Returns `None` for missing, invalid, past, or non-UTF-8
-/// headers so current backoff is preserved.
+/// Parses raw representable `Retry-After` seconds without applying delay policy.
+/// Supports delta-seconds and the existing RFC 2822 / IMF-fixdate date forms.
+/// Missing, invalid, past, unrepresentable, or non-UTF-8 headers yield `None`.
 pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     let raw = headers
         .get(reqwest::header::RETRY_AFTER)?
@@ -65,13 +63,10 @@ pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<
     if raw.is_empty() {
         return None;
     }
-    if let Ok(secs) = raw.parse::<u64>() {
-        return Some(secs.min(MAX_RETRY_AFTER_SECS));
+    if raw.bytes().all(|b| b.is_ascii_digit()) {
+        return raw.parse().ok();
     }
-    // HTTP-date form: delay until the advertised time, bounded and never
-    // negative. Past dates yield no delay so current behavior is preserved.
-    // IMF-fixdate (`... GMT`) is accepted via RFC 2822 and via an explicit
-    // GMT fallback so a different valid spelling cannot bypass the bound.
+    // Past dates yield no observation; delay policy belongs to RetryPolicy.
     let timestamp = chrono::DateTime::parse_from_rfc2822(raw)
         .map(|dt| dt.timestamp())
         .or_else(|_| {
@@ -80,11 +75,11 @@ pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<
         })
         .ok()?;
     let now = chrono::Utc::now().timestamp();
-    let delta = timestamp.saturating_sub(now);
+    let delta = timestamp.checked_sub(now)?;
     if delta <= 0 {
         return None;
     }
-    Some((delta as u64).min(MAX_RETRY_AFTER_SECS))
+    u64::try_from(delta).ok()
 }
 
 /// Bounded read of a non-success response body for `error.code` inspection.

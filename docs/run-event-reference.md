@@ -217,9 +217,16 @@ and decode as an empty array. Each entry contains `kind`, `facts.phase`
 (`fail_fast`, `retry`, `next_route`), `source` (`default`, `rule:<index>`, or
 `gateway` for a gateway terminal guard),
 optional sanitized `provider_code` (bounded `error.code`, inert unless a rule
-matches it), optional bounded `retry_after_secs` (capped at 60), whether the
-decision applied the header delay (`retry_after_applied`, only when a matching
-rule opts in and the effective action remains `retry`), and
+matches it), optional raw `retry_after_observed_secs` before policy clipping,
+and optional `retry_after_secs`, the candidate clipped to the provider's
+`retry_policy.max_retry_after_secs` (default 60, allowing 0). Both are present
+when an observation exists, even without opt-in; their difference reveals
+clipping. Missing, invalid, past, or unrepresentable HTTP header values yield no
+observation. `retry_after_applied` is true only when a matching rule opts in,
+an observation exists, and the effective action remains a same-route `retry`.
+It means the candidate is used as a backoff floor, not necessarily extra wait:
+ordinary backoff can be longer, and a zero candidate adds none. Fallback and
+guards never wait for this delay. Each decision also carries a
 nullable `guard` (`attempt_limit`, `circuit_open`, `terminal_error`,
 `stream_emitted`). Rule indexes are zero-based in the provider registry row.
 A gateway cancellation uses a null `attempt`: it cannot distinguish backoff

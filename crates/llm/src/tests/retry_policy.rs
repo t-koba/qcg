@@ -166,6 +166,28 @@ fn registry_owns_policy_and_rejects_invalid_rules() {
     );
     let router = LlmRouter::parse_text(&text).unwrap();
     assert_eq!(router.providers["local"].retry_policy().rules.len(), 1);
+    assert_eq!(
+        router.providers["local"]
+            .retry_policy()
+            .max_retry_after_secs,
+        60
+    );
+    for cap in [0, 5, 120] {
+        let text =
+            format!("{REGISTRY_FIXTURE}\n[provider.retry_policy]\nmax_retry_after_secs = {cap}\n");
+        let configured = LlmRouter::parse_text(&text).unwrap();
+        assert_eq!(
+            configured.providers["local"]
+                .retry_policy()
+                .max_retry_after_secs,
+            cap
+        );
+    }
+    for cap in ["-1", "1.5", "'60'", "18446744073709551616"] {
+        let text =
+            format!("{REGISTRY_FIXTURE}\n[provider.retry_policy]\nmax_retry_after_secs = {cap}\n");
+        assert!(LlmRouter::parse_text(&text).is_err());
+    }
     let http = format!(
         "{text}\n[[provider.retry_policy.rules]]\nkind = {{ http_status = 503 }}\naction = 'retry'\non_exhausted = 'next_route'\n"
     );
@@ -609,7 +631,7 @@ fn error_code_extraction_accepts_only_the_supported_shape() {
 }
 
 #[test]
-fn retry_after_parsing_is_bounded_and_conservative() {
+fn retry_after_parsing_preserves_representable_observations() {
     use crate::http_provider::parse_retry_after;
     use reqwest::header::{HeaderMap, HeaderValue};
     fn headers(value: &str) -> HeaderMap {
@@ -622,22 +644,44 @@ fn retry_after_parsing_is_bounded_and_conservative() {
     }
     assert_eq!(parse_retry_after(&headers("2")), Some(2));
     assert_eq!(parse_retry_after(&headers("0")), Some(0));
-    assert_eq!(parse_retry_after(&headers("120")), Some(60));
+    assert_eq!(parse_retry_after(&headers("120")), Some(120));
     assert_eq!(parse_retry_after(&headers("  7  ")), Some(7));
     assert!(parse_retry_after(&headers("abc")).is_none());
     assert!(parse_retry_after(&headers("1.5")).is_none());
     assert!(parse_retry_after(&headers("-5")).is_none());
     assert!(parse_retry_after(&HeaderMap::new()).is_none());
-    // Far-future HTTP-date is capped; the past yields no delay.
+    assert_eq!(
+        parse_retry_after(&headers(&u64::MAX.to_string())),
+        Some(u64::MAX)
+    );
+    for invalid in ["", "+5", "18446744073709551616"] {
+        assert!(parse_retry_after(&headers(invalid)).is_none());
+    }
+    let mut non_utf8 = HeaderMap::new();
+    non_utf8.insert(
+        reqwest::header::RETRY_AFTER,
+        HeaderValue::from_bytes(b"\xff").unwrap(),
+    );
+    assert!(parse_retry_after(&non_utf8).is_none());
+    // Future HTTP-date retains seconds above 60; the past yields no observation.
+    // Bound the result by wall-clock samples, not a flaky exact countdown.
+    let before = chrono::Utc::now().timestamp();
     let future = (chrono::Utc::now() + chrono::Duration::seconds(3600)).to_rfc2822();
-    assert_eq!(parse_retry_after(&headers(&future)), Some(60));
+    let parsed = parse_retry_after(&headers(&future)).unwrap();
+    let after = chrono::Utc::now().timestamp();
+    let advertised = chrono::DateTime::parse_from_rfc2822(&future)
+        .unwrap()
+        .timestamp();
+    assert!(((advertised - after) as u64..=(advertised - before) as u64).contains(&parsed));
+    assert!(parsed > 60);
     let past = (chrono::Utc::now() - chrono::Duration::seconds(3600)).to_rfc2822();
     assert!(parse_retry_after(&headers(&past)).is_none());
-    // IMF-fixdate GMT spellings are bounded the same way.
+    // IMF-fixdate GMT spelling retains the same raw observation.
     let gmt_future = (chrono::Utc::now() + chrono::Duration::seconds(3600))
         .format("%a, %d %b %Y %H:%M:%S GMT")
         .to_string();
-    assert_eq!(parse_retry_after(&headers(&gmt_future)), Some(60));
+    let parsed_gmt = parse_retry_after(&headers(&gmt_future)).unwrap();
+    assert!(parsed_gmt > 60 && parsed_gmt <= 3600);
     assert!(parse_retry_after(&headers("Wed, 21 Oct 2015 07:28:00 GMT")).is_none());
 }
 
@@ -647,6 +691,7 @@ fn retry_after_opt_in_controls_delay_provenance() {
     base.retry_after_secs = Some(7);
     let plain_default = RetryPolicy::default();
     let observed = plain_default.decide(&base, 1, 3, false, false);
+    assert_eq!(observed.retry_after_observed_secs, Some(7));
     assert_eq!(observed.retry_after_secs, Some(7));
     assert!(
         !observed.retry_after_applied,
@@ -665,6 +710,13 @@ fn retry_after_opt_in_controls_delay_provenance() {
     assert_eq!(applied.source, "rule:0");
     assert!(applied.retry_after_applied);
     assert_eq!(applied.retry_after_secs, Some(7));
+    let mut wire = serde_json::to_value(&applied).unwrap();
+    assert_eq!(wire["retry_after_observed_secs"], 7);
+    wire.as_object_mut()
+        .unwrap()
+        .remove("retry_after_observed_secs");
+    let legacy: RetryDecision = serde_json::from_value(wire).unwrap();
+    assert_eq!(legacy.retry_after_observed_secs, None);
 
     // The header is not reported as applied after an attempt-limit fallback
     // or a stream-emission guard prevents the retry.
@@ -732,46 +784,78 @@ fn policy_drops_invalid_custom_provider_codes_before_matching_and_recording() {
 }
 
 #[test]
-fn policy_bounds_custom_provider_retry_after_before_recording_and_waiting() {
+fn policy_bounds_retry_after_once_and_preserves_raw_custom_observations() {
     use crate::retry::effective_retry_delay;
     let mut error = coded_error("slow_down");
     error.retry_after_secs = Some(u64::MAX);
-    let default = RetryPolicy::default().decide(&error, 1, 3, false, false);
-    assert_eq!(default.retry_after_secs, Some(60));
-    assert!(!default.retry_after_applied);
-    assert_eq!(default.source, "default");
+    let default = RetryPolicy::default();
+    let omitted: RetryPolicy = serde_json::from_value(json!({})).unwrap();
+    for policy in [&default, &omitted] {
+        assert_eq!(policy.max_retry_after_secs, 60);
+        let decision = policy.decide(&error, 1, 3, false, false);
+        assert_eq!(decision.retry_after_observed_secs, Some(u64::MAX));
+        assert_eq!(decision.retry_after_secs, Some(60));
+        assert!(!decision.retry_after_applied);
+    }
     let base = Duration::from_millis(200);
     assert_eq!(effective_retry_delay(base, None), base);
-
-    let policy: RetryPolicy = serde_json::from_value(json!({"rules": [{
-        "provider_code": "slow_down",
-        "use_retry_after": true,
-        "action": "retry",
-        "on_exhausted": "next_route"
-    }]}))
-    .unwrap();
-    let decision = policy.decide(&error, 1, 3, false, false);
-    assert_eq!(decision.provider_code.as_deref(), Some("slow_down"));
-    assert_eq!(decision.retry_after_secs, Some(60));
-    assert_eq!(decision.source, "rule:0");
-    assert!(decision.retry_after_applied);
-    assert_eq!(
-        effective_retry_delay(base, decision.retry_after_secs),
-        Duration::from_secs(60)
-    );
-    // Defense in depth at Duration construction, even without a decision.
-    assert_eq!(
-        effective_retry_delay(base, Some(u64::MAX)),
-        Duration::from_secs(60)
-    );
-    for (attempt, emitted, action) in [
-        (3, false, RetryAction::NextRoute),
-        (1, true, RetryAction::FailFast),
-    ] {
-        let guarded = policy.decide(&error, attempt, 3, emitted, emitted);
-        assert_eq!(guarded.action, action);
-        assert_eq!(guarded.retry_after_secs, Some(60));
-        assert!(!guarded.retry_after_applied);
+    for cap in [0, 5, 60, 120, u64::MAX] {
+        let policy: RetryPolicy = serde_json::from_value(json!({
+            "max_retry_after_secs": cap,
+            "rules": [{
+                "provider_code": "slow_down",
+                "use_retry_after": true,
+                "action": "retry",
+                "on_exhausted": "next_route"
+            }]
+        }))
+        .unwrap();
+        assert!(policy.validate().is_ok());
+        for raw in [7, 180, u64::MAX] {
+            error.retry_after_secs = Some(raw);
+            let decision = policy.decide(&error, 1, 3, false, false);
+            let candidate = raw.min(cap);
+            assert_eq!(decision.retry_after_observed_secs, Some(raw));
+            assert_eq!(decision.retry_after_secs, Some(candidate));
+            assert!(decision.retry_after_applied);
+            assert_eq!(
+                effective_retry_delay(base, decision.retry_after_secs),
+                base.max(Duration::from_secs(candidate))
+            );
+        }
+        // Attempt limits, stream guards and terminal failures do not apply a delay.
+        for (attempt, emitted, kind, action) in [
+            (
+                3,
+                false,
+                LlmErrorKind::HttpStatus(429),
+                RetryAction::NextRoute,
+            ),
+            (
+                1,
+                true,
+                LlmErrorKind::HttpStatus(429),
+                RetryAction::FailFast,
+            ),
+            (1, false, LlmErrorKind::Canceled, RetryAction::FailFast),
+            (1, false, LlmErrorKind::CircuitOpen, RetryAction::NextRoute),
+        ] {
+            error.kind = kind;
+            let guarded = policy.decide(&error, attempt, 3, emitted, emitted);
+            assert_eq!(guarded.action, action);
+            assert_eq!(guarded.retry_after_observed_secs, Some(u64::MAX));
+            assert_eq!(guarded.retry_after_secs, Some(cap));
+            assert!(!guarded.retry_after_applied);
+        }
+        error.kind = LlmErrorKind::HttpStatus(429);
+    }
+    for invalid in [json!(-1), json!(1.5), json!("60"), json!(null)] {
+        assert!(
+            serde_json::from_value::<RetryPolicy>(json!({
+                "max_retry_after_secs": invalid
+            }))
+            .is_err()
+        );
     }
 }
 
@@ -805,14 +889,17 @@ async fn loopback_error_code_and_retry_after_roundtrip() {
         "type": "rate_limit_error"
     }})
     .to_string();
-    let (base_url, server) = spawn_http_response(429, body, "Retry-After: 2\r\n".into());
+    let (base_url, server) = spawn_http_response(429, body, "Retry-After: 120\r\n".into());
     let provider = HttpProvider::from_spec(spec_with_base_url("loopback", &base_url));
     let mut request = sample_request();
     request.seed = None;
     let error = provider.complete(request).await.expect_err("429 must fail");
     assert_eq!(error.kind, LlmErrorKind::HttpStatus(429));
     assert_eq!(error.provider_code.as_deref(), Some("slow_down"));
-    assert_eq!(error.retry_after_secs, Some(2));
+    assert_eq!(error.retry_after_secs, Some(120));
+    let decision = provider.retry_policy().decide(&error, 1, 3, false, false);
+    assert_eq!(decision.retry_after_observed_secs, Some(120));
+    assert_eq!(decision.retry_after_secs, Some(60));
     assert!(!error.message.contains("sensitive upstream detail"));
     assert!(!error.message.contains("slow_down"));
     server.join().expect("test server should stop");
@@ -970,5 +1057,47 @@ fn effective_retry_delay_never_shortens_backoff() {
     assert_eq!(
         effective_retry_delay(Duration::from_millis(200), Some(60)),
         Duration::from_secs(60)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_sleep_honors_full_delay_in_bounded_chunks() {
+    use crate::retry::{MAX_RETRY_SLEEP_CHUNK, sleep_retry_delay};
+    use futures_util::task::noop_waker;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    fn poll_once<F>(fut: Pin<&mut F>) -> Poll<F::Output>
+    where
+        F: Future,
+    {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        fut.poll(&mut cx)
+    }
+
+    // Multi-chunk total spans three timer chunks; the wait must outlast
+    // the first chunk and still honor the exact total.
+    let total = MAX_RETRY_SLEEP_CHUNK * 2 + Duration::from_secs(5);
+    let mut first = Box::pin(sleep_retry_delay(total));
+    assert!(poll_once(first.as_mut()).is_pending());
+    tokio::time::advance(MAX_RETRY_SLEEP_CHUNK).await;
+    assert!(
+        poll_once(first.as_mut()).is_pending(),
+        "chunked wait must outlast its first chunk"
+    );
+    drop(first);
+    let start = tokio::time::Instant::now();
+    sleep_retry_delay(total).await;
+    assert_eq!(start.elapsed(), total);
+
+    // Extreme configured delays must not wake at `far_future` (~30 years).
+    let mut extreme = Box::pin(sleep_retry_delay(Duration::from_secs(u64::MAX)));
+    assert!(poll_once(extreme.as_mut()).is_pending());
+    tokio::time::advance(Duration::from_secs(86400 * 365 * 35)).await;
+    assert!(
+        poll_once(extreme.as_mut()).is_pending(),
+        "extreme wait must outlast far_future substitution"
     );
 }

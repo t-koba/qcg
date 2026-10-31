@@ -124,6 +124,9 @@ Fields:
 - `retry_attempts`: attempts per completion call including the first, 1 to 10.
   The default is 3. The provider `retry_policy` selects which failures retry
   (by default timeouts, 5xx, 429, and empty responses); it cannot raise this bound.
+- `retry_policy.max_retry_after_secs`: maximum header-derived delay candidate
+  in seconds (default 60); `0` removes the header's delay contribution without
+  changing ordinary backoff.
 - `retry_policy.rules`: optional ordered transport-decision rules; see
   [Transport retry and route policy](#transport-retry-and-route-policy).
   Omission or an empty list uses the documented default.
@@ -751,13 +754,21 @@ OpenAI-specific disposition is hardcoded for compatible endpoints; an
 exhaustion/quota code still follows the configured rule, including a
 `next_route` to a separately authorized route.
 
-`Retry-After` response headers are parsed boundedly (delta-seconds and
-HTTP-date forms, capped at 60 seconds; missing, invalid, or past values yield
-no delay). The parsed delay is recorded on the failure and the decision, but
-the router waits for it only when the matching rule sets
+`Retry-After` response headers retain raw representable `u64` seconds
+(delta-seconds or the accepted RFC 2822 / IMF-fixdate date forms). Missing,
+invalid, past, or unrepresentable values yield no observation. The failure
+retains the raw observation; the provider's `retry_policy.max_retry_after_secs`
+clips it once into a delay candidate (default **60** when omitted). This is a
+nonnegative integer in the `u64` range; **0** removes the header's delay
+contribution, not ordinary backoff. For example, set
+`[provider.retry_policy]` with `max_retry_after_secs = 120` before its rule tables
+to permit header-derived candidates above the default.
+
+The router uses the candidate only when the matching rule sets
 `use_retry_after = true` and the effective action remains a same-route `retry`;
-otherwise current backoff and route behavior are unchanged. An applied delay
-never shortens the computed backoff: the router waits the maximum of the two.
+otherwise current backoff and route behavior are unchanged. An applied candidate
+never shortens computed backoff: the router waits the maximum of the two.
+Route fallback and terminal guards never wait for the header.
 
 Example, appended inside one provider row (before the next `[[provider]]`):
 
@@ -818,11 +829,14 @@ retains them for a failed route, and `fallback_taken` states whether this
 invocation advanced to another declared route. Each decision carries its kind,
 facts, attempt, stream flag, requested/effective actions, source (`default` or
 `rule:<zero-based index>`, or `gateway` for a gateway terminal guard), the observed
-sanitized `provider_code` and bounded `retry_after_secs` when present, whether
-this decision applies the header delay (`retry_after_applied`, true only when a
-matching rule opts in and the effective action remains `retry`), and any
-mechanism guard (`attempt_limit`,
-`circuit_open`, `terminal_error`, `stream_emitted`). A gateway cancellation uses
+sanitized `provider_code`, raw `retry_after_observed_secs`, and policy-bounded
+`retry_after_secs` candidate when present. Comparing observed and candidate
+seconds reveals clipping even without opt-in. `retry_after_applied` is true only
+when a matching rule opts in, an observation exists, and the effective action
+remains `retry`; it means the candidate is used as a backoff floor, not that it
+adds wait (a zero candidate or larger ordinary backoff may add none). Decisions
+also carry any mechanism guard (`attempt_limit`, `circuit_open`, `terminal_error`,
+`stream_emitted`). A gateway cancellation uses
 a null attempt because cancellation during backoff versus an active attempt
 cannot be distinguished there; it never invents an additional dispatched attempt.
 These observation events

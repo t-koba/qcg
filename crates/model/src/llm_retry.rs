@@ -66,20 +66,21 @@ pub struct RetryDecision {
     pub source: String,
     /// A mechanism that overrode policy, if any.
     pub guard: Option<RetryGuard>,
-    /// Sanitized provider `error.code` observed on this attempt, when any.
-    /// Bounded to 1..=64 ASCII `A-Z a-z 0-9 . _ -`; absent when no
-    /// code was present, malformed, oversized, or the body was unreadable.
-    /// Capture alone changes nothing: it is inert unless a provider rule
-    /// explicitly matches it.
+    /// Sanitized provider `error.code`: 1..=64 ASCII `A-Z a-z 0-9 . _ -`.
+    /// Absent if missing, malformed, oversized, or unreadable; inert unless a rule matches it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_code: Option<String>,
-    /// Bounded `Retry-After` delay observed on this attempt, in seconds.
-    /// Capped at 60; absent when missing, invalid, or in the past.
+    /// Raw representable `Retry-After` seconds observed on this attempt,
+    /// before provider policy clipping; absent when missing, invalid, or past.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_observed_secs: Option<u64>,
+    /// Candidate: observed seconds clipped to provider max_retry_after_secs (default 60), even without opt-in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_secs: Option<u64>,
-    /// Whether this decision will apply the observed `Retry-After` delay.
-    /// True only when a matching rule opts in and the effective action still
-    /// retries; terminal guards and route fallbacks never wait.
+    /// Whether this decision uses the policy-bounded candidate as a backoff floor.
+    /// True only for matching rule opt-in, an observation, and an effective retry;
+    /// terminal guards and route fallbacks never wait.
+    /// Does not imply extra wait if backoff already exceeds the candidate.
     #[serde(default)]
     pub retry_after_applied: bool,
 }

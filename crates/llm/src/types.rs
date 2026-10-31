@@ -289,8 +289,8 @@ pub struct LlmError {
     /// inspection of the error response observed one. Credential-free and
     /// inert unless a provider retry rule explicitly matches it.
     pub provider_code: Option<String>,
-    /// Bounded `Retry-After` delay observed on this failure, in seconds.
-    /// Capped at 60; `None` preserves current default backoff.
+    /// Raw representable `Retry-After` seconds observed on this failure.
+    /// Provider retry policy bounds the delay candidate; `None` preserves backoff.
     pub retry_after_secs: Option<u64>,
 }
 
