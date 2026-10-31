@@ -181,14 +181,14 @@ impl Manifest {
     }
 }
 
-/// Raw JSON number boundary for external run inputs.
+/// Raw JSON number boundary for values that feed contract evaluation.
 ///
 /// Integers must fit in `[-2^63, 2^64-1]`; decimals and exponents must be
 /// finite `f64`. Raw tokens are checked before parsing to `Value` so an
 /// oversized integer cannot round to `f64` first. Strings (including
 /// numeric-looking keys and string values) are skipped via string-aware
 /// scanning.
-const INPUT_NUMBER_RANGE_MSG: &str = "numbers must be integers in [-2^63, 2^64-1] or finite floats";
+const JSON_NUMBER_RANGE_MSG: &str = "numbers must be integers in [-2^63, 2^64-1] or finite floats";
 
 /// Deserializes a run-input map while preserving raw JSON number tokens.
 ///
@@ -203,22 +203,59 @@ pub fn deserialize_verified_inputs<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
+    deserialize_verified_values(deserializer, "input")
+}
+
+/// Deserializes an answer map while preserving and validating raw JSON numbers.
+pub fn deserialize_verified_answers<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_verified_values(deserializer, "answer")
+}
+
+/// Deserializes a step-output patch map while preserving and validating raw JSON numbers.
+pub fn deserialize_verified_step_outputs<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_verified_values(deserializer, "step output")
+}
+
+fn deserialize_verified_values<'de, D>(
+    deserializer: D,
+    value_kind: &str,
+) -> Result<BTreeMap<String, Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
     let raw: BTreeMap<String, Box<serde_json::value::RawValue>> =
         BTreeMap::deserialize(deserializer)?;
-    verified_inputs_from_raw_map(raw).map_err(serde::de::Error::custom)
+    verified_values_from_raw_map(raw, value_kind).map_err(serde::de::Error::custom)
 }
 
 /// Converts raw JSON input values to ordinary `Value` after range checks.
 pub fn verified_inputs_from_raw_map(
     raw: BTreeMap<String, Box<serde_json::value::RawValue>>,
 ) -> Result<BTreeMap<String, Value>, ContractError> {
+    verified_values_from_raw_map(raw, "input")
+}
+
+fn verified_values_from_raw_map(
+    raw: BTreeMap<String, Box<serde_json::value::RawValue>>,
+    value_kind: &str,
+) -> Result<BTreeMap<String, Value>, ContractError> {
     let mut out = BTreeMap::new();
     for (id, value) in raw {
         let text = value.get();
-        validate_raw_json_numbers(text)
-            .map_err(|message| ContractError::Invalid(format!("input `{id}` {message}")))?;
+        validate_json_number_tokens(text)
+            .map_err(|message| ContractError::Invalid(format!("{value_kind} `{id}` {message}")))?;
         let parsed: Value = serde_json::from_str(text).map_err(|error| {
-            ContractError::Invalid(format!("input `{id}` is invalid JSON: {error}"))
+            ContractError::Invalid(format!("{value_kind} `{id}` is invalid JSON: {error}"))
         })?;
         out.insert(id, parsed);
     }
@@ -231,10 +268,14 @@ pub fn verified_inputs_from_raw_map(
 /// parsing are not JSON numbers. The whole raw text is scanned so objects or
 /// arrays passed as a scalar still reject embedded out-of-range numbers.
 pub fn validate_input_scalar_token(raw: &str) -> Result<(), ContractError> {
-    validate_raw_json_numbers(raw).map_err(ContractError::Invalid)
+    validate_json_number_tokens(raw).map_err(ContractError::Invalid)
 }
 
-fn validate_raw_json_numbers(raw: &str) -> Result<(), String> {
+/// Validates the number tokens in already-validated raw JSON before conversion to `Value`.
+///
+/// Callers must first ensure the text is syntactically valid JSON (for example, by
+/// deserializing it as `RawValue`). Strings are skipped so numeric-looking text is preserved.
+pub fn validate_json_number_tokens(raw: &str) -> Result<(), String> {
     let bytes = raw.as_bytes();
     let mut index = 0;
     let mut in_string = false;
@@ -285,7 +326,7 @@ fn validate_number_lexeme(lexeme: &str) -> Result<(), String> {
     if supported {
         Ok(())
     } else {
-        Err(INPUT_NUMBER_RANGE_MSG.to_string())
+        Err(JSON_NUMBER_RANGE_MSG.to_string())
     }
 }
 

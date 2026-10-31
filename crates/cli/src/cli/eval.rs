@@ -34,7 +34,7 @@ pub(crate) struct EvalCase {
     pub(crate) name: String,
     #[serde(default, deserialize_with = "contract::deserialize_verified_inputs")]
     pub(crate) inputs: BTreeMap<String, Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "contract::deserialize_verified_answers")]
     pub(crate) answers: BTreeMap<String, Value>,
     #[serde(default)]
     pub(crate) confirmations: BTreeMap<String, bool>,
@@ -787,6 +787,24 @@ mod tests {
             r#"{"name": "suite", "cases": [{"name": "case", "inputs": {"payload": {"nested": [{"number": 1e9999}]}}, "assertions": [{"type": "event_count", "kind": "x"}]}]}"#,
         )
         .expect_err("non-finite float must be rejected");
+        assert!(
+            error.to_string().contains("numbers must be integers"),
+            "unexpected message: {error}"
+        );
+    }
+
+    #[test]
+    fn eval_case_answers_enforce_raw_integer_bounds() {
+        let ok: EvalSuite = serde_json::from_str(
+            r#"{"name":"suite","cases":[{"name":"case","inputs":{},"answers":{"q":{"amount":1.25}},"assertions":[{"type":"event_count","kind":"x"}]}]}"#,
+        )
+        .expect("finite float answers must pass");
+        assert_eq!(ok.cases[0].answers["q"]["amount"].as_f64(), Some(1.25));
+
+        let error = serde_json::from_str::<EvalSuite>(
+            r#"{"name":"suite","cases":[{"name":"case","inputs":{},"answers":{"q":{"amount":18446744073709551616}},"assertions":[{"type":"event_count","kind":"x"}]}]}"#,
+        )
+        .expect_err("out-of-range answer integer must be rejected");
         assert!(
             error.to_string().contains("numbers must be integers"),
             "unexpected message: {error}"

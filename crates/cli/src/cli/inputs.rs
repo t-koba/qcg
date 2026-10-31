@@ -56,7 +56,7 @@ pub(crate) fn load_answers(pairs: Vec<String>) -> Result<BTreeMap<String, Value>
         let (key, value) = pair
             .split_once('=')
             .with_context(|| format!("answer `{pair}` must be k=v"))?;
-        values.insert(key.to_string(), parse_value(value));
+        values.insert(key.to_string(), parse_answer_value(key, value)?);
     }
     Ok(values)
 }
@@ -102,11 +102,19 @@ pub(crate) fn load_confirmations(
 }
 
 fn parse_input_value(key: &str, value: &str) -> Result<Value> {
+    parse_raw_value(key, value, "input")
+}
+
+fn parse_answer_value(key: &str, value: &str) -> Result<Value> {
+    parse_raw_value(key, value, "answer")
+}
+
+fn parse_raw_value(key: &str, value: &str, value_kind: &str) -> Result<Value> {
     if let Ok(raw) = serde_json::from_str::<Box<serde_json::value::RawValue>>(value) {
-        contract::validate_input_scalar_token(raw.get())
-            .map_err(|error| anyhow::anyhow!("input `{key}` {error}"))?;
+        contract::validate_json_number_tokens(raw.get())
+            .map_err(|error| anyhow::anyhow!("{value_kind} `{key}` {error}"))?;
         return serde_json::from_str(raw.get())
-            .with_context(|| format!("input `{key}` is not supported JSON"));
+            .with_context(|| format!("{value_kind} `{key}` is not supported JSON"));
     }
     Ok(parse_value(value))
 }
@@ -310,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn input_pairs_reject_out_of_range_scalars_but_answers_do_not() {
+    fn input_pairs_and_answers_reject_out_of_range_scalars() {
         // In-range scalars keep their JSON types.
         let values = super::load_inputs(
             vec![
@@ -354,9 +362,26 @@ mod tests {
             serde_json::Value::String("18446744073709551616".into())
         );
 
-        // Answers keep their established semantics: no raw number check.
-        let answers = super::load_answers(vec!["payload=18446744073709551616".into()])
-            .expect("answers must not enforce raw bounds");
-        assert!(answers["payload"].is_number());
+        let answers = super::load_answers(vec![
+            "small=-9223372036854775808".into(),
+            "float=1.25".into(),
+            r#"text="18446744073709551616""#.into(),
+        ])
+        .expect("in-range answers, finite floats, and numeric strings must pass");
+        assert_eq!(answers["small"].as_i64(), Some(i64::MIN));
+        assert_eq!(answers["float"].as_f64(), Some(1.25));
+        assert_eq!(
+            answers["text"],
+            serde_json::Value::String("18446744073709551616".into())
+        );
+
+        for token in ["18446744073709551616", "-9223372036854775809", "1e9999"] {
+            let error = super::load_answers(vec![format!("payload={token}")])
+                .expect_err("out-of-range answer must be rejected");
+            assert!(
+                format!("{error:#}").contains("numbers must be integers"),
+                "unexpected answer error for {token}: {error:#}"
+            );
+        }
     }
 }

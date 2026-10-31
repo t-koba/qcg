@@ -698,20 +698,23 @@ compare equal.
 
 Comparisons use the numbers' exact values: two integers are never rounded
 into equality, so two distinct integers above 2^53 stay distinct, and an
-integer equals a float only when the float denotes the same number. The
-HTTP and CLI raw JSON input integer range is [-2^63, 2^64-1]. At ingestion
-the raw JSON tokens for `StartRun.inputs` and `ForkStatePatch.inputs`
-(HTTP) and for JSON input files, eval suites, and `--input key=value`
-scalars (CLI) are scanned with strings skipped before parsing to `Value`;
-integer tokens outside that range are rejected, including inside arrays and
-objects, rather than rounded to floats. Out-of-range expression integer
-literals are also refused. Finite decimal/exponent inputs retain
-floating-point semantics; numbers that cannot convert to a finite float are
-rejected. Callers that provide pre-parsed `Value`s cannot recover any
-precision already lost before ingestion. This evaluator guarantee is distinct
-from JSON consumer precision: the wire representation remains a JSON number,
-but JavaScript's `JSON.parse` converts numbers to IEEE-754 binary64, which guarantees exact
-representation of every integer only within ±(2^53 - 1). Above that range,
+integer equals a float only when the float denotes the same number. The raw JSON integer range for run data is [-2^63, 2^64-1]. QCG-owned
+boundaries check tokens before conversion to `Value`: HTTP `StartRun.inputs`
+and `StartRun.answers`, `ForkStatePatch.inputs` and `step_outputs`,
+`ForkRun.answers`, and `AnswerPayload.values`; CLI JSON input files and eval
+suites, `--input key=value` and `--answer key=value` scalars; and
+LLM-generated JSON outputs before they become step values. Out-of-range
+integer tokens are rejected, including inside arrays and objects, rather than
+rounded to floats. Numeric-looking strings and keys are not treated as
+numbers. Decimal/exponent tokens retain finite `f64` semantics; non-finite
+values and out-of-range expression integer literals are refused. Any source
+that supplies an already-parsed `serde_json::Value` (including a tool adapter)
+has lost the token spelling; an out-of-range integer already rounded to a
+float is evaluated with that approximation, so exact equality is not
+guaranteed for it. This evaluator guarantee is separate from JSON consumer
+precision: JavaScript's `JSON.parse` converts numbers to IEEE-754 binary64,
+which guarantees exact representation of every integer only within ±(2^53 - 1).
+Above that range,
 distinct integer tokens can round to the same value. The generated TypeScript
 client uses `JSON.parse`; consumers that need larger exact integers must
 preserve the JSON number token or use another exact representation.

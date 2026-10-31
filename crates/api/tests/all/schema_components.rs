@@ -524,6 +524,41 @@ fn start_run_inputs_enforce_raw_integer_bounds() {
 }
 
 #[test]
+fn answers_and_step_output_patches_enforce_raw_integer_bounds() {
+    let answer: api::AnswerPayload =
+        serde_json::from_str(r#"{"values":{"amount":1.25,"text":"18446744073709551616"}}"#)
+            .expect("finite floats and numeric strings in answers must pass");
+    assert_eq!(answer.values["amount"].as_f64(), Some(1.25));
+
+    let error = serde_json::from_str::<api::AnswerPayload>(
+        r#"{"values":{"nested":{"amount":18446744073709551616}}}"#,
+    )
+    .expect_err("answer payload must reject nested out-of-range integer");
+    assert!(
+        error.to_string().contains("numbers must be integers"),
+        "unexpected answer-payload error: {error}"
+    );
+
+    let error = serde_json::from_str::<api::StartRun>(
+        r#"{"generator_id":"g","inputs":{},"answers":{"q":{"amount":18446744073709551616}}}"#,
+    )
+    .expect_err("pre-provisioned answers must reject out-of-range integers");
+    assert!(error.to_string().contains("numbers must be integers"));
+
+    let error = serde_json::from_str::<api::ForkRun>(
+        r#"{"at_seq":1,"answers":{"q":{"amount":18446744073709551616}}}"#,
+    )
+    .expect_err("fork answers must reject out-of-range integers");
+    assert!(error.to_string().contains("numbers must be integers"));
+
+    let error = serde_json::from_str::<api::ForkStatePatch>(
+        r#"{"step_outputs":{"previous":{"amount":18446744073709551616}}}"#,
+    )
+    .expect_err("patched step outputs must reject out-of-range integers");
+    assert!(error.to_string().contains("numbers must be integers"));
+}
+
+#[test]
 fn fork_state_patch_inputs_enforce_raw_integer_bounds() {
     let ok: api::ForkStatePatch =
         serde_json::from_str(r#"{"inputs": {"small": -9223372036854775808}}"#)

@@ -1,11 +1,14 @@
-use contract::{ContextOverflowPolicy, ContextRef, Contract, NodeDef, ResourceContextRef};
+use contract::{
+    ContextOverflowPolicy, ContextRef, Contract, NodeDef, ResourceContextRef,
+    validate_json_number_tokens,
+};
 use engine::{
     ResourceSelector, ResultExt, StepContext, StepError, select_resource, validate_json_schema_step,
 };
 use llm::{ChatContent, ChatMessage, StopReason};
 use policy::{MAX_JSON_SCHEMA_BYTES, validate_bounded_json_schema};
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{Value, json, value::RawValue};
 use std::io::Read;
 
 use crate::completion::local_exhaustion;
@@ -575,7 +578,7 @@ pub(crate) fn structured_resource_selector(
 /// fenced block or any balanced object or array region.
 pub(crate) fn parse_llm_json(text: &str) -> Result<Value, String> {
     let trimmed = text.trim();
-    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+    if let Some(value) = parse_raw_json_value(trimmed)? {
         return unwrap_text_wrapped(value);
     }
     if trimmed.starts_with("```") {
@@ -587,18 +590,28 @@ pub(crate) fn parse_llm_json(text: &str) -> Result<Value, String> {
             Some(end) => &without_first_fence[..end],
             None => without_first_fence,
         };
-        if let Ok(value) = serde_json::from_str::<Value>(body.trim()) {
+        if let Some(value) = parse_raw_json_value(body.trim())? {
             return Ok(value);
         }
     }
     // Prose before/after the payload is handled by the balanced candidate
     // scanner below.
     for (start, end) in balanced_json_candidates(trimmed) {
-        if let Ok(value) = serde_json::from_str::<Value>(&trimmed[start..=end]) {
+        if let Some(value) = parse_raw_json_value(&trimmed[start..=end])? {
             return unwrap_text_wrapped(value);
         }
     }
     Err(trimmed.chars().take(120).collect())
+}
+
+fn parse_raw_json_value(text: &str) -> Result<Option<Value>, String> {
+    let Ok(raw) = serde_json::from_str::<Box<RawValue>>(text) else {
+        return Ok(None);
+    };
+    validate_json_number_tokens(raw.get())?;
+    serde_json::from_str(raw.get())
+        .map(Some)
+        .map_err(|error| format!("invalid JSON: {error}"))
 }
 
 pub(crate) fn balanced_json_candidates(text: &str) -> Vec<(usize, usize)> {
@@ -735,7 +748,7 @@ pub(crate) fn unwrap_text_wrapped(value: Value) -> Result<Value, String> {
     if let Value::Object(map) = &value
         && map.len() == 1
         && let Some(Value::String(inner)) = map.get("text")
-        && let Ok(nested) = serde_json::from_str::<Value>(inner)
+        && let Some(nested) = parse_raw_json_value(inner)?
     {
         return Ok(nested);
     }

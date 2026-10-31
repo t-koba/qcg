@@ -31,7 +31,7 @@ pub struct StartRun {
     pub inputs: BTreeMap<String, Value>,
     /// Pre-provisioned answers keyed by question id, consumed without interaction.
     /// Same semantics as eval suite answers.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "contract::deserialize_verified_answers")]
     pub answers: BTreeMap<String, Value>,
     /// Pre-provisioned confirmation decisions keyed by confirmation id.
     #[serde(default)]
@@ -54,7 +54,10 @@ pub struct StartRun {
 pub struct ForkStatePatch {
     #[serde(default, deserialize_with = "contract::deserialize_verified_inputs")]
     pub inputs: BTreeMap<String, Value>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "contract::deserialize_verified_step_outputs"
+    )]
     pub step_outputs: BTreeMap<String, Value>,
     #[serde(default)]
     pub step_statuses: BTreeMap<String, String>,
@@ -67,7 +70,7 @@ pub struct ForkRun {
     #[serde(default)]
     pub state_patch: ForkStatePatch,
     /// Pre-provisioned answers keyed by question id, consumed without interaction.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "contract::deserialize_verified_answers")]
     pub answers: BTreeMap<String, Value>,
     /// Pre-provisioned confirmation decisions keyed by confirmation id.
     #[serde(default)]
@@ -299,6 +302,7 @@ pub struct RunListQuery {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AnswerPayload {
+    #[serde(deserialize_with = "contract::deserialize_verified_answers")]
     pub values: BTreeMap<String, Value>,
 }
 

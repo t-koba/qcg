@@ -658,6 +658,44 @@ fn parse_llm_json_unwraps_text_wrapped_payload() {
 }
 
 #[test]
+fn parse_llm_json_rejects_out_of_range_integer_tokens_and_preserves_floats_and_strings() {
+    let value = parse_llm_json(
+        r#"{"max":18446744073709551615,"min":-9223372036854775808,"float":1e100,"text":"18446744073709551616"}"#,
+    )
+    .expect("supported integers, finite floats, and numeric strings should pass");
+    assert_eq!(value["max"].as_u64(), Some(u64::MAX));
+    assert_eq!(value["min"].as_i64(), Some(i64::MIN));
+    assert_eq!(value["text"], "18446744073709551616");
+
+    for token in ["18446744073709551616", "-9223372036854775809", "1e9999"] {
+        let raw = format!(r#"{{"value":{token}}}"#);
+        let error = parse_llm_json(&raw).expect_err("unsupported numeric token must be rejected");
+        assert!(
+            error.contains("numbers must be integers in [-2^63, 2^64-1] or finite floats"),
+            "unexpected error for {token}: {error}"
+        );
+    }
+
+    let noisy = r#"final JSON: {"value":18446744073709551616}."#;
+    let error = parse_llm_json(noisy).expect_err("out-of-range candidate must not be rounded");
+    assert!(
+        error.contains("numbers must be integers"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn parse_llm_json_checks_numeric_tokens_inside_text_wrapped_payloads() {
+    let inner = r#"{"value":18446744073709551616}"#;
+    let wrapped = format!(r#"{{"text":{}}}"#, serde_json::to_string(inner).unwrap());
+    let error = parse_llm_json(&wrapped).expect_err("wrapped unsupported integer must be rejected");
+    assert!(
+        error.contains("numbers must be integers"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn parse_llm_json_keeps_plain_text_object_as_is() {
     // {"answer": "..."} — single key but not "text" — must not be unwrapped.
     let value = parse_llm_json(r#"{"answer":"42"}"#).expect("should parse");
