@@ -629,9 +629,8 @@ impl<'a> LlmGateway<'a> {
         loop {
             tokio::select! {
                 _ = self.cancellation.cancelled() => {
-                    // Cancellation can race with provider events already in the
-                    // channel. Drain them first so a queued completion still
-                    // settles usage, even before rejection has been observed.
+                    // Cancellation can beat a buffered completion, even before rejection;
+                    // drain queued events first so available usage is settled before aborting.
                     receiver.close();
                     while let Ok(event) = receiver.try_recv() {
                         record(event, acc)?;
