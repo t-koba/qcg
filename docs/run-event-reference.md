@@ -234,9 +234,10 @@ transport-attempt count. `fallback_index` is its zero-based equivalent;
 invocation advances to the next declared route; `next_route` with no remaining
 route still fails. A fallback can itself refuse dispatch during capability
 revalidation. Once any stream event has been forwarded, a mechanism guard
-refuses both retry and fallback regardless of policy. These are observation
-events subject to the contract's audit configuration, not completion or
-continuation authorization. See the provider guide's
+refuses both retry and fallback regardless of policy. Ordinary route failures
+are observation events subject to the contract's audit configuration, not
+completion or continuation authorization. A failure with `web_search` liability
+(as described below) is instead durable budget state and cannot be filtered. See the provider guide's
 [transport policy](llm-provider-guide.md#transport-retry-and-route-policy) for
 defaults, matching, bounds, and duplicate-dispatch uncertainty.
 
@@ -279,8 +280,22 @@ explicitly null. `llm_call.cost_microusd` is the priced portion, not a complete
 estimate when a component is explicitly unmetered. No request and known zero
 are distinct and do not create an unresolved charge.
 
+A streaming secret-scan rejection permanently suppresses further deltas and
+clears withheld text while consuming the same provider operation. If a completion
+arrives, its known usage/search accounting is recorded once via `llm_call`, without
+response content or provider state, and the original rejection still fails the
+call even if the final text is clean. No retry or fallback follows rejection.
+If the operation fails, ends, or is canceled without a completion, a request
+that enabled hosted search records one durable `llm_route_failed.web_search`
+liability: `{"calls": null, "cost_microusd": null}`, with no text, events, citations,
+token usage, or fabricated `llm_call`. Its `kind` is `partial_stream` and
+`fallback_taken` is false. Calls without hosted search do not create a liability.
+Queued completions on terminal/cancel paths are settled at most once, without
+also recording an unknown liability.
+
 The run budget persists `unresolved_search_cost` when any completed call has an
-unknown/unpriced search charge; journal replay restores it. Required-pricing
+unknown/unpriced search charge or a failure records that liability; journal
+replay restores it. Required-pricing
 reservations refuse further provider requests while that marker is set, even
 without a token/cost cap or when the next request disables search. Supplying a
 rate later does not settle unknown historical charges.

@@ -228,6 +228,18 @@ pub struct LlmRouteFailedEventData {
     /// Number of declared routes available for this invocation.
     #[serde(default)]
     pub routes_total: usize,
+    /// Unresolved hosted-search liability after publication rejection without completion.
+    /// Numeric fields are null; no response text, search events, or citations are recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_search: Option<WebSearchLiability>,
 }
 
 pub type LlmRouteFailureKind = model::LlmErrorKind;
+
+/// Unknown possible hosted-search spend, without fabricated usage or response metadata.
+#[derive(Debug, Clone, Serialize, serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WebSearchLiability {
+    pub calls: (),
+    pub cost_microusd: (),
+}

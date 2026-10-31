@@ -95,7 +95,7 @@ pub struct BudgetState {
     #[serde(default)]
     pub tokens_cache_creation_input: u64,
     pub cost_microusd: u64,
-    /// At least one completed hosted search has an unknown/unpriced charge.
+    /// At least one hosted search has an unknown/unpriced charge or unsettled liability.
     #[serde(default)]
     pub unresolved_search_cost: bool,
     #[serde(deserialize_with = "required_presence")]
@@ -439,6 +439,17 @@ impl RunState {
                 api::JOURNAL_SCHEMA_VERSION
             )));
         }
+        if matches!(kind, "llm_call" | "llm_route_failed") {
+            self.budget.unresolved_search_cost |= event
+                .get("web_search")
+                .filter(|search| search.is_object())
+                .is_some_and(|search| {
+                    search
+                        .get("cost_microusd")
+                        .and_then(Value::as_u64)
+                        .is_none()
+                });
+        }
         match kind {
             "run_queued" | "run_started" => {
                 // Only schema 1 may omit the mode: its historical meaning is WallClock.
@@ -672,15 +683,6 @@ impl RunState {
                 self.budget.has_budget_charges = true;
             }
             "llm_call" => {
-                self.budget.unresolved_search_cost |= event
-                    .get("web_search")
-                    .filter(|search| search.is_object())
-                    .is_some_and(|search| {
-                        search
-                            .get("cost_microusd")
-                            .and_then(Value::as_u64)
-                            .is_none()
-                    });
                 self.budget.llm_calls = self.budget.llm_calls.checked_add(1).ok_or_else(|| {
                     crate::JournalError::InvalidEvent("LLM call count overflowed".into())
                 })?;

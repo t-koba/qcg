@@ -2676,6 +2676,11 @@ export interface components {
              * @default 0
              */
             routes_total: number;
+            /**
+             * @description Unresolved hosted-search liability after publication rejection without completion.
+             *     Numeric fields are null; no response text, search events, or citations are recorded.
+             */
+            web_search?: components["schemas"]["WebSearchLiability"] | null;
         };
         LlmValidationFailedEventData: {
             /** Format: uint */
@@ -3534,6 +3539,11 @@ export interface components {
         UserInteractionEventData: {
             /** @default null */
             source: string | null;
+        };
+        /** @description Unknown possible hosted-search spend, without fabricated usage or response metadata. */
+        WebSearchLiability: {
+            calls: null;
+            cost_microusd: null;
         };
         /** @description What provider-hosted search did for one response and how much was metered. */
         WebSearchUsage: {

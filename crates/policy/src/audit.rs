@@ -1,7 +1,9 @@
 //! Event classification and audit policy.
 //!
 //! The durable/observation split is a mechanism fact, not a configuration
-//! choice: a record kind is durable exactly when `RunState::apply` folds it.
+//! choice: state-bearing records must be durable. The gateway explicitly promotes
+//! `llm_route_failed` with an unresolved hosted-search liability to the durable
+//! path; ordinary route failures retain their observation classification.
 //! Observation kinds are listed here so every layer (contract validation,
 //! engine writer, service readers) agrees on what audit policy may filter.
 //! Any kind not listed is durable, so a newly added durable record is never
@@ -22,7 +24,8 @@ pub enum EventClass {
 }
 
 /// Observation record kinds. A kind that `RunState::apply` folds into state
-/// must never appear here, and a kind listed here must not fold. Durable
+/// must never appear here unless its state-bearing form is explicitly promoted
+/// to the durable path (the hosted-search liability on `llm_route_failed`). Durable
 /// records that carry no state (operator diagnostics such as
 /// `foreach_sibling_ignored`) stay durable on purpose: they are journal
 /// history that an audit policy must not be able to filter away.

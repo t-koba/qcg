@@ -522,6 +522,22 @@ mod tests {
             })
         ));
 
+        let mut liability = route_failed.clone();
+        liability["web_search"] = json!({"calls": null, "cost_microusd": null});
+        let parsed = RunEvent::from_flat(&liability).expect("search liability should decode");
+        let RunEventData::LlmRouteFailed(data) = parsed.data else {
+            panic!("route failure expected")
+        };
+        assert_eq!(
+            serde_json::to_value(data.web_search).unwrap(),
+            liability["web_search"]
+        );
+        liability["web_search"]["events"] = json!([]);
+        assert!(
+            RunEvent::from_flat(&liability).is_err(),
+            "liability has no response metadata"
+        );
+
         let mut invalid = route_failed;
         invalid["unexpected"] = json!(true);
         let error = RunEvent::from_flat(&invalid)

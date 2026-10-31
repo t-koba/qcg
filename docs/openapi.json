@@ -2174,6 +2174,17 @@
             "format": "uint",
             "minimum": 0,
             "type": "integer"
+          },
+          "web_search": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WebSearchLiability"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Unresolved hosted-search liability after publication rejection without completion.\nNumeric fields are null; no response text, search events, or citations are recorded."
           }
         },
         "required": [
@@ -4545,6 +4556,23 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "WebSearchLiability": {
+        "additionalProperties": false,
+        "description": "Unknown possible hosted-search spend, without fabricated usage or response metadata.",
+        "properties": {
+          "calls": {
+            "type": "null"
+          },
+          "cost_microusd": {
+            "type": "null"
+          }
+        },
+        "required": [
+          "calls",
+          "cost_microusd"
+        ],
         "type": "object"
       },
       "WebSearchUsage": {

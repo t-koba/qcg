@@ -39,6 +39,20 @@ struct StreamAccumulator {
     pending: String,
     published_tail: String,
     response: Option<ChatResponse>,
+    rejection: Option<LlmError>,
+    canceled: bool,
+}
+
+impl StreamAccumulator {
+    fn reject(&mut self, error: StepError) {
+        self.pending.clear();
+        self.published_tail.clear();
+        self.rejection = Some(LlmError {
+            message: error.to_string(),
+            kind: LlmErrorKind::PartialStream,
+            ..Default::default()
+        });
+    }
 }
 
 impl Drop for DecisionReservationGuard {
@@ -153,7 +167,7 @@ impl<'a> LlmGateway<'a> {
             Ok(response) => response,
             Err(error) => {
                 let error = trace.finish_error(self.provider.as_ref(), error, false);
-                self.record_route_failure(node, &model.provider, &model.model, 1, 1, &error)?;
+                self.record_route_failure(node, model, 1, 1, &error, false)?;
                 if error.kind == LlmErrorKind::Canceled {
                     return Err(StepError::Cancelled);
                 }
@@ -385,9 +399,10 @@ impl<'a> LlmGateway<'a> {
             } else {
                 llm::validate_route_capabilities(self.provider.as_ref(), &routed_request)
             };
+            let mut acc = StreamAccumulator::default();
             let result = match validation {
                 Ok(()) => {
-                    self.complete_route(node, routed_request, trace.observer())
+                    self.complete_route(node, routed_request, trace.observer(), &mut acc)
                         .await
                 }
                 Err(error) => Err(error),
@@ -399,20 +414,28 @@ impl<'a> LlmGateway<'a> {
                         model.clone(),
                         completed,
                         trace.decisions(),
+                        acc.rejection,
+                        acc.canceled,
                     ));
                     break;
                 }
                 Err(error) => {
-                    let error = trace.finish_error(self.provider.as_ref(), error, request.stream);
+                    let canceled = error.kind == LlmErrorKind::Canceled;
+                    let rejected = acc.rejection.is_some();
+                    let error = trace.finish_error(
+                        self.provider.as_ref(),
+                        acc.rejection.unwrap_or(error),
+                        request.stream,
+                    );
                     self.record_route_failure(
                         node,
-                        provider,
-                        model,
+                        route,
                         attempt + 1,
                         routes.len(),
                         &error,
+                        rejected && request.provider_web_search.is_some(),
                     )?;
-                    if error.kind == LlmErrorKind::Canceled {
+                    if canceled {
                         return Err(StepError::Cancelled);
                     }
                     if !error.allows_next_route() || attempt + 1 == routes.len() {
@@ -421,7 +444,7 @@ impl<'a> LlmGateway<'a> {
                 }
             }
         }
-        let (provider_id, model_id, response, retry_decisions) =
+        let (provider_id, model_id, response, retry_decisions, rejection, canceled) =
             response.ok_or_else(|| StepError::failed(&node.id, "no LLM route was available"))?;
         let usage = response.usage.clone();
         // A requested search remains visible even if the provider omitted usage.
@@ -488,6 +511,13 @@ impl<'a> LlmGateway<'a> {
         merge_event_extra(&mut event, event_extra(&response.usage));
         event["retry_decisions"] = json!(retry_decisions);
         self.journal.event("llm_call", event).step_err(&node.id)?;
+        if canceled {
+            return Err(StepError::Cancelled);
+        }
+        // A rejected delta remains terminal even if the completion is clean.
+        if let Some(error) = rejection {
+            return Err(error).step_err(&node.id);
+        }
         // Rejected payloads are still billable; report the scan after journaling.
         if response.stop != llm::StopReason::ModelContextWindowExceeded {
             self.scan_response(node, &response)?;
@@ -541,28 +571,34 @@ impl<'a> LlmGateway<'a> {
     fn record_route_failure(
         &self,
         node: &NodeDef,
-        provider: &str,
-        model: &str,
+        route: &ModelRef,
         attempt: usize,
         routes_total: usize,
         error: &LlmError,
+        unknown_search: bool,
     ) -> Result<(), StepError> {
-        self.journal
-            .event(
-                "llm_route_failed",
-                json!({
-                    "node": node.id,
-                    "provider": provider,
-                    "model": model,
-                    "attempt": attempt,
-                    "fallback_index": attempt.saturating_sub(1),
-                    "routes_total": routes_total,
-                    "kind": error.kind,
-                    "retry_decisions": error.decisions,
-                    "fallback_taken": attempt < routes_total && error.allows_next_route(),
-                }),
-            )
-            .step_err(&node.id)
+        let mut event = json!({
+            "node": node.id,
+            "provider": route.provider,
+            "model": route.model,
+            "attempt": attempt,
+            "fallback_index": attempt.saturating_sub(1),
+            "routes_total": routes_total,
+            "kind": error.kind,
+            "retry_decisions": error.decisions,
+            "fallback_taken": attempt < routes_total && error.allows_next_route(),
+        });
+        if unknown_search {
+            event["web_search"] = json!({"calls": null, "cost_microusd": null});
+        }
+        // Ordinary failures remain optional audit records; a search liability
+        // changes the run budget and must survive audit filtering and replay.
+        if unknown_search {
+            self.journal.durable_event("llm_route_failed", event)
+        } else {
+            self.journal.event("llm_route_failed", event)
+        }
+        .step_err(&node.id)
     }
 
     async fn complete_route(
@@ -570,6 +606,7 @@ impl<'a> LlmGateway<'a> {
         node: &NodeDef,
         request: ChatRequest,
         observer: llm::RetryObserver,
+        acc: &mut StreamAccumulator,
     ) -> Result<ChatResponse, LlmError> {
         if !request.stream {
             return tokio::select! {
@@ -586,13 +623,22 @@ impl<'a> LlmGateway<'a> {
         let (events, mut receiver) = tokio::sync::mpsc::channel(LLM_STREAM_CHANNEL_CAPACITY);
         let stream = self.provider.stream_observed(request, events, observer);
         tokio::pin!(stream);
-        let mut acc = StreamAccumulator::default();
         let record = |event, acc: &mut StreamAccumulator| {
             self.record_stream_event(node, &provider_id, &model_id, event, acc)
         };
         loop {
             tokio::select! {
                 _ = self.cancellation.cancelled() => {
+                    if acc.rejection.is_some() {
+                        receiver.close();
+                        while let Ok(event) = receiver.try_recv() {
+                            record(event, acc)?;
+                        }
+                        if let Some(response) = acc.response.take() {
+                            acc.canceled = true;
+                            return Ok(response);
+                        }
+                    }
                     return Err(LlmError {
                         message: "LLM stream canceled".into(),
                         kind: LlmErrorKind::Canceled,
@@ -600,8 +646,17 @@ impl<'a> LlmGateway<'a> {
                     });
                 }
                 result = &mut stream => {
+                    let canceled = result
+                        .as_ref()
+                        .err()
+                        .is_some_and(|error| error.kind == LlmErrorKind::Canceled);
+                    receiver.close();
                     while let Ok(event) = receiver.try_recv() {
-                        record(event, &mut acc)?;
+                        record(event, acc)?;
+                    }
+                    if acc.rejection.is_some() && let Some(response) = acc.response.take() {
+                        acc.canceled = canceled;
+                        return Ok(response);
                     }
                     if let Err(error) = result {
                         if acc.index > 0 {
@@ -615,13 +670,13 @@ impl<'a> LlmGateway<'a> {
                         }
                         return Err(error);
                     }
-                    return acc.response.ok_or_else(|| LlmError::new("LLM stream ended without a completed response"));
+                    return acc.response.take().ok_or_else(|| LlmError::new("LLM stream ended without a completed response"));
                 }
                 event = receiver.recv() => {
                     match event {
-                        Some(event) => record(event, &mut acc)?,
+                        Some(event) => record(event, acc)?,
                         None => {
-                            return acc.response.ok_or_else(|| LlmError::new("LLM stream channel closed before completion"));
+                            return acc.response.take().ok_or_else(|| LlmError::new("LLM stream channel closed before completion"));
                         }
                     }
                 }
@@ -638,8 +693,16 @@ impl<'a> LlmGateway<'a> {
         event: ChatStreamEvent,
         acc: &mut StreamAccumulator,
     ) -> Result<(), LlmError> {
+        // The first completion settles this operation; queued duplicates and
+        // post-completion deltas cannot publish or settle it again.
+        if acc.response.is_some() {
+            return Ok(());
+        }
         match event {
             ChatStreamEvent::TextDelta { text } => {
+                if acc.rejection.is_some() {
+                    return Ok(());
+                }
                 if self.secrets.is_empty() {
                     self.scan_text(node, &text)
                         .map_err(|error| LlmError::new(error.to_string()))?;
@@ -659,8 +722,10 @@ impl<'a> LlmGateway<'a> {
                 let holdback = self.secrets.max_value_len().saturating_sub(1);
                 let mut window = acc.published_tail.clone();
                 window.push_str(&acc.pending);
-                self.scan_text(node, &window)
-                    .map_err(|error| LlmError::new(error.to_string()))?;
+                if let Err(error) = self.scan_text(node, &window) {
+                    acc.reject(error);
+                    return Ok(());
+                }
                 let mut publish_len = acc.pending.len().saturating_sub(holdback);
                 while publish_len > 0 && !acc.pending.is_char_boundary(publish_len) {
                     publish_len = publish_len.saturating_sub(1);
@@ -680,7 +745,8 @@ impl<'a> LlmGateway<'a> {
             ChatStreamEvent::Completed {
                 response: completed,
             } => {
-                if !self.secrets.is_empty()
+                if acc.rejection.is_none()
+                    && !self.secrets.is_empty()
                     && completed.stop != llm::StopReason::ModelContextWindowExceeded
                 {
                     // Final gate: withheld suffix stays unpublished and visible
@@ -693,8 +759,11 @@ impl<'a> LlmGateway<'a> {
                     if !acc.pending.is_empty() {
                         let mut window = acc.published_tail.clone();
                         window.push_str(&acc.pending);
-                        self.scan_text(node, &window)
-                            .map_err(|error| LlmError::new(error.to_string()))?;
+                        if let Err(error) = self.scan_text(node, &window) {
+                            acc.reject(error);
+                            acc.response = Some(completed);
+                            return Ok(());
+                        }
                         let flush = std::mem::take(&mut acc.pending);
                         self.publish_delta(node, provider, model, &flush, &mut acc.index)?;
                         acc.published_tail.clear();

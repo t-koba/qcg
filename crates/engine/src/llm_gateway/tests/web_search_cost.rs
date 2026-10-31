@@ -5,6 +5,15 @@ use model::{
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[derive(Debug, Default, Clone, Copy)]
+enum StreamTerminal {
+    #[default]
+    End,
+    Retryable,
+    ChannelEnd,
+    Cancel,
+}
+
 /// A provider whose response carries a hosted web search: the calls it
 /// made, one of them with its action, and the citation it attached.
 #[derive(Default)]
@@ -14,6 +23,10 @@ struct SearchProvider {
     reject_response: bool,
     unsafe_search_field: Option<&'static str>,
     requests: AtomicUsize,
+    reject_delta: bool,
+    omit_completion: bool,
+    stream_terminal: StreamTerminal,
+    cancellation: CancellationToken,
 }
 
 #[async_trait]
@@ -22,7 +35,17 @@ impl LlmProvider for SearchProvider {
         "search-metered"
     }
     fn capabilities(&self) -> Capabilities {
-        Capabilities::default()
+        Capabilities {
+            streaming: true,
+            web_search: true,
+            ..Capabilities::default()
+        }
+    }
+    fn stream_retry_attempts(&self) -> usize {
+        3
+    }
+    fn retry_base_backoff(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
     }
     async fn complete(&self, request: ChatRequest) -> Result<ChatResponse, LlmError> {
         self.requests.fetch_add(1, Ordering::SeqCst);
@@ -78,16 +101,55 @@ impl LlmProvider for SearchProvider {
         events: tokio::sync::mpsc::Sender<llm::ChatStreamEvent>,
     ) -> Result<(), LlmError> {
         let response = self.complete(request).await?;
-        for event in [
-            llm::ChatStreamEvent::TextDelta {
-                text: "verified prefix; held tail".into(),
-            },
-            llm::ChatStreamEvent::Completed { response },
-        ] {
+        let deltas: &[&str] = if self.reject_delta {
+            &["sec", "ret-value", "unsafe after rejection"]
+        } else {
+            &["verified prefix; held tail"]
+        };
+        for text in deltas {
             events
-                .send(event)
+                .send(llm::ChatStreamEvent::TextDelta {
+                    text: (*text).into(),
+                })
                 .await
                 .map_err(|_| LlmError::new("closed"))?;
+        }
+        if self.reject_delta {
+            // Let the gateway latch rejection before this operation continues.
+            tokio::task::yield_now().await;
+        }
+        if !self.omit_completion {
+            events
+                .send(llm::ChatStreamEvent::Completed {
+                    response: response.clone(),
+                })
+                .await
+                .map_err(|_| LlmError::new("closed"))?;
+            if self.reject_delta {
+                // A queued duplicate must not charge usage twice.
+                events
+                    .send(llm::ChatStreamEvent::Completed { response })
+                    .await
+                    .map_err(|_| LlmError::new("closed"))?;
+            }
+        }
+        match self.stream_terminal {
+            StreamTerminal::End => {}
+            StreamTerminal::Retryable => {
+                return Err(LlmError {
+                    message: "retryable failure after deltas".into(),
+                    kind: llm::LlmErrorKind::HttpStatus(503),
+                    ..Default::default()
+                });
+            }
+            StreamTerminal::ChannelEnd => {
+                drop(events);
+                return std::future::pending().await;
+            }
+            StreamTerminal::Cancel => {
+                self.cancellation.cancel();
+                return std::future::pending().await;
+            }
         }
         Ok(())
     }
@@ -423,7 +485,7 @@ async fn an_unpriced_hosted_search_is_unmetered_not_free() {
 
 /// Rejected payloads must not discard a completed call's billable usage.
 /// Exercise both the ordinary response scan and the stream's final gate;
-/// TextDelta rejection before Completed deliberately remains out of scope.
+/// Incremental TextDelta rejection is covered separately below.
 #[tokio::test]
 async fn secret_rejected_completions_account_safely_and_block_unresolved_search_replay() {
     for stream in [false, true] {
@@ -535,6 +597,253 @@ async fn secret_rejected_completions_account_safely_and_block_unresolved_search_
                 assert_eq!(provider.requests.load(Ordering::SeqCst), 1);
                 std::fs::remove_dir_all(dir).unwrap();
             }
+        }
+    }
+}
+
+#[tokio::test]
+async fn rejected_delta_drains_completion_and_accounts_once_without_publication() {
+    for terminal in [
+        StreamTerminal::End,
+        StreamTerminal::Retryable,
+        StreamTerminal::ChannelEnd,
+        StreamTerminal::Cancel,
+    ] {
+        for unsafe_completion in [false, true] {
+            let dir = test_dir("delta-rejected-completed");
+            let journal = test_journal(&dir, "delta-rejected-completed");
+            let secrets = test_secret_store();
+            let provider = Arc::new(SearchProvider {
+                calls: Some(2),
+                reject_delta: true,
+                reject_response: unsafe_completion,
+                stream_terminal: terminal,
+                ..Default::default()
+            });
+            let mut gateway = test_gateway(provider.clone(), &secrets, &journal);
+            gateway.cancellation = provider.cancellation.clone();
+            gateway.budget.require_pricing = true;
+            let mut request = search_request();
+            request.stream = true;
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                gateway.complete(
+                    &test_node(),
+                    request,
+                    &[search_pricing(Some(0.5)), search_pricing(Some(0.5))],
+                    |_| json!({}),
+                ),
+            )
+            .await
+            .expect("terminal stream must settle")
+            .unwrap_err();
+            if matches!(terminal, StreamTerminal::Cancel) {
+                assert!(
+                    matches!(error, StepError::Cancelled),
+                    "{terminal:?}: cancellation status lost"
+                );
+            } else {
+                assert!(
+                    error.to_string().contains("secret `token`"),
+                    "{terminal:?}: {error}"
+                );
+            }
+            assert_eq!(provider.requests.load(Ordering::SeqCst), 1);
+            let text = persisted_text(&dir);
+            assert!(!text.contains("secret-value"));
+            let events: Vec<serde_json::Value> = text
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| e["t"] == "llm_delta" || e["t"] == "llm_route_failed")
+            );
+            assert_eq!(events.iter().filter(|e| e["t"] == "llm_call").count(), 1);
+            let call = llm_call_event(&dir);
+            assert_eq!(call["tokens"]["input"], 100);
+            assert_eq!(call["tokens"]["output"], 10);
+            assert_eq!(call["cost_microusd"], 1_000_110);
+            assert_eq!(call["web_search"]["calls"], 2);
+            assert_eq!(call["web_search"]["cost_microusd"], 1_000_000);
+            assert_eq!(call["web_search"]["events"][0]["action"], "search");
+            assert!(call.get("content").is_none() && call.get("provider_state").is_none());
+            for state in [
+                journal.state(),
+                crate::RunState::fold_journal(&dir.join("journal.jsonl")).unwrap(),
+            ] {
+                assert!(!state.budget.unresolved_search_cost);
+                assert_eq!(state.budget.llm_calls, 1);
+                assert_eq!(state.budget.cost_microusd, 1_000_110);
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn rejected_delta_without_completion_records_search_liability_and_blocks_replay() {
+    for terminal in [
+        StreamTerminal::End,
+        StreamTerminal::Retryable,
+        StreamTerminal::ChannelEnd,
+        StreamTerminal::Cancel,
+    ] {
+        for search_enabled in [false, true] {
+            let dir = test_dir("delta-rejected-unsettled");
+            let run_id = format!("delta-rejected-{}", uuid::Uuid::now_v7());
+            let journal = JournalWriter::create_with_policies(
+                &dir.join("journal.jsonl"),
+                &run_id,
+                false,
+                None,
+                crate::JournalLimits::default(),
+                policy::AuditPolicy {
+                    default_mode: if search_enabled {
+                        policy::AuditMode::Off
+                    } else {
+                        policy::AuditMode::Full
+                    },
+                    ..Default::default()
+                },
+                policy::AuditLimits::default(),
+            )
+            .unwrap();
+            let secrets = test_secret_store();
+            let provider = Arc::new(SearchProvider {
+                reject_delta: true,
+                omit_completion: true,
+                stream_terminal: terminal,
+                ..Default::default()
+            });
+            let routed: Arc<dyn LlmProvider> = if matches!(terminal, StreamTerminal::Retryable) {
+                let mut router = llm::LlmRouter::parse_text("").unwrap();
+                router.register(provider.clone());
+                Arc::new(router)
+            } else {
+                provider.clone()
+            };
+            let mut gateway = test_gateway(routed, &secrets, &journal);
+            gateway.cancellation = provider.cancellation.clone();
+            gateway.budget.require_pricing = true;
+            let mut request = search_request();
+            request.stream = true;
+            if !search_enabled {
+                request.provider_web_search = None;
+            }
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                gateway.complete(
+                    &test_node(),
+                    request,
+                    &[search_pricing(Some(0.5)), search_pricing(Some(0.5))],
+                    |_| panic!("no completed call"),
+                ),
+            )
+            .await
+            .expect("terminal stream must settle")
+            .unwrap_err();
+            if matches!(terminal, StreamTerminal::Cancel) {
+                assert!(
+                    matches!(error, StepError::Cancelled),
+                    "{terminal:?}: cancellation status lost"
+                );
+            } else {
+                assert!(
+                    error.to_string().contains("secret `token`"),
+                    "{terminal:?}: {error}"
+                );
+            }
+            assert_eq!(
+                provider.requests.load(Ordering::SeqCst),
+                1,
+                "must not retry or fall back"
+            );
+            let text = persisted_text(&dir);
+            assert!(!text.contains("secret-value"));
+            let events: Vec<serde_json::Value> = text
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| e["t"] == "llm_delta" || e["t"] == "llm_call")
+            );
+            let failures: Vec<_> = events
+                .iter()
+                .filter(|e| e["t"] == "llm_route_failed")
+                .collect();
+            assert_eq!(failures.len(), 1);
+            let failure = failures[0];
+            assert_eq!(failure["kind"], "partial_stream");
+            assert_eq!(failure["fallback_taken"], false);
+            assert_eq!(
+                failure["retry_decisions"]
+                    .as_array()
+                    .unwrap()
+                    .last()
+                    .unwrap()["action"],
+                "fail_fast"
+            );
+            if search_enabled {
+                assert_eq!(
+                    failure["web_search"],
+                    json!({"calls": null, "cost_microusd": null})
+                );
+            } else {
+                assert!(failure.get("web_search").is_none());
+            }
+            for state in [
+                journal.state(),
+                crate::RunState::fold_journal(&dir.join("journal.jsonl")).unwrap(),
+            ] {
+                assert_eq!(
+                    state.budget.unresolved_search_cost, search_enabled,
+                    "{terminal:?}: seq={} text={text}",
+                    state.last_seq
+                );
+                assert_eq!(
+                    (
+                        state.budget.llm_calls,
+                        state.budget.tokens_input,
+                        state.budget.tokens_output,
+                        state.budget.cost_microusd
+                    ),
+                    (0, 0, 0, 0)
+                );
+            }
+            if search_enabled {
+                let mut state = crate::RunState::fold_journal(&dir.join("journal.jsonl")).unwrap();
+                let mut settled = json!({"t": "llm_call", "tokens": TokenUsage::default(), "cost_microusd": 0,
+                    "web_search": {"calls": 0, "cost_microusd": 0}});
+                settled["seq"] = json!(state.last_seq + 1);
+                state.apply(&settled).unwrap();
+                assert!(
+                    state.budget.unresolved_search_cost,
+                    "later known-zero usage cannot settle the old liability"
+                );
+            }
+            drop(gateway);
+            drop(journal);
+            if search_enabled {
+                let resumed = test_journal(&dir, &run_id);
+                let mut gateway = test_gateway(provider.clone(), &secrets, &resumed);
+                gateway.budget.require_pricing = true;
+                let mut request = search_request();
+                request.provider_web_search = None;
+                let error = gateway
+                    .complete(&test_node(), request, &[search_pricing(Some(0.5))], |_| {
+                        json!({})
+                    })
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("unresolved hosted search cost"));
+                assert_eq!(provider.requests.load(Ordering::SeqCst), 1);
+                assert!(resumed.state().budget.unresolved_search_cost);
+            }
+            std::fs::remove_dir_all(dir).unwrap();
         }
     }
 }

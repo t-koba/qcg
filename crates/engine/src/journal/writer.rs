@@ -675,7 +675,12 @@ impl JournalWriter {
         Ok(())
     }
 
-    fn durable_event(&self, kind: &str, payload: impl Serialize) -> Result<(), JournalError> {
+    /// State-bearing forms of otherwise observational events must bypass audit filtering.
+    pub(crate) fn durable_event(
+        &self,
+        kind: &str,
+        payload: impl Serialize,
+    ) -> Result<(), JournalError> {
         let payload = serialize_bounded(&payload, self.limits.max_event_bytes, "event")?;
         let mut value = serde_json::from_slice::<Value>(&payload)?;
         if !value.is_object() {

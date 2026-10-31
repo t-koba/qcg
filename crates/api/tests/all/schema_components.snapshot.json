@@ -144,5 +144,6 @@
   "TransportPhase",
   "UrlCitation",
   "UserInteractionEventData",
+  "WebSearchLiability",
   "WebSearchUsage"
 ]
