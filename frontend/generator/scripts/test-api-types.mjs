@@ -1,5 +1,5 @@
 // Bidirectional structural parity, not a text snapshot: every legacy public
-// export is checked against a frozen pre-migration fixture. No network.
+// export is checked using frozen pre-migration declarations and OpenAPI. No network.
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
@@ -9,12 +9,12 @@ import { fileURLToPath } from 'node:url';
 import { openapiTypes } from './openapi-types.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
-const spec = JSON.parse(readFileSync(resolve(root, 'docs/openapi.json')));
+const legacySpec = JSON.parse(readFileSync(resolve(root, 'frontend/generator/testdata/legacy-openapi.json')));
 const directory = mkdtempSync(resolve(tmpdir(), 'qcg-api-parity-'));
 try {
   writeFileSync(resolve(directory, 'baseline.ts'), readFileSync(resolve(root, 'frontend/generator/testdata/legacy-api-types.ts')));
-  writeFileSync(resolve(directory, 'canonical.ts'), await openapiTypes(spec));
-  const mutated = structuredClone(spec);
+  writeFileSync(resolve(directory, 'canonical.ts'), await openapiTypes(legacySpec));
+  const mutated = structuredClone(legacySpec);
   const op = mutated.paths['/healthz'].get;
   op.operationId = 'probeHealth';
   op.parameters = [{ in: 'query', name: 'mode', required: true, schema: { type: 'string', enum: ['brief', 'full'] } }];
@@ -55,7 +55,9 @@ type Mutation = [Assert<Bi<Paths, M.paths>>, Assert<Bi<Components, M.components>
     '--noEmit', '--strict', '--target', 'ES2022', '--module', 'ESNext', '--moduleResolution', 'bundler', '--lib', 'ES2022,DOM',
     resolve(directory, 'parity.ts'), ...['client.ts', 'types.ts'].map((p) => resolve(root, 'clients/ts', p)),
     resolve(root, 'frontend/generator/src/api/client.ts')], { stdio: 'inherit' });
+  // Check the live contract independently of the historical migration baseline.
   // Unsupported content must fail before Hey API can approximate or discard it.
+  const currentSpec = JSON.parse(readFileSync(resolve(root, 'docs/openapi.json')));
   for (const [name, change] of [
     ['webhooks', (s) => { s.webhooks = { event: {} }; }],
     ['$defs', (s) => { s.$defs = { Event: { type: 'string' } }; }],
@@ -65,7 +67,7 @@ type Mutation = [Assert<Bi<Paths, M.paths>>, Assert<Bi<Components, M.components>
     ['remote ref', (s) => { s.components.schemas.Probe = { $ref: 'https://example.invalid/schema.json' }; }],
     ['duplicate operationId', (s) => { s.paths['/healthz'].get.operationId = s.paths['/metrics'].get.operationId = 'duplicate'; }],
   ]) {
-    const unsupported = structuredClone(spec);
+    const unsupported = structuredClone(currentSpec);
     change(unsupported);
     await assert.rejects(() => openapiTypes(unsupported), /Unsupported OpenAPI/, name);
   }

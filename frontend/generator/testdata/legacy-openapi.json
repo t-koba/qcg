@@ -1,0 +1,6720 @@
+{
+  "components": {
+    "responses": {
+      "TooManyRequests": {
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProblemDetails"
+            }
+          }
+        },
+        "description": "Rate limited",
+        "headers": {
+          "Retry-After": {
+            "description": "Whole seconds to wait before retrying, always at least one",
+            "schema": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProblemDetails"
+            }
+          }
+        },
+        "description": "Authentication required",
+        "headers": {
+          "WWW-Authenticate": {
+            "description": "Bearer realm=\"api\"; the request carried no valid API token",
+            "schema": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "AgentCheckpointEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "checkpoint": true,
+          "phase": {
+            "type": "string"
+          },
+          "turn": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "turn",
+          "phase",
+          "checkpoint"
+        ],
+        "type": "object"
+      },
+      "AgentCompletedEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "agent": {
+            "type": "string"
+          },
+          "tokens_total": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tool_call_id": {
+            "type": "string"
+          },
+          "turn": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "agent",
+          "tool_call_id",
+          "turn",
+          "tokens_total"
+        ],
+        "type": "object"
+      },
+      "AgentDelegatedEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "agent": {
+            "type": "string"
+          },
+          "max_calls": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_iterations": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_tokens_total": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_tool_calls_total": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tool_call_id": {
+            "type": "string"
+          },
+          "tools": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "agent",
+          "tool_call_id",
+          "tools",
+          "max_calls",
+          "max_iterations",
+          "max_tokens_total",
+          "max_tool_calls_total"
+        ],
+        "type": "object"
+      },
+      "AgentFailedEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/AgentFailureAction"
+          },
+          "agent": {
+            "type": "string"
+          },
+          "code": {
+            "$ref": "#/components/schemas/AgentFailureCode"
+          },
+          "message": {
+            "type": "string"
+          },
+          "resource_exhaustion": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AgentResourceExhaustion"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "tool_call_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "agent",
+          "code",
+          "action",
+          "message"
+        ],
+        "type": "object"
+      },
+      "AgentFailureAction": {
+        "enum": [
+          "fail",
+          "return_error"
+        ],
+        "type": "string"
+      },
+      "AgentFailureCode": {
+        "oneOf": [
+          {
+            "enum": [
+              "tool_failed",
+              "guardrail_rejected",
+              "token_budget_exceeded",
+              "tool_call_budget_exceeded",
+              "iteration_budget_exceeded",
+              "run_budget_exceeded",
+              "validation_failed",
+              "provider_failed",
+              "cancelled"
+            ],
+            "type": "string"
+          },
+          {
+            "const": "timed_out",
+            "description": "A per-attempt node timeout fired. Distinct from ordinary tool failure\nso retry policy and observability can tell an unknown-outcome timeout\napart from a proven-clean error (E11).",
+            "type": "string"
+          },
+          {
+            "const": "elapsed_exceeded",
+            "description": "The run-wide elapsed budget stopped this call. Distinct from node\ntimeout and cancellation so hosts report the actual cause (E11).",
+            "type": "string"
+          }
+        ]
+      },
+      "AgentFileChangesEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "removed_files": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "written_files": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "removed_files",
+          "written_files"
+        ],
+        "type": "object"
+      },
+      "AgentHandoffEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "agent": {
+            "type": "string"
+          },
+          "tool_call_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent",
+          "tool_call_id"
+        ],
+        "type": "object"
+      },
+      "AgentResourceExhaustion": {
+        "additionalProperties": false,
+        "properties": {
+          "allowed": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "resource": {
+            "type": "string"
+          },
+          "used": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "resource",
+          "used",
+          "allowed"
+        ],
+        "type": "object"
+      },
+      "AnswerPayload": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "values": {
+            "additionalProperties": true,
+            "type": "object"
+          }
+        },
+        "required": [
+          "values"
+        ],
+        "title": "AnswerPayload",
+        "type": "object"
+      },
+      "ArtifactPreview": {
+        "enum": [
+          "auto",
+          "text",
+          "json",
+          "markdown",
+          "image",
+          "html",
+          "pdf",
+          "audio",
+          "video",
+          "none"
+        ],
+        "type": "string"
+      },
+      "AssetSpec": {
+        "additionalProperties": false,
+        "properties": {
+          "dirs": {
+            "default": [],
+            "description": "Safe relative directory trees resolved when an asset is requested.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "files": {
+            "default": [],
+            "description": "Safe relative paths served verbatim by the assets API.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "meta": {
+            "additionalProperties": true,
+            "default": {},
+            "description": "Free-form metadata forwarded to clients untouched; the backend assigns\nno semantics.",
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "AttemptFinishedEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "attempt": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "confirm": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConfirmSpec"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "findings": {
+            "default": [],
+            "items": true,
+            "type": "array"
+          },
+          "question": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FormSpec"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FailureDetail"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "status": {
+            "$ref": "#/components/schemas/AttemptStatus"
+          }
+        },
+        "required": [
+          "attempt",
+          "status"
+        ],
+        "type": "object"
+      },
+      "AttemptStatus": {
+        "enum": [
+          "success",
+          "repaired",
+          "repair_failed",
+          "recheck_failed",
+          "check_failed",
+          "needs_user",
+          "needs_confirm"
+        ],
+        "type": "string"
+      },
+      "AuditLevel": {
+        "description": "Audit preset declared by the contract designer.",
+        "oneOf": [
+          {
+            "const": "standard",
+            "description": "Persist every observation record (default).",
+            "type": "string"
+          },
+          {
+            "const": "minimal",
+            "description": "Persist no observation record unless a class override raises it.",
+            "type": "string"
+          }
+        ]
+      },
+      "BudgetExhaustion": {
+        "additionalProperties": false,
+        "description": "Amounts reported by the enforcing budget check; resource names retain that check's scope.",
+        "properties": {
+          "allowed": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "resource": {
+            "type": "string"
+          },
+          "used": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "used_subsec_nanoseconds": {
+            "description": "Fractional part of `used` for `elapsed_seconds` only; absent on legacy/non-time facts.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "resource",
+          "used",
+          "allowed"
+        ],
+        "type": "object"
+      },
+      "CacheRetention": {
+        "description": "Declared prompt-cache retention tier. Only `extended` is defined.",
+        "oneOf": [
+          {
+            "const": "extended",
+            "description": "The route's explicitly declared extended-retention mechanism.",
+            "type": "string"
+          }
+        ]
+      },
+      "CacheWritePolicy": {
+        "description": "Declared prompt-cache write policy for this contract's LLM requests.",
+        "oneOf": [
+          {
+            "const": "allow",
+            "description": "Leave provider caching alone (default).",
+            "type": "string"
+          },
+          {
+            "const": "forbid",
+            "description": "Require qcg/provider caching to be disabled for the request.",
+            "type": "string"
+          }
+        ]
+      },
+      "CommandIsolation": {
+        "enum": [
+          "container",
+          "trusted_host"
+        ],
+        "type": "string"
+      },
+      "CommandPermission": {
+        "additionalProperties": false,
+        "properties": {
+          "args": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "bin": {
+            "type": "string"
+          },
+          "image": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "isolation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CommandIsolation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "purpose": {
+            "default": "",
+            "type": "string"
+          }
+        },
+        "required": [
+          "bin"
+        ],
+        "type": "object"
+      },
+      "ConfirmDecision": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "decision": {
+            "$ref": "#/components/schemas/ConfirmationDecision"
+          }
+        },
+        "required": [
+          "decision"
+        ],
+        "title": "ConfirmDecision",
+        "type": "object"
+      },
+      "ConfirmRequestEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "confirm": {
+            "$ref": "#/components/schemas/ConfirmSpec"
+          },
+          "files": {
+            "default": [],
+            "description": "Suspended-step file revisions retained for resume and fork.",
+            "items": {
+              "$ref": "#/components/schemas/FilePinEventData"
+            },
+            "type": "array"
+          },
+          "parallel": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "confirm"
+        ],
+        "type": "object"
+      },
+      "ConfirmSpec": {
+        "properties": {
+          "details": {
+            "default": null
+          },
+          "dry_run": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "operation_digest": {
+            "description": "Canonical digest of target + details binding this approval to the\nexact operation content (A06). Approvals never transfer across\ndifferent digests even for the same node and kind. Required:\na confirmation without a digest is corrupt, never an\ninvocation-scoped default (Q1-5 fail-closed).",
+            "type": "string"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/SideEffectScope",
+            "description": "How far this approval reaches, recorded from the manifest\npermission: `invocation` approves one call, `content` reuses the\napproval for identical content until the run ends (Q1). Required:\nthe scope must be stated explicitly, never defaulted silently.\nWire form: `invocation` confirmations carry 4-part ids\n(`node:kind:digest:invocation-hash`), `content` ones 3-part ids\n(`node:kind:digest`)."
+          },
+          "target": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "kind",
+          "target",
+          "dry_run",
+          "operation_digest",
+          "scope"
+        ],
+        "type": "object"
+      },
+      "ConfirmationDecision": {
+        "enum": [
+          "approve",
+          "deny"
+        ],
+        "type": "string"
+      },
+      "ContainerPermission": {
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "default": false,
+            "type": "boolean"
+          },
+          "images": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "on_missing": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "runtime": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ContainerRuntime"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "type": "object"
+      },
+      "ContainerRuntime": {
+        "enum": [
+          "docker",
+          "podman",
+          "docker_runsc",
+          "incus",
+          "lxd"
+        ],
+        "type": "string"
+      },
+      "ContextCompactedEventData": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/ContextCompactedPromptEventData"
+          },
+          {
+            "$ref": "#/components/schemas/ContextCompactedRequestEventData"
+          }
+        ],
+        "description": "The two payload shapes emitted by context management are deliberately kept\nas separate closed objects so prompt compaction cannot silently acquire\ntranscript-only fields."
+      },
+      "ContextCompactedPromptEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "final_bytes": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "limit_bytes": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "original_bytes": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/ContextCompactionPolicy"
+          }
+        },
+        "required": [
+          "policy",
+          "original_bytes",
+          "final_bytes",
+          "limit_bytes"
+        ],
+        "type": "object"
+      },
+      "ContextCompactedRequestEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "compacted_messages": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "compacted_tool_results": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "final_bytes": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "limit_bytes": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "original_bytes": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/ContextCompactionPolicy"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/ContextCompactionScope"
+          }
+        },
+        "required": [
+          "scope",
+          "policy",
+          "original_bytes",
+          "final_bytes",
+          "limit_bytes",
+          "compacted_tool_results",
+          "compacted_messages"
+        ],
+        "type": "object"
+      },
+      "ContextCompactionPolicy": {
+        "description": "The policy used when a prompt or an agent transcript exceeded its context limit.",
+        "enum": [
+          "error",
+          "truncate_head",
+          "truncate_tail"
+        ],
+        "type": "string"
+      },
+      "ContextCompactionScope": {
+        "enum": [
+          "request",
+          "agent_transcript"
+        ],
+        "type": "string"
+      },
+      "DependencyFailure": {
+        "additionalProperties": false,
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/DependencyStatus"
+          }
+        },
+        "required": [
+          "path",
+          "status",
+          "message"
+        ],
+        "type": "object"
+      },
+      "DependencyStatus": {
+        "enum": [
+          "skipped",
+          "failed"
+        ],
+        "type": "string"
+      },
+      "DryRunEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "details": {
+            "default": null
+          },
+          "kind": {
+            "type": "string"
+          },
+          "operation_digest": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "target"
+        ],
+        "type": "object"
+      },
+      "ElapsedAccountedEventData": {
+        "additionalProperties": false,
+        "description": "Single durable active elapsed ledger, preserving subsecond consumption.",
+        "properties": {
+          "active_nanoseconds": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "active_started_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "active_nanoseconds",
+          "active_started_at"
+        ],
+        "type": "object"
+      },
+      "EmptyEventData": {
+        "additionalProperties": false,
+        "type": "object"
+      },
+      "FailureCode": {
+        "oneOf": [
+          {
+            "enum": [
+              "when_false",
+              "dependency_unsatisfied",
+              "no_dependency_succeeded",
+              "check_failed",
+              "execution_failed",
+              "elapsed_exceeded",
+              "repair_exhausted",
+              "scheduler_failed",
+              "canceled",
+              "interrupted",
+              "budget_exceeded",
+              "provider_context_exhausted",
+              "mcp_authorization_required"
+            ],
+            "type": "string"
+          },
+          {
+            "const": "timed_out",
+            "description": "Per-attempt timeout, distinct from execution failure and run elapsed expiry (E11).",
+            "type": "string"
+          },
+          {
+            "const": "refused",
+            "description": "Guard/admission refusal, not a failed execution (E11).",
+            "type": "string"
+          }
+        ]
+      },
+      "FailureDetail": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/FailureCode"
+          },
+          "dependencies": {
+            "items": {
+              "$ref": "#/components/schemas/DependencyFailure"
+            },
+            "type": "array"
+          },
+          "exhaustion": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BudgetExhaustion"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "type": "object"
+      },
+      "FilePinEventData": {
+        "additionalProperties": false,
+        "description": "A retained workspace file revision: its path and the digest of its bytes.",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "sha256": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "sha256"
+        ],
+        "type": "object"
+      },
+      "FileValue": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "description": "Canonical inline file input exchanged by the CLI, HTTP API, and engine.",
+        "oneOf": [
+          {
+            "not": {
+              "required": [
+                "content_base64"
+              ]
+            },
+            "required": [
+              "text"
+            ]
+          },
+          {
+            "not": {
+              "required": [
+                "text"
+              ]
+            },
+            "required": [
+              "content_base64"
+            ]
+          }
+        ],
+        "properties": {
+          "content_base64": {
+            "type": "string"
+          },
+          "name": {
+            "pattern": "^(?!\\.\\.?$)[^/\\\\\\u0000]+$",
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "FileValue",
+        "type": "object"
+      },
+      "ForeachBudgetEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "executed_iterations": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_iterations": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "requested_iterations": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "requested_iterations",
+          "executed_iterations",
+          "max_iterations"
+        ],
+        "type": "object"
+      },
+      "ForeachIterationEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "index": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "index"
+        ],
+        "type": "object"
+      },
+      "ForkRun": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "answers": {
+            "additionalProperties": true,
+            "description": "Pre-provisioned answers keyed by question id, consumed without interaction.",
+            "type": "object"
+          },
+          "at_seq": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "confirmations": {
+            "additionalProperties": {
+              "type": "boolean"
+            },
+            "description": "Pre-provisioned confirmation decisions keyed by confirmation id.",
+            "type": "object"
+          },
+          "priority": {
+            "description": "Scheduling priority, higher runs first. Defaults to 0.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "state_patch": {
+            "$ref": "#/components/schemas/ForkStatePatch"
+          }
+        },
+        "required": [
+          "at_seq"
+        ],
+        "title": "ForkRun",
+        "type": "object"
+      },
+      "ForkStatePatch": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "inputs": {
+            "additionalProperties": true,
+            "default": {},
+            "type": "object"
+          },
+          "step_outputs": {
+            "additionalProperties": true,
+            "default": {},
+            "type": "object"
+          },
+          "step_statuses": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "type": "object"
+          }
+        },
+        "title": "ForkStatePatch",
+        "type": "object"
+      },
+      "FormSpec": {
+        "properties": {
+          "fields": {
+            "items": {
+              "$ref": "#/components/schemas/InputField"
+            },
+            "type": "array"
+          },
+          "id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "title_i18n": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "fields"
+        ],
+        "type": "object"
+      },
+      "GeneratorDetail": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "assets": {
+            "$ref": "#/components/schemas/AssetSpec"
+          },
+          "generator": {
+            "$ref": "#/components/schemas/GeneratorMeta"
+          },
+          "inputs": {
+            "$ref": "#/components/schemas/InputSpec"
+          },
+          "package_sha256": {
+            "description": "SHA-256 identity of the complete generator package tree.",
+            "type": "string"
+          },
+          "permissions": {
+            "$ref": "#/components/schemas/Permissions"
+          }
+        },
+        "required": [
+          "generator",
+          "package_sha256",
+          "inputs",
+          "assets",
+          "permissions"
+        ],
+        "title": "GeneratorDetail",
+        "type": "object"
+      },
+      "GeneratorMeta": {
+        "additionalProperties": false,
+        "properties": {
+          "authors": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "description": {
+            "default": "",
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "default": "",
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "version"
+        ],
+        "type": "object"
+      },
+      "GeneratorSummary": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "version",
+          "description"
+        ],
+        "title": "GeneratorSummary",
+        "type": "object"
+      },
+      "GraphResolvedEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "nodes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "nodes"
+        ],
+        "type": "object"
+      },
+      "GuardrailErrorEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "error_kind": {
+            "$ref": "#/components/schemas/GuardrailErrorKind"
+          },
+          "guardrail": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/GuardrailErrorPolicy"
+          },
+          "stage": {
+            "$ref": "#/components/schemas/GuardrailStage"
+          },
+          "tool": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "guardrail",
+          "kind",
+          "stage",
+          "error_kind",
+          "code",
+          "message",
+          "policy"
+        ],
+        "type": "object"
+      },
+      "GuardrailErrorKind": {
+        "enum": [
+          "invalid_configuration",
+          "evaluation"
+        ],
+        "type": "string"
+      },
+      "GuardrailErrorPolicy": {
+        "enum": [
+          "fail",
+          "block"
+        ],
+        "type": "string"
+      },
+      "GuardrailEvaluatedEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "guardrail": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "passed": {
+            "type": "boolean"
+          },
+          "stage": {
+            "$ref": "#/components/schemas/GuardrailStage"
+          },
+          "tool": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tripwire": {
+            "type": "boolean"
+          },
+          "violation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GuardrailViolationEventData"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "required": [
+          "guardrail",
+          "kind",
+          "stage",
+          "passed",
+          "tripwire"
+        ],
+        "type": "object"
+      },
+      "GuardrailStage": {
+        "enum": [
+          "input",
+          "output",
+          "tool_input",
+          "tool_output"
+        ],
+        "type": "string"
+      },
+      "GuardrailTripwireEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "guardrail": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "stage": {
+            "$ref": "#/components/schemas/GuardrailStage"
+          },
+          "tool": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "violation": {
+            "$ref": "#/components/schemas/GuardrailViolationEventData"
+          }
+        },
+        "required": [
+          "guardrail",
+          "kind",
+          "stage",
+          "violation"
+        ],
+        "type": "object"
+      },
+      "GuardrailViolationEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "details": {
+            "default": null
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "type": "object"
+      },
+      "InputField": {
+        "additionalProperties": false,
+        "properties": {
+          "default": {
+            "default": null
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description_i18n": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "id": {
+            "type": "string"
+          },
+          "item_type": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "label_i18n": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "min_items": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "option_labels_i18n": {
+            "additionalProperties": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "type": "object"
+          },
+          "options": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "options_from": {
+            "description": "Run-variable path supplying this field's options at run time, using\nthe same dotted paths as `ask_user.fields_from`. The value is an array\nof strings or of `{ value, label?, label_i18n? }` objects. Mutually\nexclusive with static `options` and valid only for runtime forms\n(`ask_user`), never for pre-run `[inputs]` fields.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pattern": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "placeholder": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "placeholder_i18n": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "required": {
+            "default": false,
+            "type": "boolean"
+          },
+          "schema": {
+            "description": "Optional JSON Schema applied after the canonical field-type checks."
+          },
+          "type": {
+            "type": "string"
+          },
+          "ui": {
+            "additionalProperties": true,
+            "description": "Renderer-specific presentation metadata forwarded to clients unchanged.",
+            "type": "object"
+          }
+        },
+        "required": [
+          "id",
+          "type"
+        ],
+        "type": "object"
+      },
+      "InputSpec": {
+        "additionalProperties": false,
+        "properties": {
+          "stages": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/InputStage"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "InputStage": {
+        "additionalProperties": false,
+        "properties": {
+          "fields": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/InputField"
+            },
+            "type": "array"
+          },
+          "id": {
+            "type": "string"
+          },
+          "when": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "InvalidateRun": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "description": "Caller-provided audit metadata for an irreversible successful-run invalidation.",
+        "properties": {
+          "actor_label": {
+            "description": "Descriptive label, NOT authenticated identity. Nonblank, no controls;\nat most 128 UTF-8 bytes.",
+            "type": "string"
+          },
+          "reason": {
+            "description": "Nonblank, no control characters; at most 4096 UTF-8 bytes.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason",
+          "actor_label"
+        ],
+        "title": "InvalidateRun",
+        "type": "object"
+      },
+      "LaggedAction": {
+        "enum": [
+          "resync_snapshot"
+        ],
+        "type": "string"
+      },
+      "LaggedEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/LaggedAction"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
+      },
+      "LlmCallEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "agent": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "attempt": {
+            "default": 0,
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "cache_retention": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CacheRetention"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Requested cache retention tier when non-default (`extended` only).\nAbsent means the provider default lifetime. Present only to make the\nTTL cost basis inspectable."
+          },
+          "cache_write_policy": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CacheWritePolicy"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Requested cache write policy when non-default (`forbid` only).\nAbsent means the default `allow`: the request left provider caching\nalone. Present only to make the TTL cost basis inspectable."
+          },
+          "cost_microusd": {
+            "description": "Estimated priced portion of the call; excludes explicitly unmetered components.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_tokens": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_tokens_total": {
+            "default": null,
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "model": {
+            "type": "string"
+          },
+          "parallel_tool_calls": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "provider": {
+            "type": "string"
+          },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ReasoningEffort"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "repair": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "retry_decisions": {
+            "default": [],
+            "description": "Failed provider attempts, including retries preceding a successful call.",
+            "items": {
+              "$ref": "#/components/schemas/RetryDecision"
+            },
+            "type": "array"
+          },
+          "seed": {
+            "default": null,
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "stop_reason": {
+            "description": "Normalized terminal reason; absent in older journals and decision calls.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stop_sequences": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "stream": {
+            "default": false,
+            "type": "boolean"
+          },
+          "structured_output": {
+            "$ref": "#/components/schemas/StructuredOutputMode",
+            "default": "auto"
+          },
+          "temperature": {
+            "default": null,
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "tokens": {
+            "$ref": "#/components/schemas/TokenUsageEventData"
+          },
+          "tokens_total": {
+            "default": null,
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "tool_choice": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ToolChoice"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "top_p": {
+            "default": null,
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "turn": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "verbosity": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ResponseVerbosity"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "web_search": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WebSearchUsage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Hosted-search details; null when the request did not enable the tool."
+          }
+        },
+        "required": [
+          "provider",
+          "model",
+          "max_tokens",
+          "tokens",
+          "cost_microusd"
+        ],
+        "type": "object"
+      },
+      "LlmCatalogCapabilities": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "audio_input": {
+            "type": "boolean"
+          },
+          "file_input": {
+            "type": "boolean"
+          },
+          "image_input": {
+            "type": "boolean"
+          },
+          "json_schema": {
+            "type": "boolean"
+          },
+          "parallel_tool_calls": {
+            "type": "boolean"
+          },
+          "seed": {
+            "type": "boolean"
+          },
+          "stop_sequences": {
+            "type": "boolean"
+          },
+          "streaming": {
+            "type": "boolean"
+          },
+          "structured_output_with_tools": {
+            "type": "boolean"
+          },
+          "temperature": {
+            "type": "boolean"
+          },
+          "tool_choice": {
+            "type": "boolean"
+          },
+          "tool_use": {
+            "type": "boolean"
+          },
+          "top_p": {
+            "type": "boolean"
+          },
+          "verbosity": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "tool_use",
+          "json_schema",
+          "structured_output_with_tools",
+          "seed",
+          "image_input",
+          "audio_input",
+          "file_input",
+          "streaming",
+          "temperature",
+          "top_p",
+          "stop_sequences",
+          "tool_choice",
+          "parallel_tool_calls",
+          "verbosity"
+        ],
+        "title": "LlmCatalogCapabilities",
+        "type": "object"
+      },
+      "LlmCatalogCostTier": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Effective rates in USD/1M tokens, after catalog inheritance and registry pins.\nThe greatest threshold <= whole prompt input selects a row for the whole request.",
+        "properties": {
+          "cache_creation_input_cost_per_million_usd": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "cache_read_input_cost_per_million_usd": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "input_cost_per_million_usd": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "output_cost_per_million_usd": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "threshold_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "threshold_tokens"
+        ],
+        "title": "LlmCatalogCostTier",
+        "type": "object"
+      },
+      "LlmCatalogModel": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "cache_creation_input_cost_per_million_usd": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "cache_read_input_cost_per_million_usd": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "capabilities": {
+            "$ref": "#/components/schemas/LlmCatalogCapabilities"
+          },
+          "context_tokens": {
+            "default": null,
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "cost_tiers": {
+            "default": [],
+            "description": "Effective catalog schedule, not a contract-specific final quote. Empty for no tiers.\nFlat price fields above remain base rates; null tier rates are unresolved, not free.",
+            "items": {
+              "$ref": "#/components/schemas/LlmCatalogCostTier"
+            },
+            "type": "array"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "input_cost_per_million_usd": {
+            "default": null,
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "label": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_output_tokens": {
+            "default": null,
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "output_cost_per_million_usd": {
+            "default": null,
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "reasoning_effort": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "source": {
+            "description": "`built-in`, `explicit`, `external`, or `discovery` (combined sources\nare joined with ` + `).",
+            "type": "string"
+          },
+          "warning": {
+            "default": null,
+            "description": "Model-specific advisory; not a provider failure.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "enabled",
+          "source",
+          "capabilities"
+        ],
+        "title": "LlmCatalogModel",
+        "type": "object"
+      },
+      "LlmCatalogProvider": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "available": {
+            "description": "False when the provider needs a credential that is not configured.",
+            "type": "boolean"
+          },
+          "discovery": {
+            "description": "Whether live `/v1/models` discovery is enabled for this provider.",
+            "type": "boolean"
+          },
+          "error": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "models": {
+            "items": {
+              "$ref": "#/components/schemas/LlmCatalogModel"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "available",
+          "discovery",
+          "models"
+        ],
+        "title": "LlmCatalogProvider",
+        "type": "object"
+      },
+      "LlmCatalogResponse": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Selectable LLM provider/model catalog. Metadata only: the catalog never\ncarries credentials and never grants run permissions.",
+        "properties": {
+          "fetched_at": {
+            "default": null,
+            "description": "RFC 3339 timestamp of the last successful external catalog fetch.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "providers": {
+            "items": {
+              "$ref": "#/components/schemas/LlmCatalogProvider"
+            },
+            "type": "array"
+          },
+          "sources": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/LlmCatalogSource"
+            },
+            "type": "array"
+          },
+          "stale": {
+            "default": false,
+            "description": "True while external metadata is missing or stale.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "providers"
+        ],
+        "title": "LlmCatalogResponse",
+        "type": "object"
+      },
+      "LlmCatalogSource": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "error": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fetched_at": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "location": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "location"
+        ],
+        "title": "LlmCatalogSource",
+        "type": "object"
+      },
+      "LlmDeltaEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "index": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "model": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider",
+          "model",
+          "index",
+          "text"
+        ],
+        "type": "object"
+      },
+      "LlmErrorKind": {
+        "oneOf": [
+          {
+            "enum": [
+              "timed_out",
+              "network",
+              "empty_response",
+              "invalid_response",
+              "partial_stream",
+              "canceled",
+              "circuit_open",
+              "other"
+            ],
+            "type": "string"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "http_status": {
+                "format": "uint16",
+                "maximum": 65535,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "http_status"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "LlmRouteFailedEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "attempt": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "fallback_index": {
+            "default": 0,
+            "description": "Zero-based index into the declared route list (0 is the primary route).",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "fallback_taken": {
+            "default": false,
+            "description": "Whether this invocation advanced to the next declared route.",
+            "type": "boolean"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/LlmErrorKind"
+          },
+          "model": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "retry_decisions": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/RetryDecision"
+            },
+            "type": "array"
+          },
+          "routes_total": {
+            "default": 0,
+            "description": "Number of declared routes available for this invocation.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "web_search": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WebSearchLiability"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Unresolved hosted-search liability after publication rejection without completion.\nNumeric fields are null; no response text, search events, or citations are recorded."
+          }
+        },
+        "required": [
+          "provider",
+          "model",
+          "attempt",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "LlmValidationFailedEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "attempt": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "attempt",
+          "message"
+        ],
+        "type": "object"
+      },
+      "McpAuthorizationStart": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "authorization_url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "authorization_url"
+        ],
+        "title": "McpAuthorizationStart",
+        "type": "object"
+      },
+      "McpCleanupPolicy": {
+        "description": "Settlement of a failed direct MCP session cleanup.",
+        "enum": [
+          "preserve_execution",
+          "fail_fast"
+        ],
+        "type": "string"
+      },
+      "McpCleanupPolicySource": {
+        "enum": [
+          "default",
+          "node_parameter"
+        ],
+        "type": "string"
+      },
+      "McpCleanupSettlement": {
+        "additionalProperties": false,
+        "properties": {
+          "policy": {
+            "$ref": "#/components/schemas/McpCleanupPolicy"
+          },
+          "source": {
+            "$ref": "#/components/schemas/McpCleanupPolicySource"
+          }
+        },
+        "required": [
+          "policy",
+          "source"
+        ],
+        "type": "object"
+      },
+      "McpServerList": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/McpServerSummary"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "McpServerList",
+        "type": "object"
+      },
+      "McpServerSummary": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "auth": {
+            "type": "string"
+          },
+          "authorized": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "transport": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "transport",
+          "auth",
+          "authorized"
+        ],
+        "title": "McpServerSummary",
+        "type": "object"
+      },
+      "OutOfContractEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "policy": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "policy",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "OutputArtifact": {
+        "properties": {
+          "bytes": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "description": {
+            "default": "",
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "mime": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "type": "string"
+          },
+          "preview": {
+            "$ref": "#/components/schemas/ArtifactPreview",
+            "default": "auto"
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "sha256": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "sha256",
+          "bytes",
+          "label",
+          "required"
+        ],
+        "type": "object"
+      },
+      "OutputManifest": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "artifacts": {
+            "items": {
+              "$ref": "#/components/schemas/OutputArtifact"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "artifacts"
+        ],
+        "title": "OutputManifest",
+        "type": "object"
+      },
+      "ParallelCompatibility": {
+        "description": "Compatibility preserves existing abort timing and aggregation, not replay authority.",
+        "enum": [
+          "fail_fast"
+        ],
+        "type": "string"
+      },
+      "Permissions": {
+        "additionalProperties": false,
+        "properties": {
+          "commands": {
+            "items": {
+              "$ref": "#/components/schemas/CommandPermission"
+            },
+            "type": "array"
+          },
+          "containers": {
+            "$ref": "#/components/schemas/ContainerPermission"
+          },
+          "fs_read": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "fs_write": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "network": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "network_deny_private_ips": {
+            "default": false,
+            "description": "Opt-in SSRF hardening for the HTTP fetch path. When true, every\nhop resolves ALL A/AAAA records and denies non-global IPs\n(loopback, private, link-local, multicast, unspecified, reserved);\nthe connection is pinned to the validated addresses. Default\nfalse so existing wildcard deployments keep working.",
+            "type": "boolean"
+          },
+          "side_effects": {
+            "$ref": "#/components/schemas/SideEffects"
+          },
+          "side_effects_scope": {
+            "$ref": "#/components/schemas/SideEffectScope",
+            "default": "invocation",
+            "description": "How far one approval reaches. `invocation` (default) authorizes a\nsingle call; `content` reuses the approval for identical content in\nlater calls (Q1). The serde default keeps the documented\nmanifest-parse-time default: an explicit `[permissions]` block may\nomit the key and still resolve to `invocation`."
+          }
+        },
+        "required": [
+          "fs_read",
+          "fs_write",
+          "network",
+          "commands",
+          "containers",
+          "side_effects"
+        ],
+        "type": "object"
+      },
+      "ProblemDetails": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "detail": {
+            "type": "string"
+          },
+          "errors": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ProblemFieldError"
+            },
+            "type": "array"
+          },
+          "instance": {
+            "type": "string"
+          },
+          "status": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "title": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "title",
+          "status",
+          "detail",
+          "instance",
+          "code"
+        ],
+        "title": "ProblemDetails",
+        "type": "object"
+      },
+      "ProblemFieldError": {
+        "properties": {
+          "field": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "field",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "ProviderSearchAction": {
+        "description": "What one hosted search call did.",
+        "enum": [
+          "search",
+          "open_page",
+          "find_in_page"
+        ],
+        "type": "string"
+      },
+      "ProviderSearchEvent": {
+        "additionalProperties": false,
+        "description": "One hosted search call reported by the provider.",
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/ProviderSearchAction",
+            "default": "search"
+          },
+          "id": {
+            "default": null,
+            "description": "The provider's identifier for the call, when it reports one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "queries": {
+            "default": [],
+            "description": "The queries a search action ran. Empty for page actions.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "url": {
+            "default": null,
+            "description": "The page a page action opened. Absent for a search action.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "QueuePositionQuality": {
+        "enum": [
+          "exact",
+          "estimated",
+          "unavailable"
+        ],
+        "type": "string"
+      },
+      "ReasonEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "metrics": {
+            "$ref": "#/components/schemas/RunMetrics",
+            "default": {
+              "budget_charged": 0,
+              "cost_microusd": 0,
+              "duration_ms": 0,
+              "llm_calls": 0,
+              "regenerate_attempts": 0,
+              "repair_attempts": 0,
+              "steps_executed": 0,
+              "steps_failed": 0,
+              "steps_skipped": 0,
+              "steps_succeeded": 0,
+              "steps_total": 0,
+              "tokens_cache_creation_input": 0,
+              "tokens_cached_input": 0,
+              "tokens_input": 0,
+              "tokens_output": 0,
+              "tokens_total": 0
+            },
+            "description": "Accumulated cost metrics, present when the writer attached them."
+          },
+          "reason": {
+            "$ref": "#/components/schemas/FailureDetail"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "type": "object"
+      },
+      "ReasoningEffort": {
+        "description": "Provider-neutral reasoning effort requested for a model invocation.",
+        "enum": [
+          "none",
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "type": "string"
+      },
+      "RegenerateAttemptStartedEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "attempt": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_attempts": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "attempt",
+          "max_attempts"
+        ],
+        "type": "object"
+      },
+      "RepairAttemptStartedEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "attempt": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_attempts": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "recheck": {
+            "type": "string"
+          },
+          "repair": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "repair",
+          "recheck",
+          "attempt",
+          "max_attempts"
+        ],
+        "type": "object"
+      },
+      "RequestDispatch": {
+        "enum": [
+          "not_sent",
+          "sent",
+          "unknown"
+        ],
+        "type": "string"
+      },
+      "ResourceEventCacheStatus": {
+        "enum": [
+          "not_applicable",
+          "local",
+          "hit",
+          "miss"
+        ],
+        "type": "string"
+      },
+      "ResourceEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "bytes": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "cache": {
+            "$ref": "#/components/schemas/ResourceEventCacheStatus"
+          },
+          "diagnostics": {
+            "description": "Lenient specification violations recorded while inspecting the\nresource (for example a skill name that differs from its directory).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "files": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ResourceFileEventData"
+            },
+            "type": "array"
+          },
+          "llm_visible": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "pin_sha256": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sha256": {
+            "type": "string"
+          },
+          "snapshot": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "$ref": "#/components/schemas/ResourceSource"
+          },
+          "trust": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "type",
+          "source",
+          "sha256",
+          "bytes",
+          "cache",
+          "trust",
+          "llm_visible"
+        ],
+        "type": "object"
+      },
+      "ResourceFileEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "bytes": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "path": {
+            "type": "string"
+          },
+          "sha256": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "sha256",
+          "bytes"
+        ],
+        "type": "object"
+      },
+      "ResourceSource": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "path",
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "path"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "final_url": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "url",
+                "type": "string"
+              },
+              "url": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "url",
+              "final_url"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "command": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "kind": {
+                "const": "command",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "command"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Snapshot copied from another run's declared artifact.",
+            "properties": {
+              "artifact": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "run_ref",
+                "type": "string"
+              },
+              "run_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "run_id",
+              "artifact"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "ResponseVerbosity": {
+        "description": "Provider-neutral control for the detail of a model response.",
+        "enum": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "type": "string"
+      },
+      "RetryAction": {
+        "enum": [
+          "fail_fast",
+          "retry",
+          "next_route"
+        ],
+        "type": "string"
+      },
+      "RetryDecision": {
+        "additionalProperties": false,
+        "description": "One failed provider attempt, including the effective bounded decision.",
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/RetryAction"
+          },
+          "attempt": {
+            "description": "One-based attempt within this route (not the fallback index). Null\nwhen gateway cancellation cannot know which router attempt is active.",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "facts": {
+            "$ref": "#/components/schemas/TransportFacts"
+          },
+          "guard": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RetryGuard"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A mechanism that overrode policy, if any."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/LlmErrorKind"
+          },
+          "provider_code": {
+            "description": "Sanitized provider `error.code` observed on this attempt, when any.\nBounded to 1..=64 ASCII `A-Z a-z 0-9 . _ -`; absent when no\ncode was present, malformed, oversized, or the body was unreadable.\nCapture alone changes nothing: it is inert unless a provider rule\nexplicitly matches it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "requested": {
+            "$ref": "#/components/schemas/RetryAction"
+          },
+          "retry_after_applied": {
+            "default": false,
+            "description": "Whether this decision will apply the observed `Retry-After` delay.\nTrue only when a matching rule opts in and the effective action still\nretries; terminal guards and route fallbacks never wait.",
+            "type": "boolean"
+          },
+          "retry_after_secs": {
+            "description": "Bounded `Retry-After` delay observed on this attempt, in seconds.\nCapped at 60; absent when missing, invalid, or in the past.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "source": {
+            "description": "`default`, `rule:<zero-based index>`, or `gateway` for terminal guards.",
+            "type": "string"
+          },
+          "stream": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "kind",
+          "facts",
+          "stream",
+          "requested",
+          "action",
+          "source"
+        ],
+        "type": "object"
+      },
+      "RetryGuard": {
+        "enum": [
+          "attempt_limit",
+          "stream_emitted",
+          "terminal_error",
+          "circuit_open"
+        ],
+        "type": "string"
+      },
+      "RunCompletionStatus": {
+        "enum": [
+          "success",
+          "failed"
+        ],
+        "type": "string"
+      },
+      "RunCostMetrics": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Per-run cost metrics with a USD estimate for display.",
+        "properties": {
+          "cost_usd": {
+            "description": "`cost_microusd / 1_000_000`, for display only.",
+            "format": "double",
+            "type": "number"
+          },
+          "metrics": {
+            "$ref": "#/components/schemas/RunMetrics"
+          },
+          "priced": {
+            "description": "False when any billed call lacked contract pricing, so the total may\nunderstate the true spend.",
+            "type": "boolean"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/RunStatus"
+          }
+        },
+        "required": [
+          "run_id",
+          "state",
+          "metrics",
+          "cost_usd",
+          "priced"
+        ],
+        "title": "RunCostMetrics",
+        "type": "object"
+      },
+      "RunErrorEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "metrics": {
+            "$ref": "#/components/schemas/RunMetrics",
+            "default": {
+              "budget_charged": 0,
+              "cost_microusd": 0,
+              "duration_ms": 0,
+              "llm_calls": 0,
+              "regenerate_attempts": 0,
+              "repair_attempts": 0,
+              "steps_executed": 0,
+              "steps_failed": 0,
+              "steps_skipped": 0,
+              "steps_succeeded": 0,
+              "steps_total": 0,
+              "tokens_cache_creation_input": 0,
+              "tokens_cached_input": 0,
+              "tokens_input": 0,
+              "tokens_output": 0,
+              "tokens_total": 0
+            },
+            "description": "Accumulated cost metrics, present when the writer attached them."
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FailureDetail"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Structured failure detail carrying the dedicated code (for example\nan elapsed-deadline stop), when the writer attached one."
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "type": "object"
+      },
+      "RunEvent": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/RunEventData"
+          },
+          "kind": {
+            "enum": [
+              "agent_checkpoint",
+              "agent_completed",
+              "agent_delegated",
+              "agent_failed",
+              "agent_file_changes",
+              "agent_handoff",
+              "artifact",
+              "audit_degraded",
+              "budget_charged",
+              "confirm_request",
+              "context_compacted",
+              "dry_run",
+              "elapsed_accounted",
+              "elapsed_exceeded",
+              "foreach_budget_exhausted",
+              "foreach_iteration",
+              "foreach_iteration_settled",
+              "foreach_sibling_drained",
+              "foreach_sibling_ignored",
+              "graph_resolved",
+              "guardrail_error",
+              "guardrail_evaluated",
+              "guardrail_tripwire",
+              "hook_failed",
+              "hook_replayed",
+              "hook_skipped",
+              "lagged",
+              "llm_call",
+              "llm_delta",
+              "llm_route_failed",
+              "llm_validation_failed",
+              "mcp_authorization_required",
+              "mcp_cleanup_settled",
+              "mcp_continuation_consumed",
+              "mcp_continuation_resumed",
+              "mcp_destination_decision",
+              "mcp_input_pending",
+              "operation_finished",
+              "operation_repeated",
+              "operation_started",
+              "out_of_contract",
+              "parallel_replay_authorized",
+              "parallel_task_joined",
+              "regenerate_attempt_finished",
+              "regenerate_attempt_started",
+              "repair_attempt_finished",
+              "repair_attempt_started",
+              "resource",
+              "run_canceled",
+              "run_error",
+              "run_finished",
+              "run_forked",
+              "run_interrupted",
+              "run_queued",
+              "run_resumed",
+              "run_started",
+              "run_waiting",
+              "run_yielded",
+              "shutdown",
+              "side_effect",
+              "state_patched",
+              "step_finished",
+              "step_interrupted",
+              "step_replayed",
+              "step_retry",
+              "step_skipped",
+              "step_started",
+              "step_timeout",
+              "stream_error",
+              "tool_backend_resolved",
+              "tool_call",
+              "user_answered",
+              "user_cancel_requested",
+              "user_confirmed",
+              "user_interaction"
+            ],
+            "type": "string"
+          },
+          "parent_span_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "span_id": {
+            "type": "string"
+          },
+          "trace_id": {
+            "type": "string"
+          },
+          "ts": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "seq",
+          "ts",
+          "run_id",
+          "trace_id",
+          "span_id",
+          "kind",
+          "data"
+        ],
+        "title": "RunEvent",
+        "type": "object"
+      },
+      "RunEventData": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/ElapsedAccountedEventData"
+          },
+          {
+            "$ref": "#/components/schemas/RunStartedEventData"
+          },
+          {
+            "$ref": "#/components/schemas/RunStartedEventData"
+          },
+          {
+            "$ref": "#/components/schemas/EmptyEventData"
+          },
+          {
+            "$ref": "#/components/schemas/GraphResolvedEventData"
+          },
+          {
+            "$ref": "#/components/schemas/ResourceEventData"
+          },
+          {
+            "$ref": "#/components/schemas/StepStartedEventData"
+          },
+          {
+            "$ref": "#/components/schemas/StepRetryEventData"
+          },
+          {
+            "$ref": "#/components/schemas/StepFinishedEventData"
+          },
+          {
+            "$ref": "#/components/schemas/StepReplayedEventData"
+          },
+          {
+            "$ref": "#/components/schemas/ReasonEventData"
+          },
+          {
+            "$ref": "#/components/schemas/ForeachIterationEventData"
+          },
+          {
+            "$ref": "#/components/schemas/ForeachBudgetEventData"
+          },
+          {
+            "$ref": "#/components/schemas/RepairAttemptStartedEventData"
+          },
+          {
+            "$ref": "#/components/schemas/AttemptFinishedEventData"
+          },
+          {
+            "$ref": "#/components/schemas/RegenerateAttemptStartedEventData"
+          },
+          {
+            "$ref": "#/components/schemas/AttemptFinishedEventData"
+          },
+          {
+            "$ref": "#/components/schemas/LlmCallEventData"
+          },
+          {
+            "$ref": "#/components/schemas/LlmDeltaEventData"
+          },
+          {
+            "$ref": "#/components/schemas/AgentCheckpointEventData"
+          },
+          {
+            "$ref": "#/components/schemas/AgentFileChangesEventData"
+          },
+          {
+            "$ref": "#/components/schemas/AgentDelegatedEventData"
+          },
+          {
+            "$ref": "#/components/schemas/AgentCompletedEventData"
+          },
+          {
+            "$ref": "#/components/schemas/AgentFailedEventData"
+          },
+          {
+            "$ref": "#/components/schemas/AgentHandoffEventData"
+          },
+          {
+            "$ref": "#/components/schemas/ContextCompactedEventData"
+          },
+          {
+            "$ref": "#/components/schemas/LlmValidationFailedEventData"
+          },
+          {
+            "$ref": "#/components/schemas/LlmRouteFailedEventData"
+          },
+          {
+            "$ref": "#/components/schemas/ToolCallEventData"
+          },
+          {
+            "$ref": "#/components/schemas/ToolCallEventData"
+          },
+          {
+            "$ref": "#/components/schemas/GuardrailEvaluatedEventData"
+          },
+          {
+            "$ref": "#/components/schemas/GuardrailErrorEventData"
+          },
+          {
+            "$ref": "#/components/schemas/GuardrailTripwireEventData"
+          },
+          {
+            "$ref": "#/components/schemas/ToolBackendResolvedEventData"
+          },
+          {
+            "$ref": "#/components/schemas/UserInteractionEventData"
+          },
+          {
+            "$ref": "#/components/schemas/OutOfContractEventData"
+          },
+          {
+            "$ref": "#/components/schemas/ConfirmRequestEventData"
+          },
+          {
+            "$ref": "#/components/schemas/SideEffectEventData"
+          },
+          {
+            "$ref": "#/components/schemas/DryRunEventData"
+          },
+          {
+            "$ref": "#/components/schemas/OutputArtifact"
+          },
+          {
+            "$ref": "#/components/schemas/RunWaitingEventData"
+          },
+          {
+            "$ref": "#/components/schemas/RunErrorEventData"
+          },
+          {
+            "$ref": "#/components/schemas/ReasonEventData"
+          },
+          {
+            "$ref": "#/components/schemas/ReasonEventData"
+          },
+          {
+            "$ref": "#/components/schemas/RunFinishedEventData"
+          },
+          {
+            "$ref": "#/components/schemas/LaggedEventData"
+          },
+          true
+        ]
+      },
+      "RunFinishedEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "failures": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/RunNodeFailureEventData"
+            },
+            "type": "array"
+          },
+          "metrics": {
+            "$ref": "#/components/schemas/RunMetrics"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FailureDetail"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "status": {
+            "$ref": "#/components/schemas/RunCompletionStatus"
+          }
+        },
+        "required": [
+          "status",
+          "metrics"
+        ],
+        "type": "object"
+      },
+      "RunInvalidation": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "actor_label": {
+            "type": "string"
+          },
+          "invalidated_at": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "run_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "reason",
+          "actor_label",
+          "invalidated_at"
+        ],
+        "title": "RunInvalidation",
+        "type": "object"
+      },
+      "RunListItem": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "generator_id": {
+            "type": "string"
+          },
+          "invalidation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunInvalidation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "started_at": {
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/RunStatus"
+          }
+        },
+        "required": [
+          "run_id",
+          "state",
+          "generator_id",
+          "started_at"
+        ],
+        "title": "RunListItem",
+        "type": "object"
+      },
+      "RunListOrder": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Run history sort order. Ascending is the default and preserves the\nexisting cursor contract; descending serves newest-first views so\nrecent runs never fall out of a capped fetch window (B12).",
+        "enum": [
+          "asc",
+          "desc"
+        ],
+        "title": "RunListOrder",
+        "type": "string"
+      },
+      "RunListResponse": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/RunListItem"
+            },
+            "type": "array"
+          },
+          "next_cursor": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "RunListResponse",
+        "type": "object"
+      },
+      "RunMetrics": {
+        "properties": {
+          "budget_charged": {
+            "default": 0,
+            "description": "Durable step-budget consumption (F13): sum of `budget_charged`\ndeltas. `steps_executed` counts `step_started` events (observational,\nincludes uncharged foreach children); this counter drives\n`max_steps` enforcement and survives restarts identically.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "cost_microusd": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "duration_ms": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "llm_calls": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "regenerate_attempts": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "repair_attempts": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "steps_executed": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "steps_failed": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "steps_skipped": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "steps_succeeded": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "steps_total": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tokens_cache_creation_input": {
+            "default": 0,
+            "description": "Input tokens used to create cache entries, included in total input.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tokens_cached_input": {
+            "default": 0,
+            "description": "Input tokens served from provider cache, included in `tokens_input`.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tokens_input": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tokens_output": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tokens_total": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "RunNodeFailureEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "failure": {
+            "$ref": "#/components/schemas/FailureDetail"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "failure"
+        ],
+        "type": "object"
+      },
+      "RunSnapshot": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "artifacts": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OutputManifest"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "confirm": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConfirmSpec"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "contract_sha256": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "generator_id": {
+            "description": "Owning generator id so clients never parse it from run_id (C03).\nRequired: a snapshot without an owner is corrupt, never something\nto guess from the run id.",
+            "type": "string"
+          },
+          "invalidation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunInvalidation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "description": "Run metadata admitted with the run; never authorization.",
+            "type": "object"
+          },
+          "metrics": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunMetrics"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Cost totals: exact terminal metrics when finished, otherwise a live\nsynthesis from the folded budget. Absent only before any activity."
+          },
+          "parent_run_id": {
+            "default": null,
+            "description": "Parent run id for runs created by fork.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "priority": {
+            "default": 0,
+            "description": "Scheduling priority, higher runs first.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "question": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FormSpec"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "queue_position": {
+            "default": null,
+            "description": "1-based position among queued runs, present only while `Queued`.",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "queue_position_quality": {
+            "$ref": "#/components/schemas/QueuePositionQuality",
+            "default": "unavailable"
+          },
+          "queued_at": {
+            "default": null,
+            "description": "RFC 3339 durable FIFO key while queued. Scheduler preemption may\npreserve the prior key rather than stamp the latest transition time.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "state": {
+            "$ref": "#/components/schemas/RunStatus"
+          },
+          "step_summaries": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/StepSummary"
+            },
+            "description": "Terminal outcomes folded from journal records, keyed by canonical\n`NodePath` strings. Live values and outputs are not summarized here.",
+            "type": "object"
+          }
+        },
+        "required": [
+          "run_id",
+          "state",
+          "generator_id",
+          "step_summaries"
+        ],
+        "title": "RunSnapshot",
+        "type": "object"
+      },
+      "RunStartedEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "answers": {
+            "additionalProperties": true,
+            "default": {},
+            "type": "object"
+          },
+          "audit_raise": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AuditLevel"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Per-run audit level raise recorded at admission; it can only raise\nobservation persistence."
+          },
+          "confirmations": {
+            "additionalProperties": {
+              "type": "boolean"
+            },
+            "default": {},
+            "type": "object"
+          },
+          "contract_sha256": {
+            "type": "string"
+          },
+          "effective_max_total_steps": {
+            "default": null,
+            "description": "Effective step budget after resolving the deployment ceiling.",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "effective_policy_origin": {
+            "default": null,
+            "description": "Origin of the effective budget for audit display.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "elapsed_budget_mode": {
+            "description": "Schema-1 absence means historical wall-clock accounting.",
+            "enum": [
+              "wall_clock",
+              "active_execution"
+            ],
+            "type": "string"
+          },
+          "generator": {
+            "type": "string"
+          },
+          "generator_path": {
+            "type": "string"
+          },
+          "inputs": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "description": "Free-form run metadata admitted with the run. Metadata only: the runtime\nnever reads identity or enforces authorization from labels.",
+            "type": "object"
+          },
+          "package_sha256": {
+            "default": null,
+            "description": "Full package identity for API runs. Absent on legacy/direct runs;\nthose runs cannot be recovered or forked by the service.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parallel_compatibility": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ParallelCompatibility"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Deployment-owned parallel compatibility; only fail-fast exists."
+          },
+          "parallel_compatibility_origin": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parent_run_id": {
+            "default": null,
+            "description": "Parent run id for runs created by fork.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "priority": {
+            "default": 0,
+            "description": "Scheduling priority recorded when the run was (re)queued.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "queued_at": {
+            "default": null,
+            "description": "Durable FIFO ordering key. Scheduler preemption may preserve the\nprior key; fresh/fork admissions establish a new one. Absent entries\nuse the actual event timestamp (C04), which is never backdated.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resource_hashes": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ResourceEventData"
+            },
+            "type": "array"
+          },
+          "retention_days": {
+            "default": null,
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "schema_version": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "generator",
+          "generator_path",
+          "contract_sha256",
+          "inputs",
+          "schema_version",
+          "elapsed_budget_mode"
+        ],
+        "type": "object"
+      },
+      "RunStatus": {
+        "oneOf": [
+          {
+            "enum": [
+              "queued",
+              "running",
+              "waiting",
+              "confirming",
+              "succeeded",
+              "failed",
+              "canceled",
+              "interrupted"
+            ],
+            "type": "string"
+          },
+          {
+            "const": "cancel_requested",
+            "description": "A cancel request was accepted into the mailbox but no terminal\noutcome is journaled yet. This is acceptance, not settlement: only\na journaled terminal state may report `Canceled` (A02).",
+            "type": "string"
+          }
+        ]
+      },
+      "RunWaitingEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "question": {
+            "$ref": "#/components/schemas/FormSpec"
+          },
+          "question_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "question_id",
+          "question"
+        ],
+        "type": "object"
+      },
+      "SideEffectDecision": {
+        "enum": [
+          "denied",
+          "allowed",
+          "approved_by_user",
+          "denied_by_user",
+          "confirmation_required"
+        ],
+        "type": "string"
+      },
+      "SideEffectEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "decision": {
+            "$ref": "#/components/schemas/SideEffectDecision"
+          },
+          "details": {
+            "default": null
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "operation_digest": {
+            "default": null,
+            "description": "Canonical digest binding the approval to the exact operation (A06).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "policy": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "target",
+          "decision"
+        ],
+        "type": "object"
+      },
+      "SideEffectScope": {
+        "oneOf": [
+          {
+            "const": "invocation",
+            "description": "Approval binds one invocation: a later call re-confirms even for\nidentical content.",
+            "type": "string"
+          },
+          {
+            "const": "content",
+            "description": "Approval binds the exact operation content; the same content in a\nlater invocation reuses it.",
+            "type": "string"
+          }
+        ]
+      },
+      "SideEffects": {
+        "enum": [
+          "none",
+          "confirm",
+          "dry_run_first",
+          "allowed"
+        ],
+        "type": "string"
+      },
+      "StartRun": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "answers": {
+            "additionalProperties": true,
+            "description": "Pre-provisioned answers keyed by question id, consumed without interaction.\nSame semantics as eval suite answers.",
+            "type": "object"
+          },
+          "audit_level": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AuditLevel"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Requests a higher observation-audit level for this run. The\ndeployment floor and the generator policy can only be raised."
+          },
+          "confirmations": {
+            "additionalProperties": {
+              "type": "boolean"
+            },
+            "description": "Pre-provisioned confirmation decisions keyed by confirmation id.",
+            "type": "object"
+          },
+          "generator_id": {
+            "type": "string"
+          },
+          "inputs": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Free-form run metadata (for example `owner`). Metadata only: it is\nstored and returned with the run, and never confers authorization.",
+            "type": "object"
+          },
+          "priority": {
+            "description": "Scheduling priority, higher runs first. Defaults to 0.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "generator_id",
+          "inputs"
+        ],
+        "title": "StartRun",
+        "type": "object"
+      },
+      "StepFinishedEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "answer": {
+            "default": null
+          },
+          "failed_files": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/FilePinEventData"
+            },
+            "type": "array"
+          },
+          "failed_output": {
+            "default": null
+          },
+          "files": {
+            "default": [],
+            "description": "File revisions produced by this step, retained across suspension.",
+            "items": {
+              "$ref": "#/components/schemas/FilePinEventData"
+            },
+            "type": "array"
+          },
+          "findings": {
+            "default": [],
+            "items": true,
+            "type": "array"
+          },
+          "output": {
+            "default": null
+          },
+          "output_name": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parallel": {
+            "default": false,
+            "type": "boolean"
+          },
+          "question": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FormSpec"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FailureDetail"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "status": {
+            "$ref": "#/components/schemas/StepStatus"
+          },
+          "to": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
+      },
+      "StepReplayedEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/StepStatus"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
+      },
+      "StepRetryEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "attempt": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "error": {
+            "type": "string"
+          },
+          "max_attempts": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "attempt",
+          "max_attempts",
+          "error"
+        ],
+        "type": "object"
+      },
+      "StepStartedEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "attempt": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "parallel": {
+            "default": false,
+            "type": "boolean"
+          },
+          "type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "attempt"
+        ],
+        "type": "object"
+      },
+      "StepStatus": {
+        "enum": [
+          "success",
+          "repaired",
+          "routed",
+          "repair_exhausted",
+          "answered_on_fail",
+          "regenerated",
+          "regenerate_exhausted",
+          "needs_user",
+          "needs_confirm",
+          "check_failed",
+          "failed"
+        ],
+        "type": "string"
+      },
+      "StepSummary": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Journal-folded terminal summary for one canonical node path.",
+        "properties": {
+          "reason": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FailureDetail"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Present for failed and skipped steps; success has no reason."
+          },
+          "status": {
+            "$ref": "#/components/schemas/StepSummaryStatus"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "StepSummary",
+        "type": "object"
+      },
+      "StepSummaryStatus": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Terminal outcome of one step execution, projected from the run journal.",
+        "enum": [
+          "success",
+          "failed",
+          "skipped"
+        ],
+        "title": "StepSummaryStatus",
+        "type": "string"
+      },
+      "StructuredOutputMode": {
+        "enum": [
+          "auto",
+          "native_strict",
+          "native_compatible",
+          "prompt"
+        ],
+        "type": "string"
+      },
+      "TokenUsageEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "cache_creation_input": {
+            "default": 0,
+            "description": "Input tokens used to create cache entries, included in total input.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "cached_input": {
+            "default": 0,
+            "description": "Input tokens served from provider cache, included in `input`.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "input": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "output": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "reasoning": {
+            "default": 0,
+            "description": "Reasoning tokens included in `output`.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "input",
+          "output"
+        ],
+        "type": "object"
+      },
+      "ToolBackendResolvedEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "argv": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "backend": {
+            "type": "string"
+          },
+          "tool": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "tool",
+          "backend",
+          "argv"
+        ],
+        "type": "object"
+      },
+      "ToolCallError": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/ToolCallErrorCode"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "type": "object"
+      },
+      "ToolCallErrorCode": {
+        "oneOf": [
+          {
+            "enum": [
+              "invalid_arguments",
+              "guardrail_rejected",
+              "execution_failed",
+              "output_rejected",
+              "cancelled",
+              "budget_exceeded",
+              "tool_reported_error"
+            ],
+            "type": "string"
+          },
+          {
+            "const": "timed_out",
+            "description": "Per-attempt node timeout (E11), distinct from `ExecutionFailed`.",
+            "type": "string"
+          },
+          {
+            "const": "elapsed_exceeded",
+            "description": "Run-wide elapsed budget stop (E11), distinct from timeout/cancel.",
+            "type": "string"
+          },
+          {
+            "const": "cleanup_failed",
+            "description": "Session cleanup failed; the call outcome stands separately.",
+            "type": "string"
+          }
+        ]
+      },
+      "ToolCallEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "agent": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "arguments": true,
+          "cleanup_error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ToolCallError"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Cleanup failure retained beside the execution outcome."
+          },
+          "cleanup_settlement": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/McpCleanupSettlement"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Effective cleanup policy and source; absent when cleanup settlement is not applied."
+          },
+          "duration_ms": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ToolCallError"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "id": {
+            "type": "string"
+          },
+          "phase": {
+            "$ref": "#/components/schemas/ToolCallPhase"
+          },
+          "result": true,
+          "server": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/ToolCallSource"
+            },
+            "type": "array"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ToolCallStatus"
+          },
+          "tool": {
+            "type": "string"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "tool",
+          "id",
+          "status",
+          "phase",
+          "duration_ms",
+          "arguments",
+          "result",
+          "sources",
+          "truncated"
+        ],
+        "type": "object"
+      },
+      "ToolCallPhase": {
+        "enum": [
+          "input_validation",
+          "input_guardrail",
+          "execution",
+          "output_guardrail",
+          "completed"
+        ],
+        "type": "string"
+      },
+      "ToolCallSource": {
+        "additionalProperties": false,
+        "properties": {
+          "title": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      },
+      "ToolCallStatus": {
+        "enum": [
+          "succeeded",
+          "failed",
+          "needs_user",
+          "needs_confirmation",
+          "degraded"
+        ],
+        "type": "string"
+      },
+      "ToolChoice": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/ToolChoiceMode"
+          },
+          {
+            "properties": {
+              "tool": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "tool"
+            ],
+            "type": "object"
+          }
+        ],
+        "description": "Provider-neutral policy for whether a model may call an exposed tool."
+      },
+      "ToolChoiceMode": {
+        "enum": [
+          "none",
+          "auto",
+          "required"
+        ],
+        "type": "string"
+      },
+      "TransportFacts": {
+        "additionalProperties": false,
+        "properties": {
+          "dispatch": {
+            "$ref": "#/components/schemas/RequestDispatch"
+          },
+          "phase": {
+            "$ref": "#/components/schemas/TransportPhase"
+          }
+        },
+        "required": [
+          "phase",
+          "dispatch"
+        ],
+        "type": "object"
+      },
+      "TransportPhase": {
+        "enum": [
+          "connect",
+          "response",
+          "unknown"
+        ],
+        "type": "string"
+      },
+      "UrlCitation": {
+        "additionalProperties": false,
+        "description": "One citation the provider attached to its answer.",
+        "properties": {
+          "end_index": {
+            "default": null,
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "start_index": {
+            "default": null,
+            "description": "The cited range inside the answer text, when the provider reports one.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "title": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "url": {
+            "default": "",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "UserInteractionEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "source": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "WebSearchLiability": {
+        "additionalProperties": false,
+        "description": "Unknown possible hosted-search spend, without fabricated usage or response metadata.",
+        "properties": {
+          "calls": {
+            "type": "null"
+          },
+          "cost_microusd": {
+            "type": "null"
+          }
+        },
+        "required": [
+          "calls",
+          "cost_microusd"
+        ],
+        "type": "object"
+      },
+      "WebSearchUsage": {
+        "additionalProperties": false,
+        "description": "What provider-hosted search did for one response and how much was metered.",
+        "properties": {
+          "calls": {
+            "default": null,
+            "description": "Provider-billable units under the configured mapping; null is unknown, never zero.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "citations": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/UrlCitation"
+            },
+            "type": "array"
+          },
+          "cost_microusd": {
+            "default": null,
+            "description": "Hosted search charge in microusd; null means unmetered, never free.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "events": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ProviderSearchEvent"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "title": "api",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/generators": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/GeneratorSummary"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Available generators"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "List generators"
+      }
+    },
+    "/api/generators/{id}": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Return 304 when this validator matches the current representation.",
+            "in": "header",
+            "name": "If-None-Match",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GeneratorDetail"
+                }
+              }
+            },
+            "description": "Generator detail",
+            "headers": {
+              "ETag": {
+                "description": "Weak validator for conditional GET requests.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "Not modified",
+            "headers": {
+              "ETag": {
+                "description": "Weak validator for conditional GET requests.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Resource not found"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Describe a generator"
+      }
+    },
+    "/api/generators/{id}/assets/{path}": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Generator asset bytes"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Resource not found"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Read a declared generator asset"
+      }
+    },
+    "/api/llm/catalog": {
+      "get": {
+        "parameters": [
+          {
+            "in": "query",
+            "name": "refresh",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LlmCatalogResponse"
+                }
+              }
+            },
+            "description": "Selectable provider, model, and reasoning effort metadata"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "List selectable LLM providers and models"
+      }
+    },
+    "/api/mcp/oauth/callback": {
+      "get": {
+        "parameters": [
+          {
+            "in": "query",
+            "name": "code",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "state",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "iss",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "error",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Authorization completed"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request failed"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Complete an MCP OAuth authorization callback"
+      }
+    },
+    "/api/mcp/servers": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpServerList"
+                }
+              }
+            },
+            "description": "Configured MCP servers"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "List configured MCP servers and authorization status"
+      }
+    },
+    "/api/mcp/servers/{id}/authorization": {
+      "delete": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Authorization cleared"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request failed"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        },
+        "summary": "Clear stored MCP OAuth authorization"
+      },
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpAuthorizationStart"
+                }
+              }
+            },
+            "description": "Authorization URL"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request failed"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        },
+        "summary": "Start MCP OAuth authorization"
+      }
+    },
+    "/api/mcp/servers/{id}/authorization/pending": {
+      "delete": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Pending authorization canceled"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request failed"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        },
+        "summary": "Cancel a pending MCP OAuth authorization"
+      }
+    },
+    "/api/openapi.json": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {}
+            },
+            "description": "OpenAPI document"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "OpenAPI document"
+      }
+    },
+    "/api/runs": {
+      "get": {
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "state",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/RunStatus"
+            }
+          },
+          {
+            "in": "query",
+            "name": "generator_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/RunListOrder"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunListResponse"
+                }
+              }
+            },
+            "description": "Known runs"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "List runs"
+      },
+      "post": {
+        "parameters": [
+          {
+            "description": "Required SHA-256 identity from the loaded GeneratorDetail; start is rejected if the package changed.",
+            "in": "header",
+            "name": "X-QCG-Package-SHA256",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A retained key with the same request body and package identity replays the original run. Same-process identical pending requests wait and replay; a pending request owned by another process may return 503. Changed content for a bound key returns 409. Retention is subject to expiry and entry limits; after expiry or eviction, reuse may be treated as a new request.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StartRun"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunSnapshot"
+                }
+              }
+            },
+            "description": "Started run",
+            "headers": {
+              "Location": {
+                "description": "URL of the newly created run.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Resource conflict"
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Payload too large"
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Validation failed"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service unavailable"
+          }
+        },
+        "summary": "Start a run"
+      }
+    },
+    "/api/runs/{id}": {
+      "delete": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Run deleted"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Resource not found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Resource conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Delete a terminal run"
+      },
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Return 304 when this validator matches the current representation.",
+            "in": "header",
+            "name": "If-None-Match",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunSnapshot"
+                }
+              }
+            },
+            "description": "Run snapshot",
+            "headers": {
+              "ETag": {
+                "description": "Weak validator for conditional GET requests.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "Not modified",
+            "headers": {
+              "ETag": {
+                "description": "Weak validator for conditional GET requests.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Resource not found"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Run snapshot"
+      }
+    },
+    "/api/runs/{id}/artifacts": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Return 304 when this validator matches the current representation.",
+            "in": "header",
+            "name": "If-None-Match",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OutputManifest"
+                }
+              }
+            },
+            "description": "Output manifest",
+            "headers": {
+              "ETag": {
+                "description": "Weak validator for conditional GET requests.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "Not modified",
+            "headers": {
+              "ETag": {
+                "description": "Weak validator for conditional GET requests.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Resource not found"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Run output manifest"
+      }
+    },
+    "/api/runs/{id}/artifacts.zip": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/zip": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Artifact zip"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Resource not found"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Download all artifacts as zip"
+      }
+    },
+    "/api/runs/{id}/artifacts/{path}": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Return 304 when the artifact digest matches.",
+            "in": "header",
+            "name": "If-None-Match",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "One bytes=start-end, bytes=start- or bytes=-suffix range.",
+            "in": "header",
+            "name": "Range",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Apply Range only when this strong ETag matches.",
+            "in": "header",
+            "name": "If-Range",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Artifact bytes",
+            "headers": {
+              "Accept-Ranges": {
+                "description": "Supported range unit: bytes.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Content-Disposition": {
+                "description": "Attachment filename.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "ETag": {
+                "description": "Strong validator naming the verified artifact SHA-256.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "206": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Requested byte range",
+            "headers": {
+              "Accept-Ranges": {
+                "description": "Supported range unit: bytes.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Content-Disposition": {
+                "description": "Attachment filename.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "ETag": {
+                "description": "Strong validator naming the verified artifact SHA-256.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "Not modified",
+            "headers": {
+              "ETag": {
+                "description": "Weak validator for conditional GET requests.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Resource not found"
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Payload too large"
+          },
+          "416": {
+            "description": "Unsatisfiable byte range; Content-Range gives the artifact length"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Read an artifact"
+      }
+    },
+    "/api/runs/{id}/bundle": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/zip": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Run bundle zip"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Resource not found"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Download a self-contained run bundle as zip"
+      }
+    },
+    "/api/runs/{id}/confirmations/{cid}": {
+      "put": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "cid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A retained key with identical request content replays its result. Same-process identical pending requests wait and replay; a pending request owned by another process may return 503. Changed content for a bound key returns 409. Retention is subject to expiry and entry limits; after expiry or eviction, reuse may be treated as a new request.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConfirmDecision"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunSnapshot"
+                }
+              }
+            },
+            "description": "Updated run snapshot"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Resource not found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Resource conflict"
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Validation failed"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service unavailable"
+          }
+        },
+        "summary": "Confirm or deny a pending side effect"
+      }
+    },
+    "/api/runs/{id}/events": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Resume the event stream after this event sequence number.",
+            "in": "header",
+            "name": "Last-Event-ID",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Server-sent event stream"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Resource not found"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Subscribe to run events"
+      }
+    },
+    "/api/runs/{id}/fork": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A retained key with identical request content replays its result. Same-process identical pending requests wait and replay; a pending request owned by another process may return 503. Changed content for a bound key returns 409. Retention is subject to expiry and entry limits; after expiry or eviction, reuse may be treated as a new request.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ForkRun"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunSnapshot"
+                }
+              }
+            },
+            "description": "Forked run",
+            "headers": {
+              "Location": {
+                "description": "URL of the newly created run.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Resource conflict"
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Payload too large"
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Validation failed"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service unavailable"
+          }
+        },
+        "summary": "Fork a run from a durable checkpoint"
+      }
+    },
+    "/api/runs/{id}/invalidation": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InvalidateRun"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunInvalidation"
+                }
+              }
+            },
+            "description": "Immutable invalidation record"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Resource not found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Resource conflict"
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Validation failed"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service unavailable"
+          }
+        },
+        "summary": "Invalidate a durably successful run (immutable; exact retries are no-ops)"
+      }
+    },
+    "/api/runs/{id}/journal": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Run journal JSONL"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Resource not found"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Read run journal"
+      }
+    },
+    "/api/runs/{id}/metrics": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunCostMetrics"
+                }
+              }
+            },
+            "description": "Run cost metrics with USD estimate"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Resource not found"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Read run cost metrics"
+      }
+    },
+    "/api/runs/{id}/questions/{qid}": {
+      "put": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "qid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A retained key with identical request content replays its result. Same-process identical pending requests wait and replay; a pending request owned by another process may return 503. Changed content for a bound key returns 409. Retention is subject to expiry and entry limits; after expiry or eviction, reuse may be treated as a new request.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AnswerPayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunSnapshot"
+                }
+              }
+            },
+            "description": "Updated run snapshot"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Resource not found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Resource conflict"
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Validation failed"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service unavailable"
+          }
+        },
+        "summary": "Answer a pending run question"
+      }
+    },
+    "/api/runs/{id}:cancel": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A retained key with identical request content replays its result. Same-process identical pending requests wait and replay; a pending request owned by another process may return 503. Changed content for a bound key returns 409. Retention is subject to expiry and entry limits; after expiry or eviction, reuse may be treated as a new request.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunSnapshot"
+                }
+              }
+            },
+            "description": "Settled run snapshot"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Resource not found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Resource conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Cancel a run"
+      }
+    },
+    "/healthz": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {}
+            },
+            "description": "Server is healthy"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Health check"
+      }
+    },
+    "/metrics": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "text/plain; version=0.0.4": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Prometheus text exposition"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Prometheus metrics"
+      }
+    }
+  },
+  "security": [
+    {},
+    {
+      "bearerAuth": []
+    }
+  ]
+}
