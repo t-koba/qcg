@@ -1,5 +1,4 @@
-//! Path syntax and collision checks are host-independent; filesystem length limits are not.
-//! Set keys use conservative NFD/full Unicode case-fold/NFD.
+//! Path syntax and collision checks are host-independent; filesystem length limits are not. Set keys use conservative NFD/full Unicode case-fold/NFD.
 //! Safe paths are nonempty relative slash paths excluding ADS/drive colons, backslashes, controls, trailing dots/spaces, reserved stems and Win32 `< > " | ? *`; globs also allow `*` and `?`.
 use camino::Utf8Path;
 
