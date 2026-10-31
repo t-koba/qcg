@@ -27,6 +27,7 @@ pub struct GeneratorDetail {
 #[serde(deny_unknown_fields)]
 pub struct StartRun {
     pub generator_id: String,
+    #[serde(deserialize_with = "contract::deserialize_verified_inputs")]
     pub inputs: BTreeMap<String, Value>,
     /// Pre-provisioned answers keyed by question id, consumed without interaction.
     /// Same semantics as eval suite answers.
@@ -51,7 +52,7 @@ pub struct StartRun {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ForkStatePatch {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "contract::deserialize_verified_inputs")]
     pub inputs: BTreeMap<String, Value>,
     #[serde(default)]
     pub step_outputs: BTreeMap<String, Value>,

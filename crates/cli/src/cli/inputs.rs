@@ -12,7 +12,12 @@ pub(crate) fn load_inputs(
 ) -> Result<BTreeMap<String, Value>> {
     let mut values = if let Some(file) = file {
         let bytes = files::read_bounded(&file, max_inputs_file_bytes)?;
-        serde_json::from_slice::<BTreeMap<String, Value>>(&bytes)?
+        let raw: BTreeMap<String, Box<serde_json::value::RawValue>> =
+            serde_json::from_slice(&bytes)
+                .with_context(|| format!("failed to parse inputs file `{file}`"))?;
+        contract::verified_inputs_from_raw_map(raw).map_err(|error| {
+            anyhow::anyhow!("{error}").context(format!("invalid inputs file `{file}`"))
+        })?
     } else {
         BTreeMap::new()
     };
@@ -20,7 +25,7 @@ pub(crate) fn load_inputs(
         let (key, value) = pair
             .split_once('=')
             .with_context(|| format!("input `{pair}` must be k=v"))?;
-        values.insert(key.to_string(), parse_value(value));
+        values.insert(key.to_string(), parse_input_value(key, value)?);
     }
     for pair in file_pairs {
         let (field, path) = pair
@@ -94,6 +99,16 @@ pub(crate) fn load_confirmations(
         values.insert(key.to_string(), approved);
     }
     Ok(values)
+}
+
+fn parse_input_value(key: &str, value: &str) -> Result<Value> {
+    if let Ok(raw) = serde_json::from_str::<Box<serde_json::value::RawValue>>(value) {
+        contract::validate_input_scalar_token(raw.get())
+            .map_err(|error| anyhow::anyhow!("input `{key}` {error}"))?;
+        return serde_json::from_str(raw.get())
+            .with_context(|| format!("input `{key}` is not supported JSON"));
+    }
+    Ok(parse_value(value))
 }
 
 fn parse_value(value: &str) -> Value {
@@ -233,5 +248,115 @@ mod tests {
         let values =
             super::load_confirmations(Vec::new(), Some(path)).expect("valid file should load");
         assert_eq!(values.len(), 1);
+    }
+
+    #[test]
+    fn inputs_file_enforces_raw_integer_bounds() {
+        let dir = std::env::temp_dir().join(format!("inputs-file-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("temp dir should be created");
+        let path = camino::Utf8PathBuf::from_path_buf(dir.join("inputs.json")).expect("utf8 path");
+        std::fs::write(
+            path.as_std_path(),
+            r#"{"small": -9223372036854775808, "big": 18446744073709551615}"#,
+        )
+        .expect("file should be written");
+        let values = super::load_inputs(
+            Vec::new(),
+            Some(path.clone()),
+            Vec::new(),
+            &contract::RuntimeLimits::default(),
+            None,
+        )
+        .expect("exact bounds must pass");
+        assert_eq!(values["small"].as_i64(), Some(i64::MIN));
+        assert_eq!(values["big"].as_u64(), Some(u64::MAX));
+
+        std::fs::write(
+            path.as_std_path(),
+            r#"{"payload": {"nested": [{"number": 18446744073709551616}]}}"#,
+        )
+        .expect("file should be written");
+        let error = super::load_inputs(
+            Vec::new(),
+            Some(path.clone()),
+            Vec::new(),
+            &contract::RuntimeLimits::default(),
+            None,
+        )
+        .expect_err("nested 2^64 must be rejected");
+        assert!(
+            format!("{error:#}").contains("numbers must be integers"),
+            "unexpected message: {error:#}"
+        );
+
+        std::fs::write(
+            path.as_std_path(),
+            r#"{"payload": {"nested": [{"number": 1e9999}]}}"#,
+        )
+        .expect("file should be written");
+        let error = super::load_inputs(
+            Vec::new(),
+            Some(path),
+            Vec::new(),
+            &contract::RuntimeLimits::default(),
+            None,
+        )
+        .expect_err("non-finite float must be rejected");
+        assert!(
+            format!("{error:#}").contains("numbers must be integers"),
+            "unexpected message: {error:#}"
+        );
+        std::fs::remove_dir_all(dir).expect("temporary inputs directory should be removed");
+    }
+
+    #[test]
+    fn input_pairs_reject_out_of_range_scalars_but_answers_do_not() {
+        // In-range scalars keep their JSON types.
+        let values = super::load_inputs(
+            vec![
+                "small=-9223372036854775808".into(),
+                "float=1.25".into(),
+                "exponent=1e100".into(),
+            ],
+            None,
+            Vec::new(),
+            &contract::RuntimeLimits::default(),
+            None,
+        )
+        .expect("in-range pairs must pass");
+        assert_eq!(values["small"].as_i64(), Some(i64::MIN));
+
+        for token in ["18446744073709551616", "-9223372036854775809", "1e9999"] {
+            let error = super::load_inputs(
+                vec![format!("payload={token}")],
+                None,
+                Vec::new(),
+                &contract::RuntimeLimits::default(),
+                None,
+            )
+            .expect_err("out-of-range pair must be rejected");
+            assert!(
+                format!("{error:#}").contains("numbers must be integers"),
+                "unexpected message for {token}: {error:#}"
+            );
+        }
+
+        let strings = super::load_inputs(
+            vec![r#"text="18446744073709551616""#.into()],
+            None,
+            Vec::new(),
+            &contract::RuntimeLimits::default(),
+            None,
+        )
+        .expect("numeric-looking strings must pass");
+        assert_eq!(
+            strings["text"],
+            serde_json::Value::String("18446744073709551616".into())
+        );
+
+        // Answers keep their established semantics: no raw number check.
+        let answers = super::load_answers(vec!["payload=18446744073709551616".into()])
+            .expect("answers must not enforce raw bounds");
+        assert!(answers["payload"].is_number());
     }
 }

@@ -699,11 +699,18 @@ compare equal.
 Comparisons use the numbers' exact values: two integers are never rounded
 into equality, so two distinct integers above 2^53 stay distinct, and an
 integer equals a float only when the float denotes the same number. The
-exactness holds while the value fits the JSON number type - an integer up
-to 2^64-1 - and an integer literal above that is refused rather than
-stated approximately. This evaluator guarantee is distinct from JSON consumer
-precision: the wire representation remains a JSON number, but JavaScript's
-`JSON.parse` converts numbers to IEEE-754 binary64, which guarantees exact
+HTTP and CLI raw JSON input integer range is [-2^63, 2^64-1]. At ingestion
+the raw JSON tokens for `StartRun.inputs` and `ForkStatePatch.inputs`
+(HTTP) and for JSON input files, eval suites, and `--input key=value`
+scalars (CLI) are scanned with strings skipped before parsing to `Value`;
+integer tokens outside that range are rejected, including inside arrays and
+objects, rather than rounded to floats. Out-of-range expression integer
+literals are also refused. Finite decimal/exponent inputs retain
+floating-point semantics; numbers that cannot convert to a finite float are
+rejected. Callers that provide pre-parsed `Value`s cannot recover any
+precision already lost before ingestion. This evaluator guarantee is distinct
+from JSON consumer precision: the wire representation remains a JSON number,
+but JavaScript's `JSON.parse` converts numbers to IEEE-754 binary64, which guarantees exact
 representation of every integer only within ±(2^53 - 1). Above that range,
 distinct integer tokens can round to the same value. The generated TypeScript
 client uses `JSON.parse`; consumers that need larger exact integers must

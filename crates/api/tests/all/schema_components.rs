@@ -476,3 +476,71 @@ fn failure_exhaustion_is_optional_typed_and_amounts_are_unsigned() {
             .contains(&serde_json::json!("resource"))
     );
 }
+
+#[test]
+fn start_run_inputs_enforce_raw_integer_bounds() {
+    // Raw JSON ingestion preserves tokens that a pre-parsed `Value` would
+    // already have rounded, so the DTO must reject oversized integers here.
+    let ok: api::StartRun = serde_json::from_str(
+        r#"{"generator_id": "g", "inputs": {"small": -9223372036854775808, "big": 18446744073709551615, "float": 1.25}}"#,
+    )
+    .expect("exact bounds and finite floats must pass");
+    assert_eq!(ok.inputs["small"].as_i64(), Some(i64::MIN));
+    assert_eq!(ok.inputs["big"].as_u64(), Some(u64::MAX));
+
+    for token in [
+        "-9223372036854775809",
+        "18446744073709551616",
+        "18446744073709551617",
+    ] {
+        let error = serde_json::from_str::<api::StartRun>(&format!(
+            r#"{{"generator_id": "g", "inputs": {{"payload": {{"nested": [{{"number": {token}}}]}}}}}}"#
+        ))
+        .expect_err("nested out-of-range integer must be rejected");
+        assert!(
+            error.to_string().contains("numbers must be integers"),
+            "unexpected message for {token}: {error}"
+        );
+    }
+
+    let error = serde_json::from_str::<api::StartRun>(
+        r#"{"generator_id": "g", "inputs": {"payload": {"nested": [{"number": 1e9999}]}}}"#,
+    )
+    .expect_err("non-finite float must be rejected");
+    assert!(
+        error.to_string().contains("numbers must be integers"),
+        "unexpected message: {error}"
+    );
+
+    // Numeric-looking strings and keys are not numbers.
+    let ok: api::StartRun = serde_json::from_str(
+        r#"{"generator_id": "g", "inputs": {"18446744073709551616": "18446744073709551616"}}"#,
+    )
+    .expect("numeric strings and keys must pass");
+    assert_eq!(
+        ok.inputs["18446744073709551616"],
+        serde_json::Value::String("18446744073709551616".into())
+    );
+}
+
+#[test]
+fn fork_state_patch_inputs_enforce_raw_integer_bounds() {
+    let ok: api::ForkStatePatch =
+        serde_json::from_str(r#"{"inputs": {"small": -9223372036854775808}}"#)
+            .expect("exact bound must pass");
+    assert_eq!(ok.inputs["small"].as_i64(), Some(i64::MIN));
+
+    let error = serde_json::from_str::<api::ForkStatePatch>(
+        r#"{"inputs": {"payload": 18446744073709551616}}"#,
+    )
+    .expect_err("out-of-range integer must be rejected");
+    assert!(
+        error.to_string().contains("numbers must be integers"),
+        "unexpected message: {error}"
+    );
+
+    // Missing inputs still default to empty.
+    let empty: api::ForkStatePatch =
+        serde_json::from_str(r#"{}"#).expect("missing inputs must default");
+    assert!(empty.inputs.is_empty());
+}

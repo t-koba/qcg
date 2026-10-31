@@ -72,6 +72,8 @@ impl Manifest {
         &self,
         mut values: BTreeMap<String, Value>,
     ) -> Result<BTreeMap<String, Value>, ContractError> {
+        // HTTP/CLI raw JSON number bounds are enforced before conversion to
+        // `Value`; callers supplying pre-parsed values have lost token text.
         validate_input_sizes(&values, &self.runtime)?;
         // File inputs count toward `runtime.file_count_limit` exactly like
         // collected artifacts and tool files do; only files in active
@@ -176,6 +178,114 @@ impl Manifest {
                     .join("\n")
             ))),
         }
+    }
+}
+
+/// Raw JSON number boundary for external run inputs.
+///
+/// Integers must fit in `[-2^63, 2^64-1]`; decimals and exponents must be
+/// finite `f64`. Raw tokens are checked before parsing to `Value` so an
+/// oversized integer cannot round to `f64` first. Strings (including
+/// numeric-looking keys and string values) are skipped via string-aware
+/// scanning.
+const INPUT_NUMBER_RANGE_MSG: &str = "numbers must be integers in [-2^63, 2^64-1] or finite floats";
+
+/// Deserializes a run-input map while preserving raw JSON number tokens.
+///
+/// Each value is captured as `Box<RawValue>`, its raw bytes are scanned for
+/// number tokens with strings skipped, then accepted values are parsed to
+/// ordinary `Value`. Only JSON deserializers carry raw tokens; `Value`
+/// deserializers re-serialize already-rounded numbers and cannot recover the
+/// original token.
+pub fn deserialize_verified_inputs<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: BTreeMap<String, Box<serde_json::value::RawValue>> =
+        BTreeMap::deserialize(deserializer)?;
+    verified_inputs_from_raw_map(raw).map_err(serde::de::Error::custom)
+}
+
+/// Converts raw JSON input values to ordinary `Value` after range checks.
+pub fn verified_inputs_from_raw_map(
+    raw: BTreeMap<String, Box<serde_json::value::RawValue>>,
+) -> Result<BTreeMap<String, Value>, ContractError> {
+    let mut out = BTreeMap::new();
+    for (id, value) in raw {
+        let text = value.get();
+        validate_raw_json_numbers(text)
+            .map_err(|message| ContractError::Invalid(format!("input `{id}` {message}")))?;
+        let parsed: Value = serde_json::from_str(text).map_err(|error| {
+            ContractError::Invalid(format!("input `{id}` is invalid JSON: {error}"))
+        })?;
+        out.insert(id, parsed);
+    }
+    Ok(out)
+}
+
+/// Validates one scalar `--input key=value` raw text after JSON parsing.
+///
+/// Call only when `serde_json::from_str` succeeded; plain strings that fail
+/// parsing are not JSON numbers. The whole raw text is scanned so objects or
+/// arrays passed as a scalar still reject embedded out-of-range numbers.
+pub fn validate_input_scalar_token(raw: &str) -> Result<(), ContractError> {
+    validate_raw_json_numbers(raw).map_err(ContractError::Invalid)
+}
+
+fn validate_raw_json_numbers(raw: &str) -> Result<(), String> {
+    let bytes = raw.as_bytes();
+    let mut index = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'"' {
+            in_string = true;
+            index += 1;
+            continue;
+        }
+        if byte == b'-' || byte.is_ascii_digit() {
+            let start = index;
+            index += 1;
+            while index < bytes.len()
+                && matches!(bytes[index], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+            {
+                index += 1;
+            }
+            validate_number_lexeme(&raw[start..index])?;
+            continue;
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
+fn validate_number_lexeme(lexeme: &str) -> Result<(), String> {
+    // `RawValue` has already validated JSON syntax, so this token is a valid
+    // JSON number; only its exact integer range or finite-float conversion is
+    // left to check.
+    let supported = if lexeme.contains(['.', 'e', 'E']) {
+        lexeme.parse::<f64>().is_ok_and(f64::is_finite)
+    } else {
+        lexeme.parse::<i64>().is_ok() || lexeme.parse::<u64>().is_ok()
+    };
+    if supported {
+        Ok(())
+    } else {
+        Err(INPUT_NUMBER_RANGE_MSG.to_string())
     }
 }
 
@@ -612,5 +722,114 @@ mod tests {
         let error = validate_input_field_contract("input", &field, &RuntimeLimits::default())
             .expect_err("options_from must be rejected for [inputs]");
         assert!(error.to_string().contains("ask_user"), "{error}");
+    }
+
+    fn parse_verified(text: &str) -> Result<BTreeMap<String, Value>, ContractError> {
+        let raw: BTreeMap<String, Box<serde_json::value::RawValue>> =
+            serde_json::from_str(text).expect("test JSON must parse as raw map");
+        verified_inputs_from_raw_map(raw)
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct VerifiedHolder {
+        #[serde(deserialize_with = "super::deserialize_verified_inputs")]
+        inputs: BTreeMap<String, Value>,
+    }
+
+    #[test]
+    fn raw_inputs_accept_integer_bounds_and_finite_floats() {
+        let values = parse_verified(
+            r#"{"payload": {"numbers": [-9223372036854775808, 18446744073709551615,
+                18446744073709551616.0, -9223372036854775809.0, 1e100, -1E100, 1.25]}}"#,
+        )
+        .expect("exact bounds and finite floats must pass raw validation");
+        let numbers = values["payload"]["numbers"]
+            .as_array()
+            .expect("numbers must be an array");
+        assert_eq!(numbers[0].as_i64(), Some(i64::MIN));
+        assert_eq!(numbers[1].as_u64(), Some(u64::MAX));
+        assert!(
+            numbers[2..].iter().all(|value| value.is_f64()),
+            "decimals and exponents stay floats: {numbers:?}"
+        );
+        // The serde entry point preserves the same boundary.
+        let holder: VerifiedHolder = serde_json::from_str(
+            r#"{"inputs": {"payload": {"numbers": [-9223372036854775808, 1.25]}}}"#,
+        )
+        .expect("deserialize_with must accept in-range raw inputs");
+        assert_eq!(
+            holder.inputs["payload"]["numbers"][0].as_i64(),
+            Some(i64::MIN)
+        );
+    }
+
+    #[test]
+    fn raw_inputs_reject_nested_out_of_range_integers() {
+        for token in [
+            "-9223372036854775809",
+            "18446744073709551616",
+            "18446744073709551617",
+        ] {
+            let error = parse_verified(&format!(
+                r#"{{"payload": {{"nested": [{{"number": {token}}}]}}}}"#
+            ))
+            .expect_err("nested out-of-range integer must be rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains("input `payload` numbers must be integers"),
+                "unexpected message for {token}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_inputs_preserve_numeric_strings_and_keys() {
+        let values = parse_verified(
+            r#"{"18446744073709551616": "18446744073709551616",
+                "payload": {"text": "1e9999", "escaped": "quoted: \"18446744073709551616\" remains text",
+                    "nested": ["18446744073709551616"]}}"#,
+        )
+        .expect("numeric-looking strings and keys must not be rejected");
+        assert_eq!(values["payload"]["text"], Value::String("1e9999".into()));
+        assert_eq!(
+            values["payload"]["escaped"],
+            Value::String("quoted: \"18446744073709551616\" remains text".into())
+        );
+    }
+
+    #[test]
+    fn raw_inputs_reject_nonfinite_floats() {
+        for token in ["1e9999", "-1e9999", "1E9999"] {
+            let error = parse_verified(&format!(
+                r#"{{"payload": {{"nested": [{{"number": {token}}}]}}}}"#
+            ))
+            .expect_err("non-finite float must be rejected");
+            assert!(
+                error.to_string().contains("numbers must be integers"),
+                "unexpected message for {token}: {error}"
+            );
+        }
+        // The serde entry point rejects the same token.
+        let error = serde_json::from_str::<VerifiedHolder>(
+            r#"{"inputs": {"payload": {"nested": [{"number": 1e9999}]}}}"#,
+        )
+        .expect_err("deserialize_with must reject non-finite floats");
+        assert!(
+            error.to_string().contains("numbers must be integers"),
+            "unexpected serde message: {error}"
+        );
+    }
+
+    #[test]
+    fn scalar_token_validator_covers_cli_numbers() {
+        validate_input_scalar_token("42").expect("in-range integer must pass");
+        validate_input_scalar_token("1.25").expect("finite float must pass");
+        validate_input_scalar_token("1e100").expect("finite exponent must pass");
+        validate_input_scalar_token(r#""18446744073709551616""#).expect("numeric string must pass");
+        for token in ["18446744073709551616", "-9223372036854775809", "1e9999"] {
+            validate_input_scalar_token(token)
+                .expect_err("out-of-range scalar token must be rejected");
+        }
     }
 }
