@@ -560,7 +560,11 @@ impl HttpProvider {
         let value = self.send_json(payload, model).await?;
         match self.spec.api {
             ApiFlavor::ChatCompletions => parse_chat_completions_response(value),
-            ApiFlavor::Responses => parse_responses_response(value, provider_web_search),
+            ApiFlavor::Responses => parse_responses_response(
+                value,
+                provider_web_search,
+                self.spec.web_search_billing.unwrap_or_default(),
+            ),
             ApiFlavor::AnthropicMessages => parse_anthropic_response(value),
             ApiFlavor::SystemOne => Err(LlmError::new("system_one requires typed decisions")),
         }
@@ -723,7 +727,11 @@ impl HttpProvider {
             },
         );
         let mut stream = SseStream::from_bytes_stream(body);
-        let mut accumulator = HttpStreamAccumulator::new(self.spec.api, provider_web_search)?;
+        let mut accumulator = HttpStreamAccumulator::new(
+            self.spec.api,
+            provider_web_search,
+            self.spec.web_search_billing.unwrap_or_default(),
+        )?;
         // Pre-publication gate for the provider credential (B04): text
         // deltas pass through it, and only prefixes proven free of the
         // credential are released downstream. A metadata-mixed window can

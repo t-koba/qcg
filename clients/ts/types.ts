@@ -2447,7 +2447,7 @@ export interface components {
             cache_write_policy?: components["schemas"]["CacheWritePolicy"] | null;
             /**
              * Format: uint64
-             * @description Total estimated call cost, including any priced hosted-search charge.
+             * @description Estimated priced portion of the call; excludes explicitly unmetered components.
              */
             cost_microusd: number;
             /** Format: uint32 */
@@ -3535,11 +3535,11 @@ export interface components {
             /** @default null */
             source: string | null;
         };
-        /** @description What the provider's hosted web search did in one call, and what it cost. */
+        /** @description What provider-hosted search did for one response and how much was metered. */
         WebSearchUsage: {
             /**
              * Format: uint64
-             * @description Provider-reported calls; null means unknown, never zero.
+             * @description Provider-billable units under the configured mapping; null is unknown, never zero.
              * @default null
              */
             calls: number | null;

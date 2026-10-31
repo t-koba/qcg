@@ -37,7 +37,7 @@ pub struct LlmCallEventData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
     pub tokens: TokenUsageEventData,
-    /// Total estimated call cost, including any priced hosted-search charge.
+    /// Estimated priced portion of the call; excludes explicitly unmetered components.
     pub cost_microusd: u64,
     /// Failed provider attempts, including retries preceding a successful call.
     #[serde(default)]
@@ -67,11 +67,11 @@ pub struct LlmCallEventData {
     pub web_search: Option<WebSearchUsage>,
 }
 
-/// What the provider's hosted web search did in one call, and what it cost.
+/// What provider-hosted search did for one response and how much was metered.
 #[derive(Debug, Clone, Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WebSearchUsage {
-    /// Provider-reported calls; null means unknown, never zero.
+    /// Provider-billable units under the configured mapping; null is unknown, never zero.
     #[serde(default)]
     pub calls: Option<u64>,
     /// Hosted search charge in microusd; null means unmetered, never free.

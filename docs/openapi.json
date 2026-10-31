@@ -1579,7 +1579,7 @@
             "description": "Requested cache write policy when non-default (`forbid` only).\nAbsent means the default `allow`: the request left provider caching\nalone. Present only to make the TTL cost basis inspectable."
           },
           "cost_microusd": {
-            "description": "Total estimated call cost, including any priced hosted-search charge.",
+            "description": "Estimated priced portion of the call; excludes explicitly unmetered components.",
             "format": "uint64",
             "minimum": 0,
             "type": "integer"
@@ -4549,11 +4549,11 @@
       },
       "WebSearchUsage": {
         "additionalProperties": false,
-        "description": "What the provider's hosted web search did in one call, and what it cost.",
+        "description": "What provider-hosted search did for one response and how much was metered.",
         "properties": {
           "calls": {
             "default": null,
-            "description": "Provider-reported calls; null means unknown, never zero.",
+            "description": "Provider-billable units under the configured mapping; null is unknown, never zero.",
             "format": "uint64",
             "minimum": 0,
             "type": [

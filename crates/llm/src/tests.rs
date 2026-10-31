@@ -1036,6 +1036,7 @@ fn parses_responses_text_response() {
             "usage": { "input_tokens": 7, "output_tokens": 2 }
         }),
         false,
+        WebSearchBilling::Unknown,
     )
     .expect("response should parse");
 
@@ -1059,6 +1060,7 @@ fn parses_responses_function_call() {
             "usage": { "input_tokens": 9, "output_tokens": 3 }
         }),
         false,
+        WebSearchBilling::Unknown,
     )
     .expect("response should parse");
 
@@ -1102,6 +1104,7 @@ fn response_parsers_report_reasoning_tokens_as_output_detail() {
             }
         }),
         false,
+        WebSearchBilling::Unknown,
     )
     .expect("Responses API response should parse");
     assert_eq!(responses.usage.output, 11);
@@ -1136,6 +1139,7 @@ fn response_parsers_report_cached_input_tokens() {
             }
         }),
         false,
+        WebSearchBilling::Unknown,
     )
     .expect("Responses API response should parse");
     assert_eq!(responses.usage.input, 100);
@@ -1294,12 +1298,13 @@ async fn responses_stream_treats_incomplete_as_terminal() {
             }],
             "usage": { "input_tokens": 10, "output_tokens": 5 }
         });
-        let direct = parse_responses_response(terminal.clone(), false)
+        let direct = parse_responses_response(terminal.clone(), false, WebSearchBilling::Unknown)
             .expect("direct incomplete should parse");
         assert_eq!(direct.stop, expected);
         let (events, _receiver) = mpsc::channel(4);
-        let mut accumulator = HttpStreamAccumulator::new(ApiFlavor::Responses, false)
-            .expect("responses accumulator should build");
+        let mut accumulator =
+            HttpStreamAccumulator::new(ApiFlavor::Responses, false, WebSearchBilling::Unknown)
+                .expect("responses accumulator should build");
         let streamed = accumulator
             .ingest(
                 json!({ "type": "response.incomplete", "response": terminal }),
@@ -1330,8 +1335,9 @@ async fn responses_stream_rejects_unknown_incomplete_and_missing_terminal() {
     };
     let (events, _receiver) = mpsc::channel(4);
     // Unknown incomplete reasons stay rejected, even on the stream path.
-    let mut accumulator = HttpStreamAccumulator::new(ApiFlavor::Responses, false)
-        .expect("responses accumulator should build");
+    let mut accumulator =
+        HttpStreamAccumulator::new(ApiFlavor::Responses, false, WebSearchBilling::Unknown)
+            .expect("responses accumulator should build");
     assert!(
         accumulator
             .ingest(
@@ -1343,8 +1349,9 @@ async fn responses_stream_rejects_unknown_incomplete_and_missing_terminal() {
         "unknown incomplete reason must fail"
     );
     // A terminal event without its response payload stays rejected.
-    let mut accumulator = HttpStreamAccumulator::new(ApiFlavor::Responses, false)
-        .expect("responses accumulator should build");
+    let mut accumulator =
+        HttpStreamAccumulator::new(ApiFlavor::Responses, false, WebSearchBilling::Unknown)
+            .expect("responses accumulator should build");
     let error = accumulator
         .ingest(json!({ "type": "response.incomplete" }), &events)
         .await
@@ -1355,8 +1362,9 @@ async fn responses_stream_rejects_unknown_incomplete_and_missing_terminal() {
     );
     // Failed events are never terminal: ignored, then finish reports the
     // missing terminal response.
-    let mut accumulator = HttpStreamAccumulator::new(ApiFlavor::Responses, false)
-        .expect("responses accumulator should build");
+    let mut accumulator =
+        HttpStreamAccumulator::new(ApiFlavor::Responses, false, WebSearchBilling::Unknown)
+            .expect("responses accumulator should build");
     assert!(
         accumulator
             .ingest(
@@ -1395,6 +1403,7 @@ fn parses_responses_reasoning_only_incomplete_preserves_usage() {
                 }
             }),
             false,
+            WebSearchBilling::Unknown,
         )
         .expect("reasoning-only exhaustion should parse");
         assert!(response.content.is_empty());
@@ -1419,7 +1428,7 @@ fn parses_responses_reasoning_only_incomplete_preserves_usage() {
         }),
     ] {
         assert!(
-            parse_responses_response(terminal, false).is_err(),
+            parse_responses_response(terminal, false, WebSearchBilling::Unknown).is_err(),
             "contentless responses outside max_output_tokens exhaustion must fail"
         );
     }
@@ -1437,11 +1446,12 @@ async fn responses_stream_preserves_reasoning_only_incomplete_usage() {
             "output_tokens_details": { "reasoning_tokens": 5 }
         }
     });
-    let direct = parse_responses_response(terminal.clone(), false)
+    let direct = parse_responses_response(terminal.clone(), false, WebSearchBilling::Unknown)
         .expect("direct reasoning-only exhaustion should parse");
     let (events, _receiver) = mpsc::channel(4);
-    let mut accumulator = HttpStreamAccumulator::new(ApiFlavor::Responses, false)
-        .expect("responses accumulator should build");
+    let mut accumulator =
+        HttpStreamAccumulator::new(ApiFlavor::Responses, false, WebSearchBilling::Unknown)
+            .expect("responses accumulator should build");
     let streamed = accumulator
         .ingest(
             json!({ "type": "response.incomplete", "response": terminal }),
@@ -1482,6 +1492,7 @@ fn spec_with_base_url(id: &str, base_url: &str) -> ProviderSpec {
         ..Capabilities::default()
     };
     ProviderSpec {
+        web_search_billing: None,
         id: id.into(),
         api: ApiFlavor::ChatCompletions,
         base_url: Some(base_url.into()),
@@ -3088,8 +3099,12 @@ async fn anthropic_context_exhaustion_messages_and_sse_retain_equivalent_partial
             "content":content, "stop_reason":"model_context_window_exceeded", "usage":usage
         }))
         .unwrap();
-        let mut accumulator =
-            HttpStreamAccumulator::new(ApiFlavor::AnthropicMessages, false).unwrap();
+        let mut accumulator = HttpStreamAccumulator::new(
+            ApiFlavor::AnthropicMessages,
+            false,
+            WebSearchBilling::Unknown,
+        )
+        .unwrap();
         let (events, _receiver) = mpsc::channel(16);
         accumulator
             .ingest(
@@ -3167,8 +3182,12 @@ async fn anthropic_context_exhaustion_retains_unfinished_tool_json_but_unknown_s
         "max_tokens",
         "refusal",
     ] {
-        let mut accumulator =
-            HttpStreamAccumulator::new(ApiFlavor::AnthropicMessages, false).unwrap();
+        let mut accumulator = HttpStreamAccumulator::new(
+            ApiFlavor::AnthropicMessages,
+            false,
+            WebSearchBilling::Unknown,
+        )
+        .unwrap();
         let (events, _receiver) = mpsc::channel(8);
         for event in [
             json!({"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}),

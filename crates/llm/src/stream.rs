@@ -1,4 +1,4 @@
-use model::{ProviderSearchEvent, UrlCitation};
+use model::{ProviderSearchAction, ProviderSearchEvent, UrlCitation};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use tokio::sync::mpsc;
@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use crate::parse::{
     is_web_search_call, parse_message_citations, parse_responses_response, parse_web_search_event,
 };
-use crate::provider::ApiFlavor;
+use crate::provider::{ApiFlavor, WebSearchBilling};
 use crate::types::{ChatContent, ChatResponse, ChatStreamEvent, LlmError, StopReason, TokenUsage};
 
 /// Emits one ingest delta without ever blocking. The gate path drains only
@@ -35,7 +35,11 @@ pub(crate) enum HttpStreamAccumulator {
 }
 
 impl HttpStreamAccumulator {
-    pub(crate) fn new(api: ApiFlavor, provider_web_search: bool) -> Result<Self, LlmError> {
+    pub(crate) fn new(
+        api: ApiFlavor,
+        provider_web_search: bool,
+        billing: WebSearchBilling,
+    ) -> Result<Self, LlmError> {
         Ok(match api {
             ApiFlavor::SystemOne => {
                 return Err(LlmError::new("system_one does not support streaming"));
@@ -43,6 +47,7 @@ impl HttpStreamAccumulator {
             ApiFlavor::ChatCompletions => Self::Chat(ChatCompletionAccumulator::default()),
             ApiFlavor::Responses => Self::Responses(ResponsesAccumulator {
                 provider_web_search,
+                billing,
                 ..ResponsesAccumulator::default()
             }),
             ApiFlavor::AnthropicMessages => Self::Anthropic(AnthropicAccumulator::default()),
@@ -233,12 +238,13 @@ fn parse_openai_stop_reason(reason: &str) -> Result<StopReason, LlmError> {
     }
 }
 
-/// The Responses stream accumulator. It keeps the hosted search items the
-/// stream reported so a terminal response without an output array still
-/// yields the same outcome as the direct parse.
+/// Retains streamed hosted-search actions and citations when terminal output is
+/// absent. Only OpenAI billing may derive calls from observed search actions;
+/// other modes need provider usage even when action events are available.
 #[derive(Default)]
 pub(crate) struct ResponsesAccumulator {
     provider_web_search: bool,
+    billing: WebSearchBilling,
     events: Vec<ProviderSearchEvent>,
     citations: Vec<UrlCitation>,
     calls: Option<u64>,
@@ -268,6 +274,9 @@ impl ResponsesAccumulator {
                     .get("type")
                     .and_then(Value::as_str)
                     .unwrap_or("response.completed");
+                let has_output = value
+                    .pointer("/response/output")
+                    .is_some_and(Value::is_array);
                 let response = value
                     .get("response")
                     .cloned()
@@ -275,9 +284,9 @@ impl ResponsesAccumulator {
                         LlmError::invalid_response(format!("{kind} did not include response"))
                     })
                     .and_then(|response| {
-                        parse_responses_response(response, self.provider_web_search)
+                        parse_responses_response(response, self.provider_web_search, self.billing)
                     })?;
-                Ok(Some(self.merge(response)))
+                Ok(Some(self.merge(response, has_output)))
             }
             _ => Ok(None),
         }
@@ -294,8 +303,13 @@ impl ResponsesAccumulator {
             return Ok(());
         };
         if is_web_search_call(item) {
-            self.events.push(parse_web_search_event(item)?);
-            self.calls = Some(self.calls.unwrap_or_default().saturating_add(1));
+            let event = parse_web_search_event(item)?;
+            if self.billing == WebSearchBilling::OpenaiSearchActions
+                && event.action == ProviderSearchAction::Search
+            {
+                self.calls = Some(self.calls.unwrap_or_default().saturating_add(1));
+            }
+            self.events.push(event);
         }
         if item.get("type").and_then(Value::as_str) == Some("message") {
             self.citations.extend(parse_message_citations(item)?);
@@ -305,12 +319,13 @@ impl ResponsesAccumulator {
 
     /// The terminal response is authoritative when it carries the output
     /// array. Without one, the items the stream reported are the outcome.
-    fn merge(&self, mut response: ChatResponse) -> ChatResponse {
+    fn merge(&self, mut response: ChatResponse, has_output: bool) -> ChatResponse {
         if let Some(outcome) = response.web_search.as_mut()
-            && outcome.calls.is_none()
-            && let Some(calls) = self.calls
+            && !has_output
         {
-            outcome.calls = Some(calls);
+            if self.billing == WebSearchBilling::OpenaiSearchActions {
+                outcome.calls = self.calls;
+            }
             outcome.events = self.events.clone();
             outcome.citations = self.citations.clone();
         }

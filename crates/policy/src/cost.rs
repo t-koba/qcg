@@ -10,8 +10,8 @@
 pub struct LlmCostBudget {
     pub max_tokens: Option<u64>,
     pub max_cost_microusd: Option<u64>,
-    /// True when a cost budget exists, so unpriced models fail instead of
-    /// billing zero.
+    /// True when a cost budget exists, so unpriced models and requested
+    /// hosted searches with unknown usage fail instead of billing zero.
     pub require_pricing: bool,
 }
 
@@ -24,7 +24,7 @@ pub struct PricingRow<'a> {
     pub cache_creation_input_cost_per_million_usd: Option<f64>,
     pub cache_read_input_cost_per_million_usd: Option<f64>,
     pub output_cost_per_million_usd: Option<f64>,
-    /// Hosted web search USD per call. Absent means unmetered, not free.
+    /// Hosted web search USD per provider-billable unit. Absent means unmetered, not free.
     pub web_search_call_cost_usd: Option<f64>,
 }
 

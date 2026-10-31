@@ -306,11 +306,17 @@ impl<'a> LlmGateway<'a> {
     }
 
     fn try_reserve(&self, reservation: Option<PendingReservation>) -> Result<(), StepError> {
+        let state = self.journal.state();
+        if self.budget.require_pricing && state.budget.unresolved_search_cost {
+            return Err(StepError::failed(
+                "budget",
+                "run has unresolved hosted search cost; refusing blind spend",
+            ));
+        }
         let Some(reservation) = reservation else {
             return Ok(());
         };
         let run_id = run_id_of(self.journal);
-        let state = self.journal.state();
         let spent_tokens = state
             .budget
             .tokens_input
@@ -421,8 +427,16 @@ impl<'a> LlmGateway<'a> {
             self.scan_response(node, &response)?;
         }
         let usage = response.usage.clone();
-        let web_search = response.web_search.clone();
+        // A requested search remains visible even if the provider omitted usage.
+        let web_search = response.web_search.clone().or_else(|| {
+            request
+                .provider_web_search
+                .as_ref()
+                .map(|_| Default::default())
+        });
         let web_search_calls = web_search.as_ref().and_then(|outcome| outcome.calls);
+        let search_cost =
+            self.web_search_cost_microusd(routes, &provider_id, &model_id, web_search_calls);
         let cost_microusd = self.cost_microusd(
             node,
             routes,
@@ -460,17 +474,12 @@ impl<'a> LlmGateway<'a> {
         if request.cache_retention == Some(llm::CacheRetention::Extended) {
             event["cache_retention"] = json!("extended");
         }
-        // The hosted search is reported with its own count and charge: an
-        // unpriced search is unmetered, never free.
+        // Hosted-search usage carries a provider-specific count and charge;
+        // unknown or unpriced usage remains unmetered, never free.
         if let Some(outcome) = &web_search {
             event["web_search"] = json!({
                 "calls": outcome.calls,
-                "cost_microusd": self.web_search_cost_microusd(
-                    routes,
-                    &provider_id,
-                    &model_id,
-                    outcome.calls,
-                ),
+                "cost_microusd": search_cost,
                 "events": outcome.events,
                 "citations": outcome.citations,
             });
@@ -478,6 +487,18 @@ impl<'a> LlmGateway<'a> {
         merge_event_extra(&mut event, event_extra(&response.usage));
         event["retry_decisions"] = json!(retry_decisions);
         self.journal.event("llm_call", event).step_err(&node.id)?;
+        if self.budget.require_pricing && web_search.is_some() && search_cost.is_none() {
+            let detail = match web_search_calls {
+                None => "unknown billable hosted search usage",
+                Some(_) => {
+                    "billable hosted search units without a `web_search_call_cost_usd` price"
+                }
+            };
+            return Err(StepError::failed(
+                &node.id,
+                format!("model `{provider_id}/{model_id}` has {detail} for the run cost budget"),
+            ));
+        }
         self.check_budget()?;
         if response.stop == llm::StopReason::ModelContextWindowExceeded {
             return Err(StepError::ProviderContextExhausted {

@@ -30,12 +30,17 @@ fn searched_response() -> Value {
             {
                 "id": "ws_1",
                 "type": "web_search_call",
-                "action": { "type": "search", "query": "qcg" }
+                "action": { "type": "search", "queries": ["qcg", "bounded generation"] }
             },
             {
                 "id": "ws_2",
                 "type": "web_search_call",
                 "action": { "type": "open_page", "url": "https://example.com/a" }
+            },
+            {
+                "id": "ws_3",
+                "type": "web_search_call",
+                "action": { "type": "find_in_page", "url": "https://example.com/a", "pattern": "qcg" }
             },
             {
                 "type": "message",
@@ -105,15 +110,24 @@ fn hosted_search_keeps_the_function_tools_and_the_call_bound() {
 
 #[test]
 fn parses_hosted_search_calls_and_citations() {
-    let response = parse_responses_response(searched_response(), true)
-        .expect("the searched response should parse");
+    let response = parse_responses_response(
+        searched_response(),
+        true,
+        WebSearchBilling::OpenaiSearchActions,
+    )
+    .expect("the searched response should parse");
     let outcome = response
         .web_search
         .expect("the hosted search outcome should be reported");
-    assert_eq!(outcome.events.len(), 2);
+    assert_eq!(outcome.calls, Some(1));
+    assert_eq!(outcome.events.len(), 3);
+    assert_eq!(outcome.events[2].action, ProviderSearchAction::FindInPage);
     assert_eq!(outcome.events[0].action, ProviderSearchAction::Search);
     assert_eq!(outcome.events[0].id.as_deref(), Some("ws_1"));
-    assert_eq!(outcome.events[0].queries, vec!["qcg".to_string()]);
+    assert_eq!(
+        outcome.events[0].queries,
+        vec!["qcg".to_string(), "bounded generation".to_string()]
+    );
     assert_eq!(outcome.events[1].action, ProviderSearchAction::OpenPage);
     assert_eq!(
         outcome.events[1].url.as_deref(),
@@ -127,7 +141,7 @@ fn parses_hosted_search_calls_and_citations() {
 }
 
 #[test]
-fn hosted_search_count_is_derived_from_the_output_items() {
+fn openai_search_count_is_zero_with_no_search_actions() {
     let response = parse_responses_response(
         json!({
             "status": "completed",
@@ -138,6 +152,7 @@ fn hosted_search_count_is_derived_from_the_output_items() {
             "usage": { "input_tokens": 4, "output_tokens": 1 }
         }),
         true,
+        WebSearchBilling::OpenaiSearchActions,
     )
     .expect("the response should parse");
     assert_eq!(
@@ -159,6 +174,7 @@ fn hosted_search_count_is_unknown_without_an_output_array() {
             "usage": { "input_tokens": 4, "output_tokens": 1 }
         }),
         true,
+        WebSearchBilling::OpenaiSearchActions,
     )
     .expect("the response should parse");
     assert_eq!(
@@ -173,8 +189,12 @@ fn hosted_search_count_is_unknown_without_an_output_array() {
 
 #[test]
 fn hosted_search_is_absent_when_the_request_did_not_ask_for_it() {
-    let response =
-        parse_responses_response(searched_response(), false).expect("the response should parse");
+    let response = parse_responses_response(
+        searched_response(),
+        false,
+        WebSearchBilling::OpenaiSearchActions,
+    )
+    .expect("the response should parse");
     assert!(
         response.web_search.is_none(),
         "a request without the opt-in reports no hosted search"
@@ -183,8 +203,12 @@ fn hosted_search_is_absent_when_the_request_did_not_ask_for_it() {
 
 #[test]
 fn hosted_search_carries_provider_state_for_the_replay() {
-    let response = parse_responses_response(searched_response(), true)
-        .expect("the searched response should parse");
+    let response = parse_responses_response(
+        searched_response(),
+        true,
+        WebSearchBilling::OpenaiSearchActions,
+    )
+    .expect("the searched response should parse");
     let state = response
         .provider_state
         .expect("the hosted call must be replayed with the next request");
@@ -200,6 +224,7 @@ fn hosted_search_carries_provider_state_for_the_replay() {
             "usage": { "input_tokens": 4, "output_tokens": 1 }
         }),
         true,
+        WebSearchBilling::OpenaiSearchActions,
     )
     .expect("the response should parse");
     assert!(
@@ -211,8 +236,12 @@ fn hosted_search_carries_provider_state_for_the_replay() {
 #[tokio::test]
 async fn hosted_search_stream_outcome_matches_the_direct_parse() {
     let (events, _receiver) = mpsc::channel(8);
-    let mut accumulator = HttpStreamAccumulator::new(ApiFlavor::Responses, true)
-        .expect("the Responses accumulator should build");
+    let mut accumulator = HttpStreamAccumulator::new(
+        ApiFlavor::Responses,
+        true,
+        WebSearchBilling::OpenaiSearchActions,
+    )
+    .expect("the Responses accumulator should build");
     let streamed = accumulator
         .ingest(
             json!({ "type": "response.completed", "response": searched_response() }),
@@ -221,16 +250,24 @@ async fn hosted_search_stream_outcome_matches_the_direct_parse() {
         .await
         .expect("the stream should ingest")
         .expect("the stream should end with a response");
-    let direct = parse_responses_response(searched_response(), true)
-        .expect("the searched response should parse");
+    let direct = parse_responses_response(
+        searched_response(),
+        true,
+        WebSearchBilling::OpenaiSearchActions,
+    )
+    .expect("the searched response should parse");
     assert_eq!(streamed.web_search, direct.web_search);
 }
 
 #[tokio::test]
-async fn hosted_search_stream_counts_the_reported_output_items() {
+async fn openai_search_stream_falls_back_to_observed_search_actions() {
     let (events, _receiver) = mpsc::channel(8);
-    let mut accumulator = HttpStreamAccumulator::new(ApiFlavor::Responses, true)
-        .expect("the Responses accumulator should build");
+    let mut accumulator = HttpStreamAccumulator::new(
+        ApiFlavor::Responses,
+        true,
+        WebSearchBilling::OpenaiSearchActions,
+    )
+    .expect("the Responses accumulator should build");
     accumulator
         .ingest(
             json!({
@@ -349,7 +386,254 @@ fn a_malformed_hosted_call_is_an_error_not_a_panic() {
             "usage": { "input_tokens": 4, "output_tokens": 1 }
         }),
         true,
+        WebSearchBilling::OpenaiSearchActions,
     )
     .expect_err("an unknown action must be refused");
     assert!(error.message.contains("unknown action"), "{error}");
+}
+
+async fn stream_search_response(
+    terminal: Value,
+    billing: WebSearchBilling,
+    items: Vec<Value>,
+) -> ChatResponse {
+    let (events, _receiver) = mpsc::channel(8);
+    let mut accumulator = HttpStreamAccumulator::new(ApiFlavor::Responses, true, billing).unwrap();
+    for item in items {
+        assert!(
+            accumulator
+                .ingest(
+                    json!({
+                        "type": "response.output_item.done", "item": item
+                    }),
+                    &events
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    accumulator
+        .ingest(
+            json!({
+                "type": "response.completed", "response": terminal
+            }),
+            &events,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn hosted_search_billing_modes_preserve_events_and_citations() {
+    use WebSearchBilling::*;
+    let expected = parse_responses_response(searched_response(), true, OpenaiSearchActions)
+        .unwrap()
+        .web_search
+        .unwrap();
+    for (billing, usage, calls) in [
+        (
+            OpenaiSearchActions,
+            json!({"web_search": {"num_requests": 7}}),
+            Some(1),
+        ),
+        (Unknown, json!({"web_search": {"num_requests": 7}}), None),
+        (
+            AzureNumRequests,
+            json!({"web_search": {"num_requests": 7}}),
+            Some(7),
+        ),
+        (
+            AzureNumRequests,
+            json!({"web_search": {"num_requests": 0}}),
+            Some(0),
+        ),
+        (AzureNumRequests, Value::Null, None),
+        (AzureNumRequests, json!({"web_search": {}}), None),
+        (
+            AzureNumRequests,
+            json!({"web_search": {"num_requests": null}}),
+            None,
+        ),
+        (
+            AzureNumRequests,
+            json!({"web_search": {"num_requests": -1}}),
+            None,
+        ),
+        (
+            AzureNumRequests,
+            json!({"web_search": {"num_requests": 1.5}}),
+            None,
+        ),
+        (
+            AzureNumRequests,
+            json!({"web_search": {"num_requests": 1.0}}),
+            None,
+        ),
+        (
+            AzureNumRequests,
+            json!({"web_search": {"num_requests": "7"}}),
+            None,
+        ),
+        (
+            AzureNumRequests,
+            json!({"web_search": {"num_requests": true}}),
+            None,
+        ),
+    ] {
+        let mut terminal = searched_response();
+        terminal["tool_usage"] = usage;
+        let items = terminal["output"].as_array().unwrap().clone();
+        let direct = parse_responses_response(terminal.clone(), true, billing).unwrap();
+        let outcome = direct.web_search.as_ref().unwrap();
+        assert_eq!(outcome.calls, calls, "{billing:?}: {terminal}");
+        assert_eq!(outcome.events, expected.events);
+        assert_eq!(outcome.citations, expected.citations);
+        // The full terminal output is authoritative, not added to streamed items.
+        let streamed = stream_search_response(terminal.clone(), billing, items.clone()).await;
+        assert_eq!(streamed.web_search, direct.web_search);
+        // Usage remains authoritative even without terminal output. Actions/citations
+        // survive independently of whether a billable count could be determined.
+        terminal.as_object_mut().unwrap().remove("output");
+        terminal["output_text"] = json!("answer");
+        let direct = parse_responses_response(terminal.clone(), true, billing).unwrap();
+        assert_eq!(
+            direct.web_search.unwrap().calls,
+            if billing == OpenaiSearchActions {
+                None
+            } else {
+                calls
+            }
+        );
+        let streamed = stream_search_response(terminal, billing, items).await;
+        let outcome = streamed.web_search.unwrap();
+        assert_eq!(outcome.calls, calls, "{billing:?}");
+        assert_eq!(outcome.events, expected.events);
+        assert_eq!(outcome.citations, expected.citations);
+    }
+}
+
+#[tokio::test]
+async fn hosted_search_terminal_output_controls_stream_fallback() {
+    use WebSearchBilling::*;
+    let fixture = searched_response();
+    let items = fixture["output"].as_array().unwrap().clone();
+    let mut terminal = fixture.clone();
+    terminal["output"] = json!([items.last().unwrap()]); // No search action.
+    for billing in [OpenaiSearchActions, AzureNumRequests, Unknown] {
+        let direct = parse_responses_response(terminal.clone(), true, billing).unwrap();
+        let streamed = stream_search_response(terminal.clone(), billing, items.clone()).await;
+        assert_eq!(streamed.web_search, direct.web_search);
+        assert!(streamed.web_search.unwrap().events.is_empty());
+    }
+    terminal.as_object_mut().unwrap().remove("output");
+    terminal["output_text"] = json!("answer");
+    for billing in [OpenaiSearchActions, AzureNumRequests, Unknown] {
+        // Citation-only and completely absent stream output must not lose citations
+        // or manufacture a zero count from the absence of search actions.
+        for items in [vec![items.last().unwrap().clone()], vec![]] {
+            let expected_citations = usize::from(!items.is_empty());
+            let outcome = stream_search_response(terminal.clone(), billing, items)
+                .await
+                .web_search
+                .unwrap();
+            assert_eq!(outcome.calls, None);
+            assert!(outcome.events.is_empty());
+            assert_eq!(outcome.citations.len(), expected_citations);
+        }
+    }
+}
+
+#[test]
+fn hosted_search_billing_config_is_explicit_and_responses_only() {
+    for id in ["openai_responses", "azure-openai", "arbitrary-id"] {
+        let row = test_provider_row(id, "responses", "https://api.openai.com/v1", "");
+        let file = ProvidersFile::parse(&row).unwrap();
+        assert_eq!(file.provider[0].web_search_billing, None);
+    }
+    for (name, mode) in [
+        ("unknown", WebSearchBilling::Unknown),
+        (
+            "openai_search_actions",
+            WebSearchBilling::OpenaiSearchActions,
+        ),
+        ("azure_num_requests", WebSearchBilling::AzureNumRequests),
+    ] {
+        for api in [
+            "responses",
+            "chat_completions",
+            "anthropic_messages",
+            "system_one",
+        ] {
+            let row = test_provider_row(
+                "arbitrary-id",
+                api,
+                "https://example.invalid",
+                &format!("web_search_billing = \"{name}\"\n"),
+            );
+            if api == "responses" {
+                let file = ProvidersFile::parse(&row).unwrap();
+                assert_eq!(file.provider[0].web_search_billing, Some(mode));
+            } else {
+                let error = ProvidersFile::parse(&row).unwrap_err();
+                assert!(error.to_string().contains("web_search_billing"), "{error}");
+            }
+        }
+    }
+    assert!(
+        ProvidersFile::parse(&test_provider_row(
+            "p",
+            "responses",
+            "https://example.invalid",
+            "web_search_billing = \"guess\"\n"
+        ))
+        .is_err()
+    );
+}
+
+#[test]
+fn bundled_responses_profiles_declare_their_search_billing_units() {
+    let bundled = include_str!("../../../../providers.toml");
+    for (id, mode) in [
+        ("openai_responses", WebSearchBilling::OpenaiSearchActions),
+        ("azure-openai", WebSearchBilling::AzureNumRequests),
+    ] {
+        let start = bundled
+            .find(&format!("# [[provider]]\n# id = \"{id}\""))
+            .unwrap();
+        let text = bundled[start..]
+            .split("\n\n")
+            .next()
+            .unwrap()
+            .lines()
+            .map(|line| line.strip_prefix("# ").unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let file = ProvidersFile::parse(&text).unwrap();
+        assert_eq!(file.provider[0].web_search_billing, Some(mode));
+    }
+}
+
+#[tokio::test]
+async fn openai_search_count_uses_normalized_actions() {
+    let mut terminal = searched_response();
+    terminal["output"][0]["action"] = json!("search");
+    terminal["output"][0]["query"] = json!("qcg");
+    let direct = parse_responses_response(
+        terminal.clone(),
+        true,
+        WebSearchBilling::OpenaiSearchActions,
+    )
+    .unwrap()
+    .web_search
+    .unwrap();
+    assert_eq!(direct.calls, Some(1));
+    assert_eq!(direct.events[0].queries, vec!["qcg"]);
+    let items = terminal["output"].as_array().unwrap().clone();
+    terminal.as_object_mut().unwrap().remove("output");
+    terminal["output_text"] = json!("answer");
+    let streamed =
+        stream_search_response(terminal, WebSearchBilling::OpenaiSearchActions, items).await;
+    assert_eq!(streamed.web_search.unwrap(), direct);
 }

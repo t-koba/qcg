@@ -153,6 +153,10 @@ Fields:
 - `chat_token_limit_field`: Chat Completions output-limit field. It defaults
   to `max_tokens`; use `max_completion_tokens` for current OpenAI and Azure
   reasoning endpoints. It is rejected for other API flavors.
+- `web_search_billing`: Responses-only hosted-search billable-unit mapping:
+  `unknown` (the default), `openai_search_actions`, or `azure_num_requests`.
+  Select it explicitly for the provider's billing semantics; qcg never guesses
+  from the provider id or endpoint URL. See [provider-native web search](#provider-native-web-search).
 - `stream_retry_attempts`: retry attempts for a stream that fails before
   delivering any event (default `0`, range `0..=3`). A retry is refused once
   any event was delivered, so two model responses can never interleave.
@@ -1120,7 +1124,9 @@ Notes:
 - Azure OpenAI uses deployment names as the model value. The recommended
   `azure-openai` row uses the current Responses API and expects
   `AZURE_OPENAI_BASE_URL` to include `/openai/v1`. It does not use an
-  `api-version` query.
+  `api-version` query. For hosted search, advertise `web_search = true` only
+  on supported models and select `web_search_billing = "azure_num_requests"`
+  (already selected in the commented profile).
   Cloudflare resolves `{CLOUDFLARE_ACCOUNT_ID}` inside its base URL. Rows
   fail validation while required placeholders remain unresolved.
 - The `tinyfish-api` REST search profile requires `TINYFISH_API_KEY` in the qcg
@@ -1467,19 +1473,41 @@ is the provider's, not the generator's, and the contract's network
 permission allowlist does not govern it. qcg sends no request to the
 searched hosts.
 
-Usage and cost: the provider does not report how many hosted calls it made
-in its usage object. qcg derives the count from the `web_search_call` output
-items of the response and records it in the `llm_call.web_search` payload,
-together with the search actions and attached URL citations. No output items
-leaves the count unknown, never zero. OpenAI's public Responses pricing lists
-`web_search` at $10 per 1,000 calls ($0.01/call), with search-content tokens
-billed at model input rates. For that rate, set
-`web_search_call_cost_usd = 0.01` on the selected model's contract pricing
-row; configure token rates separately. qcg does not infer the hosted-search
-price: a missing price is recorded as unmetered, never free, and a run whose
-cost budget requires pricing refuses a reported positive search count without
-a price. Verify the effective rate against the
-[OpenAI API pricing](https://developers.openai.com/api/docs/pricing).
+Usage and cost: `llm_call.web_search.calls` counts provider-billable units,
+not every `web_search_call` output item. The provider row's Responses-only
+`web_search_billing` setting selects the mapping:
+
+| Setting | Billable count |
+|---|---|
+| `unknown` (default) | Unknown, even if output items or usage are present |
+| `openai_search_actions` | Number of `search` actions in the output array; `open_page` and `find_in_page` are not billed calls |
+| `azure_num_requests` | Provider-reported nonnegative integer `tool_usage.web_search.num_requests` (Bing requests); absent or invalid values remain unknown |
+
+The shipped `openai_responses` profile selects `openai_search_actions`;
+`azure-openai` selects `azure_num_requests`. Other compatible endpoints must
+select their supported mapping explicitly; the id and URL do not choose it.
+For OpenAI mode, an output array with no search actions reports zero; no
+output array leaves the count unknown. In streaming, only OpenAI mode may
+fall back to observed finished search actions when the terminal response
+omits output. Azure and unknown modes never infer usage from streamed items.
+All modes retain the full action events and URL citations independently of
+the billable count, including streamed items when terminal output is absent.
+A null count is unknown, never zero.
+
+OpenAI's public Responses pricing lists `web_search` at $10 per 1,000 calls
+($0.01 per billable search action), with search-content tokens billed at model
+input rates. For that rate, set `web_search_call_cost_usd = 0.01` on the selected
+model's contract pricing row; configure token rates separately. For Azure,
+price the reported Bing request unit at the applicable Azure rate, not an
+OpenAI action rate. qcg does not infer hosted-search prices: unknown usage or
+a missing price for positive billable usage remains unmetered, never free.
+A run whose cost budget requires pricing refuses requested-but-unknown search
+usage and known positive counts without a price; no request and known zero are
+distinct. Totals are estimates, not invoices. Verify effective
+rates and usage semantics against
+[OpenAI web search](https://developers.openai.com/api/docs/guides/tools-web-search),
+[OpenAI API pricing](https://developers.openai.com/api/docs/pricing), and
+[Azure OpenAI web search](https://learn.microsoft.com/en-us/azure/ai-foundry/openai/how-to/web-search).
 
 ### Anthropic context-window terminal
 

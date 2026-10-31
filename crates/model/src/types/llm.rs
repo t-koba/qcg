@@ -98,8 +98,8 @@ impl fmt::Display for ReasoningEffort {
 
 /// The provider's own hosted web search. It is a separate mechanism from the
 /// local `web.search` tool, from MCP tools and from the external search
-/// adapter: the provider performs the fetch, bills it per call, and the
-/// network egress happens on the provider's side.
+/// adapter: usage follows the configured provider-billing unit, and the
+/// fetch and its network egress happen on the provider's side.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProviderWebSearch {
@@ -187,9 +187,9 @@ pub struct UrlCitation {
     pub end_index: Option<u64>,
 }
 
-/// What one response did with the provider's hosted search. `calls` is the
-/// number of hosted calls the provider reported; `None` means the provider
-/// did not report it, which is unknown and never zero.
+/// What one response did with hosted search. `calls` counts provider-billable units,
+/// mapped by the configured billing mode, not action events. `None` means unknown,
+/// never zero; events and citations remain available independently of metering.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProviderWebSearchOutcome {

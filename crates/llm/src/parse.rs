@@ -1,3 +1,4 @@
+use crate::provider::WebSearchBilling;
 use model::{ProviderSearchAction, ProviderSearchEvent, ProviderWebSearchOutcome, UrlCitation};
 use serde_json::{Value, json};
 
@@ -104,6 +105,7 @@ fn parse_openai_tool_call(call: &Value) -> Result<ChatContent, LlmError> {
 pub(crate) fn parse_responses_response(
     value: Value,
     provider_web_search: bool,
+    billing: WebSearchBilling,
 ) -> Result<ChatResponse, LlmError> {
     let mut content = Vec::new();
     let output_items = value.get("output").and_then(Value::as_array);
@@ -219,7 +221,7 @@ pub(crate) fn parse_responses_response(
     let provider_state = (matches!(stop, StopReason::ToolUse) || hosted_call)
         .then(|| value.get("output").cloned())
         .flatten();
-    let web_search = provider_web_search_outcome(&value, provider_web_search)?;
+    let web_search = provider_web_search_outcome(&value, provider_web_search, billing)?;
     Ok(ChatResponse {
         content,
         usage,
@@ -259,29 +261,18 @@ pub(crate) fn parse_message_citations(item: &Value) -> Result<Vec<UrlCitation>, 
     Ok(citations)
 }
 
-/// Reads what the provider's hosted search did. The count is derived from
-/// the reported `web_search_call` items: a response without an output array
-/// did not report the count, which is unknown and never zero.
+/// Keep all actions/citations, but meter only the configured provider's billable units.
 fn provider_web_search_outcome(
     value: &Value,
     provider_web_search: bool,
+    billing: WebSearchBilling,
 ) -> Result<Option<ProviderWebSearchOutcome>, LlmError> {
     if !provider_web_search {
         return Ok(None);
     }
-    let Some(output) = value.get("output").and_then(Value::as_array) else {
-        return Ok(Some(ProviderWebSearchOutcome::default()));
-    };
-    let mut outcome = ProviderWebSearchOutcome {
-        calls: Some(
-            output
-                .iter()
-                .filter(|item| is_web_search_call(item))
-                .count() as u64,
-        ),
-        ..ProviderWebSearchOutcome::default()
-    };
-    for item in output {
+    let output = value.get("output").and_then(Value::as_array);
+    let mut outcome = ProviderWebSearchOutcome::default();
+    for item in output.into_iter().flatten() {
         if is_web_search_call(item) {
             outcome.events.push(parse_web_search_event(item)?);
         }
@@ -289,6 +280,19 @@ fn provider_web_search_outcome(
             outcome.citations.extend(parse_message_citations(item)?);
         }
     }
+    outcome.calls = match billing {
+        WebSearchBilling::Unknown => None,
+        WebSearchBilling::OpenaiSearchActions => output.map(|_| {
+            outcome
+                .events
+                .iter()
+                .filter(|event| event.action == ProviderSearchAction::Search)
+                .count() as u64
+        }),
+        WebSearchBilling::AzureNumRequests => value
+            .pointer("/tool_usage/web_search/num_requests")
+            .and_then(Value::as_u64),
+    };
     Ok(Some(outcome))
 }
 

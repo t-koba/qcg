@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const RUN_STATE_SCHEMA_VERSION: u32 = 8;
+pub const RUN_STATE_SCHEMA_VERSION: u32 = 9;
 
 fn is_known_journal_event_kind(kind: &str) -> bool {
     api::is_known_run_event_kind(kind) || api::INTERNAL_RUN_EVENT_KINDS.contains(&kind)
@@ -95,6 +95,9 @@ pub struct BudgetState {
     #[serde(default)]
     pub tokens_cache_creation_input: u64,
     pub cost_microusd: u64,
+    /// At least one completed hosted search has an unknown/unpriced charge.
+    #[serde(default)]
+    pub unresolved_search_cost: bool,
     #[serde(deserialize_with = "required_presence")]
     pub started_at: Option<String>,
 }
@@ -669,6 +672,15 @@ impl RunState {
                 self.budget.has_budget_charges = true;
             }
             "llm_call" => {
+                self.budget.unresolved_search_cost |= event
+                    .get("web_search")
+                    .filter(|search| search.is_object())
+                    .is_some_and(|search| {
+                        search
+                            .get("cost_microusd")
+                            .and_then(Value::as_u64)
+                            .is_none()
+                    });
                 self.budget.llm_calls = self.budget.llm_calls.checked_add(1).ok_or_else(|| {
                     crate::JournalError::InvalidEvent("LLM call count overflowed".into())
                 })?;

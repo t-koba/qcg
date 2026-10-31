@@ -198,8 +198,8 @@ pub struct ModelRef {
     pub cache_read_input_cost_per_million_usd: Option<f64>,
     #[serde(default)]
     pub output_cost_per_million_usd: Option<f64>,
-    /// Hosted web search USD per call. Absent means the search charge is
-    /// unmetered, never free.
+    /// Hosted web search USD per provider-billable unit. Absent means the
+    /// search charge is unmetered, never free.
     #[serde(default)]
     pub web_search_call_cost_usd: Option<f64>,
     /// Context tiers: the rates that apply to a whole request once its

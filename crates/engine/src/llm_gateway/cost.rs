@@ -49,9 +49,9 @@ impl<'a> LlmGateway<'a> {
         entries.get(index).copied()
     }
 
-    /// The hosted search charge of one response, in microusd. `None` means
-    /// the run does not price the search: the charge is unmetered, never
-    /// free.
+    /// The hosted-search charge of one response, in microusd. `None` means
+    /// its count or a positive count's price is unknown; a known zero count
+    /// has a known zero charge.
     pub(crate) fn web_search_cost_microusd(
         &self,
         routes: &[ModelRef],
@@ -59,7 +59,10 @@ impl<'a> LlmGateway<'a> {
         model: &str,
         calls: Option<u64>,
     ) -> Option<u64> {
-        let calls = calls.filter(|calls| *calls > 0)?;
+        let calls = calls?;
+        if calls == 0 {
+            return Some(0);
+        }
         let price = self
             .selected_route(routes, provider, model)
             .and_then(|route| route.web_search_call_cost_usd)?;
@@ -128,27 +131,16 @@ impl<'a> LlmGateway<'a> {
             + usage.cached_input as f64 * read
             + usage.cache_creation_input as f64 * creation
             + usage.output as f64 * output;
-        // The provider bills its hosted search per call. The count comes
-        // from the response, and a run that requires pricing refuses a
-        // reported call it cannot price.
-        if let Some(calls) = web_search_calls.filter(|calls| *calls > 0) {
-            match route.web_search_call_cost_usd {
-                Some(price) => {
-                    if !price.is_finite() || price < 0.0 {
-                        return Err(StepError::failed(&node.id, "invalid model pricing"));
-                    }
-                    microusd += calls as f64 * price * 1_000_000.0;
-                }
-                None if self.budget.require_pricing => {
-                    return Err(StepError::failed(
-                        &node.id,
-                        format!(
-                            "model `{provider}/{model}` reports {calls} hosted web search call(s) without a `web_search_call_cost_usd` price for the run cost budget"
-                        ),
-                    ));
-                }
-                None => {}
+        // The count is provider-specific and contains only billable units.
+        // Unpriced search stays out of this priced portion. The completion
+        // path journals it explicitly as null before enforcing required pricing.
+        if let Some(calls) = web_search_calls.filter(|calls| *calls > 0)
+            && let Some(price) = route.web_search_call_cost_usd
+        {
+            if !price.is_finite() || price < 0.0 {
+                return Err(StepError::failed(&node.id, "invalid model pricing"));
             }
+            microusd += calls as f64 * price * 1_000_000.0;
         }
         Ok(microusd.round().clamp(0.0, u64::MAX as f64) as u64)
     }

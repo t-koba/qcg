@@ -84,8 +84,14 @@ Fields:
   an Extended TTL derives the creation price from ordinary input, so that
   derived price satisfies the requirement. Before dispatch, even without a cost
   cap or known cache usage, required pricing checks resolved cache reads and
-  creation in every reachable base/tier row. A configured Extended TTL may
-  derive creation pricing instead, but then ordinary input pricing must exist
+  creation in every reachable base/tier row. A requested provider-hosted search
+  with an unknown billable count or positive units without a rate fails after
+  journaling known tokens, priced cost, and available search events/citations
+  with a null search charge. `cost_microusd` then covers only priced components.
+  The run budget persists/replays an unresolved-search-cost marker; required
+  pricing refuses subsequent provider requests, even without a cost cap.
+  No request and known zero usage are distinct and do not set that marker. A configured
+  Extended TTL may derive creation pricing instead, but then ordinary input pricing must exist
   in every row. A maximum across tiers cannot fill an unpriced row. With `require_pricing: false`, missing
   cache prices still contribute zero. Budgets are estimates, not invoices.
   No provider-specific discounts or separate TTL rate schedules are inferred; extended writes use the configured input-rate multiplier.
@@ -645,10 +651,15 @@ provider_web_search = { search_context_size = "medium", allowed_domains = ["exam
   and 1 at least. It does not limit local function-tool calls.
 
 The search runs at the provider, so it is not a local HTTP tool and the
-contract's network permissions do not govern it. The provider bills the
-calls apart from the tokens, so a run that wants the charge metered prices
-it with `web_search_call_cost_usd` on the model's pricing row. See the
-[provider guide](llm-provider-guide.md#provider-native-web-search) for the
+contract's network permissions do not govern it. The provider bills
+hosted-search usage separately from tokens, so a run that wants it metered
+prices each provider-billable unit with
+`web_search_call_cost_usd` on the model's pricing row. This price is
+per provider-billable unit, not per action event: OpenAI mode counts `search`
+actions only; Azure mode uses the reported Bing request count. The provider
+row must select the appropriate `web_search_billing` mapping. Unknown usage
+remains null and unmetered, never an inferred zero or an output-item charge.
+See the [provider guide](llm-provider-guide.md#provider-native-web-search) for the
 capability matrix and the usage semantics.
 
 ### Expressions

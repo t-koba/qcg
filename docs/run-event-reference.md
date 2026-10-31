@@ -269,17 +269,36 @@ microUSD = ordinary_input * input_cost_per_million_usd
          + web_search.calls * web_search_call_cost_usd * 1_000_000
 ```
 
-The final term applies when a positive hosted-search call count and per-call
-price are both known. If no search was requested, omit the term; if the count
-is unknown or no price is configured, the search remains unmetered, never
-free. A run requiring pricing refuses a reported positive count without a
-price.
+A known zero count contributes zero. For a positive count, the final term
+applies when its per-unit price is known. When pricing is optional, an unknown
+count or positive count without a configured price remains unmetered, never
+free. With required pricing, a requested search with unknown units or a known
+positive count without a price fails the call **after** journaling its known token
+usage, priced cost, and available search events/citations. The search charge is
+explicitly null. `llm_call.cost_microusd` is the priced portion, not a complete
+estimate when a component is explicitly unmetered. No request and known zero
+are distinct and do not create an unresolved charge.
 
-When provider-hosted search was requested, `llm_call.web_search` carries
+The run budget persists `unresolved_search_cost` when any completed call has an
+unknown/unpriced search charge; journal replay restores it. Required-pricing
+reservations refuse further provider requests while that marker is set, even
+without a token/cost cap or when the next request disables search. Supplying a
+rate later does not settle unknown historical charges.
+
+A completed call that requested provider-hosted search has
+`llm_call.web_search` with
 `calls`, `cost_microusd`, `events`, and `citations`. A null call count means
 unknown, never zero; a null search `cost_microusd` means unmetered, never free.
-The search cost field is the hosted-search component of the total
-`llm_call.cost_microusd` shown above.
+The search cost field is the hosted-search component of the priced portion
+`llm_call.cost_microusd` shown above. `calls` is the provider-billable unit count
+selected by the provider row's `web_search_billing`: OpenAI counts `search`
+actions (not `open_page`/`find_in_page`); Azure reads the nonnegative integer
+`tool_usage.web_search.num_requests`. Missing/invalid Azure usage and the
+default `unknown` mapping leave `calls` null, never guessed from output items.
+Events and citations remain complete independently of billing. If a streamed
+terminal response omits output, its usage still controls Azure billing; only
+OpenAI mode may fall back to observed search actions. All modes retain the
+streamed events and citations in that case.
 
 Rates are USD per 1M tokens. On the base row, each omitted cache rate falls
 back to that row's ordinary input rate; explicit zero is honored. A tier row
@@ -287,7 +306,10 @@ inherits the base row's cache rate instead (see below). `require_pricing`
 requires ordinary input/output rates and resolved cache rates for any nonzero
 cache usage. Before dispatch, even without a cost cap, required pricing
 checks cache-read and cache-creation completeness in every reachable base/tier
-row. A configured Extended TTL may derive creation pricing from ordinary
+row. A requested provider-hosted search whose billable count is unknown fails
+after the response instead of being silently excluded from the cost budget;
+no request and known zero usage are distinct. A configured Extended TTL may
+derive creation pricing from ordinary
 input, provided every row has that input price; tier maxima cannot hide an
 unpriced row. Post-response checks remain defensive.
 Totals remain estimates,

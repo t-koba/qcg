@@ -481,11 +481,23 @@ impl ModelSpec {
     }
 }
 
+/// Provider-declared hosted-search billing units; never inferred from a URL or id.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSearchBilling {
+    #[default]
+    Unknown,
+    OpenaiSearchActions,
+    AzureNumRequests,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderSpec {
     pub id: String,
     pub api: ApiFlavor,
+    /// Responses-only billing mapping. Omission leaves hosted-search usage unknown.
+    pub web_search_billing: Option<WebSearchBilling>,
     pub base_url: Option<String>,
     pub base_url_env: Option<String>,
     pub api_key_env: Option<String>,
@@ -687,6 +699,10 @@ impl ProviderSpec {
             }
         }
         validate_capabilities_for_api(&self.id, self.api, &self.capabilities)?;
+        reject(
+            self.web_search_billing.is_some() && self.api != ApiFlavor::Responses,
+            "may only set `web_search_billing` for responses",
+        )?;
         reject(
             self.chat_token_limit_field.is_some() && self.api != ApiFlavor::ChatCompletions,
             "may only set `chat_token_limit_field` for chat_completions",
