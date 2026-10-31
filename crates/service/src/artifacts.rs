@@ -132,36 +132,47 @@ pub fn write_artifacts_zip_stream_with_limits<W: Write>(
     }
     let directories: std::collections::BTreeSet<_> = directories.into_values().collect();
     check_verified_artifact_hashes(&verified)?;
-    let mut zip = zip::ZipWriter::new_stream(CountingWriter::new(writer, limits.max_bytes));
-    for directory in directories {
-        let metadata = std::fs::metadata(workspace.join(&directory))?;
-        zip.add_directory(
-            format!("{directory}/"),
-            artifact_zip_options(&metadata, true)?,
-        )
-        .map_err(artifact_zip_error)?;
-    }
-    for artifact in verified {
-        let metadata = std::fs::metadata(&artifact.fs_path)?;
-        let mut file = File::open(&artifact.fs_path)?.take(artifact.bytes.saturating_add(1));
-        zip.start_file(&artifact.path, artifact_zip_options(&metadata, false)?)
+    write_artifact_archive(writer, limits, "artifact zip", |zip| {
+        for directory in directories {
+            let metadata = std::fs::metadata(workspace.join(&directory))?;
+            zip.add_directory(
+                format!("{directory}/"),
+                artifact_zip_options(&metadata, true)?,
+            )
             .map_err(artifact_zip_error)?;
-        copy_verified_artifact(&mut file, &mut zip, &artifact)?;
-    }
-    finish_artifact_archive(zip, "artifact zip")
+        }
+        for artifact in verified {
+            let metadata = std::fs::metadata(&artifact.fs_path)?;
+            let mut file = File::open(&artifact.fs_path)?.take(artifact.bytes.saturating_add(1));
+            zip.start_file(&artifact.path, artifact_zip_options(&metadata, false)?)
+                .map_err(artifact_zip_error)?;
+            copy_verified_artifact(&mut file, zip, &artifact)?;
+        }
+        Ok(())
+    })
 }
 
-fn finish_artifact_archive<W: Write>(
-    zip: zip::ZipWriter<zip::write::StreamWriter<CountingWriter<W>>>,
+// One owner blocks implicit ZIP finalization after any entry-writing failure.
+fn write_artifact_archive<W: Write>(
+    writer: W,
+    limits: &ArtifactZipLimits,
     label: &str,
+    write: impl FnOnce(
+        &mut zip::ZipWriter<zip::write::StreamWriter<CountingWriter<W>>>,
+    ) -> Result<(), ServiceError>,
 ) -> Result<(), ServiceError> {
+    let mut zip = zip::ZipWriter::new_stream(CountingWriter::new(writer, limits.max_bytes));
+    write(&mut zip).inspect_err(|_| {
+        if let Some(writer) = zip.get_ref() {
+            writer.get_ref().aborted.set(true);
+        }
+        tracing::warn!("streamed archive write failed; archive aborted");
+    })?;
     let writer = zip.finish().map_err(artifact_zip_error)?.into_inner();
-    if writer.exceeded {
-        let detail = match writer.limit {
-            Some(limit) => format!("{label} output exceeds {limit} bytes"),
-            None => format!("{label} output exceeded its bound"),
-        };
-        return Err(ServiceError::Invalid(detail));
+    if let Some(limit) = writer.limit.filter(|_| writer.exceeded) {
+        return Err(ServiceError::Invalid(format!(
+            "{label} output exceeds {limit} bytes"
+        )));
     }
     Ok(())
 }
@@ -180,8 +191,7 @@ pub fn write_run_bundle_stream_with_limits<W: Write>(
     limits: &ArtifactZipLimits,
 ) -> Result<(), ServiceError> {
     check_bundle_limits(parts.source_bytes, parts.entry_count, limits)?;
-    let mut zip = zip::ZipWriter::new_stream(CountingWriter::new(writer, limits.max_bytes));
-    let result: Result<(), ServiceError> = (|| {
+    write_artifact_archive(writer, limits, "run bundle", |zip| {
         let mut metas = vec![
             ("snapshot.json", &parts.snapshot_bytes),
             ("inputs.json", &parts.inputs_bytes),
@@ -204,12 +214,8 @@ pub fn write_run_bundle_stream_with_limits<W: Write>(
             zip.start_file(format!("{name}.jsonl"), bundle_entry_options(false))
                 .map_err(artifact_zip_error)?;
             let mut src = File::open(path)?.take(len);
-            if std::io::copy(&mut src, &mut zip)? != len {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    format!("{name} shorter than prepared length"),
-                )
-                .into());
+            if std::io::copy(&mut src, zip)? != len {
+                return Err(short_archive_source(name));
             }
         }
         for dir in &parts.directories {
@@ -217,70 +223,52 @@ pub fn write_run_bundle_stream_with_limits<W: Write>(
                 .map_err(artifact_zip_error)?;
         }
         for artifact in &parts.verified {
-            let file = File::open(&artifact.fs_path)?;
-            let mut src = file.take(artifact.bytes);
+            let mut src = File::open(&artifact.fs_path)?.take(artifact.bytes);
             zip.start_file(
                 format!("artifacts/{}", artifact.path),
                 bundle_entry_options(false),
             )
             .map_err(artifact_zip_error)?;
-            copy_verified_artifact(&mut src, &mut zip, artifact)?;
+            copy_verified_artifact(&mut src, zip, artifact)?;
         }
         Ok(())
-    })();
-    // Block implicit finalization for every failed bundle entry, not only artifacts.
-    if result.is_err()
-        && let Some(writer) = zip.get_ref()
-    {
-        writer.get_ref().aborted.set(true);
-    }
-    result?;
-    finish_artifact_archive(zip, "run bundle")
+    })
 }
 
-// The abort flag also blocks ZipWriter's implicit finalization on drop.
+fn short_archive_source(name: &str) -> ServiceError {
+    let detail = format!("{name} shorter than prepared length");
+    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, detail).into()
+}
+
 fn copy_verified_artifact<W: Write>(
     mut src: impl std::io::Read,
     zip: &mut zip::ZipWriter<zip::write::StreamWriter<CountingWriter<W>>>,
     artifact: &VerifiedArtifact,
 ) -> Result<(), ServiceError> {
-    let result = (|| {
-        let mut hash = Sha256::new();
-        let mut copied = 0_u64;
-        let mut buffer = [0; 8192];
-        loop {
-            let count = match src.read(&mut buffer) {
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                result => result?,
-            };
-            if count == 0 {
-                break;
-            }
-            zip.write_all(&buffer[..count])?;
-            hash.update(&buffer[..count]);
-            copied += count as u64;
+    let mut hash = Sha256::new();
+    let mut copied = 0_u64;
+    let mut buffer = [0; 8192];
+    loop {
+        let count = match src.read(&mut buffer) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if count == 0 {
+            break;
         }
-        if copied < artifact.bytes {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "artifact shorter than prepared length",
-            )
-            .into());
-        }
-        if copied != artifact.bytes || hex::encode(hash.finalize()) != artifact.sha256 {
-            return Err(ServiceError::Invalid(
-                "streamed artifact bytes mismatch or sha256 mismatch".into(),
-            ));
-        }
-        Ok(())
-    })();
-    if result.is_err()
-        && let Some(writer) = zip.get_ref()
-    {
-        writer.get_ref().aborted.set(true);
-        tracing::warn!("streamed artifact verification/copy failed; archive aborted");
+        zip.write_all(&buffer[..count])?;
+        hash.update(&buffer[..count]);
+        copied += count as u64;
     }
-    result
+    if copied < artifact.bytes {
+        return Err(short_archive_source("artifact"));
+    }
+    if copied != artifact.bytes || hex::encode(hash.finalize()) != artifact.sha256 {
+        return Err(ServiceError::Invalid(
+            "streamed artifact bytes mismatch or sha256 mismatch".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn json_size<T: serde::Serialize>(value: &T) -> Result<u64, ServiceError> {
@@ -332,41 +320,33 @@ impl<W> CountingWriter<W> {
 
 impl<W: Write> Write for CountingWriter<W> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if self.aborted.get() {
+        // Stay aborted unless the entire operation succeeds, including finish writes.
+        if self.aborted.replace(true) {
             return Err(std::io::Error::other("artifact archive aborted"));
         }
-        // Any write error aborts the stream so `ZipWriter::drop` cannot
-        // retry finalization after an explicit `zip.finish()` failure.
-        let result: std::io::Result<usize> = (|| {
-            let remaining = match self.limit {
-                Some(limit) => usize::try_from(limit.saturating_sub(self.written))
-                    .map_err(|_| std::io::Error::other("artifact zip output size overflowed"))?
-                    .min(bytes.len()),
-                None => bytes.len(),
-            };
-            self.inner.write_all(&bytes[..remaining])?;
-            self.written = self
-                .written
-                .checked_add(bytes.len() as u64)
-                .ok_or_else(|| std::io::Error::other("artifact zip output size overflowed"))?;
-            self.exceeded |= remaining < bytes.len();
-            Ok(bytes.len())
-        })();
-        if result.is_err() {
-            self.aborted.set(true);
-        }
-        result
+        let remaining = match self.limit {
+            Some(limit) => usize::try_from(limit.saturating_sub(self.written))
+                .map_err(|_| std::io::Error::other("artifact zip output size overflowed"))?
+                .min(bytes.len()),
+            None => bytes.len(),
+        };
+        self.inner.write_all(&bytes[..remaining])?;
+        self.written = self
+            .written
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| std::io::Error::other("artifact zip output size overflowed"))?;
+        self.exceeded |= remaining < bytes.len();
+        self.aborted.set(false);
+        Ok(bytes.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        if self.aborted.get() {
+        if self.aborted.replace(true) {
             return Err(std::io::Error::other("artifact archive aborted"));
         }
-        let result = self.inner.flush();
-        if result.is_err() {
-            self.aborted.set(true);
-        }
-        result
+        self.inner.flush()?;
+        self.aborted.set(false);
+        Ok(())
     }
 }
 
@@ -379,17 +359,15 @@ fn artifact_zip_options(
     directory: bool,
 ) -> Result<SimpleFileOptions, ServiceError> {
     // Share the explicit platform/compression defaults, then apply source metadata.
-    let mut options = bundle_entry_options(directory);
-    let modified = metadata.modified()?;
-    let modified = chrono::DateTime::<chrono::Utc>::from(modified).naive_utc();
+    let modified = chrono::DateTime::<chrono::Utc>::from(metadata.modified()?).naive_utc();
     let modified = zip::DateTime::try_from(modified).map_err(|error| {
         ServiceError::Invalid(format!(
             "artifact modification time is not representable in ZIP: {error}"
         ))
     })?;
-    options = options.last_modified_time(modified);
+    let options = bundle_entry_options(directory).last_modified_time(modified);
     #[cfg(unix)]
-    {
+    let mode = {
         use std::os::unix::fs::PermissionsExt as _;
         let mode = metadata.permissions().mode() & 0o777;
         if mode == 0 {
@@ -397,23 +375,20 @@ fn artifact_zip_options(
                 "artifact file mode is zero; refusing to archive a modeless entry".into(),
             ));
         }
-        options = options.unix_permissions(mode);
-    }
+        mode
+    };
+    // No silent default: non-Unix metadata carries no Unix mode, so
+    // declare the entry mode from the file type and readonly bit
+    // instead of letting the zip writer synthesize one (E15).
     #[cfg(not(unix))]
-    {
-        // No silent default: non-Unix metadata carries no Unix mode, so
-        // declare the entry mode from the file type and readonly bit
-        // instead of letting the zip writer synthesize one (E15).
-        let mode = if directory {
-            0o755
-        } else if metadata.permissions().readonly() {
-            0o444
-        } else {
-            0o644
-        };
-        options = options.unix_permissions(mode);
-    }
-    Ok(options)
+    let mode = if directory {
+        0o755
+    } else if metadata.permissions().readonly() {
+        0o444
+    } else {
+        0o644
+    };
+    Ok(options.unix_permissions(mode))
 }
 
 /// Fixed zip options for synthesized bundle entries (no source file metadata).
