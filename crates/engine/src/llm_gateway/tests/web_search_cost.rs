@@ -114,10 +114,8 @@ impl LlmProvider for SearchProvider {
                 .await
                 .map_err(|_| LlmError::new("closed"))?;
         }
-        if self.reject_delta {
-            // Let the gateway latch rejection before this operation continues.
-            tokio::task::yield_now().await;
-        }
+        // Do not yield between deltas and completion: cancellation may race
+        // with these buffered events before the gateway observes rejection.
         if !self.omit_completion {
             events
                 .send(llm::ChatStreamEvent::Completed {
@@ -658,7 +656,8 @@ async fn rejected_delta_drains_completion_and_accounts_once_without_publication(
             assert!(
                 !events
                     .iter()
-                    .any(|e| e["t"] == "llm_delta" || e["t"] == "llm_route_failed")
+                    .any(|e| e["t"] == "llm_delta" || e["t"] == "llm_route_failed"),
+                "{terminal:?}, unsafe_completion={unsafe_completion}: {text}"
             );
             assert_eq!(events.iter().filter(|e| e["t"] == "llm_call").count(), 1);
             let call = llm_call_event(&dir);

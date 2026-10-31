@@ -629,15 +629,16 @@ impl<'a> LlmGateway<'a> {
         loop {
             tokio::select! {
                 _ = self.cancellation.cancelled() => {
-                    if acc.rejection.is_some() {
-                        receiver.close();
-                        while let Ok(event) = receiver.try_recv() {
-                            record(event, acc)?;
-                        }
-                        if let Some(response) = acc.response.take() {
-                            acc.canceled = true;
-                            return Ok(response);
-                        }
+                    // Cancellation can race with provider events already in the
+                    // channel. Drain them first so a queued completion still
+                    // settles usage, even before rejection has been observed.
+                    receiver.close();
+                    while let Ok(event) = receiver.try_recv() {
+                        record(event, acc)?;
+                    }
+                    if let Some(response) = acc.response.take() {
+                        acc.canceled = true;
+                        return Ok(response);
                     }
                     return Err(LlmError {
                         message: "LLM stream canceled".into(),
