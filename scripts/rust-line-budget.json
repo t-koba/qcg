@@ -4,7 +4,7 @@
   "totalMax": 97211,
   "crates": {
     "api": 2991,
-    "cli": 8394,
+    "cli": 8396,
     "container": 1691,
     "contract": 6772,
     "engine": 19626,
@@ -16,7 +16,7 @@
     "model": 893,
     "policy": 2084,
     "server": 7349,
-    "service": 14984,
+    "service": 14988,
     "steps": 6573,
     "keyring-store": 14
   }

@@ -159,7 +159,8 @@ pub(crate) enum Command {
         /// Bounds expanded bytes. Omitted means the 10 MiB default, never unlimited.
         #[arg(long = "max-bytes", env = "PACKAGE_MAX_BYTES")]
         max_bytes: Option<u64>,
-        /// Explicit max only. Omitted means no mechanistic limit.
+        /// Compressed bytes buffered for HTTP/local install archives (provisional default: 16 MiB).
+        /// Explicit values raise/lower this transport cap, independent of expanded bytes/entries.
         #[arg(long = "max-archive-bytes", env = "PACKAGE_MAX_ARCHIVE_BYTES")]
         max_archive_bytes: Option<u64>,
         /// Explicit max only. Omitted means no mechanistic limit.

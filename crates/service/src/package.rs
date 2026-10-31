@@ -24,10 +24,13 @@ pub const DEFAULT_PACKAGE_MAX_ENTRIES: usize = 1000;
 /// Default expanded-bytes bound for package archives (bomb gate, 10 MiB).
 pub const DEFAULT_PACKAGE_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
-/// Bounded by default: `max_entries` (1000 entries) and `max_bytes` (10 MiB
-/// expanded) fail closed without configuration. `max_archive_bytes` stays
-/// explicit-only (an archive-byte cap cannot stop a bomb) and
-/// `max_metadata_bytes` stays explicit-only (uncalibrated).
+/// Provisional compressed install-archive buffer bound (transport policy, 16 MiB).
+pub const DEFAULT_PACKAGE_MAX_ARCHIVE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Bounded by default: 1000 entries, 10 MiB expanded, and 16 MiB compressed
+/// install-archive bytes. The archive cap bounds transport memory, not bombs;
+/// entry/expanded gates remain independent. Explicit overrides may raise/lower
+/// these defaults; `max_metadata_bytes` stays explicit-only (uncalibrated).
 #[derive(Debug, Clone, Copy)]
 pub struct PackageLimits {
     /// Raw ZIP entries (including duplicate names), checked before inventory allocation.
@@ -43,7 +46,7 @@ impl Default for PackageLimits {
             max_entries: Some(DEFAULT_PACKAGE_MAX_ENTRIES),
             max_bytes: Some(DEFAULT_PACKAGE_MAX_BYTES),
             max_metadata_bytes: None,
-            max_archive_bytes: None,
+            max_archive_bytes: Some(DEFAULT_PACKAGE_MAX_ARCHIVE_BYTES),
         }
     }
 }
@@ -2714,9 +2717,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn default_package_limits_pin_bounded_entry_and_byte_gates() {
-        // Pin the bounded defaults: entry count (1000) and expanded bytes
-        // (10 MiB) fail closed without configuration, while archive and
-        // metadata bounds stay explicit-only. A regression to all-`None`
+        // Pin the independent entry (1000), expanded-byte (10 MiB), and
+        // compressed install-archive (16 MiB) defaults; only metadata
+        // stays explicit-only. A regression to all-`None`
         // would silently reopen the bomb/flood shapes, so the default must
         // also reject a flood archive through the real unpack path.
         use std::io::Write as _;
@@ -2727,7 +2730,11 @@ mod tests {
         assert_eq!(limits.max_bytes, Some(DEFAULT_PACKAGE_MAX_BYTES));
         assert_eq!(limits.max_bytes, Some(10 * 1024 * 1024));
         assert_eq!(limits.max_metadata_bytes, None);
-        assert_eq!(limits.max_archive_bytes, None);
+        assert_eq!(
+            limits.max_archive_bytes,
+            Some(DEFAULT_PACKAGE_MAX_ARCHIVE_BYTES)
+        );
+        assert_eq!(limits.max_archive_bytes, Some(16 * 1024 * 1024));
 
         let root = temp_dir("default-limits-flood");
         let _temp_guard = TempGuard(root.clone());

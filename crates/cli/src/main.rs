@@ -572,7 +572,8 @@ async fn run_async() -> Result<std::process::ExitCode> {
                     max_entries: max_entries.or(service::PackageLimits::default().max_entries),
                     max_bytes: max_bytes.or(service::PackageLimits::default().max_bytes),
                     max_metadata_bytes,
-                    max_archive_bytes,
+                    max_archive_bytes: max_archive_bytes
+                        .or(service::PackageLimits::default().max_archive_bytes),
                 },
             )
             .await?;

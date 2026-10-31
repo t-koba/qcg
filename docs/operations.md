@@ -318,13 +318,21 @@ memory or disk. Minimum set:
   The defaults already bound untrusted trees; raise them only for
   reviewed large generators.
 - `qcg install`: `--max-entries` (default 1000), `--max-bytes`
-  (default 10 MiB), `--max-archive-bytes` plus `--max-metadata-bytes`
-  (both explicit-only). The entry/expanded defaults already reject
-  entry-flood and zip-bomb shapes; bound the archive dimension explicitly
-  for untrusted installs, e.g.
-  `qcg install pkg.pkg --max-archive-bytes 5242880` (5 MiB
-  archive: wide headroom over the in-repo fixtures at ~30 KiB and 13
-  entries).
+  (default 10 MiB expanded), `--max-archive-bytes` (provisional default
+  16 MiB compressed), `--max-metadata-bytes` (explicit-only). The archive cap
+  bounds compressed bytes buffered for HTTP and local install archives;
+  `--max-archive-bytes` / `PACKAGE_MAX_ARCHIVE_BYTES` can raise or lower it.
+  It is an independent transport-memory policy, not a replacement for the
+  entry-flood/zip-bomb gates or an established production-size envelope.
+  For example, `qcg install pkg.pkg --max-archive-bytes 5242880` lowers only
+  the compressed cap to 5 MiB.
+
+The provisional archive default was checked against 61 locally packaged
+fixtures (1,274–3,468 bytes), a 9 MiB random-payload package (9,442,106 bytes),
+and a 998-input-file, long-name stress package (9,399,980 bytes). No local
+archive caches were available. These samples exercise packaging and headroom
+near the expanded-size/entry defaults, but are **not a production distribution**;
+review the default as representative deployment evidence becomes available.
 
 `[budget]` (`max_steps`, `max_tokens`, `max_cost_usd`,
 `max_elapsed_seconds`) is the run-wide backstop and should always be set for

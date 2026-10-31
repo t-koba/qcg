@@ -14,17 +14,22 @@ exports use the CLI-owned client in `src/http.rs`:
   `policy::DEFAULT_HTTP_BODY_LIMIT_BYTES`. Both advertised Content-Length and
   streamed bytes are checked before buffering beyond the cap. Local `file://`
   indexes retain their existing filesystem behavior.
-- Remote package bytes retain the explicit `PackageLimits.max_archive_bytes`
-  bound (`--max-archive-bytes` / `PACKAGE_MAX_ARCHIVE_BYTES`), checked from
-  Content-Length and during download. Omission still means no archive-byte
-  cap: this is distinct from the default expanded-size and entry-count gates,
-  which defend against decompression bombs. Local package handling is unchanged.
+- Compressed bytes buffered for HTTP and local install archives default to
+  **16 MiB** via `service::PackageLimits.max_archive_bytes`. Explicit
+  `--max-archive-bytes` / `PACKAGE_MAX_ARCHIVE_BYTES` values can raise or lower
+  the cap. HTTP checks Content-Length and streamed bytes; local reads are also
+  bounded. This provisional transport-memory policy is not an empirically
+  established production-size envelope: local fixture/stress samples are not a
+  production distribution. The independent **10 MiB expanded-size / 1000-entry**
+  gates still defend against decompression bombs and entry floods;
+  `max_metadata_bytes` remains explicit-only.
 - Trace export checks the response status and does not buffer its body.
 
 Initial endpoint support is unchanged: registry indexes use `file://` or
 `https://`, direct remote packages allow `http://` and `https://`, and trace
 exports use the operator-supplied endpoint. These transport defaults do not
-change the service's package limits or the run's HTTP-step policies.
+change the run's HTTP-step policies; install archive defaults come from the
+service's package-limit policy.
 
 ## Standalone subscription authentication
 

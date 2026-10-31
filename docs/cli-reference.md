@@ -118,14 +118,17 @@ JSON event output go to stdout.
   `<id>[@version-requirement]` instead installs from configured registries
   (see below), including `[dependencies]` recursively. Entry count defaults
   to 1000 and expanded bytes to 10 MiB (`PACKAGE_MAX_ENTRIES`,
-  `PACKAGE_MAX_BYTES` override); archive and metadata bounds stay
-  explicit-only (`PACKAGE_MAX_ARCHIVE_BYTES`,
-  `PACKAGE_MAX_METADATA_BYTES`).
-  For untrusted packages the entry/expanded defaults already apply; bound
-  the archive dimension explicitly as well, e.g.
-  `qcg install pkg.pkg --max-archive-bytes 5242880` (5 MiB
-  archive: wide headroom over the in-repo fixtures at ~30 KiB and 13
-  entries, while the defaults reject entry-flood and zip-bomb shapes).
+  `PACKAGE_MAX_BYTES` override). Compressed bytes buffered for HTTP and local
+  install archives default to **16 MiB** (16777216 bytes);
+  `--max-archive-bytes` / `PACKAGE_MAX_ARCHIVE_BYTES` can raise or lower this
+  independent transport-memory cap. Metadata stays explicit-only
+  (`--max-metadata-bytes` / `PACKAGE_MAX_METADATA_BYTES`).
+  The archive default is provisional policy, not an established production-size
+  envelope: local fixture and near-expanded-limit stress samples are not a
+  production distribution. It does not replace the expanded-size/entry gates
+  against zip bombs and entry floods. For example,
+  `qcg install pkg.pkg --max-archive-bytes 5242880` lowers the compressed cap to
+  5 MiB without changing either decompression gate.
 - `qcg registry add <name> <url>`, `qcg registry remove <name>`,
   `qcg registry list`: manage registry index URLs (`file://` or `https://`)
   under `$DATA_HOME` (default `~/.data`). Everything is user-owned files; no
@@ -415,9 +418,11 @@ path is unchanged. Only offline mocks have been tested, not real accounts. See
   `server-cors` cargo feature refuse configured origins with an explicit error.
 - `PACKAGE_MAX_ENTRIES` (default `1000`), `PACKAGE_MAX_BYTES`
   (default `10485760`): entry and expanded-byte bounds for `qcg package`
-  and `qcg install`. `PACKAGE_MAX_ARCHIVE_BYTES`,
-  `PACKAGE_MAX_METADATA_BYTES`: explicit max for archive and metadata
-  bytes. Unset means no mechanistic limit for those two only.
+  and `qcg install`. `PACKAGE_MAX_ARCHIVE_BYTES` (provisional default
+  `16777216`, 16 MiB): compressed HTTP/local install-archive buffer bound;
+  explicit values raise/lower it independently of expanded bytes and entries.
+  `PACKAGE_MAX_METADATA_BYTES`: explicit max for metadata bytes; unset means
+  no mechanistic metadata limit.
 - `MAX_INPUTS_FILE_BYTES`: explicit max for `qcg run --inputs-file`.
   Unset means no mechanistic limit.
 - `MAX_REQUEST_BYTES` (default `2097152`, 2 MiB): whole-request-body limit

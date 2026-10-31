@@ -171,7 +171,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn index_limit_accepts_exact_boundary_and_archive_limit_remains_optional() {
+    async fn body_limit_accepts_exact_boundary_and_explicit_none() {
         for limit in [Some(8), None] {
             let (url, server) = serve("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\n1234\r\n4\r\n5678\r\n0\r\n\r\n".into()).await;
             assert_eq!(get(&url, limit).await.unwrap(), b"12345678");
