@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::common::{
-    open_package_read, package_file, read_opened_bounded, render_command, render_json_templates,
+    open_package_read, package_file, parse_json, read_opened_bounded, render_command,
+    render_json_templates,
 };
 use super::container_backend::build_tool_backend_candidate;
 use policy::MAX_COMMAND_RESULT_FILES;
@@ -373,7 +374,7 @@ async fn structured_outcome(
             format!("structured stdout is not valid UTF-8: {error}"),
         )
     })?;
-    let result: StructuredCommandResult = serde_json::from_str(stdout).map_err(|error| {
+    let result: StructuredCommandResult = parse_json(stdout.as_bytes()).map_err(|error| {
         StepError::failed(&node.id, format!("structured stdout is invalid: {error}"))
     })?;
     if matches!(result.status, StructuredCommandStatus::CheckFailed) && result.findings.is_empty() {
@@ -620,4 +621,50 @@ fn resolve_command_result_files(
         resolved.push(path);
     }
     Ok(resolved)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::{json_test_helpers::Harness, test_helpers::package_node};
+
+    #[tokio::test]
+    async fn structured_stdout_guards_nested_numbers_before_deserialization() {
+        let mut harness = Harness::new("structured-json");
+        let node = package_node("command", "command", "result = \"structured\"");
+        let params: CommandParams = engine::step_params(&node, "command").unwrap();
+        for token in [
+            "18446744073709551616",
+            "-9223372036854775809",
+            "18446744073709551615",
+        ] {
+            let stdout =
+                format!(r#"{{"status":"success","output":{{"nested":[{token}]}},"files":[]}}"#);
+            let output = engine::CommandOutput {
+                status: 0,
+                stdout_bytes: stdout.as_bytes().to_vec(),
+                stdout,
+                stderr: String::new(),
+                stderr_bytes: vec![],
+            };
+            let result = structured_outcome(&mut harness.context(), &node, &params, &output).await;
+            if token == "18446744073709551615" {
+                let StepOutcome::Success {
+                    output: Some(value),
+                    ..
+                } = result.unwrap()
+                else {
+                    panic!("expected success")
+                };
+                assert_eq!(value["output"]["nested"][0].as_u64(), Some(u64::MAX));
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains("structured stdout is invalid:")
+                        && error.contains("[-2^63, 2^64-1]"),
+                    "{error}"
+                );
+            }
+        }
+    }
 }

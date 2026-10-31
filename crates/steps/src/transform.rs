@@ -7,8 +7,8 @@ use serde_json::{Value, json};
 
 use super::common::{
     bounded_transform_text, decode_base64_file_atomic, encode_base64_file_atomic,
-    merge_json_objects, parse_unix_mode, require, strip_null_values, validate_unix_mode_template,
-    write_transform_output, write_zip_atomic,
+    merge_json_objects, parse_json, parse_unix_mode, require, strip_null_values,
+    validate_unix_mode_template, write_transform_output, write_zip_atomic,
 };
 pub(crate) struct TransformStep;
 
@@ -159,7 +159,7 @@ impl StepExecutor for TransformStep {
                 let text = bounded_transform_text(&ctx.run.fs, &source_path, transform_limit)
                     .await
                     .map_err(|error| StepError::failed(&node.id, error))?;
-                let value: Value = serde_json::from_str(&text)?;
+                let value: Value = parse_json(text.as_bytes())?;
                 let rendered = serde_json::to_string_pretty(&value)? + "\n";
                 write_transform_output(
                     &ctx.run.fs,
@@ -175,7 +175,7 @@ impl StepExecutor for TransformStep {
                 let text = bounded_transform_text(&ctx.run.fs, &source_path, transform_limit)
                     .await
                     .map_err(|error| StepError::failed(&node.id, error))?;
-                let value: Value = serde_json::from_str(&text)?;
+                let value: Value = parse_json(text.as_bytes())?;
                 let rendered = serde_json::to_string(&value)? + "\n";
                 write_transform_output(
                     &ctx.run.fs,
@@ -227,8 +227,8 @@ impl StepExecutor for TransformStep {
                     bounded_transform_text(&ctx.run.fs, &source_path, transform_limit)
                         .await
                         .map_err(|error| StepError::failed(&node.id, error))?;
-                let overlay: Value = serde_json::from_str(&overlay_text)?;
-                let mut base: Value = serde_json::from_str(&base_text)?;
+                let overlay: Value = parse_json(overlay_text.as_bytes())?;
+                let mut base: Value = parse_json(base_text.as_bytes())?;
                 merge_json_objects(&mut base, &overlay);
                 let rendered = serde_json::to_string_pretty(&base)?;
                 let rendered = rendered + "\n";
@@ -246,7 +246,7 @@ impl StepExecutor for TransformStep {
                 let text = bounded_transform_text(&ctx.run.fs, &source_path, transform_limit)
                     .await
                     .map_err(|error| StepError::failed(&node.id, error))?;
-                let mut value: Value = serde_json::from_str(&text)?;
+                let mut value: Value = parse_json(text.as_bytes())?;
                 strip_null_values(&mut value);
                 let value: toml::Value = toml::Value::try_from(value).map_err(|error| {
                     StepError::failed(&node.id, format!("failed to convert JSON to TOML: {error}"))
@@ -355,6 +355,47 @@ fn transform_params(node: &NodeDef) -> Result<TransformParams, StepError> {
 mod tests {
     use crate::common::build_zip;
     use camino::Utf8PathBuf;
+
+    #[tokio::test]
+    async fn json_transforms_guard_both_merge_inputs_before_writing() {
+        use super::*;
+        use crate::common::{json_test_helpers::Harness, test_helpers::package_node};
+        let mut harness = Harness::new("json-transforms");
+        for transform in ["json_pretty", "json_compact", "json_merge", "json_to_toml"] {
+            for bad_base in [false, true]
+                .into_iter()
+                .take(if transform == "json_merge" { 2 } else { 1 })
+            {
+                let bad = r#"{"nested":[18446744073709551617]}"#;
+                std::fs::write(
+                    harness.run.workspace.join("source.json"),
+                    if bad_base { "{}" } else { bad },
+                )
+                .unwrap();
+                std::fs::write(
+                    harness.run.workspace.join("base.json"),
+                    if bad_base { bad } else { "{}" },
+                )
+                .unwrap();
+                let node = package_node(
+                    "transform",
+                    "transform",
+                    &format!(
+                        "transform = {transform:?}\nsource = \"source.json\"\ntarget = \"target\"\nwith = \"base.json\""
+                    ),
+                );
+                let error = TransformStep
+                    .execute(&mut harness.context(), &node)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("[-2^63, 2^64-1]"),
+                    "{transform}: {error}"
+                );
+                assert!(!harness.run.workspace.join("target").exists());
+            }
+        }
+    }
 
     #[test]
     fn zip_transform_preserves_directory_entries_metadata_and_contents() {

@@ -7,8 +7,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::common::{
-    open_package_read, package_file, read_opened_bounded, render_json_templates, require,
-    strict_base64_decode, write_atomic,
+    open_package_read, package_file, parse_json, read_opened_bounded, render_json_templates,
+    require, strict_base64_decode, write_atomic,
 };
 pub(crate) struct HttpStep;
 
@@ -485,7 +485,7 @@ impl StepExecutor for HttpStep {
                     })?
                     .to_owned(),
             ),
-            HttpOutputMode::Json => serde_json::from_slice(&response.body).map_err(|error| {
+            HttpOutputMode::Json => parse_json(&response.body).map_err(|error| {
                 StepError::failed(
                     &node.id,
                     format!("HTTP response body is not valid JSON: {error}"),
@@ -603,6 +603,51 @@ pub(crate) fn http_approval_details(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn json_response_guards_number_tokens_before_step_output() {
+        use super::*;
+        use crate::common::{json_test_helpers::Harness, test_helpers::package_node};
+        let app = axum::Router::new()
+            .route(
+                "/bad",
+                axum::routing::get(|| async { r#"{"nested":[18446744073709551617]}"# }),
+            )
+            .route(
+                "/good",
+                axum::routing::get(|| async { r#"{"nested":[18446744073709551615]}"# }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut harness = Harness::new("http-json");
+        for path in ["bad", "good"] {
+            let node = package_node(
+                path,
+                "http",
+                &format!("url = \"http://{address}/{path}\"\noutput = \"json\""),
+            );
+            let result = HttpStep.execute(&mut harness.context(), &node).await;
+            if path == "good" {
+                let StepOutcome::Success {
+                    output: Some(value),
+                    ..
+                } = result.unwrap()
+                else {
+                    panic!("expected success")
+                };
+                assert_eq!(value["body"]["nested"][0].as_u64(), Some(u64::MAX));
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains("HTTP response body is not valid JSON:")
+                        && error.contains("[-2^63, 2^64-1]"),
+                    "{error}"
+                );
+            }
+        }
+        server.abort();
+    }
+
     #[test]
     fn idempotency_header_rejects_case_insensitive_duplicates() {
         use super::explicit_idempotency_header;

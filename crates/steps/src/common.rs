@@ -59,3 +59,57 @@ version = "0.1.0"
         .expect("step node should parse")
     }
 }
+
+#[cfg(test)]
+pub(crate) mod json_test_helpers {
+    use super::test_helpers::test_contract;
+    use contract::ValueBag;
+    use engine::{JournalWriter, RunContext, StepContext};
+
+    pub(crate) struct Harness {
+        pub run: RunContext,
+        journal: JournalWriter,
+        vars: ValueBag,
+    }
+
+    impl Harness {
+        pub fn new(name: &str) -> Self {
+            let (mut contract, root) = test_contract(name);
+            contract.manifest.permissions.fs_read = vec!["workspace".into()];
+            contract.manifest.permissions.fs_write = vec!["workspace".into()];
+            contract.manifest.permissions.network = vec!["127.0.0.1".into()];
+            std::fs::create_dir(root.join("workspace")).unwrap();
+            let run = RunContext::for_tests(
+                name.into(),
+                root.join("workspace"),
+                root.join("meta"),
+                contract,
+                Default::default(),
+                Default::default(),
+            )
+            .unwrap();
+            let journal =
+                JournalWriter::create(&root.join("journal.jsonl"), name, false, None).unwrap();
+            Self {
+                run,
+                journal,
+                vars: ValueBag::with_inputs(Default::default()),
+            }
+        }
+
+        pub fn context(&mut self) -> StepContext<'_> {
+            StepContext {
+                run: &self.run,
+                journal: &self.journal,
+                vars: &mut self.vars,
+                llm: None,
+            }
+        }
+    }
+
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.run.contract.root);
+        }
+    }
+}

@@ -703,13 +703,17 @@ boundaries check tokens before conversion to `Value`: HTTP `StartRun.inputs`
 and `StartRun.answers`, `ForkStatePatch.inputs` and `step_outputs`,
 `ForkRun.answers`, and `AnswerPayload.values`; CLI JSON input files and eval
 suites, `--input key=value` and `--answer key=value` scalars; and
-LLM-generated JSON outputs before they become step values. Out-of-range
+LLM-generated JSON outputs, HTTP step responses with `output = "json"`,
+structured command stdout (including bundled tools), and JSON files read by
+`json_pretty`, `json_compact`, `json_merge` (both inputs), and `json_to_toml`
+transforms before conversion to step values or output files. Out-of-range
 integer tokens are rejected, including inside arrays and objects, rather than
 rounded to floats. Numeric-looking strings and keys are not treated as
 numbers. Decimal/exponent tokens retain finite `f64` semantics; non-finite
 values and out-of-range expression integer literals are refused. Any source
-that supplies an already-parsed `serde_json::Value` (including a tool adapter)
-has lost the token spelling; an out-of-range integer already rounded to a
+that supplies an already-parsed `serde_json::Value` (including MCP structured
+outputs already deserialized by `rmcp`, or a tool adapter) has lost the token
+spelling; an out-of-range integer already rounded to a
 float is evaluated with that approximation, so exact equality is not
 guaranteed for it. This evaluator guarantee is separate from JSON consumer
 precision: JavaScript's `JSON.parse` converts numbers to IEEE-754 binary64,
