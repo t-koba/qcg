@@ -1,4 +1,4 @@
-use crate::common::{bounded_transform_text, package_file, require};
+use crate::common::{bounded_transform_text, package_file, parse_json, require};
 use async_trait::async_trait;
 use contract::{Contract, NodeDef};
 use engine::{StepContext, StepError, StepExecutor, StepOutcome, validate_json_schema_findings};
@@ -58,7 +58,7 @@ impl StepExecutor for CheckSchemaStep {
         )
         .await
         .map_err(|error| StepError::failed(&node.id, error))?;
-        let value: Value = serde_json::from_str(&value_source)
+        let value: Value = parse_json(value_source.as_bytes())
             .map_err(|error| StepError::failed(&node.id, format!("invalid JSON: {error}")))?;
         let schema = load_package_schema(&ctx.run.contract, node, &params.schema)?;
         let findings = validate_json_schema_findings(&schema, &value, "$");
@@ -108,7 +108,7 @@ fn load_package_schema(
             ),
         ));
     }
-    let schema: Value = serde_json::from_slice(&bytes).map_err(|error| {
+    let schema: Value = parse_json(&bytes).map_err(|error| {
         StepError::failed(
             &node.id,
             format!("schema package file `{relative}` is not valid JSON: {error}"),
@@ -121,4 +121,76 @@ fn load_package_schema(
         )
     })?;
     Ok(schema)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::{json_test_helpers::Harness, test_helpers::package_node};
+
+    #[tokio::test]
+    async fn check_schema_guards_number_tokens_before_deserialization() {
+        let mut harness = Harness::new("check-schema-json");
+        let node = package_node(
+            "check-schema",
+            "check.schema",
+            "source = \"value.json\"\nschema = \"schema.json\"",
+        );
+        std::fs::write(
+            harness.run.contract.root.join("schema.json"),
+            r#"{"type":"object"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            harness.run.workspace.join("value.json"),
+            r#"{"id":18446744073709551616}"#,
+        )
+        .unwrap();
+        let error = CheckSchemaStep
+            .execute(&mut harness.context(), &node)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("invalid JSON:") && error.contains("[-2^63, 2^64-1]"),
+            "{error}"
+        );
+        std::fs::write(harness.run.workspace.join("value.json"), r#"{"id":1}"#).unwrap();
+        std::fs::write(
+            harness.run.contract.root.join("schema.json"),
+            r#"{"type":"object","properties":{"id":{"const":18446744073709551616}}}"#,
+        )
+        .unwrap();
+        let error = CheckSchemaStep
+            .execute(&mut harness.context(), &node)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("is not valid JSON:") && error.contains("[-2^63, 2^64-1]"),
+            "{error}"
+        );
+        std::fs::write(
+            harness.run.contract.root.join("schema.json"),
+            r#"{"type":"object","properties":{"id":{"const":1}},"required":["id"]}"#,
+        )
+        .unwrap();
+        std::fs::write(harness.run.workspace.join("value.json"), r#"{"id":1}"#).unwrap();
+        let StepOutcome::Success { output, .. } = CheckSchemaStep
+            .execute(&mut harness.context(), &node)
+            .await
+            .unwrap()
+        else {
+            panic!("in-range match should pass");
+        };
+        assert_eq!(output.as_ref().unwrap()["status"], "pass");
+        std::fs::write(harness.run.workspace.join("value.json"), r#"{"id":2}"#).unwrap();
+        let StepOutcome::CheckFailed { .. } = CheckSchemaStep
+            .execute(&mut harness.context(), &node)
+            .await
+            .unwrap()
+        else {
+            panic!("in-range mismatch should check-fail");
+        };
+    }
 }
