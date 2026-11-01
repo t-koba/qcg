@@ -1,7 +1,4 @@
-//! Path syntax and collision checks are host-independent; qcg imposes no per-component
-//! or full-path length cap. The target OS/filesystem and configured workspace root can
-//! still make an accepted path unusable. Set keys use conservative NFD/full Unicode
-//! case-fold/NFD.
+//! Host-independent syntax/collision checks impose no component or full-path length cap; OS/filesystem and workspace-root limits can still make accepted paths unusable. Set keys use conservative NFD/full Unicode case-fold/NFD.
 //! Safe paths are nonempty relative slash paths excluding ADS/drive colons, backslashes, controls, trailing dots/spaces, reserved stems and Win32 `< > " | ? *`; globs also allow `*` and `?`.
 use camino::Utf8Path;
 
