@@ -327,6 +327,10 @@ path is unchanged. Only offline mocks have been tested, not real accounts. See
 ## Environment variables
 
 - `RUST_LOG`: tracing filter, for example `qcg=debug,engine=trace`.
+- `SERVICE_NAME`: service identity. A non-empty value wins; otherwise the
+  running binary's file stem is used, falling back to `server`. The value
+  appears as the log `service` field, the OTLP `service.name`, the MCP
+  client/server implementation name and the package builder id.
 - `AUTO_GC=0|false|off`: disable every automatic retention sweep — `qcg
   serve`'s periodic task and the sweep that precedes `qcg run`. The manual
   `qcg runs gc` sweep is not automatic and still runs.
