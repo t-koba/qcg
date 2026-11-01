@@ -470,10 +470,10 @@ npm packages:
 - @esbuild/win32-arm64@0.25.12 — MIT
 - @esbuild/win32-ia32@0.25.12 — MIT
 - @esbuild/win32-x64@0.25.12 — MIT
-- @hey-api/codegen-core@0.8.1 — MIT
+- @hey-api/codegen-core@0.8.2 — MIT
 - @hey-api/json-schema-ref-parser@1.4.2 — MIT
-- @hey-api/openapi-ts@0.97.1 — MIT
-- @hey-api/shared@0.4.3 — MIT
+- @hey-api/openapi-ts@0.97.3 — MIT
+- @hey-api/shared@0.4.5 — MIT
 - @hey-api/spec-types@0.2.0 — MIT
 - @hey-api/types@0.1.4 — MIT
 - @jridgewell/gen-mapping@0.3.13 — MIT
@@ -571,7 +571,7 @@ npm packages:
 - is-wsl@3.1.1 — MIT
 - isexe@2.0.0 — ISC
 - jiti@2.7.0 — MIT
-- js-yaml@4.1.1 — MIT
+- js-yaml@4.3.2 — MIT
 - kleur@4.1.5 — MIT
 - locate-character@3.0.0 — MIT
 - magic-string@0.30.21 — MIT
