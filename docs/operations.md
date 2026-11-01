@@ -43,13 +43,15 @@ flag only — see `docs/security.md` "Platform guarantees" for the normative
 definition. The default `exclusive` run store
 takes one directory lock. `shared-filesystem` enables active-active services
 when the underlying storage provides reliable advisory locks: run-level leases
-prevent duplicate execution, abandoned work is rescanned every 5 seconds, and
-non-owner services follow the durable journal for SSE delivery (roughly
-250 ms poll granularity rather than the 5 second rescan). Each process
+prevent duplicate execution, abandoned work is rescanned every 5 seconds by
+default (`SHARED_RESCAN_SECS`, default `5`, range `1..=3600`), and non-owner
+services follow the durable journal for SSE delivery (roughly 250 ms poll
+granularity rather than the rescan interval). Each process
 carries an owner id; answers, approvals, and cancel requests are journaled
 durably (`user_answered`, `user_confirmed`, `user_cancel_requested`) so the
 owner merges peer progress on refresh and resumes answered prompts. Cancel
-from a non-owner is observed within the 5 second refresh window.
+from a non-owner is observed within one rescan interval (5 seconds by
+default).
 
 The server default is eight concurrently executing API runs. Set
 `--max-active-runs` or `MAX_ACTIVE_RUNS` to change the process-local limit.
@@ -863,9 +865,10 @@ Unattended limits:
   caps remain global refresh failures. A clean later refresh returns health
   to `healthy`.
 - Global refresh failures retry indefinitely with exponential delays of
-  2, 4, 8, 16, 32, then at most 64 times `SHARED_STORE_RESCAN_SECS` (default
-  rescan cadence 5 s; maximum retry delay 320 s). Success resets the failure
-  backoff; isolated run failures keep the normal cadence. Unexpected worker
+  2, 4, 8, 16, 32, then at most 64 times the `SHARED_RESCAN_SECS` cadence, so
+  the ceiling is 320 s at the default 5 s and scales with a larger configured
+  cadence. Success resets the failure backoff; isolated run failures keep the
+  normal cadence. Unexpected worker
   exits/panics are logged and supervised with the same bounded restart
   backoff. Shutdown interrupts retry/restart waits; the server's existing
   shutdown grace/deadline still bounds in-progress work.
