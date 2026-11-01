@@ -4,7 +4,7 @@
   "totalMax": 97494,
   "crates": {
     "api": 3008,
-    "cli": 8439,
+    "cli": 8440,
     "container": 1691,
     "contract": 6923,
     "engine": 19702,

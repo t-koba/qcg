@@ -363,10 +363,7 @@ pub(crate) fn show_costs(
         tokens_cached_input: u64,
         tokens_cache_creation_input: u64,
         cost_microusd: u64,
-        base_input_rate: Option<f64>,
-        base_cache_read_rate: Option<f64>,
-        base_cache_creation_rate: Option<f64>,
-        base_output_rate: Option<f64>,
+        base_rates: Option<Option<(f64, f64, f64, f64)>>,
         unpriced_calls: u64,
     }
 
@@ -412,49 +409,53 @@ pub(crate) fn show_costs(
             Some(metrics) => metrics,
             None => continue,
         };
+        let contract = read_run_generator_path(&run_dir)
+            .ok()
+            .and_then(|path| Contract::load(path).ok());
         let mut unpriced = false;
-        if by_model {
-            let contract = read_run_generator_path(&run_dir)
-                .ok()
-                .and_then(|path| Contract::load(path).ok());
-            for event in read_run_events(&run_dir)? {
-                let api::RunEventData::LlmCall(data) = &event.data else {
-                    continue;
-                };
-                let entry = models
-                    .entry((data.provider.clone(), data.model.clone()))
-                    .or_insert_with(|| ModelAggregate {
-                        provider: data.provider.clone(),
-                        model: data.model.clone(),
-                        ..Default::default()
-                    });
-                entry.calls = entry.calls.saturating_add(1);
-                entry.tokens_input = entry.tokens_input.saturating_add(data.tokens.input);
-                entry.tokens_output = entry.tokens_output.saturating_add(data.tokens.output);
-                entry.tokens_cached_input = entry
-                    .tokens_cached_input
-                    .saturating_add(data.tokens.cached_input);
-                entry.tokens_cache_creation_input = entry
-                    .tokens_cache_creation_input
-                    .saturating_add(data.tokens.cache_creation_input);
-                entry.cost_microusd = entry.cost_microusd.saturating_add(data.cost_microusd);
-                let billed = data.tokens.input.saturating_add(data.tokens.output) > 0;
-                match contract
-                    .as_ref()
-                    .and_then(|contract| find_pricing(contract, &data.provider, &data.model))
-                {
-                    Some((input_rate, cache_read_rate, cache_creation_rate, output_rate)) => {
-                        entry.base_input_rate = Some(input_rate);
-                        entry.base_cache_read_rate = Some(cache_read_rate);
-                        entry.base_cache_creation_rate = Some(cache_creation_rate);
-                        entry.base_output_rate = Some(output_rate);
-                    }
-                    None if billed && data.cost_microusd == 0 => {
-                        entry.unpriced_calls = entry.unpriced_calls.saturating_add(1);
-                        unpriced = true;
-                    }
-                    None => {}
+        for event in read_run_events(&run_dir)? {
+            let api::RunEventData::LlmCall(data) = &event.data else {
+                continue;
+            };
+            let billed = data.tokens.input.saturating_add(data.tokens.output) > 0;
+            let pricing = contract
+                .as_ref()
+                .and_then(|contract| find_pricing(contract, &data.provider, &data.model));
+            let unpriced_call = billed && data.cost_microusd == 0 && pricing.is_none();
+            unpriced |= unpriced_call;
+            if !by_model {
+                continue;
+            }
+            let entry = models
+                .entry((data.provider.clone(), data.model.clone()))
+                .or_insert_with(|| ModelAggregate {
+                    provider: data.provider.clone(),
+                    model: data.model.clone(),
+                    ..Default::default()
+                });
+            entry.calls = entry.calls.saturating_add(1);
+            entry.tokens_input = entry.tokens_input.saturating_add(data.tokens.input);
+            entry.tokens_output = entry.tokens_output.saturating_add(data.tokens.output);
+            entry.tokens_cached_input = entry
+                .tokens_cached_input
+                .saturating_add(data.tokens.cached_input);
+            entry.tokens_cache_creation_input = entry
+                .tokens_cache_creation_input
+                .saturating_add(data.tokens.cache_creation_input);
+            entry.cost_microusd = entry.cost_microusd.saturating_add(data.cost_microusd);
+            entry.unpriced_calls = entry
+                .unpriced_calls
+                .saturating_add(u64::from(unpriced_call));
+            match pricing {
+                Some(rates) => {
+                    entry.base_rates = match entry.base_rates {
+                        None => Some(Some(rates)),
+                        Some(Some(previous)) if previous == rates => Some(Some(rates)),
+                        _ => Some(None),
+                    };
                 }
+                None if billed => entry.base_rates = Some(None),
+                None => {}
             }
         }
         runs.push(RunCost {
@@ -499,21 +500,29 @@ pub(crate) fn show_costs(
             payload["models"] = json!(
                 models
                     .values()
-                    .map(|entry| json!({
-                        "provider": entry.provider,
-                        "model": entry.model,
-                        "llm_calls": entry.calls,
-                        "tokens_input": entry.tokens_input,
-                        "tokens_output": entry.tokens_output,
-                        "tokens_cached_input": entry.tokens_cached_input,
-                        "tokens_cache_creation_input": entry.tokens_cache_creation_input,
-                        "base_input_rate": entry.base_input_rate,
-                        "base_cache_read_rate": entry.base_cache_read_rate,
-                        "base_cache_creation_rate": entry.base_cache_creation_rate,
-                        "base_output_rate": entry.base_output_rate,
-                        "cost_microusd": entry.cost_microusd,
-                        "unpriced_calls": entry.unpriced_calls,
-                    }))
+                    .map(|entry| {
+                        let (input, read, creation, output) = match entry.base_rates {
+                            Some(Some((input, read, creation, output))) => {
+                                (Some(input), Some(read), Some(creation), Some(output))
+                            }
+                            _ => (None, None, None, None),
+                        };
+                        json!({
+                            "provider": entry.provider,
+                            "model": entry.model,
+                            "llm_calls": entry.calls,
+                            "tokens_input": entry.tokens_input,
+                            "tokens_output": entry.tokens_output,
+                            "tokens_cached_input": entry.tokens_cached_input,
+                            "tokens_cache_creation_input": entry.tokens_cache_creation_input,
+                            "base_input_rate": input,
+                            "base_cache_read_rate": read,
+                            "base_cache_creation_rate": creation,
+                            "base_output_rate": output,
+                            "cost_microusd": entry.cost_microusd,
+                            "unpriced_calls": entry.unpriced_calls,
+                        })
+                    })
                     .collect::<Vec<_>>()
             );
         }
@@ -554,13 +563,8 @@ pub(crate) fn show_costs(
                 .cmp(&(right.provider.clone(), right.model.clone()))
         });
         for entry in models {
-            let rates = match (
-                entry.base_input_rate,
-                entry.base_cache_read_rate,
-                entry.base_cache_creation_rate,
-                entry.base_output_rate,
-            ) {
-                (Some(input), Some(read), Some(creation), Some(output)) => {
+            let rates = match entry.base_rates {
+                Some(Some((input, read, creation, output))) => {
                     format!("{input}/{read}/{creation}/{output}")
                 }
                 _ => "n/a".into(),
@@ -583,8 +587,6 @@ pub(crate) fn show_costs(
     Ok(())
 }
 
-/// Contract base-row unit prices (USD per 1M tokens) for one provider/model
-/// route, with omitted cache rates inheriting the ordinary input rate.
 pub(crate) fn find_pricing(
     contract: &Contract,
     provider: &str,
