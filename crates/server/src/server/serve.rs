@@ -2096,6 +2096,44 @@ command = ["sh", "-c", "sleep 30"]"#,
                 "refusal must name {part}: {error}"
             );
         }
+        // A companion knob without RATE_LIMIT_RPS is refused whatever its own
+        // value: an invalid one names itself, a valid one names the missing rps.
+        for (name, value, part) in [
+            (
+                "RATE_LIMIT_MAX_IDENTITIES",
+                "many",
+                "RATE_LIMIT_MAX_IDENTITIES",
+            ),
+            ("RATE_LIMIT_OVERFLOW", "sometimes", "RATE_LIMIT_OVERFLOW"),
+            (
+                "RATE_LIMIT_IDENTITY_HEADER",
+                "authorization",
+                "RATE_LIMIT_IDENTITY_HEADER",
+            ),
+            ("RATE_LIMIT_MAX_IDENTITIES", "64", "RATE_LIMIT_RPS"),
+            ("RATE_LIMIT_OVERFLOW", "reject", "RATE_LIMIT_RPS"),
+            (
+                "RATE_LIMIT_IDENTITY_HEADER",
+                "x-client-id",
+                "RATE_LIMIT_RPS",
+            ),
+        ] {
+            unset("RATE_LIMIT_RPS");
+            unset("RATE_LIMIT_BURST");
+            unset("RATE_LIMIT_IDENTITY_HEADER");
+            unset("RATE_LIMIT_MAX_IDENTITIES");
+            unset("RATE_LIMIT_OVERFLOW");
+            set(name, value);
+            let error = resolve_server_policy(&config)
+                .expect_err("a companion knob without RATE_LIMIT_RPS must refuse boot");
+            assert!(
+                error.contains("rate limit") && error.contains(part),
+                "refusal must name {part}: {error}"
+            );
+        }
+        unset("RATE_LIMIT_IDENTITY_HEADER");
+        unset("RATE_LIMIT_MAX_IDENTITIES");
+        unset("RATE_LIMIT_OVERFLOW");
         set("RATE_LIMIT_RPS", "10");
         unset("RATE_LIMIT_BURST");
         assert_eq!(

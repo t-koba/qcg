@@ -57,26 +57,19 @@ pub struct RateLimitPolicy {
 }
 
 /// Resolves the deployment rate limit from the environment. Unset
-/// `RATE_LIMIT_RPS` disables limiting; `RATE_LIMIT_BURST` defaults
-/// to the rps value. Every other combination is refused: only integers of at
-/// least 1 are accepted, and a lone burst setting is an incomplete
-/// configuration rather than a silent no-op (E04).
+/// `RATE_LIMIT_RPS` disables limiting only when no companion knob is set;
+/// `RATE_LIMIT_BURST` defaults to the rps value. Every other combination is
+/// refused: only integers of at least 1 are accepted, and a companion setting
+/// without `RATE_LIMIT_RPS` is an incomplete configuration rather than a
+/// silent no-op (E04), whatever the companion's own value.
 pub(crate) fn resolve_rate_limit_policy() -> Result<Option<RateLimitPolicy>, String> {
     let rps = match std::env::var("RATE_LIMIT_RPS") {
-        Err(_) => {
-            if std::env::var("RATE_LIMIT_BURST").is_ok() {
-                return Err(
-                    "RATE_LIMIT_BURST is set without RATE_LIMIT_RPS; set both or neither"
-                        .to_string(),
-                );
-            }
-            return Ok(None);
-        }
-        Ok(value) => parse_positive("RATE_LIMIT_RPS", &value)?,
+        Ok(value) => Some(parse_positive("RATE_LIMIT_RPS", &value)?),
+        Err(_) => None,
     };
     let burst = match std::env::var("RATE_LIMIT_BURST") {
-        Err(_) => rps,
-        Ok(value) => parse_positive("RATE_LIMIT_BURST", &value)?,
+        Ok(value) => Some(parse_positive("RATE_LIMIT_BURST", &value)?),
+        Err(_) => None,
     };
     let trusted_identity_header = match std::env::var("RATE_LIMIT_IDENTITY_HEADER") {
         Err(_) => None,
@@ -125,9 +118,26 @@ pub(crate) fn resolve_rate_limit_policy() -> Result<Option<RateLimitPolicy>, Str
             }
         },
     };
+    let Some(rps) = rps else {
+        // Limiting is off, so every companion setting is a knob that silently
+        // does nothing: refuse instead of booting a mis-configured deployment.
+        for name in [
+            "RATE_LIMIT_BURST",
+            "RATE_LIMIT_IDENTITY_HEADER",
+            "RATE_LIMIT_MAX_IDENTITIES",
+            "RATE_LIMIT_OVERFLOW",
+        ] {
+            if std::env::var(name).is_ok() {
+                return Err(format!(
+                    "{name} is set without RATE_LIMIT_RPS; set both or neither"
+                ));
+            }
+        }
+        return Ok(None);
+    };
     Ok(Some(RateLimitPolicy {
         rps,
-        burst,
+        burst: burst.unwrap_or(rps),
         trusted_identity_header,
         max_identities,
         overflow,

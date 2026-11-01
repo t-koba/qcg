@@ -345,11 +345,12 @@ path is unchanged. Only offline mocks have been tested, not real accounts. See
   permissions; there is no implicit fallback.
 - `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST`: optional per-credential
   token bucket for the HTTP server. Unset `RATE_LIMIT_RPS` disables rate
-  limiting; `RATE_LIMIT_BURST` defaults to the rps value. Buckets are keyed
-  by the presented bearer credential (one anonymous bucket otherwise), so
-  credentials never share a budget. Requests over the limit receive `429` with
-  `Retry-After`; `GET /healthz` is exempt. Invalid values, zero, or a burst
-  without an rps refuse boot.
+  limiting only when no companion rate-limit setting is present;
+  `RATE_LIMIT_BURST` defaults to the rps value. Buckets are keyed by the
+  presented bearer credential (one anonymous bucket otherwise), so credentials
+  never share a budget. Requests over the limit receive `429` with
+  `Retry-After`; `GET /healthz` is exempt. Invalid values, zero, or any
+  companion setting without an rps refuse boot.
 - `RATE_LIMIT_MAX_IDENTITIES` (default `4096`, range `1..=65536`) and
   `RATE_LIMIT_OVERFLOW` (`fold` or `reject`, default `fold`): deployment
   identity budget and overflow choice. The bucket map never exceeds the
@@ -357,6 +358,10 @@ path is unchanged. Only offline mocks have been tested, not real accounts. See
   denies newcomers with `429` and keeps established budgets independent.
   Neither mode refills an exhausted bucket via rotation. Invalid values
   refuse boot.
+- `RATE_LIMIT_IDENTITY_HEADER`: optional trusted header whose value keys the
+  bucket, for deployments whose outer proxy strips or overwrites that header
+  (otherwise callers can assert their own identity). `authorization` and names
+  containing spaces or colons are refused; so is setting it without an rps.
 - `LIVE_EVENT_CHANNEL_CAPACITY` (default `512`, range `16..=65536`),
   `JOURNAL_POLL_INTERVAL_MS` (default `250`, range `50..=5000`),
   `MAX_DIRECTORY_SCAN_ENTRIES` (default `100000`, range `1000..=10000000`),
