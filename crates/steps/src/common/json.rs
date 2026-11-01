@@ -1,10 +1,11 @@
 use contract::NodeDef;
 use engine::{StepContext, StepError};
 use serde::de::{DeserializeOwned, Error as _};
-use serde_json::Value;
+use serde_json::{Value, value::RawValue};
 
 /// Preserve number tokens until syntax and the evaluator's numeric range are checked.
 pub(crate) fn parse_json<T: DeserializeOwned>(bytes: &[u8]) -> serde_json::Result<T> {
+    serde_json::from_slice::<&RawValue>(bytes)?;
     contract::parse_json_guarded(bytes).map_err(serde_json::Error::custom)
 }
 
