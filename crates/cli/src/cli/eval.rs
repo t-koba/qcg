@@ -793,6 +793,41 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn run_eval_refuses_out_of_range_suite_numbers() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("qcg-eval-guard-{stamp}"));
+        std::fs::create_dir_all(&dir).expect("temp dir should create");
+        let suite = dir.join("suite.json");
+        std::fs::write(
+            &suite,
+            r#"{"name": "suite", "cases": [{"name": "case", "assertions": [{"type": "manifest_pointer", "pointer": "/value", "equals": 18446744073709551616}]}]}"#,
+        )
+        .expect("suite should write");
+        let deployment = crate::CliDeployment {
+            providers_path: None,
+            container_timeouts: policy::ContainerTimeouts::default(),
+            retention: policy::RetentionPolicy::default(),
+        };
+        let error = run_eval(
+            Utf8PathBuf::from("/nonexistent/generator"),
+            Utf8Path::from_path(&suite).expect("suite path is UTF-8"),
+            Utf8Path::from_path(&dir).expect("dir path is UTF-8"),
+            Utf8PathBuf::from_path_buf(dir.join("runs")).expect("runs path is UTF-8"),
+            deployment,
+            None,
+            false,
+        )
+        .await
+        .expect_err("an out-of-range suite must be refused");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(error.to_string().contains("invalid eval suite"), "{error}");
+        assert!(error.to_string().contains("[-2^63, 2^64-1]"), "{error}");
+    }
+
     #[test]
     fn eval_suite_assertions_enforce_raw_integer_bounds() {
         let ok: EvalSuite = contract::parse_json_guarded(
