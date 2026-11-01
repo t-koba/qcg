@@ -490,14 +490,34 @@ pub(crate) fn show_costs(
             .iter()
             .map(|run| run.metrics.cost_microusd)
             .fold(0_u64, u64::saturating_add);
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "runs": items,
-                "total_cost_microusd": total_microusd,
-                "total_cost_usd": total_microusd as f64 / 1_000_000.0,
-            }))?
-        );
+        let mut payload = json!({
+            "runs": items,
+            "total_cost_microusd": total_microusd,
+            "total_cost_usd": total_microusd as f64 / 1_000_000.0,
+        });
+        if by_model {
+            payload["models"] = json!(
+                models
+                    .values()
+                    .map(|entry| json!({
+                        "provider": entry.provider,
+                        "model": entry.model,
+                        "llm_calls": entry.calls,
+                        "tokens_input": entry.tokens_input,
+                        "tokens_output": entry.tokens_output,
+                        "tokens_cached_input": entry.tokens_cached_input,
+                        "tokens_cache_creation_input": entry.tokens_cache_creation_input,
+                        "input_rate": entry.input_rate,
+                        "cache_read_rate": entry.cache_read_rate,
+                        "cache_creation_rate": entry.cache_creation_rate,
+                        "output_rate": entry.output_rate,
+                        "cost_microusd": entry.cost_microusd,
+                        "unpriced_calls": entry.unpriced_calls,
+                    }))
+                    .collect::<Vec<_>>()
+            );
+        }
+        println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
     }
     println!("run\tstate\tgenerator\ttokens(in/out/cached/creation)\tcalls\tcost\tunpriced");
