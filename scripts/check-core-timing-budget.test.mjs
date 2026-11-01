@@ -82,6 +82,20 @@ test("v2 profile budgets only Linux exact-cache-hit rustc-1.99.1 default workspa
   );
 });
 
+test("default workspace ceiling follows its recorded sample", () => {
+  // The policy comment records the exact-hit sample the v2 ceiling comes
+  // from; recompute it so the constant cannot drift from that evidence.
+  const sample = [103, 121, 123, 127];
+  const mean = sample.reduce((sum, value) => sum + value, 0) / sample.length;
+  const variance =
+    sample.reduce((sum, value) => sum + (value - mean) ** 2, 0) /
+    (sample.length - 1);
+  assert.equal(
+    Math.ceil(mean + 3 * Math.sqrt(variance)),
+    Number(budgetFor("default workspace")),
+  );
+});
+
 test("budget verdict is synthetic: within at the bound, exceeded above it", () => {
   let r = bash(
     `source scripts/check-core.sh
@@ -131,7 +145,7 @@ echo "rc=$?"`,
 });
 
 test("timed wrapper keeps output, fails on exceed, preserves prior failure", () => {
-  // Within budget: instant command passes with the v1 budget line.
+  // Within budget: instant command passes with the budget line.
   let r = bash(
     `source scripts/check-core.sh
 unset GITHUB_STEP_SUMMARY
