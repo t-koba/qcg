@@ -1,13 +1,11 @@
 use contract::NodeDef;
 use engine::{StepContext, StepError};
 use serde::de::{DeserializeOwned, Error as _};
-use serde_json::{Value, value::RawValue};
+use serde_json::Value;
 
 /// Preserve number tokens until syntax and the evaluator's numeric range are checked.
 pub(crate) fn parse_json<T: DeserializeOwned>(bytes: &[u8]) -> serde_json::Result<T> {
-    let raw: &RawValue = serde_json::from_slice(bytes)?;
-    contract::validate_json_number_tokens(raw.get()).map_err(serde_json::Error::custom)?;
-    serde_json::from_str(raw.get())
+    contract::parse_json_guarded(bytes).map_err(serde_json::Error::custom)
 }
 
 /// Recursively merges `overlay` into `base`. Objects merge key-by-key with

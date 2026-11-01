@@ -170,8 +170,8 @@ pub(crate) async fn run_eval(
     json_output: bool,
 ) -> Result<EvalReport> {
     let source = files::read_bounded(suite_path, None)?;
-    let suite: EvalSuite = serde_json::from_slice(&source)
-        .with_context(|| format!("invalid eval suite `{suite_path}`"))?;
+    let suite: EvalSuite = contract::parse_json_guarded(&source)
+        .map_err(|error| anyhow::anyhow!("invalid eval suite `{suite_path}`: {error}"))?;
     validate_eval_suite(&suite)?;
     let generator_contract = Contract::load(&generator)
         .with_context(|| format!("failed to load eval generator `{generator}`"))?;
@@ -791,6 +791,43 @@ mod tests {
             error.to_string().contains("numbers must be integers"),
             "unexpected message: {error}"
         );
+    }
+
+    #[test]
+    fn eval_suite_assertions_enforce_raw_integer_bounds() {
+        let ok: EvalSuite = contract::parse_json_guarded(
+            r#"{"name": "suite", "cases": [{"name": "case", "assertions": [{"type": "manifest_pointer", "pointer": "/value", "equals": 9223372036854775807}]}]}"#
+                .as_bytes(),
+        )
+        .expect("in-range integer expectation must pass");
+        let [EvalAssertion::ManifestPointer { equals, .. }] = &ok.cases[0].assertions[..] else {
+            panic!("expected a manifest pointer assertion");
+        };
+        assert_eq!(equals.as_i64(), Some(i64::MAX));
+
+        let error = contract::parse_json_guarded::<EvalSuite>(
+            r#"{"name": "suite", "cases": [{"name": "case", "assertions": [{"type": "manifest_pointer", "pointer": "/value", "equals": 18446744073709551616}]}]}"#
+                .as_bytes(),
+        )
+        .expect_err("out-of-range expectation must be refused");
+        assert!(error.contains("numbers must be integers"), "{error}");
+
+        let error = contract::parse_json_guarded::<EvalSuite>(
+            r#"{"name": "suite", "cases": [{"name": "case", "assertions": [{"type": "artifact_json_schema", "path": "out.json", "schema": {"type": "integer", "maximum": 18446744073709551616}}]}]}"#
+                .as_bytes(),
+        )
+        .expect_err("out-of-range schema bound must be refused");
+        assert!(error.contains("numbers must be integers"), "{error}");
+
+        let ok: EvalSuite = contract::parse_json_guarded(
+            r#"{"name": "suite", "cases": [{"name": "case", "assertions": [{"type": "manifest_pointer", "pointer": "/ratio", "equals": 0.5}]}]}"#
+                .as_bytes(),
+        )
+        .expect("finite float expectation must pass");
+        let [EvalAssertion::ManifestPointer { equals, .. }] = &ok.cases[0].assertions[..] else {
+            panic!("expected a manifest pointer assertion");
+        };
+        assert_eq!(equals.as_f64(), Some(0.5));
     }
 
     #[test]

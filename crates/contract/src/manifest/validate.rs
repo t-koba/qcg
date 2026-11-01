@@ -271,6 +271,17 @@ pub fn validate_input_scalar_token(raw: &str) -> Result<(), ContractError> {
     validate_json_number_tokens(raw).map_err(ContractError::Invalid)
 }
 
+/// Deserializes JSON after the number-token guard accepted every number in it.
+///
+/// Out-of-range integers and non-finite floats fail before conversion to the
+/// target type, so a typed reader cannot round a token the product refuses.
+pub fn parse_json_guarded<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
+    let raw: &serde_json::value::RawValue =
+        serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    validate_json_number_tokens(raw.get())?;
+    serde_json::from_str(raw.get()).map_err(|error| error.to_string())
+}
+
 /// Validates the number tokens in already-validated raw JSON before conversion to `Value`.
 ///
 /// Callers must first ensure the text is syntactically valid JSON (for example, by
