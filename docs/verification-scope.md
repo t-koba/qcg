@@ -41,13 +41,15 @@ npm verification includes development dependencies. Vite/Vitest/esbuild/
 Playwright/Hey API execute on developer or CI machines. Svelte
 runtime and compiled application/WASM ship in the SPA; the build tools and
 Node modules do not ship as server endpoints. `npm audit --audit-level=moderate`
-is a required gate, with the lockfile reviewed instead of force-upgrading
-outside parent compatibility constraints.
+is a required gate: the lockfile is reviewed rather than force-upgraded outside
+parent compatibility constraints, and where a dependency pins a vulnerable
+transitive version exactly, an npm `overrides` entry pins the fixed version
+instead of a fork or a vendored patch.
 
 ## OpenAPI declaration generation
 
 Both API generation entry points use `frontend/generator/scripts/openapi-types.mjs`:
-unmodified `@hey-api/openapi-ts` 0.97.1 translates schemas, then qcg adapts its
+unmodified `@hey-api/openapi-ts` 0.97.3 translates schemas, then qcg adapts its
 TypeScript AST into the legacy `paths`, `webhooks`, `components`, `$defs` and
 `operations` exports. TypeScript is pinned to 5.9.3; the 7.x peer is incompatible
 with this generator's `NewLineKind.LineFeed` usage. Generated declarations carry

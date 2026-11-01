@@ -34,7 +34,7 @@ export async function openapiTypes(spec) {
     return { name, type: `components[${quote(section)}][${quote(name)}]` };
   };
   function normalize(schema, where) {
-    // Hey API 0.97.1 drops boolean-true object properties; {} preserves unknown.
+    // A boolean-true schema becomes {} so unknown properties stay permitted.
     if (schema === true) return {};
     if (schema === false) fail(where, 'boolean-false schema');
     if (!schema || typeof schema !== 'object' || Array.isArray(schema)) fail(where, 'expected schema');
