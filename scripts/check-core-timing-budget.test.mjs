@@ -257,7 +257,12 @@ echo "rc=$?"`,
     assert.match(text, /timing_budget_policy=v2/);
     assert.match(text, /budgets_s=\{default workspace:151; MCP no-default:16; server no-default:48;/);
     assert.match(text, /MCP live server:27; MCP no-default live server:24\}/);
-    assert.match(text, /timing_budget_basis=Each Linux invocation ceiling is ceil\(mean\+3\*sample_sd\) of the exact-cache-hit sample/);
+    assert.ok(
+      text.includes(
+        "timing_budget_basis=Each Linux invocation ceiling is ceil(mean+3*sample_sd) of the exact-cache-hit sample its regime records in the policy comment; three SD is an engineering margin, not a calibrated false-alarm guarantee.",
+      ),
+      "timing summary must carry the complete basis sentence",
+    );
     assert.match(
       text,
       /\| invocation \| result \| elapsed_s \| budget_s \| budget_result \|/,
