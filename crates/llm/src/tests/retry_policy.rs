@@ -212,7 +212,7 @@ fn registry_owns_policy_and_rejects_invalid_rules() {
     }
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn reqwest_connect_and_body_facts_are_not_inferred_from_messages() {
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -235,10 +235,10 @@ async fn reqwest_connect_and_body_facts_are_not_inferred_from_messages() {
 
     // A request can time out after dispatch while waiting for response headers.
     // Keep a loopback connection open until reqwest times out, and synchronize
-    // on the server reading the request rather than relying on a sleep.
+    // on the server reading the request before pausing and advancing time.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
-    let (received_tx, received_rx) = std::sync::mpsc::channel();
+    let (received_tx, received_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
@@ -252,14 +252,19 @@ async fn reqwest_connect_and_body_facts_are_not_inferred_from_messages() {
         .timeout(Duration::from_secs(1))
         .build()
         .unwrap();
-    let raw = client
-        .get(format!("http://{address}"))
-        .send()
-        .await
-        .unwrap_err();
+    let request = client.get(format!("http://{address}"));
+    let pending = tokio::spawn(async move { request.send().await });
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), received_rx)
+            .await
+            .unwrap()
+            .unwrap()
+    );
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let raw = pending.await.unwrap().unwrap_err();
     assert!(raw.is_timeout());
     assert!(!raw.is_connect());
-    assert!(received_rx.recv_timeout(Duration::from_secs(5)).unwrap());
     let mapped = llm_http_error(raw);
     assert_eq!(mapped.kind, LlmErrorKind::TimedOut);
     assert_eq!(mapped.facts, TransportFacts::default());
