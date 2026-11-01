@@ -42,7 +42,7 @@ qcg_rustc_version() {
   fi
 }
 # Prints the whole-command budget in seconds for a label, or nothing when
-# the v1 profile does not apply. Never fails.
+# the current budget profile does not apply. Never fails.
 qcg_test_time_budget_for_label() {
   local label="$1"
   local budget
@@ -73,7 +73,7 @@ qcg_test_time_budget_for_label() {
   fi
   printf '%s' "$budget"
 }
-# Checks one elapsed measurement against the v1 profile. Prints an
+# Checks one elapsed measurement against the current budget profile. Prints an
 # actionable failure to stderr and returns 1 only when a budget applies and
 # is exceeded; returns 0 for within-budget or no-budget.
 qcg_test_time_check_budget() {

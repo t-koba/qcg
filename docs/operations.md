@@ -45,8 +45,9 @@ takes one directory lock. `shared-filesystem` enables active-active services
 when the underlying storage provides reliable advisory locks: run-level leases
 prevent duplicate execution, abandoned work is rescanned every 5 seconds by
 default (`SHARED_RESCAN_SECS`, default `5`, range `1..=3600`), and non-owner
-services follow the durable journal for SSE delivery (roughly 250 ms poll
-granularity rather than the rescan interval). Each process
+services follow the durable journal for SSE delivery (roughly the
+`JOURNAL_POLL_INTERVAL_MS` cadence, 250 ms by default, rather than the rescan
+interval). Each process
 carries an owner id; answers, approvals, and cancel requests are journaled
 durably (`user_answered`, `user_confirmed`, `user_cancel_requested`) so the
 owner merges peer progress on refresh and resumes answered prompts. Cancel

@@ -252,7 +252,8 @@ copying OAuth tokens, and tokens are kept in the OS keyring by default.
 The default `exclusive` store locks `--runs-dir`. `shared-filesystem` permits
 multiple services over a filesystem with reliable advisory locks, uses a
 run-level execution lease to prevent duplicate execution, polls for abandoned
-runs every 5 seconds, and follows journals written by another process. Each API
+runs every `SHARED_RESCAN_SECS` (5 seconds by default), and follows journals
+written by another process. Each API
 run has a UUID-based ID and separate `meta/journal.jsonl`
 and `workspace/` paths. Direct `qcg run --output` invocations reject concurrent
 use of the same output directory.
@@ -349,13 +350,13 @@ path is unchanged. Only offline mocks have been tested, not real accounts. See
   declared `mcp` tool selects an explicit `[[mcp_server]]` row. The selected
   hosts or exact stdio command must still be listed in the contract's
   permissions; there is no implicit fallback.
-- `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST`: optional per-credential
-  token bucket for the HTTP server. Unset `RATE_LIMIT_RPS` disables rate
+- `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST`: optional token bucket for the
+  HTTP server. Unset `RATE_LIMIT_RPS` disables rate
   limiting only when no companion rate-limit setting is present;
   `RATE_LIMIT_BURST` defaults to the rps value. Buckets are keyed by the
   configured `RATE_LIMIT_IDENTITY_HEADER` value when it is set and non-blank,
   else by a verified bearer credential, else one anonymous bucket, so
-  credentials never share a budget. Requests over the limit receive `429`
+  callers keyed apart never share a budget. Requests over the limit receive `429`
   with `Retry-After`; `GET /healthz` is exempt. Invalid values, zero, or any
   companion setting without an rps refuse boot.
 - `RATE_LIMIT_MAX_IDENTITIES` (default `4096`, range `1..=65536`) and

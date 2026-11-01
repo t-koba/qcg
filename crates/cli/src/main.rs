@@ -738,13 +738,13 @@ async fn run_async() -> Result<std::process::ExitCode> {
     Ok(std::process::ExitCode::SUCCESS)
 }
 
-/// Resolves the instance bearer token: an explicit flag or `API_TOKEN`
-/// wins, then `API_TOKEN_FILE` (the only documented file source). An
-/// unreadable or empty file fails closed instead of booting unauthenticated.
 fn command_hint(args: &str) -> String {
     policy::binary_stem().map_or_else(|| args.to_owned(), |stem| format!("{stem} {args}"))
 }
 
+/// Resolves the instance bearer token: an explicit flag or `API_TOKEN`
+/// wins, then `API_TOKEN_FILE` (the only documented file source). An
+/// unreadable or empty file fails closed instead of booting unauthenticated.
 fn resolve_api_token(explicit: Option<String>) -> anyhow::Result<Option<String>> {
     if explicit.is_some() {
         return Ok(explicit);
@@ -860,8 +860,7 @@ mod tests {
         if env_process::isolated() {
             return;
         }
-        // SAFETY: this test owns SERVICE_NAME in this process; no other test in
-        // the binary reads or writes it.
+        // SAFETY: the isolated child process owns this environment.
         unsafe {
             std::env::set_var("SERVICE_NAME", "llm-gateway");
         }

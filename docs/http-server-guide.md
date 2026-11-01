@@ -72,7 +72,8 @@ Every API run gets a UUID-based ID and an isolated directory under
 The default `--run-store exclusive` takes one filesystem lock on `--runs-dir`.
 `--run-store shared-filesystem` allows multiple services on storage with
 reliable advisory locking. A run-level lease admits exactly one executor;
-services rescan every 5 seconds to recover work after an owner exits, and SSE
+services rescan every `SHARED_RESCAN_SECS` (5 seconds by default) to recover
+work after an owner exits, and SSE
 polls the durable journal when the owner is another process. Process-local
 `--max-active-runs` limits still need external capacity planning.
 
