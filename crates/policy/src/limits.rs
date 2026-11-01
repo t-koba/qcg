@@ -24,13 +24,12 @@ pub const MAX_LIVE_EVENT_CHANNEL_CAPACITY: usize = 65_536;
 pub const MIN_JOURNAL_POLL_INTERVAL_MILLIS: u64 = 50;
 pub const MAX_JOURNAL_POLL_INTERVAL_MILLIS: u64 = 5_000;
 
-/// Inclusive mechanism bounds for shared-store rescan and the queued
-/// resumer cadence, in seconds.
+/// Bounds and defaults for the shared-store rescan and queued-resumer cadence (s).
 pub const MIN_STORE_RESCAN_SECS: u64 = 1;
 pub const MAX_STORE_RESCAN_SECS: u64 = 3_600;
+pub const DEFAULT_STORE_RESCAN_SECS: u64 = 5;
+pub const DEFAULT_QUEUED_RESUMER_SECS: u64 = 5;
 
-/// Default in-memory scan window for journal tail repair and seq
-/// recovery. The mechanism bounds keep repair memory flat.
 pub const DEFAULT_JOURNAL_SCAN_WINDOW_BYTES: usize = 1024 * 1024;
 pub const MIN_JOURNAL_SCAN_WINDOW_BYTES: usize = 4_096;
 pub const MAX_JOURNAL_SCAN_WINDOW_BYTES: usize = 64 * 1024 * 1024;

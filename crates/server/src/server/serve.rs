@@ -207,13 +207,13 @@ pub fn resolve_server_policy_with_container_timeouts(
     let retention = policy::RetentionPolicy::from_env()?;
     let shared_store_rescan_secs = policy::parse_bounded_env(
         "SHARED_RESCAN_SECS",
-        5,
+        policy::DEFAULT_STORE_RESCAN_SECS,
         policy::MIN_STORE_RESCAN_SECS,
         policy::MAX_STORE_RESCAN_SECS,
     )?;
     let queued_resumer_secs = policy::parse_bounded_env(
         "QUEUED_RESUMER_SECS",
-        5,
+        policy::DEFAULT_QUEUED_RESUMER_SECS,
         policy::MIN_STORE_RESCAN_SECS,
         policy::MAX_STORE_RESCAN_SECS,
     )?;
@@ -2371,6 +2371,14 @@ command = ["sh", "-c", "sleep 30"]"#,
         assert_eq!(
             policy.journal_poll_interval_millis,
             policy::JOURNAL_POLL_INTERVAL_MILLIS
+        );
+        assert_eq!(
+            policy.shared_store_rescan_secs,
+            policy::DEFAULT_STORE_RESCAN_SECS
+        );
+        assert_eq!(
+            policy.queued_resumer_secs,
+            policy::DEFAULT_QUEUED_RESUMER_SECS
         );
         assert_eq!(policy.shutdown_drain.as_secs(), 30);
         assert_eq!(policy.shutdown_settle.as_secs(), 150);

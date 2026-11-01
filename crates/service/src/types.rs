@@ -94,8 +94,8 @@ impl Default for ServiceDeploymentPolicy {
             live_event_channel_capacity: policy::LIVE_EVENT_CHANNEL_CAPACITY,
             journal_poll_interval_millis: policy::JOURNAL_POLL_INTERVAL_MILLIS,
             max_directory_scan_entries: policy::DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES,
-            shared_store_rescan_secs: 5,
-            queued_resumer_secs: 5,
+            shared_store_rescan_secs: policy::DEFAULT_STORE_RESCAN_SECS,
+            queued_resumer_secs: policy::DEFAULT_QUEUED_RESUMER_SECS,
         }
     }
 }
