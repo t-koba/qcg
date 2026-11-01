@@ -301,3 +301,70 @@ async fn snapshot_exposes_generator_id_without_parsing_run_id() {
     );
     let _ = std::fs::remove_dir_all(&runs);
 }
+
+#[tokio::test]
+async fn cost_metrics_treat_unmetered_search_as_unpriced() {
+    let root = temp_run_dir("search-priced");
+    let _ = std::fs::remove_dir_all(&root);
+    let service = test_service(vec![], root.clone());
+    let contract_dir = root.join("contract");
+    std::fs::create_dir_all(&contract_dir).unwrap();
+    std::fs::write(
+        contract_dir.join(contract::MANIFEST_FILE),
+        r#"
+[generator]
+id = "search-fixture"
+name = "Search Fixture"
+version = "0.1.0"
+
+[llm]
+max_tokens = 1024
+[llm.model]
+provider = "provider"
+model = "model"
+input_cost_per_million_usd = 2.0
+output_cost_per_million_usd = 10.0
+
+[[flow]]
+id = "emit"
+type = "write"
+params = { content = "x", output_file = "x.txt" }
+"#,
+    )
+    .unwrap();
+    let generator_path = contract_dir.as_str();
+    let meta = root.join("search-call").join("meta");
+    std::fs::create_dir_all(&meta).unwrap();
+    let journal =
+        engine::JournalWriter::create(&meta.join("journal.jsonl"), "search-call", false, None)
+            .unwrap();
+    journal
+        .event(
+            "run_started",
+            json!({"generator": "search-fixture@0.1.0",
+                "generator_path": generator_path,
+                "contract_sha256": "test", "inputs": {},
+                "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                "elapsed_budget_mode": "wall_clock"}),
+        )
+        .unwrap();
+    journal
+        .event(
+            "llm_call",
+            json!({"node": "generate", "provider": "provider", "model": "model",
+                "max_tokens": 16,
+                "tokens": {"input": 100, "output": 20, "cached_input": 0},
+                "cost_microusd": 42,
+                "web_search": {"calls": null, "cost_microusd": null}}),
+        )
+        .unwrap();
+    journal
+        .event("run_finished", json!({"status": "success"}))
+        .unwrap();
+    let costs = service
+        .run_cost_metrics("search-call".into())
+        .await
+        .expect("cost metrics should load");
+    assert!(!costs.priced, "unmetered hosted search must report risk");
+    let _ = std::fs::remove_dir_all(&root);
+}

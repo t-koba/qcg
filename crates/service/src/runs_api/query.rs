@@ -745,13 +745,14 @@ impl LocalService {
         // Pricing coverage degrades loudly, never silently: an unloadable
         // contract reports totals as potentially understated instead of
         // failing metrics the journal already supports.
-        let priced = match self.pricing_covered(journal_events, &run_dir).await {
-            Ok(priced) => priced,
-            Err(error) => {
-                tracing::warn!(run_id = %id, %error, "pricing coverage check failed; reporting unpriced");
-                false
-            }
-        };
+        let priced = !state.budget.unresolved_search_cost
+            && match self.pricing_covered(journal_events, &run_dir).await {
+                Ok(priced) => priced,
+                Err(error) => {
+                    tracing::warn!(run_id = %id, %error, "pricing coverage check failed; reporting unpriced");
+                    false
+                }
+            };
         Ok(RunCostMetrics {
             run_id: id,
             state: state
@@ -766,9 +767,8 @@ impl LocalService {
         })
     }
 
-    /// True when every billed LLM call resolves to contract pricing.
-    /// Unpriced calls may understate the total, so callers must surface this.
-    /// Takes already-read events so pricing never re-scans the journal.
+    /// True when every billed LLM call resolves to contract pricing; unpriced
+    /// calls may understate the total. Takes already-read events.
     pub(super) async fn pricing_covered(
         &self,
         events: &[api::RunEvent],

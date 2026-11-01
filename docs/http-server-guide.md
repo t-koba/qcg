@@ -106,7 +106,8 @@ event, artifact, and journal routes. Principal paths include:
 - `GET /api/runs/{id}/journal`
 - `GET /api/runs/{id}/metrics` returns cost totals (`tokens_*`,
   `llm_calls`, `cost_microusd`, `cost_usd`, `duration_ms`) with a `priced`
-  flag that is false when billed calls lacked contract pricing
+  flag that is false when billed calls lacked contract pricing or the run
+  recorded an unmetered hosted-search charge
 
 ### Invalidating a successful result
 
