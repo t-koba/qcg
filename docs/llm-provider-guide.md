@@ -208,7 +208,12 @@ Fields:
   `anthropic_messages` only (adding `cache_control: {"ttl": "1h"}` to every
   cache marker the row emits, system and top-level automatic markers). Setting
   `prompt_cache_retention` requires `capabilities.prompt_cache` on the
-  effective row/model. Azure GPT-5.6+ supports only
+  effective row/model. A cache write is priced by the lifetime qcg requests:
+  a default-lifetime write bills at the model's
+  `cache_creation_input_cost_per_million_usd`, while an `extended` request
+  bills writes at the ordinary input rate times the provider's long-lifetime
+  multiplier (`ttl_1h` 2x, `ttl_12h` 2.5x); `retention_24h` is a retention
+  policy, so it keeps the default write rate. Azure GPT-5.6+ supports only
   `prompt_cache_options.ttl: "30m"`, not an `extended` tier; older Azure models
   use the separate `prompt_cache_retention` control. These are cache-lifetime
   controls, not data-retention policies or deletion guarantees. Official

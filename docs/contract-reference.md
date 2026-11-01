@@ -81,8 +81,10 @@ Fields:
   contract rates override catalog prices field by field; unspecified fields may
   use the catalog's matching model price. `require_pricing` requires ordinary
   input/output prices and resolved cache prices for any nonzero cache usage;
-  an Extended TTL derives the creation price from ordinary input, so that
-  derived price satisfies the requirement. Before dispatch, even without a cost
+  an Extended TTL derives the creation price from ordinary input times the
+  provider's long-lifetime multiplier (`ttl_1h` 2x, `ttl_12h` 2.5x; a
+  `retention_24h` row is a retention policy and keeps the default write rate),
+  so that derived price satisfies the requirement. Before dispatch, even without a cost
   cap or known cache usage, required pricing checks resolved cache reads and
   creation in every reachable base/tier row. A requested provider-hosted search
   with an unknown billable count or positive units without a rate fails after
