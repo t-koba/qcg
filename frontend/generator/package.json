@@ -23,6 +23,9 @@
     "vitest": "4.1.12",
     "esbuild": "0.25.12",
     "playwright": "1.63.0",
-    "@hey-api/openapi-ts": "0.97.1"
+    "@hey-api/openapi-ts": "0.97.3"
+  },
+  "overrides": {
+    "js-yaml": "4.3.2"
   }
 }
