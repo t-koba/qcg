@@ -82,26 +82,29 @@ test("v2 profile budgets only Linux exact-cache-hit rustc-1.99.1 default workspa
   );
 });
 
-test("default workspace ceiling follows its recorded sample", () => {
-  // Read the evidence from the policy comment itself, so the sample, its
-  // statistics, the documented ceiling and the constant cannot drift apart.
+test("every timing ceiling follows its recorded evidence", () => {
+  // Each ceiling line records the sample statistics it came from, so the
+  // recorded statistics, the documented ceiling and the constant must agree.
   const policy = readFileSync("scripts/check-core.sh", "utf8");
-  const recorded = policy.match(
-    /measured ([\d, ]+and \d+) s \(mean ([\d.]+), sample SD ([\d.]+)\)/,
-  );
-  assert.ok(recorded, "policy comment must record the exact-hit sample");
-  const sample = recorded[1].replace(" and ", ", ").split(", ").map(Number);
-  const mean = sample.reduce((sum, value) => sum + value, 0) / sample.length;
-  const sd = Math.sqrt(
-    sample.reduce((sum, value) => sum + (value - mean) ** 2, 0) /
-      (sample.length - 1),
-  );
-  assert.equal(mean.toFixed(1), Number(recorded[2]).toFixed(1));
-  assert.equal(sd.toFixed(2), Number(recorded[3]).toFixed(2));
-  const documented = policy.match(/rule to that regime -> (\d+)s/);
-  assert.ok(documented, "policy comment must record the ceiling");
-  assert.equal(Math.ceil(mean + 3 * sd), Number(documented[1]));
-  assert.equal(Number(documented[1]), Number(budgetFor("default workspace")));
+  const lines = [
+    ...policy.matchAll(
+      /^#   (.+): mean ([\d.]+), sample SD ([\d.]+), max (\d+) -> (\d+)s$/gm,
+    ),
+  ];
+  assert.equal(lines.length, 5, "policy comment must record all five ceilings");
+  for (const [, label, mean, sd, max, ceiling] of lines) {
+    assert.equal(
+      Math.ceil(Number(mean) + 3 * Number(sd)),
+      Number(ceiling),
+      `${label}: ceiling must be ceil(mean+3*sample_SD)`,
+    );
+    assert.ok(Number(max) <= Number(ceiling), `${label}: max must fit the ceiling`);
+    assert.equal(
+      Number(ceiling),
+      Number(budgetFor(label)),
+      `${label}: recorded ceiling must equal the configured budget`,
+    );
+  }
 });
 
 test("budget verdict is synthetic: within at the bound, exceeded above it", () => {

@@ -11,20 +11,21 @@ _qcg_test_time_artifact="target/qcg-test-time-${GITHUB_RUN_ID:-local}-${GITHUB_R
 
 # Measured invocation budget v2 (Bash SECONDS whole-command invocation
 # wall time, including Cargo/build overhead; NOT test-only timing).
-# Evidence: exact-cache-hit Linux whole-command observations. The four small
-# invocations keep the v1 sample (n=16: 15 historical plus run 40102552370 /
-# SHA 3ffa8bed), mean/sample-SD/observed-max -> ceiling: MCP no-default
-# 12.00/1.26/14 -> 16s; server no-default 33.81/4.68/41 -> 48s; MCP live
-# server 19.94/2.26/24 -> 27s; MCP no-default live server 18.44/1.67/21 -> 24s.
-# The default workspace runs in a slower regime: four later exact-hit passes
-# measured 103, 121, 123 and 127 s (mean 118.5, sample SD 10.63), so v2
-# applies the same ceil(mean+3*sample_SD) rule to that regime -> 151s. Each ceiling is
-# therefore ceil(mean+3*sample_SD) of the sample that describes its current
-# regime. Three SD is an engineering envelope, not a calibrated false-alarm
-# guarantee; changing thresholds requires a new policy version and fresh
-# evidence. Apply only with RUNNER_OS=Linux, cargo exact cache hit=true and
-# rustc=1.99.1. Other OS/groups, cache/setup brackets, CI job duration and
-# run/day totals remain unbudgeted.
+# Evidence: exact-cache-hit Linux whole-command observations. Each ceiling is
+# ceil(mean+3*sample_SD) of the sample that describes its current regime; the
+# small invocations keep the v1 sample (n=16: 15 historical plus run
+# 40102552370 / SHA 3ffa8bed) and the default workspace uses four later passes
+# (103, 121, 123, 127 s). One parseable line per ceiling:
+#   MCP no-default: mean 12.00, sample SD 1.26, max 14 -> 16s
+#   server no-default: mean 33.81, sample SD 4.68, max 41 -> 48s
+#   MCP live server: mean 19.94, sample SD 2.26, max 24 -> 27s
+#   MCP no-default live server: mean 18.44, sample SD 1.67, max 21 -> 24s
+#   default workspace: mean 118.50, sample SD 10.63, max 127 -> 151s
+# Three SD is an engineering envelope, not a calibrated false-alarm guarantee;
+# changing thresholds requires a new policy version and fresh evidence. Apply
+# only with RUNNER_OS=Linux, cargo exact cache hit=true and rustc=1.99.1. Other
+# OS/groups, cache/setup brackets, CI job duration and run/day totals remain
+# unbudgeted.
 # Focused tests synthesize elapsed time through Bash SECONDS; production
 # policy values are fixed here and cannot be raised through the environment.
 QCG_TEST_TIME_BUDGET_POLICY_VERSION=v2
