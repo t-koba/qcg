@@ -15,6 +15,21 @@ pub fn read_run_generator_path(run_dir: &Utf8Path) -> Result<Utf8PathBuf, Servic
     Ok(Utf8PathBuf::from(&started.generator_path))
 }
 
+/// The run's pinned generator package directory when one was admitted.
+pub fn run_generator_root(run_dir: &Utf8Path) -> Result<Option<Utf8PathBuf>, ServiceError> {
+    let events = read_durable_run_events(run_dir)?;
+    let (_, started) = run_identity_event(run_dir, &events)?;
+    let Some(package_sha256) = started.package_sha256.as_deref() else {
+        return Ok(None);
+    };
+    crate::run_package::load_identity(
+        run_dir,
+        Some(package_sha256),
+        Some(&started.contract_sha256),
+    )?;
+    Ok(Some(crate::run_package::package_dir(run_dir)))
+}
+
 /// The contract the run used: pinned package bytes, or the recorded path for legacy runs.
 pub fn load_run_contract(run_dir: &Utf8Path) -> Result<contract::Contract, ServiceError> {
     let events = read_durable_run_events(run_dir)?;
@@ -264,6 +279,53 @@ params = {{ content = "x", output_file = "x.txt" }}
         write_contract(&source, 5.0);
         let loaded = load_run_contract(&run).unwrap();
         assert_eq!(input_rate(&loaded), Some(5.0));
+        assert!(run_generator_root(&run).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pinned_generator_root_survives_a_deleted_source() {
+        let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!("qcg-pinned-root-{}", uuid::Uuid::now_v7()));
+        let source = root.join("source");
+        write_contract(&source, 2.0);
+        let original = Contract::load(&source).unwrap();
+        let package_sha256 = package_identity_sha256(&source, &PackageLimits::default()).unwrap();
+        let run = root.join("run");
+        let package = run.join("generator-package");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::copy(
+            source.join(contract::MANIFEST_FILE),
+            package.join(contract::MANIFEST_FILE),
+        )
+        .unwrap();
+        write_run(&run, &source, Some(&package_sha256), &original.sha256);
+        std::fs::remove_dir_all(&source).unwrap();
+        assert_eq!(run_generator_root(&run).unwrap(), Some(package));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pinned_generator_root_refuses_a_changed_package() {
+        let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!("qcg-pinned-root-bad-{}", uuid::Uuid::now_v7()));
+        let source = root.join("source");
+        write_contract(&source, 2.0);
+        let original = Contract::load(&source).unwrap();
+        let package_sha256 = package_identity_sha256(&source, &PackageLimits::default()).unwrap();
+        let run = root.join("run");
+        let package = run.join("generator-package");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::copy(
+            source.join(contract::MANIFEST_FILE),
+            package.join(contract::MANIFEST_FILE),
+        )
+        .unwrap();
+        write_run(&run, &source, Some(&package_sha256), &original.sha256);
+        write_contract(&package, 5.0);
+        assert!(run_generator_root(&run).is_err());
         let _ = std::fs::remove_dir_all(root);
     }
 }

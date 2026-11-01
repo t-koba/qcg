@@ -169,7 +169,9 @@ JSON event output go to stdout.
 - `qcg runs replay <id> [generator] [--runs-dir dir] [--output dir]
   [--reuse-seed] [--answer id=value]... [--confirm id=approve|deny]...
   [--confirmations-file file.json] [--json]` re-executes the recorded inputs
-  with re-specified answers and confirmations for unattended completion.
+  with re-specified answers and confirmations for unattended completion. A run
+  with a pinned generator package replays those bytes; the recorded source path
+  is used only for legacy runs without a pinned identity.
 - `qcg runs fork <id> --at-seq N [--state-patch patch.json]
   [--answer id=value]... [--confirm id=approve|deny]...
   [--confirmations-file file.json] [--runs-dir dir] [--json]` restores
