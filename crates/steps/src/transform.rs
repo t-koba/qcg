@@ -146,14 +146,7 @@ impl StepExecutor for TransformStep {
                     .secrets
                     .inject_declared_placeholders(&text, &params.secrets)
                     .map_err(|error| StepError::failed(&node.id, error))?;
-                write_transform_output(
-                    &ctx.run.fs,
-                    &node.id,
-                    &target_path,
-                    injected.as_bytes(),
-                    output_limit,
-                )
-                .await?;
+                write_output(ctx, node, &target_path, injected.as_bytes(), output_limit).await?;
             }
             "json_pretty" => {
                 let text = bounded_transform_text(&ctx.run.fs, &source_path, transform_limit)
@@ -161,14 +154,7 @@ impl StepExecutor for TransformStep {
                     .map_err(|error| StepError::failed(&node.id, error))?;
                 let value: Value = parse_json(text.as_bytes())?;
                 let rendered = serde_json::to_string_pretty(&value)? + "\n";
-                write_transform_output(
-                    &ctx.run.fs,
-                    &node.id,
-                    &target_path,
-                    rendered.as_bytes(),
-                    output_limit,
-                )
-                .await?;
+                write_output(ctx, node, &target_path, rendered.as_bytes(), output_limit).await?;
                 value_output = Some(value);
             }
             "json_compact" => {
@@ -177,14 +163,7 @@ impl StepExecutor for TransformStep {
                     .map_err(|error| StepError::failed(&node.id, error))?;
                 let value: Value = parse_json(text.as_bytes())?;
                 let rendered = serde_json::to_string(&value)? + "\n";
-                write_transform_output(
-                    &ctx.run.fs,
-                    &node.id,
-                    &target_path,
-                    rendered.as_bytes(),
-                    output_limit,
-                )
-                .await?;
+                write_output(ctx, node, &target_path, rendered.as_bytes(), output_limit).await?;
                 value_output = Some(value);
             }
             "toml_to_json" => {
@@ -196,14 +175,7 @@ impl StepExecutor for TransformStep {
                 })?;
                 let value = serde_json::to_value(value)?;
                 let rendered = serde_json::to_string_pretty(&value)? + "\n";
-                write_transform_output(
-                    &ctx.run.fs,
-                    &node.id,
-                    &target_path,
-                    rendered.as_bytes(),
-                    output_limit,
-                )
-                .await?;
+                write_output(ctx, node, &target_path, rendered.as_bytes(), output_limit).await?;
                 value_output = Some(value);
             }
             "json_merge" => {
@@ -232,14 +204,7 @@ impl StepExecutor for TransformStep {
                 merge_json_objects(&mut base, &overlay);
                 let rendered = serde_json::to_string_pretty(&base)?;
                 let rendered = rendered + "\n";
-                write_transform_output(
-                    &ctx.run.fs,
-                    &node.id,
-                    &target_path,
-                    rendered.as_bytes(),
-                    output_limit,
-                )
-                .await?;
+                write_output(ctx, node, &target_path, rendered.as_bytes(), output_limit).await?;
                 value_output = Some(base);
             }
             "json_to_toml" => {
@@ -254,14 +219,7 @@ impl StepExecutor for TransformStep {
                 let text = toml::to_string_pretty(&value).map_err(|error| {
                     StepError::failed(&node.id, format!("failed to encode TOML: {error}"))
                 })?;
-                write_transform_output(
-                    &ctx.run.fs,
-                    &node.id,
-                    &target_path,
-                    text.as_bytes(),
-                    output_limit,
-                )
-                .await?;
+                write_output(ctx, node, &target_path, text.as_bytes(), output_limit).await?;
             }
             "base64_decode" => {
                 let unix_mode = parse_unix_mode(node, rendered_unix_mode.as_deref())?;
@@ -324,6 +282,16 @@ impl StepExecutor for TransformStep {
             files: vec![target_path],
         })
     }
+}
+
+async fn write_output(
+    ctx: &StepContext<'_>,
+    node: &NodeDef,
+    target_path: &camino::Utf8Path,
+    bytes: &[u8],
+    limit: Option<usize>,
+) -> Result<(), StepError> {
+    write_transform_output(&ctx.run.fs, &node.id, target_path, bytes, limit).await
 }
 
 fn transform_params(node: &NodeDef) -> Result<TransformParams, StepError> {
