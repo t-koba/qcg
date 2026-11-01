@@ -83,17 +83,25 @@ test("v2 profile budgets only Linux exact-cache-hit rustc-1.99.1 default workspa
 });
 
 test("default workspace ceiling follows its recorded sample", () => {
-  // The policy comment records the exact-hit sample the v2 ceiling comes
-  // from; recompute it so the constant cannot drift from that evidence.
-  const sample = [103, 121, 123, 127];
-  const mean = sample.reduce((sum, value) => sum + value, 0) / sample.length;
-  const variance =
-    sample.reduce((sum, value) => sum + (value - mean) ** 2, 0) /
-    (sample.length - 1);
-  assert.equal(
-    Math.ceil(mean + 3 * Math.sqrt(variance)),
-    Number(budgetFor("default workspace")),
+  // Read the evidence from the policy comment itself, so the sample, its
+  // statistics, the documented ceiling and the constant cannot drift apart.
+  const policy = readFileSync("scripts/check-core.sh", "utf8");
+  const recorded = policy.match(
+    /measured ([\d, ]+and \d+) s \(mean ([\d.]+), sample SD ([\d.]+)\)/,
   );
+  assert.ok(recorded, "policy comment must record the exact-hit sample");
+  const sample = recorded[1].replace(" and ", ", ").split(", ").map(Number);
+  const mean = sample.reduce((sum, value) => sum + value, 0) / sample.length;
+  const sd = Math.sqrt(
+    sample.reduce((sum, value) => sum + (value - mean) ** 2, 0) /
+      (sample.length - 1),
+  );
+  assert.equal(mean.toFixed(1), Number(recorded[2]).toFixed(1));
+  assert.equal(sd.toFixed(2), Number(recorded[3]).toFixed(2));
+  const documented = policy.match(/rule to that regime -> (\d+)s/);
+  assert.ok(documented, "policy comment must record the ceiling");
+  assert.equal(Math.ceil(mean + 3 * sd), Number(documented[1]));
+  assert.equal(Number(documented[1]), Number(budgetFor("default workspace")));
 });
 
 test("budget verdict is synthetic: within at the bound, exceeded above it", () => {
