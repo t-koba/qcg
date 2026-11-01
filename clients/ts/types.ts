@@ -954,8 +954,8 @@ type QcgModel103 = {
     cost_usd: number;
     metrics: QcgModel112;
     /**
-     * False when any billed call lacked contract pricing, so the total may
-     * understate the true spend.
+     * False when a billed call lacked contract pricing, search is unmetered,
+     * or the pricing contract cannot be resolved; the total may understate.
      */
     priced: boolean;
     run_id: string;
