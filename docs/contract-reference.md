@@ -704,9 +704,10 @@ and `StartRun.answers`, `ForkStatePatch.inputs` and `step_outputs`,
 `ForkRun.answers`, and `AnswerPayload.values`; CLI JSON input files and eval
 suites, `--input key=value` and `--answer key=value` scalars; and
 LLM-generated JSON outputs, HTTP step responses with `output = "json"`,
-structured command stdout (including bundled tools), and JSON files read by
-`json_pretty`, `json_compact`, `json_merge` (both inputs), and `json_to_toml`
-transforms before conversion to step values or output files. Out-of-range
+structured command stdout (including bundled tools), command JSON input
+files, and JSON files read by `json_pretty`, `json_compact`, `json_merge` (both
+inputs), and `json_to_toml` transforms before conversion to step values or
+output files. Out-of-range
 integer tokens are rejected, including inside arrays and objects, rather than
 rounded to floats. Numeric-looking strings and keys are not treated as
 numbers. Decimal/exponent tokens retain finite `f64` semantics; non-finite

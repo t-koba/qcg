@@ -528,7 +528,7 @@ async fn command_input(
                 .map_err(|error| StepError::failed(&node.id, error))?
         }
     };
-    let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+    let value: Value = parse_json::<Value>(&bytes).map_err(|error| {
         StepError::failed(
             &node.id,
             format!("command input file is not valid JSON: {error}"),
@@ -666,5 +666,36 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn command_input_file_guards_numbers_before_deserialization() {
+        let mut harness = Harness::new("command-input-file-json");
+        let node = package_node("command", "command", "input_file = \"input.json\"");
+        let params: CommandParams = engine::step_params(&node, "command").unwrap();
+        std::fs::write(
+            harness.run.workspace.join("input.json"),
+            "{\"values\":[18446744073709551616]}",
+        )
+        .unwrap();
+        let error = command_input(&harness.context(), &node, &params)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("command input file is not valid JSON:")
+                && error.contains("[-2^63, 2^64-1]"),
+            "{error}"
+        );
+        std::fs::write(
+            harness.run.workspace.join("input.json"),
+            "{ \"values\" : [ 18446744073709551615 ] }",
+        )
+        .unwrap();
+        let bytes = command_input(&harness.context(), &node, &params)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bytes, b"{\"values\":[18446744073709551615]}");
     }
 }
