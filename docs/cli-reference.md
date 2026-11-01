@@ -165,7 +165,10 @@ JSON event output go to stdout.
   `models` when the flag is set. Tier and extended-TTL calls are billed from
   other rows, so the base prices need not multiply the cost. Every run is
   checked for unpriced billed calls and unmetered hosted-search charges and
-  flagged, since its total may understate spend.
+  flagged, since its total may understate spend. The metrics endpoint is
+  stricter: it also reports `priced: false` when the run's pricing contract
+  cannot be resolved, so its flag can be false where `runs costs` finds no
+  unpriced call.
 - `qcg runs replay <id> [generator] [--runs-dir dir] [--output dir]
   [--reuse-seed] [--answer id=value]... [--confirm id=approve|deny]...
   [--confirmations-file file.json] [--json]` re-executes the recorded inputs

@@ -268,8 +268,8 @@ pub struct RunCostMetrics {
     pub metrics: RunMetrics,
     /// `cost_microusd / 1_000_000`, for display only.
     pub cost_usd: f64,
-    /// False when any billed call lacked contract pricing or carried an
-    /// unmetered hosted-search charge, so the total may understate spend.
+    /// False when a billed call lacked contract pricing, search is unmetered,
+    /// or the pricing contract cannot be resolved; the total may understate.
     pub priced: bool,
 }
 
