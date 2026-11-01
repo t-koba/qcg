@@ -212,7 +212,7 @@ fn registry_owns_policy_and_rejects_invalid_rules() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn reqwest_connect_and_body_facts_are_not_inferred_from_messages() {
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -266,6 +266,7 @@ async fn reqwest_connect_and_body_facts_are_not_inferred_from_messages() {
     release_tx.send(()).unwrap();
     server.join().unwrap();
 
+    tokio::time::resume();
     let (url, server) = spawn_http_response(200, "short".into(), "".into());
     let response = client.get(url).send().await.unwrap();
     // Decoding a text body as JSON is a response-side failure.
