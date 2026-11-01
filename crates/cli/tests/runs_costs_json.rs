@@ -70,7 +70,7 @@ fn by_model_json_carries_the_breakdown_and_only_with_the_flag() {
     assert_eq!(models[0]["tokens_input"], 100);
     assert_eq!(models[0]["tokens_output"], 20);
     assert_eq!(models[0]["cost_microusd"], 42);
-    assert!(models[0]["input_rate"].is_null());
+    assert!(models[0]["base_input_rate"].is_null());
     assert_eq!(value["total_cost_microusd"], 42);
 
     let plain = costs(&runs, false);

@@ -158,10 +158,13 @@ JSON event output go to stdout.
   `{summary, diagnosis}` with no threshold judgement.
 - `qcg runs costs [--runs-dir dir] [--state <s>] [--generator <id>]
   [--by-model] [--json]` prints per-run cost totals plus a grand total.
-  `--by-model` adds a provider/model breakdown with tokens, calls, contract
-  unit prices (USD per 1M tokens, `n/a` when unpriced), and cost; `--json`
-  carries those rows under `models` when the flag is set. Runs with unpriced
-  billed calls are flagged, since their totals may understate spend.
+  `--by-model` adds a provider/model breakdown with tokens, calls, the
+  contract model's base-row unit prices (USD per 1M tokens, `n/a` when the
+  base row lacks input or output pricing), and the journaled charge; `--json`
+  carries the same rows under `models` when the flag is set. Tier and
+  extended-TTL calls are billed from other rows, so the base prices need not
+  multiply the cost. Runs with unpriced billed calls are flagged, since their
+  totals may understate spend.
 - `qcg runs replay <id> [generator] [--runs-dir dir] [--output dir]
   [--reuse-seed] [--answer id=value]... [--confirm id=approve|deny]...
   [--confirmations-file file.json] [--json]` re-executes the recorded inputs

@@ -363,10 +363,10 @@ pub(crate) fn show_costs(
         tokens_cached_input: u64,
         tokens_cache_creation_input: u64,
         cost_microusd: u64,
-        input_rate: Option<f64>,
-        cache_read_rate: Option<f64>,
-        cache_creation_rate: Option<f64>,
-        output_rate: Option<f64>,
+        base_input_rate: Option<f64>,
+        base_cache_read_rate: Option<f64>,
+        base_cache_creation_rate: Option<f64>,
+        base_output_rate: Option<f64>,
         unpriced_calls: u64,
     }
 
@@ -444,10 +444,10 @@ pub(crate) fn show_costs(
                     .and_then(|contract| find_pricing(contract, &data.provider, &data.model))
                 {
                     Some((input_rate, cache_read_rate, cache_creation_rate, output_rate)) => {
-                        entry.input_rate = Some(input_rate);
-                        entry.cache_read_rate = Some(cache_read_rate);
-                        entry.cache_creation_rate = Some(cache_creation_rate);
-                        entry.output_rate = Some(output_rate);
+                        entry.base_input_rate = Some(input_rate);
+                        entry.base_cache_read_rate = Some(cache_read_rate);
+                        entry.base_cache_creation_rate = Some(cache_creation_rate);
+                        entry.base_output_rate = Some(output_rate);
                     }
                     None if billed && data.cost_microusd == 0 => {
                         entry.unpriced_calls = entry.unpriced_calls.saturating_add(1);
@@ -507,10 +507,10 @@ pub(crate) fn show_costs(
                         "tokens_output": entry.tokens_output,
                         "tokens_cached_input": entry.tokens_cached_input,
                         "tokens_cache_creation_input": entry.tokens_cache_creation_input,
-                        "input_rate": entry.input_rate,
-                        "cache_read_rate": entry.cache_read_rate,
-                        "cache_creation_rate": entry.cache_creation_rate,
-                        "output_rate": entry.output_rate,
+                        "base_input_rate": entry.base_input_rate,
+                        "base_cache_read_rate": entry.base_cache_read_rate,
+                        "base_cache_creation_rate": entry.base_cache_creation_rate,
+                        "base_output_rate": entry.base_output_rate,
                         "cost_microusd": entry.cost_microusd,
                         "unpriced_calls": entry.unpriced_calls,
                     }))
@@ -546,7 +546,7 @@ pub(crate) fn show_costs(
     );
     if by_model && !models.is_empty() {
         println!(
-            "model\tprovider\ttokens(in/out/cached/creation)\tcalls\tunit(contract input/read/write/output USD per 1M)\tcost\tunpriced_calls"
+            "model\tprovider\ttokens(in/out/cached/creation)\tcalls\tbase(contract input/read/write/output USD per 1M)\tcost\tunpriced_calls"
         );
         let mut models: Vec<&ModelAggregate> = models.values().collect();
         models.sort_by(|left, right| {
@@ -555,10 +555,10 @@ pub(crate) fn show_costs(
         });
         for entry in models {
             let rates = match (
-                entry.input_rate,
-                entry.cache_read_rate,
-                entry.cache_creation_rate,
-                entry.output_rate,
+                entry.base_input_rate,
+                entry.base_cache_read_rate,
+                entry.base_cache_creation_rate,
+                entry.base_output_rate,
             ) {
                 (Some(input), Some(read), Some(creation), Some(output)) => {
                     format!("{input}/{read}/{creation}/{output}")
@@ -583,8 +583,8 @@ pub(crate) fn show_costs(
     Ok(())
 }
 
-/// Contract unit prices (USD per 1M tokens) for one provider/model route,
-/// with omitted cache rates inheriting the ordinary input rate.
+/// Contract base-row unit prices (USD per 1M tokens) for one provider/model
+/// route, with omitted cache rates inheriting the ordinary input rate.
 pub(crate) fn find_pricing(
     contract: &Contract,
     provider: &str,
