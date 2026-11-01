@@ -1539,146 +1539,14 @@ mod daemon_policy_tests {
     use super::*;
 
     #[tokio::test]
-    async fn captured_policy_reaches_every_cleanup_path() {
+    async fn captured_policy_reaches_every_cleanup_path_incus() {
         let Some(daemon) = Daemon::isolated(
-            "session::daemon_policy_tests::captured_policy_reaches_every_cleanup_path",
+            "session::daemon_policy_tests::captured_policy_reaches_every_cleanup_path_incus",
         ) else {
             return;
         };
         let timeouts = policy::ContainerTimeouts::from_seconds([1; 4]).unwrap();
-        for docker in [false, true] {
-            for path in ["async", "sync", "drop", "spawn-failure"] {
-                daemon.mode("hang-stop");
-                let id = if docker {
-                    let file = daemon.root.join("cid");
-                    std::fs::write(&file, "owned-id").unwrap();
-                    InstanceId::CidFile(file)
-                } else {
-                    InstanceId::Name("owned-name".into())
-                };
-                let session = Session {
-                    timeouts,
-                    backend: if docker {
-                        Backend::Docker {
-                            binary: "docker".into(),
-                            runtime_flag: None,
-                        }
-                    } else {
-                        Backend::Incus {
-                            binary: "incus".into(),
-                        }
-                    },
-                    id,
-                };
-                match path {
-                    "async" => {
-                        let started = std::time::Instant::now();
-                        teardown(&session).await.unwrap();
-                        assert!(
-                            started.elapsed() < Duration::from_secs(4),
-                            "{path} ignored frozen stop timeout"
-                        );
-                    }
-                    "sync" => {
-                        let started = std::time::Instant::now();
-                        teardown_sync(&session).unwrap();
-                        assert!(
-                            started.elapsed() < Duration::from_secs(4),
-                            "{path} ignored frozen stop timeout"
-                        );
-                    }
-                    "drop" => {
-                        // The guard never blocks the dropping thread, so this
-                        // measures the spawn, not the cleanup it started.
-                        let dropped = std::time::Instant::now();
-                        drop(SessionGuard::new(session));
-                        assert!(
-                            dropped.elapsed() < Duration::from_secs(4),
-                            "drop blocked the dropping thread"
-                        );
-                        // The cleanup runs on a worker a loaded runner can
-                        // starve, so its completion is bounded by the join
-                        // alone, never by the wall clock around the join.
-                        assert_eq!(
-                            await_outstanding_cleanups(
-                                daemon_policy_test_support::CLEANUP_JOIN_BOUND,
-                            )
-                            .await
-                            .outstanding,
-                            0
-                        );
-                    }
-                    "spawn-failure" => {
-                        let started = std::time::Instant::now();
-                        spawn_cleanup_with(session, None, |_| false);
-                        assert!(
-                            started.elapsed() < Duration::from_secs(4),
-                            "{path} ignored frozen stop timeout"
-                        );
-                    }
-                    _ => unreachable!(),
-                }
-                // The captured stop timeout must reach every cleanup path: the
-                // daemon hangs for eight seconds on stop, so a removal that
-                // follows the stop attempt promptly proves the path used the
-                // frozen timeout instead of waiting out the hang.
-                let (stop, removal) = if docker {
-                    ("kill ", "rm -f")
-                } else {
-                    ("stop -f", "delete -f")
-                };
-                let gap = daemon
-                    .gap_between(stop, removal)
-                    .unwrap_or_else(|| panic!("{path} never reached {removal}"));
-                assert!(
-                    gap < daemon_policy_test_support::STOP_TIMEOUT_GAP_BOUND,
-                    "{path} ignored frozen stop timeout: {gap:?}"
-                );
-                assert!(daemon.log().contains(if docker {
-                    "rm -f owned-id"
-                } else {
-                    "delete -f owned-name"
-                }));
-            }
-            daemon.mode("hang-delete");
-            let session = if docker {
-                let file = daemon.root.join("cid-delete");
-                std::fs::write(&file, "owned-id").unwrap();
-                Session {
-                    timeouts,
-                    backend: Backend::Docker {
-                        binary: "docker".into(),
-                        runtime_flag: None,
-                    },
-                    id: InstanceId::CidFile(file),
-                }
-            } else {
-                Session {
-                    timeouts,
-                    backend: Backend::Incus {
-                        binary: "incus".into(),
-                    },
-                    id: InstanceId::Name("owned-name".into()),
-                }
-            };
-            for sync in [false, true] {
-                let start = std::time::Instant::now();
-                let error = if sync {
-                    teardown_sync(&session)
-                } else {
-                    teardown(&session).await
-                }
-                .unwrap_err();
-                assert!(matches!(
-                    error,
-                    ContainerError::StageTimedOut {
-                        timeout_secs: 1,
-                        ..
-                    }
-                ));
-                assert!(start.elapsed() < Duration::from_secs(4));
-            }
-        }
+        check_cleanup_paths(&daemon, timeouts, false).await;
 
         // Provision keeps the complete bundle on successful transfer too.
         daemon.mode("ok");
@@ -1730,6 +1598,155 @@ mod daemon_policy_tests {
             "the aborted provision ignored the frozen stop timeout: {gap:?}"
         );
         assert!(daemon.log().contains("delete -f"));
+    }
+
+    #[tokio::test]
+    async fn captured_policy_reaches_every_cleanup_path_docker() {
+        let Some(daemon) = Daemon::isolated(
+            "session::daemon_policy_tests::captured_policy_reaches_every_cleanup_path_docker",
+        ) else {
+            return;
+        };
+        let timeouts = policy::ContainerTimeouts::from_seconds([1; 4]).unwrap();
+        check_cleanup_paths(&daemon, timeouts, true).await;
+    }
+
+    // Each backend runs in its own isolated subprocess, so their real-time
+    // timeout checks can overlap without sharing daemon modes or cleanup workers.
+    async fn check_cleanup_paths(
+        daemon: &Daemon,
+        timeouts: policy::ContainerTimeouts,
+        docker: bool,
+    ) {
+        for path in ["async", "sync", "drop", "spawn-failure"] {
+            daemon.mode("hang-stop");
+            let id = if docker {
+                let file = daemon.root.join("cid");
+                std::fs::write(&file, "owned-id").unwrap();
+                InstanceId::CidFile(file)
+            } else {
+                InstanceId::Name("owned-name".into())
+            };
+            let session = Session {
+                timeouts,
+                backend: if docker {
+                    Backend::Docker {
+                        binary: "docker".into(),
+                        runtime_flag: None,
+                    }
+                } else {
+                    Backend::Incus {
+                        binary: "incus".into(),
+                    }
+                },
+                id,
+            };
+            match path {
+                "async" => {
+                    let started = std::time::Instant::now();
+                    teardown(&session).await.unwrap();
+                    assert!(
+                        started.elapsed() < Duration::from_secs(4),
+                        "{path} ignored frozen stop timeout"
+                    );
+                }
+                "sync" => {
+                    let started = std::time::Instant::now();
+                    teardown_sync(&session).unwrap();
+                    assert!(
+                        started.elapsed() < Duration::from_secs(4),
+                        "{path} ignored frozen stop timeout"
+                    );
+                }
+                "drop" => {
+                    // The guard never blocks the dropping thread, so this
+                    // measures the spawn, not the cleanup it started.
+                    let dropped = std::time::Instant::now();
+                    drop(SessionGuard::new(session));
+                    assert!(
+                        dropped.elapsed() < Duration::from_secs(4),
+                        "drop blocked the dropping thread"
+                    );
+                    // The cleanup runs on a worker a loaded runner can
+                    // starve, so its completion is bounded by the join
+                    // alone, never by the wall clock around the join.
+                    assert_eq!(
+                        await_outstanding_cleanups(daemon_policy_test_support::CLEANUP_JOIN_BOUND)
+                            .await
+                            .outstanding,
+                        0
+                    );
+                }
+                "spawn-failure" => {
+                    let started = std::time::Instant::now();
+                    spawn_cleanup_with(session, None, |_| false);
+                    assert!(
+                        started.elapsed() < Duration::from_secs(4),
+                        "{path} ignored frozen stop timeout"
+                    );
+                }
+                _ => unreachable!(),
+            }
+            // The captured stop timeout must reach every cleanup path: the
+            // daemon hangs for eight seconds on stop, so a removal that
+            // follows the stop attempt promptly proves the path used the
+            // frozen timeout instead of waiting out the hang.
+            let (stop, removal) = if docker {
+                ("kill ", "rm -f")
+            } else {
+                ("stop -f", "delete -f")
+            };
+            let gap = daemon
+                .gap_between(stop, removal)
+                .unwrap_or_else(|| panic!("{path} never reached {removal}"));
+            assert!(
+                gap < daemon_policy_test_support::STOP_TIMEOUT_GAP_BOUND,
+                "{path} ignored frozen stop timeout: {gap:?}"
+            );
+            assert!(daemon.log().contains(if docker {
+                "rm -f owned-id"
+            } else {
+                "delete -f owned-name"
+            }));
+        }
+        daemon.mode("hang-delete");
+        let session = if docker {
+            let file = daemon.root.join("cid-delete");
+            std::fs::write(&file, "owned-id").unwrap();
+            Session {
+                timeouts,
+                backend: Backend::Docker {
+                    binary: "docker".into(),
+                    runtime_flag: None,
+                },
+                id: InstanceId::CidFile(file),
+            }
+        } else {
+            Session {
+                timeouts,
+                backend: Backend::Incus {
+                    binary: "incus".into(),
+                },
+                id: InstanceId::Name("owned-name".into()),
+            }
+        };
+        for sync in [false, true] {
+            let start = std::time::Instant::now();
+            let error = if sync {
+                teardown_sync(&session)
+            } else {
+                teardown(&session).await
+            }
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                ContainerError::StageTimedOut {
+                    timeout_secs: 1,
+                    ..
+                }
+            ));
+            assert!(start.elapsed() < Duration::from_secs(4));
+        }
     }
 }
 
