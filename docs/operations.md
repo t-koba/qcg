@@ -249,7 +249,9 @@ policy the run originally ran under.
 
 The store scan is bounded by `MAX_DIRECTORY_SCAN_ENTRIES` (default `100000`);
 a store with more entries refuses the sweep instead of scanning without
-bound. A refused sweep is a failure, not a skip: it ends `qcg serve`'s
+bound. The same bound applies to read paths: `runs list`, `runs costs` and
+generator-root listing refuse a store or root above it. A refused sweep is a
+failure, not a skip: it ends `qcg serve`'s
 retention task for the rest of the process and is reported as a failure when
 the server shuts down, and it fails the run that `qcg run` precedes. The
 automatic sweeps — `qcg serve`'s periodic task and the sweep that precedes

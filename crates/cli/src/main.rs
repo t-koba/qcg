@@ -22,7 +22,6 @@ use cli::plan::print_run_plan;
 use cli::replay::{ReplayRequest, export_run_trace, replay_run};
 use cli::runs_cli::{list_runs, show_costs, show_run};
 use cli::setup::{bundled_generators_root, init_tracing};
-use policy::MAX_DIRECTORY_SCAN_ENTRIES;
 use service::app_registry_with_providers as app_registry;
 
 // Windows main threads default to a 1 MiB stack, which overflows while clap
@@ -106,6 +105,10 @@ pub(crate) async fn serve_with_config(
     println!("{service} listening on http://{actual_addr}");
     server::serve_with_resolved_policy(policy, config, listener).await?;
     Ok(())
+}
+
+fn directory_scan_limit() -> anyhow::Result<usize> {
+    policy::retention::directory_scan_limit_from_env().map_err(anyhow::Error::msg)
 }
 
 fn main() -> Result<std::process::ExitCode> {
@@ -259,6 +262,7 @@ async fn run_async() -> Result<std::process::ExitCode> {
             .await?;
         }
         Command::List { generators_dir } => {
+            let scan_limit = directory_scan_limit()?;
             let mut roots = vec![generators_dir.clone()];
             if let Some(bundled) = bundled_generators_root()
                 && bundled != generators_dir
@@ -273,10 +277,8 @@ async fn run_async() -> Result<std::process::ExitCode> {
                 }
                 for entry in std::fs::read_dir(root)? {
                     scanned = scanned.saturating_add(1);
-                    if scanned > MAX_DIRECTORY_SCAN_ENTRIES {
-                        anyhow::bail!(
-                            "generator roots contain more than {MAX_DIRECTORY_SCAN_ENTRIES} entries"
-                        );
+                    if scanned > scan_limit {
+                        anyhow::bail!("generator roots contain more than {scan_limit} entries");
                     }
                     let entry = entry?;
                     let path = Utf8PathBuf::from_path_buf(entry.path()).map_err(|path| {
@@ -334,7 +336,12 @@ async fn run_async() -> Result<std::process::ExitCode> {
                 runs_dir,
                 state,
                 generator,
-            } => list_runs(&runs_dir, state.as_deref(), generator.as_deref())?,
+            } => list_runs(
+                &runs_dir,
+                state.as_deref(),
+                generator.as_deref(),
+                directory_scan_limit()?,
+            )?,
             RunsCommand::Show {
                 id,
                 runs_dir,
@@ -347,7 +354,14 @@ async fn run_async() -> Result<std::process::ExitCode> {
                 generator,
                 by_model,
                 json,
-            } => show_costs(&runs_dir, &state, &generator, by_model, json)?,
+            } => show_costs(
+                &runs_dir,
+                &state,
+                &generator,
+                by_model,
+                json,
+                directory_scan_limit()?,
+            )?,
             RunsCommand::Replay {
                 id,
                 generator,

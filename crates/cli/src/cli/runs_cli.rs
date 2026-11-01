@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use contract::Contract;
-use policy::MAX_DIRECTORY_SCAN_ENTRIES;
 use serde_json::{Value, json};
 use service::{
     list_run_summaries, load_run_contract, read_run_events, resolve_run_dir, run_summary,
@@ -12,8 +11,9 @@ pub(crate) fn list_runs(
     runs_dir: &Utf8Path,
     state: Option<&str>,
     generator: Option<&str>,
+    max_scan_entries: usize,
 ) -> Result<()> {
-    for (summary, _) in list_run_summaries(runs_dir, policy::DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES)? {
+    for (summary, _) in list_run_summaries(runs_dir, max_scan_entries)? {
         if let Some(want) = state
             && summary.status != want
         {
@@ -352,6 +352,7 @@ pub(crate) fn show_costs(
     generator_filter: &Option<String>,
     by_model: bool,
     json_output: bool,
+    max_scan_entries: usize,
 ) -> Result<()> {
     #[derive(Debug, Default)]
     struct ModelAggregate {
@@ -382,8 +383,8 @@ pub(crate) fn show_costs(
         .with_context(|| format!("failed to list runs under `{runs_dir}`"))?;
     for entry in entries {
         scanned = scanned.saturating_add(1);
-        if scanned > MAX_DIRECTORY_SCAN_ENTRIES {
-            anyhow::bail!("runs directory contains more than {MAX_DIRECTORY_SCAN_ENTRIES} entries");
+        if scanned > max_scan_entries {
+            anyhow::bail!("runs directory contains more than {max_scan_entries} entries");
         }
         let entry = entry?;
         let run_dir = Utf8PathBuf::from_path_buf(entry.path())

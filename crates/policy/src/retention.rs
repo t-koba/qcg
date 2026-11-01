@@ -40,13 +40,7 @@ impl RetentionPolicy {
     pub fn from_env() -> Result<Self, String> {
         let keep = parse_positive_env("GC_KEEP", DEFAULT_GC_KEEP)?;
         let keep_failed = parse_positive_env("GC_KEEP_FAILED", DEFAULT_GC_KEEP_FAILED)?;
-        let max_scan_entries = usize::try_from(parse_bounded_env(
-            "MAX_DIRECTORY_SCAN_ENTRIES",
-            DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES as u64,
-            MIN_DIRECTORY_SCAN_ENTRIES as u64,
-            MAX_DIRECTORY_SCAN_ENTRIES as u64,
-        )?)
-        .map_err(|_| "MAX_DIRECTORY_SCAN_ENTRIES is not representable".to_string())?;
+        let max_scan_entries = directory_scan_limit_from_env()?;
         Ok(Self {
             keep,
             keep_failed,
@@ -68,6 +62,17 @@ impl RetentionPolicy {
         }
         self
     }
+}
+
+/// The deployment's directory-scan bound for listing run or generator roots.
+pub fn directory_scan_limit_from_env() -> Result<usize, String> {
+    usize::try_from(parse_bounded_env(
+        "MAX_DIRECTORY_SCAN_ENTRIES",
+        DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES as u64,
+        MIN_DIRECTORY_SCAN_ENTRIES as u64,
+        MAX_DIRECTORY_SCAN_ENTRIES as u64,
+    )?)
+    .map_err(|_| "MAX_DIRECTORY_SCAN_ENTRIES is not representable".to_string())
 }
 
 #[cfg(test)]
