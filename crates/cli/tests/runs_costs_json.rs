@@ -78,3 +78,37 @@ fn by_model_json_carries_the_breakdown_and_only_with_the_flag() {
 
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn by_model_text_header_names_the_contract_base_rates() {
+    let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+        .unwrap()
+        .join(format!("runs-costs-text-{}", uuid::Uuid::now_v7()));
+    let runs = write_cost_run(&root);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_qcg"))
+        .args(["runs", "costs", "--runs-dir"])
+        .arg(&runs)
+        .arg("--by-model")
+        .env_remove("PROVIDERS")
+        .env("AUTO_GC", "false")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("base(contract input/read/write/output USD per 1M)"),
+        "base-rate header missing: {stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("model\tprovider"))
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
