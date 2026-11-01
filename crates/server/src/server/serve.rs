@@ -103,8 +103,9 @@ pub struct ResolvedServerPolicy {
     pub preemption_queue_position: policy::PreemptionQueuePosition,
     /// Deployment HTTP rate limit resolved at boot (E04 freeze). `None`
     /// leaves the server unthrottled; `Some` installs one shared
-    /// anonymous/instance bucket plus one bucket for verified identity
-    /// (F10), never one bucket per unverified presented string.
+    /// anonymous/instance bucket plus one bucket per trusted identity header
+    /// value and one for verified identity (F10), never one bucket per
+    /// unverified presented string.
     pub rate_limit: Option<RateLimitPolicy>,
     /// Deployment audit floor resolved at boot (E04 freeze).
     pub audit_floor: policy::AuditFloor,

@@ -353,9 +353,10 @@ path is unchanged. Only offline mocks have been tested, not real accounts. See
   token bucket for the HTTP server. Unset `RATE_LIMIT_RPS` disables rate
   limiting only when no companion rate-limit setting is present;
   `RATE_LIMIT_BURST` defaults to the rps value. Buckets are keyed by the
-  presented bearer credential (one anonymous bucket otherwise), so credentials
-  never share a budget. Requests over the limit receive `429` with
-  `Retry-After`; `GET /healthz` is exempt. Invalid values, zero, or any
+  configured `RATE_LIMIT_IDENTITY_HEADER` value when it is set and non-blank,
+  else by a verified bearer credential, else one anonymous bucket, so
+  credentials never share a budget. Requests over the limit receive `429`
+  with `Retry-After`; `GET /healthz` is exempt. Invalid values, zero, or any
   companion setting without an rps refuse boot.
 - `RATE_LIMIT_MAX_IDENTITIES` (default `4096`, range `1..=65536`) and
   `RATE_LIMIT_OVERFLOW` (`fold` or `reject`, default `fold`): deployment

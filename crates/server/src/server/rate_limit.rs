@@ -1,12 +1,12 @@
 //! HTTP rate limiting: token buckets resolved once at boot.
 //!
 //! Deployment policy enters through [`super::serve::ResolvedServerPolicy`];
-//! requests never re-read the environment. Buckets key only on verified
-//! identity (F10): the configured bearer digest when authentication is on,
-//! otherwise a single shared anonymous/instance bucket. Presented but
-//! unverified `Authorization` strings never mint new buckets, so rotating
-//! fake bearers cannot escape the anonymous budget. `/healthz` stays exempt
-//! so liveness probes never consume budget.
+//! requests never re-read the environment. A configured trusted identity
+//! header keys the bucket by its trimmed, non-empty value (F10); otherwise a
+//! verified bearer digest keys it; everything else shares one anonymous
+//! instance bucket. Presented but unverified `Authorization` strings never
+//! mint new buckets, so rotating fake bearers cannot escape the anonymous
+//! budget. `/healthz` stays exempt so liveness probes never consume budget.
 
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, header};
@@ -168,8 +168,9 @@ struct TokenBucket {
 pub(crate) struct RateLimiter {
     policy: RateLimitPolicy,
     /// Expected bearer digest when authentication is configured. `None`
-    /// means the instance is unauthenticated: every request shares the
-    /// anonymous bucket regardless of any presented header (F10).
+    /// means the instance is unauthenticated: requests without a usable
+    /// trusted identity header value share the anonymous bucket whatever
+    /// bearer they present (F10).
     expected_digest: Option<[u8; 32]>,
     buckets: Mutex<HashMap<Option<[u8; 32]>, TokenBucket>>,
 }
@@ -297,9 +298,9 @@ impl RateLimiter {
 
 /// Axum middleware: admits the request when a token is available and answers
 /// 429 with an integer `Retry-After` otherwise. `/healthz` is exempt so a
-/// saturated limiter can never make the process look unhealthy. Only
-/// verified identity splits buckets (F10); unverified bearers share the
-/// anonymous budget.
+/// saturated limiter can never make the process look unhealthy. A configured
+/// trusted identity header, else a verified bearer, splits buckets (F10);
+/// unverified bearers share the anonymous budget.
 pub(crate) async fn enforce_rate_limit(
     State(limiter): State<Arc<RateLimiter>>,
     request: Request,
@@ -767,6 +768,62 @@ mod tests {
         assert!(
             limiter.try_acquire(bob, now).is_err(),
             "bob must stay exhausted"
+        );
+    }
+    #[test]
+    fn trusted_identity_header_keys_before_the_bearer() {
+        let expected = sha256_bytes("valid-token");
+        let policy_for = |header: bool| RateLimitPolicy {
+            rps: 1,
+            burst: 1,
+            trusted_identity_header: header.then(|| "x-client-id".to_string()),
+            max_identities: policy::DEFAULT_RATE_LIMIT_MAX_IDENTITIES,
+            overflow: RateLimitOverflow::FoldAnonymous,
+        };
+        let attempt = |client: Option<&str>, bearer: Option<&str>| {
+            let mut builder = HttpRequest::builder().uri("/work");
+            if let Some(client) = client {
+                builder = builder.header("x-client-id", client);
+            }
+            if let Some(bearer) = bearer {
+                builder = builder.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+            }
+            builder.body(Body::empty()).expect("request should build")
+        };
+        let limiter = RateLimiter::with_expected_digest(policy_for(true), Some(expected));
+        let first = limiter.rate_key(&attempt(Some("client-a"), Some("valid-token")));
+        let second = limiter.rate_key(&attempt(Some("client-b"), Some("valid-token")));
+        assert_eq!(
+            first,
+            Some(sha256_bytes("client-a")),
+            "the trimmed header value keys the bucket"
+        );
+        assert_ne!(first, second, "distinct values must not share a bucket");
+        assert_ne!(
+            first,
+            Some(expected),
+            "the header wins over a verified bearer"
+        );
+        assert_eq!(
+            limiter.rate_key(&attempt(Some("   "), Some("valid-token"))),
+            Some(expected),
+            "a blank header falls back to the verified bearer"
+        );
+        assert_eq!(
+            limiter.rate_key(&attempt(None, Some("valid-token"))),
+            Some(expected),
+            "an absent header falls back to the verified bearer"
+        );
+        let anonymous = RateLimiter::with_expected_digest(policy_for(true), None);
+        assert_eq!(
+            anonymous.rate_key(&attempt(Some("client-a"), None)),
+            Some(sha256_bytes("client-a")),
+            "the header keys even when no bearer is configured"
+        );
+        assert_eq!(
+            anonymous.rate_key(&attempt(None, Some("anything"))),
+            None,
+            "without a header or verified bearer the bucket is anonymous"
         );
     }
 }
