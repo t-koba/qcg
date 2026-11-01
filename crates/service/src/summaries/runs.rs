@@ -15,6 +15,21 @@ pub fn read_run_generator_path(run_dir: &Utf8Path) -> Result<Utf8PathBuf, Servic
     Ok(Utf8PathBuf::from(&started.generator_path))
 }
 
+/// The contract the run used: pinned package bytes, or the recorded path for legacy runs.
+pub fn load_run_contract(run_dir: &Utf8Path) -> Result<contract::Contract, ServiceError> {
+    let events = read_durable_run_events(run_dir)?;
+    let (_, started) = run_identity_event(run_dir, &events)?;
+    if let Some(package_sha256) = started.package_sha256.as_deref() {
+        return crate::run_package::load_identity(
+            run_dir,
+            Some(package_sha256),
+            Some(&started.contract_sha256),
+        );
+    }
+    contract::Contract::load(Utf8PathBuf::from(&started.generator_path))
+        .map_err(|error| ServiceError::Invalid(error.to_string()))
+}
+
 pub fn read_run_inputs(run_dir: &Utf8Path) -> Result<BTreeMap<String, Value>, ServiceError> {
     let events = read_durable_run_events(run_dir)?;
     let (_, started) = run_identity_event(run_dir, &events)?;
@@ -130,4 +145,125 @@ pub(crate) fn run_summary_from_state(
         artifacts,
         retention_days,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::package::{PackageLimits, package_identity_sha256};
+    use contract::Contract;
+    use engine::JournalWriter;
+    use serde_json::json;
+
+    fn write_contract(dir: &Utf8Path, input: f64) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join(contract::MANIFEST_FILE),
+            format!(
+                r#"
+[generator]
+id = "pricing-fixture"
+name = "Pricing Fixture"
+version = "0.1.0"
+
+[llm]
+max_tokens = 1024
+[llm.model]
+provider = "provider"
+model = "model"
+input_cost_per_million_usd = {input}
+output_cost_per_million_usd = 10.0
+
+[[flow]]
+id = "emit"
+type = "write"
+params = {{ content = "x", output_file = "x.txt" }}
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_run(
+        run_dir: &Utf8Path,
+        generator_path: &Utf8Path,
+        package_sha256: Option<&str>,
+        contract_sha256: &str,
+    ) {
+        let meta = run_dir.join("meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        let journal =
+            JournalWriter::create(&meta.join("journal.jsonl"), "run", false, None).unwrap();
+        journal
+            .event(
+                "run_started",
+                json!({
+                    "generator": "pricing-fixture@0.1.0",
+                    "generator_path": generator_path.as_str(),
+                    "contract_sha256": contract_sha256,
+                    "package_sha256": package_sha256,
+                    "inputs": {},
+                    "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                    "elapsed_budget_mode": "wall_clock"
+                }),
+            )
+            .unwrap();
+        journal
+            .event("run_finished", json!({"status": "success"}))
+            .unwrap();
+    }
+
+    fn input_rate(contract: &Contract) -> Option<f64> {
+        contract
+            .manifest
+            .llm
+            .as_ref()
+            .and_then(|llm| llm.model.as_ref())
+            .and_then(|model| model.input_cost_per_million_usd)
+    }
+
+    #[test]
+    fn pinned_package_prices_the_bytes_the_run_used() {
+        let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!("qcg-load-contract-{}", uuid::Uuid::now_v7()));
+        let source = root.join("source");
+        write_contract(&source, 2.0);
+        let original = Contract::load(&source).unwrap();
+        let package_sha256 = package_identity_sha256(&source, &PackageLimits::default()).unwrap();
+        let run = root.join("run");
+        let package = run.join("generator-package");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::copy(
+            source.join(contract::MANIFEST_FILE),
+            package.join(contract::MANIFEST_FILE),
+        )
+        .unwrap();
+        write_run(&run, &source, Some(&package_sha256), &original.sha256);
+
+        write_contract(&source, 5.0);
+        assert_ne!(Contract::load(&source).unwrap().sha256, original.sha256);
+
+        let loaded = load_run_contract(&run).unwrap();
+        assert_eq!(loaded.sha256, original.sha256);
+        assert_eq!(input_rate(&loaded), Some(2.0));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_run_falls_back_to_the_recorded_path() {
+        let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!("qcg-load-contract-legacy-{}", uuid::Uuid::now_v7()));
+        let source = root.join("source");
+        write_contract(&source, 2.0);
+        let original = Contract::load(&source).unwrap();
+        let run = root.join("run");
+        write_run(&run, &source, None, &original.sha256);
+
+        write_contract(&source, 5.0);
+        let loaded = load_run_contract(&run).unwrap();
+        assert_eq!(input_rate(&loaded), Some(5.0));
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

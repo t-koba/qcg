@@ -4,7 +4,7 @@ use contract::Contract;
 use policy::MAX_DIRECTORY_SCAN_ENTRIES;
 use serde_json::{Value, json};
 use service::{
-    list_run_summaries, read_run_events, read_run_generator_path, resolve_run_dir, run_summary,
+    list_run_summaries, load_run_contract, read_run_events, resolve_run_dir, run_summary,
 };
 use std::collections::BTreeMap;
 
@@ -409,9 +409,7 @@ pub(crate) fn show_costs(
             Some(metrics) => metrics,
             None => continue,
         };
-        let contract = read_run_generator_path(&run_dir)
-            .ok()
-            .and_then(|path| Contract::load(path).ok());
+        let contract = load_run_contract(&run_dir).ok();
         let mut unpriced = false;
         for event in read_run_events(&run_dir)? {
             let api::RunEventData::LlmCall(data) = &event.data else {
