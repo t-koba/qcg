@@ -105,9 +105,26 @@ fn by_model_text_header_names_the_contract_base_rates() {
         "base-rate header missing: {stdout}"
     );
     assert!(
-        stdout
-            .lines()
-            .any(|line| line.starts_with("model\tprovider"))
+        stdout.contains("model\tprovider\t100/20/0/0\t1\tn/a"),
+        "by-model row missing: {stdout}"
+    );
+
+    let plain = Command::new(env!("CARGO_BIN_EXE_qcg"))
+        .args(["runs", "costs", "--runs-dir"])
+        .arg(&runs)
+        .env_remove("PROVIDERS")
+        .env("AUTO_GC", "false")
+        .output()
+        .unwrap();
+    assert!(
+        plain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    let plain = String::from_utf8(plain.stdout).unwrap();
+    assert!(
+        !plain.contains("base(contract"),
+        "base-rate header must require --by-model: {plain}"
     );
 
     std::fs::remove_dir_all(root).unwrap();
