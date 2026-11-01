@@ -164,8 +164,8 @@ JSON event output go to stdout.
   base rows), and the journaled charge; `--json` carries the same rows under
   `models` when the flag is set. Tier and extended-TTL calls are billed from
   other rows, so the base prices need not multiply the cost. Every run is
-  checked for unpriced billed calls and flagged, since its total may understate
-  spend.
+  checked for unpriced billed calls and unmetered hosted-search charges and
+  flagged, since its total may understate spend.
 - `qcg runs replay <id> [generator] [--runs-dir dir] [--output dir]
   [--reuse-seed] [--answer id=value]... [--confirm id=approve|deny]...
   [--confirmations-file file.json] [--json]` re-executes the recorded inputs

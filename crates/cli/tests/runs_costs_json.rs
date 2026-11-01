@@ -7,6 +7,8 @@ fn write_cost_run(
     name: &str,
     cost_microusd: u64,
     generator_path: &str,
+    search: bool,
+    route_failed: bool,
 ) -> Utf8PathBuf {
     let runs = root.join("runs");
     let meta = runs.join(name).join("meta");
@@ -22,15 +24,24 @@ fn write_cost_run(
                 "elapsed_budget_mode": "wall_clock", "retention_days": 10}),
         )
         .unwrap();
-    journal
-        .event(
-            "llm_call",
-            json!({"node": "generate", "provider": "provider", "model": "model",
-                "seed": 1_u64, "max_tokens": 16,
-                "tokens": {"input": 100, "output": 20, "cached_input": 0},
-                "cost_microusd": cost_microusd}),
-        )
-        .unwrap();
+    let mut call = json!({"node": "generate", "provider": "provider", "model": "model",
+        "seed": 1_u64, "max_tokens": 16,
+        "tokens": {"input": 100, "output": 20, "cached_input": 0},
+        "cost_microusd": cost_microusd});
+    if search {
+        call["web_search"] = json!({"calls": null, "cost_microusd": null});
+    }
+    journal.event("llm_call", call).unwrap();
+    if route_failed {
+        journal
+            .event(
+                "llm_route_failed",
+                json!({"provider": "provider", "model": "model", "attempt": 1,
+                    "kind": "network",
+                    "web_search": {"calls": null, "cost_microusd": null}}),
+            )
+            .unwrap();
+    }
     journal
         .event("run_finished", json!({"status": "success"}))
         .unwrap();
@@ -93,7 +104,7 @@ fn by_model_json_carries_the_breakdown_and_only_with_the_flag() {
     let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
         .unwrap()
         .join(format!("runs-costs-json-{}", uuid::Uuid::now_v7()));
-    let runs = write_cost_run(&root, "cost-run", 42, "demo");
+    let runs = write_cost_run(&root, "cost-run", 42, "demo", false, false);
 
     let value = costs(&runs, true);
     let models = value["models"].as_array().expect("models array");
@@ -118,7 +129,7 @@ fn by_model_text_header_names_the_contract_base_rates() {
     let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
         .unwrap()
         .join(format!("runs-costs-text-{}", uuid::Uuid::now_v7()));
-    let runs = write_cost_run(&root, "cost-run", 42, "demo");
+    let runs = write_cost_run(&root, "cost-run", 42, "demo", false, false);
 
     let output = Command::new(env!("CARGO_BIN_EXE_qcg"))
         .args(["runs", "costs", "--runs-dir"])
@@ -169,7 +180,7 @@ fn unpriced_is_flagged_without_by_model() {
     let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
         .unwrap()
         .join(format!("runs-costs-unpriced-{}", uuid::Uuid::now_v7()));
-    let runs = write_cost_run(&root, "unpriced-run", 0, "missing-contract");
+    let runs = write_cost_run(&root, "unpriced-run", 0, "missing-contract", false, false);
 
     let plain = costs(&runs, false);
     assert_eq!(plain["runs"][0]["unpriced"], true);
@@ -189,8 +200,8 @@ fn by_model_rates_require_one_base_row() {
         .join(format!("runs-costs-mixed-{}", uuid::Uuid::now_v7()));
     let contract_a = write_contract(&root.join("contract-a"), 2.0, 10.0);
     let contract_b = write_contract(&root.join("contract-b"), 5.0, 20.0);
-    write_cost_run(&root, "run-a", 10, contract_a.as_str());
-    let runs = write_cost_run(&root, "run-b", 20, contract_b.as_str());
+    write_cost_run(&root, "run-a", 10, contract_a.as_str(), false, false);
+    let runs = write_cost_run(&root, "run-b", 20, contract_b.as_str(), false, false);
 
     let mixed = costs(&runs, true);
     let models = mixed["models"].as_array().unwrap();
@@ -204,11 +215,39 @@ fn by_model_rates_require_one_base_row() {
         .unwrap()
         .join(format!("runs-costs-single-{}", uuid::Uuid::now_v7()));
     let contract = write_contract(&single_root.join("contract"), 2.0, 10.0);
-    let single_runs = write_cost_run(&single_root, "run", 10, contract.as_str());
+    let single_runs = write_cost_run(&single_root, "run", 10, contract.as_str(), false, false);
     let single = costs(&single_runs, true);
     assert_eq!(single["models"][0]["base_input_rate"], 2.0);
     assert_eq!(single["models"][0]["base_output_rate"], 10.0);
 
     std::fs::remove_dir_all(root).unwrap();
     std::fs::remove_dir_all(single_root).unwrap();
+}
+
+#[test]
+fn unmetered_search_is_flagged_in_both_modes() {
+    for (search, route_failed) in [(true, false), (false, true)] {
+        let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "runs-costs-search-{}-{}",
+                search,
+                uuid::Uuid::now_v7()
+            ));
+        let runs = write_cost_run(&root, "run", 42, "demo", search, route_failed);
+
+        let plain = costs(&runs, false);
+        assert_eq!(
+            plain["runs"][0]["unpriced"], true,
+            "search={search}, route_failed={route_failed}"
+        );
+
+        let with_models = costs(&runs, true);
+        assert_eq!(with_models["runs"][0]["unpriced"], true);
+        if search {
+            assert_eq!(with_models["models"][0]["unpriced_calls"], 1);
+        }
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

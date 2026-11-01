@@ -413,13 +413,18 @@ pub(crate) fn show_costs(
         let mut unpriced = false;
         for event in read_run_events(&run_dir)? {
             let api::RunEventData::LlmCall(data) = &event.data else {
+                if let api::RunEventData::LlmRouteFailed(data) = &event.data {
+                    unpriced |= data.web_search.is_some();
+                }
                 continue;
             };
             let billed = data.tokens.input.saturating_add(data.tokens.output) > 0;
             let pricing = contract
                 .as_ref()
                 .and_then(|contract| find_pricing(contract, &data.provider, &data.model));
-            let unpriced_call = billed && data.cost_microusd == 0 && pricing.is_none();
+            let search = data.web_search.as_ref();
+            let unpriced_call = search.is_some_and(|usage| usage.cost_microusd.is_none())
+                || (billed && data.cost_microusd == 0 && pricing.is_none());
             unpriced |= unpriced_call;
             if !by_model {
                 continue;
