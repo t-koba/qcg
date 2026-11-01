@@ -357,16 +357,18 @@ Fields:
   No vendor prices or cache TTL tiers are built in. `require_pricing` requires
   ordinary input/output rates and checks resolved cache-read and cache-creation
   pricing in every reachable base/tier row before dispatch, even without a cost
-  cap. A configured Extended TTL may derive creation pricing from ordinary input
-  only if every row has an input price. Costs remain estimates, not invoices.
+  cap. A configured Extended TTL may derive creation pricing from the selected
+  context tier's ordinary input rate only if every row has an input price.
+  Costs remain estimates, not invoices.
 - `cost_tiers`: optional context tiers, the same shape the contract's
   `model.cost_tiers` uses. A tier names `threshold_tokens` and the rates that
   price a request whose whole prompt input reaches that threshold. A rate the
-  tier does not name inherits the base row's rate for that category, so a
-  cache rate the tier does not name inherits the base row's cache rate. A
-  registry tier list replaces the external catalog's tier list for the same
-  model instead of merging with it, so an operator can state the exact
-  schedule.
+  tier does not name inherits the base row's rate for that category, so for a
+  default-lifetime request a cache rate the tier does not name inherits the
+  base row's cache rate. An extended-TTL write prices from the tier's ordinary
+  input rate instead. A registry tier list replaces the external catalog's tier
+  list for the same model instead of merging with it, so an operator can state
+  the exact schedule.
 - A rate the registry row pins prices every tier it inherits, exactly as a
   contract pin does: the pinned rate is carried into each inherited external
   tier, so it prices that tier, and the tier contributes only the rates the
@@ -1439,7 +1441,8 @@ extended `ttl_1h` writes cost 2x. OpenAI GPT-5.6+ Responses default 30-minute wr
 1.25x ordinary input; Responses extended `ttl_12h` writes cost 2.5x. Default
 write rates remain supplied by the selected pricing row; qcg does not infer
 prices from model names or default markers. Older OpenAI/Azure
-`retention_24h` policies do not change the configured write rate.
+`retention_24h` policies do not change the selected row's resolved
+cache-write rate.
 
 When `cache_retention = "extended"` requests `ttl_1h` or `ttl_12h`, the cost
 meter replaces only the `cache_creation_input` rate with the corresponding

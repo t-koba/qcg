@@ -156,7 +156,7 @@ Fields:
   policy or guarantee deletion at any time. Usage normalization is unchanged.
   With `extended`, qcg estimates aggregate `cache_creation_input` at 2x the
   selected context tier's ordinary input rate for requested `ttl_1h`, and 2.5x
-  for requested `ttl_12h`; `retention_24h` keeps the configured cache-write
+  for requested `ttl_12h`; `retention_24h` keeps the selected row's resolved cache-write
   rate. The meter does not use provider-specific TTL subcounters, which may be
   absent from streaming usage. Anthropic may also create default 5m writes
   during tool/thinking continuations alongside requested 1h markers, so the
