@@ -2963,7 +2963,7 @@
             "$ref": "#/components/schemas/RunMetrics"
           },
           "priced": {
-            "description": "False when any billed call lacked contract pricing, so the total may\nunderstate the true spend.",
+            "description": "False when a billed call lacked contract pricing, search is unmetered,\nor the pricing contract cannot be resolved; the total may understate.",
             "type": "boolean"
           },
           "run_id": {
