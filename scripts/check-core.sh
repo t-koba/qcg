@@ -17,8 +17,8 @@ _qcg_test_time_artifact="target/qcg-test-time-${GITHUB_RUN_ID:-local}-${GITHUB_R
 # 12.00/1.26/14 -> 16s; server no-default 33.81/4.68/41 -> 48s; MCP live
 # server 19.94/2.26/24 -> 27s; MCP no-default live server 18.44/1.67/21 -> 24s.
 # The default workspace runs in a slower regime: four later exact-hit passes
-# measured 103, 121, 123 and 127 s (mean 118.5, sample SD 9.3), so v2 applies
-# the same ceil(mean+3*sample_SD) rule to that regime -> 147s. Each ceiling is
+# measured 103, 121, 123 and 127 s (mean 118.5, sample SD 10.63), so v2
+# applies the same ceil(mean+3*sample_SD) rule to that regime -> 151s. Each ceiling is
 # therefore ceil(mean+3*sample_SD) of the sample that describes its current
 # regime. Three SD is an engineering envelope, not a calibrated false-alarm
 # guarantee; changing thresholds requires a new policy version and fresh
@@ -28,7 +28,7 @@ _qcg_test_time_artifact="target/qcg-test-time-${GITHUB_RUN_ID:-local}-${GITHUB_R
 # Focused tests synthesize elapsed time through Bash SECONDS; production
 # policy values are fixed here and cannot be raised through the environment.
 QCG_TEST_TIME_BUDGET_POLICY_VERSION=v2
-QCG_TEST_TIME_BUDGET_LINUX_DEFAULT_WORKSPACE_S=147
+QCG_TEST_TIME_BUDGET_LINUX_DEFAULT_WORKSPACE_S=151
 QCG_TEST_TIME_BUDGET_LINUX_MCP_NO_DEFAULT_S=16
 QCG_TEST_TIME_BUDGET_LINUX_SERVER_NO_DEFAULT_S=48
 QCG_TEST_TIME_BUDGET_LINUX_MCP_LIVE_SERVER_S=27
