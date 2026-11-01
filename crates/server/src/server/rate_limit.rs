@@ -75,10 +75,11 @@ pub(crate) fn resolve_rate_limit_policy() -> Result<Option<RateLimitPolicy>, Str
         Err(_) => None,
         Ok(value) => {
             let name = value.trim().to_ascii_lowercase();
-            if name.is_empty()
-                || name == "authorization"
-                || name.contains(' ')
-                || name.contains(':')
+            // The limiter looks this name up on real requests, so a name HTTP
+            // cannot carry would boot and then never match, silently folding
+            // every caller into one bucket.
+            if name == "authorization"
+                || axum::http::HeaderName::from_bytes(name.as_bytes()).is_err()
             {
                 return Err(format!(
                     "invalid RATE_LIMIT_IDENTITY_HEADER `{value}`: must be a non-authorization header name"

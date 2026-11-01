@@ -2197,6 +2197,31 @@ command = ["sh", "-c", "sleep 30"]"#,
         // A nondefault budget with explicit reject resolves.
         set("RATE_LIMIT_MAX_IDENTITIES", "2");
         set("RATE_LIMIT_OVERFLOW", "reject");
+        // The trusted identity header must be a name HTTP can carry, since the
+        // limiter looks it up on real requests.
+        for (value, expected) in [("X-Client-Id", "x-client-id"), ("x_trace", "x_trace")] {
+            set("RATE_LIMIT_IDENTITY_HEADER", value);
+            let resolved =
+                resolve_server_policy(&config).expect("a usable header name should resolve");
+            assert_eq!(
+                resolved
+                    .rate_limit
+                    .expect("rate limit should resolve")
+                    .trusted_identity_header
+                    .as_deref(),
+                Some(expected)
+            );
+        }
+        for value in ["authorization", "", "x y", "x:y", "x,y", "x(client-id)"] {
+            set("RATE_LIMIT_IDENTITY_HEADER", value);
+            let error = resolve_server_policy(&config)
+                .expect_err("an unusable identity header must refuse boot");
+            assert!(
+                error.contains("RATE_LIMIT_IDENTITY_HEADER"),
+                "refusal must name the header: {error}"
+            );
+        }
+        unset("RATE_LIMIT_IDENTITY_HEADER");
         let resolved = resolve_server_policy(&config).expect("valid capacity knobs should resolve");
         let limited = resolved.rate_limit.expect("rate limit should resolve");
         assert_eq!(limited.max_identities, 2);

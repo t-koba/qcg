@@ -364,8 +364,9 @@ path is unchanged. Only offline mocks have been tested, not real accounts. See
   refuse boot.
 - `RATE_LIMIT_IDENTITY_HEADER`: optional trusted header whose value keys the
   bucket, for deployments whose outer proxy strips or overwrites that header
-  (otherwise callers can assert their own identity). `authorization` and names
-  containing spaces or colons are refused; so is setting it without an rps.
+  (otherwise callers can assert their own identity). `authorization` and any
+  name that is not a valid HTTP header name are refused, as is setting it
+  without an rps.
 - `LIVE_EVENT_CHANNEL_CAPACITY` (default `512`, range `16..=65536`),
   `JOURNAL_POLL_INTERVAL_MS` (default `250`, range `50..=5000`),
   `MAX_DIRECTORY_SCAN_ENTRIES` (default `100000`, range `1000..=10000000`),
