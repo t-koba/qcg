@@ -92,7 +92,20 @@ test("every timing ceiling follows its recorded evidence", () => {
     ),
   ];
   assert.equal(lines.length, 5, "policy comment must record all five ceilings");
+  const sampleMatch = policy.match(/\(([\d, ]+) s\)\./);
+  assert.ok(sampleMatch, "policy comment must record the default-workspace sample");
+  const sample = sampleMatch[1].split(", ").map(Number);
+  const sampleMean = sample.reduce((sum, value) => sum + value, 0) / sample.length;
+  const sampleSd = Math.sqrt(
+    sample.reduce((sum, value) => sum + (value - sampleMean) ** 2, 0) /
+      (sample.length - 1),
+  );
   for (const [, label, mean, sd, max, ceiling] of lines) {
+    if (label === "default workspace") {
+      assert.equal(Number(mean).toFixed(2), sampleMean.toFixed(2));
+      assert.equal(Number(sd).toFixed(2), sampleSd.toFixed(2));
+      assert.equal(Number(max), Math.max(...sample));
+    }
     assert.equal(
       Math.ceil(Number(mean) + 3 * Number(sd)),
       Number(ceiling),
