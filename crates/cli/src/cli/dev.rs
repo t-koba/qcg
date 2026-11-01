@@ -135,10 +135,8 @@ pub(crate) async fn run_dev(
         );
     }
     let watcher = PollWatcher::new(generators_dir.clone())?;
-    eprintln!(
-        "{} dev watching `{generators_dir}` every {watch_interval_ms} ms",
-        policy::default_service_name()
-    );
+    let service = policy::default_service_name();
+    eprintln!("{service} dev watching `{generators_dir}` every {watch_interval_ms} ms");
     tokio::spawn(watch_generators(
         watcher,
         Duration::from_millis(watch_interval_ms),

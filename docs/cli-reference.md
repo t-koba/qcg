@@ -330,7 +330,9 @@ path is unchanged. Only offline mocks have been tested, not real accounts. See
 - `SERVICE_NAME`: service identity. A non-empty value wins; otherwise the
   running binary's file stem is used, falling back to `server`. The value
   appears as the log `service` field, the OTLP `service.name`, the MCP
-  client/server implementation name and the package builder id.
+  client/server implementation name, the package builder id and the `serve`
+  and `dev` status lines. Command hints always name the running binary, never
+  this identity.
 - `AUTO_GC=0|false|off`: disable every automatic retention sweep — `qcg
   serve`'s periodic task and the sweep that precedes `qcg run`. The manual
   `qcg runs gc` sweep is not automatic and still runs.

@@ -102,10 +102,8 @@ pub(crate) async fn serve_with_config(
     let addr: std::net::SocketAddr = format!("{bind}:{port}").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual_addr = listener.local_addr()?;
-    println!(
-        "{} listening on http://{actual_addr}",
-        policy::default_service_name()
-    );
+    let service = policy::default_service_name();
+    println!("{service} listening on http://{actual_addr}");
     server::serve_with_resolved_policy(policy, config, listener).await?;
     Ok(())
 }
@@ -743,6 +741,10 @@ async fn run_async() -> Result<std::process::ExitCode> {
 /// Resolves the instance bearer token: an explicit flag or `API_TOKEN`
 /// wins, then `API_TOKEN_FILE` (the only documented file source). An
 /// unreadable or empty file fails closed instead of booting unauthenticated.
+fn command_hint(args: &str) -> String {
+    policy::binary_stem().map_or_else(|| args.to_owned(), |stem| format!("{stem} {args}"))
+}
+
 fn resolve_api_token(explicit: Option<String>) -> anyhow::Result<Option<String>> {
     if explicit.is_some() {
         return Ok(explicit);
@@ -823,8 +825,8 @@ fn print_llm_catalog(catalog: &api::LlmCatalogResponse) {
     }
     if catalog.stale {
         eprintln!(
-            "catalog metadata is stale; run `{} models --refresh`",
-            policy::default_service_name()
+            "catalog metadata is stale; run `{}`",
+            command_hint("models --refresh")
         );
     }
     for source in &catalog.sources {
@@ -852,6 +854,28 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs::File;
     use uuid::Uuid;
+
+    #[test]
+    fn command_hints_use_the_binary_not_the_service_name() {
+        if env_process::isolated() {
+            return;
+        }
+        // SAFETY: this test owns SERVICE_NAME in this process; no other test in
+        // the binary reads or writes it.
+        unsafe {
+            std::env::set_var("SERVICE_NAME", "llm-gateway");
+        }
+        let hint = command_hint("models --refresh");
+        unsafe {
+            std::env::remove_var("SERVICE_NAME");
+        }
+        assert!(
+            !hint.contains("llm-gateway"),
+            "a hint must not name the service identity: {hint}"
+        );
+        let stem = policy::binary_stem().expect("test binary has a stem");
+        assert_eq!(hint, format!("{stem} models --refresh"));
+    }
 
     #[cfg(test)]
     mod env_process {

@@ -267,10 +267,10 @@ pub async fn resolve(
     requirement: &semver::VersionReq,
 ) -> Result<ResolvedPackage> {
     if config.registries.is_empty() {
-        anyhow::bail!(format!(
-            "no registries configured; add one with `{} registry add <name> <url>`",
-            policy::default_service_name()
-        ));
+        anyhow::bail!(
+            "no registries configured; add one with `{}`",
+            crate::command_hint("registry add <name> <url>")
+        );
     }
     let mut best: Option<(semver::Version, ResolvedPackage)> = None;
     for (registry, url) in &config.registries {
