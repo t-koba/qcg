@@ -211,9 +211,10 @@ Fields:
   effective row/model. A cache write is priced by the lifetime qcg requests:
   a default-lifetime write bills at the model's
   `cache_creation_input_cost_per_million_usd`, while an `extended` request
-  bills writes at the ordinary input rate times the provider's long-lifetime
-  multiplier (`ttl_1h` 2x, `ttl_12h` 2.5x); `retention_24h` is a retention
-  policy, so it keeps the default write rate. Azure GPT-5.6+ supports only
+  bills writes at the selected context tier's ordinary input rate times the
+  provider's long-lifetime multiplier (`ttl_1h` 2x, `ttl_12h` 2.5x);
+  `retention_24h` is a retention policy, so it keeps the selected row's
+  resolved cache-write rate. Azure GPT-5.6+ supports only
   `prompt_cache_options.ttl: "30m"`, not an `extended` tier; older Azure models
   use the separate `prompt_cache_retention` control. These are cache-lifetime
   controls, not data-retention policies or deletion guarantees. Official
@@ -414,8 +415,10 @@ Configured prices must be finite and non-negative (the manifest rejects
 invalid prices, and the runtime refuses to bill them). `ModelRef::invalid_price`
 validates base-row and web-search rates; `policy::validate_cost_tiers` validates
 tier schedules. Tier rates are resolved by `policy::CostRates::resolve`:
-absent tier cache rates inherit the base row's resolved cache rate, never the
-tier's own input rate.
+for a default-lifetime request absent tier cache rates inherit the base row's
+resolved cache rate, never the tier's own input rate. An extended-TTL write is
+the exception: it prices at the selected tier's ordinary input rate times the
+provider multiplier.
 
 A context tier schedule the source publishes but qcg cannot read leaves the
 model's flat rates in place: qcg prices a request at a rate it read, never at

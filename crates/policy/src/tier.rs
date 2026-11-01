@@ -61,8 +61,8 @@ impl CostRates {
     /// The rates that apply to a request, given the tier it reaches. A tier
     /// is a whole price row: the rates it names win, and a rate it does not
     /// name inherits the base row's rate for that category. The base row
-    /// prices an absent cache rate at its own ordinary input rate, and a
-    /// tier's own input rate never prices cache tokens.
+    /// prices an absent cache rate at its own ordinary input rate; for a
+    /// default-lifetime request a tier's own input rate prices no cache token.
     pub fn resolve(&self, tier: Option<&CostTier>) -> CostRates {
         let input = tier
             .and_then(|tier| tier.input_cost_per_million_usd)
@@ -280,8 +280,9 @@ mod tests {
             output_cost_per_million_usd: None,
         }));
         assert_eq!(rows.input, Some(5.0));
-        // A cache rate the tier does not name inherits the base row's
-        // cache rate, never the tier's own input rate. The base row names
+        // For a default-lifetime request a cache rate the tier does not name
+        // inherits the base row's cache rate, never the tier's own input rate.
+        // The base row names
         // no cache-creation rate, so it prices cache creation at its own
         // ordinary input rate.
         assert_eq!(rows.cache_read, Some(0.1));

@@ -81,9 +81,10 @@ Fields:
   contract rates override catalog prices field by field; unspecified fields may
   use the catalog's matching model price. `require_pricing` requires ordinary
   input/output prices and resolved cache prices for any nonzero cache usage;
-  an Extended TTL derives the creation price from ordinary input times the
-  provider's long-lifetime multiplier (`ttl_1h` 2x, `ttl_12h` 2.5x; a
-  `retention_24h` row is a retention policy and keeps the default write rate),
+  an Extended TTL derives the creation price from the selected context tier's
+  ordinary input rate times the provider's long-lifetime multiplier (`ttl_1h`
+  2x, `ttl_12h` 2.5x; a `retention_24h` row is a retention policy and keeps the
+  selected row's resolved cache-write rate),
   so that derived price satisfies the requirement. Before dispatch, even without a cost
   cap or known cache usage, required pricing checks resolved cache reads and
   creation in every reachable base/tier row. A requested provider-hosted search
@@ -109,7 +110,9 @@ Fields:
   increase and every rate must be finite and non-negative. A tier rate that is
   omitted inherits the base row's rate for that category. A cache rate the tier
   does not name therefore inherits the base row's cache rate, never the tier's
-  own ordinary input rate: an ordinary input price is not a cache price. A
+  own ordinary input rate: an ordinary input price is not a cache price. An
+  extended-TTL write is the one exception: it prices from the selected tier's
+  own ordinary input rate (see the cache-rate bullet under `model`). A
   contract that declares tiers owns the whole schedule; otherwise the catalog's
   tiers apply, and a rate the contract pinned prices every tier.
 - `max_context_bytes`

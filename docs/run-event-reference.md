@@ -348,9 +348,10 @@ cache_creation_input`, and the tier with the greatest threshold the request
 reaches prices the whole request: no token is split across two tiers and no
 token is counted twice. A tier rate wins over the base row's rate for the same
 category; a rate the tier does not name inherits the base row's rate for that
-category. A cache rate the tier does not name therefore inherits the base
-row's cache rate, never the tier's own ordinary input rate: an ordinary input
-price is not a cache price. An output rate the tier does not name falls back
+category. For a default-lifetime request a cache rate the tier does not name
+therefore inherits the base row's cache rate, never the tier's own ordinary
+input rate: an ordinary input price is not a cache price. An output rate the
+tier does not name falls back
 to the base row's output rate. A request that stays below every threshold is
 priced at the base row. Admission reservations cannot prove which tier a
 request reaches, so they reserve at the dearest rate any tier on the row
