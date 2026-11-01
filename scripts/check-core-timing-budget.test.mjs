@@ -33,13 +33,13 @@ printf '%s' "$(qcg_test_time_budget_for_label ${JSON.stringify(label)})"`, {
   return r.stdout;
 }
 
-test("v1 profile budgets only Linux exact-cache-hit rustc-1.99.1 default workspace", () => {
-  assert.equal(budgetFor("default workspace"), "120");
+test("v2 profile budgets only Linux exact-cache-hit rustc-1.99.1 default workspace", () => {
+  assert.equal(budgetFor("default workspace"), "147");
   assert.equal(
     budgetFor("default workspace", {
       QCG_TEST_TIME_BUDGET_LINUX_DEFAULT_WORKSPACE_S: "9999",
     }),
-    "120",
+    "147",
   );
   assert.equal(budgetFor("MCP no-default"), "16");
   assert.equal(budgetFor("server no-default"), "48");
@@ -96,7 +96,7 @@ echo "rc=$?"`,
   r = bash(
     `source scripts/check-core.sh
 set +e
-qcg_test_time_check_budget "default workspace" 120
+qcg_test_time_check_budget "default workspace" 147
 echo "rc=$?"`,
     BUDGETED_ENV,
   );
@@ -106,7 +106,7 @@ echo "rc=$?"`,
   r = bash(
     `source scripts/check-core.sh
 set +e
-qcg_test_time_check_budget "default workspace" 121
+qcg_test_time_check_budget "default workspace" 148
 echo "rc=$?"`,
     BUDGETED_ENV,
   );
@@ -114,8 +114,8 @@ echo "rc=$?"`,
   assert.match(r.stdout, /rc=1/);
   assert.match(r.stderr, /qcg-test-time-budget exceeded/);
   assert.match(r.stderr, /label="default workspace"/);
-  assert.match(r.stderr, /budget_s=120/);
-  assert.match(r.stderr, /policy=v1/);
+  assert.match(r.stderr, /budget_s=147/);
+  assert.match(r.stderr, /policy=v2/);
 
   // Unbudgeted labels never exceed, even far above the budget.
   r = bash(
@@ -144,7 +144,7 @@ echo "rc=$?"`,
   assert.match(r.stdout, /qcg-test-time label="default workspace" result=passed elapsed_s=/);
   assert.match(
     r.stdout,
-    /qcg-test-time-budget policy=v1 label="default workspace" budget_s=120 elapsed_s=\d+ verdict=within/,
+    /qcg-test-time-budget policy=v2 label="default workspace" budget_s=147 elapsed_s=\d+ verdict=within/,
   );
 
   // Unbudgeted label reports no budget and still passes.
@@ -163,7 +163,7 @@ echo "rc=$?"`,
   r = bash(
     `source scripts/check-core.sh
 unset GITHUB_STEP_SUMMARY
-fake_over_budget() { SECONDS=$((start + 121)); }
+fake_over_budget() { SECONDS=$((start + 148)); }
 set +e
 qcg_test_time "default workspace" fake_over_budget
 echo "rc=$?"`,
@@ -171,7 +171,7 @@ echo "rc=$?"`,
   );
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /result=passed/);
-  assert.match(r.stdout, /budget_s=120 elapsed_s=121 verdict=exceeded/);
+  assert.match(r.stdout, /budget_s=147 elapsed_s=148 verdict=exceeded/);
   assert.match(r.stderr, /qcg-test-time-budget exceeded/);
   assert.match(r.stdout, /rc=1/);
 
@@ -179,7 +179,7 @@ echo "rc=$?"`,
   r = bash(
     `source scripts/check-core.sh
 unset GITHUB_STEP_SUMMARY
-fake_failed_over_budget() { SECONDS=$((start + 121)); return 42; }
+fake_failed_over_budget() { SECONDS=$((start + 148)); return 42; }
 set +e
 qcg_test_time "default workspace" fake_failed_over_budget
 echo "rc=$?"`,
@@ -187,7 +187,7 @@ echo "rc=$?"`,
   );
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /result=failed/);
-  assert.match(r.stdout, /budget_s=120 elapsed_s=121 verdict=exceeded/);
+  assert.match(r.stdout, /budget_s=147 elapsed_s=148 verdict=exceeded/);
   assert.match(r.stderr, /qcg-test-time-budget exceeded/);
   assert.match(r.stdout, /rc=42/);
 });
@@ -204,7 +204,7 @@ rm -f "$GITHUB_STEP_SUMMARY"
 set +e
 qcg_test_time "default workspace" true
 qcg_test_time "MCP no-default" true
-fake_over_budget() { SECONDS=$((start + 121)); }
+fake_over_budget() { SECONDS=$((start + 148)); }
 qcg_test_time "default workspace" fake_over_budget
 echo "rc=$?"`,
       {
@@ -216,20 +216,20 @@ echo "rc=$?"`,
     );
     assert.equal(r.status, 0, r.stderr);
     const text = readFileSync(summary, "utf8");
-    assert.match(text, /timing_budget_policy=v1/);
-    assert.match(text, /budgets_s=\{default workspace:120; MCP no-default:16; server no-default:48;/);
+    assert.match(text, /timing_budget_policy=v2/);
+    assert.match(text, /budgets_s=\{default workspace:147; MCP no-default:16; server no-default:48;/);
     assert.match(text, /MCP live server:27; MCP no-default live server:24\}/);
-    assert.match(text, /timing_budget_basis=Each Linux invocation ceiling is ceil\(mean\+3\*sample_sd\) from n=16/);
+    assert.match(text, /timing_budget_basis=Each Linux invocation ceiling is ceil\(mean\+3\*sample_sd\) of the exact-cache-hit sample/);
     assert.match(
       text,
       /\| invocation \| result \| elapsed_s \| budget_s \| budget_result \|/,
     );
-    assert.match(text, /\| default workspace \| passed \| \d+ \| 120 \| within \|/);
+    assert.match(text, /\| default workspace \| passed \| \d+ \| 147 \| within \|/);
     assert.match(text, /\| MCP no-default \| passed \| \d+ \| 16 \| within \|/);
-    assert.match(text, /\| default workspace \| passed \| 121 \| 120 \| exceeded \|/);
+    assert.match(text, /\| default workspace \| passed \| 148 \| 147 \| exceeded \|/);
     assert.match(text, /\*\*qcg-test-time-budget exceeded\*\*/);
     const artifactText = readFileSync(artifact, "utf8");
-    assert.match(artifactText, /timing_budget_policy=v1/);
+    assert.match(artifactText, /timing_budget_policy=v2/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
     rmSync(artifact, { force: true });
