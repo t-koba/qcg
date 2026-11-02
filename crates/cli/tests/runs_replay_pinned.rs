@@ -108,7 +108,7 @@ fn replay_defaults_to_the_pinned_package_when_the_source_is_gone() {
     let source = root.join("source");
     write_contract(&source);
     seed_run(&runs, "pinned", &source, true);
-    let package = runs.join("pinned/generator-package");
+    let package = runs.join("pinned").join("generator-package");
     std::fs::remove_dir_all(&source).unwrap();
 
     let report = replay(&runs, "pinned");
