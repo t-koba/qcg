@@ -27,6 +27,39 @@ pub const DEFAULT_RETRY_RATE_LIMIT_FLOOR_MS: u64 = 5000;
 /// Default cap on the exponential retry-backoff exponent. Provider rows may
 /// set any cap within the mechanistic range 1..=16.
 pub const DEFAULT_RETRY_BACKOFF_EXPONENT_CAP: u32 = 8;
+/// Default Anthropic API version sent as the `anthropic-version` header.
+/// Single owner of the default; rows override it with `api_version`.
+pub const DEFAULT_ANTHROPIC_API_VERSION: &str = "2023-06-01";
+/// First Anthropic API version that removes the sampling parameters
+/// `temperature` and `top_p` (Anthropic also removes `top_k`, which qcg
+/// does not expose). Rows on this version or later must not advertise
+/// sampling capabilities.
+pub const ANTHROPIC_SAMPLING_REMOVED_VERSION: &str = "2026-10-21";
+
+/// Returns true when `version` is a strict `YYYY-MM-DD` date: ten ASCII
+/// characters with digits everywhere except hyphens at positions 5 and 8.
+pub(crate) fn is_valid_anthropic_api_version(version: &str) -> bool {
+    let bytes = version.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    for (index, byte) in bytes.iter().enumerate() {
+        if index == 4 || index == 7 {
+            continue;
+        }
+        if !byte.is_ascii_digit() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Returns true when an Anthropic API version removes the sampling
+/// parameters. The fixed zero-padded `YYYY-MM-DD` shape makes strict
+/// lexicographic comparison equal chronological comparison.
+pub(crate) fn anthropic_version_removes_sampling(version: &str) -> bool {
+    version >= ANTHROPIC_SAMPLING_REMOVED_VERSION
+}
 
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
@@ -529,6 +562,10 @@ pub struct ProviderSpec {
     /// Cap on the exponential retry-backoff exponent (default 8).
     pub retry_backoff_exponent_cap: Option<u32>,
     pub chat_token_limit_field: Option<ChatTokenLimitField>,
+    /// Anthropic `anthropic-version` header value (`YYYY-MM-DD`, default
+    /// `2023-06-01`). Valid only for `anthropic_messages`; rejected for
+    /// other APIs and when empty or malformed.
+    pub api_version: Option<String>,
     /// How `[llm].cache = "auto"` is expressed for this row. Required when
     /// the `prompt_cache` capability is enabled and invalid otherwise.
     pub prompt_cache_field: Option<PromptCacheField>,
@@ -568,6 +605,15 @@ pub struct ProviderSpec {
 const MAX_STREAM_RETRY_ATTEMPTS: u32 = 3;
 
 impl ProviderSpec {
+    /// Resolved Anthropic `anthropic-version` header value: the row's
+    /// `api_version` or the default. Single owner of the default so the
+    /// header sender and validation agree.
+    pub fn anthropic_api_version(&self) -> &str {
+        self.api_version
+            .as_deref()
+            .unwrap_or(DEFAULT_ANTHROPIC_API_VERSION)
+    }
+
     pub(crate) fn validate(&self) -> Result<(), String> {
         let invalid = |message: &str| format!("provider `{}` {message}", self.id);
         let reject = |condition: bool, message: &str| {
@@ -707,6 +753,27 @@ impl ProviderSpec {
             self.chat_token_limit_field.is_some() && self.api != ApiFlavor::ChatCompletions,
             "may only set `chat_token_limit_field` for chat_completions",
         )?;
+        reject(
+            self.api_version.is_some() && self.api != ApiFlavor::AnthropicMessages,
+            "may only set `api_version` for anthropic_messages",
+        )?;
+        if let Some(version) = self.api_version.as_deref()
+            && (version.is_empty() || !is_valid_anthropic_api_version(version))
+        {
+            return Err(invalid(&format!(
+                "declares an invalid `api_version` `{version}`: must be `YYYY-MM-DD`"
+            )));
+        }
+        if self.api == ApiFlavor::AnthropicMessages
+            && anthropic_version_removes_sampling(self.anthropic_api_version())
+            && (self.capabilities.temperature || self.capabilities.top_p)
+        {
+            return Err(invalid(&format!(
+                "with `api_version` `{}` may not advertise `temperature` or `top_p`: version {} or later removes sampling parameters, so set both capabilities false",
+                self.anthropic_api_version(),
+                ANTHROPIC_SAMPLING_REMOVED_VERSION
+            )));
+        }
         let decision_transport_is_default = self.decision_input_wrapper
             == DecisionInputWrapper::None
             && self.decision_model_in_body
@@ -785,6 +852,22 @@ impl ProviderSpec {
                     "provider `{}` declares duplicate model id `{}`",
                     self.id, model.id
                 ));
+            }
+        }
+        if self.api == ApiFlavor::AnthropicMessages
+            && anthropic_version_removes_sampling(self.anthropic_api_version())
+        {
+            for model in &self.models {
+                let effective = model.effective_capabilities(&self.capabilities);
+                if effective.temperature || effective.top_p {
+                    return Err(format!(
+                        "provider `{}` model `{}` with `api_version` `{}` may not advertise `temperature` or `top_p`: version {} or later removes sampling parameters, so set both capabilities false",
+                        self.id,
+                        model.id,
+                        self.anthropic_api_version(),
+                        ANTHROPIC_SAMPLING_REMOVED_VERSION
+                    ));
+                }
             }
         }
         reject(

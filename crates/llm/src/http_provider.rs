@@ -214,6 +214,12 @@ impl HttpProvider {
         self.spec.capabilities_for_model(model)
     }
 
+    /// Resolved `anthropic-version` header value for this row. Exposed so
+    /// tests assert the configured version without a mock server.
+    pub(crate) fn anthropic_version(&self) -> &str {
+        self.spec.anthropic_api_version()
+    }
+
     pub fn pricing_for_model(&self, model: &str) -> Option<ModelPricing> {
         self.spec.pricing_for_model(model)
     }
@@ -596,7 +602,7 @@ impl HttpProvider {
             };
         }
         if self.spec.api == ApiFlavor::AnthropicMessages {
-            builder = builder.header("anthropic-version", "2023-06-01");
+            builder = builder.header("anthropic-version", self.anthropic_version());
         }
         let response = builder.send().await.map_err(llm_http_error)?;
         let status = response.status();

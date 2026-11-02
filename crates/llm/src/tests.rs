@@ -1495,6 +1495,7 @@ fn spec_with_base_url(id: &str, base_url: &str) -> ProviderSpec {
         web_search_billing: None,
         id: id.into(),
         api: ApiFlavor::ChatCompletions,
+        api_version: None,
         base_url: Some(base_url.into()),
         base_url_env: None,
         api_key_env: None,
@@ -2122,6 +2123,226 @@ fn system_one_decision_transports_validate_without_network() {
             extra,
         );
         ProvidersFile::parse(&source).expect("decision transports must validate");
+    }
+}
+
+#[test]
+fn anthropic_api_version_defaults_and_resolves() {
+    let file = ProvidersFile::parse(&test_provider_row(
+        "anthropic-default",
+        "anthropic_messages",
+        "https://example.invalid",
+        "",
+    ))
+    .expect("default anthropic row must validate");
+    assert_eq!(file.provider[0].anthropic_api_version(), "2023-06-01");
+    let provider = HttpProvider::from_spec(file.provider[0].clone());
+    assert_eq!(provider.anthropic_version(), "2023-06-01");
+
+    let file = ProvidersFile::parse(&test_provider_row(
+        "anthropic-pinned",
+        "anthropic_messages",
+        "https://example.invalid",
+        "api_version = \"2025-01-01\"\n",
+    ))
+    .expect("configured anthropic row must validate");
+    assert_eq!(file.provider[0].anthropic_api_version(), "2025-01-01");
+    let provider = HttpProvider::from_spec(file.provider[0].clone());
+    assert_eq!(provider.anthropic_version(), "2025-01-01");
+}
+
+#[test]
+fn anthropic_api_version_changeover_rejects_sampling_capabilities() {
+    for extra in [
+        "api_version = \"2026-10-21\"\ncapabilities = { temperature = true }\n",
+        "api_version = \"2026-10-21\"\ncapabilities = { top_p = true }\n",
+        "api_version = \"2027-01-01\"\ncapabilities = { temperature = true, top_p = true }\n",
+    ] {
+        let error = ProvidersFile::parse(&test_provider_row(
+            "anthropic-new",
+            "anthropic_messages",
+            "https://example.invalid",
+            extra,
+        ))
+        .expect_err("sampling capabilities must fail on removed versions");
+        assert!(error.contains("provider `anthropic-new`"), "{error}");
+        assert!(error.contains("removes"), "{error}");
+    }
+    // The same row with both sampling flags false loads.
+    let file = ProvidersFile::parse(&test_provider_row(
+        "anthropic-new",
+        "anthropic_messages",
+        "https://example.invalid",
+        "api_version = \"2026-10-21\"\ncapabilities = { temperature = false, top_p = false }\n",
+    ))
+    .expect("disabled sampling must load on removed versions");
+    assert_eq!(file.provider[0].anthropic_api_version(), "2026-10-21");
+    // Versions before the changeover keep the current capability rules.
+    for extra in [
+        "capabilities = { temperature = true, top_p = true }\n",
+        "api_version = \"2026-10-20\"\ncapabilities = { temperature = true, top_p = true }\n",
+    ] {
+        ProvidersFile::parse(&test_provider_row(
+            "anthropic-old",
+            "anthropic_messages",
+            "https://example.invalid",
+            extra,
+        ))
+        .expect("sampling stays valid before the changeover");
+    }
+    // A new-version row cannot smuggle sampling through a model override.
+    let error = ProvidersFile::parse(&test_provider_row(
+        "anthropic-model",
+        "anthropic_messages",
+        "https://example.invalid",
+        "api_version = \"2026-10-21\"\n\n[[provider.models]]\nid = \"model\"\ncapabilities = { temperature = true }\n",
+    ))
+    .expect_err("model sampling must fail on removed versions");
+    assert!(error.contains("anthropic-model"), "{error}");
+    assert!(error.contains("removes"), "{error}");
+}
+
+#[test]
+fn anthropic_api_version_rejects_other_apis_and_malformed_versions() {
+    let error = ProvidersFile::parse(&test_provider_row(
+        "chat-version",
+        "chat_completions",
+        "https://example.invalid",
+        "api_version = \"2023-06-01\"\n",
+    ))
+    .expect_err("api_version must be anthropic-only");
+    assert!(error.contains("api_version"), "{error}");
+    assert!(error.contains("anthropic_messages"), "{error}");
+
+    for version in [
+        "",
+        "2026-1-1",
+        "not-a-version",
+        "20261021",
+        "2026/10/21",
+        "2026-10-211",
+    ] {
+        let extra = format!("api_version = \"{version}\"\n");
+        let error = ProvidersFile::parse(&test_provider_row(
+            "anthropic-bad",
+            "anthropic_messages",
+            "https://example.invalid",
+            &extra,
+        ))
+        .expect_err("malformed api_version must fail");
+        assert!(error.contains("api_version"), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn anthropic_version_header_is_sent_on_the_wire() {
+    use std::sync::{Arc, Mutex};
+    fn spawn_header_server(body: String) -> (String, Arc<Mutex<Option<String>>>, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let address = listener.local_addr().expect("listener address");
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let server_captured = Arc::clone(&captured);
+        let handle = std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut raw = Vec::new();
+            let mut buf = [0_u8; 4096];
+            let header_end = loop {
+                let n = stream.read(&mut buf).expect("request should arrive");
+                if n == 0 {
+                    break None;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break Some(pos + 4);
+                }
+            };
+            let Some(header_end) = header_end else {
+                return;
+            };
+            let headers = String::from_utf8_lossy(&raw[..header_end]).into_owned();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.trim()
+                        .eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            while raw.len() < header_end + content_length {
+                let n = stream.read(&mut buf).expect("body should arrive");
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+            }
+            *server_captured.lock().unwrap() = Some(headers);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        (format!("http://{address}"), captured, handle)
+    }
+    let body = serde_json::to_string(&json!({
+        "content": [{"type": "text", "text": "hello"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 5, "output_tokens": 2},
+    }))
+    .expect("fixture should serialize");
+    for (extra, expected) in [
+        ("".to_owned(), "2023-06-01"),
+        ("api_version = \"2026-10-21\"\n".to_owned(), "2026-10-21"),
+    ] {
+        let (base_url, captured, server) = spawn_header_server(body.clone());
+        let source = format!(
+            "\n[[provider]]\nid = \"anthropic-wire\"\napi = \"anthropic_messages\"\nbase_url = \"{base_url}\"\n{extra}"
+        );
+        let file = ProvidersFile::parse(&source).expect("wire row must validate");
+        let provider = HttpProvider::from_spec(file.provider.into_iter().next().expect("row"));
+        let request = ChatRequest {
+            provider: "anthropic-wire".into(),
+            model: "wire-model".into(),
+            system: None,
+            messages: vec![ChatMessage::text("user", "hello")],
+            tools: vec![],
+            response_schema: None,
+            structured_output: StructuredOutputMode::Auto,
+            temperature: None,
+            top_p: None,
+            max_tokens: 16,
+            stop_sequences: vec![],
+            seed: None,
+            reasoning_effort: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            verbosity: None,
+            stream: false,
+            prompt_cache: PromptCache::Off,
+            cache_write: CacheWritePolicy::Allow,
+            cache_retention: None,
+            provider_web_search: None,
+        };
+        provider
+            .complete(request)
+            .await
+            .expect("wire request should succeed");
+        let headers = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("server saw a request");
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains(&format!("anthropic-version: {expected}")),
+            "expected anthropic-version {expected}, got: {headers}"
+        );
+        server.join().expect("server should stop");
     }
 }
 
