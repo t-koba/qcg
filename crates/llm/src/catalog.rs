@@ -360,7 +360,7 @@ impl CatalogService {
     ) -> Option<crate::types::Capabilities> {
         let spec = self.specs.get(provider)?;
         self.model_spec(provider, model)
-            .map(|model| model.effective_capabilities(&spec.capabilities))
+            .map(|model| spec.effective_capabilities(&model))
             .or_else(|| Some(spec.capabilities.clone()))
     }
 
@@ -385,6 +385,14 @@ impl CatalogService {
                             *explicit = merge_model(external_model, explicit);
                         }
                         None => provider_models.push(external_model.clone()),
+                    }
+                }
+            }
+            if spec.sampling_removed() {
+                for model in &mut provider_models {
+                    if let Some(capabilities) = model.capabilities.as_mut() {
+                        capabilities.temperature = false;
+                        capabilities.top_p = false;
                     }
                 }
             }
@@ -550,14 +558,14 @@ impl CatalogService {
                     };
                 models.insert(
                     model.id.clone(),
-                    model_view(&merged, source, &spec.capabilities),
+                    model_view(&merged, source, spec.effective_capabilities(&merged)),
                 );
             }
             if let Some(external_models) = external_models {
                 for (model_id, model) in external_models {
-                    models
-                        .entry(model_id.clone())
-                        .or_insert_with(|| model_view(model, "external", &spec.capabilities));
+                    models.entry(model_id.clone()).or_insert_with(|| {
+                        model_view(model, "external", spec.effective_capabilities(model))
+                    });
                 }
             }
             let mut error = None;
@@ -577,7 +585,10 @@ impl CatalogService {
                                             ..ModelSpec::default()
                                         },
                                         "discovery",
-                                        &spec.capabilities,
+                                        spec.effective_capabilities(&ModelSpec {
+                                            id: id.clone(),
+                                            ..ModelSpec::default()
+                                        }),
                                     )
                                 });
                         }
@@ -820,7 +831,7 @@ fn fake_provider_view() -> CatalogProviderView {
                 ..ModelSpec::default()
             },
             "built-in",
-            &FakeLlmProvider.capabilities(),
+            FakeLlmProvider.capabilities(),
         )],
     }
 }
@@ -828,17 +839,16 @@ fn fake_provider_view() -> CatalogProviderView {
 fn model_view(
     model: &ModelSpec,
     source: &str,
-    provider_capabilities: &crate::types::Capabilities,
+    capabilities: crate::types::Capabilities,
 ) -> CatalogModelView {
-    let effective = model.effective_capabilities(provider_capabilities);
     CatalogModelView {
         id: model.id.clone(),
         warning: None,
         label: model.label.clone(),
         enabled: model.is_enabled(),
         source: source.to_string(),
-        reasoning_effort: effective.reasoning_effort.clone(),
-        capabilities: effective,
+        reasoning_effort: capabilities.reasoning_effort.clone(),
+        capabilities,
         input_cost_per_million_usd: model.input_cost_per_million_usd,
         cache_creation_input_cost_per_million_usd: model.cache_creation_input_cost_per_million_usd,
         cache_read_input_cost_per_million_usd: model.cache_read_input_cost_per_million_usd,
@@ -1282,6 +1292,81 @@ mod tests {
 }
 "#;
 
+    #[tokio::test]
+    async fn anthropic_new_version_clamps_catalog_sampling_capabilities() {
+        let file = ProvidersFile::parse(
+            r#"
+[[provider]]
+id = "anthropic-new"
+api = "anthropic_messages"
+base_url = "https://example.test/v1"
+api_version = "2026-10-21"
+
+[[provider.models]]
+id = "declared"
+"#,
+        )
+        .expect("registry must parse");
+        let service = CatalogService::new(file.provider, None).expect("catalog service");
+        let mut external = map_models_dev(
+            r#"{
+              "anthropic-new": {
+                "models": {
+                  "declared": { "temperature": true },
+                  "external-only": { "temperature": true }
+                }
+              }
+            }"#,
+        )
+        .expect("external catalog");
+        for model in external
+            .providers
+            .get_mut("anthropic-new")
+            .expect("external provider")
+            .values_mut()
+        {
+            model
+                .capabilities
+                .as_mut()
+                .expect("mapped capabilities")
+                .top_p = true;
+        }
+        {
+            let mut snapshot = service
+                .snapshot
+                .write()
+                .unwrap_or_else(|error| error.into_inner());
+            snapshot.external = external;
+        }
+        service.rebuild_models();
+        for id in ["declared", "external-only"] {
+            let capabilities = service
+                .model_capabilities("anthropic-new", id)
+                .expect("effective capabilities");
+            assert!(!capabilities.temperature, "{id}");
+            assert!(!capabilities.top_p, "{id}");
+            let spec = service.model_spec("anthropic-new", id).expect("model spec");
+            let capabilities = spec.capabilities.expect("merged capabilities");
+            assert!(!capabilities.temperature, "{id}");
+            assert!(!capabilities.top_p, "{id}");
+        }
+        let view = service.view(false).await;
+        let provider = view
+            .providers
+            .iter()
+            .find(|provider| provider.id == "anthropic-new")
+            .expect("provider view");
+        for id in ["declared", "external-only"] {
+            let model = provider
+                .models
+                .iter()
+                .find(|model| model.id == id)
+                .expect("model view");
+            assert!(!model.capabilities.temperature, "{id}");
+            assert!(!model.capabilities.top_p, "{id}");
+        }
+    }
+
     #[test]
     fn models_dev_maps_reasoning_effort_capabilities_and_pricing() {
         let catalog = map_models_dev(MODELS_DEV_FIXTURE).expect("fixture must map");
@@ -1516,7 +1601,7 @@ mod tests {
         let catalog = map_models_dev(MODELS_DEV_TIER_FIXTURE).unwrap();
         let mut model = catalog.providers["openai"]["short-band"].clone();
         model.cost_tiers[0].cache_read_input_cost_per_million_usd = Some(0.0);
-        let view = model_view(&model, "external", &Default::default());
+        let view = model_view(&model, "external", Default::default());
         assert_eq!(view.input_cost_per_million_usd, Some(3.0));
         assert_eq!(view.cache_creation_input_cost_per_million_usd, None);
         let tier = &view.cost_tiers[0];
@@ -1547,7 +1632,7 @@ mod tests {
         model.output_cost_per_million_usd = None;
         model.cost_tiers[0].output_cost_per_million_usd = None;
         let json =
-            serde_json::to_value(model_view(&model, "external", &Default::default())).unwrap();
+            serde_json::to_value(model_view(&model, "external", Default::default())).unwrap();
         assert!(json["cost_tiers"][0]["cache_creation_input_cost_per_million_usd"].is_null());
         assert!(json["cost_tiers"][0]["output_cost_per_million_usd"].is_null());
         assert_eq!(
@@ -1556,7 +1641,7 @@ mod tests {
         );
         model.cost_tiers.clear();
         assert!(
-            model_view(&model, "external", &Default::default())
+            model_view(&model, "external", Default::default())
                 .cost_tiers
                 .is_empty()
         );
@@ -1598,7 +1683,7 @@ mod tests {
         );
         assert_eq!(merged.cost_tiers[0].output_cost_per_million_usd, Some(4.0));
         assert_eq!(merged.cost_tiers[0].threshold_tokens, 272_001);
-        let view = model_view(&merged, "explicit + external", &Default::default());
+        let view = model_view(&merged, "explicit + external", Default::default());
         assert_eq!(view.input_cost_per_million_usd, Some(0.5));
         let tier = &view.cost_tiers[0];
         assert_eq!(tier.threshold_tokens, 272_001);
@@ -1638,7 +1723,7 @@ mod tests {
         assert_eq!(merged.cost_tiers.len(), 1);
         assert_eq!(merged.cost_tiers[0].threshold_tokens, 100_000);
         assert_eq!(merged.cost_tiers[0].input_cost_per_million_usd, Some(3.0));
-        let view = model_view(&merged, "explicit + external", &Default::default());
+        let view = model_view(&merged, "explicit + external", Default::default());
         assert_eq!(view.input_cost_per_million_usd, Some(1.0));
         assert_eq!(view.cost_tiers.len(), 1);
         let tier = &view.cost_tiers[0];

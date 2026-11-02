@@ -98,7 +98,9 @@ Fields:
   default `2023-06-01`). Valid only for `anthropic_messages`; it is rejected
   for other APIs and when empty or malformed. Versions `2026-10-21` or later
   remove `temperature` and `top_p`, so such rows must set both capabilities
-  false; earlier versions keep the current capability rules. The version
+  false; earlier versions keep the current capability rules. Catalog metadata
+  cannot re-enable them: merged model capabilities are clamped for such rows.
+  The version
   selects only the header value; response and streaming shapes are unchanged.
 - `path_template`: optional request path where `{model}` expands to the model
   name from the contract. `{model}` expands as path segments so namespaced

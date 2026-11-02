@@ -587,6 +587,22 @@ impl ProviderSpec {
             .unwrap_or(DEFAULT_ANTHROPIC_API_VERSION)
     }
 
+    /// True when the row's Anthropic API version removes temperature/top_p.
+    pub(crate) fn sampling_removed(&self) -> bool {
+        self.api == ApiFlavor::AnthropicMessages
+            && self.anthropic_api_version() >= ANTHROPIC_SAMPLING_REMOVED_VERSION
+    }
+
+    /// Effective capabilities for a model, honoring the row's API version.
+    pub fn effective_capabilities(&self, model: &ModelSpec) -> Capabilities {
+        let mut capabilities = model.effective_capabilities(&self.capabilities);
+        if self.sampling_removed() {
+            capabilities.temperature = false;
+            capabilities.top_p = false;
+        }
+        capabilities
+    }
+
     pub(crate) fn validate(&self) -> Result<(), String> {
         let invalid = |message: &str| format!("provider `{}` {message}", self.id);
         let reject = |condition: bool, message: &str| {
@@ -733,9 +749,7 @@ impl ProviderSpec {
                 "`api_version` must be an anthropic_messages `YYYY-MM-DD` date",
             ));
         }
-        if self.api == ApiFlavor::AnthropicMessages
-            && self.anthropic_api_version() >= ANTHROPIC_SAMPLING_REMOVED_VERSION
-        {
+        if self.sampling_removed() {
             let model = self.models.iter().any(|model| {
                 let caps = model.effective_capabilities(&self.capabilities);
                 caps.temperature || caps.top_p
@@ -865,7 +879,7 @@ impl ProviderSpec {
     /// working with arbitrary model strings).
     pub fn capabilities_for_model(&self, id: &str) -> Capabilities {
         self.model(id)
-            .map(|model| model.effective_capabilities(&self.capabilities))
+            .map(|model| self.effective_capabilities(model))
             .unwrap_or_else(|| self.capabilities.clone())
     }
 
