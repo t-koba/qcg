@@ -366,5 +366,70 @@ params = { content = "x", output_file = "x.txt" }
         .await
         .expect("cost metrics should load");
     assert!(!costs.priced, "unmetered hosted search must report risk");
+
+    // Liability-only shape: no billed call at all, only a failed route whose
+    // hosted search was not metered. `pricing_covered` returns true early on an
+    // empty call list, so the marker in `run_cost_metrics` alone must keep the
+    // run unpriced.
+    let meta = root.join("search-route-failed").join("meta");
+    std::fs::create_dir_all(&meta).unwrap();
+    let journal = engine::JournalWriter::create(
+        &meta.join("journal.jsonl"),
+        "search-route-failed",
+        false,
+        None,
+    )
+    .unwrap();
+    journal
+        .event(
+            "run_started",
+            json!({"generator": "search-fixture@0.1.0",
+                "generator_path": generator_path,
+                "contract_sha256": "test", "inputs": {},
+                "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                "elapsed_budget_mode": "wall_clock"}),
+        )
+        .unwrap();
+    // A search liability makes the engine write this otherwise observational
+    // event durably. The writer keeps that choice internal, so append the
+    // durable record here; the next writer event resynchronizes from it.
+    let mut line = serde_json::to_vec(&json!({
+        "t": "llm_route_failed",
+        "seq": 2,
+        "ts": "2026-11-02T00:00:00Z",
+        "run_id": "search-route-failed",
+        "trace_id": api::trace_id_for_run("search-route-failed"),
+        "span_id": api::span_id_for_seq(2),
+        "parent_span_id": api::span_id_for_scope("search-route-failed", "step:generate"),
+        "node": "generate", "provider": "provider", "model": "model",
+        "attempt": 1, "kind": {"http_status": 503},
+        "web_search": {"calls": null, "cost_microusd": null}
+    }))
+    .unwrap();
+    line.push(b'\n');
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(meta.join("journal.jsonl"))
+        .unwrap();
+    std::io::Write::write_all(&mut file, &line).unwrap();
+    journal
+        .event("run_finished", json!({"status": "success"}))
+        .unwrap();
+    let view = service
+        .read_view(root.join("search-route-failed"))
+        .await
+        .expect("the liability-only run should read");
+    assert!(
+        view.state.budget.unresolved_search_cost,
+        "the route-failure event must mark unresolved hosted-search cost"
+    );
+    let costs = service
+        .run_cost_metrics("search-route-failed".into())
+        .await
+        .expect("cost metrics should load");
+    assert!(
+        !costs.priced,
+        "a liability-only run with unmetered search must stay unpriced"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
