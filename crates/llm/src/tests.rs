@@ -2166,7 +2166,7 @@ fn anthropic_api_version_changeover_rejects_sampling_capabilities() {
         ))
         .expect_err("sampling capabilities must fail on removed versions");
         assert!(error.contains("provider `anthropic-new`"), "{error}");
-        assert!(error.contains("removes"), "{error}");
+        assert!(error.contains("sampling"), "{error}");
     }
     // The same row with both sampling flags false loads.
     let file = ProvidersFile::parse(&test_provider_row(
@@ -2199,7 +2199,7 @@ fn anthropic_api_version_changeover_rejects_sampling_capabilities() {
     ))
     .expect_err("model sampling must fail on removed versions");
     assert!(error.contains("anthropic-model"), "{error}");
-    assert!(error.contains("removes"), "{error}");
+    assert!(error.contains("sampling"), "{error}");
 }
 
 #[test]
