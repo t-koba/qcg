@@ -7,12 +7,16 @@ use service::{
 };
 use std::collections::BTreeMap;
 
+pub(crate) fn directory_scan_limit() -> Result<usize> {
+    policy::retention::directory_scan_limit_from_env().map_err(anyhow::Error::msg)
+}
+
 pub(crate) fn list_runs(
     runs_dir: &Utf8Path,
     state: Option<&str>,
     generator: Option<&str>,
-    max_scan_entries: usize,
 ) -> Result<()> {
+    let max_scan_entries = directory_scan_limit()?;
     for (summary, _) in list_run_summaries(runs_dir, max_scan_entries)? {
         if let Some(want) = state
             && summary.status != want
@@ -352,7 +356,6 @@ pub(crate) fn show_costs(
     generator_filter: &Option<String>,
     by_model: bool,
     json_output: bool,
-    max_scan_entries: usize,
 ) -> Result<()> {
     #[derive(Debug, Default)]
     struct ModelAggregate {
@@ -378,6 +381,7 @@ pub(crate) fn show_costs(
 
     let mut runs: Vec<RunCost> = Vec::new();
     let mut models: BTreeMap<(String, String), ModelAggregate> = BTreeMap::new();
+    let max_scan_entries = directory_scan_limit()?;
     let mut scanned = 0_usize;
     let entries = std::fs::read_dir(runs_dir)
         .with_context(|| format!("failed to list runs under `{runs_dir}`"))?;

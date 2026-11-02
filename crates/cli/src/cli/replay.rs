@@ -4,8 +4,7 @@ use engine::read_output_manifest;
 use model::OutputManifest;
 use serde_json::{Value, json};
 use service::{
-    DirectRun, read_run_events, read_run_generator_path, read_run_inputs, resolve_run_dir,
-    run_generator_root, run_meta_dir,
+    DirectRun, read_run_events, read_run_inputs, resolve_run_dir, run_generator_root, run_meta_dir,
 };
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -44,10 +43,7 @@ pub(crate) async fn replay_run(
     };
     let generator_path = match generator {
         Some(path) => path.clone(),
-        None => match run_generator_root(&original_dir)? {
-            Some(path) => path,
-            None => read_run_generator_path(&original_dir)?,
-        },
+        None => run_generator_root(&original_dir)?,
     };
     let output_dir = match output {
         Some(output) => output,

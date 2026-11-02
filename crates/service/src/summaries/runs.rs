@@ -1,4 +1,5 @@
 use super::super::types::ServiceError;
+use crate::run_package::{load_identity, package_dir};
 use camino::{Utf8Path, Utf8PathBuf};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -15,33 +16,20 @@ pub fn read_run_generator_path(run_dir: &Utf8Path) -> Result<Utf8PathBuf, Servic
     Ok(Utf8PathBuf::from(&started.generator_path))
 }
 
-/// The run's pinned generator package directory when one was admitted.
-pub fn run_generator_root(run_dir: &Utf8Path) -> Result<Option<Utf8PathBuf>, ServiceError> {
+/// The run's generator root: verified pinned package, or recorded path for legacy runs.
+pub fn run_generator_root(run_dir: &Utf8Path) -> Result<Utf8PathBuf, ServiceError> {
     let events = read_durable_run_events(run_dir)?;
     let (_, started) = run_identity_event(run_dir, &events)?;
-    let Some(package_sha256) = started.package_sha256.as_deref() else {
-        return Ok(None);
+    let Some(expected) = started.package_sha256.as_deref() else {
+        return Ok(Utf8PathBuf::from(&started.generator_path));
     };
-    crate::run_package::load_identity(
-        run_dir,
-        Some(package_sha256),
-        Some(&started.contract_sha256),
-    )?;
-    Ok(Some(crate::run_package::package_dir(run_dir)))
+    load_identity(run_dir, Some(expected), Some(&started.contract_sha256))?;
+    Ok(package_dir(run_dir))
 }
 
 /// The contract the run used: pinned package bytes, or the recorded path for legacy runs.
 pub fn load_run_contract(run_dir: &Utf8Path) -> Result<contract::Contract, ServiceError> {
-    let events = read_durable_run_events(run_dir)?;
-    let (_, started) = run_identity_event(run_dir, &events)?;
-    if let Some(package_sha256) = started.package_sha256.as_deref() {
-        return crate::run_package::load_identity(
-            run_dir,
-            Some(package_sha256),
-            Some(&started.contract_sha256),
-        );
-    }
-    contract::Contract::load(Utf8PathBuf::from(&started.generator_path))
+    contract::Contract::load(run_generator_root(run_dir)?)
         .map_err(|error| ServiceError::Invalid(error.to_string()))
 }
 
@@ -279,7 +267,7 @@ params = {{ content = "x", output_file = "x.txt" }}
         write_contract(&source, 5.0);
         let loaded = load_run_contract(&run).unwrap();
         assert_eq!(input_rate(&loaded), Some(5.0));
-        assert!(run_generator_root(&run).unwrap().is_none());
+        assert_eq!(run_generator_root(&run).unwrap(), source);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -302,7 +290,7 @@ params = {{ content = "x", output_file = "x.txt" }}
         .unwrap();
         write_run(&run, &source, Some(&package_sha256), &original.sha256);
         std::fs::remove_dir_all(&source).unwrap();
-        assert_eq!(run_generator_root(&run).unwrap(), Some(package));
+        assert_eq!(run_generator_root(&run).unwrap(), package);
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -185,10 +185,6 @@ impl LlmRouter {
         &self.search
     }
 
-    pub fn mcp_runtime(&self) -> &mcp::McpRuntime {
-        &self.mcp
-    }
-
     pub fn catalog(&self) -> &Arc<CatalogService> {
         &self.catalog
     }
