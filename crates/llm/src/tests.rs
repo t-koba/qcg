@@ -2136,8 +2136,6 @@ fn anthropic_api_version_defaults_and_resolves() {
     ))
     .expect("default anthropic row must validate");
     assert_eq!(file.provider[0].anthropic_api_version(), "2023-06-01");
-    let provider = HttpProvider::from_spec(file.provider[0].clone());
-    assert_eq!(provider.anthropic_version(), "2023-06-01");
 
     let file = ProvidersFile::parse(&test_provider_row(
         "anthropic-pinned",
@@ -2147,8 +2145,6 @@ fn anthropic_api_version_defaults_and_resolves() {
     ))
     .expect("configured anthropic row must validate");
     assert_eq!(file.provider[0].anthropic_api_version(), "2025-01-01");
-    let provider = HttpProvider::from_spec(file.provider[0].clone());
-    assert_eq!(provider.anthropic_version(), "2025-01-01");
 }
 
 #[test]
@@ -2166,7 +2162,11 @@ fn anthropic_api_version_changeover_rejects_sampling_capabilities() {
         ))
         .expect_err("sampling capabilities must fail on removed versions");
         assert!(error.contains("provider `anthropic-new`"), "{error}");
-        assert!(error.contains("sampling"), "{error}");
+        assert!(
+            error.contains("version `2026-10-21` or later removes sampling parameters"),
+            "{error}"
+        );
+        assert!(error.contains("set both capabilities false"), "{error}");
     }
     // The same row with both sampling flags false loads.
     let file = ProvidersFile::parse(&test_provider_row(
@@ -2199,7 +2199,11 @@ fn anthropic_api_version_changeover_rejects_sampling_capabilities() {
     ))
     .expect_err("model sampling must fail on removed versions");
     assert!(error.contains("anthropic-model"), "{error}");
-    assert!(error.contains("sampling"), "{error}");
+    assert!(error.contains("model `model`"), "{error}");
+    assert!(
+        error.contains("version `2026-10-21` or later removes sampling parameters"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -2211,8 +2215,10 @@ fn anthropic_api_version_rejects_other_apis_and_malformed_versions() {
         "api_version = \"2023-06-01\"\n",
     ))
     .expect_err("api_version must be anthropic-only");
-    assert!(error.contains("api_version"), "{error}");
-    assert!(error.contains("anthropic_messages"), "{error}");
+    assert!(
+        error.contains("may only set `api_version` for anthropic_messages"),
+        "{error}"
+    );
 
     for version in [
         "",
@@ -2221,6 +2227,8 @@ fn anthropic_api_version_rejects_other_apis_and_malformed_versions() {
         "20261021",
         "2026/10/21",
         "2026-10-211",
+        "2026-02-30",
+        "2026-13-01",
     ] {
         let extra = format!("api_version = \"{version}\"\n");
         let error = ProvidersFile::parse(&test_provider_row(
@@ -2230,7 +2238,10 @@ fn anthropic_api_version_rejects_other_apis_and_malformed_versions() {
             &extra,
         ))
         .expect_err("malformed api_version must fail");
-        assert!(error.contains("api_version"), "{error}");
+        assert!(
+            error.contains(&format!("declares an invalid `api_version` `{version}`")),
+            "{error}"
+        );
     }
 }
 

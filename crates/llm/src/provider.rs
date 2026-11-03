@@ -27,15 +27,10 @@ pub const DEFAULT_RETRY_RATE_LIMIT_FLOOR_MS: u64 = 5000;
 /// Default cap on the exponential retry-backoff exponent. Provider rows may
 /// set any cap within the mechanistic range 1..=16.
 pub const DEFAULT_RETRY_BACKOFF_EXPONENT_CAP: u32 = 8;
-/// Default Anthropic API version; rows may override it with `api_version`.
-pub const DEFAULT_ANTHROPIC_API_VERSION: &str = "2023-06-01";
+const DEFAULT_ANTHROPIC_API_VERSION: &str = "2023-06-01";
 const ANTHROPIC_SAMPLING_REMOVED_VERSION: &str = "2026-10-21";
 fn is_anthropic_version(version: &str) -> bool {
-    matches!(
-        version.as_bytes(),
-        [a, b, c, d, b'-', e, f, b'-', g, h]
-            if [a, b, c, d, e, f, g, h].iter().all(|byte| byte.is_ascii_digit())
-    )
+    version.len() == 10 && chrono::NaiveDate::parse_from_str(version, "%Y-%m-%d").is_ok()
 }
 
 #[async_trait]
@@ -587,20 +582,9 @@ impl ProviderSpec {
             .unwrap_or(DEFAULT_ANTHROPIC_API_VERSION)
     }
 
-    /// True when the row's Anthropic API version removes temperature/top_p.
     pub(crate) fn sampling_removed(&self) -> bool {
         self.api == ApiFlavor::AnthropicMessages
             && self.anthropic_api_version() >= ANTHROPIC_SAMPLING_REMOVED_VERSION
-    }
-
-    /// Effective capabilities for a model, honoring the row's API version.
-    pub fn effective_capabilities(&self, model: &ModelSpec) -> Capabilities {
-        let mut capabilities = model.effective_capabilities(&self.capabilities);
-        if self.sampling_removed() {
-            capabilities.temperature = false;
-            capabilities.top_p = false;
-        }
-        capabilities
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
@@ -742,21 +726,21 @@ impl ProviderSpec {
             self.chat_token_limit_field.is_some() && self.api != ApiFlavor::ChatCompletions,
             "may only set `chat_token_limit_field` for chat_completions",
         )?;
-        if self.api_version.as_deref().is_some_and(|version| {
-            self.api != ApiFlavor::AnthropicMessages || !is_anthropic_version(version)
-        }) {
-            return Err(invalid(
-                "`api_version` must be an anthropic_messages `YYYY-MM-DD` date",
-            ));
-        }
-        if self.sampling_removed() {
-            let model = self.models.iter().any(|model| {
-                let caps = model.effective_capabilities(&self.capabilities);
-                caps.temperature || caps.top_p
-            });
-            if self.capabilities.temperature || self.capabilities.top_p || model {
-                return Err(invalid("sampling is not supported on this `api_version`"));
+        let version = self.anthropic_api_version();
+        if let Some(configured) = self.api_version.as_deref() {
+            if self.api != ApiFlavor::AnthropicMessages {
+                return Err(invalid("may only set `api_version` for anthropic_messages"));
             }
+            if !is_anthropic_version(configured) {
+                return Err(invalid(&format!(
+                    "declares an invalid `api_version` `{configured}`: must be `YYYY-MM-DD`"
+                )));
+            }
+        }
+        if self.sampling_removed() && (self.capabilities.temperature || self.capabilities.top_p) {
+            return Err(invalid(&format!(
+                "with `api_version` `{version}` may not advertise `temperature` or `top_p`: version `{ANTHROPIC_SAMPLING_REMOVED_VERSION}` or later removes sampling parameters, so set both capabilities false"
+            )));
         }
         let decision_transport_is_default = self.decision_input_wrapper
             == DecisionInputWrapper::None
@@ -821,6 +805,15 @@ impl ProviderSpec {
         let mut model_ids = BTreeMap::new();
         for model in &self.models {
             model.validate(&self.id, self.api)?;
+            if self.sampling_removed()
+                && let Some(capabilities) = &model.capabilities
+                && (capabilities.temperature || capabilities.top_p)
+            {
+                let model_id = &model.id;
+                return Err(invalid(&format!(
+                    "model `{model_id}` with `api_version` `{version}` may not advertise `temperature` or `top_p`: version `{ANTHROPIC_SAMPLING_REMOVED_VERSION}` or later removes sampling parameters, so set both capabilities false"
+                )));
+            }
             if model.prompt_cache_retention.is_some()
                 && !model
                     .effective_capabilities(&self.capabilities)
@@ -879,7 +872,7 @@ impl ProviderSpec {
     /// working with arbitrary model strings).
     pub fn capabilities_for_model(&self, id: &str) -> Capabilities {
         self.model(id)
-            .map(|model| self.effective_capabilities(model))
+            .map(|model| model.effective_capabilities(&self.capabilities))
             .unwrap_or_else(|| self.capabilities.clone())
     }
 
