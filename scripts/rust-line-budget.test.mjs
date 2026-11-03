@@ -41,6 +41,10 @@ test("recursive budget counts test locations uncapped and caps only product", ()
     assert.deepEqual(stats.crates.demo, { product: 1, test: 9 });
     assert.equal(stats.totals.test, 11);
     assert.deepEqual(budgetErrors(budget, stats), []);
+    assert.notDeepEqual(budgetErrors({ totalMax: 2, crates: { demo: 1 } }, stats), []);
+    assert.notDeepEqual(budgetErrors({ totalMax: 1, crates: { demo: 2 } }, stats), []);
+    assert.notDeepEqual(budgetErrors({ totalMax: 0, crates: { demo: 1 } }, stats), []);
+    assert.notDeepEqual(budgetErrors({ totalMax: 1, crates: { demo: 0 } }, stats), []);
     write(root, "crates/demo/tests/extra.rs", "test\n".repeat(100));
     assert.deepEqual(budgetErrors(budget, collectStats(root)), []);
     write(root, "crates/demo/src/lib.rs", "fn product() {}\nfn growth() {}\n");

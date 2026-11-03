@@ -63,8 +63,8 @@ export function budgetErrors(b, s) {
   if (!b?.crates || typeof b.crates !== "object" || Array.isArray(b.crates)) return ["budget must define crates"];
   const caps = b.crates, names = Object.keys(s.crates).sort(), out = [];
   if (names.join("\n") !== Object.keys(caps).sort().join("\n")) out.push("budget crate set differs");
-  for (const name of names) if (!Number.isInteger(caps[name]) || caps[name] < 0) out.push(`invalid cap for ${name}`); else if (s.crates[name].product > caps[name]) out.push(`${name} product lines ${s.crates[name].product} exceed ${caps[name]}`);
-  if (!Number.isInteger(b.totalMax) || b.totalMax < s.totals.product) out.push(`total product lines ${s.totals.product} exceed ${b.totalMax}`);
+  for (const name of names) if (!Number.isInteger(caps[name]) || caps[name] < 0) out.push(`invalid cap for ${name}`); else if (s.crates[name].product !== caps[name]) out.push(`${name} product lines ${s.crates[name].product} must equal ${caps[name]}`);
+  if (!Number.isInteger(b.totalMax)) out.push("invalid totalMax"); else if (b.totalMax !== s.totals.product) out.push(`total product lines ${s.totals.product} must equal ${b.totalMax}`);
   return out;
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
@@ -73,6 +73,6 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   for (const [name, c] of Object.entries(s.crates)) console.log(`  ${name}: product=${c.product} test=${c.test}`);
   console.log(`  total: product=${s.totals.product} test=${s.totals.test}`);
   for (const error of e) console.error(`rust-line-budget: ${error}`);
-  console.log(e.length ? "rust-line-budget: FAIL" : `rust-line-budget: pass (total product ${s.totals.product} <= ${b.totalMax})`);
+  console.log(e.length ? "rust-line-budget: FAIL" : `rust-line-budget: pass (total product ${s.totals.product} == ${b.totalMax})`);
   if (e.length) process.exitCode = 1;
 }
