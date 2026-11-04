@@ -1,6 +1,5 @@
-//! Linux cgroup-v2 crash recovery for trusted-host workloads; opt-in only.
-//! Not a sandbox: containers remain responsible for untrusted code.
-//! Each run binds before launch; recovery kills and confirms only its tree.
+//! Opt-in Linux cgroup-v2 crash recovery for trusted-host workloads, not sandboxing.
+//! Each run binds before launch; recovery kills and confirms its tree. Containers isolate untrusted code.
 
 use camino::{Utf8Path, Utf8PathBuf};
 #[cfg(target_os = "linux")]
@@ -10,7 +9,7 @@ use policy::{
     HostCgroupScope, run_root_name,
 };
 use std::io::Read;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
@@ -361,6 +360,7 @@ fn write_binding_atomically(
     file.write_all(&contents)?;
     file.sync_all()?;
     std::fs::rename(tmp.as_std_path(), path.as_std_path())?;
+    #[cfg(target_os = "linux")]
     std::fs::File::open(meta_dir)?.sync_all()?;
     Ok(())
 }
