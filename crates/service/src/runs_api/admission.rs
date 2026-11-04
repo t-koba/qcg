@@ -663,23 +663,21 @@ impl LocalService {
         self.fork_run_with_id(source_id, request, None).await
     }
 
-    /// Checks source eligibility only for a fresh checkpoint copy. Shared
-    /// stores use the source journal as authority; a lease protects a
-    /// nonterminal pending checkpoint while it is copied. Terminal state
-    /// needs no lease, since its durable settlement already prevents further
-    /// execution writes.
+    /// Checks the current source journal under execution ownership in either
+    /// store mode. The caller holds the lease through the fresh checkpoint
+    /// copy, including for terminal sources with unresolved operations.
     async fn fork_source_copy_lease(
         &self,
         source_id: &str,
         source_dir: &Utf8Path,
-    ) -> Result<Option<crate::run_dirs::RunExecutionLock>, ApiError> {
+    ) -> Result<crate::run_dirs::RunExecutionLock, ApiError> {
         let conflict = || ApiError::Conflict {
             detail: format!(
                 "run `{source_id}` is still executing; fork a stable waiting or terminal checkpoint"
             ),
         };
-        if self.inner.run_store_mode == RunStoreMode::Exclusive {
-            if self
+        if self.inner.run_store_mode == RunStoreMode::Exclusive
+            && self
                 .inner
                 .runs
                 .read()
@@ -688,45 +686,29 @@ impl LocalService {
                 .is_some_and(|source| {
                     matches!(source.state, RunStatus::Queued | RunStatus::Running)
                 })
-            {
-                return Err(conflict());
-            }
-            return Ok(None);
+        {
+            return Err(conflict());
         }
-
+        let lease = crate::run_dirs::try_lock_run_execution(source_dir)
+            .map_err(api_internal)?
+            .ok_or_else(conflict)?;
         let state = self.authoritative_state(source_dir).await?;
         verify_fork_source_identity(&state, source_id)?;
+        state
+            .ensure_no_fail_closed_inflight_operations()
+            .map_err(|detail| ApiError::Conflict { detail })?;
         if state.terminal.is_some() {
-            return Ok(None);
+            return Ok(lease);
         }
-
-        match crate::run_dirs::try_lock_run_execution(source_dir).map_err(api_internal)? {
-            Some(lease) => {
-                let state = self.authoritative_state(source_dir).await?;
-                verify_fork_source_identity(&state, source_id)?;
-                if state.terminal.is_some() {
-                    return Ok(None);
-                }
-                let pending_controls = crate::run_dirs::list_pending_cancel_controls(source_dir)
-                    .map_err(api_internal)?;
-                if state.settled_pending().is_some()
-                    && !state.cancel_requested
-                    && pending_controls.is_empty()
-                {
-                    Ok(Some(lease))
-                } else {
-                    Err(conflict())
-                }
-            }
-            None => {
-                let state = self.authoritative_state(source_dir).await?;
-                verify_fork_source_identity(&state, source_id)?;
-                if state.terminal.is_some() {
-                    Ok(None)
-                } else {
-                    Err(conflict())
-                }
-            }
+        let pending_controls =
+            crate::run_dirs::list_pending_cancel_controls(source_dir).map_err(api_internal)?;
+        if state.settled_pending().is_some()
+            && !state.cancel_requested
+            && pending_controls.is_empty()
+        {
+            Ok(lease)
+        } else {
+            Err(conflict())
         }
     }
 
@@ -830,7 +812,7 @@ impl LocalService {
                 .as_deref()
                 .ok_or_else(|| api_internal("fresh fork is missing its source directory"))?;
             // A child adoption or live hit converges before source eligibility
-            // is consulted. Shared-mode leases remain held through the copy
+            // is consulted. Source leases remain held through the copy
             // and are released before child execution.
             let source_lease = self.fork_source_copy_lease(source_id, source_dir).await?;
             created_fresh = prepare_checkpoint_fork(

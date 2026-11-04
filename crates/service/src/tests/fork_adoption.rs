@@ -97,6 +97,98 @@ async fn failed_engine_terminal_is_reconciled_before_fork() {
 }
 
 #[tokio::test]
+async fn terminal_fork_checks_current_source_operations_before_copy() {
+    for mode in [RunStoreMode::Exclusive, RunStoreMode::SharedFilesystem] {
+        let root = temp_run_dir("fork-terminal-inflight");
+        let _guard = TempGuard(root.clone());
+        let generators =
+            Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+        let runs = root.join("runs");
+        let service = LocalService::with_generator_roots_policy_and_store_mode(
+            vec![generators],
+            runs.clone(),
+            None,
+            policy::DEFAULT_MAX_ACTIVE_RUNS,
+            DEFAULT_MAX_TRACKED_RUNS,
+            mode,
+            ServiceDeploymentPolicy::default(),
+        )
+        .unwrap();
+        for policy in [None, Some("fail"), Some("repeat")] {
+            let source = service
+                .start_run(StartRun {
+                    generator_id: "ask-user".into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            wait_for_snapshot(&service, &source, RunStatus::Waiting).await;
+            let source_dir = runs.join(&source);
+            wait_for_free_execution_lease(&source_dir).await;
+            let at_seq = latest_event_seq(&source_dir, "run_waiting");
+            // Simulate a later external operation followed by failure, leaving
+            // the service's preloaded source record stale at Waiting.
+            let lease = crate::run_dirs::try_lock_run_execution(&source_dir)
+                .unwrap()
+                .unwrap();
+            let writer = engine::JournalWriter::create(
+                &run_meta_dir(&source_dir).join("journal.jsonl"),
+                &source,
+                false,
+                None,
+            )
+            .unwrap();
+            if let Some(policy) = policy {
+                writer.event("operation_started", json!({
+                    "operation_id": "unresolved-fork-operation", "operation_digest": "digest",
+                    "invocation_id": "invocation", "node": "external", "kind": "command",
+                    "target": "fixture", "on_indeterminate": policy,
+                })).unwrap();
+            }
+            writer
+                .event("run_error", json!({"error": "fixture failure"}))
+                .unwrap();
+            drop(writer);
+            drop(lease);
+            let before = read_journal_events(&source_dir).unwrap();
+            let state = engine::RunState::fold_values(&before).unwrap();
+            assert_eq!(state.terminal, Some(engine::TerminalState::Failed));
+            assert!(before.last().unwrap()["seq"].as_u64().unwrap() > at_seq);
+            let child = format!("fork-{}", policy.unwrap_or("no-started"));
+            let result = service
+                .fork_run_with_id(
+                    &source,
+                    ForkRun {
+                        at_seq,
+                        ..Default::default()
+                    },
+                    Some(child.clone()),
+                )
+                .await;
+            if policy == Some("fail") {
+                let error =
+                    result.expect_err("unresolved source must refuse an earlier checkpoint");
+                assert!(
+                    error.to_string().contains("unresolved-fork-operation"),
+                    "{error}"
+                );
+                assert!(error.to_string().contains("remains Started"), "{error}");
+                assert!(
+                    !runs.join(&child).exists(),
+                    "refusal must precede child creation"
+                );
+                assert!(!service.inner.runs.read().await.contains_key(&child));
+            } else {
+                assert_eq!(result.unwrap(), child);
+                wait_for_snapshot(&service, &child, RunStatus::Waiting).await;
+                service.cancel(child).await.unwrap();
+            }
+            assert_eq!(read_journal_events(&source_dir).unwrap(), before);
+        }
+    }
+}
+
+#[tokio::test]
 async fn journal_order_wins_restart_and_fork_continue_v2() {
     // E06 end to end: z_first writes v1, a_second overwrites v2 (same
     // path), then a question suspends. Answering, restarting, and
@@ -2095,7 +2187,7 @@ fn latest_event_seq(run_dir: &Utf8Path, kind: &str) -> u64 {
 }
 
 #[tokio::test]
-async fn shared_fork_uses_terminal_source_journal_despite_stale_cache_and_held_lease() {
+async fn shared_fork_uses_terminal_source_journal_under_lease_despite_stale_cache() {
     let root = temp_run_dir("fork-shared-terminal-authority");
     let _guard = TempGuard(root.clone());
     let generators =
@@ -2156,30 +2248,34 @@ async fn shared_fork_uses_terminal_source_journal_despite_stale_cache_and_held_l
     std::fs::write(unrelated_meta.join("journal.jsonl"), b"not-json\n")
         .expect("unrelated corrupt journal");
 
-    let fork_id = peer
-        .fork_run_with_id(
-            &source,
-            ForkRun {
-                at_seq: checkpoint,
-                ..Default::default()
-            },
-            Some("ask-user-fork-shared-terminal".into()),
-        )
+    let child = "ask-user-fork-shared-terminal";
+    let request = ForkRun {
+        at_seq: checkpoint,
+        ..Default::default()
+    };
+    let error = peer
+        .fork_run_with_id(&source, request.clone(), Some(child.into()))
         .await
-        .expect("durably terminal source should fork despite stale cache and held lease");
-    assert_eq!(fork_id, "ask-user-fork-shared-terminal");
+        .expect_err("even a terminal source must be owned before checking and copying");
+    assert!(matches!(error, ApiError::Conflict { .. }), "{error}");
+    assert!(!runs.join(child).exists());
     assert!(
         crate::run_dirs::try_lock_run_execution(&source_dir)
             .expect("source lease probe should work")
             .is_none(),
-        "terminal fast path must leave the externally held source lease alone"
+        "refusal must leave the externally held source lease alone"
     );
+    drop(held_source_lease);
+    let fork_id = peer
+        .fork_run_with_id(&source, request, Some(child.into()))
+        .await
+        .expect("durably terminal source should fork despite stale cache once owned");
+    assert_eq!(fork_id, child);
     assert_eq!(
         wait_for_terminal_snapshot(&peer, &fork_id).await.state,
         RunStatus::Succeeded,
         "the historical checkpoint copy should execute successfully"
     );
-    drop(held_source_lease);
 }
 
 #[tokio::test]
