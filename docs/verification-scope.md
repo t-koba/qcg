@@ -115,6 +115,14 @@ installation; API/WASM generation and frontend building still run there.
 End-to-end CI builds the frontend
 inside its browser runner once, after generating API/WASM inputs.
 
+## Host-process crash boundary
+
+The trusted-host command and MCP stdio tests cover live cancellation and
+shutdown, not cleanup after qcg is killed. A process-group signal cannot reach
+a descendant that leaves the group, and the current Unix guard is not persisted
+for recovery. No host-process SIGKILL cleanup guarantee is claimed; see
+[host-process crash-recovery limits](host-process-crash-recovery.md).
+
 ## Container crash boundary
 
 The container/MCP cleanup tests cover the live-process lifecycle and daemon

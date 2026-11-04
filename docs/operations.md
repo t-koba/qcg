@@ -79,7 +79,9 @@ that run and waiting for its existing child-process cleanup and terminal
 `run_canceled` journal event before exiting unsuccessfully. This applies to
 ordinary and `--json` execution; JSON mode does not bypass cancellation.
 Catchable signals are not crash recovery: SIGKILL and process crashes cannot
-run this cleanup or guarantee a terminal journal event.
+run this cleanup or guarantee a terminal journal event. A trusted-host command
+or MCP stdio process may also outlive qcg; see [host-process crash-recovery
+limits](host-process-crash-recovery.md).
 
 ## Container daemon operation policy
 

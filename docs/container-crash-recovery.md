@@ -143,6 +143,7 @@ resolution, or conditional-deletion semantics. Normal lifecycle and
 indeterminate-replay tests likewise are not acceptance evidence for crash
 cleanup. Real qcg SIGKILL tests during creation and workload, gate integration,
 backend identity binding, and failure/other-run isolation remain required once
-a safe backend primitive is established. Incus/LXD and Unix/MCP containment
-remain separate; a persisted friendly name, PID or PGID supplies no durable
-reuse guard.
+a safe backend primitive is established. Incus/LXD identity and Unix/MCP
+process containment remain separate; see [host-process crash-recovery
+limits](host-process-crash-recovery.md). A persisted friendly name, PID or
+PGID supplies no durable reuse guard.

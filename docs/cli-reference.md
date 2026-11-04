@@ -212,7 +212,9 @@ JSON event output go to stdout.
   process. Nonterminal service runs must be canceled and settled first;
   direct execution interrupted outside a settled pause must recover safely
   before deletion. Discard removes journal metadata, not the direct output
-  directory, and does not clean up orphaned external processes or containers.
+  directory, and does not clean up orphaned external processes or containers;
+  see [host-process crash-recovery limits](host-process-crash-recovery.md) and
+  [container crash-recovery limits](container-crash-recovery.md).
   Any `Started` external operation blocks deletion even if the run is terminal,
   regardless of its `on_indeterminate` policy; pre-policy journals default to
   `fail`. Retain the journal and reconcile its external outcome. There is no

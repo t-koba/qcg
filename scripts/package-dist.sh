@@ -59,6 +59,8 @@ public_docs=(
   "openapi.json"
   "operations.md"
   "run-event-reference.md"
+  "container-crash-recovery.md"
+  "host-process-crash-recovery.md"
   "security.md"
   "tool-backend-guide.md"
 )

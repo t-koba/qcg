@@ -594,7 +594,9 @@ discarded so mapped credential values cannot be copied into qcg logs. Process
 control variables such as `LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, `NODE_OPTIONS`,
 and language runtime search paths cannot be supplied by either environment
 field. On Unix the server starts in a dedicated process group, so cancellation
-and bounded shutdown also terminate descendants.
+and bounded shutdown signal descendants that remain in that group. A descendant
+can leave the group, and qcg SIGKILL bypasses this cleanup; see
+[host-process crash-recovery limits](host-process-crash-recovery.md).
 
 ### Authentication and credentials
 
