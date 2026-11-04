@@ -118,13 +118,25 @@ indeterminate operation or bypasses Started/Repeat policy.
 - **macOS:** the current process-group mechanism is escapable. No supported
   descendant boundary that survives qcg SIGKILL has been established for
   arbitrary host commands or MCP stdio.
-- **Windows:** the command path uses a Job Object with `KILL_ON_JOB_CLOSE`,
-  but assigns the process after `spawn`. It has not proved that payload code
-  cannot create an unassigned descendant first. MCP stdio does not attach its
-  Windows child to that Job Object. Neither path has a whole-tree crash-cleanup
-  guarantee.
+- **Windows:** the engine command path calls Tokio `Command::spawn()` before
+  creating, configuring, and assigning its per-command Job Object. Its explicit
+  process flag is `CREATE_NEW_PROCESS_GROUP`, not `CREATE_SUSPENDED`, so payload
+  code can run before `AssignProcessToJobObject`; descendants created in that
+  window are not retroactively enrolled. The guard can terminate job members
+  after attachment, but does not prove whole-tree cancellation or crash cleanup.
+  Host MCP does not attach its Windows child to the command Job Object.
 
-Normal live-process cancellation remains available. These limitations do not
+  The locked Rust 1.99/Tokio 1.53.3 stack has no supported stable Tokio hook for
+  pre-creation process attributes: Rust's `CommandExt::spawn_with_attributes`
+  is nightly-only, and Tokio's `Command::spawn_with` requires `tokio_unstable`.
+  `PROC_THREAD_ATTRIBUTE_JOB_LIST` and a process-lifetime Job Object containing
+  qcg itself are candidate routes, but neither has been implemented or tested
+  for this process hierarchy, handle lifetime, or Windows runner environment.
+  Until launch-time membership and qcg-death cleanup are validated on Windows,
+  no Windows whole-tree crash-cleanup guarantee is claimed.
+
+Normal cancellation still targets the tracked process and any attached job
+members; it does not close the pre-assignment gap. These limitations do not
 change container cleanup or the journal's indeterminate-operation policy.
 
 ## Provisioning and verification
