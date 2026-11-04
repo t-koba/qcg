@@ -8,6 +8,17 @@ use std::collections::BTreeMap;
 /// a non-deterministic question id looping forever.
 pub(crate) const MAX_QUESTION_DISCOVERY_ATTEMPTS: usize = 32;
 
+/// Extracts the stable pending-question id from the direct-run error, which
+/// may append human-readable recovery guidance after the id.
+pub(crate) fn question_id_from_wait_error(message: &str) -> Option<&str> {
+    let question_id = message.strip_prefix("run is waiting for user input: ")?;
+    Some(
+        question_id
+            .split_once("; ")
+            .map_or(question_id, |(id, _)| id),
+    )
+}
+
 /// Resolves a pre-provisioned answer keyed by node id against the concrete
 /// question id a run reports. `ask_user` identities bind the resolved
 /// question content (`<node>:ask_user:<sha256>`), so callers that provision
@@ -24,6 +35,18 @@ pub(crate) fn answer_for_question<'a>(
     (digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
         .then(|| answers.get(node))
         .flatten()
+}
+
+#[test]
+fn question_id_extraction_ignores_direct_run_recovery_guidance() {
+    let id = format!("ask_purpose:ask_user:{}", "a".repeat(64));
+    let message =
+        format!("run is waiting for user input: {id}; repeat the original qcg run command");
+    assert_eq!(question_id_from_wait_error(&message), Some(id.as_str()));
+
+    let answer = serde_json::json!({"description": "generated"});
+    let answers = BTreeMap::from([("ask_purpose".to_owned(), answer.clone())]);
+    assert_eq!(answer_for_question(&answers, &id), Some(&answer));
 }
 
 /// Opt-in that lets a test report a skipped loopback bind instead of

@@ -86,8 +86,7 @@ async fn run_generator(
             Ok(_) => return Ok(run_dir(label)),
             Err(error) => {
                 let message = error.to_string();
-                let Some(question_id) = message.strip_prefix("run is waiting for user input: ")
-                else {
+                let Some(question_id) = crate::question_id_from_wait_error(&message) else {
                     return Err(message);
                 };
                 let Some(answer) = crate::answer_for_question(&reply, question_id) else {
