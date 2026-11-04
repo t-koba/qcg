@@ -1,4 +1,4 @@
-use crate::{JournalWriter, StepControlFlow, StepError, StepOutcome};
+use crate::{JournalWriter, StepError, StepOutcome};
 use camino::Utf8PathBuf;
 use contract::{NodeDef, ValueBag};
 use model::{FailureCode, FailureDetail, NodePath};
@@ -25,15 +25,9 @@ impl Engine {
         budget: &mut BudgetTracker,
         node: &NodeDef,
     ) -> Result<StepOutcome, EngineError> {
-        let params: ForeachControlParams = node.deserialize_params().map_err(|error| {
-            StepError::failed(&node.id, format!("invalid foreach params: {error}"))
-        })?;
+        let params: ForeachControlParams = crate::step_params(node, "foreach")?;
         for (field, value) in [("items", &params.items), ("subflow", &params.subflow)] {
-            if value.trim().is_empty() {
-                return Err(
-                    StepError::failed(&node.id, format!("foreach {field} is required")).into(),
-                );
-            }
+            crate::require_field(node, Some(value.trim()), &format!("foreach {field}"))?;
         }
         for (field, value, max) in [
             (
@@ -90,34 +84,9 @@ impl Engine {
             )?;
         }
         let item_count = items.len();
-        let subflow = params.subflow.as_str();
-        let block = context
-            .contract
-            .manifest
-            .blocks
-            .get(subflow)
-            .ok_or_else(|| StepError::failed(&node.id, format!("unknown subflow `{subflow}`")))?;
-        if params.parallel > 1 && item_count > 1 {
-            for child in block.iter() {
-                let unsafe_leaf = self.registry.traits(&child.kind).is_none_or(|traits| {
-                    !traits.parallel_safe && traits.control_flow == StepControlFlow::Plain
-                });
-                let message = if unsafe_leaf {
-                    format!(
-                        "foreach block child `{}` is not parallel-safe; use parallel = 1",
-                        child.id
-                    )
-                } else if child.on_fail.is_some() {
-                    format!(
-                        "foreach block child `{}` declares on_fail routing; parallel execution requires parallel = 1",
-                        child.id
-                    )
-                } else {
-                    continue;
-                };
-                return Err(StepError::failed(&node.id, message).into());
-            }
-        }
+        let block = self
+            .registry
+            .foreach_block(node, &context.contract, &params)?;
         let mut files = Vec::new();
         // Reuse settled checks without letting them abort an answered owner's path.
         let mut terminals = BTreeMap::new();
@@ -164,7 +133,7 @@ impl Engine {
         };
         let context = Arc::new(context.clone());
         let journal = Arc::new(journal.clone_for_parallel()?);
-        let block = Arc::new(block.clone());
+        let block = Arc::new(block.to_vec());
         let mut tasks = JoinSet::new();
         let mut task_indices = HashMap::new();
         let mut pending = items.into_iter().enumerate();

@@ -355,18 +355,12 @@ impl StepRegistry {
             .iter()
             .chain(contract.manifest.blocks.values().flatten())
         {
-            if let Some(error) = self.validation_error(node, contract, "node", &node.id) {
-                errors.push(error);
-            }
+            errors.extend(self.validation_error(node, contract, "node", &node.id));
         }
-        // Lifecycle hooks execute through the same registry, so a hook with
-        // an unregistered or invalid step type fails at contract load
-        // instead of at run start.
+        // Hooks share registry preflight with flow and block nodes.
         for (event, hook) in contract.manifest.hooks.entries() {
             let node = hook.to_node(event);
-            if let Some(error) = self.validation_error(&node, contract, "hook", event) {
-                errors.push(error);
-            }
+            errors.extend(self.validation_error(&node, contract, "hook", event));
         }
         match errors.as_slice() {
             [] => Ok(()),
@@ -387,6 +381,40 @@ impl StepRegistry {
         }
     }
 
+    /// Foreach admits control-flow children independently of wave scheduling traits.
+    pub(crate) fn foreach_block<'a>(
+        &self,
+        node: &NodeDef,
+        contract: &'a Contract,
+        params: &crate::engine::ForeachControlParams,
+    ) -> Result<&'a [NodeDef], StepError> {
+        let subflow = params.subflow.as_str();
+        let block =
+            contract.manifest.blocks.get(subflow).ok_or_else(|| {
+                StepError::failed(&node.id, format!("unknown subflow `{subflow}`"))
+            })?;
+        if params.parallel > 1 {
+            for child in block.iter() {
+                let unsafe_leaf = self.traits(&child.kind).is_none_or(|traits| {
+                    !traits.parallel_safe && traits.control_flow == StepControlFlow::Plain
+                });
+                let problem = if unsafe_leaf {
+                    "is not parallel-safe"
+                } else if child.on_fail.is_some() {
+                    "declares on_fail routing"
+                } else {
+                    continue;
+                };
+                let id = &child.id;
+                return Err(StepError::failed(
+                    &node.id,
+                    format!("foreach block child `{id}` {problem}; use parallel = 1"),
+                ));
+            }
+        }
+        Ok(block)
+    }
+
     fn validation_error(
         &self,
         node: &NodeDef,
@@ -395,7 +423,16 @@ impl StepRegistry {
         name: &str,
     ) -> Option<String> {
         let message = match self.get(&node.kind) {
-            Some(executor) => executor.validate(node, contract).err()?.to_string(),
+            Some(executor) => executor
+                .validate(node, contract)
+                .and_then(|()| {
+                    if executor.traits().control_flow == StepControlFlow::Foreach {
+                        self.foreach_block(node, contract, &step_params(node, "foreach")?)?;
+                    }
+                    Ok(())
+                })
+                .err()?
+                .to_string(),
             None => format!("step type `{}` is not registered", node.kind),
         };
         let message = contract.line_hint(&message);

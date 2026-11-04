@@ -104,6 +104,13 @@ max_iterations = 20
 parallel = 4
 ```
 
+Registry-backed validation (`qcg validate`, install, and run preflight) rejects
+`parallel > 1` when a block child is an unsafe plain step (for example,
+`command`) or declares any `on_fail` routing. This depends on the declaration,
+not the eventual item count: even zero or one item requires `parallel = 1`
+for these children. Nested control-flow children remain allowed, with each
+foreach validated against its own declared parallelism and block.
+
 `items` may resolve to an array or an object. Array entries are exposed directly
 as `item`; object entries are exposed as `item.key` and `item.value`. Items
 beyond `max_iterations` are not executed. The step returns requested and

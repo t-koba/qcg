@@ -1682,6 +1682,104 @@ async fn foreach_parallel_refuses_parallel_unsafe_children() {
     let _ = std::fs::remove_dir_all(&run_dir);
 }
 
+#[test]
+fn foreach_preflight_preserves_control_flow_and_on_fail_rules() {
+    for (control_flow, on_fail, parallel, expected) in [
+        (false, false, 2, Ok(())),
+        (false, true, 2, Err("on_fail routing")),
+        (true, false, 2, Ok(())),
+        (true, true, 2, Err("on_fail routing")),
+        (false, true, 1, Ok(())),
+        (true, true, 1, Ok(())),
+    ] {
+        let mut child = if control_flow {
+            foreach_node("child", "inner", "[]", 1, 10)
+        } else {
+            node("child", "test.pass")
+        };
+        child.on_fail = on_fail.then_some(OnFail::Fail);
+        let mut manifest = manifest(vec![foreach_node("each", "body", "[]", parallel, 10)]);
+        manifest.blocks.insert("body".into(), vec![child]);
+        manifest.blocks.insert("inner".into(), vec![]);
+        let dir = temp_run_dir("foreach-preflight-traits");
+        let contract = test_contract(&dir, manifest);
+        let mut registry = StepRegistry::new();
+        registry.register(TestForeachStep);
+        registry.register(TestPassStep);
+        let result = registry.validate_contract(&contract);
+        match expected {
+            Ok(()) => result.expect("permitted foreach child must validate"),
+            Err(message) => {
+                let error = result.expect_err("parallel on_fail must fail preflight");
+                assert!(error.to_string().contains(message), "{error}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[tokio::test]
+async fn foreach_runtime_rechecks_safety_after_successful_preflight() {
+    // A real executor changes its traits after the preceding step. This reaches
+    // the defensive runtime gate through normal production preflight, not a bypass.
+    struct ChangingSafety(Arc<AtomicBool>);
+    #[async_trait]
+    impl StepExecutor for ChangingSafety {
+        fn type_id(&self) -> &'static str {
+            "test.changing_safety"
+        }
+        fn traits(&self) -> StepTraits {
+            StepTraits {
+                parallel_safe: self.0.load(Ordering::SeqCst),
+                ..StepTraits::default()
+            }
+        }
+        async fn execute(
+            &self,
+            _ctx: &mut StepContext<'_>,
+            node: &NodeDef,
+        ) -> Result<StepOutcome, StepError> {
+            assert_eq!(node.id, "before", "unsafe foreach child must not execute");
+            self.0.store(false, Ordering::SeqCst);
+            Ok(StepOutcome::Success {
+                output: None,
+                files: vec![],
+            })
+        }
+    }
+    let mut manifest = manifest(vec![
+        node("before", "test.changing_safety"),
+        foreach_node("each", "body", "['one']", 2, 10),
+    ]);
+    manifest
+        .blocks
+        .insert("body".into(), vec![node("child", "test.changing_safety")]);
+    let dir = temp_run_dir("foreach-runtime-defense");
+    let contract = test_contract(&dir, manifest);
+    let safe = Arc::new(AtomicBool::new(true));
+    let mut registry = StepRegistry::new();
+    registry.register(TestForeachStep);
+    registry.register(ChangingSafety(safe.clone()));
+    registry
+        .validate_contract(&contract)
+        .expect("initial traits are safe");
+    let error = Engine::new(registry)
+        .run_with_id(
+            "foreach-runtime-defense".into(),
+            dir.join("meta"),
+            contract,
+            BTreeMap::new(),
+            run_options(dir.join("workspace")),
+        )
+        .await
+        .expect_err("runtime must recheck the now unsafe child");
+    assert!(!safe.load(Ordering::SeqCst));
+    assert!(error.to_string().contains("not parallel-safe"), "{error}");
+    let events = journal_events(&dir);
+    assert!(has_event(&events, "step_finished", "before"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[tokio::test]
 async fn foreach_parallel_merges_child_outputs_into_the_parent_scope() {
     // E10: parallel iterations run on cloned value bags, so their step

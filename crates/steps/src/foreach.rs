@@ -43,15 +43,8 @@ impl StepExecutor for ForeachStep {
         }
     }
 
-    fn validate(&self, node: &NodeDef, contract: &Contract) -> Result<(), StepError> {
-        let params = foreach_params(node)?;
-        if !contract.manifest.blocks.contains_key(&params.subflow) {
-            return Err(StepError::failed(
-                &node.id,
-                format!("unknown subflow `{}`", params.subflow),
-            ));
-        }
-        Ok(())
+    fn validate(&self, node: &NodeDef, _contract: &Contract) -> Result<(), StepError> {
+        foreach_params(node).map(|_| ())
     }
 
     async fn execute(
