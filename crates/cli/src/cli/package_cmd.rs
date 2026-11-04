@@ -204,14 +204,15 @@ fn stage_package_output(
     output: &Utf8Path,
     write: impl FnOnce(&mut File) -> Result<(), std::io::Error>,
 ) -> Result<()> {
+    let parent = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Utf8Path::new("."));
     #[cfg(unix)]
     {
         // Shared staging dance (E15): pin the parent here, stage/publish
         // through `files::stage_file_at` so pack and unpack cannot drift.
         use std::os::unix::ffi::OsStrExt as _;
-        let parent = output
-            .parent()
-            .context("package output must have a parent directory")?;
         let file_name = output
             .file_name()
             .context("package output must have a file name")?;
@@ -256,9 +257,6 @@ fn stage_package_output(
         let file_name = output
             .file_name()
             .context("package output must have a file name")?;
-        let parent = output
-            .parent()
-            .context("package output must have a parent directory")?;
         for _ in 0..100 {
             let staging = parent.join(format!(
                 ".{file_name}.part-{}",
