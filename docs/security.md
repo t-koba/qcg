@@ -308,7 +308,10 @@ build. `runc` below 1.3.6 lets a malicious-image `/dev` symlink violate host fil
 The declared
 runtime is recorded in the command plan, and cleanup (stop/delete with a
 Drop-path safety net) runs on success, error, cancel, and timeout for
-every family. Managed MCP server processes additionally pass secret-backed
+every family while qcg remains alive. SIGKILL/crash recovery does not currently
+reclaim container effects, and run deletion/GC is not proof that they stopped;
+see [container crash-recovery limits](container-crash-recovery.md). Managed MCP
+server processes additionally pass secret-backed
 values through explicit spawn flags, which are briefly visible in the
 host-local process table; prefer Docker-family runtimes for secret-heavy
 MCP servers when that visibility matters.

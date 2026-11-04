@@ -115,6 +115,15 @@ installation; API/WASM generation and frontend building still run there.
 End-to-end CI builds the frontend
 inside its browser runner once, after generating API/WASM inputs.
 
+## Container crash boundary
+
+The container/MCP cleanup tests cover the live-process lifecycle and daemon
+operation timeouts, not identity-safe reclamation after qcg is killed. CLI
+doubles can demonstrate late creation after client death, but cannot establish
+a real daemon's deletion identity or creation-fencing semantics. No Docker,
+Podman, or Incus SIGKILL cleanup guarantee is claimed; see
+[container crash-recovery limits](container-crash-recovery.md).
+
 ## Measured timing bounds
 
 The container tests' wall-clock bounds are sized from measurements. On
