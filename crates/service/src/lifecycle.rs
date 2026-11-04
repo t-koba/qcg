@@ -1336,11 +1336,7 @@ impl LocalService {
                     return;
                 }
             };
-            // Publish this process as the execution owner in the lease file
-            // itself so shared-store peers observe the hand-off in their
-            // refresh merge (E12). Advisory only: the flock above is the
-            // authority, so a claim-write failure warns and execution still
-            // proceeds under the held lease.
+            // Publish advisory ownership for peer refresh; the held flock is authority.
             if let Err(error) = claim_run_execution_owner(&execution_lock, &self.inner.owner_id) {
                 tracing::warn!(run_id = %request.run_id, %error, "execution owner claim failed; lease authority is unaffected");
             }
@@ -1362,10 +1358,33 @@ impl LocalService {
             let queue_notify = Arc::clone(&self.inner.queue_notify);
             let handle = tokio::spawn(async move {
                 let _execution_lock = execution_lock;
-                // Convert pending cancel mailbox entries to single journal events
-                // before the engine writer starts. This task holds the execution
-                // lease, so no other owner appends concurrently (A01/A02). A
-                // failed drain refuses to start without inventing cancellation;
+                // Under the lease, journal refusal (not cleanup) before any re-entry.
+                // Fail-closed `Started` operations block; `repeat` passes
+                // through to the existing operation guard on execution.
+                if let Err(error) = fold_run_state(&run_dir).and_then(|state| {
+                    if let Err(error) = state.ensure_no_fail_closed_inflight_operations() {
+                        if state.terminal.is_none() {
+                            engine::JournalWriter::append_single_event(
+                                &run_meta_dir(&run_dir).join("journal.jsonl"),
+                                &run_id,
+                                "run_error",
+                                serde_json::json!({"error": error}),
+                                engine::JournalLimits::default(),
+                                Some(events.clone()),
+                            )
+                            .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+                        }
+                        return Err(ServiceError::Invalid(error));
+                    }
+                    Ok(())
+                }) {
+                    tracing::error!(run_id = %run_id, %error, "refusing run ownership re-entry; journal retained");
+                    service.mark_spawn_failed(&run_id).await;
+                    return;
+                }
+                // Convert cancel mailbox entries before the engine writer starts,
+                // under the execution lease so no owner appends concurrently (A01/A02).
+                // A failed drain refuses startup without inventing cancellation;
                 // the resumer retries observation after this task exits.
                 if let Err(error) = service.drain_cancel_controls(&run_id, &run_dir).await {
                     tracing::error!(run_id = %run_id, %error, "cancel drain failed; refusing to start execution");
@@ -1547,14 +1566,7 @@ impl LocalService {
                         ) {
                             tracing::error!(%journal_error, run_id = %run_id, "failed to journal package verification failure");
                         }
-                        let mut runs = service.inner.runs.write().await;
-                        if let Some(record) = runs.get_mut(&run_id) {
-                            record.state = RunStatus::Failed;
-                            record.preempted = false;
-                            record.clear_prompt();
-                        }
-                        drop(runs);
-                        service.inner.queue_notify.notify_waiters();
+                        service.mark_spawn_failed(&run_id).await;
                         return;
                     }
                 };

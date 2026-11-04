@@ -53,44 +53,26 @@ fn startup_sweep(
     workspace: &camino::Utf8Path,
     metadata_dir: &camino::Utf8Path,
 ) -> Result<(), EngineError> {
-    // Reap staging orphans left by a killed process before doing any
-    // work: callers hold the execution lease (or the direct-run lock),
-    // so no live writer exists for these directories, and the age gate
-    // additionally protects young files (E13b). Every known staging
-    // prefix is swept (see STARTUP_SWEEP_FRAGMENTS).
-    for fragment in STARTUP_SWEEP_FRAGMENTS {
-        if let Err(error) = crate::FsGateway::sweep_orphaned_staging_files(
-            workspace,
-            fragment,
-            std::time::Duration::from_secs(3600),
-        ) {
-            return Err(EngineError::Failed(format!(
-                "startup staging sweep for `{fragment}` failed: {error}"
-            )));
-        }
-    }
-    if let Err(error) = crate::FsGateway::sweep_orphaned_staging_files(
-        &metadata_dir.join("checkpoint-blobs"),
-        ".tmp-",
-        std::time::Duration::from_secs(3600),
-    ) {
-        return Err(EngineError::Failed(format!(
-            "startup checkpoint-blob sweep failed: {error}"
-        )));
-    }
-    // Fork blob staging uses the same `.part-` atomic-write prefix
-    // as workspace writes (E06/E13); the blob sweep above only covers
-    // `.tmp-`, so also reap `.part-` orphans here.
-    {
-        let fragment = ".part-";
-        if let Err(error) = crate::FsGateway::sweep_orphaned_staging_files(
-            &metadata_dir.join("checkpoint-blobs"),
-            fragment,
-            std::time::Duration::from_secs(3600),
-        ) {
-            return Err(EngineError::Failed(format!(
-                "startup checkpoint-blob sweep for `{fragment}` failed: {error}"
-            )));
+    // Callers hold execution ownership. Sweep only stale staging files,
+    // never external resources; this is not crash cleanup of run effects.
+    for (directory, fragments) in [
+        (workspace.to_owned(), STARTUP_SWEEP_FRAGMENTS.as_slice()),
+        (
+            metadata_dir.join("checkpoint-blobs"),
+            &[".tmp-", ".part-"][..],
+        ),
+    ] {
+        for fragment in fragments {
+            crate::FsGateway::sweep_orphaned_staging_files(
+                &directory,
+                fragment,
+                std::time::Duration::from_secs(3600),
+            )
+            .map_err(|error| {
+                EngineError::Failed(format!(
+                    "startup staging sweep for `{fragment}` failed: {error}"
+                ))
+            })?;
         }
     }
     Ok(())
@@ -482,6 +464,10 @@ impl Engine {
             audit_limits,
         )?;
         let replay = JournalReplay::from_state(journal.state());
+        replay
+            .state
+            .ensure_no_fail_closed_inflight_operations()
+            .map_err(EngineError::Failed)?;
         let run_id = match &replay.state.run_id {
             Some(existing) if existing != &requested_run_id => {
                 return Err(EngineError::Failed(format!(

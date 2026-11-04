@@ -23,7 +23,7 @@ impl RunSummary {
     pub fn direct_run_hint(&self) -> Option<String> {
         self.direct_owner.map(|owner| match owner {
             "active" => "direct owner active; wait for the original invocation to exit".into(),
-            _ => format!("direct owner inactive; not service-resumable: repeat the original qcg run command with the same generator/output and --answer or --confirm, or discard a paused run with qcg runs delete {}", self.run_id),
+            _ => format!("direct owner inactive; not service-resumable: repeat the original qcg run command with the same generator/output and --answer or --confirm, or discard a paused run with qcg runs delete {}; unresolved Started operations block both until their external outcome is reconciled", self.run_id),
         })
     }
 

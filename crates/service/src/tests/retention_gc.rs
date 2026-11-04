@@ -157,3 +157,143 @@ async fn retention_gc_persistent_failure_ends_task_with_error() {
         "exhausted retention retries end the task with Err"
     );
 }
+
+#[tokio::test]
+async fn started_operation_retains_even_terminal_evidence_without_blocking_other_runs() {
+    let runs = temp_run_dir("gc-inflight-evidence");
+    let _guard = TempGuard(runs.clone());
+    write_finished_run(&runs, "unrelated");
+    for id in ["unresolved", "finished-indeterminate"] {
+        let meta = runs.join(id).join("meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        let journal =
+            engine::JournalWriter::create(&meta.join("journal.jsonl"), id, false, None).unwrap();
+        journal.event("run_started", json!({
+            "generator": "demo@1.0.0", "generator_path": "demo", "contract_sha256": "test",
+            "inputs": {}, "resource_hashes": [], "schema_version": api::JOURNAL_SCHEMA_VERSION,
+            "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
+            "retention_days": 0,
+        })).unwrap();
+        journal.event("operation_started", json!({
+            "operation_id": "opaque-operation", "operation_digest": "digest",
+            "invocation_id": "invocation", "node": "external", "kind": "command", "target": "fixture",
+        })).unwrap();
+        if id == "finished-indeterminate" {
+            journal
+                .event(
+                    "operation_finished",
+                    json!({
+                        "operation_id": "opaque-operation", "status": "indeterminate",
+                    }),
+                )
+                .unwrap();
+        }
+        journal
+            .event("run_finished", json!({"status": "success"}))
+            .unwrap();
+    }
+    // A `repeat` Started operation is still evidence for deletion/GC even
+    // though re-entry lets it reach the repeat guard.
+    {
+        let meta = runs.join("repeat-unresolved").join("meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        let journal = engine::JournalWriter::create(
+            &meta.join("journal.jsonl"),
+            "repeat-unresolved",
+            false,
+            None,
+        )
+        .unwrap();
+        journal.event("run_started", json!({
+            "generator": "demo@1.0.0", "generator_path": "demo", "contract_sha256": "test",
+            "inputs": {}, "resource_hashes": [], "schema_version": api::JOURNAL_SCHEMA_VERSION,
+            "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
+            "retention_days": 0,
+        })).unwrap();
+        journal.event("operation_started", json!({
+            "operation_id": "opaque-repeat", "operation_digest": "digest",
+            "invocation_id": "invocation", "node": "external", "kind": "command", "target": "fixture",
+            "on_indeterminate": "repeat",
+        })).unwrap();
+        journal
+            .event("run_finished", json!({"status": "success"}))
+            .unwrap();
+    }
+    let journal = runs.join("unresolved/meta/journal.jsonl");
+    let before = std::fs::read(&journal).unwrap();
+    // Legacy Started events without a policy field fold fail-closed.
+    let legacy = crate::summaries::fold_run_state(&runs.join("unresolved")).unwrap();
+    assert_eq!(
+        legacy.operation_records["opaque-operation"].on_indeterminate,
+        contract::RetryOnIndeterminate::Fail
+    );
+    assert!(legacy.ensure_no_inflight_operations().is_err());
+    assert!(legacy.ensure_no_fail_closed_inflight_operations().is_err());
+    // Repeat Started passes the re-entry gate but still blocks retention.
+    let repeated = crate::summaries::fold_run_state(&runs.join("repeat-unresolved")).unwrap();
+    assert_eq!(
+        repeated.operation_records["opaque-repeat"].on_indeterminate,
+        contract::RetryOnIndeterminate::Repeat
+    );
+    assert!(repeated.ensure_no_fail_closed_inflight_operations().is_ok());
+    assert!(repeated.ensure_no_inflight_operations().is_err());
+    let service = gc_service(&runs, 0);
+    for id in ["unresolved", "repeat-unresolved"] {
+        let refused = service.delete_run(id).await.unwrap_err().to_string();
+        assert!(
+            refused.contains(if id == "unresolved" {
+                "opaque-operation"
+            } else {
+                "opaque-repeat"
+            }) && refused.contains("remains Started"),
+            "{refused}"
+        );
+    }
+    // Unknown policy values also fold fail-closed.
+    {
+        let meta = runs.join("unknown-policy").join("meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        let journal = engine::JournalWriter::create(
+            &meta.join("journal.jsonl"),
+            "unknown-policy",
+            false,
+            None,
+        )
+        .unwrap();
+        journal.event("run_started", json!({
+            "generator": "demo@1.0.0", "generator_path": "demo", "contract_sha256": "test",
+            "inputs": {}, "resource_hashes": [], "schema_version": api::JOURNAL_SCHEMA_VERSION,
+            "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
+            "retention_days": 0,
+        })).unwrap();
+        journal.event("operation_started", json!({
+            "operation_id": "opaque-unknown", "operation_digest": "digest",
+            "invocation_id": "invocation", "node": "external", "kind": "command", "target": "fixture",
+            "on_indeterminate": "sometimes",
+        })).unwrap();
+        journal
+            .event("run_finished", json!({"status": "success"}))
+            .unwrap();
+        let folded = crate::summaries::fold_run_state(&runs.join("unknown-policy")).unwrap();
+        assert_eq!(
+            folded.operation_records["opaque-unknown"].on_indeterminate,
+            contract::RetryOnIndeterminate::Fail
+        );
+        assert!(folded.ensure_no_fail_closed_inflight_operations().is_err());
+        std::fs::remove_dir_all(runs.join("unknown-policy")).unwrap();
+    }
+    for delete in [false, true] {
+        let selected = gc_run_directories(&runs, 0, 0, delete, 100).unwrap();
+        assert_eq!(selected.len(), 2);
+        assert!(
+            !selected
+                .iter()
+                .any(|path| path.file_name() == Some("unresolved")
+                    || path.file_name() == Some("repeat-unresolved"))
+        );
+        assert_eq!(std::fs::read(&journal).unwrap(), before);
+        assert!(runs.join("repeat-unresolved").exists());
+    }
+    assert!(!runs.join("unrelated").exists());
+    assert!(!runs.join("finished-indeterminate").exists());
+}

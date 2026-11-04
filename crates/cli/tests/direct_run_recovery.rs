@@ -398,10 +398,14 @@ command = ["sh", "-c", "sleep 60 & echo $$ $! > pids; wait"]
             let events = service::read_journal_events(&runs.join(&id)).unwrap();
             assert_eq!(events.last().unwrap()["t"], "run_canceled");
             assert_eq!(fixture.show(&id)["status"], "canceled");
+            // Cancellation settled normally after local cleanup, but the
+            // external operation has no durable finish. Do not infer its
+            // outcome from a terminal run event or erase the remaining proof.
             let deleted = fixture.run(&["runs", "delete", &id]);
-            assert!(deleted.status.success(), "{deleted:?}");
-            assert!(!runs.join(&id).exists());
-            // A second direct run can acquire the same store and output lease.
+            assert!(!deleted.status.success(), "{deleted:?}");
+            assert!(String::from_utf8_lossy(&deleted.stderr).contains("remains Started"));
+            assert!(runs.join(&id).exists());
+            // An unrelated direct run can still use the same store.
             let source = Utf8Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../fixtures/generators/ask-user")
                 .join(contract::MANIFEST_FILE);
@@ -410,10 +414,173 @@ command = ["sh", "-c", "sleep 60 & echo $$ $! > pids; wait"]
                 fixture.0.join("generator").join(contract::MANIFEST_FILE),
             )
             .unwrap();
-            let second = fixture.run(&["run", "generator", "--output", "out", "--yes"]);
+            let second = fixture.run(&["run", "generator", "--output", "second", "--yes"]);
             assert!(!second.status.success(), "{second:?}");
-            assert_eq!(fixture.show(&id)["status"], "waiting");
+            let other = service::list_run_summaries(&runs, 100)
+                .unwrap()
+                .into_iter()
+                .find(|(s, _)| s.run_id != id)
+                .unwrap()
+                .0
+                .run_id;
+            assert_eq!(fixture.show(&other)["status"], "waiting");
         }
+    }
+
+    #[tokio::test]
+    async fn sigkill_retains_started_operation_before_restart_or_delete() {
+        let fixture = Fixture::new("side-effect-confirm");
+        std::fs::write(
+            fixture.0.join("generator").join(contract::MANIFEST_FILE),
+            r#"
+[generator]
+id = "crash-evidence"
+name = "Crash evidence"
+version = "0.1.0"
+[permissions]
+network = []
+fs_read = ["workspace"]
+fs_write = ["workspace"]
+side_effects = "allowed"
+containers = { enabled = false }
+[[permissions.commands]]
+bin = "sh"
+args = ["-c", "echo $$ > pids; exec sleep 60"]
+purpose = "bounded crash fixture"
+isolation = "trusted_host"
+[[flow]]
+id = "earlier"
+type = "write"
+[flow.params]
+content = "earlier node ran"
+output_file = "earlier.txt"
+[[flow]]
+id = "inflight"
+type = "command"
+[flow.params]
+command = ["sh", "-c", "echo $$ > pids; exec sleep 60"]
+"#,
+        )
+        .unwrap();
+        let mut running = Running {
+            child: Some(
+                Command::new(env!("CARGO_BIN_EXE_qcg"))
+                    .current_dir(&fixture.0)
+                    .args(["run", "generator", "--output", "out", "--yes"])
+                    .env("AUTO_GC", "0")
+                    .env_remove("PROVIDERS")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            ),
+            pid_file: fixture.0.join("out/pids"),
+        };
+        wait_until(
+            || {
+                assert!(
+                    running
+                        .child
+                        .as_mut()
+                        .unwrap()
+                        .try_wait()
+                        .unwrap()
+                        .is_none(),
+                    "qcg exited before external command launch"
+                );
+                running.pid_file.exists()
+            },
+            "external command launch",
+        );
+        let runs = fixture.0.join(".data/runs");
+        let id = service::list_run_summaries(&runs, 100)
+            .unwrap()
+            .pop()
+            .unwrap()
+            .0
+            .run_id;
+        let journal = runs.join(&id).join("meta/journal.jsonl");
+        // SIGKILL only qcg. The owned fixture command deliberately stays alive;
+        // Running's drop cleans it, not the product's evidence-retention gate.
+        running.child.as_mut().unwrap().kill().unwrap();
+        running.child.as_mut().unwrap().wait().unwrap();
+        let before = std::fs::read(&journal).unwrap();
+        let state = RunState::fold_journal(&journal).unwrap();
+        let (operation, _) = state
+            .operation_records
+            .iter()
+            .find(|(_, record)| record.status == engine::OperationStatus::Started)
+            .unwrap();
+        assert!(state.terminal.is_none());
+        let effect_pid: i32 = std::fs::read_to_string(&running.pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: signal zero only observes the fixture process; no claim of cleanup.
+        assert_eq!(unsafe { libc::kill(effect_pid, 0) }, 0);
+        std::fs::remove_file(fixture.0.join("out/earlier.txt")).unwrap();
+        let resumed = fixture.run(&["run", "generator", "--output", "out", "--yes"]);
+        assert!(!resumed.status.success());
+        let detail = String::from_utf8_lossy(&resumed.stderr);
+        assert!(
+            detail.contains(operation) && detail.contains("remains Started"),
+            "{detail}"
+        );
+        assert!(
+            !detail.contains("echo $$"),
+            "diagnostic must not repeat command payload"
+        );
+        assert!(!fixture.0.join("out/earlier.txt").exists());
+        assert_eq!(std::fs::read(&journal).unwrap(), before);
+        let replayed = fixture.run(&["runs", "replay", &id, "--output", "replay-out"]);
+        assert!(!replayed.status.success());
+        assert!(String::from_utf8_lossy(&replayed.stderr).contains(operation));
+        assert!(!fixture.0.join("replay-out").exists());
+        let deleted = fixture.run(&["runs", "delete", &id]);
+        assert!(!deleted.status.success());
+        assert!(String::from_utf8_lossy(&deleted.stderr).contains(operation));
+        assert_eq!(std::fs::read(&journal).unwrap(), before);
+        for mode in [
+            service::RunStoreMode::Exclusive,
+            service::RunStoreMode::SharedFilesystem,
+        ] {
+            let service = service::LocalService::with_generator_roots_policy_and_store_mode(
+                vec![fixture.0.join("generator")],
+                runs.clone(),
+                None,
+                1,
+                1,
+                mode,
+                service::ServiceDeploymentPolicy::default(),
+            )
+            .unwrap();
+            service.resume_recovered_runs().await;
+            assert_eq!(std::fs::read(&journal).unwrap(), before);
+        }
+        // A fresh run in the same store remains usable and independently deletable.
+        let source = Utf8Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/generators/ask-user")
+            .join(contract::MANIFEST_FILE);
+        std::fs::create_dir(fixture.0.join("other")).unwrap();
+        std::fs::copy(
+            source,
+            fixture.0.join("other").join(contract::MANIFEST_FILE),
+        )
+        .unwrap();
+        let other = fixture.run(&["run", "other", "--output", "other-out", "--yes"]);
+        assert!(!other.status.success()); // Truthful waiting state, not a crash.
+        let other_id = service::list_run_summaries(&runs, 100)
+            .unwrap()
+            .into_iter()
+            .find(|(s, _)| s.run_id != id)
+            .unwrap()
+            .0
+            .run_id;
+        assert_eq!(fixture.show(&other_id)["status"], "waiting");
+        assert!(fixture.run(&["runs", "delete", &other_id]).status.success());
+        assert_eq!(std::fs::read(&journal).unwrap(), before);
     }
 
     #[test]

@@ -39,7 +39,8 @@ JSON event output go to stdout.
   inputs, and exact `--output` path, adding `--answer` or `--confirm` with the
   full interaction ID reported by the run. Contract/resource changes or an
   indeterminate operation can prevent safe continuation; the refusal explains
-  the cause. A paused journal can instead be discarded with `runs delete`.
+  the cause. A paused journal can instead be discarded with `runs delete` unless
+  it retains an unresolved `Started` external operation.
   `--plan` prints the execution plan (steps with `needs`, `on_deps`, full `when`,
   `output`, `parallel` membership, permissions, declared outputs,
   pre-provision coverage, plus read-only `ids` with `questions` and
@@ -187,7 +188,10 @@ JSON event output go to stdout.
   [--confirmations-file file.json] [--json]` re-executes the recorded inputs
   with re-specified answers and confirmations for unattended completion. A run
   with a pinned generator package replays those bytes; the recorded source path
-  is used only for legacy runs without a pinned identity.
+  is used only for legacy runs without a pinned identity. Replay refuses a source
+  journal containing an unresolved fail-closed (`fail`, including pre-policy)
+  `Started` external operation. A `repeat` `Started` source passes this gate,
+  but replay still starts a distinct run rather than reconciling the source journal.
 - `qcg runs fork <id> --at-seq N [--state-patch patch.json]
   [--answer id=value]... [--confirm id=approve|deny]...
   [--confirmations-file file.json] [--runs-dir dir] [--json]` restores
@@ -209,6 +213,10 @@ JSON event output go to stdout.
   direct execution interrupted outside a settled pause must recover safely
   before deletion. Discard removes journal metadata, not the direct output
   directory, and does not clean up orphaned external processes or containers.
+  Any `Started` external operation blocks deletion even if the run is terminal,
+  regardless of its `on_indeterminate` policy; pre-policy journals default to
+  `fail`. Retain the journal and reconcile its external outcome. There is no
+  automatic reconciliation command; see [crash-recovery limits](container-crash-recovery.md).
   Use `--runs-dir` for the journal's actual store when the output's parent is
   not the current directory. A repeated delete reports not-found.
 - `qcg runs export <id> [--runs-dir dir] [--output bundle.zip]` writes a
@@ -220,6 +228,9 @@ JSON event output go to stdout.
 - `qcg runs gc [--runs-dir dir] [--keep N] [--keep-failed N] [--delete]`
 
 GC is a dry run without `--delete` and never removes a non-terminal run.
+It also skips runs with any unresolved `Started` external operation (any policy,
+with pre-policy journals treated as `fail`) without charging
+retention slots or blocking collection of unrelated runs.
 `--keep` retains the newest nonfailed terminal runs (success, canceled, or
 interrupted). Failed runs do not consume that budget and are governed only by
 the separate `--keep-failed` budget. Both default to the deployment policy

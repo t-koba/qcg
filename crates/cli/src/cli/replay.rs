@@ -35,6 +35,9 @@ pub(crate) async fn replay_run(
         json_output,
     } = request;
     let original_dir = resolve_run_dir(&runs_dir, &id)?;
+    engine::RunState::fold_journal(&run_meta_dir(&original_dir).join("journal.jsonl"))?
+        .ensure_no_fail_closed_inflight_operations()
+        .map_err(anyhow::Error::msg)?;
     let inputs = read_run_inputs(&original_dir)?;
     let replay_seed = if reuse_seed {
         Some(replay_seed_from_journal(&original_dir)?)

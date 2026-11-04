@@ -287,6 +287,11 @@ pub struct OperationRecord {
     /// a different invocation is treated as corruption and refused, never
     /// executed.
     pub invocation: String,
+    /// Effective `on_indeterminate` retry policy journaled with the
+    /// `operation_started` event. Absent in pre-policy journals and
+    /// deserializes to `Fail` closed.
+    #[serde(default)]
+    pub on_indeterminate: contract::RetryOnIndeterminate,
 }
 
 /// Results larger than this are not cached inline for resends: they spill
@@ -310,6 +315,40 @@ pub fn operation_id_for(run_id: &str, node_id: &str, invocation_id: &str) -> Str
 }
 
 impl RunState {
+    /// Deletion and retention-GC gate: retains every `Started` operation
+    /// regardless of its durable `on_indeterminate` policy. Neither
+    /// deletion nor GC is cleanup; they must not erase evidence while the
+    /// external outcome is unknown.
+    pub fn ensure_no_inflight_operations(&self) -> Result<(), String> {
+        if let Some((id, _)) = self
+            .operation_records
+            .iter()
+            .find(|(_, record)| record.status == OperationStatus::Started)
+        {
+            return Err(format!(
+                "unresolved external operation `{id}` remains Started; preserve the run journal and reconcile the external outcome before recovery or deletion; qcg has not proved that the effect stopped"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Re-entry and replay gate: refuses a `Started` operation only when
+    /// its durable `on_indeterminate` policy is fail-closed (the default
+    /// for pre-policy journals). A `Started` record with `repeat` is
+    /// allowed through so the existing operation guard can re-execute it
+    /// with the acknowledged double-apply risk.
+    pub fn ensure_no_fail_closed_inflight_operations(&self) -> Result<(), String> {
+        if let Some((id, _)) = self.operation_records.iter().find(|(_, record)| {
+            record.status == OperationStatus::Started
+                && record.on_indeterminate == contract::RetryOnIndeterminate::Fail
+        }) {
+            return Err(format!(
+                "unresolved external operation `{id}` remains Started; preserve the run journal and reconcile the external outcome before recovery or deletion; qcg has not proved that the effect stopped"
+            ));
+        }
+        Ok(())
+    }
+
     /// An active episode may emit a prompt before its cleanup has finished.
     /// Publish/accept that interaction only once accounting is durably closed.
     /// An open crash anchor must be recovered under the execution lease, not
@@ -1077,6 +1116,7 @@ impl RunState {
                             // MCP continuation records key outside the
                             // operation-id namespace and carry no invocation.
                             invocation: String::new(),
+                            on_indeterminate: contract::RetryOnIndeterminate::Fail,
                         },
                     );
                 }
@@ -1132,6 +1172,14 @@ impl RunState {
                             )
                         })?
                         .to_string();
+                    // Durable retry policy for the re-entry gate: current
+                    // writers journal `on_indeterminate` (`fail`/`repeat`);
+                    // absent or unknown values default to fail-closed.
+                    let on_indeterminate =
+                        match event.get("on_indeterminate").and_then(Value::as_str) {
+                            Some("repeat") => contract::RetryOnIndeterminate::Repeat,
+                            _ => contract::RetryOnIndeterminate::Fail,
+                        };
                     let record =
                         self.operation_records
                             .entry(id.to_string())
@@ -1141,11 +1189,13 @@ impl RunState {
                                 result: None,
                                 result_ref: None,
                                 invocation: invocation.clone(),
+                                on_indeterminate,
                             });
                     // A restarted attempt reuses its record; only the status
                     // motion matters, never a digest rewrite. Generation
                     // overflow fails closed instead of reusing generations.
                     record.status = OperationStatus::Started;
+                    record.on_indeterminate = on_indeterminate;
                     let attempts = self.operation_attempts.entry(id.to_string()).or_default();
                     *attempts = attempts.checked_add(1).ok_or_else(|| {
                         crate::JournalError::InvalidEvent(
@@ -1184,6 +1234,7 @@ impl RunState {
                                 result: None,
                                 result_ref: None,
                                 invocation: String::new(),
+                                on_indeterminate: contract::RetryOnIndeterminate::Fail,
                             });
                     // The started record carries the authoritative digest;
                     // finished events repeat it, but an absent one must not
@@ -1980,5 +2031,118 @@ mod tests {
             error.to_string().contains("non-negative integer"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn started_policy_separates_reentry_from_retention() {
+        // Legacy Started without a policy field folds fail-closed and
+        // blocks both gates; `repeat` passes re-entry but still blocks
+        // deletion/GC; finished indeterminate blocks neither.
+        let mut legacy = RunState::default();
+        legacy
+            .apply(&operation_event(1, "operation_started", "op-legacy", None))
+            .expect("legacy start should fold");
+        assert_eq!(
+            legacy.operation_records["op-legacy"].on_indeterminate,
+            contract::RetryOnIndeterminate::Fail
+        );
+        assert!(legacy.ensure_no_fail_closed_inflight_operations().is_err());
+        assert!(legacy.ensure_no_inflight_operations().is_err());
+
+        let mut repeated = RunState::default();
+        repeated
+            .apply(&json!({
+                "t": "operation_started",
+                "seq": 1,
+                "operation_id": "op-repeat",
+                "operation_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "invocation_id": "invocation",
+                "on_indeterminate": "repeat",
+            }))
+            .expect("repeat start should fold");
+        assert_eq!(
+            repeated.operation_records["op-repeat"].on_indeterminate,
+            contract::RetryOnIndeterminate::Repeat
+        );
+        assert!(repeated.ensure_no_fail_closed_inflight_operations().is_ok());
+        assert!(repeated.ensure_no_inflight_operations().is_err());
+
+        let mut unknown = RunState::default();
+        unknown
+            .apply(&json!({
+                "t": "operation_started",
+                "seq": 1,
+                "operation_id": "op-unknown",
+                "operation_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "invocation_id": "invocation",
+                "on_indeterminate": "sometimes",
+            }))
+            .expect("unknown policy should fold");
+        assert_eq!(
+            unknown.operation_records["op-unknown"].on_indeterminate,
+            contract::RetryOnIndeterminate::Fail
+        );
+        assert!(unknown.ensure_no_fail_closed_inflight_operations().is_err());
+
+        let mut finished = RunState::default();
+        finished
+            .apply(&json!({
+                "t": "operation_started",
+                "seq": 1,
+                "operation_id": "op-done",
+                "operation_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "invocation_id": "invocation",
+                "on_indeterminate": "fail",
+            }))
+            .expect("start should fold");
+        finished
+            .apply(&operation_event(
+                2,
+                "operation_finished",
+                "op-done",
+                Some("indeterminate"),
+            ))
+            .expect("indeterminate finish should fold");
+        assert!(finished.ensure_no_fail_closed_inflight_operations().is_ok());
+        assert!(finished.ensure_no_inflight_operations().is_ok());
+
+        // A restarted Started attempt updates the durable policy.
+        let mut updated = RunState::default();
+        updated
+            .apply(&operation_event(1, "operation_started", "op-flip", None))
+            .expect("legacy start should fold");
+        assert!(updated.ensure_no_fail_closed_inflight_operations().is_err());
+        updated
+            .apply(&json!({
+                "t": "operation_started",
+                "seq": 2,
+                "operation_id": "op-flip",
+                "operation_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "invocation_id": "invocation",
+                "on_indeterminate": "repeat",
+            }))
+            .expect("repeat restart should fold");
+        assert_eq!(
+            updated.operation_records["op-flip"].on_indeterminate,
+            contract::RetryOnIndeterminate::Repeat
+        );
+        assert!(updated.ensure_no_fail_closed_inflight_operations().is_ok());
+
+        // Diagnostics stay nonsecret and per-run.
+        let detail = legacy
+            .ensure_no_fail_closed_inflight_operations()
+            .unwrap_err();
+        assert!(detail.contains("op-legacy") && detail.contains("remains Started"));
+        assert!(!detail.contains("invocation-payload-secret"));
+
+        // Operation records round-trip the policy through state.json.
+        let bytes = serde_json::to_vec(&repeated).expect("state should serialize");
+        let reparsed: RunState = serde_json::from_slice(&bytes).expect("state should parse");
+        assert_eq!(
+            reparsed.operation_records["op-repeat"].on_indeterminate,
+            contract::RetryOnIndeterminate::Repeat
+        );
+        let legacy_bytes = serde_json::to_vec(&legacy).expect("state should serialize");
+        assert!(String::from_utf8_lossy(&legacy_bytes).contains("fail"));
     }
 }

@@ -573,6 +573,15 @@ impl RunContext {
             .map(|retry| retry.on_indeterminate)
             .unwrap_or(RetryOnIndeterminate::Fail);
         let start_fresh = |journal: &JournalWriter| -> Result<GuardDecision, StepError> {
+            // Persist the effective retry policy with the start so the
+            // re-entry gate can distinguish fail-closed from repeat
+            // without the node definition. Serialized `fail`/`repeat`
+            // matches the contract schema; old events without the field
+            // fold to `Fail`.
+            let on_indeterminate = match policy {
+                RetryOnIndeterminate::Repeat => "repeat",
+                RetryOnIndeterminate::Fail => "fail",
+            };
             journal
                 .event(
                     "operation_started",
@@ -584,6 +593,7 @@ impl RunContext {
                         "operation_digest": digest,
                         "invocation_id": invocation_id,
                         "attempt": attempt,
+                        "on_indeterminate": on_indeterminate,
                     }),
                 )
                 .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
@@ -1112,12 +1122,14 @@ mod tests {
         // Test-only helper for digest/cache unit tests that never reach the
         // invocation check: production records always carry a non-empty
         // invocation, and the guard refuses empty ones as corrupt (E07).
+        // Defaults to fail-closed like pre-policy journals.
         OperationRecord {
             digest: digest.into(),
             status,
             result,
             result_ref: None,
             invocation: String::new(),
+            on_indeterminate: RetryOnIndeterminate::Fail,
         }
     }
 
@@ -1846,6 +1858,17 @@ mod tests {
         )
         .expect("indeterminate should journal");
         assert!(
+            journal.state().ensure_no_inflight_operations().is_ok(),
+            "a finished indeterminate attempt must not block retention"
+        );
+        assert!(
+            journal
+                .state()
+                .ensure_no_fail_closed_inflight_operations()
+                .is_ok(),
+            "a finished indeterminate attempt must reach its configured replay policy"
+        );
+        assert!(
             matches!(
                 ctx.guard_external_operation(
                     &journal,
@@ -1879,6 +1902,17 @@ mod tests {
             },
         )
         .expect("indeterminate should journal");
+        assert!(
+            journal.state().ensure_no_inflight_operations().is_ok(),
+            "a finished indeterminate attempt must not block retention"
+        );
+        assert!(
+            journal
+                .state()
+                .ensure_no_fail_closed_inflight_operations()
+                .is_ok(),
+            "a finished indeterminate attempt must reach its configured replay policy"
+        );
         assert!(
             matches!(
                 ctx.guard_external_operation(
@@ -2283,6 +2317,120 @@ mod tests {
         assert!(
             error.to_string().contains("sidecar bound"),
             "refusal must name the sidecar bound: {error}"
+        );
+    }
+
+    #[test]
+    fn started_repeat_journal_passes_reentry_and_reaches_repeat_guard() {
+        // A `Started` operation journaled with `repeat` must pass the
+        // re-entry gate and reach the existing repeat guard, while still
+        // blocking deletion/GC. A `fail` Started must block re-entry.
+        use contract::RetryOnIndeterminate;
+        let details = Some(json!({"url": "https://example.test"}));
+        // Repeat: journaled policy passes re-entry, retention still blocks.
+        let (_dir, metadata, ctx, mut node) = guard_harness("started-repeat-gate");
+        node.retry = Some(contract::RetryPolicy {
+            max_attempts: 2,
+            backoff_ms: 0,
+            timeout_secs: None,
+            on_indeterminate: RetryOnIndeterminate::Repeat,
+        });
+        let journal = test_guard_journal(&metadata, "started-repeat-gate");
+        let operation_id = test_proceed_call(&ctx, &journal, &node, &details, "call-repeat-gate");
+        let values = journal_values(&metadata.join("journal.jsonl"));
+        let started = values
+            .iter()
+            .find(|event| event.get("t").and_then(Value::as_str) == Some("operation_started"))
+            .expect("operation_started should be journaled");
+        assert_eq!(
+            started.get("on_indeterminate").and_then(Value::as_str),
+            Some("repeat"),
+            "the effective repeat policy must be journaled"
+        );
+        assert_eq!(
+            journal.state().operation_records[&operation_id].on_indeterminate,
+            RetryOnIndeterminate::Repeat
+        );
+        assert!(
+            journal
+                .state()
+                .ensure_no_fail_closed_inflight_operations()
+                .is_ok(),
+            "repeat Started must reach the repeat guard, not the re-entry refusal"
+        );
+        assert!(
+            journal.state().ensure_no_inflight_operations().is_err(),
+            "repeat Started must still block deletion/GC"
+        );
+        match ctx
+            .guard_external_operation(
+                &journal,
+                &node,
+                "http",
+                "https://example.test",
+                &details,
+                "call-repeat-gate",
+            )
+            .expect("repeat guard should re-execute")
+        {
+            GuardDecision::Proceed { operation_id: id } => assert_eq!(id, operation_id),
+            GuardDecision::Resend { .. } => panic!("repeat must re-execute, not resend"),
+        }
+        let repeated = journal_values(&metadata.join("journal.jsonl"));
+        assert!(
+            repeated
+                .iter()
+                .any(|event| event.get("t").and_then(Value::as_str) == Some("operation_repeated")),
+            "repeat must journal the acknowledged double-apply risk"
+        );
+        // Fail: the same Started shape blocks re-entry.
+        let (_dir, metadata, ctx, mut node) = guard_harness("started-fail-gate");
+        node.retry = Some(contract::RetryPolicy {
+            max_attempts: 2,
+            backoff_ms: 0,
+            timeout_secs: None,
+            on_indeterminate: RetryOnIndeterminate::Fail,
+        });
+        let journal = test_guard_journal(&metadata, "started-fail-gate");
+        let operation_id = test_proceed_call(&ctx, &journal, &node, &details, "call-fail-gate");
+        let values = journal_values(&metadata.join("journal.jsonl"));
+        assert_eq!(
+            values
+                .iter()
+                .find(|event| event.get("t").and_then(Value::as_str) == Some("operation_started"))
+                .and_then(|event| event.get("on_indeterminate"))
+                .and_then(Value::as_str),
+            Some("fail"),
+            "the effective fail policy must be journaled"
+        );
+        assert_eq!(
+            journal.state().operation_records[&operation_id].on_indeterminate,
+            RetryOnIndeterminate::Fail
+        );
+        assert!(
+            journal
+                .state()
+                .ensure_no_fail_closed_inflight_operations()
+                .is_err(),
+            "fail Started must block re-entry"
+        );
+        assert!(
+            journal.state().ensure_no_inflight_operations().is_err(),
+            "fail Started must block deletion/GC"
+        );
+        assert!(
+            matches!(
+                ctx.guard_external_operation(
+                    &journal,
+                    &node,
+                    "http",
+                    "https://example.test",
+                    &details,
+                    "call-fail-gate",
+                ),
+                Err(crate::StepError::Refused { .. })
+            ),
+            "fail Started must refuse automatic replay"
         );
     }
 

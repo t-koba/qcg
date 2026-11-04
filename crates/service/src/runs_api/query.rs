@@ -91,6 +91,9 @@ impl LocalService {
             .get(id)
             .is_some_and(|record| crate::types::task_slot_is_live(&record.task));
         let state = self.authoritative_state(&run_dir).await?;
+        state
+            .ensure_no_inflight_operations()
+            .map_err(|detail| ApiError::Conflict { detail })?;
         let direct = crate::run_dirs::is_direct_run(&run_dir, &state);
         if live_task || (state.terminal.is_none() && !(direct && state.settled_pending().is_some()))
         {

@@ -18,7 +18,29 @@ its external resources were stopped. Likewise, deleting a run or applying
 retention GC is not a container cleanup operation. Do not use run deletion as a
 way to stop orphaned containers. Retain the run journal and daemon-side evidence
 until the original backend and its in-flight operations have been reconciled.
-The current implementation does not itself prevent deletion of this evidence.
+A durable external operation still marked `Started` is retained while its
+outcome is unknown. Same-run ownership re-entry refuses a `Started` operation
+whose durable `on_indeterminate` policy is fail-closed; a `repeat` operation
+reaches the existing guard, which re-executes it with the acknowledged
+double-apply risk. `qcg runs replay` applies the source policy gate too, but
+starts a distinct new run; it does not reconcile or clear the original journal.
+Explicit run deletion and retention GC retain every `Started` operation
+regardless of policy. GC skips such a run without charging retention slots or
+blocking collection of unrelated runs. The effective policy is journaled with
+each `operation_started` event (`fail`/`repeat`) and folded into the operation
+record; pre-policy journals and unknown values default to `fail` closed. The
+diagnostic identifies the operation without repeating its command, arguments,
+or payload. This gate retains evidence; it neither stops the effect nor proves
+it stopped. A terminal run event is not an operation finish: cancellation can
+settle normally while leaving a `Started` record, and that record still blocks
+deletion and fail-closed re-entry. A completed `FailedIndeterminate` operation
+keeps its existing replay policy, including an explicitly configured repeat;
+it is not blocked by this gate.
+
+There is no automatic reconciliation command yet. Keep the journal intact while
+establishing the original backend's outcome and resource ownership; do not edit
+operation status merely to bypass the gate. A future reconciliation path must
+record an evidenced outcome before permitting recovery or deletion.
 
 ## Why the current resource handles are insufficient
 

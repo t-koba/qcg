@@ -46,16 +46,16 @@ pub fn run_summary(run_dir: &Utf8Path) -> Result<RunSummary, ServiceError> {
 /// Summary plus the folded `last_seq` from a single journal read: listing
 /// paths use this so one run never costs a summary scan plus a second fold.
 pub fn run_summary_with_seq(run_dir: &Utf8Path) -> Result<(RunSummary, u64), ServiceError> {
-    let (mut summary, seq) = run_summary_core_with_seq(run_dir)?;
+    let (mut summary, state) = run_summary_core_with_state(run_dir)?;
     summary.invalidation = crate::invalidation::read_invalidation(run_dir)?;
-    Ok((summary, seq))
+    Ok((summary, state.last_seq))
 }
 
 /// Journal-derived summary without auxiliary invalidation metadata, used by
 /// retention so a broken invalidation sidecar cannot change expiry behavior.
-pub(super) fn run_summary_core_with_seq(
+pub(super) fn run_summary_core_with_state(
     run_dir: &Utf8Path,
-) -> Result<(RunSummary, u64), ServiceError> {
+) -> Result<(RunSummary, engine::RunState), ServiceError> {
     let values = read_journal_events(run_dir)?;
     let state = engine::RunState::fold_values(&values)
         .map_err(|error| ServiceError::Invalid(error.to_string()))?;
@@ -64,7 +64,7 @@ pub(super) fn run_summary_core_with_seq(
         .map(|event| RunEvent::from_flat(event).map_err(ServiceError::Invalid))
         .collect::<Result<Vec<_>, _>>()?;
     let summary = run_summary_from_state(run_dir, &events, &state)?;
-    Ok((summary, state.last_seq))
+    Ok((summary, state))
 }
 
 /// Minimal journal projection for run-reference selector discovery. It does

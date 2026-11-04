@@ -2295,6 +2295,7 @@ mod tests {
             result: Some(json!({"file": "out.txt"})),
             invocation: String::new(),
             result_ref: None,
+            on_indeterminate: contract::RetryOnIndeterminate::Fail,
         };
         assert_eq!(
             redacted_success_resend(Some(&cached)),
@@ -2310,6 +2311,7 @@ mod tests {
                     result: None,
                     invocation: String::new(),
                     result_ref: None,
+                    on_indeterminate: contract::RetryOnIndeterminate::Fail,
                 },
             ),
             (
@@ -2320,6 +2322,7 @@ mod tests {
                     result: None,
                     invocation: String::new(),
                     result_ref: None,
+                    on_indeterminate: contract::RetryOnIndeterminate::Fail,
                 },
             ),
             (
@@ -2330,6 +2333,7 @@ mod tests {
                     result: None,
                     invocation: String::new(),
                     result_ref: None,
+                    on_indeterminate: contract::RetryOnIndeterminate::Fail,
                 },
             ),
             (
@@ -2340,6 +2344,7 @@ mod tests {
                     result: None,
                     invocation: String::new(),
                     result_ref: None,
+                    on_indeterminate: contract::RetryOnIndeterminate::Fail,
                 },
             ),
         ] {

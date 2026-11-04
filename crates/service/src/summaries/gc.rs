@@ -2,7 +2,7 @@ use super::super::types::ServiceError;
 use api::RunEvent;
 use camino::{Utf8Path, Utf8PathBuf};
 
-use super::runs::run_summary_core_with_seq;
+use super::runs::run_summary_core_with_state;
 use super::summary::run_meta_dir;
 
 pub(crate) fn run_identity_event<'a>(
@@ -84,7 +84,7 @@ pub fn gc_run_directories(
         if journal_metadata.len() == 0 {
             continue;
         }
-        let (summary, _) = match run_summary_core_with_seq(&path) {
+        let (summary, _) = match run_summary_core_with_state(&path) {
             Ok(summary) => summary,
             Err(error) => {
                 tracing::warn!(run_path = %path, %error, "skipping run with unreadable or corrupt journal during retention GC");
@@ -126,7 +126,10 @@ pub fn gc_run_directories(
             let Some(execution) = crate::run_dirs::try_lock_existing_run_execution(&path)? else {
                 return Ok(None);
             };
-            let (summary, _) = run_summary_core_with_seq(&path)?;
+            let (summary, state) = run_summary_core_with_state(&path)?;
+            state
+                .ensure_no_inflight_operations()
+                .map_err(ServiceError::Invalid)?;
             Ok::<_, ServiceError>(Some((admission, handoff, execution, summary)))
         })();
         let (_admission, _handoff, _execution, summary) = match protection {

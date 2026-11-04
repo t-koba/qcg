@@ -311,3 +311,100 @@ async fn spawn_projection_preserves_record_fields_and_shared_handles() {
     spawn.cancellation.cancel();
     assert!(record.cancellation.is_cancelled());
 }
+
+#[tokio::test]
+async fn unresolved_operation_journals_ownership_refusal_without_replay() {
+    let root = temp_run_dir("shared-inflight-evidence");
+    let _guard = TempGuard(root.clone());
+    let runs = root.join("runs");
+    let owner = shared_service(&runs);
+    let id = waiting_run(&owner).await;
+    crate::tests::support::wait_for_run_execution_lease(&runs.join(&id)).await;
+    let journal_path = runs.join(&id).join("meta/journal.jsonl");
+    let writer = engine::JournalWriter::create(&journal_path, &id, false, None).unwrap();
+    writer.event("operation_started", serde_json::json!({
+        "operation_id": "unresolved-fixture", "operation_digest": "digest",
+        "invocation_id": "invocation", "node": "external", "kind": "command", "target": "fixture",
+    })).unwrap();
+    drop(writer);
+    let before = crate::summaries::read_journal_events(&runs.join(&id)).unwrap();
+    drop(owner);
+    let restarted = shared_service(&runs);
+    restarted.resume_recovered_runs().await;
+    wait_for_snapshot(&restarted, &id, RunStatus::Failed).await;
+    let after = crate::summaries::read_journal_events(&runs.join(&id)).unwrap();
+    assert_eq!(&after[..before.len()], before.as_slice());
+    assert_eq!(
+        after.len(),
+        before.len() + 1,
+        "no steps or replay may occur"
+    );
+    let refusal = after.last().unwrap();
+    assert_eq!(refusal["t"], "run_error");
+    use futures_util::StreamExt;
+    let (history, settled, _) = restarted
+        .history_events(&id, before.last().unwrap()["seq"].as_u64().unwrap())
+        .await
+        .unwrap();
+    assert!(settled);
+    let visible = history.collect::<Vec<_>>().await;
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].kind, "run_error");
+    let state = crate::summaries::fold_run_state(&runs.join(&id)).unwrap();
+    assert_eq!(
+        state.operation_records["unresolved-fixture"].status,
+        engine::OperationStatus::Started
+    );
+    // Legacy Started without a policy field folds fail-closed.
+    assert_eq!(
+        state.operation_records["unresolved-fixture"].on_indeterminate,
+        contract::RetryOnIndeterminate::Fail
+    );
+    assert!(state.ensure_no_inflight_operations().is_err());
+    assert_eq!(
+        refusal["error"],
+        state
+            .ensure_no_fail_closed_inflight_operations()
+            .unwrap_err()
+    );
+    assert!(
+        !refusal["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("fixture-command-payload")
+    );
+    restarted.resume_recovered_runs().await;
+    let error = restarted.delete_run(&id).await.unwrap_err().to_string();
+    assert!(
+        error.contains("unresolved-fixture") && error.contains("remains Started"),
+        "{error}"
+    );
+    let healthy = waiting_run(&restarted).await;
+    assert_ne!(healthy, id);
+    drop(restarted);
+    let again = shared_service(&runs);
+    wait_for_snapshot(&again, &id, RunStatus::Failed).await;
+    again.resume_recovered_runs().await;
+    assert_eq!(
+        crate::summaries::read_journal_events(&runs.join(&id)).unwrap(),
+        after
+    );
+}
+
+#[tokio::test]
+async fn corrupt_journal_reentry_does_not_append_a_refusal() {
+    let root = temp_run_dir("shared-corrupt-reentry");
+    let _guard = TempGuard(root.clone());
+    let runs = root.join("runs");
+    let service = shared_service(&runs);
+    let id = waiting_run(&service).await;
+    crate::tests::support::wait_for_run_execution_lease(&runs.join(&id)).await;
+    let journal_path = runs.join(&id).join("meta/journal.jsonl");
+    let mut corrupt = std::fs::read(&journal_path).unwrap();
+    corrupt.extend_from_slice(b"not a journal event\n");
+    std::fs::write(&journal_path, &corrupt).unwrap();
+    service.resume_recovered_runs().await;
+    crate::tests::support::wait_for_run_execution_lease(&runs.join(&id)).await;
+    assert_eq!(std::fs::read(&journal_path).unwrap(), corrupt);
+    assert_ne!(waiting_run(&service).await, id);
+}
