@@ -14,4 +14,5 @@ pub(crate) mod plan;
 pub(crate) mod replay;
 pub(crate) mod runs_cli;
 pub(crate) mod setup;
+pub(crate) mod signals;
 pub(crate) mod skill;

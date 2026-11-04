@@ -217,6 +217,7 @@ async fn run_async() -> Result<std::process::ExitCode> {
             let service =
                 local_cli_service(Utf8PathBuf::new(), runs_dir.clone(), deployment.clone())?;
             auto_gc_runs(&runs_dir, &deployment.retention)?;
+            let cancellation = tokio_util::sync::CancellationToken::new();
             let run = DirectRun {
                 generator_path: generator,
                 inputs,
@@ -226,16 +227,21 @@ async fn run_async() -> Result<std::process::ExitCode> {
                 answers,
                 confirmations,
                 llm_seed_override: None,
+                cancellation: cancellation.clone(),
             };
-            if json {
-                let result = service.run_generator_path_with_events(run).await?;
-                for event in result.events {
-                    println!("{}", serde_json::to_string(&event)?);
+            cli::signals::with_run_signals(cancellation, async {
+                if json {
+                    let result = service.run_generator_path_with_events(run).await?;
+                    for event in result.events {
+                        println!("{}", serde_json::to_string(&event)?);
+                    }
+                } else {
+                    let manifest = service.run_generator_path(run).await?;
+                    println!("{}", serde_json::to_string_pretty(&manifest)?);
                 }
-            } else {
-                let manifest = service.run_generator_path(run).await?;
-                println!("{}", serde_json::to_string_pretty(&manifest)?);
-            }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await??;
         }
         Command::Eval {
             generator,

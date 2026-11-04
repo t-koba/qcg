@@ -74,6 +74,13 @@ does not execute or settle them until a later journal read succeeds.
 `QUEUED_RESUMER_SECS` controls the retry cadence (default 5 s, range 1..=3600).
 Queue admission time and position are visible on run snapshots while queued.
 
+Direct `qcg run` handles Ctrl-C (SIGINT), and on Unix SIGTERM, by cancelling
+that run and waiting for its existing child-process cleanup and terminal
+`run_canceled` journal event before exiting unsuccessfully. This applies to
+ordinary and `--json` execution; JSON mode does not bypass cancellation.
+Catchable signals are not crash recovery: SIGKILL and process crashes cannot
+run this cleanup or guarantee a terminal journal event.
+
 ## Container daemon operation policy
 
 Container daemon budgets are deployment policy, shared by engine command

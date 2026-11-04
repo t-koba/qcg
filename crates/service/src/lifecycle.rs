@@ -1807,7 +1807,7 @@ impl LocalService {
                         question: None,
                         confirm: None,
                         events: events.clone(),
-                        cancellation: CancellationToken::new(),
+                        cancellation: run.cancellation.clone(),
                         scheduler_yield: tokio_util::sync::CancellationToken::new(),
                         task: Arc::new(Mutex::new(None)),
                         queued_at: Some(chrono::Utc::now()),
@@ -1852,6 +1852,7 @@ impl LocalService {
             let mut runs = self.inner.runs.write().await;
             if let Some(record) = runs.get_mut(&run_id) {
                 record.state = RunStatus::Running;
+                record.cancellation = run.cancellation.clone();
             }
         }
         let policy = crate::types::ResolvedExecutionPolicy::resolve(
@@ -1887,7 +1888,7 @@ impl LocalService {
                     llm_provider: Some(Arc::clone(&runtime.provider)),
                     llm_seed_override: run.llm_seed_override,
                     run_refs: run_refs.clone(),
-                    cancellation: CancellationToken::new(),
+                    cancellation: run.cancellation.clone(),
                     // Direct executions observe the service drain like
                     // spawned runs: a shutdown mid-run ends the wait
                     // instead of overrunning it (E05).

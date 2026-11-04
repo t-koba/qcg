@@ -42,6 +42,7 @@ async fn e05_direct_run_refuses_during_shutdown() {
             interactive: false,
             json_events: false,
             llm_seed_override: None,
+            cancellation: Default::default(),
         })
         .await
         .expect_err("direct run during shutdown must be refused");

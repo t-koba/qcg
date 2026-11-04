@@ -571,6 +571,7 @@ command = ["sh", "-c", "sleep 1"]"#,
         answers: BTreeMap::new(),
         confirmations: BTreeMap::new(),
         llm_seed_override: None,
+        cancellation: Default::default(),
     };
     let first = tokio::spawn({
         let service = service.clone();

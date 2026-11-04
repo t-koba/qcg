@@ -3266,6 +3266,7 @@ images = ["images:alpine@sha256:{0}"]
             answers: BTreeMap::new(),
             confirmations: BTreeMap::new(),
             llm_seed_override: None,
+            cancellation: Default::default(),
         })
         .await
         .unwrap_err();

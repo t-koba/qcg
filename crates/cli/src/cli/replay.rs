@@ -66,6 +66,7 @@ pub(crate) async fn replay_run(
             answers,
             confirmations,
             llm_seed_override: replay_seed,
+            cancellation: Default::default(),
         })
         .await?;
     let original_manifest = match read_output_manifest(&run_meta_dir(&original_dir)) {

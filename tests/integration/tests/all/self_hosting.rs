@@ -64,6 +64,7 @@ async fn run_generator(
                     answers: provisioned.clone(),
                     confirmations: BTreeMap::new(),
                     llm_seed_override: None,
+                    cancellation: Default::default(),
                 })
                 .await
             {

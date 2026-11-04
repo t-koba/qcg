@@ -160,6 +160,8 @@ pub struct DirectRun {
     pub answers: BTreeMap<String, Value>,
     pub confirmations: BTreeMap<String, bool>,
     pub llm_seed_override: Option<u64>,
+    /// Caller-owned cancellation; completion waits for cleanup and journal settlement.
+    pub cancellation: CancellationToken,
 }
 
 #[derive(Debug, Clone)]

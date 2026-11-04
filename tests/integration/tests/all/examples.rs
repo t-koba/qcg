@@ -2234,6 +2234,7 @@ async fn settled_agent_secret_result_replays_failure_without_reexecuting() {
         answers: BTreeMap::new(),
         confirmations: BTreeMap::new(),
         llm_seed_override: None,
+        cancellation: Default::default(),
     };
     let first = service.run_generator_path(direct()).await;
     let first_error = first
@@ -2957,6 +2958,7 @@ async fn direct_run_events_match_journal_event_sequence() {
             answers: answers([]),
             confirmations: BTreeMap::new(),
             llm_seed_override: None,
+            cancellation: Default::default(),
         })
         .await
         .expect("direct run should succeed");
@@ -3001,6 +3003,7 @@ async fn foreach_parallelism_preserves_all_iterations_and_truncates_at_budget() 
             answers: answers([]),
             confirmations: BTreeMap::new(),
             llm_seed_override: None,
+            cancellation: Default::default(),
         })
         .await
         .expect("foreach run should succeed");
@@ -3299,6 +3302,7 @@ async fn run_generator(
                     answers: provisioned.clone(),
                     confirmations: BTreeMap::new(),
                     llm_seed_override: None,
+                    cancellation: Default::default(),
                 })
                 .await
             {

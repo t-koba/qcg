@@ -192,6 +192,7 @@ pub(crate) async fn run_eval(
                 answers: case.answers.clone(),
                 confirmations: case.confirmations.clone(),
                 llm_seed_override: case.seed.map(|seed| seed.saturating_add(repetition as u64)),
+                cancellation: Default::default(),
             };
             let report = match service.run_generator_path_with_events(run).await {
                 Ok(result) => {
