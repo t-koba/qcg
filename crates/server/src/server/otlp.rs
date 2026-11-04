@@ -736,6 +736,8 @@ mod tests {
             let bad = root.join("runs/bad/meta");
             std::fs::create_dir_all(&bad).unwrap();
             std::fs::write(bad.join("journal.jsonl"), "{bad json\n").unwrap();
+            // Exercise malformed-journal isolation rather than a missing lock.
+            std::fs::write(bad.join(".journal.lock"), b"").unwrap();
             for iteration in 0..8 {
                 let id = format!("good-{iteration}");
                 let meta = root.join("runs").join(&id).join("meta");
@@ -746,7 +748,21 @@ mod tests {
                 // the observation path must not fold execution state.
                 event["t"] = json!("budget_charged");
                 event["amount"] = json!(0);
-                std::fs::write(meta.join("journal.jsonl"), format!("{event}\n")).unwrap();
+                let journal = meta.join("journal.jsonl");
+                std::fs::write(&journal, format!("{event}\n")).unwrap();
+                // EventCursor readers require the writer-shared run lock file.
+                std::fs::write(meta.join(".journal.lock"), b"").unwrap();
+                let observed = service.observable_run_ids().await.unwrap();
+                assert!(
+                    observed.contains(&id),
+                    "new run must be observable: {observed:?}"
+                );
+                let batch = service
+                    .read_event_batch(&id, service::EventCursor::default())
+                    .await
+                    .unwrap();
+                assert_eq!(batch.events.len(), 1, "new journal event must be readable");
+                trace_payload(&id, &batch.events).expect("the test event must map to a trace");
                 let (endpoint, collector) =
                     serve_collector_once(200, br#"{"partialSuccess":{"rejectedSpans":1}}"#);
                 let config = OtlpConfig {
