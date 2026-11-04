@@ -87,11 +87,15 @@ wiped; ambiguous evidence must first be reconciled under exclusive ownership.
 Checkpoint forks copy checkpoint data, never the source's cgroup binding.
 
 The sidecar is a bounded (16 KiB identity-record format), no-follow regular-file
-read. Reconciliation checks the caller's expected run id, schema version,
-32-hex-digit nonce, exact nonce-derived root name/path, canonical parent, and
-kernel boot identity before targeting anything. With the parent variable
-unset it uses the persisted parent; a different nonempty configured parent
-fails closed. It never infers ownership from PID/PGID numbers.
+read. Every binding is checked for the caller's expected run id, schema,
+32-hex-digit nonce, nonce-derived root identity, and retirement state. A
+durably cleaned binding with empty confirmation is an idempotent no-op after
+reboots or platform migration, even if its former parent no longer exists.
+An uncleaned binding still requires its exact nonce-derived root, canonical
+parent, matching configuration when set,
+and same kernel boot before targeting anything. With the parent variable
+unset it uses the persisted parent. It never infers ownership from PID/PGID
+numbers.
 
 Cleanup kills the whole root via `cgroup.kill`, confirms `cgroup.events`
 reports `populated 0`, and removes nested cgroups bottom-up. Confirmation

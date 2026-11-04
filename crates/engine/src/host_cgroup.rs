@@ -1,29 +1,6 @@
-//! Linux cgroup-v2 crash-recovery owner for trusted-host processes.
-//!
-//! `trusted_host` workloads are trusted; this is whole-tree cleanup, not a
-//! hostile-code sandbox. Containers remain responsible for untrusted code.
-//! Configuration is explicit and optional (`QCG_HOST_CGROUP_PARENT`), default
-//! absent: without it launches keep their live process-group behavior and no
-//! crash-cleanup claim is made. When enabled but invalid, binding fails
-//! before any host launch.
-//!
-//! One [`policy::HostCgroupScope`] is bound per run execution beneath the
-//! authorized delegated parent, durably recorded in
-//! `meta/host-cgroup.json` before any host command or MCP stdio startup
-//! (MCP connection can precede its `operation_started` event). Children
-//! self-place via a `pre_exec` write to the run root's `cgroup.procs`
-//! before payload execution, with parent-death protection across the
-//! fork-to-placement window: no post-spawn PID/PGID migration
-//! is the containment boundary. Live `ProcessTreeGuard` cancellation is kept
-//! where compatible. Reconciliation runs under the per-run execution lease
-//! before `Started` replay/refusal, recovery/resume, deletion, and
-//! retention GC, and bounded normal return retires only this run's tree.
-//! Cleanup kills the whole run root (`cgroup.kill`), confirms
-//! `cgroup.events` reports `populated 0`, removes nested cgroups
-//! bottom-up, and preserves the binding on any timeout, error, or identity
-//! ambiguity. Absent PIDs or directory deletion are never cleanup proof,
-//! and parents, siblings, unrelated runs, or foreign hosts are never
-//! targeted.
+//! Linux cgroup-v2 crash recovery for trusted-host workloads; opt-in only.
+//! Not a sandbox: containers remain responsible for untrusted code.
+//! Each run binds before launch; recovery kills and confirms only its tree.
 
 use camino::{Utf8Path, Utf8PathBuf};
 #[cfg(target_os = "linux")]
@@ -283,8 +260,7 @@ pub fn load_host_binding(
     Ok(Some(serde_json::from_slice(&bytes)?))
 }
 
-/// Binds one unique per-run-execution root under the authorized parent and
-/// durably records it before any host launch. Returns `None` when disabled.
+/// Binds and records a unique run root before launch; disabled returns `None`.
 pub fn bind_host_cgroup(
     config: &HostCgroupConfig,
     meta_dir: &Utf8Path,
@@ -389,10 +365,8 @@ fn write_binding_atomically(
     Ok(())
 }
 
-/// Reconciles the persisted binding under the caller's exclusive execution
-/// lease. Still uses the persisted parent when the current configuration
-/// was removed; a changed nonempty parent is refused; any mismatch, foreign boot, or ambiguity
-/// preserves the binding and refuses instead of targeting another cgroup.
+/// Reconciles under exclusive execution ownership. Cleaned bindings are
+/// idempotent no-ops; uncleaned bindings require same-boot identity.
 pub fn reconcile_host_cgroup(
     meta_dir: &Utf8Path,
     current: &HostCgroupConfig,
@@ -415,8 +389,6 @@ pub fn reconcile_host_cgroup(
     }
     #[cfg(target_os = "linux")]
     {
-        // The persisted parent must still be a valid delegation for this
-        // process; otherwise reconciliation cannot prove ownership.
         let canonical_parent = validate_delegated_parent(&binding.delegated_parent)?;
         if canonical_parent != binding.delegated_parent {
             return Err(HostCgroupError::identity(
@@ -428,8 +400,7 @@ pub fn reconcile_host_cgroup(
     }
 }
 
-/// Retires one run's tree after bounded normal execution. Only this run's
-/// root is targeted; parents and siblings are never touched.
+/// Retires one run's tree after bounded execution; never targets its parent.
 pub fn retire_host_scope(meta: &Utf8Path, scope: &HostCgroupScope) -> Result<(), HostCgroupError> {
     let binding = load_host_binding(meta)?
         .ok_or_else(|| HostCgroupError::identity("missing host binding"))?;
@@ -438,6 +409,9 @@ pub fn retire_host_scope(meta: &Utf8Path, scope: &HostCgroupScope) -> Result<(),
         return Err(HostCgroupError::identity(
             "host binding changed during execution",
         ));
+    }
+    if binding.cleaned {
+        return Ok(());
     }
     retire_binding(meta, binding)
 }
@@ -448,8 +422,31 @@ fn validate_binding(
     expected: &str,
 ) -> Result<(), HostCgroupError> {
     validate_binding_record(binding, expected)?;
-    // Check even cleaned records: their persisted parent must be canonical,
-    // not a lexical alias that could redirect a future binding or retirement.
+    // Completed cleanup never dereferences the old cgroup path.
+    if binding.cleaned {
+        return Ok(());
+    }
+    if current_boot_id()? != binding.boot_id {
+        return Err(HostCgroupError::identity(
+            "host-cgroup binding is from a different boot; refusing",
+        ));
+    }
+    if policy::validate_parent_path(&binding.delegated_parent).is_err()
+        || binding.delegated_parent.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+        || binding.run_root
+            != binding
+                .delegated_parent
+                .join(run_root_name(expected, &binding.nonce))
+    {
+        return Err(HostCgroupError::identity(
+            "host-cgroup binding run/nonce/root/parent identity mismatch; refusing",
+        ));
+    }
     if binding.delegated_parent.canonicalize()? != binding.delegated_parent {
         return Err(HostCgroupError::identity(
             "delegated parent is not canonical; refusing",
@@ -476,28 +473,33 @@ fn validate_binding_record(
             .nonce
             .bytes()
             .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
-        || policy::validate_parent_path(&binding.delegated_parent).is_err()
-        || binding.delegated_parent.components().any(|c| {
-            matches!(
-                c,
-                std::path::Component::ParentDir | std::path::Component::CurDir
-            )
-        })
-        || binding.run_root
-            != binding
-                .delegated_parent
-                .join(run_root_name(expected, &binding.nonce))
+        || binding.boot_id.is_empty()
+        || !binding_paths_match(binding, expected)
+        || (binding.cleaned && !binding.empty_confirmed)
     {
         return Err(HostCgroupError::identity(
-            "host-cgroup binding run/nonce/root/parent identity mismatch; refusing",
-        ));
-    }
-    if current_boot_id()? != binding.boot_id {
-        return Err(HostCgroupError::identity(
-            "host-cgroup binding is from a different boot; refusing",
+            "host-cgroup binding run/nonce/root/retirement identity mismatch; refusing",
         ));
     }
     Ok(())
+}
+
+// Validate the persisted Linux path spelling without requiring its mount.
+fn binding_paths_match(binding: &HostCgroupBinding, expected: &str) -> bool {
+    let Some(parent) = binding.delegated_parent.to_str() else {
+        return false;
+    };
+    let Some(root) = binding.run_root.to_str() else {
+        return false;
+    };
+    let Some(relative) = parent.strip_prefix("/sys/fs/cgroup/") else {
+        return false;
+    };
+    !relative.is_empty()
+        && relative
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+        && root == format!("{parent}/{}", run_root_name(expected, &binding.nonce))
 }
 
 #[cfg(target_os = "linux")]
@@ -524,8 +526,7 @@ fn retire_binding(_meta: &Utf8Path, _binding: HostCgroupBinding) -> Result<(), H
     ))
 }
 
-/// Kills the complete per-run subtree, confirms `populated 0`, and removes
-/// nested cgroups bottom-up. Preserves evidence on any failure.
+/// Kills, emptiness-confirms, and removes the per-run subtree; preserves errors.
 #[cfg(target_os = "linux")]
 pub fn cleanup_scope(scope: &HostCgroupScope) -> Result<(), HostCgroupError> {
     kill_and_confirm(scope)?;
@@ -664,10 +665,8 @@ fn read_occupancy(root: &Path) -> Result<bool, HostCgroupError> {
     }
 }
 
-/// Applies race-free self-placement to a not-yet-spawned std command.
-/// The child writes its own pid into the run root before payload execution,
-/// so a qcg death between fork and exec cannot leave it outside. Must be
-/// called before `spawn`; post-spawn migration is never the boundary.
+/// Applies race-free self-placement before a std command starts its payload.
+/// Must be called before `spawn`; post-spawn migration is never the boundary.
 #[cfg(target_os = "linux")]
 pub fn apply_scope_to_std_command(
     command: &mut std::process::Command,
@@ -765,6 +764,58 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod cleaned_binding_tests {
+    use super::*;
+
+    fn retired_binding(cleaned: bool, empty_confirmed: bool) -> (Utf8PathBuf, HostCgroupBinding) {
+        let meta = Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("qcg-retired-{}", uuid::Uuid::now_v7())),
+        )
+        .unwrap();
+        let parent = format!(
+            "/sys/fs/cgroup/removed-{}",
+            uuid::Uuid::now_v7().as_simple()
+        );
+        let nonce = "a".repeat(32);
+        let binding = HostCgroupBinding {
+            version: HOST_CGROUP_BINDING_VERSION,
+            run_id: "run".into(),
+            nonce: nonce.clone(),
+            run_root: PathBuf::from(format!("{parent}/{}", run_root_name("run", &nonce))),
+            delegated_parent: PathBuf::from(parent),
+            boot_id: "previous-boot".into(),
+            cleaned,
+            empty_confirmed,
+        };
+        write_binding_atomically(&meta, &binding).unwrap();
+        (meta, binding)
+    }
+
+    #[test]
+    fn cleaned_binding_is_noop_after_boot_change_and_parent_removal() {
+        let (meta, binding) = retired_binding(true, true);
+        assert!(!binding.delegated_parent.exists());
+        let before = std::fs::read(binding_path(&meta)).unwrap();
+        assert_eq!(
+            reconcile_host_cgroup(&meta, &HostCgroupConfig::disabled(), "run").unwrap(),
+            HostCgroupReconcile::AlreadyCleaned
+        );
+        assert_eq!(std::fs::read(binding_path(&meta)).unwrap(), before);
+        assert_eq!(load_host_binding(&meta).unwrap().unwrap(), binding);
+        std::fs::remove_dir_all(meta).unwrap();
+    }
+
+    #[test]
+    fn cleaned_binding_requires_durable_empty_confirmation() {
+        let (meta, _) = retired_binding(true, false);
+        let before = std::fs::read(binding_path(&meta)).unwrap();
+        assert!(reconcile_host_cgroup(&meta, &HostCgroupConfig::disabled(), "run").is_err());
+        assert_eq!(std::fs::read(binding_path(&meta)).unwrap(), before);
+        std::fs::remove_dir_all(meta).unwrap();
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod identity_tests {
     use super::*;
@@ -785,6 +836,26 @@ mod identity_tests {
         binding
     }
     #[test]
+    fn uncleaned_foreign_boot_is_refused_without_mutating_binding() {
+        let meta = Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("qcg-foreign-boot-{}", uuid::Uuid::now_v7())),
+        )
+        .unwrap();
+        let mut binding = fixture(&meta);
+        binding.cleaned = false;
+        binding.empty_confirmed = false;
+        binding.boot_id = "foreign-boot".into();
+        write_binding_atomically(&meta, &binding).unwrap();
+        let before = std::fs::read(binding_path(&meta)).unwrap();
+        assert!(matches!(
+            reconcile_host_cgroup(&meta, &HostCgroupConfig::disabled(), "run"),
+            Err(HostCgroupError::Identity(_))
+        ));
+        assert_eq!(std::fs::read(binding_path(&meta)).unwrap(), before);
+        std::fs::remove_dir_all(meta).unwrap();
+    }
+
+    #[test]
     fn host_cgroup_identity_checks_precede_any_cleanup() {
         let meta = Utf8PathBuf::from_path_buf(
             std::env::temp_dir().join(format!("qcg-identity-{}", uuid::Uuid::now_v7())),
@@ -795,10 +866,11 @@ mod identity_tests {
         validate_binding_record(&valid, "run").unwrap();
         assert!(reconcile_host_cgroup(&meta, &disabled, "another-run").is_err());
         let changed = HostCgroupConfig::from_parent(Some("/sys/fs/cgroup/other".into())).unwrap();
-        assert!(reconcile_host_cgroup(&meta, &changed, "run").is_err());
-        for field in [
-            "run_id", "sibling", "nonce", "nonhex", "boot", "parent", "version",
-        ] {
+        assert_eq!(
+            reconcile_host_cgroup(&meta, &changed, "run").unwrap(),
+            HostCgroupReconcile::AlreadyCleaned
+        );
+        for field in ["run_id", "sibling", "nonce", "nonhex", "parent", "version"] {
             let mut binding = valid.clone();
             match field {
                 "run_id" => binding.run_id = "sibling-run".into(),
@@ -809,7 +881,6 @@ mod identity_tests {
                 }
                 "nonce" => binding.nonce = "bad".into(),
                 "nonhex" => binding.nonce = "z".repeat(32),
-                "boot" => binding.boot_id = "foreign".into(),
                 "parent" => binding.delegated_parent.push("../qcg-test"),
                 _ => binding.version += 1,
             }
