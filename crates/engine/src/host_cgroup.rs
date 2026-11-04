@@ -266,7 +266,7 @@ pub fn bind_host_cgroup(
     meta_dir: &Utf8Path,
     run_id: &str,
 ) -> Result<Option<HostCgroupScope>, HostCgroupError> {
-    let Some(parent) = config.parent() else {
+    let Some(_parent) = config.parent() else {
         return Ok(None);
     };
     #[cfg(not(target_os = "linux"))]
@@ -286,7 +286,7 @@ pub fn bind_host_cgroup(
             ));
         }
         cleanup_timing()?;
-        let canonical_parent = validate_delegated_parent(parent)?;
+        let canonical_parent = validate_delegated_parent(_parent)?;
         let boot_id = current_boot_id()?;
         let nonce = uuid::Uuid::now_v7().as_simple().to_string();
         let name = run_root_name(run_id, &nonce);
@@ -337,7 +337,7 @@ pub fn bind_host_cgroup(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 fn write_binding_atomically(
     meta_dir: &Utf8Path,
     binding: &HostCgroupBinding,
@@ -689,14 +689,14 @@ pub fn apply_scope_to_std_command(
 /// Applies the scope to a Tokio command before spawn. `None` is a no-op.
 pub fn apply_scope_to_tokio_command(
     command: &mut tokio::process::Command,
-    scope: Option<&HostCgroupScope>,
+    _scope: Option<&HostCgroupScope>,
 ) -> Result<(), HostCgroupError> {
-    let Some(scope) = scope else {
+    let Some(_scope) = _scope else {
         return Ok(());
     };
     #[cfg(target_os = "linux")]
     {
-        apply_scope_to_std_command(command.as_std_mut(), scope)
+        apply_scope_to_std_command(command.as_std_mut(), _scope)
     }
     #[cfg(not(target_os = "linux"))]
     {

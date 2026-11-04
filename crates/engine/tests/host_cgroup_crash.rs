@@ -435,7 +435,7 @@ fn host_cgroup_owner_sigkill_launch_and_workload_recovery() {
             assert_eq!(
                 membership.trim(),
                 format!(
-                    "0::{}",
+                    "0::/{}",
                     scope
                         .run_root
                         .strip_prefix("/sys/fs/cgroup")
