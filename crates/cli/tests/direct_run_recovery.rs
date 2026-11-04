@@ -515,7 +515,7 @@ command = ["sh", "-c", "cat /proc/self/cgroup > membership; echo $$ > pids; exec
             assert_eq!(
                 membership.trim(),
                 format!(
-                    "0::{}",
+                    "0::/{}",
                     scope
                         .run_root
                         .strip_prefix("/sys/fs/cgroup")
