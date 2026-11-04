@@ -64,17 +64,76 @@ precondition, or a daemon operation handle. `Backend` in
 `crates/container/src/backend.rs` captures a client binary and optional runtime
 flag, not a stable daemon/project identity or a creation fence.
 
-## Verification limit
+## Docker/Podman reconciliation blocker
 
-The existing adapters do not establish an ID-only or atomic ownership-guarded
-removal contract, a durable creation acknowledgement, or an authenticated
-backend identity. A matching label followed by an unqualified removal command
-is therefore not an established identity-safe recovery protocol. No such
-protocol is currently claimed for any family.
+A preselected name and ownership label, applied together at creation, would
+close the CID-file discovery gap. They would not by themselves make cleanup
+safe. Consider this sequence under otherwise exclusive qcg run ownership:
 
-CLI doubles can test qcg's ordering and demonstrate late creation after client
-death. They cannot establish a real daemon's resource replacement, ID-or-name
-resolution, or conditional-deletion semantics. Normal lifecycle tests and
-passing indeterminate-replay tests are not acceptance evidence for crash
-cleanup. Unix command trees and host MCP stdio containment are separate
-concerns; a persisted PID or PGID does not supply a durable identity either.
+1. Recovery inspects full ID A and verifies its operation label.
+2. A is removed by another daemon actor (or automatic removal).
+3. A different resource B acquires the **name** A.
+4. Recovery submits `container rm --force A`.
+
+If the removal interface falls back from an absent ID to a name, step 4 can
+remove B despite the earlier ownership check. Re-inspecting immediately before
+removal only narrows this race. Passing the result of a label-filtered list to
+`rm` has the same problem. A full-length ID string is not an ID-only interface
+contract. The current adapter supplies neither an expected-label precondition
+nor a backend-wide exclusion of other actors. Binding the original daemon and
+context is necessary too; the client binary alone does not identify that daemon.
+
+No production reconciliation protocol is established for either Docker or
+Podman yet. They require separate backend verification: a property observed
+on Docker must not be assumed for rootless Podman, or conversely. In particular,
+Podman's filtering or storage APIs need their own ownership/removal analysis,
+not a claim of equivalence to Docker's CLI. An ID-only or atomically
+ownership-conditional removal primitive would address the replacement issue;
+it would not independently fence an asynchronous create. Missing resources,
+daemon errors, and cleanup failures must remain unresolved, not successful
+cleanup. An empty lookup must never clear a durable Started operation.
+
+## Real-backend identity diagnostic
+
+`scripts/probe-container-identity.py` prepares a bounded, destructive protocol
+probe for a **disposable local daemon with no concurrent resource mutation**:
+
+```sh
+python3 scripts/probe-container-identity.py docker --command-timeout 30
+python3 scripts/probe-container-identity.py podman --command-timeout 30
+```
+
+It builds a static C fixture with the local compiler (`--compiler`, default
+`cc`), imports its filesystem, and uses `--pull=never` and no container network.
+It needs no base-image download. It creates and removes an owned fixture, then
+creates another owned fixture whose name equals the first fixture's full ID.
+Only after inspecting that alias and checking its actual ID, name and test
+label does it deliberately try the stale-ID removal. This is a counterexample
+probe, **not** a proposed cleanup algorithm. Ordinary fixture cleanup verifies
+IDs and labels too, under the disposable/quiescent-daemon precondition that
+production recovery cannot assume.
+
+A successful JSON result reports whether the stale-ID removal deleted the
+different-ID fixture; it explicitly reports that crash cleanup is **not
+certified**. Failure to create the alias, backend unavailability, or failed
+removal is inconclusive, not evidence of an ID-only primitive. Timeouts and
+failed creates/imports can leave fixtures: discard the disposable daemon, or
+retain its evidence for manual reconciliation. There are no absence-based
+cleanup retries. Per-command bounds are supplied by the caller; the dedicated
+Ubuntu 24.04 workflow configures 30 seconds and a five-minute job deadline.
+
+`.github/workflows/container-identity.yml` runs Docker and rootless Podman
+separately after a relevant `mizu` push or explicit dispatch. A green diagnostic
+job is not crash-cleanup acceptance. Its real-backend results must be read
+before selecting a production primitive; preparing the workflow does not mean
+it has run. Local guard tests only cover the diagnostic's refusal on ownership
+mismatch/unavailability and reporting of cleanup failure.
+
+CLI doubles cannot establish daemon resource replacement, ID-or-name
+resolution, or conditional-deletion semantics. Normal lifecycle and
+indeterminate-replay tests likewise are not acceptance evidence for crash
+cleanup. Real qcg SIGKILL tests during creation and workload, gate integration,
+backend identity binding, and failure/other-run isolation remain required once
+a safe backend primitive is established. Incus/LXD and Unix/MCP containment
+remain separate; a persisted friendly name, PID or PGID supplies no durable
+reuse guard.

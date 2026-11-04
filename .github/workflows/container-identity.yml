@@ -1,0 +1,41 @@
+name: Container identity diagnostic
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [mizu]
+    paths:
+      - .github/workflows/container-identity.yml
+      - scripts/probe-container-identity.py
+      - scripts/test-probe-container-identity.py
+      - scripts/fixtures/container-hold.c
+
+permissions:
+  contents: read
+
+jobs:
+  identity:
+    name: Identity probe (${{ matrix.backend }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [docker, podman]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check diagnostic guards
+        run: python3 scripts/test-probe-container-identity.py
+      # Runner Docker and rootless Podman; no sudo, login, or image pull.
+      - name: Probe real backend (not crash-cleanup certification)
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 scripts/probe-container-identity.py '${{ matrix.backend }}' \
+            --command-timeout 30 | tee identity.json
+      - name: Retain observed interface result
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: container-identity-${{ matrix.backend }}
+          path: identity.json
+          if-no-files-found: error
