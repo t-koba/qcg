@@ -38,6 +38,8 @@ impl EventCursor {
             run_meta_dir(directory).join("journal.jsonl"),
             run_meta_dir(directory).join("audit.jsonl"),
         ];
+        // Capture both streams under the writer lock; parse only after releasing it.
+        let guard = engine::acquire_journal_read_lock(&paths[0])?;
         let mut readers = Vec::new();
         for (index, path) in paths.iter().enumerate() {
             let file = match File::open(path) {
@@ -55,7 +57,9 @@ impl EventCursor {
                 };
                 #[cfg(not(unix))]
                 let identity = (0, 0);
-                if cursor.identities[index].is_some_and(|prior| prior != identity) {
+                if cursor.identities[index].is_some_and(|prior| prior != identity)
+                    || size < cursor.offsets[index]
+                {
                     cursor.offsets[index] = 0;
                     cursor.counts[index] = 0;
                     cursor.stream_seq[index] = 0;
@@ -69,22 +73,19 @@ impl EventCursor {
                     policy::DEFAULT_MAX_AUDIT_TOTAL_BYTES
                 };
                 if size > limit as u64 {
-                    return Err(ServiceError::Invalid(format!(
-                        "{} exceeds byte limit",
-                        path
-                    )));
-                }
-                if size < cursor.offsets[index] {
-                    cursor.offsets[index] = 0;
-                    cursor.counts[index] = 0;
-                    cursor.stream_seq[index] = 0;
+                    return Err(ServiceError::Invalid(format!("{path} exceeds byte limit")));
                 }
                 file.seek(std::io::SeekFrom::Start(cursor.offsets[index]))?;
                 Some(BufReader::new(file.take(size - cursor.offsets[index])))
             } else {
                 None
             });
+            #[cfg(test)]
+            if index == 0 {
+                tests::between_boundary_captures();
+            }
         }
+        drop(guard);
         fn next(
             reader: &mut Option<BufReader<std::io::Take<File>>>,
             max_event: usize,
@@ -179,8 +180,7 @@ impl EventCursor {
     }
 }
 impl LocalService {
-    /// Observation export enumerates directories without folding each run.
-    /// A damaged journal is handled independently by read_event_batch.
+    /// Export enumerates without folding; read_event_batch isolates damaged journals.
     pub async fn observable_run_ids(&self) -> Result<Vec<String>, ApiError> {
         let root = self.inner.runs_dir.clone();
         let cap = self.inner.deployment_policy.max_directory_scan_entries;
@@ -351,6 +351,98 @@ impl LocalService {
 mod tests {
     use super::*;
     use camino::Utf8PathBuf;
+    thread_local! {
+        static CAPTURE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+    pub(super) fn between_boundary_captures() {
+        if let Some(hook) = CAPTURE_HOOK.with_borrow_mut(Option::take) {
+            hook();
+        }
+    }
+
+    #[test]
+    fn writer_cannot_split_cursor_snapshot() {
+        // Cover both an absent audit file and an existing stream at capture time.
+        for seed_audit in [false, true] {
+            let directory = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+                .unwrap()
+                .join(format!("qcg-cut-{}", uuid::Uuid::now_v7()));
+            let path = run_meta_dir(&directory).join("journal.jsonl");
+            let writer = engine::JournalWriter::create(&path, "test", false, None).unwrap();
+            writer
+                .event("audit_degraded", serde_json::json!({}))
+                .unwrap();
+            if seed_audit {
+                writer
+                    .event("llm_delta", serde_json::json!({"provider":"test", "model":"test", "index":0, "text":"seed"}))
+                    .unwrap();
+            }
+            let initial_count = if seed_audit { 2 } else { 1 };
+            let (start_tx, start_rx) = std::sync::mpsc::channel();
+            let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let append = std::thread::spawn(move || {
+                start_rx.recv().unwrap();
+                // An independent descriptor observes the same OS lock as the real writer.
+                let lock = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(engine::journal_lock_path(&path))
+                    .unwrap();
+                let blocked = match lock.try_lock() {
+                    Err(std::fs::TryLockError::WouldBlock) => true,
+                    Ok(()) => {
+                        lock.unlock().unwrap();
+                        false
+                    }
+                    Err(error) => panic!("lock probe failed: {error}"),
+                };
+                blocked_tx.send(blocked).unwrap();
+                writer
+                    .event("audit_degraded", serde_json::json!({}))
+                    .unwrap();
+                writer
+                    .event("llm_delta", serde_json::json!({"provider":"test", "model":"test", "index":1, "text":"new"}))
+                    .unwrap();
+                let _ = done_tx.send(());
+            });
+            let contended = std::rc::Rc::new(std::cell::Cell::new(false));
+            let observed = contended.clone();
+            CAPTURE_HOOK.with_borrow_mut(|hook| {
+                *hook = Some(Box::new(move || {
+                    start_tx.send(()).unwrap();
+                    let blocked = blocked_rx.recv().unwrap();
+                    observed.set(blocked);
+                    // With the old unlocked reader, deterministically put both appends
+                    // between captures: the audit seq then hides the missing durable seq.
+                    if !blocked {
+                        done_rx.recv().unwrap();
+                    }
+                }))
+            });
+            let first = EventCursor::default().read(&directory).unwrap();
+            append.join().unwrap();
+            let mut seen = first.events;
+            let first_count = seen.len();
+            let mut cursor = first.cursor;
+            // A fixed bound suffices for these tiny streams; include repeated empty polls.
+            for _ in 0..3 {
+                let batch = cursor.read(&directory).unwrap();
+                assert!(batch.exhausted);
+                seen.extend(batch.events);
+                cursor = batch.cursor;
+            }
+            assert_eq!(
+                seen.iter()
+                    .map(|e| e["seq"].as_u64().unwrap())
+                    .collect::<Vec<_>>(),
+                (1..=initial_count + 2).collect::<Vec<_>>()
+            );
+            assert_eq!(first_count, initial_count as usize);
+            assert!(contended.get(), "writer must be excluded between captures");
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
     fn record(seq: usize) -> Value {
         serde_json::json!({"t":"run_started","seq":seq,"ts":"2026-10-02T00:00:00Z","run_id":"test","trace_id":api::trace_id_for_run("test"),"span_id":api::span_id_for_seq(seq as u64),"generator":"test","generator_path":"test","contract_sha256":"abc","inputs":{},"resource_hashes":[],"schema_version":1})
     }
@@ -361,6 +453,7 @@ mod tests {
             .join(format!("qcg-batch-{}", uuid::Uuid::now_v7()));
         let meta = run_meta_dir(&directory);
         std::fs::create_dir_all(&meta).unwrap();
+        File::create(engine::journal_lock_path(&meta.join("journal.jsonl"))).unwrap();
         let mut durable = String::new();
         let mut audit = String::new();
         for seq in 1..=600 {
@@ -391,10 +484,11 @@ mod tests {
             .append(true)
             .open(meta.join("journal.jsonl"))
             .unwrap();
-        write!(file, "{}", record(601)).unwrap();
+        // A legitimate sequence gap must not delay the next complete event.
+        write!(file, "{}", record(602)).unwrap();
         assert!(cursor.read(&directory).unwrap().events.is_empty());
         writeln!(file).unwrap();
-        assert_eq!(cursor.read(&directory).unwrap().events[0]["seq"], 601);
+        assert_eq!(cursor.read(&directory).unwrap().events[0]["seq"], 602);
         std::fs::write(
             meta.join("audit.jsonl"),
             vec![b'x'; policy::DEFAULT_MAX_JOURNAL_EVENT_BYTES + 2],

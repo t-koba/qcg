@@ -7,8 +7,8 @@ pub use read::*;
 pub use serialize::*;
 pub use types::*;
 pub use writer::{
-    journal_lock_path, read_last_seq_from_file_tail, read_last_seq_from_tail,
-    repair_truncated_tail_locked,
+    acquire_journal_read_lock, journal_lock_path, read_last_seq_from_file_tail,
+    read_last_seq_from_tail, repair_truncated_tail_locked,
 };
 
 #[cfg(test)]

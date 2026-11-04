@@ -11,12 +11,6 @@ use super::read::{journal_metrics, read_journal_values};
 use super::serialize::{append_serialized_json_line, serialize_bounded};
 use super::types::{JournalError, JournalLimits, JournalWriter};
 
-/// Terminal journal events use the single canonical
-/// `api::is_terminal_event_kind` predicate shared with the service live
-/// tail, SSE wrapper, and shared poller, so sync, metrics, shutdown markers,
-/// and streams can never disagree about what "finished" means (Q2/E12).
-/// There is no local duplicate predicate: every call below invokes the
-/// canonical one directly.
 /// Adopts a cache only when its schema and sequence match the durable journal tail.
 fn resync_durable_state(
     journal_path: &Utf8Path,
@@ -123,19 +117,20 @@ fn sync_parent_dir(journal_path: &Utf8Path) -> Result<(), JournalError> {
     Ok(())
 }
 
-fn acquire_journal_lock(journal_path: &Utf8Path) -> Result<File, JournalError> {
-    let lock_path = journal_lock_path(journal_path);
-    if let Some(parent) = lock_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+fn acquire_journal_lock(journal_path: &Utf8Path) -> std::io::Result<File> {
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(&lock_path)?;
-    file.lock()?;
-    Ok(file)
+        .open(journal_lock_path(journal_path))?;
+    file.lock().map(|()| file)
+}
+
+/// Acquires an exclusive boundary lock through the read-only lock-file handle.
+pub fn acquire_journal_read_lock(journal_path: &Utf8Path) -> std::io::Result<File> {
+    let file = File::open(journal_lock_path(journal_path))?;
+    file.lock().map(|()| file)
 }
 
 /// Latest durable seq without folding the whole journal: scan the tail
