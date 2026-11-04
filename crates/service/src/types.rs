@@ -8,7 +8,6 @@ use contract::Contract;
 use model::OutputManifest;
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::fs::File;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinHandle;
@@ -186,7 +185,7 @@ pub(crate) struct LocalServiceInner {
     pub(crate) max_tracked_runs: usize,
     pub(crate) run_store_mode: RunStoreMode,
     pub(crate) shared_recovery_status: Mutex<SharedRecoveryStatus>,
-    pub(crate) _runs_lock: Option<File>,
+    pub(crate) _runs_lock: Option<crate::run_dirs::RunStoreLock>,
     pub(crate) queue_notify: Arc<tokio::sync::Notify>,
     /// Stable identity of this service process for shared-store ownership.
     pub(crate) owner_id: String,

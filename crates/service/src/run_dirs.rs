@@ -150,7 +150,24 @@ pub(crate) fn is_regular_file(path: &Utf8Path) -> Result<bool, ServiceError> {
     }
 }
 
-pub(crate) fn lock_runs_directory(runs_dir: &Utf8Path) -> Result<File, ServiceError> {
+fn unlock_advisory_file(file: &File, owner: &'static str) {
+    if let Err(error) = file.unlock() {
+        tracing::warn!(%error, owner, "failed to unlock advisory file lock");
+    }
+}
+
+/// Store-wide service ownership. Explicitly unlock on drop because a
+/// concurrent fork may temporarily retain the descriptor until exec.
+#[derive(Debug)]
+pub(crate) struct RunStoreLock(File);
+
+impl Drop for RunStoreLock {
+    fn drop(&mut self) {
+        unlock_advisory_file(&self.0, "run store");
+    }
+}
+
+pub(crate) fn lock_runs_directory(runs_dir: &Utf8Path) -> Result<RunStoreLock, ServiceError> {
     std::fs::create_dir_all(runs_dir)?;
     let lock_path = runs_dir.join(".service.lock");
     let file = open_lock_file(&lock_path)?;
@@ -163,19 +180,19 @@ pub(crate) fn lock_runs_directory(runs_dir: &Utf8Path) -> Result<File, ServiceEr
         }
         Err(std::fs::TryLockError::Error(error)) => return Err(ServiceError::Io(error)),
     }
-    Ok(file)
+    Ok(RunStoreLock(file))
 }
 
-/// Shared counterpart of [`lock_runs_directory`]: any number of
-/// SharedFilesystem peers hold a shared lock together, while an Exclusive
-/// service is refused until every shared peer exits. This makes the two
-/// store modes mutually exclusive on the same runs directory (E12c).
-pub(crate) fn lock_runs_directory_shared(runs_dir: &Utf8Path) -> Result<File, ServiceError> {
+/// Shared peers coexist; Exclusive mode waits until all release the same
+/// `.service.lock`, keeping the store modes mutually exclusive (E12c).
+pub(crate) fn lock_runs_directory_shared(
+    runs_dir: &Utf8Path,
+) -> Result<RunStoreLock, ServiceError> {
     std::fs::create_dir_all(runs_dir)?;
     let lock_path = runs_dir.join(".service.lock");
     let file = open_lock_file(&lock_path)?;
     match file.try_lock_shared() {
-        Ok(()) => Ok(file),
+        Ok(()) => Ok(RunStoreLock(file)),
         Err(std::fs::TryLockError::WouldBlock) => Err(ServiceError::Invalid(format!(
             "runs directory `{runs_dir}` is exclusively owned by another qcg service"
         ))),
@@ -207,13 +224,11 @@ impl Drop for RunAdmissionLock {
     }
 }
 
-/// Number of run-coordination shards. Power of two so the index is a
-/// bitmask; each independent lock namespace has a fixed file count.
+/// Fixed shard count; power of two for the index bitmask.
 pub(crate) const RUN_COORDINATION_SHARD_COUNT: usize = 64;
 
-/// Maps a run id to its coordination shard (FNV-1a, 64-bit, same family as
-/// the workspace patch shards). Distinct spellings of one id share one shard
-/// because the id itself (the directory name) is hashed, never a path.
+/// FNV-1a maps each run-id directory name to one of the fixed shards;
+/// the directory name is hashed, never a path.
 fn run_coordination_shard_index(run_id: &str) -> usize {
     let mut hash: u64 = 0xcbf29ce484222325;
     for byte in run_id.as_bytes() {
@@ -223,14 +238,9 @@ fn run_coordination_shard_index(run_id: &str) -> usize {
     (hash as usize) & (RUN_COORDINATION_SHARD_COUNT - 1)
 }
 
-/// Whether a runs-directory entry is store coordination/metadata rather
-/// than a run directory (G03): hidden entries (`.service.lock`,
-/// `.maintenance.lock`, legacy `.admission-*.lock`, `.admission-shards/`,
-/// `.handoff-shards/`)
-/// and the `idempotency` bookkeeping directory. Scans skip these WITHOUT
-/// counting them toward `max_scan_entries`, so lifetime admissions can
-/// never exhaust the recovery budget. Mirrors the shutdown orphan pass,
-/// which already skips `idempotency` and dotfiles.
+/// Coordination metadata (`.service.lock`, other hidden entries and
+/// `idempotency`) is excluded from scans and scan budgets, including shutdown
+/// orphan scanning. This keeps fixed shards and lifetime admissions bounded.
 pub(crate) fn is_store_coordination_name(name: &str) -> bool {
     name.starts_with('.') || name == "idempotency"
 }
@@ -281,11 +291,7 @@ pub(crate) struct RunHandoffLock(File);
 
 impl Drop for RunHandoffLock {
     fn drop(&mut self) {
-        // A fork may retain the descriptor until exec; close alone is not
-        // sufficient to release ownership at the end of this handoff.
-        if let Err(error) = self.0.unlock() {
-            tracing::warn!(%error, "failed to unlock run handoff lease");
-        }
+        unlock_advisory_file(&self.0, "run handoff");
     }
 }
 
@@ -314,8 +320,7 @@ pub(crate) async fn lock_run_handoff(
 }
 
 fn try_lock_run_shard(run_dir: &Utf8Path, directory: &str) -> Result<Option<File>, ServiceError> {
-    // Never unlink locked files: a fresh inode would split ownership.
-    // Both independent namespaces use the same fixed-size shard mapping.
+    // Open the stable shard; never unlink it or split ownership.
     let runs_dir = run_dir
         .parent()
         .ok_or_else(|| ServiceError::Invalid(format!("run directory `{run_dir}` has no parent")))?;
@@ -369,9 +374,7 @@ pub(crate) struct RunExecutionLock(File);
 
 impl Drop for RunExecutionLock {
     fn drop(&mut self) {
-        if let Err(error) = self.0.unlock() {
-            tracing::warn!(%error, "failed to unlock run execution lease");
-        }
+        unlock_advisory_file(&self.0, "run execution");
     }
 }
 
@@ -484,9 +487,7 @@ pub struct StoreMaintenanceLock(File);
 
 impl Drop for StoreMaintenanceLock {
     fn drop(&mut self) {
-        if let Err(error) = self.0.unlock() {
-            tracing::warn!(%error, "failed to unlock run store maintenance lease");
-        }
+        unlock_advisory_file(&self.0, "run store maintenance");
     }
 }
 
@@ -2768,6 +2769,25 @@ mod tests {
         drop(next);
         assert!(try_lock_store_maintenance(&root).unwrap().is_some());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_store_lock_release_does_not_wait_for_inherited_descriptors() {
+        let root = temp_root("service-store-lock-inheritance");
+        let _temp_guard = TempGuard(root.clone());
+        let runs = root.join("runs");
+        let owner = lock_runs_directory(&runs).unwrap();
+        // dup shares the open file description just as fork does before exec
+        // closes CLOEXEC descriptors in a concurrently spawning command.
+        let inherited = owner.0.try_clone().unwrap();
+        assert!(lock_runs_directory_shared(&runs).is_err());
+        drop(owner);
+        let next = lock_runs_directory_shared(&runs).unwrap();
+        drop(inherited);
+        assert!(lock_runs_directory(&runs).is_err());
+        drop(next);
+        lock_runs_directory(&runs).unwrap();
     }
 
     #[test]
