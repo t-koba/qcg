@@ -1943,11 +1943,13 @@ command_timeout_seconds = 300"#,
             .state,
         RunStatus::Running
     );
+    // The durable fail-closed Started operation is rejected at re-entry
+    // before the preempted run can wait as a queue member.
     assert_eq!(
-        wait_for_snapshot(&service, &running, RunStatus::Queued)
+        wait_for_snapshot(&service, &running, RunStatus::Failed)
             .await
             .state,
-        RunStatus::Queued
+        RunStatus::Failed
     );
     let snapshot = service
         .snapshot(queued_equal.clone())
@@ -1958,10 +1960,24 @@ command_timeout_seconds = 300"#,
         .snapshot(running.clone())
         .await
         .expect("preempted snapshot should load");
-    assert_eq!(snapshot.queue_position, Some(2));
+    assert_eq!(snapshot.state, RunStatus::Failed);
+    assert_eq!(snapshot.queue_position, None);
     // The preempted writer must have exited before the requeue append:
     // seqs stay unique and monotonic across the handoff.
     let journal = read_journal_string(&service, running.clone()).await;
+    let journal_events: Vec<Value> = journal
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("journal event should be JSON"))
+        .collect();
+    assert_eq!(
+        journal_events
+            .iter()
+            .filter(|event| event["t"] == "operation_started")
+            .count(),
+        1,
+        "the interrupted command must not be replayed"
+    );
+    assert!(journal.contains("remains Started"), "{journal}");
     let seqs: Vec<u64> = journal
         .lines()
         .map(|line| {
@@ -2007,9 +2023,7 @@ command_timeout_seconds = 300"#,
         RunStatus::Failed
     );
     assert!(
-        read_journal_string(&service, running.clone())
-            .await
-            .contains("indeterminate result after interruption"),
+        journal.contains("remains Started"),
         "an external command must never be blindly replayed after preemption"
     );
     drop(service);

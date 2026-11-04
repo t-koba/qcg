@@ -214,10 +214,19 @@ async fn bounded_scheduler_comparison_boundary_safety_and_interrupt_latency() {
                 );
             } else {
                 assert_eq!(victim_state, RunStatus::Failed);
-                assert!(
-                    read_journal_string(&service, victim.clone())
-                        .await
-                        .contains("indeterminate result after interruption")
+                let journal = read_journal_string(&service, victim.clone()).await;
+                assert!(journal.contains("remains Started"), "{journal}");
+                let events: Vec<serde_json::Value> = journal
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| event["t"] == "operation_started")
+                        .count(),
+                    1,
+                    "an interrupted fail-closed command is not replayed"
                 );
             }
             let values =
@@ -264,7 +273,9 @@ async fn bounded_scheduler_comparison_boundary_safety_and_interrupt_latency() {
                     "urgent execution's preempted wait must not be charged"
                 );
 
-                // Ordinary cancel closes survive interrupt's canceled-suffix truncation.
+                // Boundary yielding resumes a second execution episode;
+                // interrupt preemption with a Started operation is refused
+                // before a second episode can start.
                 let closes: Vec<_> = values
                     .iter()
                     .enumerate()
@@ -272,10 +283,12 @@ async fn bounded_scheduler_comparison_boundary_safety_and_interrupt_latency() {
                         e["t"] == "elapsed_accounted" && e["active_started_at"].is_null()
                     })
                     .collect();
-                assert!(
-                    closes.len() >= 2,
-                    "identity initializes the ledger; two execution episodes close"
-                );
+                let expected_closes = if mode == PreemptionMode::StepBoundary {
+                    2
+                } else {
+                    1
+                };
+                assert_eq!(closes.len(), expected_closes);
             }
             service.shutdown_active_runs().await.unwrap();
         }
