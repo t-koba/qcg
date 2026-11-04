@@ -8,6 +8,7 @@ pub struct RunSummary {
     pub invalidation: Option<api::RunInvalidation>,
     pub run_id: String,
     pub status: String,
+    pub direct_owner: Option<&'static str>,
     pub generator: String,
     pub generator_path: String,
     pub contract_sha256: String,
@@ -19,11 +20,20 @@ pub struct RunSummary {
 }
 
 impl RunSummary {
+    pub fn direct_run_hint(&self) -> Option<String> {
+        self.direct_owner.map(|owner| match owner {
+            "active" => "direct owner active; wait for the original invocation to exit".into(),
+            _ => format!("direct owner inactive; not service-resumable: repeat the original qcg run command with the same generator/output and --answer or --confirm, or discard a paused run with qcg runs delete {}", self.run_id),
+        })
+    }
+
     pub fn to_json(&self) -> Value {
         json!({
             "run_id": self.run_id,
             "invalidation": self.invalidation,
             "status": self.status,
+            "direct_owner": self.direct_owner,
+            "recovery": self.direct_run_hint(),
             "generator": self.generator,
             "generator_path": self.generator_path,
             "contract_sha256": self.contract_sha256,

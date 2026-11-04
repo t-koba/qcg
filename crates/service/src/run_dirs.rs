@@ -120,6 +120,20 @@ pub(crate) fn direct_run_id(workspace: &Utf8Path) -> String {
     format!("direct-{digest}")
 }
 
+/// Direct CLI journals are owned only by their original invocation, never
+/// adopted by the service scheduler. A missing package alone is not enough:
+/// malformed or legacy service admissions must still fail closed.
+pub(crate) fn is_direct_run(run_dir: &Utf8Path, state: &engine::RunState) -> bool {
+    let Some(id) = run_dir.file_name() else {
+        return false;
+    };
+    state.package_sha256.is_none()
+        && state.run_id.as_deref() == Some(id)
+        && id.strip_prefix("direct-").is_some_and(|digest| {
+            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+}
+
 pub(crate) fn is_regular_directory(path: &Utf8Path) -> Result<bool, ServiceError> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => Ok(metadata.file_type().is_dir()),
@@ -2451,20 +2465,15 @@ pub(crate) fn has_pending_cancel_control(run_dir: &Utf8Path) -> bool {
     }
 }
 
-pub(crate) fn lock_direct_run(metadata_dir: &Utf8Path) -> Result<File, ServiceError> {
-    std::fs::create_dir_all(metadata_dir)?;
-    let lock_path = metadata_dir.join(".run.lock");
-    let file = open_lock_file(&lock_path)?;
-    match file.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => {
-            return Err(ServiceError::Invalid(format!(
-                "output metadata `{metadata_dir}` is already active in another qcg run"
-            )));
-        }
-        Err(std::fs::TryLockError::Error(error)) => return Err(ServiceError::Io(error)),
-    }
-    Ok(file)
+/// Direct and service executions use the same lease, including retention and
+/// deletion. Admission fences creation against removal of the lock directory.
+pub(crate) fn lock_direct_run(metadata_dir: &Utf8Path) -> Result<RunExecutionLock, ServiceError> {
+    let run_dir = metadata_dir.parent().expect("direct metadata has a parent");
+    try_lock_run_execution(run_dir)?.ok_or_else(|| {
+        ServiceError::Invalid(format!(
+            "output metadata `{metadata_dir}` is already active in another qcg run"
+        ))
+    })
 }
 
 pub fn direct_run_meta_dir(workspace: &Utf8Path) -> Utf8PathBuf {

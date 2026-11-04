@@ -32,6 +32,14 @@ JSON event output go to stdout.
   confirmations pause or fail the run instead of prompting, so pre-provision
   them with `--answer` and `--confirm` (or `--confirmations-file`, a JSON
   id-to-boolean map); use only for a reviewed contract.
+  Direct runs use `direct-<digest>` journal IDs derived from the output path.
+  Their journals live under `<output-parent>/.data/runs`;
+  they are not service-owned runs and are never scheduled by service recovery.
+  To continue a paused run, repeat the original command with the same generator,
+  inputs, and exact `--output` path, adding `--answer` or `--confirm` with the
+  full interaction ID reported by the run. Contract/resource changes or an
+  indeterminate operation can prevent safe continuation; the refusal explains
+  the cause. A paused journal can instead be discarded with `runs delete`.
   `--plan` prints the execution plan (steps with `needs`, `on_deps`, full `when`,
   `output`, `parallel` membership, permissions, declared outputs,
   pre-provision coverage, plus read-only `ids` with `questions` and
@@ -147,6 +155,11 @@ JSON event output go to stdout.
 ## Run commands
 
 - `qcg runs list [--runs-dir dir] [--state <s>] [--generator <id>]`
+  and `runs show` retain the journal's nonterminal status for direct runs.
+  They also report whether a direct execution owner is active or inactive and
+  show continuation/discard guidance (`direct_owner` and `recovery` in show
+  JSON). Inactive ownership is an observation, not a terminal outcome: even a
+  dead owner's journal can still say `running`. It is not a service queue entry.
 - `qcg runs show <id> [--runs-dir dir] [--json] [--diagnose]` prints status, inputs,
   artifacts, and cost metrics (tokens in/out/cached, LLM calls, microUSD with
   a USD estimate, duration). `--diagnose` bundles journal failure signals
@@ -190,8 +203,14 @@ JSON event output go to stdout.
   `list`, and JSON summaries expose invalidation; `export` includes it in the
   bundle snapshot. There is no un-invalidate. See [operations](operations.md#run-invalidation).
 - `qcg runs delete <id> [--runs-dir dir] [--json]` deletes a terminal run
-  directory. Active runs are rejected; cancel first. A repeated delete
-  reports not-found.
+  directory, or discards an inactive direct run paused for input/confirmation.
+  It refuses a still-active direct execution owner, including one in another
+  process. Nonterminal service runs must be canceled and settled first;
+  direct execution interrupted outside a settled pause must recover safely
+  before deletion. Discard removes journal metadata, not the direct output
+  directory, and does not clean up orphaned external processes or containers.
+  Use `--runs-dir` for the journal's actual store when the output's parent is
+  not the current directory. A repeated delete reports not-found.
 - `qcg runs export <id> [--runs-dir dir] [--output bundle.zip]` writes a
   self-contained run bundle (snapshot, inputs, journal, outputs, verified
   artifacts).

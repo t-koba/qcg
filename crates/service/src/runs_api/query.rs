@@ -24,8 +24,8 @@ fn step_summaries_from_nodes(
 }
 
 impl LocalService {
-    /// Delete a terminal run directory. Active runs are rejected so deletion
-    /// never interrupts execution; cancel first. Missing runs are an error.
+    /// Delete a terminal run or discard an inactive direct CLI journal.
+    /// Live owners are rejected. Missing runs are an error.
     /// A repeated delete after success reports not-found; list first when
     /// retrying unattended cleanup.
     pub async fn delete_run(&self, id: &str) -> Result<(), ApiError> {
@@ -74,7 +74,7 @@ impl LocalService {
         if _execution_lease.is_none() {
             return Err(ApiError::Conflict {
                 detail: format!(
-                    "run `{id}` is executing elsewhere; cancel and wait for settlement before deletion"
+                    "run `{id}` is executing elsewhere; wait for its owner to exit or cancel and wait for settlement before deletion"
                 ),
             });
         }
@@ -90,10 +90,18 @@ impl LocalService {
             .await
             .get(id)
             .is_some_and(|record| crate::types::task_slot_is_live(&record.task));
-        let terminal = !live_task && self.authoritative_state(&run_dir).await?.terminal.is_some();
-        if !terminal {
+        let state = self.authoritative_state(&run_dir).await?;
+        let direct = crate::run_dirs::is_direct_run(&run_dir, &state);
+        if live_task || (state.terminal.is_none() && !(direct && state.settled_pending().is_some()))
+        {
             return Err(ApiError::Conflict {
-                detail: format!("run `{id}` is still active; cancel it before deletion"),
+                detail: if direct {
+                    format!(
+                        "run `{id}` has unsettled direct execution; repeat the original qcg run command to recover safely before deletion"
+                    )
+                } else {
+                    format!("run `{id}` is still active; cancel it before deletion")
+                },
             });
         }
         self.inner.runs.write().await.remove(id);

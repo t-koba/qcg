@@ -29,7 +29,7 @@ pub(crate) fn list_runs(
             continue;
         }
         println!(
-            "{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}",
             summary.run_id,
             summary.status,
             summary.generator,
@@ -41,7 +41,8 @@ pub(crate) fn list_runs(
                     "invalidated: {} ({} at {})",
                     r.reason, r.actor_label, r.invalidated_at
                 ))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            summary.direct_run_hint().unwrap_or_default()
         );
     }
     Ok(())
@@ -72,6 +73,9 @@ pub(crate) fn show_run(
     }
     println!("run: {id}");
     println!("status: {}", summary.status);
+    if let Some(hint) = summary.direct_run_hint() {
+        println!("{hint}");
+    }
     if let Some(record) = &summary.invalidation {
         println!(
             "invalidated: {} ({} at {})",

@@ -1761,7 +1761,15 @@ impl LocalService {
         let runtime = Arc::clone(&self.inner.llm_runtime);
         let run_id = direct_run_id(&run.output_dir);
         let metadata_dir = direct_run_meta_dir(&run.output_dir);
+        let run_dir = metadata_dir.parent().expect("direct metadata has a parent");
+        let admission = crate::run_dirs::lock_run_admission(run_dir, &self.inner.shutdown)
+            .await
+            .map_err(api_internal)?
+            .ok_or_else(|| ApiError::Unavailable {
+                detail: "server is shutting down".into(),
+            })?;
         let _run_lock = lock_direct_run(&metadata_dir).map_err(api_internal)?;
+        drop(admission);
         let run_refs = crate::run_refs::load_or_resolve_run_refs(
             &self.inner.runs_dir,
             &contract,
@@ -1773,10 +1781,7 @@ impl LocalService {
         // Priority 0, FIFO by admission; removed on completion.
         let (events, mut receiver) =
             broadcast::channel(self.inner.deployment_policy.live_event_channel_capacity);
-        let ephemeral_dir = metadata_dir
-            .parent()
-            .map(|parent| parent.to_owned())
-            .unwrap_or_else(|| metadata_dir.clone());
+        let ephemeral_dir = run_dir.to_owned();
         {
             let mut runs = self.inner.runs.write().await;
             // A stale ephemeral from a crashed direct run must not block.
@@ -1896,7 +1901,10 @@ impl LocalService {
             Err(error) => {
                 self.remove_ephemeral_now(&run_id).await;
                 std::mem::forget(_ephemeral_guard);
-                return Err(api_internal(error));
+                return Err(api_internal(format!(
+                    "{error}; repeat the original qcg run command with the same generator/output and --answer or --confirm to continue if safe; a paused run can instead be discarded with qcg runs delete {run_id} --runs-dir {:?}",
+                    run_dir.parent().expect("direct run has a store").as_str()
+                )));
             }
         };
         let collected = match mode {

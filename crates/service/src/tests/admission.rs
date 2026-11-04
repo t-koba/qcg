@@ -577,7 +577,7 @@ command = ["sh", "-c", "sleep 1"]"#,
         let run = direct_run();
         async move { service.run_generator_path(run).await }
     });
-    let lock_path = direct_run_meta_dir(&output).join(".run.lock");
+    let lock_path = direct_run_meta_dir(&output).join("execution.lock");
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             if let Ok(probe) = OpenOptions::new().read(true).write(true).open(&lock_path) {
@@ -594,6 +594,18 @@ command = ["sh", "-c", "sleep 1"]"#,
     })
     .await
     .expect("first direct run should acquire its output lock");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !direct_run_meta_dir(&output).join("journal.jsonl").exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the direct owner should create its journal");
+    let delete_error = service
+        .delete_run(&direct_run_id(&output))
+        .await
+        .unwrap_err();
+    assert!(delete_error.to_string().contains("executing elsewhere"));
     let error = service
         .run_generator_path(direct_run())
         .await

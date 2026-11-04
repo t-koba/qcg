@@ -209,6 +209,9 @@ fn rehydrate_run(
     for event in &journal_values {
         RunEvent::from_flat(event).map_err(ServiceError::Invalid)?;
     }
+    if crate::run_dirs::is_direct_run(run_dir, &state) {
+        return Ok(None);
+    }
     *nonterminal_runs = nonterminal_runs.saturating_add(1);
     let run_id = run_dir
         .file_name()

@@ -139,6 +139,18 @@ pub(crate) fn run_summary_from_state(
             .ok_or_else(|| ServiceError::Invalid("run directory has no file name".into()))?
             .to_string(),
         status: status.to_string(),
+        direct_owner: if state.terminal.is_none() && crate::run_dirs::is_direct_run(run_dir, state)
+        {
+            Some(
+                if crate::run_dirs::try_lock_existing_run_execution(run_dir)?.is_some() {
+                    "inactive"
+                } else {
+                    "active"
+                },
+            )
+        } else {
+            None
+        },
         generator: started.generator.clone(),
         generator_path: started.generator_path.clone(),
         contract_sha256: started.contract_sha256.clone(),
