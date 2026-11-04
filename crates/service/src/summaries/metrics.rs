@@ -263,13 +263,13 @@ mod tests {
 
     #[tokio::test]
     async fn resumed_history_does_not_end_a_live_poll() {
-        use std::io::Write;
         let directory = Utf8PathBuf::from_path_buf(
             std::env::temp_dir().join(format!("poll-resumed-{}", uuid::Uuid::now_v7())),
         )
         .unwrap();
         std::fs::create_dir_all(run_meta_dir(&directory)).unwrap();
         let path = run_meta_dir(&directory).join("journal.jsonl");
+        std::fs::File::create(engine::journal_lock_path(&path)).unwrap();
         let record = |seq, kind| {
             let mut value = serde_json::json!({
                 "seq": seq, "run_id": "resumed", "t": kind,
@@ -278,9 +278,6 @@ mod tests {
             });
             if kind == "run_interrupted" {
                 value["reason"] = serde_json::json!({"code":"interrupted", "message":"test"});
-            } else if kind == "run_finished" {
-                value["status"] = serde_json::json!("success");
-                value["metrics"] = serde_json::to_value(model::RunMetrics::default()).unwrap();
             }
             format!("{}\n", value)
         };
@@ -302,11 +299,18 @@ mod tests {
                 .await
                 .is_err()
         );
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap();
-        write!(file, "{}", record(3, "run_finished")).unwrap();
+        engine::JournalWriter::append_single_event(
+            &path,
+            "resumed",
+            "run_finished",
+            serde_json::json!({
+                "status": "success",
+                "metrics": model::RunMetrics::default(),
+            }),
+            JournalLimits::default(),
+            None,
+        )
+        .unwrap();
         let event = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
             .await
             .unwrap()
