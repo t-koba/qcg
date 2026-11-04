@@ -1311,6 +1311,7 @@ mod tests {
             replay_through: 0,
             replayed_steps: Arc::new(std::collections::BTreeMap::new()),
             checkpoint_accounting: Arc::new(Mutex::new(CheckpointAccounting::default())),
+            host_cgroup: None,
         };
         (dir, metadata, ctx, node)
     }

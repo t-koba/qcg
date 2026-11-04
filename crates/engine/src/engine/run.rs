@@ -454,6 +454,15 @@ impl Engine {
                 ))
             })?;
         std::fs::create_dir_all(&metadata_dir)?;
+        // Host-cgroup crash recovery: read the optional delegation before any
+        // host launch. Invalid configuration fails here, before journal use.
+        // Reconciliation runs under the caller's execution lease before the
+        // `Started` gate, using the persisted binding even when the current
+        // configuration was removed (a changed nonempty parent is refused).
+        let host_config = crate::host_cgroup::host_cgroup_config_from_env()
+            .map_err(|error| EngineError::Failed(error.to_string()))?;
+        crate::host_cgroup::reconcile_host_cgroup(&metadata_dir, &host_config, &requested_run_id)
+            .map_err(|error| EngineError::Failed(error.to_string()))?;
         let journal = JournalWriter::create_with_policies(
             &metadata_dir.join("journal.jsonl"),
             &requested_run_id,
@@ -485,6 +494,12 @@ impl Engine {
                 contract.sha256
             )));
         }
+        // Durably bind one unique per-run-execution root before any host
+        // command or MCP stdio startup. MCP connection can precede its
+        // `operation_started` record, so the binding cannot wait for the
+        // operation guard.
+        let host_scope = crate::host_cgroup::bind_host_cgroup(&host_config, &metadata_dir, &run_id)
+            .map_err(|error| EngineError::Failed(error.to_string()))?;
         let mode = if replay.state.budget.started_at.is_some() {
             replay.state.budget.elapsed_budget_mode
         } else {
@@ -575,7 +590,8 @@ impl Engine {
                 // static wildcards to match those run-private absolutes while
                 // all other absolutes still fail closed.
                 .with_extra_allowed_root(metadata_dir.clone())
-                .with_cancellation(options.cancellation.clone()),
+                .with_cancellation(options.cancellation.clone())
+                .with_host_cgroup(host_scope.clone()),
             http: HttpGateway::new(
                 contract.manifest.permissions.clone(),
                 std::time::Duration::from_secs(contract.manifest.runtime.http_timeout_seconds),
@@ -598,6 +614,7 @@ impl Engine {
             replay_through: replay.state.last_seq,
             replayed_steps: Arc::new(replay.steps.clone()),
             checkpoint_accounting: Arc::new(Mutex::new(CheckpointAccounting::default())),
+            host_cgroup: host_scope.clone(),
             contract,
             workspace,
             metadata: metadata_dir.clone(),
@@ -1427,6 +1444,16 @@ impl Engine {
         journal.event("run_finished", json!({ "status": "success" }))?;
         Ok(outputs)
         }.await;
+        // Bounded normal retirement: clean only this run's tree. Failures
+        // preserve the binding for the next reconciliation and are returned
+        // visibly rather than treating a generated artifact as cleanup proof.
+        if let Some(scope) = host_scope.as_ref() {
+            crate::host_cgroup::retire_host_scope(&metadata_dir, scope).map_err(|error| {
+                EngineError::Failed(format!(
+                    "host-cgroup retirement failed; binding retained: {error}"
+                ))
+            })?;
+        }
         super::elapsed::close(&mut episode, &journal)?;
         result
     }

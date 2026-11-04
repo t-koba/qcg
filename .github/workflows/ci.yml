@@ -245,3 +245,43 @@ jobs:
 
       - name: Cargo machete (unused dependencies)
         run: cargo machete
+
+  # Linux-only crash-recovery proof for trusted-host cgroups. Provisions a
+  # writable delegated subtree (operator-confirmed systemd delegation) and
+  # runs the host_cgroup tests inside it. Tests that need no delegation run
+  # everywhere; delegation-gated tests skip without it and run here.
+  host-cgroup:
+    name: Host cgroup recovery (Linux delegation)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      # Cache restore is optional: populate the locked Linux dependencies even
+      # on a clean runner, before the delegated tests enforce offline execution.
+      - name: Fetch locked Linux dependencies
+        run: cargo fetch --locked --target x86_64-unknown-linux-gnu
+
+      - name: Provision delegated cgroup and run host_cgroup tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          # No manual migration or shared-root controller changes. systemd owns
+          # the unit boundary and delegates it to the runner UID, not root.
+          sudo systemd-run --wait --pipe --collect \
+            --unit="qcg-cgroup-test-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --property=Delegate=yes --property="User=$(id -un)" \
+            --property="Group=$(id -gn)" --working-directory="$PWD" \
+            --setenv="HOME=$HOME" --setenv="PATH=$PATH" \
+            --setenv="CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+            /bin/bash scripts/test-host-cgroup.sh

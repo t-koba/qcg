@@ -126,6 +126,20 @@ pub fn gc_run_directories(
             let Some(execution) = crate::run_dirs::try_lock_existing_run_execution(&path)? else {
                 return Ok(None);
             };
+            // Reconcile host cgroups under the run leases before the `Started` gate;
+            // failures preserve evidence, and previews must remain read-only.
+            if delete {
+                let config = engine::host_cgroup::host_cgroup_config_from_env()
+                    .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+                let meta = run_meta_dir(&path);
+                engine::host_cgroup::reconcile_host_cgroup(
+                    &meta,
+                    &config,
+                    path.file_name()
+                        .ok_or_else(|| ServiceError::Invalid("run directory lacks id".into()))?,
+                )
+                .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+            }
             let (summary, state) = run_summary_core_with_state(&path)?;
             state
                 .ensure_no_inflight_operations()

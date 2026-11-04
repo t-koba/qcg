@@ -35,6 +35,9 @@ pub struct CmdGateway {
     /// other per-run directories, never to the host.
     extra_allowed_roots: Vec<Utf8PathBuf>,
     cancellation: CancellationToken,
+    /// Run-scoped cgroup-v2 cleanup scope when crash recovery is enabled.
+    /// `None` preserves existing live cancellation with no crash claim.
+    host_cgroup: Option<policy::HostCgroupScope>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -61,6 +64,7 @@ impl CmdGateway {
             workspace,
             extra_allowed_roots: Vec::new(),
             cancellation: CancellationToken::new(),
+            host_cgroup: None,
         }
     }
 
@@ -84,6 +88,18 @@ impl CmdGateway {
     pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
         self.cancellation = cancellation;
         self
+    }
+
+    /// Attaches the run-scoped cgroup cleanup scope. `None` keeps the
+    /// existing live process-group behavior with no crash-cleanup claim.
+    pub fn with_host_cgroup(mut self, scope: Option<policy::HostCgroupScope>) -> Self {
+        self.host_cgroup = scope;
+        self
+    }
+
+    /// Current run-scoped cgroup scope, if any.
+    pub fn host_cgroup(&self) -> Option<&policy::HostCgroupScope> {
+        self.host_cgroup.as_ref()
     }
 
     pub async fn run(&self, argv: &[String]) -> Result<CommandOutput, GatewayError> {
@@ -119,11 +135,12 @@ impl CmdGateway {
             }
         })? {
             CommandIsolation::TrustedHost => {
-                self.run_trusted_process_with_stdin(
+                self.run_host_process(
                     argv,
                     timeout_seconds,
                     output_limit_bytes,
                     stdin,
+                    self.host_cgroup.as_ref(),
                 )
                 .await
             }
@@ -229,11 +246,14 @@ impl CmdGateway {
                 };
                 let guard = SessionGuard::new(session.clone());
                 let result = self
-                    .run_trusted_process_with_stdin(
+                    // Runtime clients are not host payloads; daemon lifecycle
+                    // stays under the existing container owner, never this scope.
+                    .run_host_process(
                         &container_argv,
                         timeout_seconds,
                         output_limit_bytes,
                         spec.stdin,
+                        None,
                     )
                     .await;
                 // Awaited cleanup on every exit path; `--rm` normally removes
@@ -305,11 +325,14 @@ impl CmdGateway {
                     }
                 };
                 let result = self
-                    .run_trusted_process_with_stdin(
+                    // Runtime clients are not host payloads; daemon lifecycle
+                    // stays under the existing container owner, never this scope.
+                    .run_host_process(
                         &container_argv,
                         timeout_seconds,
                         output_limit_bytes,
                         spec.stdin,
+                        None,
                     )
                     .await;
                 if let Err(error) = teardown(&provisioned).await {
@@ -342,6 +365,24 @@ impl CmdGateway {
         output_limit_bytes: Option<usize>,
         stdin_bytes: Option<&[u8]>,
     ) -> Result<CommandOutput, GatewayError> {
+        self.run_host_process(
+            argv,
+            timeout_seconds,
+            output_limit_bytes,
+            stdin_bytes,
+            self.host_cgroup.as_ref(),
+        )
+        .await
+    }
+
+    async fn run_host_process(
+        &self,
+        argv: &[String],
+        timeout_seconds: u64,
+        output_limit_bytes: Option<usize>,
+        stdin_bytes: Option<&[u8]>,
+        scope: Option<&policy::HostCgroupScope>,
+    ) -> Result<CommandOutput, GatewayError> {
         let (bin, args) = argv.split_first().ok_or(GatewayError::EmptyCommand)?;
         if self
             .bounds
@@ -367,6 +408,13 @@ impl CmdGateway {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         configure_process_group(&mut command);
+        // Race-free cgroup self-placement before payload execution. Fails
+        // before launch when the delegation is invalid; `None` keeps the
+        // existing live process-group behavior with no crash claim.
+        if let Some(scope) = scope {
+            crate::host_cgroup::apply_scope_to_tokio_command(&mut command, Some(scope))
+                .map_err(|error| GatewayError::Io(std::io::Error::other(error.to_string())))?;
+        }
         let mut child = command.spawn()?;
         let mut process_tree = ProcessTreeGuard::attach(&child)?;
         let pid = child.id();
@@ -765,7 +813,14 @@ mod daemon_policy_tests {
             permissions,
             Utf8PathBuf::from_path_buf(daemon.root.clone()).unwrap(),
         )
-        .with_container_timeouts(policy::ContainerTimeouts::from_seconds([30, 30, 30, 1]).unwrap());
+        .with_container_timeouts(policy::ContainerTimeouts::from_seconds([30, 30, 30, 1]).unwrap())
+        .with_host_cgroup(Some(policy::HostCgroupScope {
+            delegated_parent: "/sys/fs/cgroup/missing".into(),
+            run_root: "/sys/fs/cgroup/missing/invalid".into(),
+            run_id: "container-client".into(),
+            nonce: "invalid".into(),
+            boot_id: "boot".into(),
+        }));
         let image = format!("images:alpine@sha256:{}", "a".repeat(64));
         let argv = vec!["echo".to_string()];
         // Only the target budget is short: a slow preceding command must not
@@ -828,6 +883,7 @@ mod daemon_policy_tests {
         let mut permissions = Permissions::default();
         permissions.containers.runtime = Some(contract::ContainerRuntime::Docker);
         let docker = CmdGateway::new(permissions, gateway.workspace.clone())
+            .with_host_cgroup(gateway.host_cgroup.clone())
             .with_container_timeouts(policy::ContainerTimeouts::from_seconds([1; 4]).unwrap());
         daemon.mode("docker-workload");
         let start = std::time::Instant::now();

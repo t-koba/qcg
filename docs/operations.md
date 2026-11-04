@@ -83,6 +83,29 @@ run this cleanup or guarantee a terminal journal event. A trusted-host command
 or MCP stdio process may also outlive qcg; see [host-process crash-recovery
 limits](host-process-crash-recovery.md).
 
+## Host-process crash containment configuration
+
+Linux cgroup-v2 crash recovery for `trusted_host` commands and host MCP stdio
+is opt-in via `QCG_HOST_CGROUP_PARENT`, the already-delegated parent beneath
+`/sys/fs/cgroup` (for example `/sys/fs/cgroup/qcg.slice`). Unset or blank is
+the default: launches keep their existing live process-group cancellation
+with no crash-cleanup claim. A present-but-invalid value fails before any
+host launch. The parent must already be delegated to the qcg user with
+writable `cgroup.procs`, readable occupancy, and usable per-run `cgroup.kill`;
+no controllers or writable `cgroup.subtree_control` are required; qcg never creates,
+chowns, or sudoes beneath a shared root at runtime. When enabled, each run
+execution binds a unique `qcg-<run>-<nonce>` root recorded in
+`meta/host-cgroup.json`, children self-place before payload execution, and
+reconciliation under the execution lease precedes `Started` replay/refusal,
+recovery, deletion, and retention GC, killing the whole root via
+`cgroup.kill` and confirming `populated 0`. A changed nonempty configured parent
+refuses reconciliation; unset still uses persisted identity. Trusted host execution is not a
+hostile-code sandbox; use containers for untrusted code. The
+`Started`-operation gate retains unresolved evidence, not a complete process
+inventory. See [host-process crash-recovery limits](host-process-crash-recovery.md)
+for the full boundary. Container daemon timeout settings below do not enable
+host process cleanup.
+
 ## Container daemon operation policy
 
 Container daemon budgets are deployment policy, shared by engine command

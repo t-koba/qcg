@@ -1397,3 +1397,31 @@ fn command_permission_matches_exact_and_wildcard_argv() {
         &argv(&["git", "status"])
     ));
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn host_cgroup_applies_to_all_trusted_host_payload_launch_paths() {
+    let scope = policy::HostCgroupScope {
+        delegated_parent: "/sys/fs/cgroup/missing".into(),
+        run_root: "/sys/fs/cgroup/missing/invalid".into(),
+        run_id: "run".into(),
+        nonce: "invalid".into(),
+        boot_id: "boot".into(),
+    };
+    let mut permissions = Permissions::default();
+    permissions.commands.push(CommandPermission {
+        bin: "/bin/echo".into(),
+        args: vec!["ok".into()],
+        purpose: "host scope test".into(),
+        isolation: Some(CommandIsolation::TrustedHost),
+        image: None,
+    });
+    let gateway = CmdGateway::new(permissions, camino::Utf8PathBuf::from("/tmp"))
+        .with_host_cgroup(Some(scope));
+    let argv = vec!["/bin/echo".into(), "ok".into()];
+    // Trusted-host callers that already checked their operation policy (the
+    // engine spawn API and bundled tools) must not bypass scope placement.
+    assert!(gateway.run_trusted_process(&argv, 2, None).await.is_err());
+    // Explicitly authorized trusted-host payloads must use it (and fail closed).
+    assert!(gateway.run(&argv).await.is_err());
+}

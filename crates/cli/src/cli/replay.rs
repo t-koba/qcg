@@ -35,9 +35,8 @@ pub(crate) async fn replay_run(
         json_output,
     } = request;
     let original_dir = resolve_run_dir(&runs_dir, &id)?;
-    engine::RunState::fold_journal(&run_meta_dir(&original_dir).join("journal.jsonl"))?
-        .ensure_no_fail_closed_inflight_operations()
-        .map_err(anyhow::Error::msg)?;
+    let service = crate::local_cli_service(Utf8PathBuf::new(), runs_dir.to_path_buf(), deployment)?;
+    service.reconcile_replay_source(&id).await?;
     let inputs = read_run_inputs(&original_dir)?;
     let replay_seed = if reuse_seed {
         Some(replay_seed_from_journal(&original_dir)?)
@@ -58,7 +57,6 @@ pub(crate) async fn replay_run(
             runs_dir.join(format!("{id}-replay-{timestamp}"))
         }
     };
-    let service = crate::local_cli_service(Utf8PathBuf::new(), runs_dir.to_path_buf(), deployment)?;
     let replay_manifest = service
         .run_generator_path(DirectRun {
             generator_path: generator_path.clone(),

@@ -234,6 +234,7 @@ impl McpAgentTools {
                 .collect(),
             commands: permitted_commands,
             workspace: ctx.run.fs.workspace().as_std_path().to_path_buf(),
+            host_cgroup: ctx.run.host_cgroup.clone(),
         };
 
         let mut joins = tokio::task::JoinSet::new();

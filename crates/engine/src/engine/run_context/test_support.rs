@@ -53,6 +53,7 @@ impl RunContext {
             checkpoint_accounting: Arc::new(Mutex::new(
                 crate::engine::checkpoint::CheckpointAccounting::default(),
             )),
+            host_cgroup: None,
         })
     }
 }

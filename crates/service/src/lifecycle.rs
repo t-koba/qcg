@@ -1358,6 +1358,23 @@ impl LocalService {
             let queue_notify = Arc::clone(&self.inner.queue_notify);
             let handle = tokio::spawn(async move {
                 let _execution_lock = execution_lock;
+                // Host-cgroup reconciliation under the execution lease before
+                // any `Started` replay/refusal. Uses the persisted binding even
+                // when the current delegation was removed (a changed nonempty parent is refused); any
+                // identity ambiguity or cleanup failure blocks re-entry and
+                // preserves the journal.
+                if let Err(error) = (|| {
+                    let config = engine::host_cgroup::host_cgroup_config_from_env()
+                        .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+                    let meta = run_meta_dir(&run_dir);
+                    engine::host_cgroup::reconcile_host_cgroup(&meta, &config, &run_id)
+                        .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+                    Ok::<_, ServiceError>(())
+                })() {
+                    tracing::error!(run_id = %run_id, %error, "host-cgroup reconciliation refused re-entry; journal retained");
+                    service.mark_spawn_failed(&run_id).await;
+                    return;
+                }
                 // Under the lease, journal refusal (not cleanup) before any re-entry.
                 // Fail-closed `Started` operations block; `repeat` passes
                 // through to the existing operation guard on execution.

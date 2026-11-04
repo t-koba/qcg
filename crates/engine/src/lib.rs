@@ -1,6 +1,7 @@
 mod artifact;
 mod engine;
 mod gateway;
+pub mod host_cgroup;
 mod journal;
 mod llm_gateway;
 mod mcp_form;

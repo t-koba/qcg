@@ -9,6 +9,9 @@ pub struct McpAccess {
     pub network_hosts: BTreeSet<String>,
     pub commands: Vec<McpCommandAccess>,
     pub workspace: std::path::PathBuf,
+    /// Run-scoped cgroup-v2 cleanup scope when crash recovery is enabled.
+    /// `None` preserves existing live cancellation with no crash claim.
+    pub host_cgroup: Option<policy::HostCgroupScope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

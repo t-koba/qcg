@@ -429,6 +429,10 @@ command = ["sh", "-c", "sleep 60 & echo $$ $! > pids; wait"]
 
     #[tokio::test]
     async fn sigkill_retains_started_operation_before_restart_or_delete() {
+        let delegated = engine::host_cgroup::host_cgroup_tests_enabled();
+        if !delegated {
+            eprintln!("SKIP live cgroup assertions in CLI SIGKILL: QCG_HOST_CGROUP_PARENT unset");
+        }
         let fixture = Fixture::new("side-effect-confirm");
         std::fs::write(
             fixture.0.join("generator").join(contract::MANIFEST_FILE),
@@ -445,7 +449,7 @@ side_effects = "allowed"
 containers = { enabled = false }
 [[permissions.commands]]
 bin = "sh"
-args = ["-c", "echo $$ > pids; exec sleep 60"]
+args = ["-c", "cat /proc/self/cgroup > membership; echo $$ > pids; exec sleep 60"]
 purpose = "bounded crash fixture"
 isolation = "trusted_host"
 [[flow]]
@@ -458,7 +462,7 @@ output_file = "earlier.txt"
 id = "inflight"
 type = "command"
 [flow.params]
-command = ["sh", "-c", "echo $$ > pids; exec sleep 60"]
+command = ["sh", "-c", "cat /proc/self/cgroup > membership; echo $$ > pids; exec sleep 60"]
 "#,
         )
         .unwrap();
@@ -501,8 +505,31 @@ command = ["sh", "-c", "echo $$ > pids; exec sleep 60"]
             .0
             .run_id;
         let journal = runs.join(&id).join("meta/journal.jsonl");
+        let meta = runs.join(&id).join("meta");
+        let scope = if delegated {
+            let scope = engine::host_cgroup::load_host_binding(&meta)
+                .unwrap()
+                .unwrap()
+                .scope();
+            let membership = std::fs::read_to_string(fixture.0.join("out/membership")).unwrap();
+            assert_eq!(
+                membership.trim(),
+                format!(
+                    "0::{}",
+                    scope
+                        .run_root
+                        .strip_prefix("/sys/fs/cgroup")
+                        .unwrap()
+                        .display()
+                )
+            );
+            Some(scope)
+        } else {
+            None
+        };
         // SIGKILL only qcg. The owned fixture command deliberately stays alive;
-        // Running's drop cleans it, not the product's evidence-retention gate.
+        // Without delegation Running's drop is the fixture backstop; with it,
+        // the next owner must clean the tree before the unchanged Started gate.
         running.child.as_mut().unwrap().kill().unwrap();
         running.child.as_mut().unwrap().wait().unwrap();
         let before = std::fs::read(&journal).unwrap();
@@ -534,6 +561,25 @@ command = ["sh", "-c", "echo $$ > pids; exec sleep 60"]
         );
         assert!(!fixture.0.join("out/earlier.txt").exists());
         assert_eq!(std::fs::read(&journal).unwrap(), before);
+        if let Some(scope) = &scope {
+            assert!(
+                !scope.run_root.exists(),
+                "new qcg owner must reconcile the crashed tree"
+            );
+            assert!(
+                engine::host_cgroup::load_host_binding(&meta)
+                    .unwrap()
+                    .unwrap()
+                    .cleaned
+            );
+            let state = std::fs::read_to_string(format!("/proc/{effect_pid}/stat")).ok();
+            assert!(
+                state.is_none_or(|s| s
+                    .rsplit_once(") ")
+                    .is_some_and(|(_, tail)| tail.starts_with('Z'))),
+                "payload survived recovery"
+            );
+        }
         let replayed = fixture.run(&["runs", "replay", &id, "--output", "replay-out"]);
         assert!(!replayed.status.success());
         assert!(String::from_utf8_lossy(&replayed.stderr).contains(operation));

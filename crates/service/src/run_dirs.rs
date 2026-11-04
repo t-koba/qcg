@@ -1139,6 +1139,16 @@ pub(crate) fn journal_is_empty(path: &Utf8Path) -> std::io::Result<bool> {
 /// damage from the crashed attempt (E03).
 fn wipe_incomplete_run_dir(run_dir: &Utf8Path) -> Result<(), ServiceError> {
     use crate::summaries::run_meta_dir;
+    let binding = engine::host_cgroup::binding_path(&run_meta_dir(run_dir));
+    match std::fs::symlink_metadata(&binding) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+        Ok(_) => {
+            return Err(ServiceError::Invalid(format!(
+                "host-cgroup evidence at `{binding}`; refusing incomplete-admission wipe; reconcile/delete under exclusive ownership"
+            )));
+        }
+    }
     let keep = run_meta_dir(run_dir).join("control");
     // Pin the keep path without following symlinks (E01): `read_dir`
     // follows a symlinked control directory while publish pins O_NOFOLLOW,

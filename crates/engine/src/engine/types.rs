@@ -279,6 +279,9 @@ pub struct RunContext {
     pub fs: FsGateway,
     pub cmd: CmdGateway,
     pub http: HttpGateway,
+    /// Run-scoped cgroup-v2 cleanup scope when enabled. `None` preserves
+    /// existing behavior with no crash-cleanup claim.
+    pub host_cgroup: Option<policy::HostCgroupScope>,
     pub secrets: SecretStore,
     pub interactive: bool,
     pub answers: BTreeMap<String, Value>,

@@ -317,6 +317,7 @@ async fn execute(
                 network_hosts: ["127.0.0.1".to_owned()].into(),
                 commands: Vec::new(),
                 workspace: ctx.run.workspace.as_std_path().to_owned(),
+                host_cgroup: None,
             },
             ctx.run.cancellation.clone(),
         )
@@ -349,6 +350,7 @@ async fn execute_large(
                 network_hosts: ["127.0.0.1".to_owned()].into(),
                 commands: Vec::new(),
                 workspace: ctx.run.workspace.as_std_path().to_owned(),
+                host_cgroup: None,
             },
             ctx.run.cancellation.clone(),
         )

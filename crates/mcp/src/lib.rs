@@ -70,6 +70,7 @@ mod tests {
                 runtime: Some(McpContainerRuntime::Incus),
             }],
             workspace: daemon.root.clone(),
+            host_cgroup: None,
         };
         for (mode, stage) in [
             ("hang-admin", "discover-pool"),
@@ -619,6 +620,7 @@ mod tests {
             network_hosts: BTreeSet::new(),
             commands: vec![McpCommandAccess::trusted_host(vec!["other".into()])],
             workspace: std::env::temp_dir(),
+            host_cgroup: None,
         };
         assert!(access.validate(profile).is_err());
     }

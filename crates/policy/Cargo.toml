@@ -17,3 +17,6 @@ serde_json.workspace = true
 url.workspace = true
 unicase = "2.9.0"
 unicode-normalization = "0.1.25"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true

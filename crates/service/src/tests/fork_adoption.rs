@@ -1248,6 +1248,12 @@ async fn fork_copies_every_referenced_checkpoint_revision() {
         journal.push('\n');
     }
     std::fs::write(source_meta.join("journal.jsonl"), journal).expect("source journal");
+    // Scope metadata is an ownership capability, not checkpoint data.
+    std::fs::write(
+        engine::host_cgroup::binding_path(&source_meta),
+        b"source-binding",
+    )
+    .unwrap();
     let fork_id = "g-fork-1".to_string();
     let fork_dir = runs.join(&fork_id);
     crate::run_dirs::prepare_checkpoint_fork(
@@ -1259,6 +1265,8 @@ async fn fork_copies_every_referenced_checkpoint_revision() {
         &ForkStatePatch::default(),
     )
     .expect("checkpoint copy should succeed");
+    assert!(!engine::host_cgroup::binding_path(&run_meta_dir(&fork_dir)).exists());
+    assert!(engine::host_cgroup::binding_path(&source_meta).exists());
     let fork_blobs = run_meta_dir(&fork_dir).join("checkpoint-blobs");
     for digest in [sha(v1), sha(v2), sha(failed)] {
         assert!(

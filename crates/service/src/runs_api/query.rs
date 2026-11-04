@@ -24,6 +24,45 @@ fn step_summaries_from_nodes(
 }
 
 impl LocalService {
+    /// Reconcile a replay source only while owning all destructive-operation leases.
+    /// This does not authorize repeating an indeterminate operation.
+    pub async fn reconcile_replay_source(&self, id: &str) -> Result<(), ApiError> {
+        self.ensure_running()?;
+        let busy = || ApiError::Conflict {
+            detail: format!("run `{id}` is busy; retry replay"),
+        };
+        let _store = crate::run_dirs::try_lock_store_maintenance(&self.inner.runs_dir)
+            .map_err(api_internal)?
+            .ok_or_else(busy)?;
+        let dir = self.run_dir_for(id).await?;
+        let _admission = crate::run_dirs::try_lock_run_admission(&dir)
+            .map_err(api_internal)?
+            .ok_or_else(busy)?;
+        let _handoff = crate::run_dirs::try_lock_run_handoff(&dir)
+            .map_err(api_internal)?
+            .ok_or_else(busy)?;
+        crate::invalidation::require_run_directory(&dir)?;
+        let _execution = crate::run_dirs::try_lock_run_execution(&dir)
+            .map_err(api_internal)?
+            .ok_or_else(busy)?;
+        let config =
+            engine::host_cgroup::host_cgroup_config_from_env().map_err(|e| ApiError::Conflict {
+                detail: e.to_string(),
+            })?;
+        engine::host_cgroup::reconcile_host_cgroup(
+            &crate::summaries::run_meta_dir(&dir),
+            &config,
+            id,
+        )
+        .map_err(|e| ApiError::Conflict {
+            detail: e.to_string(),
+        })?;
+        self.authoritative_state(&dir)
+            .await?
+            .ensure_no_fail_closed_inflight_operations()
+            .map_err(|detail| ApiError::Conflict { detail })
+    }
+
     /// Delete a terminal run or discard an inactive direct CLI journal.
     /// Live owners are rejected. Missing runs are an error.
     /// A repeated delete after success reports not-found; list first when
@@ -90,6 +129,23 @@ impl LocalService {
             .await
             .get(id)
             .is_some_and(|record| crate::types::task_slot_is_live(&record.task));
+        // Host-cgroup reconciliation under the execution lease before the
+        // `Started` deletion gate. Uses the persisted binding even when the
+        // current delegation was removed (a changed nonempty parent is refused); failures preserve the
+        // journal and refuse deletion rather than targeting another cgroup.
+        {
+            let config = engine::host_cgroup::host_cgroup_config_from_env().map_err(|error| {
+                ApiError::Conflict {
+                    detail: error.to_string(),
+                }
+            })?;
+            let meta = crate::summaries::run_meta_dir(&run_dir);
+            engine::host_cgroup::reconcile_host_cgroup(&meta, &config, id).map_err(|error| {
+                ApiError::Conflict {
+                    detail: error.to_string(),
+                }
+            })?;
+        }
         let state = self.authoritative_state(&run_dir).await?;
         state
             .ensure_no_inflight_operations()

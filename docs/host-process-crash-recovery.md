@@ -1,48 +1,146 @@
 # Host-process cleanup after a qcg crash
 
-## Current boundary
+## Current boundary and configuration
 
-Trusted-host commands and host-mode MCP stdio servers execute as external
-processes. While qcg is alive, command cancellation/timeout and MCP transport
-close/drop use an in-memory process-tree guard. On Unix the guard signals a
-dedicated process group; it covers only processes that remain in that group.
-A descendant can call `setsid` to leave it. Tokio's child `kill_on_drop` only
-covers the direct child when the guard is dropped.
-
-These guards do not run after qcg receives SIGKILL. The Unix PGID is held only
-in memory, and a numeric PID/PGID after restart cannot prove that the same
-process group still exists. The Windows command path uses a Job Object with
-`KILL_ON_JOB_CLOSE`, but assigns the spawned process after `spawn`; the launch
-path has not proved that untrusted code cannot create an unassigned descendant
-first. The MCP stdio path does not attach its Windows child to that Job Object.
-No whole-tree crash-cleanup guarantee is claimed for these paths.
-
-## Recovery safety
-
-A durable external operation still marked `Started` is retained, and the
-existing fail-closed policy blocks its re-entry or deletion/GC where required.
-That preserves evidence; it does not stop a process or establish its outcome.
-Run deletion, a missing process lookup, and a changed PID/PGID are not cleanup
-acknowledgements. There is no automatic process reconciliation command. Keep
-the journal and reconcile the external effect before removing its evidence.
-Container daemon effects have a separate boundary and procedure in
+Trusted-host commands and host-mode MCP stdio servers execute as the qcg OS
+user. `trusted_host` means the workload is trusted, not sandboxed against
+hostile code; use container isolation for untrusted code. A process-tree
+cleanup mechanism does not change that trust boundary. Container daemon
+effects have a separate boundary and procedure in
 [container crash-recovery limits](container-crash-recovery.md).
 
-## Platform work not yet proven
+Crash recovery for host processes is Linux cgroup-v2 only and opt-in.
+The deployment sets `QCG_HOST_CGROUP_PARENT` to an already-delegated cgroup
+directory (for example `/sys/fs/cgroup/qcg.slice`). Unset or blank means
+disabled: launches keep their existing live process-group cancellation and no
+crash-cleanup claim is made. A present-but-invalid value fails before any
+host command or MCP stdio launch, without fallback to a PID/PGID claim.
 
-- **Linux:** cgroup v2 is a candidate for recursive process containment, but
-  qcg does not create or own a protected per-operation cgroup, place a process
-  there before untrusted code starts, or prove that the workload cannot migrate
-  itself out. A safe implementation also needs durable object ownership,
-  restart-safe identity checks, and confirmation that the subtree is empty.
-- **macOS:** the current process-group mechanism is escapable. No supported,
-  non-escapable process-tree boundary that survives qcg SIGKILL has been
-  established for arbitrary host commands or MCP stdio.
-- **Windows:** the engine command Job Object path needs launch-time membership
-  proof; MCP stdio needs an equivalent whole-tree owner. Neither is covered by
-  the current crash-recovery evidence gate.
+Installing qcg on a cgroup-v2 host, or placing its service in a delegated
+systemd unit, does not enable cleanup by itself. The configured parent must
+already be delegated to the qcg user: absolute, beneath `/sys/fs/cgroup`
+(never the mount itself), a v2 domain cgroup with writable `cgroup.procs`,
+readable `cgroup.events` with a valid `populated` field.
+No controllers are enabled or required; `cgroup.subtree_control` need not be
+writable. qcg creates a per-run child and verifies that its `cgroup.kill`
+works while empty, before binding or launching a payload. The parent itself
+need not grant kill permission. qcg never chowns or sudoes beneath a shared
+root at runtime. The host must expose cgroup v2 (`0::` in `/proc/self/cgroup`
+and `cgroup.controllers` at the mount).
 
-Until platform-specific launch, ownership, descendant, and recovery tests prove
-those boundaries, retain unresolved run evidence and do not claim that orphaned
-host processes were cleaned up. Normal live-process cancellation remains
-available; this limitation does not change container cleanup policy.
+While qcg is alive, command cancellation/timeout and MCP transport close/drop
+use an in-memory process-tree guard alongside the cgroup. On Unix the guard
+signals a dedicated process group; it covers only processes that remain in
+that group. A descendant can call `setsid` to leave it. Tokio's child
+`kill_on_drop` covers only the direct child when the guard is dropped. These
+guards do not run after qcg receives SIGKILL. A numeric PID/PGID after
+restart cannot prove that the same process group still exists.
+
+## Recovery safety and its limits
+
+A durable external operation still marked `Started` is retained. Under
+exclusive run ownership, re-entry refuses default fail-closed operations; an
+explicit `on_indeterminate=repeat` still reaches the existing operation guard.
+Explicit deletion and retention GC refuse every `Started` operation,
+including repeat-policy operations. These checks preserve evidence; they do
+not stop a process or establish its outcome.
+
+The operation gate is not a complete inventory of host processes. In
+particular, MCP can start its stdio server while connecting and discovering
+tools, before the tool call's `operation_started` record exists. Absence of a
+`Started` record therefore does not establish that no MCP process survives.
+Run deletion, a missing process lookup, and a changed PID/PGID are not cleanup
+acknowledgements. There is no automatic host-process reconciliation command.
+Keep the journal and reconcile the external effect before removing its
+evidence. Even confirmed process termination would not prove that a tool's
+external effect was unapplied or make an indeterminate operation safe to replay.
+
+## Linux: delegated per-run subtree
+
+When enabled, qcg binds one unique per-run-execution root beneath the
+authorized delegated parent before any host launch, including MCP connection
+setup. The binding is durably recorded in `meta/host-cgroup.json` with the
+run id, a fresh nonce, canonical parent and root paths, kernel boot id, and a
+cleaned flag. The root name is `qcg-<sanitized-run-id>-<nonce>`.
+
+Only permission-checked `trusted_host` commands and host-mode MCP stdio
+payloads attach this scope. Docker/Podman/Incus clients, lifecycle helpers,
+and container daemon processes do not; container cleanup policy is unchanged.
+
+Children self-place via a `pre_exec` write of their own pid to the run root's
+`cgroup.procs` before payload execution. The shared engine/MCP launch helper
+uses raw syscalls and pre-built data. It arms `PR_SET_PDEATHSIG(SIGKILL)` and
+checks that the original owner is still the parent before placement, covering
+owner death before the hook runs. After successful placement it clears that
+signal: the cgroup, not the spawning thread's lifetime, now owns cleanup.
+A child delayed before placement cannot execute payload code after its owner
+dies, even if recovery already removed the empty root. Post-spawn migration,
+saved PID/PGID numbers, and shell wrappers are not ownership boundaries.
+Trusted descendants may move among child cgroups inside the root; workloads
+must not migrate outside it. This is not an adversarial sandbox.
+
+Under the per-run execution lease, reconciliation precedes recovery, direct
+re-entry, replay decisions, deletion, and retention GC. CLI replay delegates
+reconciliation to the service under store-maintenance, admission, handoff,
+and execution locks. An incomplete admission with any extant binding is not
+wiped; ambiguous evidence must first be reconciled under exclusive ownership.
+Checkpoint forks copy checkpoint data, never the source's cgroup binding.
+
+The sidecar is a bounded (16 KiB identity-record format), no-follow regular-file
+read. Reconciliation checks the caller's expected run id, schema version,
+32-hex-digit nonce, exact nonce-derived root name/path, canonical parent, and
+kernel boot identity before targeting anything. With the parent variable
+unset it uses the persisted parent; a different nonempty configured parent
+fails closed. It never infers ownership from PID/PGID numbers.
+
+Cleanup kills the whole root via `cgroup.kill`, confirms `cgroup.events`
+reports `populated 0`, and removes nested cgroups bottom-up. Confirmation
+uses deployment settings `QCG_HOST_CGROUP_CLEANUP_TIMEOUT_MS` (default 10000)
+and `QCG_HOST_CGROUP_POLL_MS` (default 50), positive integer milliseconds;
+invalid timing fails before launch. Reading only root `cgroup.procs` does not
+prove emptiness. Normal return/handoff retires this run's tree the same way.
+
+Binding updates use a unique create-new temporary file, file fsync, atomic
+rename, and metadata-directory fsync. Empty confirmation is durably recorded
+*before* directory removal, then `cleaned` is recorded after removal. Recovery
+can finish an interrupted retirement from that durable confirmation. Missing
+roots without it remain ambiguous and refuse cleanup. Timeouts, I/O errors,
+or identity ambiguity retain evidence and block recovery/deletion; normal
+retirement errors are returned visibly. Stopping processes never resolves an
+indeterminate operation or bypasses Started/Repeat policy.
+
+## Other platforms
+
+- **macOS:** the current process-group mechanism is escapable. No supported
+  descendant boundary that survives qcg SIGKILL has been established for
+  arbitrary host commands or MCP stdio.
+- **Windows:** the command path uses a Job Object with `KILL_ON_JOB_CLOSE`,
+  but assigns the process after `spawn`. It has not proved that payload code
+  cannot create an unassigned descendant first. MCP stdio does not attach its
+  Windows child to that Job Object. Neither path has a whole-tree crash-cleanup
+  guarantee.
+
+Normal live-process cancellation remains available. These limitations do not
+change container cleanup or the journal's indeterminate-operation policy.
+
+## Provisioning and verification
+
+The Linux CI job runs `scripts/test-host-cgroup.sh` as the runner UID inside
+an actual transient systemd service with `Delegate=yes` and `User`/`Group`.
+The script derives its parent from its own `/proc/self/cgroup` and probes a
+new child for kill/occupancy support; it never changes shared-root controllers
+or moves a runner shell manually. Unavailable delegation fails the job. There
+is no root fallback, so a successful job establishes unprivileged delegation.
+
+Tests without a configured parent skip live cgroup cases (including on a
+read-only local sandbox); a configured but unusable parent fails, never skips.
+Coverage includes launch membership, MCP transport launch, session escape,
+leader exit, sibling isolation, binding tampering, replay lease exclusion,
+incomplete-admission evidence retention, and interrupted retirement. A separate
+owner test executable uses qcg's binding/launch/reconciliation APIs: controlled
+pre-placement and pre-exec barriers plus a running workload let the runner
+SIGKILL the owner (not the command leader), then start a different owner to
+reconcile. The CLI SIGKILL regression also kills a real `qcg run` during
+workload and, when delegated, verifies membership and cleanup by a new qcg
+owner before the unchanged Started gate refuses re-entry. These are test
+cases, not a claim that a live delegated CI run has completed.

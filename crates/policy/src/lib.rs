@@ -16,7 +16,14 @@ pub enum McpAuthorizationAction {
 pub mod audit;
 pub mod container;
 pub mod cost;
+pub mod host_cgroup;
 pub use container::ContainerTimeouts;
+pub use host_cgroup::{
+    CGROUP2_MOUNT, HOST_CGROUP_BINDING_FILE, HOST_CGROUP_BINDING_VERSION, HOST_CGROUP_PARENT_ENV,
+    HostCgroupBinding, HostCgroupConfig, HostCgroupScope, host_cgroup_cleanup_timing,
+    is_inside_cgroup_mount, is_strictly_inside, run_root_name, sanitize_run_component,
+    validate_parent_path,
+};
 pub mod credential;
 pub mod destination_decider;
 pub mod limits;
@@ -87,3 +94,6 @@ pub use tier::{
     CostRates, CostTier, CostTierError, carry_pinned_rates, max_cost_rates, select_cost_tier,
     validate_cost_tiers,
 };
+
+#[cfg(target_os = "linux")]
+pub mod host_cgroup_launch;

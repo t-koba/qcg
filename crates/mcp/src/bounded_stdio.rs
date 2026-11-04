@@ -27,14 +27,36 @@ pub(crate) struct BoundedChildTransport {
 }
 
 impl BoundedChildTransport {
+    #[allow(dead_code)]
     pub(crate) fn spawn(
+        command: tokio::process::Command,
+        max_message_bytes: usize,
+    ) -> std::io::Result<Self> {
+        Self::spawn_with_scope(command, max_message_bytes, None)
+    }
+
+    /// Spawns with race-free cgroup self-placement before payload execution
+    /// when a run scope is present. Fails before spawn when the delegation
+    /// is invalid; `None` keeps existing live process-group behavior.
+    pub(crate) fn spawn_with_scope(
         mut command: tokio::process::Command,
         max_message_bytes: usize,
+        scope: Option<&policy::HostCgroupScope>,
     ) -> std::io::Result<Self> {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt as _;
             command.as_std_mut().process_group(0);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(scope) = scope {
+            apply_host_scope(&mut command, scope)?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        if scope.is_some() {
+            return Err(std::io::Error::other(
+                "host cgroup launch is Linux cgroup-v2 only",
+            ));
         }
         let mut child = command
             .stdin(Stdio::piped())
@@ -183,6 +205,18 @@ impl BoundedChildTransport {
             tracing::warn!(%error, "container teardown failed");
         }
     }
+}
+
+/// Race-free self-placement into the run's cgroup root before payload
+/// execution. The child writes its own pid, so a qcg death between fork and
+/// exec cannot leave it outside. Async-signal-safe: only raw syscalls on a
+/// pre-built path and stack pid buffer.
+#[cfg(target_os = "linux")]
+fn apply_host_scope(
+    command: &mut tokio::process::Command,
+    scope: &policy::HostCgroupScope,
+) -> std::io::Result<()> {
+    policy::host_cgroup_launch::apply_scope(command.as_std_mut(), scope)
 }
 
 impl Drop for BoundedChildTransport {
@@ -495,5 +529,134 @@ mod tests {
         // Keep the fallback EOF alive until after the assertion so it cannot
         // make a leaking close implementation appear to pass.
         drop(lifeline);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod host_cgroup_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn enabled_scope(
+        label: &str,
+    ) -> Option<(
+        std::path::PathBuf,
+        policy::HostCgroupScope,
+        policy::HostCgroupConfig,
+    )> {
+        if std::env::var(policy::HOST_CGROUP_PARENT_ENV)
+            .ok()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            eprintln!("SKIP {label}: no delegation env");
+            return None;
+        }
+        let config = policy::HostCgroupConfig::from_env().expect("invalid delegation config");
+        let canonical = config
+            .parent()
+            .unwrap()
+            .canonicalize()
+            .expect("delegated parent missing");
+        for leaf in ["cgroup.procs", "cgroup.kill", "cgroup.events"] {
+            assert!(canonical.join(leaf).is_file(), "missing {leaf}");
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(canonical.join("cgroup.procs"))
+            .expect("delegation not writable");
+        let meta = std::env::temp_dir().join(format!(
+            "qcg-mcp-{label}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7().as_simple()
+        ));
+        std::fs::create_dir_all(&meta).unwrap();
+        // Bind via raw directory creation (engine owns the JSON binding; this
+        // probe only needs the run root for launch placement).
+        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let nonce = uuid::Uuid::now_v7().as_simple().to_string();
+        let name = policy::run_root_name(&format!("mcp-{label}"), &nonce);
+        let run_root = canonical.join(&name);
+        std::fs::create_dir(&run_root).expect("cannot create run cgroup");
+        std::fs::write(run_root.join("cgroup.kill"), "1").expect("cgroup.kill unusable");
+        let scope = policy::HostCgroupScope {
+            delegated_parent: canonical,
+            run_root,
+            run_id: format!("mcp-{label}"),
+            nonce,
+            boot_id: boot,
+        };
+        Some((meta, scope, config))
+    }
+
+    fn procs_contains(root: &std::path::Path, pid: u32) -> bool {
+        let Ok(contents) = std::fs::read_to_string(root.join("cgroup.procs")) else {
+            return false;
+        };
+        contents.lines().any(|line| line.trim() == pid.to_string())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn mcp_stdio_launch_self_places_before_payload() {
+        let Some((meta, scope, _)) = enabled_scope("launch") else {
+            return;
+        };
+        let mut command = tokio::process::Command::new("/bin/sleep");
+        command.arg("30");
+        let mut transport = BoundedChildTransport::spawn_with_scope(command, 1024, Some(&scope))
+            .expect("MCP spawn with scope should succeed");
+        let pid = transport.child.id().expect("child should have pid");
+        let start = Instant::now();
+        let mut placed = false;
+        while start.elapsed() < Duration::from_secs(5) {
+            if procs_contains(&scope.run_root, pid) {
+                placed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            placed,
+            "MCP child {pid} should self-place into {}",
+            scope.run_root.display()
+        );
+        // Transport close must not orphan the test sleeper; kill via cgroup.
+        std::fs::write(scope.run_root.join("cgroup.kill"), "1").unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let _ = transport.child.kill().await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), transport.child.wait()).await;
+        std::fs::remove_dir(&scope.run_root).unwrap();
+        let _ = std::fs::remove_dir_all(&meta);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn mcp_invalid_scope_fails_before_spawn() {
+        // Outside-mount scope must be refused before spawn, never migrated.
+        let scope = policy::HostCgroupScope {
+            delegated_parent: std::path::PathBuf::from("/tmp"),
+            run_root: std::path::PathBuf::from("/tmp/qcg-bad"),
+            run_id: "bad".into(),
+            nonce: "n".into(),
+            boot_id: "b".into(),
+        };
+        let command = tokio::process::Command::new("/bin/sleep");
+        assert!(
+            BoundedChildTransport::spawn_with_scope(command, 1024, Some(&scope)).is_err(),
+            "outside-mount scope must fail before spawn"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_disabled_scope_is_noop() {
+        // Always runnable: None preserves existing live behavior.
+        let command = tokio::process::Command::new("/bin/true");
+        // spawn_with_scope with None must behave like spawn (no cgroup).
+        let mut transport = BoundedChildTransport::spawn_with_scope(command, 1024, None)
+            .expect("None scope must not fail launch");
+        let _ = tokio::time::timeout(Duration::from_secs(3), transport.close()).await;
     }
 }

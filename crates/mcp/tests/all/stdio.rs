@@ -60,6 +60,7 @@ fn access(commands: &[Vec<String>]) -> McpAccess {
             .map(McpCommandAccess::trusted_host)
             .collect(),
         workspace: std::env::current_dir().expect("test workspace should be available"),
+        host_cgroup: None,
     }
 }
 
@@ -193,6 +194,15 @@ async fn frozen_daemon_policy_reaches_normal_container_session_close() {
         let access = McpAccess {
             network_hosts: BTreeSet::new(),
             workspace: daemon.root.clone(),
+            // Container runtime clients must never attach the host payload scope.
+            // This unusable scope would make either client's spawn fail if attached.
+            host_cgroup: Some(policy::HostCgroupScope {
+                delegated_parent: "/sys/fs/cgroup/missing".into(),
+                run_root: "/sys/fs/cgroup/missing/invalid".into(),
+                run_id: "container".into(),
+                nonce: "invalid".into(),
+                boot_id: "boot".into(),
+            }),
             commands: vec![McpCommandAccess {
                 argv: argv.clone(),
                 isolation: mcp::McpCommandIsolation::Container,

@@ -933,8 +933,13 @@ impl McpRuntime {
             }
             sensitive_values.push(value);
         }
-        let mut transport = BoundedChildTransport::spawn(command, profile.spec.max_response_bytes)
-            .map_err(|error| McpError::Transport(error.to_string()))?;
+        let host_scope = host_stdio_scope(access.host_cgroup.as_ref(), container_cleanup.is_some());
+        let mut transport = BoundedChildTransport::spawn_with_scope(
+            command,
+            profile.spec.max_response_bytes,
+            host_scope,
+        )
+        .map_err(|error| McpError::Transport(error.to_string()))?;
         if let Some(session) = container_cleanup {
             transport = transport.with_container_cleanup(session);
         }
@@ -946,6 +951,13 @@ impl McpRuntime {
         )
         .await
     }
+}
+
+fn host_stdio_scope(
+    scope: Option<&policy::HostCgroupScope>,
+    container_client: bool,
+) -> Option<&policy::HostCgroupScope> {
+    if container_client { None } else { scope }
 }
 
 fn public_default_specs() -> Vec<McpServerSpec> {
@@ -1013,5 +1025,19 @@ mod tests {
         // Session Drop returns the count instead.
         owned.fetch_sub(1, Ordering::AcqRel);
         assert_eq!(counter.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn container_mcp_client_does_not_inherit_host_cgroup() {
+        let scope = policy::HostCgroupScope {
+            delegated_parent: "/sys/fs/cgroup/qcg.slice".into(),
+            run_root: "/sys/fs/cgroup/qcg.slice/qcg-run-test".into(),
+            run_id: "test".into(),
+            nonce: "nonce".into(),
+            boot_id: "boot".into(),
+        };
+        assert!(host_stdio_scope(Some(&scope), true).is_none());
+        assert_eq!(host_stdio_scope(Some(&scope), false), Some(&scope));
+        assert!(host_stdio_scope(None, false).is_none());
     }
 }
