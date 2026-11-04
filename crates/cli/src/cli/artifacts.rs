@@ -26,15 +26,9 @@ pub(crate) fn read_declared_artifact(
     let artifact = declared_artifact(manifest, path)?;
     let declared = usize::try_from(artifact.bytes)
         .map_err(|_| format!("artifact `{path}` byte count does not fit this platform"))?;
-    if runtime
-        .output_file_limit_bytes
-        .is_some_and(|limit| artifact.bytes > limit as u64)
+    if let Some(limit) = runtime.output_file_limit_bytes
+        && artifact.bytes > limit as u64
     {
-        let Some(limit) = runtime.output_file_limit_bytes else {
-            return Err(format!(
-                "artifact `{path}` exceeds the configured output file limit"
-            ));
-        };
         return Err(format!(
             "artifact `{path}` exceeds runtime.output_file_limit_bytes ({limit})"
         ));

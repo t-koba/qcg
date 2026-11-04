@@ -307,8 +307,8 @@ impl LocalService {
         // The reserved id becomes a run directory name, so a generator id that
         // carries a separator (`nested/generator`) or `..` is refused here
         // instead of producing a run id that escapes the runs directory.
-        if !is_safe_run_id(generator_id) {
-            return Err(api_bad_request(format!(
+        if !policy::is_safe_path_component(generator_id) {
+            return Err(ApiError::invalid(format!(
                 "generator id `{generator_id}` is not allowed"
             )));
         }
@@ -322,8 +322,8 @@ impl LocalService {
         // must remain independent of the source's retention or snapshot state.
         // A fresh owner validates and loads the pinned source in `fork_run_with_id`.
         let reserved = format!("fork-{}", uuid::Uuid::now_v7());
-        if !is_safe_run_id(&reserved) {
-            return Err(api_bad_request(format!(
+        if !policy::is_safe_path_component(&reserved) {
+            return Err(ApiError::invalid(format!(
                 "fork run id `{reserved}` is not allowed"
             )));
         }
@@ -371,7 +371,7 @@ impl LocalService {
         let generator_path = contract.root.clone();
         if let Some(expected) = expected_package_sha256 {
             if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                return Err(api_bad_request(
+                return Err(ApiError::invalid(
                     "package identity must be a 64-character SHA-256 hex digest",
                 ));
             }
@@ -431,8 +431,10 @@ impl LocalService {
         };
         let run_id = reserved_run_id
             .unwrap_or_else(|| format!("{}-{}", req.generator_id, uuid::Uuid::now_v7()));
-        if !is_safe_run_id(&run_id) {
-            return Err(api_bad_request(format!("run id `{run_id}` is not allowed")));
+        if !policy::is_safe_path_component(&run_id) {
+            return Err(ApiError::invalid(format!(
+                "run id `{run_id}` is not allowed"
+            )));
         }
         let run_dir = self.inner.runs_dir.join(&run_id);
         // H01: cancellable shard wait shared with fork (see helper).
@@ -620,7 +622,7 @@ impl LocalService {
         };
         let effective = crate::types::ResolvedExecutionPolicy::resolve(
             staged.contract.manifest.budget.max_steps,
-            self.max_total_steps(),
+            self.inner.deployment_policy.max_total_steps,
             self.inner.deployment_policy.max_parallel_steps,
         );
         // Fresh admissions share one durable queue instant with memory;
@@ -745,8 +747,10 @@ impl LocalService {
             preloaded_source = Some((source_dir, state, contract));
             run_id
         };
-        if !is_safe_run_id(&run_id) {
-            return Err(api_bad_request(format!("run id `{run_id}` is not allowed")));
+        if !policy::is_safe_path_component(&run_id) {
+            return Err(ApiError::invalid(format!(
+                "run id `{run_id}` is not allowed"
+            )));
         }
         let run_dir = self.inner.runs_dir.join(&run_id);
         // H01: cancellable shard wait shared with start (see helper).
@@ -986,7 +990,7 @@ impl LocalService {
         };
         let fork_effective = crate::types::ResolvedExecutionPolicy::resolve(
             staged.contract.manifest.budget.max_steps,
-            self.max_total_steps(),
+            self.inner.deployment_policy.max_total_steps,
             self.inner.deployment_policy.max_parallel_steps,
         );
         // Fresh admissions share one durable queue instant with memory;

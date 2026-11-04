@@ -28,6 +28,7 @@ llm-steps = { path = "../llm-steps" }
 policy = { path = "../policy" }
 steps = { path = "../steps" }
 model = { path = "../model" }
+same-file.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

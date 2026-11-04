@@ -7,7 +7,7 @@ impl LocalService {
     /// on resume. At most one victim per arrival; equal priorities never
     /// preempt each other.
     pub(super) async fn preempt_for_priority(&self, priority: i32) {
-        if !self.preemption_enabled() {
+        if !self.inner.deployment_policy.preemption_enabled {
             return;
         }
         let victim = {
@@ -66,7 +66,7 @@ impl LocalService {
         let (run_dir, task_identity) = {
             let runs = self.inner.runs.read().await;
             let Some(record) = runs.get(id) else {
-                return Err(api_not_found(format!("run `{id}` was not found")));
+                return Err(ApiError::not_found(format!("run `{id}` was not found")));
             };
             if record.state != RunStatus::Running
                 || record.preempted

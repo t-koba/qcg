@@ -32,7 +32,7 @@ impl LocalService {
             self.ensure_running()?;
             let record = runs
                 .get_mut(&id)
-                .ok_or_else(|| api_not_found(format!("run `{id}` was not found")))?;
+                .ok_or_else(|| ApiError::not_found(format!("run `{id}` was not found")))?;
             if let Some(existing) = record.answers.get(&question_id) {
                 return if existing == &answer {
                     // Idempotent replay: the first call already journaled and
@@ -65,14 +65,14 @@ impl LocalService {
                         }
                         _ => {
                             if record.state != RunStatus::Waiting {
-                                return Err(api_bad_request(format!(
+                                return Err(ApiError::invalid(format!(
                                     "run `{id}` is not waiting for user input"
                                 )));
                             }
                             let question = record.question.clone().ok_or_else(|| {
-                                api_bad_request(format!("run `{id}` has no question"))
+                                ApiError::invalid(format!("run `{id}` has no question"))
                             })?;
-                            return Err(api_bad_request(format!(
+                            return Err(ApiError::invalid(format!(
                                 "answer was for `{}`, but run is waiting for `{}`",
                                 question_id, question.id
                             )));
@@ -214,7 +214,7 @@ impl LocalService {
             self.ensure_running()?;
             let record = runs
                 .get_mut(&id)
-                .ok_or_else(|| api_not_found(format!("run `{id}` was not found")))?;
+                .ok_or_else(|| ApiError::not_found(format!("run `{id}` was not found")))?;
             if let Some(existing) = record.confirmations.get(&confirmation_id) {
                 return if *existing == approved {
                     // Idempotent replay: the first call already journaled and
@@ -229,14 +229,14 @@ impl LocalService {
                 };
             }
             if record.state != RunStatus::Confirming {
-                return Err(api_bad_request(format!(
+                return Err(ApiError::invalid(format!(
                     "run `{id}` is not waiting for side-effect confirmation"
                 )));
             }
             let confirm = record
                 .confirm
                 .clone()
-                .ok_or_else(|| api_bad_request(format!("run `{id}` has no confirmation")))?;
+                .ok_or_else(|| ApiError::invalid(format!("run `{id}` has no confirmation")))?;
             // Full-id string match is the corruption gate: a malformed or
             // foreign confirmation id never equals the pending id, so it
             // fails here as Conflict instead of aliasing another scope
@@ -403,7 +403,7 @@ impl LocalService {
             });
         }
         if state.cancel_requested {
-            return Err(api_bad_request(format!(
+            return Err(ApiError::invalid(format!(
                 "run `{id}` is not waiting for user input; a cancel was accepted"
             )));
         }
@@ -424,7 +424,7 @@ impl LocalService {
                     "question `{question_id}` was already answered with different values"
                 ),
             }),
-            None => Err(api_bad_request(format!(
+            None => Err(ApiError::invalid(format!(
                 "run `{id}` is not waiting for user input"
             ))),
         }
@@ -449,7 +449,7 @@ impl LocalService {
             });
         }
         if state.cancel_requested {
-            return Err(api_bad_request(format!(
+            return Err(ApiError::invalid(format!(
                 "run `{id}` is not waiting for side-effect confirmation; a cancel was accepted"
             )));
         }
@@ -478,7 +478,7 @@ impl LocalService {
                     "confirmation `{confirmation_id}` already has a different decision"
                 ),
             }),
-            None => Err(api_bad_request(format!(
+            None => Err(ApiError::invalid(format!(
                 "run `{id}` is not waiting for side-effect confirmation"
             ))),
         }

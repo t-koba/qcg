@@ -1,4 +1,4 @@
-use crate::artifacts::{api_bad_request, api_internal, api_not_found};
+use crate::artifacts::api_internal;
 use crate::package::{PackageLimits, package_identity_sha256};
 use crate::types::LocalService;
 use api::{
@@ -7,8 +7,7 @@ use api::{
 };
 use camino::Utf8PathBuf;
 use contract::{Contract, PackagePathError};
-use policy::DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES;
-use policy::is_safe_relative_path;
+use policy::{DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES, is_safe_relative_path};
 use tokio::io::AsyncReadExt as _;
 
 impl LocalService {
@@ -77,7 +76,7 @@ impl LocalService {
             || path.to_ascii_lowercase().contains("%2f")
             || path.to_ascii_lowercase().contains("%5c")
         {
-            return Err(api_bad_request(format!(
+            return Err(ApiError::invalid(format!(
                 "generator asset path `{path}` is not allowed"
             )));
         }
@@ -92,7 +91,7 @@ impl LocalService {
                 .is_some_and(|suffix| suffix.starts_with('/') && suffix.len() > 1)
         });
         if !exact && !in_dir {
-            return Err(api_not_found(format!(
+            return Err(ApiError::not_found(format!(
                 "generator asset `{path}` was not declared"
             )));
         }
@@ -101,19 +100,19 @@ impl LocalService {
             Err(PackagePathError::Path { source, .. })
                 if source.kind() == std::io::ErrorKind::NotFound =>
             {
-                return Err(api_not_found(format!(
+                return Err(ApiError::not_found(format!(
                     "generator asset `{path}` was not found"
                 )));
             }
             Err(PackagePathError::Escapes { .. }) => {
-                return Err(api_not_found(format!(
+                return Err(ApiError::not_found(format!(
                     "generator asset `{path}` was not found"
                 )));
             }
             Err(error) => return Err(api_internal(error)),
         };
         if !requested.is_file() {
-            return Err(api_not_found(format!(
+            return Err(ApiError::not_found(format!(
                 "generator asset `{path}` was not found"
             )));
         }

@@ -1,4 +1,4 @@
-use crate::artifacts::{api_bad_request, api_internal, api_not_found, event_kinds, is_safe_run_id};
+use crate::artifacts::{api_internal, event_kinds};
 use crate::queue::{PriorityPermits, queue_head};
 use crate::run_dirs::{
     app_registry, claim_run_execution_owner, consume_cancel_control, direct_run_id,
@@ -256,20 +256,6 @@ impl LocalService {
                 handle.abort();
             }
         }
-    }
-
-    /// Deployment policy is frozen at construction through
-    /// [`Self::with_generator_roots_policy_and_store_mode`]: post-construction
-    /// setters were removed so policy can never race recovery execution (E04).
-    /// Stored by value (`Copy`), read without locking.
-    pub(crate) fn max_total_steps(&self) -> Option<usize> {
-        self.inner.deployment_policy.max_total_steps
-    }
-
-    /// Deployment policy accessor without locking (E04): frozen by value at
-    /// construction, never mutated afterwards.
-    pub(crate) fn preemption_enabled(&self) -> bool {
-        self.inner.deployment_policy.preemption_enabled
     }
 
     /// Starts the retention GC unconditionally. Hosts decide enablement via
@@ -1168,7 +1154,7 @@ impl LocalService {
         let runs = self.inner.runs.read().await;
         let record = runs
             .get(id)
-            .ok_or_else(|| api_not_found(format!("run `{id}` was not found")))?;
+            .ok_or_else(|| ApiError::not_found(format!("run `{id}` was not found")))?;
         Ok(record.events.subscribe())
     }
 
@@ -1176,8 +1162,8 @@ impl LocalService {
     /// id names one directory under the runs root, so it must be a single safe
     /// path component before any path is built from it.
     pub async fn run_dir_for(&self, id: &str) -> Result<Utf8PathBuf, ApiError> {
-        if !is_safe_run_id(id) {
-            return Err(api_bad_request(format!("run id `{id}` is not allowed")));
+        if !policy::is_safe_path_component(id) {
+            return Err(ApiError::invalid(format!("run id `{id}` is not allowed")));
         }
         let memory = self
             .inner
@@ -1191,7 +1177,7 @@ impl LocalService {
         }
         let run_dir = self.inner.runs_dir.join(id);
         if !is_regular_file(&run_meta_dir(&run_dir).join("journal.jsonl")).map_err(api_internal)? {
-            return Err(api_not_found(format!("run `{id}` was not found")));
+            return Err(ApiError::not_found(format!("run `{id}` was not found")));
         }
         Ok(run_dir)
     }
@@ -1223,8 +1209,8 @@ impl LocalService {
     pub(crate) fn load_generator(&self, id: &str) -> Result<Contract, ApiError> {
         // A generator id names one directory under a generator root, so it
         // obeys the same single-component rule as a run id.
-        if !is_safe_run_id(id) {
-            return Err(api_bad_request(format!(
+        if !policy::is_safe_path_component(id) {
+            return Err(ApiError::invalid(format!(
                 "generator id `{id}` is not allowed"
             )));
         }
@@ -1236,7 +1222,7 @@ impl LocalService {
                 return Ok(contract);
             }
         }
-        Err(api_not_found(format!(
+        Err(ApiError::not_found(format!(
             "generator `{id}` was not found in any generator root: {}",
             self.inner
                 .generator_roots
@@ -1886,7 +1872,7 @@ impl LocalService {
         }
         let policy = crate::types::ResolvedExecutionPolicy::resolve(
             contract.manifest.budget.max_steps,
-            self.max_total_steps(),
+            self.inner.deployment_policy.max_total_steps,
             self.inner.deployment_policy.max_parallel_steps,
         );
         let json_events = matches!(mode, DirectEventMode::None) && run.json_events;

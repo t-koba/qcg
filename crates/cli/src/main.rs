@@ -498,6 +498,7 @@ async fn run_async() -> Result<std::process::ExitCode> {
                     .await?;
                 let output =
                     output.unwrap_or_else(|| Utf8PathBuf::from(format!("{id}-bundle.zip")));
+                parts.validate_output_path(&output)?;
                 let file = std::fs::File::create(&output)
                     .with_context(|| format!("failed to create bundle `{output}`"))?;
                 service::write_run_bundle_stream_with_limits(

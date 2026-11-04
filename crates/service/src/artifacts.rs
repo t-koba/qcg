@@ -5,7 +5,6 @@ use api::{ApiError, RunEvent};
 use camino::{Utf8Path, Utf8PathBuf};
 use engine::resolve_artifact_path;
 use model::OutputManifest;
-use policy::is_safe_path_component;
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
 use std::fs::File;
@@ -181,6 +180,32 @@ fn artifact_zip_error(error: zip::result::ZipError) -> ServiceError {
     match error {
         zip::result::ZipError::Io(error) => ServiceError::Invalid(error.to_string()),
         error => ServiceError::Zip(error),
+    }
+}
+
+impl crate::types::RunBundleParts {
+    /// Refuse a bundle output that aliases a source file. Preflight only.
+    pub fn validate_output_path(&self, output: &Utf8Path) -> Result<(), ServiceError> {
+        let meta = [
+            "journal.jsonl",
+            "audit.jsonl",
+            "outputs.json",
+            "invalidation.json",
+        ]
+        .map(|name| self.journal.with_file_name(name));
+        for source in meta.iter().chain(self.verified.iter().map(|a| &a.fs_path)) {
+            match same_file::is_same_file(output.as_std_path(), source.as_std_path()) {
+                Ok(true) => {
+                    return Err(ServiceError::Invalid(format!(
+                        "bundle output `{output}` aliases source `{source}`"
+                    )));
+                }
+                Ok(false) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -407,20 +432,8 @@ fn bundle_entry_options(directory: bool) -> SimpleFileOptions {
         .unix_permissions(if directory { 0o755 } else { 0o644 })
 }
 
-pub(crate) fn api_bad_request(message: impl Into<String>) -> ApiError {
-    ApiError::invalid(message)
-}
-
-pub(crate) fn api_not_found(message: impl Into<String>) -> ApiError {
-    ApiError::not_found(message)
-}
-
 pub(crate) fn api_internal(error: impl std::fmt::Display) -> ApiError {
     ApiError::internal(error.to_string())
-}
-
-pub(crate) fn is_safe_run_id(id: &str) -> bool {
-    is_safe_path_component(id)
 }
 
 pub(crate) fn event_kinds(events: &[RunEvent]) -> Vec<String> {

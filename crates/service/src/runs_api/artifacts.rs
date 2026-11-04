@@ -153,7 +153,7 @@ impl LocalService {
             .artifacts
             .into_iter()
             .find(|artifact| artifact.path == path)
-            .ok_or_else(|| api_not_found(format!("artifact `{path}` was not found")))?;
+            .ok_or_else(|| ApiError::not_found(format!("artifact `{path}` was not found")))?;
         if let Some(limit) = limits.and_then(|l| l.effective().max_bytes)
             && artifact.bytes > limit
         {
