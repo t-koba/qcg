@@ -1364,23 +1364,42 @@ impl LocalService {
                 // Under the lease, journal refusal (not cleanup) before any re-entry.
                 // Fail-closed `Started` operations block; `repeat` passes
                 // through to the existing operation guard on execution.
-                if let Err(error) = fold_run_state(&run_dir).and_then(|state| {
-                    if let Err(error) = state.ensure_no_fail_closed_inflight_operations() {
-                        if state.terminal.is_none() {
-                            engine::JournalWriter::append_single_event(
-                                &run_meta_dir(&run_dir).join("journal.jsonl"),
-                                &run_id,
-                                "run_error",
-                                serde_json::json!({"error": error}),
-                                engine::JournalLimits::default(),
-                                Some(events.clone()),
-                            )
-                            .map_err(|error| ServiceError::Invalid(error.to_string()))?;
-                        }
-                        return Err(ServiceError::Invalid(error));
+                let state = match fold_run_state(&run_dir) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        // A failed journal observation is not proof of a run
+                        // failure. Keep the last-known queued interaction and
+                        // let the resumer retry after the journal is repaired.
+                        tracing::error!(
+                            run_id = %run_id,
+                            phase = "pre_execution_journal",
+                            %error,
+                            "pre-execution journal observation failed; refusing execution and retaining retryable state"
+                        );
+                        return;
                     }
-                    Ok(())
-                }) {
+                };
+                if let Err(error) = state.ensure_no_fail_closed_inflight_operations() {
+                    if state.terminal.is_none()
+                        && let Err(append_error) = engine::JournalWriter::append_single_event(
+                            &run_meta_dir(&run_dir).join("journal.jsonl"),
+                            &run_id,
+                            "run_error",
+                            serde_json::json!({"error": error.clone()}),
+                            engine::JournalLimits::default(),
+                            Some(events.clone()),
+                        )
+                    {
+                        // Do not claim a durable failure when the refusal
+                        // itself could not be recorded.
+                        tracing::error!(
+                            run_id = %run_id,
+                            %error,
+                            %append_error,
+                            "unable to record unresolved-operation refusal; retaining retryable state"
+                        );
+                        return;
+                    }
                     tracing::error!(run_id = %run_id, %error, "refusing run ownership re-entry; journal retained");
                     service.mark_spawn_failed(&run_id).await;
                     return;
