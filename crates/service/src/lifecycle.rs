@@ -1361,21 +1361,11 @@ impl LocalService {
                     service.mark_spawn_failed(&run_id).await;
                     return;
                 }
-                // Under the lease, journal refusal (not cleanup) before any re-entry.
-                // Fail-closed `Started` operations block; `repeat` passes
-                // through to the existing operation guard on execution.
+                // Refuse journal-observation failures without changing queued state.
                 let state = match fold_run_state(&run_dir) {
                     Ok(state) => state,
                     Err(error) => {
-                        // A failed journal observation is not proof of a run
-                        // failure. Keep the last-known queued interaction and
-                        // let the resumer retry after the journal is repaired.
-                        tracing::error!(
-                            run_id = %run_id,
-                            phase = "pre_execution_journal",
-                            %error,
-                            "pre-execution journal observation failed; refusing execution and retaining retryable state"
-                        );
+                        tracing::error!(run_id = %run_id, phase = "pre_execution_journal", %error, "journal read failed; retaining queued state");
                         return;
                     }
                 };
@@ -1385,19 +1375,12 @@ impl LocalService {
                             &run_meta_dir(&run_dir).join("journal.jsonl"),
                             &run_id,
                             "run_error",
-                            serde_json::json!({"error": error.clone()}),
+                            serde_json::json!({"error": &error}),
                             engine::JournalLimits::default(),
                             Some(events.clone()),
                         )
                     {
-                        // Do not claim a durable failure when the refusal
-                        // itself could not be recorded.
-                        tracing::error!(
-                            run_id = %run_id,
-                            %error,
-                            %append_error,
-                            "unable to record unresolved-operation refusal; retaining retryable state"
-                        );
+                        tracing::error!(run_id = %run_id, %error, %append_error, "refusal record failed; retaining run");
                         return;
                     }
                     tracing::error!(run_id = %run_id, %error, "refusing run ownership re-entry; journal retained");
@@ -1412,11 +1395,9 @@ impl LocalService {
                     tracing::error!(run_id = %run_id, %error, "cancel drain failed; refusing to start execution");
                     return;
                 }
-                // Priority admission: only the queue head takes a slot, so a
-                // freed slot wakes waiters but cannot be taken out of order.
-                // Equal priorities keep FIFO order; cancellation aborts the wait.
-                // The notified future is created before the state check so a
-                // notify between check and wait is never lost (A11).
+                // Only the queue head takes each freed slot; priorities preserve
+                // order, equal priorities remain FIFO, and cancellation aborts.
+                // Notify before checking state to prevent a lost wakeup (A11).
                 let _permit = loop {
                     let notified = queue_notify.notified();
                     // A peer cancel observed while queued settles without ever
