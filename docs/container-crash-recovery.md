@@ -51,6 +51,15 @@ record an evidenced outcome before permitting recovery or deletion.
 | Managed instances | `provision_incus` in `crates/container/src/session.rs` generates a name before `init` | The name and provisioning guard exist only in process memory; a friendly name is not a reuse guard |
 | Recovery and maintenance | Run journal plus run/store leases | `operation_started` does not bind a daemon resource or acknowledge cancellation of creation |
 
+`RunContext::guard_external_operation` does durably append a generic
+`operation_started` before the command gateway is called, and returns its
+stable operation ID to the step. The ordinary and agent command paths do not
+pass that ID into `CmdGateway`; the container adapter therefore cannot derive
+a run-bound name/label from it. The generic record also carries no effect type,
+backend identity, or container ID. It is a pre-call breadcrumb, not a container
+recovery handle: a safe protocol still needs effect-specific identity and
+creation/reconciliation evidence tied to the daemon request.
+
 `docker_run_argv` in `crates/container/src/plans.rs` currently uses `run --rm
 --cidfile ...`, without a precommitted ownership name or label. Automatic removal
 also means a completed workload can disappear before recovery can inspect it.
