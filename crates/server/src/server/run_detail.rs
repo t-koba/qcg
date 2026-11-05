@@ -575,22 +575,7 @@ fn parse_if_none_match(headers: &HeaderMap) -> Result<IfNoneMatch, ApiHttpError>
     let mut tags = Vec::new();
     for raw in none_match.split(',') {
         let candidate = raw.trim();
-        if candidate.is_empty() {
-            return Err(ApiHttpError::bad_request(
-                "If-None-Match must be `*` or a comma-separated entity-tag list",
-            ));
-        }
-        if candidate == "*" {
-            return Err(ApiHttpError::bad_request(
-                "If-None-Match must be `*` or a comma-separated entity-tag list",
-            ));
-        }
         let opaque = candidate.strip_prefix("W/").unwrap_or(candidate);
-        if opaque.starts_with("w/") || candidate.starts_with("w/") {
-            return Err(ApiHttpError::bad_request(
-                "If-None-Match must be `*` or a comma-separated entity-tag list",
-            ));
-        }
         if !(opaque.starts_with('"') && opaque.ends_with('"') && opaque.len() >= 2) {
             return Err(ApiHttpError::bad_request(
                 "If-None-Match must be `*` or a comma-separated entity-tag list",
@@ -752,11 +737,7 @@ pub(crate) async fn read_artifact(
         .map_err(ApiHttpError::from_api)?;
     let strong_etag = format!("\"{}\"", artifact.sha256);
     let precondition = parse_if_none_match(&headers)?;
-    let not_modified = match &precondition {
-        IfNoneMatch::Absent => false,
-        IfNoneMatch::Star => true,
-        IfNoneMatch::Tags(tags) => tags.iter().any(|tag| tag == &artifact.sha256),
-    };
+    let not_modified = if_none_match_matches(&precondition, &artifact.sha256);
 
     // Bound before allocating and verify from the opened description. The
     // response is built from this byte snapshot, not a later read of the

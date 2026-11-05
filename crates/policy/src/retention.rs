@@ -38,13 +38,10 @@ impl RetentionPolicy {
     /// Errors name the offending variable and carry no prefix of their own:
     /// each caller adds the context its own surface needs.
     pub fn from_env() -> Result<Self, String> {
-        let keep = parse_positive_env("GC_KEEP", DEFAULT_GC_KEEP)?;
-        let keep_failed = parse_positive_env("GC_KEEP_FAILED", DEFAULT_GC_KEEP_FAILED)?;
-        let max_scan_entries = directory_scan_limit_from_env()?;
         Ok(Self {
-            keep,
-            keep_failed,
-            max_scan_entries,
+            keep: parse_positive_env("GC_KEEP", DEFAULT_GC_KEEP)?,
+            keep_failed: parse_positive_env("GC_KEEP_FAILED", DEFAULT_GC_KEEP_FAILED)?,
+            max_scan_entries: directory_scan_limit_from_env()?,
         })
     }
 
@@ -54,12 +51,8 @@ impl RetentionPolicy {
     /// overrides the environment and never silently replaces it with a
     /// default.
     pub fn with_counts(mut self, keep: Option<usize>, keep_failed: Option<usize>) -> Self {
-        if let Some(keep) = keep {
-            self.keep = keep;
-        }
-        if let Some(keep_failed) = keep_failed {
-            self.keep_failed = keep_failed;
-        }
+        self.keep = keep.unwrap_or(self.keep);
+        self.keep_failed = keep_failed.unwrap_or(self.keep_failed);
         self
     }
 }

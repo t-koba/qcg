@@ -38,12 +38,9 @@ pub(crate) fn gc_runs(
         delete,
         policy.max_scan_entries,
     )?;
+    let action = if delete { "deleted" } else { "would_delete" };
     for path in selected {
-        if delete {
-            println!("deleted {path}");
-        } else {
-            println!("would_delete {path}");
-        }
+        println!("{action} {path}");
     }
     Ok(())
 }
