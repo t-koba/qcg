@@ -146,7 +146,14 @@ indeterminate operation or bypasses Started/Repeat policy.
   code can run before `AssignProcessToJobObject`; descendants created in that
   window are not retroactively enrolled. The guard can terminate job members
   after attachment, but does not prove whole-tree cancellation or crash cleanup.
-  Host MCP does not attach its Windows child to the command Job Object.
+  Host MCP does not attach its Windows child to the command Job Object. Its
+  trusted-host stdio path uses Tokio `Command` with `kill_on_drop(true)`;
+  `BoundedChildTransport` sets a process group only under `cfg(unix)` and has
+  no Windows Job Object attachment. That drop policy covers normal Rust-side
+  cleanup, not qcg death: abrupt termination does not run `Drop`, and Windows
+  [does not terminate child processes when their parent exits](https://learn.microsoft.com/en-us/windows/win32/procthread/terminating-a-process).
+  No whole-tree crash cleanup is claimed for Windows MCP; retain the existing
+  unresolved-operation and `Started`-evidence policy.
 
   The Windows API supports creation-time job assignment through
   `PROC_THREAD_ATTRIBUTE_JOB_LIST` (Windows 10 version 1703 and Windows Server
