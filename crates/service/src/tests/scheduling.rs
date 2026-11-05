@@ -4,7 +4,6 @@ use crate::*;
 use api::{RunStatus, StartRun};
 use camino::Utf8Path;
 use std::time::{Duration, Instant};
-use tokio::sync::oneshot;
 
 fn generator(root: &Utf8Path, id: &str, delay: &str) {
     let dir = root.join(id);
@@ -91,124 +90,175 @@ async fn operation_started(service: &LocalService, id: &str) {
     .unwrap();
 }
 
-async fn wait_for_test_queue_slot(
+async fn launch_queue_probe(
     service: &LocalService,
-    run_id: &str,
-    waiting: Option<oneshot::Sender<()>>,
-) -> crate::queue::Permit {
-    let mut waiting = waiting;
-    loop {
-        let mut notified = Box::pin(service.inner.queue_notify.notified());
-        notified.as_mut().enable();
-        let head = {
-            let runs = service.inner.runs.read().await;
-            crate::queue::queue_head(&runs)
+    root: &Utf8Path,
+    direct: bool,
+    name: &str,
+    tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+    cancellation: &tokio_util::sync::CancellationToken,
+) {
+    if direct {
+        let service = service.clone();
+        let run = DirectRun {
+            generator_path: root.join("probe"),
+            output_dir: root.join(name),
+            inputs: Default::default(),
+            answers: Default::default(),
+            confirmations: Default::default(),
+            json_events: false,
+            interactive: false,
+            llm_seed_override: None,
+            cancellation: cancellation.clone(),
         };
-        if head.as_deref() == Some(run_id)
-            && let Some(permit) = crate::queue::PriorityPermits::try_take(
-                &service.inner.execution_permits,
-                service.inner.queue_notify.clone(),
-            )
-        {
-            return permit;
-        }
-        if let Some(waiting) = waiting.take() {
-            let _ = waiting.send(());
-        }
-        notified.await;
+        tasks.push(tokio::spawn(async move {
+            // Cancellation during cleanup is expected, but a panic is not.
+            let _ = service.run_generator_path_with_events(run).await;
+        }));
+    } else {
+        start(service, "probe", 0).await;
     }
 }
 
-#[tokio::test]
-async fn advancing_queue_head_wakes_waiters_to_use_spare_slots() {
+async fn gated_step_events(
+    service: &LocalService,
+    run_dir: &Utf8Path,
+    workspace: &Utf8Path,
+) -> tokio::sync::broadcast::Receiver<api::RunEvent> {
+    std::fs::create_dir_all(workspace).unwrap();
+    let fifo = std::ffi::CString::new(workspace.join("gate").as_str()).unwrap();
+    // The command cannot complete until cleanup cancels it. No polling or
+    // timing threshold is used to keep the earlier run's permit occupied.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    service.inner.runs.read().await[run_dir.file_name().unwrap()]
+        .events
+        .subscribe()
+}
+
+async fn engine_step_started(events: &mut tokio::sync::broadcast::Receiver<api::RunEvent>) {
+    loop {
+        let event = events.recv().await.unwrap();
+        if matches!(event.data, api::RunEventData::StepStarted(_)) {
+            assert_eq!(event.path.as_ref().unwrap().as_str(), "blocked");
+            return;
+        }
+    }
+}
+
+async fn queue_head_wakes_successor(direct: bool) {
+    use futures_util::FutureExt;
     let root = temp_run_dir("queue-head-advance-notifies");
     let _temp = TempGuard(root.clone());
-    generator(&root, "unused", "0.1");
+    std::fs::create_dir_all(root.join("probe")).unwrap();
+    std::fs::write(root.join("probe").join(contract::MANIFEST_FILE), r#"
+[generator]
+id = "probe"
+name = "Queue notification probe"
+version = "0.1.0"
+[[flow]]
+id = "blocked"
+type = "command"
+[flow.params]
+command = ["sh", "-c", "read value < gate"]
+[permissions]
+fs_read = ["workspace"]
+fs_write = ["workspace"]
+network = []
+side_effects = "allowed"
+side_effects_scope = "invocation"
+commands = [{ bin = "sh", args = ["-c", "read value < gate"], purpose = "cancellable gate", isolation = "trusted_host" }]
+[permissions.containers]
+enabled = false
+[runtime]
+command_timeout_seconds = 60
+"#).unwrap();
+    let service = service_with_capacity(&root, ServiceDeploymentPolicy::default(), 2);
+    let probe = QueueProbe(root.clone());
+    let mut tasks = Vec::new();
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    // Catch assertion failures as well as timeouts so every exit releases
+    // rendezvous senders, cancels engine gates and joins direct owners.
+    let result =
+        std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(5), async {
+            let (head_admitted, release_head) = probe.gate("admitted");
+            launch_queue_probe(&service, &root, direct, "first", &mut tasks, &cancellation).await;
+            let head = head_admitted.await.unwrap();
+            let head_workspace = if direct {
+                root.join("first")
+            } else {
+                run_workspace_dir(&head)
+            };
+            let mut head_events = gated_step_events(&service, &head, &head_workspace).await;
 
-    let prior = synthetic_hitl_record(&root.join("fixture"), "prior");
-    let mut first = prior.clone();
-    let mut second = prior.clone();
-    let mut third = prior.clone();
-    let mut prior = prior;
-    prior.state = RunStatus::Running;
-    let queued_at = chrono::Utc::now();
-    first.priority = 30;
-    first.queued_at = Some(queued_at);
-    second.priority = 20;
-    second.queued_at = Some(queued_at + chrono::Duration::milliseconds(1));
-    third.priority = 10;
-    third.queued_at = Some(queued_at + chrono::Duration::milliseconds(2));
-
-    // One slot represents a run that remains active. The remaining three
-    // let the head and both successors proceed without releasing that slot.
-    let service = service_with_capacity(&root, ServiceDeploymentPolicy::default(), 4);
-    let _prior_permit = crate::queue::PriorityPermits::try_take(
-        &service.inner.execution_permits,
-        service.inner.queue_notify.clone(),
-    )
-    .expect("prior run should occupy one slot");
-    {
-        let mut runs = service.inner.runs.write().await;
-        runs.insert("prior".into(), prior);
-        runs.insert("first".into(), first);
-        runs.insert("second".into(), second);
-        runs.insert("third".into(), third);
+            let (successor_waiting, release_waiter) = probe.gate("waiting");
+            launch_queue_probe(&service, &root, direct, "second", &mut tasks, &cancellation).await;
+            let successor = successor_waiting.await.unwrap();
+            let successor_workspace = if direct {
+                root.join("second")
+            } else {
+                run_workspace_dir(&successor)
+            };
+            let mut successor_events =
+                gated_step_events(&service, &successor, &successor_workspace).await;
+            {
+                let runs = service.inner.runs.read().await;
+                assert_eq!(runs[head.file_name().unwrap()].state, RunStatus::Queued);
+                assert_eq!(
+                    runs[successor.file_name().unwrap()].state,
+                    RunStatus::Queued
+                );
+                assert_eq!(crate::queue::queue_head(&runs).as_deref(), head.file_name());
+            }
+            // The successor has already created its production Notified future
+            // and failed the head check. No test-side queue notification occurs.
+            release_waiter.send(()).unwrap();
+            release_head.send(()).unwrap();
+            engine_step_started(&mut head_events).await;
+            engine_step_started(&mut successor_events).await;
+            let runs = service.inner.runs.read().await;
+            assert_eq!(runs[head.file_name().unwrap()].state, RunStatus::Running);
+            assert_eq!(
+                runs[successor.file_name().unwrap()].state,
+                RunStatus::Running
+            );
+            assert_eq!(crate::queue::queue_head(&runs), None);
+            assert!(
+                crate::queue::PriorityPermits::try_take(
+                    &service.inner.execution_permits,
+                    service.inner.queue_notify.clone()
+                )
+                .is_none(),
+                "both engine steps must still hold their permits"
+            );
+        }))
+        .catch_unwind()
+        .await;
+    cancellation.cancel();
+    let shutdown = service.shutdown_active_runs().await;
+    for mut task in tasks {
+        match tokio::time::timeout(Duration::from_secs(3), &mut task).await {
+            Ok(joined) => joined.unwrap(),
+            Err(error) => {
+                task.abort();
+                let _ = task.await;
+                panic!("direct owner did not stop after cancellation: {error}");
+            }
+        }
     }
+    shutdown.unwrap();
+    result
+        .unwrap()
+        .expect("successor must start before the head releases its permit");
+}
 
-    let (second_waiting, second_ready) = oneshot::channel();
-    let second_service = service.clone();
-    let second_waiter = tokio::spawn(async move {
-        wait_for_test_queue_slot(&second_service, "second", Some(second_waiting)).await
-    });
-    let (third_waiting, third_ready) = oneshot::channel();
-    let third_service = service.clone();
-    let third_waiter = tokio::spawn(async move {
-        wait_for_test_queue_slot(&third_service, "third", Some(third_waiting)).await
-    });
-    tokio::time::timeout(Duration::from_secs(2), async {
-        second_ready.await.expect("second waiter should be queued");
-        third_ready.await.expect("third waiter should be queued");
-    })
-    .await
-    .expect("successors should wait behind the head");
+#[tokio::test]
+async fn api_advancing_queue_head_wakes_waiters_to_use_spare_slots() {
+    queue_head_wakes_successor(false).await;
+}
 
-    let _first_permit = wait_for_test_queue_slot(&service, "first", None).await;
-    {
-        let mut runs = service.inner.runs.write().await;
-        runs.get_mut("first").expect("head should exist").state = RunStatus::Running;
-    }
-    // The first run still owns its permit. Advancing its status must wake the
-    // next queued run even though no permit was returned to the pool.
-    service.inner.queue_notify.notify_waiters();
-
-    let _second_permit = tokio::time::timeout(Duration::from_secs(2), second_waiter)
-        .await
-        .expect("second run should use a spare slot before the prior run ends")
-        .expect("second waiter should not panic");
-    {
-        let mut runs = service.inner.runs.write().await;
-        runs.get_mut("second")
-            .expect("second run should exist")
-            .state = RunStatus::Running;
-    }
-    service.inner.queue_notify.notify_waiters();
-
-    let _third_permit = tokio::time::timeout(Duration::from_secs(2), third_waiter)
-        .await
-        .expect("third run should use the final spare slot")
-        .expect("third waiter should not panic");
-    {
-        let mut runs = service.inner.runs.write().await;
-        runs.get_mut("third").expect("third run should exist").state = RunStatus::Running;
-    }
-    service.inner.queue_notify.notify_waiters();
-    let runs = service.inner.runs.read().await;
-    assert!(
-        ["prior", "first", "second", "third"]
-            .iter()
-            .all(|id| runs[*id].state == RunStatus::Running)
-    );
-    assert_eq!(crate::queue::queue_head(&runs), None);
+#[tokio::test]
+async fn direct_advancing_queue_head_wakes_waiters_to_use_spare_slots() {
+    queue_head_wakes_successor(true).await;
 }
 
 #[tokio::test]

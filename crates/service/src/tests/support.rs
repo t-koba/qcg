@@ -628,3 +628,56 @@ pub(crate) async fn pause_suspension_commit(run_dir: &Utf8Path) {
         let _ = resume.await;
     }
 }
+
+// Path-scoped, one-shot checkpoints; dropping the probe removes unused gates.
+type QueueGate = (
+    tokio::sync::oneshot::Sender<Utf8PathBuf>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+static QUEUE_GATES: std::sync::LazyLock<Mutex<BTreeMap<(Utf8PathBuf, &'static str), QueueGate>>> =
+    std::sync::LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+pub(crate) struct QueueProbe(pub(crate) Utf8PathBuf);
+impl QueueProbe {
+    pub(crate) fn gate(
+        &self,
+        phase: &'static str,
+    ) -> (
+        tokio::sync::oneshot::Receiver<Utf8PathBuf>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached, observed) = tokio::sync::oneshot::channel();
+        let (release, resume) = tokio::sync::oneshot::channel();
+        assert!(
+            QUEUE_GATES
+                .lock()
+                .unwrap()
+                .insert((self.0.clone(), phase), (reached, resume))
+                .is_none()
+        );
+        (observed, release)
+    }
+}
+impl Drop for QueueProbe {
+    fn drop(&mut self) {
+        QUEUE_GATES
+            .lock()
+            .unwrap()
+            .retain(|(root, _), _| root != &self.0);
+    }
+}
+
+pub(crate) async fn queue_checkpoint(run_dir: &Utf8Path, phase: &'static str) {
+    let gate = {
+        let mut gates = QUEUE_GATES.lock().unwrap();
+        let key = gates
+            .keys()
+            .find(|(root, point)| run_dir.starts_with(root) && *point == phase)
+            .cloned();
+        key.and_then(|key| gates.remove(&key))
+    };
+    if let Some((reached, resume)) = gate {
+        let _ = reached.send(run_dir.to_owned());
+        let _ = resume.await;
+    }
+}

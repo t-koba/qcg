@@ -1389,9 +1389,8 @@ impl LocalService {
                     tracing::error!(run_id = %run_id, %error, "cancel drain failed; refusing to start execution");
                     return;
                 }
-                // Only the queue head takes each freed slot; priorities preserve
-                // order, equal priorities remain FIFO, and cancellation aborts.
-                // Notify before checking state to prevent a lost wakeup (A11).
+                // Queue-head admission preserves priority/FIFO; register Notify
+                // before checking state to prevent a lost wakeup (A11).
                 let _permit = loop {
                     let notified = queue_notify.notified();
                     // A peer cancel observed while queued settles without ever
@@ -1429,6 +1428,8 @@ impl LocalService {
                     {
                         break permit;
                     }
+                    #[cfg(test)]
+                    crate::tests::support::queue_checkpoint(&run_dir, "waiting").await;
                     tokio::select! {
                         _ = cancellation.cancelled() => {
                             service
@@ -1439,6 +1440,8 @@ impl LocalService {
                         _ = notified => continue,
                     }
                 };
+                #[cfg(test)]
+                crate::tests::support::queue_checkpoint(&run_dir, "admitted").await;
                 let (package_state, journaled) = {
                     let mut runs = service.inner.runs.write().await;
                     let Some(record) = runs.get_mut(&run_id) else {
@@ -1538,8 +1541,7 @@ impl LocalService {
                     record.owner_id = service.inner.owner_id.clone();
                     (package_state, journaled)
                 };
-                // Advancing the queue head may expose a spare slot; wake
-                // waiters only after releasing the run-map write lock.
+                // Wake spare-slot waiters after releasing the run-map write lock.
                 service.inner.queue_notify.notify_waiters();
                 // Verify after queue delay and reload only the derived snapshot.
                 // Never execute the installed package, even if the snapshot vanished.
@@ -1788,9 +1790,7 @@ impl LocalService {
             &metadata_dir,
         )?;
         warn_if_shared_runs_dir_owned(&run.output_dir);
-        // Unified scheduler: direct executions register an ephemeral Queued
-        // record so the same queue_head ordering governs API and direct runs.
-        // Priority 0, FIFO by admission; removed on completion.
+        // Ephemeral direct records share API queue order: priority 0, FIFO.
         let (events, mut receiver) =
             broadcast::channel(self.inner.deployment_policy.live_event_channel_capacity);
         let ephemeral_dir = run_dir.to_owned();
@@ -1848,9 +1848,9 @@ impl LocalService {
             {
                 break permit;
             }
-            // Direct runs never preempt API runs; they wait for head.
-            // Shutdown ends the wait instead of hanging the direct caller
-            // past the drain (E05).
+            #[cfg(test)]
+            crate::tests::support::queue_checkpoint(run_dir, "waiting").await;
+            // Direct runs wait without preempting; shutdown ends the wait (E05).
             tokio::select! {
                 _ = shutdown => {
                     return Err(ApiError::Unavailable {
@@ -1860,6 +1860,8 @@ impl LocalService {
                 _ = notified => continue,
             }
         };
+        #[cfg(test)]
+        crate::tests::support::queue_checkpoint(run_dir, "admitted").await;
         {
             let mut runs = self.inner.runs.write().await;
             if let Some(record) = runs.get_mut(&run_id) {
@@ -1902,9 +1904,7 @@ impl LocalService {
                     llm_seed_override: run.llm_seed_override,
                     run_refs: run_refs.clone(),
                     cancellation: run.cancellation.clone(),
-                    // Direct executions observe the service drain like
-                    // spawned runs: a shutdown mid-run ends the wait
-                    // instead of overrunning it (E05).
+                    // Direct executions also stop at the service drain (E05).
                     shutdown: Some(self.shutdown_token()),
                     scheduler_yield: tokio_util::sync::CancellationToken::new(),
                 },
