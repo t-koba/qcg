@@ -56,6 +56,10 @@ pub struct ServiceDeploymentPolicy {
     pub gc_keep_failed: usize,
     /// Seconds between automatic retention sweeps.
     pub gc_interval_secs: u64,
+    /// Attempts per retention pass, including the first; must be nonzero.
+    pub gc_retry_attempts: u32,
+    /// Delay between failed attempts, in milliseconds; zero retries immediately.
+    pub gc_retry_delay_ms: u32,
     /// Deployment cap on parallel wave scheduling. `None` uses the CPU
     /// count.
     pub max_parallel_steps: Option<usize>,
@@ -88,6 +92,8 @@ impl Default for ServiceDeploymentPolicy {
             gc_keep: policy::DEFAULT_GC_KEEP,
             gc_keep_failed: policy::DEFAULT_GC_KEEP_FAILED,
             gc_interval_secs: policy::DEFAULT_GC_INTERVAL_SECS,
+            gc_retry_attempts: 3,
+            gc_retry_delay_ms: 200,
             max_parallel_steps: None,
             parallel_compatibility: policy::scheduling::ParallelCompatibility::default(),
             live_event_channel_capacity: policy::LIVE_EVENT_CHANNEL_CAPACITY,

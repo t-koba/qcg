@@ -306,6 +306,15 @@ qcg runs gc --runs-dir /var/lib/qcg/runs --keep 50
 qcg runs gc --runs-dir /var/lib/qcg/runs --keep 50 --keep-failed 10 --delete
 ```
 
+The service retention task resolves `GC_RETRY_ATTEMPTS` (default `3`, range
+`1..=4294967295`, including the first attempt) and `GC_RETRY_DELAY_MS` (default
+`200`, range `0..=4294967295` milliseconds) once at server boot into frozen
+policy; invalid values refuse boot. Delay zero retries immediately. Failures
+sleep only between attempts, never after the final failure; exhaustion ends the
+task with an error surfaced at shutdown. Maintenance-lock contention is a
+successful skip, not a retry. These settings do not change manual or pre-run
+sweep selection.
+
 GC never removes a non-terminal run. The first command is a dry run.
 
 Retention is bounded by the count budgets and, when the contract declared

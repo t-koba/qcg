@@ -86,10 +86,7 @@ impl Drop for RemoveEphemeralOnDrop {
 }
 
 impl LocalService {
-    /// Constructor that takes deployment policy up front so hosts never race
-    /// a post-construction setter against recovery execution (E04). Policy
-    /// is frozen into the service before it is returned: no recovery or
-    /// resident task can observe a half-configured service.
+    /// Freezes deployment policy before recovery or resident tasks can see it (E04).
     pub fn with_generator_roots_policy_and_store_mode(
         generator_roots: Vec<Utf8PathBuf>,
         runs_dir: Utf8PathBuf,
@@ -110,11 +107,8 @@ impl LocalService {
         )
     }
 
-    /// Shared construction core: validates limits, acquires the store lock,
-    /// rehydrates, and freezes the deployment policy in one step. The older
-    /// 6-argument constructor below delegates with the default policy; the
-    /// policy constructor above delegates with the host policy. Neither
-    /// exposes a half-built service (E04).
+    /// Shared construction core: validates limits, locks, rehydrates, and freezes
+    /// the deployment policy atomically for both constructors (E04).
     ///
     /// Host ordering contract (E04): construction performs lock plus
     /// directory creation plus rehydration only, and starts no resident
@@ -132,6 +126,11 @@ impl LocalService {
         run_store_mode: RunStoreMode,
         policy: ServiceDeploymentPolicy,
     ) -> Result<Self, ServiceError> {
+        if policy.gc_retry_attempts == 0 {
+            return Err(ServiceError::Invalid(
+                "gc_retry_attempts must be nonzero".into(),
+            ));
+        }
         if max_active_runs == 0 {
             return Err(ServiceError::Invalid(
                 "max_active_runs must be greater than zero".into(),
@@ -258,20 +257,16 @@ impl LocalService {
         }
     }
 
-    /// Starts the retention GC unconditionally. Hosts decide enablement via
-    /// configuration (for example `AUTO_GC`) before calling, so the
-    /// service never reinterprets environment policy internally (3.2).
-    /// Each pass retries transient failures boundedly and the task ends
-    /// with Err when the bound is exceeded, so a wedged store surfaces at
-    /// shutdown instead of looping silently as Ok forever (E05).
+    /// Starts retention GC; the host decides enablement (e.g. `AUTO_GC`).
+    /// Frozen deployment policy bounds retries; exhaustion ends the task with
+    /// Err, surfacing a wedged store at shutdown instead of hiding it (E05).
     pub fn start_retention_gc(
         &self,
         shutdown: CancellationToken,
     ) -> Option<JoinHandle<Result<(), ServiceError>>> {
         let service = self.clone();
         Some(tokio::spawn(async move {
-            // The first pass is cancellable too: a service that starts
-            // during shutdown must not run an uncancellable GC sweep (E05).
+            // Startup sweeps must also be cancellable during shutdown (E05).
             let first = tokio::select! {
                 _ = shutdown.cancelled() => return Ok(()),
                 result = service.collect_retained_runs_with_retry() => result,
@@ -297,30 +292,29 @@ impl LocalService {
         }))
     }
 
-    /// A GC pass retries failures boundedly; lock contention skips normally.
-    /// Exhausted errors return Err so the task ends visibly instead of looping as Ok (E05).
+    /// Retry boundedly; contention skips normally, exhaustion ends visibly (E05).
     async fn collect_retained_runs_with_retry(&self) -> Result<(), ServiceError> {
         #[cfg(test)]
         crate::retention_gc_test_hooks::record_pass();
-        let mut last_error = None;
-        for _ in 0..3 {
-            match self.collect_retained_runs().await {
+        // Construction freezes both the attempt budget and the inter-attempt delay.
+        let policy = &self.inner.deployment_policy;
+        for attempt in 1..=policy.gc_retry_attempts {
+            let result = self.collect_retained_runs().await;
+            #[cfg(test)]
+            crate::retention_gc_test_hooks::record_attempt();
+            match result {
                 Ok(()) => return Ok(()),
+                Err(error) if attempt == policy.gc_retry_attempts => return Err(error),
                 Err(error) => {
-                    tracing::warn!(%error, "run retention pass failed; retrying");
-                    last_error = Some(error);
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    tracing::warn!(%error, attempt, "run retention pass failed; retrying");
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        policy.gc_retry_delay_ms.into(),
+                    ))
+                    .await;
                 }
             }
         }
-        // The loop above returns on the first success, so reaching here
-        // means all three attempts failed and a last error exists (E03).
-        match last_error {
-            Some(error) => Err(error),
-            None => Err(ServiceError::Invalid(
-                "run retention failed without a recorded error".into(),
-            )),
-        }
+        unreachable!("construction validates nonzero gc_retry_attempts")
     }
 
     /// Refreshes the external model catalog in the background while the

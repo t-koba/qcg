@@ -71,19 +71,10 @@ pub async fn serve_with_resolved_policy(
 /// refused boot leaves no occupied port behind (E04). `serve_*` re-runs
 /// the same check after bind as defense in depth for direct callers that
 /// skip pre-validation; the pre-bind call is what keeps the port free.
-/// Port-free refusal holds only on that path (E04): `serve_with_listener`
-/// takes an already-bound listener, so a post-bind refusal still holds
-/// the port — pre-validate before bind when port occupation matters.
-/// Service construction (lock + directories) happens before router build,
-/// but no resident task or recovery runs until the router succeeds, so a
-/// router failure drops the service with its lock released and zero
-/// recovered side effects (E04).
-/// Deployment policy resolved once per boot from flags and the environment.
-/// Resolving once (instead of validating strings first and re-reading the
-/// environment later) keeps validation and use on the same values even if
-/// the environment changes mid-boot (E04). Every `ServerConfig` field is
-/// validated here with explicit fail-closed bounds: a refused boot leaves
-/// no occupied port, no lock, and no recovery behind (E04).
+/// Resolve before binding for port-free refusal (`serve_with_listener` is already bound).
+/// Construction locks/creates directories; recovery and resident tasks start
+/// only after router success; failure releases the lock without recovered effects.
+/// Freeze flag/environment policy and check bounds before lock/port/recovery (E04).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedServerPolicy {
     pub container_timeouts: policy::ContainerTimeouts,
@@ -99,22 +90,19 @@ pub struct ResolvedServerPolicy {
     pub elapsed_budget_mode: policy::ElapsedBudgetMode,
     pub preemption_mode: policy::PreemptionMode,
     pub preemption_queue_position: policy::PreemptionQueuePosition,
-    /// Deployment HTTP rate limit resolved at boot (E04 freeze). `None`
-    /// leaves the server unthrottled; `Some` installs one shared
-    /// anonymous/instance bucket plus one bucket per trusted identity header
-    /// value and one for verified identity (F10), never one bucket per
-    /// unverified presented string.
+    /// Frozen rate limit: None is unthrottled; Some buckets anonymous/trusted identities only.
     pub rate_limit: Option<RateLimitPolicy>,
     /// Deployment audit floor resolved at boot (E04 freeze).
     pub audit_floor: policy::AuditFloor,
-    /// Resident OTLP export resolved at boot (E04 freeze). `None` disables
-    /// export entirely.
+    /// Frozen resident OTLP export; `None` disables it.
     pub otlp: Option<super::otlp::OtlpConfig>,
     /// Retention sweep policy resolved at boot (E04 freeze).
     pub gc_keep: usize,
     pub gc_keep_failed: usize,
     pub gc_interval_secs: u64,
-    /// Deployment cap on parallel wave scheduling; `None` uses the CPU count.
+    pub gc_retry_attempts: u32,
+    pub gc_retry_delay_ms: u32,
+    /// Parallel wave cap; `None` uses the CPU count.
     pub max_parallel_steps: Option<usize>,
     /// Metrics cardinality policy resolved at boot (E04 freeze).
     pub metrics_policy: super::middleware::MetricsPolicy,
@@ -182,9 +170,7 @@ pub fn resolve_server_policy_with_container_timeouts(
     let preemption_mode = policy::PreemptionMode::from_env("PREEMPTION_MODE")?;
     let preemption_queue_position =
         policy::PreemptionQueuePosition::from_env("PREEMPTION_QUEUE_POSITION")?;
-    // Rate limit: strict positive integers only, never a silent fold. Unset
-    // rps disables the layer; every other invalid or incomplete combination
-    // refuses boot (E04).
+    // Unset rps disables rate limiting; invalid/incomplete combinations refuse boot.
     let rate_limit = super::rate_limit::resolve_rate_limit_policy()
         .map_err(|detail| format!("invalid rate limit configuration: {detail}"))?;
     let metrics_policy = super::middleware::resolve_metrics_policy()
@@ -204,9 +190,21 @@ pub fn resolve_server_policy_with_container_timeouts(
         policy::MIN_JOURNAL_POLL_INTERVAL_MILLIS,
         policy::MAX_JOURNAL_POLL_INTERVAL_MILLIS,
     )?;
-    // Retention sweep policy: one budget resolved from one place, so every
-    // sweep path keeps the same counts and the same store scan bound.
+    // All sweep paths share one resolved retention count/scan budget.
     let retention = policy::RetentionPolicy::from_env()?;
+    let gc_defaults = service::ServiceDeploymentPolicy::default();
+    let gc_retry_attempts = policy::parse_bounded_env(
+        "GC_RETRY_ATTEMPTS",
+        gc_defaults.gc_retry_attempts.into(),
+        1,
+        u32::MAX.into(),
+    )? as u32;
+    let gc_retry_delay_ms = policy::parse_bounded_env(
+        "GC_RETRY_DELAY_MS",
+        gc_defaults.gc_retry_delay_ms.into(),
+        0,
+        u32::MAX.into(),
+    )? as u32;
     let shared_store_rescan_secs = policy::parse_bounded_env(
         "SHARED_RESCAN_SECS",
         policy::DEFAULT_STORE_RESCAN_SECS,
@@ -368,6 +366,8 @@ pub fn resolve_server_policy_with_container_timeouts(
         gc_keep: retention.keep,
         gc_keep_failed: retention.keep_failed,
         gc_interval_secs,
+        gc_retry_attempts,
+        gc_retry_delay_ms,
         max_parallel_steps,
         live_event_channel_capacity,
         journal_poll_interval_millis,
@@ -385,11 +385,8 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
     listener: tokio::net::TcpListener,
     shutdown_deadline: std::time::Duration,
 ) -> Result<SocketAddr> {
-    // The listener is already bound by the caller: local_addr is a pure
-    // query with no new port occupation. The main path resolved before bind
-    // (keeping refused boots from occupying the port); this resolved path
-    // never re-reads the environment, so the frozen policy is authoritative
-    // even if the environment changed after bind (E04 single freeze).
+    // The caller already bound the listener; local_addr occupies no new port.
+    // Frozen policy stays authoritative without re-reading the environment (E04).
     let actual_addr = listener.local_addr()?;
     // The frozen policy was validated before the service is created: a
     // misconfigured boot fails before acquiring the run-store lock or
@@ -420,6 +417,8 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
         gc_keep,
         gc_keep_failed,
         gc_interval_secs,
+        gc_retry_attempts,
+        gc_retry_delay_ms,
         max_parallel_steps,
         live_event_channel_capacity,
         journal_poll_interval_millis,
@@ -462,8 +461,7 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
     );
     let mut roots = vec![config.generators_dir.clone()];
     roots.extend(config.extra_generators_dirs.clone());
-    // Deployment policy enters through the constructor, never through
-    // post-construction setters that could race recovery execution (E04).
+    // Construct with frozen policy; post-construction setters could race recovery (E04).
     let service = LocalService::with_generator_roots_policy_and_store_mode(
         roots,
         config.runs_dir.clone(),
@@ -483,6 +481,8 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
             gc_keep,
             gc_keep_failed,
             gc_interval_secs,
+            gc_retry_attempts,
+            gc_retry_delay_ms,
             max_parallel_steps,
             parallel_compatibility: Default::default(),
             live_event_channel_capacity,
@@ -2385,6 +2385,8 @@ command = ["sh", "-c", "sleep 30"]"#,
         ] {
             unset(variable);
         }
+        unset("GC_RETRY_ATTEMPTS");
+        unset("GC_RETRY_DELAY_MS");
         let policy = resolve_server_policy(&config).expect("defaults should resolve");
         assert_eq!(
             policy.live_event_channel_capacity,
@@ -2402,6 +2404,34 @@ command = ["sh", "-c", "sleep 30"]"#,
             policy.queued_resumer_secs,
             policy::DEFAULT_QUEUED_RESUMER_SECS
         );
+        assert_eq!(policy.gc_retry_attempts, 3);
+        assert_eq!(policy.gc_retry_delay_ms, 200);
+        for (name, invalid) in [
+            (
+                "GC_RETRY_ATTEMPTS",
+                vec!["0", "-1", "", "1.5", "no", "4294967296"],
+            ),
+            (
+                "GC_RETRY_DELAY_MS",
+                vec!["-1", "", "1.5", "no", "4294967296"],
+            ),
+        ] {
+            for value in invalid {
+                set(name, value);
+                let error = resolve_server_policy(&config).unwrap_err();
+                assert!(error.contains(name), "{error}");
+            }
+            unset(name);
+        }
+        for (attempts, delay_ms) in [(1, 0), (7, 1234), (u32::MAX, u32::MAX)] {
+            set("GC_RETRY_ATTEMPTS", &attempts.to_string());
+            set("GC_RETRY_DELAY_MS", &delay_ms.to_string());
+            let frozen = resolve_server_policy(&config).unwrap();
+            unset("GC_RETRY_ATTEMPTS");
+            unset("GC_RETRY_DELAY_MS");
+            assert_eq!(frozen.gc_retry_attempts, attempts);
+            assert_eq!(frozen.gc_retry_delay_ms, delay_ms);
+        }
         assert_eq!(policy.shutdown_drain.as_secs(), 30);
         assert_eq!(policy.shutdown_settle.as_secs(), 150);
         assert_eq!(policy.shutdown_task_grace.as_secs(), 5);

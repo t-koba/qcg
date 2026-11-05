@@ -470,8 +470,11 @@ path is unchanged. Only offline mocks have been tested, not real accounts. See
   separate `GC_KEEP_FAILED` count. A retention window recorded in a run's
   journal expires that run independently of the counts: a run past its window
   is collected even when the count budget would keep it, while a run inside
-  its window is still governed by the count budgets. Invalid or zero values
-  refuse boot.
+  its window is still governed by the count budgets. `GC_RETRY_ATTEMPTS`
+  (default `3`, range `1..=4294967295`, including the first attempt) and
+  `GC_RETRY_DELAY_MS` (default `200`, range `0..=4294967295`) configure only
+  the service-task retry budget and inter-attempt delay; zero delay retries
+  immediately. Invalid values or zero keep/attempt counts refuse boot.
 - `AUDIT_FLOOR=minimal|standard`: deployment audit floor. `standard`
   restores full observation-record persistence for every run regardless of the
   contract's `[audit]` policy; a floor can only raise persistence.
