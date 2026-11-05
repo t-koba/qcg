@@ -185,14 +185,16 @@ its in-flight blocking pass; joining that wrapper does not prove the pass ended.
 Each Ready publication first persists an expiry-index entry under that lock.
 The index identifies the exact publication, including a fresh publication UUID,
 so obsolete work cannot delete a replacement even if its generation restarts.
-While the completion marker is absent, each owner performs one locked legacy
-directory discovery. Enumeration is one-time and unbatched, but registration
-attempts (including the first batch) are limited to
-`IDEMPOTENCY_SWEEP_MAX_ENTRIES` legacy paths per pass, independently of expiry
-and temp cleanup. Unvisited and failed paths survive in a round-robin retry
-queue; incomplete enumeration may restart. A restart before completion discovers
-again. The marker is published only after every path resolves; observing a valid
-peer marker or publishing it releases the entire queue. Errors are warned for
+While the completion marker is absent, each owner streams legacy directory
+entries under the lock, inspecting at most `IDEMPOTENCY_SWEEP_MAX_ENTRIES`
+entries per pass (including ignored names), independently of expiry and temp
+cleanup. The directory cursor resumes across passes with constant-size retry
+state, rather than collecting paths. A failed entry ends that pass; later passes
+resume at the next entry so corrupt records cannot starve healthy ones. At EOF
+following a failure, discovery restarts to retry unresolved obligations. A restart
+before completion also begins a bounded traversal from the start.
+The marker is published only after a full successful traversal; observing a valid
+peer marker or publishing it releases the cursor. Errors are warned for
 retry; corrupt or foreign records require operator repair, never speculative
 deletion. With the marker present, maintenance traverses only bounded due index
 work, not all Ready files, including after restart. Retirement attempts are

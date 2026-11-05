@@ -1,16 +1,15 @@
-//! Idle, shared-lock expiry ownership. The on-disk radix index orders creation
-//! seconds, not deadlines: each peer applies its frozen TTL, even after restart.
+//! Idle shared-lock expiry ownership; peers apply their frozen TTL to indexed creation times.
 use super::*;
 use std::io::ErrorKind::{DirectoryNotEmpty, NotFound};
 use std::sync::{Arc, Mutex};
-use std::{collections::VecDeque, fs, time::Duration};
+use std::{fs, time::Duration};
 use tokio_util::sync::CancellationToken;
 #[derive(Debug)]
 pub(crate) struct IdempotencySweep {
     interval: Duration,
     max_entries: usize,
     temps: Mutex<Option<fs::ReadDir>>,
-    migration: Mutex<Option<VecDeque<Utf8PathBuf>>>,
+    migration: Mutex<Option<MigrationCursor>>,
     due: Mutex<DueCursor>,
 }
 impl Default for IdempotencySweep {
@@ -180,12 +179,15 @@ fn required_bytes(path: &camino::Utf8Path) -> Result<Vec<u8>, String> {
         BoundedRead::Unreadable(e) => Err(e),
     }
 }
-// Discover once per owner; batch registrations and round-robin failed paths.
-// Retain incomplete state until a peer or this owner durably completes migration.
+#[derive(Debug)]
+struct MigrationCursor {
+    entries: fs::ReadDir,
+    failed: bool,
+}
 fn migrate(
     runs: &Utf8PathBuf,
     stop: &CancellationToken,
-    pending: &mut Option<VecDeque<Utf8PathBuf>>,
+    pending: &mut Option<MigrationCursor>,
     budget: usize,
 ) -> Result<(), String> {
     let marker = idempotency_dir(runs).join(".expiry-complete");
@@ -200,40 +202,42 @@ fn migrate(
     }
     let temps = temp_dir(runs)?;
     if pending.is_none() {
-        let mut paths = VecDeque::new();
-        for entry in fs::read_dir(idempotency_dir(runs)).map_err(|e| e.to_string())? {
-            check_stop(stop)?;
-            if let Ok(path) = Utf8PathBuf::from_path_buf(entry.map_err(|e| e.to_string())?.path()) {
-                let name = path.file_name().unwrap();
-                if name.strip_suffix(".json").is_some_and(canonical_key_hash)
-                    || generated_temp(name)
-                {
-                    paths.push_back(path);
-                }
-            }
-        }
-        *pending = Some(paths);
+        *pending = Some(MigrationCursor {
+            entries: fs::read_dir(idempotency_dir(runs)).map_err(|e| e.to_string())?,
+            failed: false,
+        });
     }
-    let paths = pending.as_mut().unwrap();
-    let mut failure = None;
-    for _ in 0..budget.min(paths.len()) {
+    let cursor = pending.as_mut().unwrap();
+    for _ in 0..budget {
         check_stop(stop)?;
-        let path = paths.pop_front().unwrap();
-        if let Err(error) = discover(runs, &temps, &path) {
-            paths.push_back(path);
-            failure.get_or_insert(error);
+        let Some(entry) = cursor.entries.next() else {
+            if cursor.failed {
+                *pending = None;
+                return Err("expiry migration traversal failed; will rescan".into());
+            }
+            publish(runs, &marker, b"1")?;
+            *pending = None;
+            return Ok(());
+        };
+        #[cfg(test)]
+        tests::count_scanned_entry();
+        let result = entry.map_err(|e| e.to_string()).and_then(|entry| {
+            Utf8PathBuf::from_path_buf(entry.path())
+                .ok()
+                .map_or(Ok(()), |path| discover(runs, &temps, &path))
+        });
+        if let Err(error) = result {
+            cursor.failed = true;
+            return Err(error);
         }
     }
-    if !paths.is_empty() {
-        return Err(failure.unwrap_or_else(|| "expiry migration incomplete".into()));
-    }
-    check_stop(stop)?;
-    publish(runs, &marker, b"1")?;
-    *pending = None;
-    Ok(())
+    Err("expiry migration incomplete".into())
 }
 fn discover(runs: &Utf8PathBuf, temps: &Utf8PathBuf, path: &Utf8PathBuf) -> Result<(), String> {
     let name = path.file_name().unwrap();
+    if !(name.strip_suffix(".json").is_some_and(canonical_key_hash) || generated_temp(name)) {
+        return Ok(());
+    }
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -275,12 +279,8 @@ struct DueCursor {
     branches: Vec<(Utf8PathBuf, u8)>,
     leaf: Option<fs::ReadDir>,
 }
-// Sixteen hex levels are intrinsic to u64. Each budgeted traversal step reads
-// at most one leaf entry and probes one child or finishes one exhausted branch.
-// Both branch position and leaf iterator survive pass limits and damaged work.
-// Exhausted paths are pruning obligations too: publication can fail before
-// creating an entry. Retain position on removal/sync failure; later cycles
-// revisit nonempty paths without a separate tree scan.
+// The fixed 16-level radix bounds child probes; count probes, leaf entries, and
+// pruning attempts. Retain positions on failure to retry without rescanning.
 fn due_work(
     root: &Utf8PathBuf,
     cutoff: &str,
@@ -387,8 +387,36 @@ fn reap(runs: &Utf8PathBuf, work: &Utf8PathBuf, now: u64, ttl: Duration) -> Resu
 mod tests {
     use super::*;
 
+    thread_local! { static SCANNED_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+    pub(super) fn count_scanned_entry() {
+        SCANNED_ENTRIES.with(|n| n.set(n.get() + 1));
+    }
+    fn reset_scanned_entries() {
+        SCANNED_ENTRIES.with(|n| n.set(0));
+    }
+    fn scanned_entries() -> usize {
+        SCANNED_ENTRIES.with(std::cell::Cell::get)
+    }
+
     fn migrate(runs: &Utf8PathBuf, stop: &CancellationToken) -> Result<(), String> {
         super::migrate(runs, stop, &mut None, usize::MAX)
+    }
+
+    fn finish_migration(sweep: &IdempotencySweep, runs: &Utf8PathBuf, now: u64) {
+        // Enough for the current traversal and one retry after a repaired error.
+        let passes = fs::read_dir(idempotency_dir(runs)).unwrap().count() * 3 + 4;
+        for _ in 0..passes {
+            let _ = sweep.pass_at(
+                runs,
+                Duration::from_secs(10),
+                || Ok(now),
+                &CancellationToken::new(),
+            );
+            if idempotency_dir(runs).join(".expiry-complete").exists() {
+                return;
+            }
+        }
+        panic!("migration did not finish after repair");
     }
 
     fn runs() -> Utf8PathBuf {
@@ -442,22 +470,24 @@ mod tests {
         let stop = CancellationToken::new();
         let root = idempotency_dir(&runs).join(".expiry");
         let marker = idempotency_dir(&runs).join(".expiry-complete");
-        // Discovery may enumerate all six keys, but even the first pass may
-        // register only two. Keep all unvisited paths until their batch runs.
-        for remaining in [4, 2, 0] {
+        let mut indexed = 0;
+        for _ in 0..10 {
             let result = sweep.pass_at(&runs, ttl, || Ok(90), &stop);
-            if remaining > 0 {
-                assert!(result.is_err());
-            } else {
-                assert_eq!(result.unwrap(), 0);
-            }
-            let state = sweep.migration.lock().unwrap();
-            assert_eq!(state.as_ref().map_or(0, VecDeque::len), remaining);
-            assert_eq!(state.is_none(), remaining == 0);
-            assert_eq!(marker.exists(), remaining == 0);
-            assert_eq!(index_files(&root).len(), 6 - remaining);
+            let next = index_files(&root).len();
+            assert!(
+                next - indexed <= 2,
+                "registration shares the discovery bound"
+            );
+            indexed = next;
             assert!(old.iter().all(|p| p.exists()));
+            if marker.exists() {
+                assert_eq!(result.unwrap(), 0);
+                break;
+            }
+            assert!(result.is_err());
         }
+        assert!(marker.exists());
+        assert_eq!(indexed, 6);
         // A completed migration never re-reads unrelated Ready keys.
         let foreign = idempotency_dir(&runs).join(format!("{}.json", "a".repeat(64)));
         fs::write(&foreign, b"not json").unwrap();
@@ -483,6 +513,70 @@ mod tests {
         );
         assert!(index_files(&root).is_empty());
         assert_eq!(fs::read(&foreign).unwrap(), b"not json");
+        fs::remove_dir_all(runs).unwrap();
+    }
+
+    #[test]
+    fn large_legacy_directory_streams_one_entry_and_releases_admission_lock_per_pass() {
+        let runs = runs();
+        for i in 0..1024 {
+            fs::write(idempotency_dir(&runs).join(format!("ignored-{i}")), b"keep").unwrap();
+        }
+        for i in 0..3 {
+            ready(&runs, &format!("legacy-{i}"), 90, false);
+        }
+        let sweep = IdempotencySweep::new(Duration::from_secs(60), 1);
+        let stop = CancellationToken::new();
+        reset_scanned_entries();
+        for scanned in 1..=32 {
+            assert!(
+                sweep
+                    .pass_at(&runs, Duration::from_secs(10), || Ok(90), &stop)
+                    .is_err()
+            );
+            // Instrument actual yielded entries, not just successful registrations:
+            // ignored files must consume budget too, with no eager enumeration.
+            assert_eq!(scanned_entries(), scanned);
+            assert!(!idempotency_dir(&runs).join(".expiry-complete").exists());
+            let lock = open_no_follow(
+                &idempotency_dir(&runs).join(".idempotency.lock"),
+                true,
+                true,
+                false,
+                false,
+            )
+            .unwrap();
+            lock.try_lock()
+                .expect("incomplete pass must release the shared lock");
+            drop(lock);
+            if scanned == 1 {
+                assert!(matches!(
+                    claim_durable_pending(
+                        &runs,
+                        "admission",
+                        "digest",
+                        Some("reserved".into()),
+                        Duration::from_secs(10),
+                        &sweep
+                    )
+                    .unwrap(),
+                    ClaimOutcome::Owner { .. }
+                ));
+            }
+        }
+        // A fresh peer/restarted owner rediscovers legacy work. Its successful
+        // traversal publishes the marker and releases the first owner's cursor.
+        let peer = IdempotencySweep::new(Duration::from_secs(60), 256);
+        finish_migration(&peer, &runs, 90);
+        sweep
+            .pass_at(&runs, Duration::from_secs(10), || Ok(90), &stop)
+            .unwrap();
+        assert!(sweep.migration.lock().unwrap().is_none());
+        assert_eq!(
+            index_files(&idempotency_dir(&runs).join(".expiry")).len(),
+            3
+        );
+        assert!(pending_path(&runs, "admission").exists());
         fs::remove_dir_all(runs).unwrap();
     }
 
@@ -543,11 +637,13 @@ mod tests {
         let bad = idempotency_path(&runs, "bad");
         fs::write(&bad, b"broken").unwrap();
         let valid = ready(&runs, "valid", 90, false);
-        assert!(
-            sweep
-                .pass_at(&runs, ttl, || Ok(100), &CancellationToken::new())
-                .is_err()
-        );
+        for _ in 0..8 {
+            assert!(
+                sweep
+                    .pass_at(&runs, ttl, || Ok(100), &CancellationToken::new())
+                    .is_err()
+            );
+        }
         assert!(!idempotency_dir(&runs).join(".expiry-complete").exists());
         assert!(
             !valid.exists(),
@@ -722,6 +818,16 @@ mod tests {
         // Repair and retry complete discovery and expiry without lost work.
         fs::remove_file(&path).unwrap();
         fs::rename(target, &path).unwrap();
+        assert!(
+            sweep
+                .pass_at(
+                    &runs,
+                    Duration::from_secs(1),
+                    || Ok(100),
+                    &CancellationToken::new()
+                )
+                .is_err()
+        );
         assert_eq!(
             sweep
                 .pass_at(
@@ -731,8 +837,9 @@ mod tests {
                     &CancellationToken::new()
                 )
                 .unwrap(),
-            1
+            0
         );
+        assert!(!path.exists());
         fs::remove_dir_all(runs).unwrap();
     }
 
@@ -833,6 +940,7 @@ mod tests {
         for stamps in [[70, 70], [70, 71]] {
             let runs = runs();
             let ttl = Duration::from_secs(10);
+            migrate(&runs, &CancellationToken::new()).unwrap();
             let root = idempotency_dir(&runs).join(".expiry");
             let corrupt: Vec<_> = stamps
                 .into_iter()
@@ -906,88 +1014,67 @@ mod tests {
         fs::write(&root, b"blocked").unwrap();
         let sweep = IdempotencySweep::new(Duration::from_secs(60), 1);
         let stop = CancellationToken::new();
-        assert!(sweep.pass_at(&runs, ttl, || Ok(100), &stop).is_err());
+        // Cross the entire directory, not just ignored names, while index
+        // registration is obstructed. Retry must rediscover failed records.
+        for _ in 0..fs::read_dir(idempotency_dir(&runs)).unwrap().count() + 2 {
+            assert!(sweep.pass_at(&runs, ttl, || Ok(100), &stop).is_err());
+        }
         assert!(!marker.exists());
         assert!(legacy.iter().all(|p| p.exists()));
-        assert_eq!(sweep.migration.lock().unwrap().as_ref().unwrap().len(), 3);
-        // This is deliberately introduced after discovery. Same-owner retry
-        // must not enumerate it; an absent marker lets a restart discover it.
-        let later = ready(&runs, "later-legacy", 90, false);
         fs::remove_file(&root).unwrap();
-        for remaining in (0..3).rev() {
-            let result = sweep.pass_at(&runs, ttl, || Ok(100), &stop);
-            if remaining > 0 {
-                assert!(result.is_err());
-            } else {
-                result.unwrap();
-            }
-            assert_eq!(
-                sweep
-                    .migration
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .map_or(0, VecDeque::len),
-                remaining
-            );
-            assert_eq!(marker.exists(), remaining == 0);
-            assert_eq!(sweep.migration.lock().unwrap().is_none(), remaining == 0);
-        }
+        finish_migration(&sweep, &runs, 100);
+        assert!(marker.exists());
         for _ in 0..3 {
             sweep.pass_at(&runs, ttl, || Ok(100), &stop).unwrap();
         }
         assert!(legacy.iter().all(|p| !p.exists()));
         assert!(index_files(&root).is_empty());
-        assert!(later.exists());
         fs::remove_dir_all(runs).unwrap();
     }
 
     #[test]
-    fn persistent_migration_damage_skips_rescan_but_new_indexed_work_still_proceeds() {
+    fn persistent_migration_damage_rescans_without_starving_legacy_or_indexed_work() {
         let runs = runs();
         let ttl = Duration::from_secs(10);
-        let bad = idempotency_path(&runs, "bad-legacy");
-        fs::write(&bad, b"broken").unwrap();
+        let bad: Vec<_> = ["bad-legacy-1", "bad-legacy-2"]
+            .into_iter()
+            .map(|key| {
+                let path = idempotency_path(&runs, key);
+                fs::write(&path, b"broken").unwrap();
+                path
+            })
+            .collect();
         let old = ready(&runs, "old-legacy", 90, false);
         let sweep = IdempotencySweep::new(Duration::from_secs(60), 1);
         let stop = CancellationToken::new();
-        for _ in 0..2 {
+        for _ in 0..16 {
             assert!(sweep.pass_at(&runs, ttl, || Ok(100), &stop).is_err());
         }
-        assert!(
-            !old.exists(),
-            "a permanent failure cannot monopolize a one-item batch"
-        );
-        assert_eq!(fs::read(&bad).unwrap(), b"broken");
-        assert!(!idempotency_dir(&runs).join(".expiry-complete").exists());
-        let later = ready(&runs, "later-legacy", 90, false);
-        assert!(sweep.pass_at(&runs, ttl, || Ok(100), &stop).is_err());
-        assert!(
-            later.exists(),
-            "retry must not rescan unrelated Ready paths"
-        );
+        assert!(!old.exists(), "failed paths must not monopolize discovery");
         let fresh = ready(&runs, "fresh-indexed", 90, true);
-        assert!(sweep.pass_at(&runs, ttl, || Ok(100), &stop).is_err());
-        for _ in 0..2 {
+        for _ in 0..16 {
             assert!(sweep.pass_at(&runs, ttl, || Ok(100), &stop).is_err());
         }
-        assert!(!fresh.exists());
-        assert_eq!(fs::read(&bad).unwrap(), b"broken");
-        let restart = IdempotencySweep::new(Duration::from_secs(60), 1);
-        for _ in 0..2 {
-            assert!(restart.pass_at(&runs, ttl, || Ok(100), &stop).is_err());
-        }
         assert!(
-            !later.exists(),
-            "restart discovers while the marker is absent"
+            !fresh.exists(),
+            "indexed expiry is independent of migration errors"
         );
-        // Repairing malformed evidence also resolves the retained retry path.
-        ready(&runs, "bad-legacy", 90, false);
-        for _ in 0..3 {
-            sweep.pass_at(&runs, ttl, || Ok(100), &stop).unwrap();
+        for path in &bad {
+            assert_eq!(fs::read(path).unwrap(), b"broken");
         }
-        assert!(!bad.exists());
-        assert!(idempotency_dir(&runs).join(".expiry-complete").exists());
+        assert!(!idempotency_dir(&runs).join(".expiry-complete").exists());
+        // Repair one obligation; the other must still prevent completion across
+        // multiple traversals, then both must resolve without restarting the owner.
+        ready(&runs, "bad-legacy-1", 90, false);
+        for _ in 0..24 {
+            assert!(sweep.pass_at(&runs, ttl, || Ok(100), &stop).is_err());
+        }
+        assert!(!bad[0].exists());
+        assert_eq!(fs::read(&bad[1]).unwrap(), b"broken");
+        assert!(!idempotency_dir(&runs).join(".expiry-complete").exists());
+        ready(&runs, "bad-legacy-2", 90, false);
+        finish_migration(&sweep, &runs, 100);
+        assert!(bad.iter().all(|p| !p.exists()));
         fs::remove_dir_all(runs).unwrap();
     }
     #[test]
@@ -999,8 +1086,16 @@ mod tests {
         let a = IdempotencySweep::new(Duration::from_secs(60), 1);
         let b = IdempotencySweep::new(Duration::from_secs(60), 1);
         let stop = CancellationToken::new();
-        assert!(a.pass_at(&runs, ttl, || Ok(100), &stop).is_err());
-        assert_eq!(a.migration.lock().unwrap().as_ref().unwrap().len(), 1);
+        let mut saw_damage = false;
+        for _ in 0..8 {
+            let error = a.pass_at(&runs, ttl, || Ok(100), &stop).unwrap_err();
+            if error != "expiry migration incomplete" {
+                saw_damage = true;
+                break;
+            }
+        }
+        assert!(saw_damage, "owner must have visited the corrupt obligation");
+        assert!(!idempotency_dir(&runs).join(".expiry-complete").exists());
         let marker = idempotency_dir(&runs).join(".expiry-complete");
         // An invalid marker is not permission to discard retry evidence.
         fs::write(&marker, b"invalid").unwrap();
@@ -1008,7 +1103,8 @@ mod tests {
         assert!(a.migration.lock().unwrap().is_some());
         fs::remove_file(&marker).unwrap();
         ready(&runs, "legacy", 90, false);
-        assert_eq!(b.pass_at(&runs, ttl, || Ok(100), &stop).unwrap(), 1);
+        finish_migration(&b, &runs, 100);
+        assert!(!bad.exists());
         assert!(b.migration.lock().unwrap().is_none());
         assert_eq!(fs::read(&marker).unwrap(), b"1");
         assert_eq!(a.pass_at(&runs, ttl, || Ok(100), &stop).unwrap(), 0);
@@ -1120,15 +1216,7 @@ mod tests {
             assert!(open_no_follow(&link, true, false, false, false).is_err());
         }
         let sweep = IdempotencySweep::new(Duration::from_secs(60), 1);
-        let stop = CancellationToken::new();
-        assert!(
-            sweep
-                .pass_at(&runs, Duration::from_secs(1), || Ok(100), &stop)
-                .is_err()
-        );
-        sweep
-            .pass_at(&runs, Duration::from_secs(1), || Ok(100), &stop)
-            .unwrap();
+        finish_migration(&sweep, &runs, 100);
         assert!(sweep.migration.lock().unwrap().is_none());
         assert_eq!(
             fs::read(idempotency_dir(&runs).join(".expiry-complete")).unwrap(),
