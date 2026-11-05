@@ -345,6 +345,29 @@ function redirectResponse(location) {
   check("G05-04 limit path releases all", cancelled.length === 6, JSON.stringify(cancelled));
 }
 
+// G07-05: query options are honored and a positional query takes precedence.
+{
+  const requests = [];
+  const mock = async (url, init) => {
+    requests.push({
+      search: new URL(String(url)).searchParams.toString(),
+      probe: new Headers(init.headers).get("x-probe"),
+    });
+    return new Response('{"items":[]}', {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  const client = new QcgClient({ baseUrl: "http://127.0.0.1:9", fetch: mock });
+  await client.listRuns(undefined, { query: { limit: 1 }, headers: { "x-probe": "kept" } });
+  await client.listRuns({ limit: 2 }, { query: { limit: 3 } });
+  await client.listRuns({}, { query: { limit: 4 } });
+  check("G07-05 options-only query", requests[0].search === "limit=1", JSON.stringify(requests));
+  check("G07-05 positional query wins", requests[1].search === "limit=2", JSON.stringify(requests));
+  check("G07-05 empty positional query wins", requests[2].search === "", JSON.stringify(requests));
+  check("G07-05 headers preserved", requests[0].probe === "kept", JSON.stringify(requests[0]));
+}
+
 // G07-04: typed response readers over mocked fetch.
 {
   const mock = async (url) => {

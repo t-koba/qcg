@@ -200,7 +200,7 @@ function tsOperation(entry) {
   }
   const call = [];
   if (hasQuery) {
-    call.push(hasIdempotency || headers.length > 0 || bodySchema ? "query: query ?? options?.query" : "query");
+    call.push("query: query ?? options?.query");
   }
   if (bodySchema) {
     call.push(headers.length > 0 || hasQuery ? "body: body ?? options?.body" : "body");

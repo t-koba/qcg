@@ -353,11 +353,11 @@ export class QcgClient {
   }
 
   async llmCatalog(query?: paths["/api/llm/catalog"]["get"]["parameters"]["query"], options?: { query?: Record<string, unknown>; headers?: Record<string, string> }): Promise<paths["/api/llm/catalog"]["get"]["responses"][200]["content"]["application/json"] | null> {
-    return this.requestJson<paths["/api/llm/catalog"]["get"]["responses"][200]["content"]["application/json"] | null>("GET", `/api/llm/catalog`, { query, headers: options?.headers });
+    return this.requestJson<paths["/api/llm/catalog"]["get"]["responses"][200]["content"]["application/json"] | null>("GET", `/api/llm/catalog`, { query: query ?? options?.query, headers: options?.headers });
   }
 
   async completeMcpAuthorization(query?: paths["/api/mcp/oauth/callback"]["get"]["parameters"]["query"], options?: { query?: Record<string, unknown>; headers?: Record<string, string> }): Promise<string | null> {
-    return this.requestText("GET", `/api/mcp/oauth/callback`, { query, headers: options?.headers });
+    return this.requestText("GET", `/api/mcp/oauth/callback`, { query: query ?? options?.query, headers: options?.headers });
   }
 
   async listMcpServers(): Promise<paths["/api/mcp/servers"]["get"]["responses"][200]["content"]["application/json"] | null> {
@@ -381,7 +381,7 @@ export class QcgClient {
   }
 
   async listRuns(query?: paths["/api/runs"]["get"]["parameters"]["query"], options?: { query?: Record<string, unknown>; headers?: Record<string, string> }): Promise<paths["/api/runs"]["get"]["responses"][200]["content"]["application/json"] | null> {
-    return this.requestJson<paths["/api/runs"]["get"]["responses"][200]["content"]["application/json"] | null>("GET", `/api/runs`, { query, headers: options?.headers });
+    return this.requestJson<paths["/api/runs"]["get"]["responses"][200]["content"]["application/json"] | null>("GET", `/api/runs`, { query: query ?? options?.query, headers: options?.headers });
   }
 
   async startRun(body: paths["/api/runs"]["post"]["requestBody"]["content"]["application/json"], options?: { body?: unknown; headers?: Record<string, string>; idempotencyKey?: string }): Promise<paths["/api/runs"]["post"]["responses"][201]["content"]["application/json"] | null> {
