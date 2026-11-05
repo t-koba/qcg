@@ -745,19 +745,26 @@ pub(crate) async fn read_artifact(
     headers: HeaderMap,
 ) -> Result<Response, ApiHttpError> {
     let content_disposition = content_disposition_attachment(&path);
-    // Retained for stream diagnostics below: the service call moves `id`.
-    let logged_id = id.clone();
     let (artifact, resolved) = state
         .service
         .read_artifact_with_limits(id, path, &state.artifact_limits)
         .await
         .map_err(ApiHttpError::from_api)?;
-    // Verify size via metadata before allocating, then bound the read by
-    // the manifest size + 1 so a swapped larger file never forces excess
-    // allocation before the configured limits are enforced (C05).
-    let metadata = tokio::fs::metadata(&resolved)
+    let strong_etag = format!("\"{}\"", artifact.sha256);
+    let precondition = parse_if_none_match(&headers)?;
+    let not_modified = match &precondition {
+        IfNoneMatch::Absent => false,
+        IfNoneMatch::Star => true,
+        IfNoneMatch::Tags(tags) => tags.iter().any(|tag| tag == &artifact.sha256),
+    };
+
+    // Bound before allocating and verify from the opened description. The
+    // response is built from this byte snapshot, not a later read of the
+    // mutable inode, so its strong ETag names the bytes actually delivered.
+    let mut file = tokio::fs::File::open(&resolved)
         .await
         .map_err(ApiHttpError::internal)?;
+    let metadata = file.metadata().await.map_err(ApiHttpError::internal)?;
     if let Some(limit) = state.artifact_limits.effective().max_bytes
         && metadata.len() > limit
     {
@@ -765,33 +772,6 @@ pub(crate) async fn read_artifact(
             actual_bytes: metadata.len() as usize,
             limit_bytes: limit as usize,
         }));
-    }
-    // Strong validator from the manifest sha256 (E16): the content is
-    // verified byte-for-byte against this digest before delivery, so the
-    // ETag names the exact bytes served. Weak comparison still applies, and
-    // `*` matches any existing artifact. Invalid preconditions fail closed
-    // with 400 via the shared parser.
-    let strong_etag = format!("\"{}\"", artifact.sha256);
-    match parse_if_none_match(&headers)? {
-        IfNoneMatch::Absent => {}
-        IfNoneMatch::Star => {
-            return Response::builder()
-                .status(StatusCode::NOT_MODIFIED)
-                .header(header::ETAG, strong_etag)
-                .header(header::CACHE_CONTROL, "no-store")
-                .body(Body::empty())
-                .map_err(ApiHttpError::internal);
-        }
-        IfNoneMatch::Tags(tags) => {
-            if tags.iter().any(|tag| tag == &artifact.sha256) {
-                return Response::builder()
-                    .status(StatusCode::NOT_MODIFIED)
-                    .header(header::ETAG, strong_etag)
-                    .header(header::CACHE_CONTROL, "no-store")
-                    .body(Body::empty())
-                    .map_err(ApiHttpError::internal);
-            }
-        }
     }
     if metadata.len() != artifact.bytes {
         return Err(ApiHttpError::internal(format!(
@@ -801,19 +781,22 @@ pub(crate) async fn read_artifact(
             metadata.len()
         )));
     }
-    // Streamed verification on the open file description (constant
-    // memory): hash and length are checked before delivery, then the SAME
-    // description rewinds for the response body, so a path swap between
-    // verify and serve cannot substitute bytes.
-    let mut file = tokio::fs::File::open(&resolved)
-        .await
-        .map_err(ApiHttpError::internal)?;
+    // `read_artifact_with_limits` bounds the manifest size by the configured
+    // artifact cap; reserve safely and never retain beyond that exact size.
+    let expected_capacity = usize::try_from(artifact.bytes).map_err(ApiHttpError::internal)?;
+    let mut verified_bytes = Vec::new();
+    if !not_modified {
+        verified_bytes
+            .try_reserve_exact(expected_capacity)
+            .map_err(ApiHttpError::internal)?;
+    }
     {
         use sha2::Digest as _;
         use tokio::io::AsyncReadExt as _;
         let mut hasher = sha2::Sha256::new();
         let mut seen: u64 = 0;
-        // Manifest size + 1 detects post-stat growth without over-allocating.
+        // Manifest size + 1 detects post-stat growth without reading or
+        // retaining an unbounded replacement file.
         let mut remaining = artifact.bytes.saturating_add(1);
         let mut chunk = vec![0u8; 64 * 1024];
         loop {
@@ -829,11 +812,25 @@ pub(crate) async fn read_artifact(
                 break;
             }
             hasher.update(&chunk[..read]);
+            if !not_modified {
+                let keep = read.min(expected_capacity.saturating_sub(verified_bytes.len()));
+                verified_bytes.extend_from_slice(&chunk[..keep]);
+            }
             seen = seen.saturating_add(read as u64);
             remaining = remaining.saturating_sub(read as u64);
         }
         verify_artifact_measurement(&artifact, seen, &hex::encode(hasher.finalize()))
             .map_err(ApiHttpError::internal)?;
+    }
+    drop(file);
+
+    if not_modified {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, strong_etag)
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(Body::empty())
+            .map_err(ApiHttpError::internal);
     }
     let range = artifact_range(&headers, &strong_etag, artifact.bytes);
     let (start, length, partial) = match range {
@@ -848,44 +845,36 @@ pub(crate) async fn read_artifact(
                 .map_err(ApiHttpError::internal);
         }
     };
-    {
-        use tokio::io::AsyncSeekExt as _;
-        file.seek(std::io::SeekFrom::Start(start))
-            .await
-            .map_err(ApiHttpError::internal)?;
+    let start_usize = usize::try_from(start).map_err(ApiHttpError::internal)?;
+    let length_usize = usize::try_from(length).map_err(ApiHttpError::internal)?;
+    let end = start_usize
+        .checked_add(length_usize)
+        .ok_or_else(|| ApiHttpError::internal("artifact range offset overflowed"))?;
+    if end > verified_bytes.len() {
+        return Err(ApiHttpError::internal(
+            "verified artifact snapshot is shorter than the requested range",
+        ));
     }
     let content_type = artifact
         .mime
         .unwrap_or_else(|| content_type_for_name(&artifact.path).to_string());
-    // A slow client must not hold graceful drain open: the body ends at
-    // shutdown like every other long-lived stream (E05).
+    // Keep body delivery bounded and cancellable while serving chunks from
+    // the immutable, already-verified snapshot (E05/E16).
     let shutdown = state.shutdown.clone();
-    let logged_path = artifact.path.clone();
-    let logged_bytes = artifact.bytes;
-    let stream = tokio_util::io::ReaderStream::new(tokio::io::AsyncReadExt::take(file, length))
-        .take_until(async move {
-            shutdown.cancelled().await;
-        })
-        .then(move |item| {
-            let logged_id = logged_id.clone();
-            let logged_path = logged_path.clone();
-            async move {
-                item.map_err(|error| {
-                    // A mid-body read failure aborts the connection, which
-                    // the client reports as a truncated body: log the run,
-                    // path, and expected length so the truncation is
-                    // diagnosable server-side.
-                    tracing::error!(
-                        run_id = %logged_id,
-                        path = %logged_path,
-                        expected_bytes = logged_bytes,
-                        %error,
-                        "artifact body stream failed mid-delivery",
-                    );
-                    error
-                })
+    let stream = futures_util::stream::unfold(
+        (verified_bytes, start_usize, end),
+        |(verified_bytes, offset, end)| async move {
+            if offset >= end {
+                return None;
             }
-        });
+            let chunk_end = offset.saturating_add(64 * 1024).min(end);
+            let chunk = verified_bytes[offset..chunk_end].to_vec();
+            Some((Ok::<_, io::Error>(chunk), (verified_bytes, chunk_end, end)))
+        },
+    )
+    .take_until(async move {
+        shutdown.cancelled().await;
+    });
     let mut response = Response::builder()
         .status(if partial {
             StatusCode::PARTIAL_CONTENT
@@ -1261,8 +1250,8 @@ pub(crate) fn content_disposition_attachment(path: &str) -> String {
 /// Verify a singly-served artifact against its manifest before delivery.
 /// Size alone cannot detect a same-length post-completion swap, so the
 /// sha256 is always compared, matching the ZIP/bundle verification.
-/// Single comparison contract for artifact delivery, shared by buffered
-/// and streaming verifiers so the two paths cannot disagree.
+/// Single comparison contract for the verified artifact snapshot before
+/// conditional headers or response bytes are produced.
 pub(crate) fn verify_artifact_measurement(
     artifact: &model::OutputArtifact,
     actual_len: u64,
@@ -1670,10 +1659,9 @@ mod tests {
     #[tokio::test]
     async fn single_artifact_strong_etag_names_verified_bytes() {
         // E16: the single-artifact endpoint binds its strong ETag to the
-        // manifest sha256, verifies size plus sha256 on the open file
-        // description before delivery, serves a 304 on a matching
-        // precondition, and refuses a same-size content swap. Real service,
-        // real tempdir storage, no mocks.
+        // manifest sha256, verifies size plus sha256 before delivery, serves
+        // a 304 only for the verified bytes, and snapshots the body across an
+        // in-place write after response creation. Real service and storage.
         use axum::extract::{Path, State};
         use axum::http::{HeaderMap, header};
         use std::collections::{BTreeMap, BTreeSet};
@@ -1740,6 +1728,11 @@ mod tests {
             )
             .await
             .expect("artifact should resolve");
+        let original = std::fs::read(&resolved).expect("artifact bytes should read");
+        assert_eq!(
+            hex::encode(sha2::Sha256::digest(&original)),
+            artifact.sha256
+        );
         // 200 delivery carries the manifest sha256 as the strong ETag.
         let response = read_artifact(
             State(state.clone()),
@@ -1761,7 +1754,32 @@ mod tests {
             format!("\"{}\"", artifact.sha256),
             "the strong ETag must name the manifest sha256"
         );
-        // A matching precondition yields 304 without a body.
+        // Same-inode writes after response creation cannot change the
+        // already-verified representation named by the strong ETag.
+        let mut swapped = original.clone();
+        if let Some(first) = swapped.first_mut() {
+            *first = first.wrapping_add(1);
+        }
+        assert_eq!(swapped.len(), original.len(), "swap must keep the size");
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&resolved)
+            .expect("open artifact inode for an in-place write");
+        std::io::Write::write_all(&mut writer, &swapped).expect("overwrite the same inode");
+        std::io::Write::flush(&mut writer).expect("flush in-place overwrite");
+        let delivered = axum::body::to_bytes(response.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("verified response should still deliver its snapshot");
+        assert_eq!(delivered.as_ref(), original.as_slice());
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&resolved)
+            .expect("reopen artifact inode for restoration");
+        std::io::Write::write_all(&mut writer, &original).expect("restore original bytes");
+        std::io::Write::flush(&mut writer).expect("flush restored bytes");
+
+        // A matching precondition yields 304 without a body, after the
+        // current file has again been verified against the manifest.
         let mut precond = HeaderMap::new();
         precond.insert(
             header::IF_NONE_MATCH,
@@ -1795,9 +1813,7 @@ mod tests {
                     .is_empty()
             );
         }
-        // A same-size content swap fails delivery: the verifier reads the
-        // open description, so the swap cannot pass the sha256 check.
-        let original = std::fs::read(&resolved).expect("artifact bytes should read");
+        // A same-size content swap before a new request still fails closed.
         let mut swapped = original.clone();
         if let Some(first) = swapped.first_mut() {
             *first = first.wrapping_add(1);
@@ -2048,18 +2064,14 @@ mod tests {
         });
         let mut mismatch_etag = HeaderMap::new();
         mismatch_etag.insert(header::IF_NONE_MATCH, strong.parse().unwrap());
-        assert_eq!(
-            read_artifact(
-                State(mismatch_conditional),
-                Path((run_id.clone(), "large.bin".to_string())),
-                mismatch_etag,
-            )
-            .await
-            .unwrap()
-            .status(),
-            StatusCode::NOT_MODIFIED,
-            "in-cap manifest mismatch keeps the pre-existing conditional response semantics"
-        );
+        let mismatch_error = read_artifact(
+            State(mismatch_conditional),
+            Path((run_id.clone(), "large.bin".to_string())),
+            mismatch_etag,
+        )
+        .await
+        .expect_err("a matching tag cannot mask a manifest/file size mismatch");
+        assert_eq!(mismatch_error.problem.status, 500);
         std::fs::write(run_dir.join("meta/outputs.json"), raw).unwrap();
         let larger = make_state(service::ArtifactZipLimits {
             max_bytes: Some(4096),
