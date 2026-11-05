@@ -97,7 +97,7 @@ pub fn host_cgroup_supported() -> bool {
 pub fn host_cgroup_tests_enabled() -> bool {
     #[cfg(not(target_os = "linux"))]
     {
-        return false;
+        false
     }
     #[cfg(target_os = "linux")]
     {
@@ -271,9 +271,9 @@ pub fn bind_host_cgroup(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (meta_dir, run_id);
-        return Err(HostCgroupError::config(
+        Err(HostCgroupError::config(
             "host cgroup recovery is Linux cgroup-v2 only",
-        ));
+        ))
     }
     #[cfg(target_os = "linux")]
     {
@@ -383,9 +383,9 @@ pub fn reconcile_host_cgroup(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = current;
-        return Err(HostCgroupError::identity(
+        Err(HostCgroupError::identity(
             "persisted host-cgroup binding requires Linux to reconcile; refusing",
-        ));
+        ))
     }
     #[cfg(target_os = "linux")]
     {
