@@ -71,13 +71,10 @@ pub(crate) fn package(
         if matches!(name.as_str(), SBOM_PATH | PROVENANCE_PATH) {
             anyhow::bail!("package input uses reserved metadata path `{name}`");
         }
-        if limits.max_entries.is_some_and(|limit| {
-            directories.len().saturating_add(entries.len())
+        if let Some(limit) = limits.max_entries
+            && directories.len().saturating_add(entries.len())
                 >= limit.saturating_sub(GENERATED_PACKAGE_ENTRIES)
-        }) {
-            let Some(limit) = limits.max_entries else {
-                anyhow::bail!("package entry limit is missing");
-            };
+        {
             anyhow::bail!("package input contains too many entries: exceeds {limit}");
         }
         // Open first (O_NOFOLLOW at use time): the length gate and the
@@ -101,10 +98,9 @@ pub(crate) fn package(
         total_bytes = total_bytes
             .checked_add(bytes)
             .context("package input size overflowed")?;
-        if limits.max_bytes.is_some_and(|limit| total_bytes > limit) {
-            let Some(limit) = limits.max_bytes else {
-                anyhow::bail!("package byte limit is missing");
-            };
+        if let Some(limit) = limits.max_bytes
+            && total_bytes > limit
+        {
             anyhow::bail!("package input exceeds {limit} bytes");
         }
         // The per-file hash enforces the same byte bound as the total gate
@@ -131,7 +127,7 @@ pub(crate) fn package(
                 // Sanitized permission bits, verified on unpack alongside
                 // the hash: modes round-trip explicitly, never by umask or
                 // silent default (E15).
-                "mode": sanitized_source_mode(&entry.metadata),
+                "mode": files::sanitized_metadata_mode(&entry.metadata),
             })
         })
         .collect::<Vec<_>>();
@@ -216,14 +212,6 @@ fn check_package_output_limits(
     Ok(())
 }
 
-/// Sanitized permission bits recorded per file in the SBOM and verified on
-/// unpack: setuid/setgid/sticky never survive and world-writable is
-/// cleared, symmetric with the unpack sanitizer (E15). Non-Unix maps the
-/// read-only flag onto the explicit file modes (platform limitation).
-fn sanitized_source_mode(metadata: &std::fs::Metadata) -> u32 {
-    files::sanitized_metadata_mode(metadata)
-}
-
 /// Stages the package archive in an owner-only sibling temp, applies the
 /// final 0644 BEFORE the rename (pre-rename chmod), syncs, and publishes
 /// by rename plus directory sync. Unix runs handle-relative to a pinned
@@ -238,14 +226,15 @@ fn stage_package_output(
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or(Utf8Path::new("."));
+    let file_name = output
+        .file_name()
+        .context("package output must have a file name")?;
     #[cfg(unix)]
     {
         // Shared staging dance (E15): pin the parent here, stage/publish
         // through `files::stage_file_at` so pack and unpack cannot drift.
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use std::os::unix::ffi::OsStrExt as _;
-        let file_name = output
-            .file_name()
-            .context("package output must have a file name")?;
         let owned = {
             let canonical = dunce::canonicalize(parent).with_context(|| {
                 format!("failed to canonicalize package output directory `{parent}`")
@@ -266,27 +255,15 @@ fn stage_package_output(
                 std::io::Error::last_os_error()
             );
         }
-        // Closed on every exit below.
-        struct FdGuard(std::os::unix::io::RawFd);
-        impl Drop for FdGuard {
-            fn drop(&mut self) {
-                // SAFETY: the fd is owned by this guard.
-                unsafe {
-                    libc::close(self.0);
-                }
-            }
-        }
-        let parent_guard = FdGuard(parent_fd);
+        // SAFETY: open returned a valid fd, exclusively owned here.
+        let parent_guard = unsafe { OwnedFd::from_raw_fd(parent_fd) };
         // The published package is conventionally world-readable (0644);
         // the mode lands pre-rename inside the shared helper (E15).
-        files::stage_file_at(parent_guard.0, file_name, 0o644, 100, write)?;
+        files::stage_file_at(parent_guard.as_raw_fd(), file_name, 0o644, 100, write)?;
         Ok(())
     }
     #[cfg(not(unix))]
     {
-        let file_name = output
-            .file_name()
-            .context("package output must have a file name")?;
         for _ in 0..100 {
             let staging = parent.join(format!(
                 ".{file_name}.part-{}",
@@ -414,10 +391,7 @@ fn package_zip_options(metadata: &std::fs::Metadata, directory: bool) -> Result<
     options = with_zip_modified_time(options, metadata.modified()?)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
-        // Sanitize like unpack via the single shared helper (E15).
-        let mode = files::sanitize_mode_bits(metadata.permissions().mode());
-        options = options.unix_permissions(mode);
+        options = options.unix_permissions(files::sanitized_metadata_mode(metadata));
     }
     #[cfg(not(unix))]
     {

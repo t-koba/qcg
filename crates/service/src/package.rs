@@ -632,7 +632,9 @@ pub fn unpack_package(
     // Pin the target directory once (Unix): every parent creation and file
     // staging below runs relative to this fd (E15).
     #[cfg(unix)]
-    let pinned_target = open_pinned_dir(target)?;
+    let target_root = &open_pinned_dir(target)?;
+    #[cfg(not(unix))]
+    let target_root = target;
     let mut entries = archive.entries(&mut buffer);
     while let Some(header) = entries.next_entry().map_err(invalid_zip)? {
         let rel = package_entry_path(header.file_path().as_bytes())?;
@@ -713,7 +715,7 @@ pub fn unpack_package(
             // restore their archive modes only after all descendants exist.
             // Unix changes remain pinned-handle-relative (E15).
             #[cfg(unix)]
-            with_parent_fd(&pinned_target, &rel, |parent, leaf| {
+            with_parent_fd(target_root, &rel, |parent, leaf| {
                 create_dir_leaf_fd(parent, leaf, PACKAGE_BUILD_DIR_MODE)
             })?;
             #[cfg(not(unix))]
@@ -729,7 +731,7 @@ pub fn unpack_package(
             // File leaves are staged with the final mode applied BEFORE the
             // rename; no post-rename chmod ever runs (E15).
             #[cfg(unix)]
-            with_parent_fd(&pinned_target, &rel, |parent, leaf| {
+            with_parent_fd(target_root, &rel, |parent, leaf| {
                 stage_file_fd(parent, leaf, archived_mode, |output| {
                     copy_package_entry(
                         &mut entry,
@@ -773,17 +775,23 @@ pub fn unpack_package(
         }
     }
     verify_package_inventory(target, limits)?;
+    restore_directory_modes(directories, target_root)
+}
+
+/// Restore final directory modes deepest-first, after all children are materialized.
+fn restore_directory_modes(
+    mut directories: Vec<(Utf8PathBuf, u32)>,
+    #[cfg(unix)] root: &PinnedDir,
+    #[cfg(not(unix))] root: &Utf8Path,
+) -> Result<(), ServiceError> {
     directories.sort_unstable_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
     for (rel, mode) in directories {
         #[cfg(unix)]
-        with_parent_fd(&pinned_target, &rel, |parent, leaf| {
+        with_parent_fd(root, &rel, |parent, leaf| {
             create_dir_leaf_fd(parent, leaf, mode)
         })?;
         #[cfg(not(unix))]
-        {
-            let out = target.join(&rel);
-            package_dir_leaf_path(&out, &rel, mode)?;
-        }
+        package_dir_leaf_path(&root.join(&rel), &rel, mode)?;
     }
     Ok(())
 }
@@ -1239,7 +1247,9 @@ pub fn copy_dir_all(
     // Pin the target once (Unix): destination parents and file staging run
     // relative to this fd (E15).
     #[cfg(unix)]
-    let pinned_target = open_pinned_dir(target)?;
+    let target_root = &open_pinned_dir(target)?;
+    #[cfg(not(unix))]
+    let target_root = target;
     for entry in files::WalkDir::new(source) {
         let entry = entry.map_err(|error| {
             ServiceError::Invalid(format!("failed to walk `{source}`: {error}"))
@@ -1317,7 +1327,7 @@ pub fn copy_dir_all(
             }
             let mode = explicit_source_mode(&source_metadata, true);
             #[cfg(unix)]
-            with_parent_fd(&pinned_target, rel, |parent, leaf| {
+            with_parent_fd(target_root, rel, |parent, leaf| {
                 create_dir_leaf_fd(parent, leaf, PACKAGE_BUILD_DIR_MODE)
             })?;
             #[cfg(not(unix))]
@@ -1356,7 +1366,7 @@ pub fn copy_dir_all(
         // length gate above and the copy below is impossible: the gate and
         // the bytes share one inode.
         #[cfg(unix)]
-        with_parent_fd(&pinned_target, rel, |parent, leaf| {
+        with_parent_fd(target_root, rel, |parent, leaf| {
             stage_file_fd(parent, leaf, explicit_mode, |output| {
                 let copied = std::io::copy(&mut input, output)?;
                 if copied != metadata.len() {
@@ -1399,19 +1409,7 @@ pub fn copy_dir_all(
             })?;
         }
     }
-    directories.sort_unstable_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
-    for (rel, mode) in directories {
-        #[cfg(unix)]
-        with_parent_fd(&pinned_target, &rel, |parent, leaf| {
-            create_dir_leaf_fd(parent, leaf, mode)
-        })?;
-        #[cfg(not(unix))]
-        {
-            let dest = target.join(&rel);
-            package_dir_leaf_path(&dest, &rel, mode)?;
-        }
-    }
-    Ok(())
+    restore_directory_modes(directories, target_root)
 }
 
 /// Derives the explicit source mode for a copied entry. Unix preserves the
