@@ -167,10 +167,11 @@ pub(crate) fn package(
             }
         }
     }))?;
-    check_expanded_package_bytes(
+    check_package_output_limits(
         total_bytes,
         [sbom.len(), provenance.len()],
         limits.max_bytes,
+        limits.max_metadata_bytes,
     )?;
     // Stage + rename through a local helper that applies the final 0644
     // BEFORE the rename: the output is never truncated in place, a
@@ -191,10 +192,11 @@ pub(crate) fn package(
     Ok(())
 }
 
-fn check_expanded_package_bytes(
+fn check_package_output_limits(
     input_bytes: u64,
     metadata_sizes: [usize; 2],
     max_bytes: Option<u64>,
+    max_metadata_bytes: Option<usize>,
 ) -> Result<()> {
     if let Some(limit) = max_bytes
         && metadata_sizes
@@ -205,6 +207,11 @@ fn check_expanded_package_bytes(
             .is_none_or(|total| total > limit)
     {
         anyhow::bail!("package expanded size including generated metadata exceeds {limit} bytes");
+    }
+    if let Some(limit) = max_metadata_bytes
+        && metadata_sizes.iter().any(|size| *size > limit)
+    {
+        anyhow::bail!("package generated metadata exceeds {limit} bytes per file");
     }
     Ok(())
 }
@@ -576,7 +583,7 @@ mod tests {
     }
 
     #[test]
-    fn package_byte_limit_includes_generated_metadata_at_exact_boundary() {
+    fn package_output_limits_include_generated_metadata_at_exact_boundaries() {
         let root = Utf8PathBuf::from_path_buf(
             std::env::temp_dir().join(format!("package-byte-boundary-{}", uuid::Uuid::now_v7())),
         )
@@ -604,6 +611,11 @@ version = "1.0.0"
                 total.checked_add(archive.by_index(index).unwrap().size())
             })
             .expect("expanded byte total");
+        let metadata_limit = [SBOM_PATH, PROVENANCE_PATH]
+            .into_iter()
+            .map(|name| usize::try_from(archive.by_name(name).unwrap().size()).unwrap())
+            .max()
+            .unwrap();
         let input_bytes = std::fs::metadata(input.join(contract::MANIFEST_FILE))
             .unwrap()
             .len();
@@ -615,10 +627,20 @@ version = "1.0.0"
 
         let exact_limits = service::PackageLimits {
             max_bytes: Some(expanded_bytes),
+            max_metadata_bytes: Some(metadata_limit),
             ..defaults
         };
-        package(&input, &root.join("exact.pkg"), &exact_limits)
-            .expect("exact expanded-byte boundary should pass");
+        let exact = root.join("exact.pkg");
+        package(&input, &exact, &exact_limits)
+            .expect("exact expanded and metadata boundaries should pass");
+        let unpacked = root.join("unpacked");
+        std::fs::create_dir_all(&unpacked).expect("unpack target");
+        service::package::unpack_package(&exact, &unpacked, &exact_limits)
+            .expect("matching pack and unpack limits should succeed");
+        assert_eq!(
+            std::fs::read(unpacked.join(contract::MANIFEST_FILE)).unwrap(),
+            std::fs::read(input.join(contract::MANIFEST_FILE)).unwrap()
+        );
         let under_limits = service::PackageLimits {
             max_bytes: Some(expanded_bytes - 1),
             ..defaults
@@ -627,14 +649,26 @@ version = "1.0.0"
         let error = package(&input, &under, &under_limits).unwrap_err();
         assert!(error.to_string().contains("generated metadata"));
         assert!(!under.exists(), "rejected package must not be published");
+
+        let existing = root.join("metadata-under.pkg");
+        std::fs::write(&existing, b"unchanged").unwrap();
+        let metadata_under = service::PackageLimits {
+            max_metadata_bytes: Some(metadata_limit - 1),
+            ..defaults
+        };
+        let error = package(&input, &existing, &metadata_under).unwrap_err();
+        assert!(error.to_string().contains("per file"));
+        assert_eq!(std::fs::read(&existing).unwrap(), b"unchanged");
     }
 
     #[test]
-    fn package_byte_limit_overflow_fails_closed_and_none_is_unbounded() {
-        assert!(check_expanded_package_bytes(1, [4, 5], Some(10)).is_ok());
-        assert!(check_expanded_package_bytes(1, [4, 5], Some(9)).is_err());
-        assert!(check_expanded_package_bytes(u64::MAX, [1, 0], Some(u64::MAX)).is_err());
-        assert!(check_expanded_package_bytes(u64::MAX, [1, 0], None).is_ok());
+    fn package_output_limits_fail_closed_on_overflow_and_leave_none_unbounded() {
+        assert!(check_package_output_limits(1, [4, 5], Some(10), None).is_ok());
+        assert!(check_package_output_limits(1, [4, 5], Some(9), None).is_err());
+        assert!(check_package_output_limits(u64::MAX, [1, 0], Some(u64::MAX), None).is_err());
+        assert!(check_package_output_limits(u64::MAX, [1, 0], None, None).is_ok());
+        assert!(check_package_output_limits(1, [4, 5], None, Some(5)).is_ok());
+        assert!(check_package_output_limits(1, [4, 5], None, Some(4)).is_err());
     }
 
     #[cfg(unix)]
