@@ -148,14 +148,33 @@ indeterminate operation or bypasses Started/Repeat policy.
   after attachment, but does not prove whole-tree cancellation or crash cleanup.
   Host MCP does not attach its Windows child to the command Job Object.
 
-  The locked Rust 1.99/Tokio 1.53.3 stack has no supported stable Tokio hook for
-  pre-creation process attributes: Rust's `CommandExt::spawn_with_attributes`
-  is nightly-only, and Tokio's `Command::spawn_with` requires `tokio_unstable`.
-  `PROC_THREAD_ATTRIBUTE_JOB_LIST` and a process-lifetime Job Object containing
-  qcg itself are candidate routes, but neither has been implemented or tested
-  for this process hierarchy, handle lifetime, or Windows runner environment.
-  Until launch-time membership and qcg-death cleanup are validated on Windows,
-  no Windows whole-tree crash-cleanup guarantee is claimed.
+  The Windows API supports creation-time job assignment through
+  `PROC_THREAD_ATTRIBUTE_JOB_LIST` (Windows 10 version 1703 and Windows Server
+  2016 or later). Microsoft describes the behavior in its [job-list
+  explanation](https://devblogs.microsoft.com/oldnewthing/20230209-00/?p=107812):
+  the child is assigned before its initial thread is allowed to run. The
+  locked Rust 1.99/Tokio 1.53.3 stack has no supported stable Tokio hook for
+  those process attributes: Rust's
+  `CommandExt::spawn_with_attributes` remains nightly-only, and Tokio's
+  `Command::spawn_with` requires `tokio_unstable`. Stable Rust can call the
+  documented Win32 APIs through bindings, but qcg has no custom `CreateProcessW`
+  adapter that preserves its command-line, environment, working-directory,
+  stdio, and asynchronous child semantics; that route is not implemented or
+  tested. See Microsoft's [`UpdateProcThreadAttribute` reference](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute)
+  and [job-object limits](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects).
+
+  A stable `CREATE_SUSPENDED` creation flag could prevent the child from running
+  before a later `AssignProcessToJobObject` and explicit resume, but it is not
+  an atomic owner-death boundary: qcg can die after process creation and before
+  assignment, leaving a suspended child outside the kill-on-close job. The
+  locked stable Rust/Tokio child APIs do not expose the initial thread handle
+  needed for a direct resume. An app-wide Job Object assigned to qcg affects
+  all child processes by default and depends on the surrounding job
+  hierarchy, so it is not an equivalent per-command fix. None of these
+  alternatives has been implemented or tested for this process hierarchy,
+  handle lifetime, or Windows runner environment. Until launch-time membership
+  and qcg-death cleanup are validated on Windows, no Windows whole-tree
+  crash-cleanup guarantee is claimed.
 
 Normal cancellation still targets the tracked process and any attached job
 members; it does not close the pre-assignment gap. These limitations do not
