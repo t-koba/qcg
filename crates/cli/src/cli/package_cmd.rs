@@ -167,6 +167,11 @@ pub(crate) fn package(
             }
         }
     }))?;
+    check_expanded_package_bytes(
+        total_bytes,
+        [sbom.len(), provenance.len()],
+        limits.max_bytes,
+    )?;
     // Stage + rename through a local helper that applies the final 0644
     // BEFORE the rename: the output is never truncated in place, a
     // terminal symlink at the output is refused fail-closed (never
@@ -183,6 +188,24 @@ pub(crate) fn package(
         )
         .map_err(|error| std::io::Error::other(error.to_string()))
     })?;
+    Ok(())
+}
+
+fn check_expanded_package_bytes(
+    input_bytes: u64,
+    metadata_sizes: [usize; 2],
+    max_bytes: Option<u64>,
+) -> Result<()> {
+    if let Some(limit) = max_bytes
+        && metadata_sizes
+            .into_iter()
+            .try_fold(input_bytes, |total, size| {
+                total.checked_add(u64::try_from(size).ok()?)
+            })
+            .is_none_or(|total| total > limit)
+    {
+        anyhow::bail!("package expanded size including generated metadata exceeds {limit} bytes");
+    }
     Ok(())
 }
 
@@ -538,23 +561,80 @@ mod tests {
         }
     }
 
-    // Every test in this module is Unix-gated (executable-bit behavior),
-    // so the parent import is Unix-only too.
-    #[cfg(unix)]
     use super::*;
 
     /// Removes the temp root on drop so a failed assertion cannot leak test
     /// directories (E04). A removal failure warns instead of being silently
-    /// ignored. Unix executable-bit tests only.
-    #[cfg(unix)]
+    /// ignored; the guard is shared across package tests.
     struct TempGuard(Utf8PathBuf);
-    #[cfg(unix)]
     impl Drop for TempGuard {
         fn drop(&mut self) {
             if let Err(error) = std::fs::remove_dir_all(self.0.as_std_path()) {
                 eprintln!("test temp cleanup failed for {}: {error}", self.0);
             }
         }
+    }
+
+    #[test]
+    fn package_byte_limit_includes_generated_metadata_at_exact_boundary() {
+        let root = Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("package-byte-boundary-{}", uuid::Uuid::now_v7())),
+        )
+        .expect("temporary path must be UTF-8");
+        std::fs::create_dir_all(&root).expect("temp root");
+        let _temp_guard = TempGuard(root.clone());
+        let input = root.join("input");
+        std::fs::create_dir_all(&input).expect("input dir");
+        std::fs::write(
+            input.join(contract::MANIFEST_FILE),
+            r#"[generator]
+id = "bytes"
+name = "Bytes"
+version = "1.0.0"
+"#,
+        )
+        .expect("manifest");
+
+        let defaults = service::PackageLimits::default();
+        let baseline = root.join("baseline.pkg");
+        package(&input, &baseline, &defaults).expect("baseline package");
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&baseline).unwrap()).unwrap();
+        let expanded_bytes = (0..archive.len())
+            .try_fold(0_u64, |total, index| {
+                total.checked_add(archive.by_index(index).unwrap().size())
+            })
+            .expect("expanded byte total");
+        let input_bytes = std::fs::metadata(input.join(contract::MANIFEST_FILE))
+            .unwrap()
+            .len();
+        assert!(
+            expanded_bytes > input_bytes,
+            "metadata must add expanded bytes"
+        );
+        drop(archive);
+
+        let exact_limits = service::PackageLimits {
+            max_bytes: Some(expanded_bytes),
+            ..defaults
+        };
+        package(&input, &root.join("exact.pkg"), &exact_limits)
+            .expect("exact expanded-byte boundary should pass");
+        let under_limits = service::PackageLimits {
+            max_bytes: Some(expanded_bytes - 1),
+            ..defaults
+        };
+        let under = root.join("under.pkg");
+        let error = package(&input, &under, &under_limits).unwrap_err();
+        assert!(error.to_string().contains("generated metadata"));
+        assert!(!under.exists(), "rejected package must not be published");
+    }
+
+    #[test]
+    fn package_byte_limit_overflow_fails_closed_and_none_is_unbounded() {
+        assert!(check_expanded_package_bytes(1, [4, 5], Some(10)).is_ok());
+        assert!(check_expanded_package_bytes(1, [4, 5], Some(9)).is_err());
+        assert!(check_expanded_package_bytes(u64::MAX, [1, 0], Some(u64::MAX)).is_err());
+        assert!(check_expanded_package_bytes(u64::MAX, [1, 0], None).is_ok());
     }
 
     #[cfg(unix)]
