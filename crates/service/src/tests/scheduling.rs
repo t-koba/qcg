@@ -179,7 +179,7 @@ async fn advancing_queue_head_wakes_waiters_to_use_spare_slots() {
     }
     // The first run still owns its permit. Advancing its status must wake the
     // next queued run even though no permit was returned to the pool.
-    crate::queue::notify_head_advanced(&service.inner.queue_notify);
+    service.inner.queue_notify.notify_waiters();
 
     let _second_permit = tokio::time::timeout(Duration::from_secs(2), second_waiter)
         .await
@@ -191,7 +191,7 @@ async fn advancing_queue_head_wakes_waiters_to_use_spare_slots() {
             .expect("second run should exist")
             .state = RunStatus::Running;
     }
-    crate::queue::notify_head_advanced(&service.inner.queue_notify);
+    service.inner.queue_notify.notify_waiters();
 
     let _third_permit = tokio::time::timeout(Duration::from_secs(2), third_waiter)
         .await
@@ -201,7 +201,7 @@ async fn advancing_queue_head_wakes_waiters_to_use_spare_slots() {
         let mut runs = service.inner.runs.write().await;
         runs.get_mut("third").expect("third run should exist").state = RunStatus::Running;
     }
-    crate::queue::notify_head_advanced(&service.inner.queue_notify);
+    service.inner.queue_notify.notify_waiters();
     let runs = service.inner.runs.read().await;
     assert!(
         ["prior", "first", "second", "third"]
