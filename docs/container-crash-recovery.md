@@ -92,15 +92,30 @@ contract. The current adapter supplies neither an expected-label precondition
 nor a backend-wide exclusion of other actors. Binding the original daemon and
 context is necessary too; the client binary alone does not identify that daemon.
 
-No production reconciliation protocol is established for either Docker or
-Podman yet. They require separate backend verification: a property observed
-on Docker must not be assumed for rootless Podman, or conversely. In particular,
-Podman's filtering or storage APIs need their own ownership/removal analysis,
-not a claim of equivalence to Docker's CLI. An ID-only or atomically
-ownership-conditional removal primitive would address the replacement issue;
-it would not independently fence an asynchronous create. Missing resources,
-daemon errors, and cleanup failures must remain unresolved, not successful
-cleanup. An empty lookup must never clear a durable Started operation.
+The public API surfaces reviewed for Docker Engine v1.48 and Podman 4.9.x do
+not document a conditional-delete precondition. Docker's
+[`DELETE /containers/{id}`](https://docs.docker.com/reference/api/engine/version/v1.48/)
+selector accepts an ID or name and exposes removal flags; Podman's
+[`DELETE /libpod/containers/{name}`](https://docs.podman.io/en/v4.9.3/_static/api.html)
+selector likewise accepts a name or ID and exposes force/removal options.
+Neither endpoint requires the expected immutable ID, ownership label, or
+generation as a condition on deletion. Calling these routes directly through
+HTTP or an SDK therefore does not, by itself, remove the verified-ID-to-delete
+race. This is an API-contract review, not a direct API race test; an alternative
+must be checked against its exact supported server implementation and version.
+
+An ownership-conditional removal primitive would address only replacement at
+delete time. It would not fence an asynchronous create submitted before qcg
+crashed. Safe reconciliation needs both instance-safe destruction and a durable
+creation token with authoritative terminal status or an acknowledged
+cancel/drain barrier that prevents late resource creation. Neither is provided
+by the current adapter or established by the CLI diagnostic. Docker and
+rootless Podman require separate backend verification; do not assume that a
+property on one holds for the other. Podman's filtering or storage APIs need
+their own ownership/removal analysis, not a claim of equivalence to Docker's
+CLI. Missing resources, daemon errors, and cleanup failures must remain
+unresolved, not successful cleanup. An empty lookup must never clear a durable
+Started operation.
 
 ## Real-backend identity diagnostic
 
@@ -121,6 +136,14 @@ label does it deliberately try the stale-ID removal. This is a counterexample
 probe, **not** a proposed cleanup algorithm. Ordinary fixture cleanup verifies
 IDs and labels too, under the disposable/quiescent-daemon precondition that
 production recovery cannot assume.
+
+The exact workflow publication
+[`a1ff46772f9da523cc58629d087eaf39ba49dc12`](https://github.com/t-koba/qcg/actions/runs/42098124987)
+observed Docker CLI 28.0.4 and rootless Podman 4.9.3 both resolving the stale
+full-ID string as a replacement's name and removing that different-ID fixture.
+These are tested CLI behaviors only: the run did not exercise API removal,
+server-version negotiation, a concurrent replacement race, or qcg SIGKILL
+recovery, and it does not establish crash cleanup.
 
 A successful JSON result reports whether the stale-ID removal deleted the
 different-ID fixture; it explicitly reports that crash cleanup is **not
