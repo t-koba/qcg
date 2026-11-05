@@ -225,10 +225,10 @@ async fn bounded_scheduler_comparison_boundary_safety_and_interrupt_latency() {
                 "0.3"
             };
             generator(&root, "slow", slow_command);
-            // Keep the urgent run observable in Running until the test releases
-            // it; the finite wait also prevents a failed assertion orphaning a shell.
+            // Keep the urgent run observable until release; its bounded minimum wait
+            // makes the preemption gap measurable and prevents an orphaned shell.
             let urgent_command = concat!(
-                "0; count=0; while [ ! -f release ] && [ $count -lt 500 ]; ",
+                "0; count=0; while { [ ! -f release ] || [ $count -lt 5 ]; } && [ $count -lt 500 ]; ",
                 "do sleep 0.02; count=$((count + 1)); done; test -f release",
             );
             generator(&root, "urgent", urgent_command);
