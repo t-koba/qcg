@@ -684,7 +684,9 @@ Admission records and run coordination locks are different mechanisms.
 - Admission records are persistent: idempotency mappings under
   `<runs-dir>/idempotency/` plus the durable `run_queued` journal event. The
   default replay TTL is 24 hours from initial Ready publication
-  (`IDEMPOTENCY_TTL_SECS` configures it). `IDEMPOTENCY_MAX_ENTRIES` bounds only
+  (`IDEMPOTENCY_TTL_SECS` configures it). Shared peers need matching TTLs
+  and reasonably synchronized clocks; a shorter/fast peer can expire a
+  mapping before another peer's intended replay window. `IDEMPOTENCY_MAX_ENTRIES` bounds only
   the process-local cache/admission map, not durable records; Pending entries
   resist capacity eviction and can temporarily exceed the budget. A retained
   key with identical content replays the original result; same-process identical
@@ -697,21 +699,39 @@ Admission records and run coordination locks are different mechanisms.
   rather than depend on an expired key. In-memory Ready caches and durable
   records expire from the same persisted creation time; loading or replaying a
   record does not renew it. There is no absolute durable record count cap.
-  Physical deletion happens later through opportunistic maintenance: new claim
-  attempts reaching durable publication advance one resumable bounded pass
-  under the shared idempotency lock; idle servers and replay-only traffic do
-  not. Each server instance has its own cursor and monotonic cadence, and
-  restart begins a new
-  traversal. `IDEMPOTENCY_SWEEP_INTERVAL_SECS` defaults to 60 seconds and
-  `IDEMPOTENCY_SWEEP_MAX_ENTRIES` to 256 yielded directory entries per pass
-  (including ignored names). The positive-integer settings freeze at startup;
-  unset selects the default, while zero, negative, malformed, overflowing, or
-  non-Unicode values refuse startup. The scan cadence is independent of pending
-  claim TTL/staging age. It removes only expired, verifiable Ready records and
-  exact stale staging temps; pending claims (including expired ones),
-  unexpired Ready records, and corrupt/ambiguous records remain. Sweep failures
-  are warned without refusing the current claim; other claim publishers
-  serialize behind the bounded pass. The pre-execution ownership recheck
+  Physical deletion is owned by an idle resident task, not by later requests.
+  It runs at startup and then after each `IDEMPOTENCY_SWEEP_INTERVAL_SECS`
+  delay (default 60), retiring at most `IDEMPOTENCY_SWEEP_MAX_ENTRIES` due
+  obligations per pass (default 256) under the shared idempotency lock. The
+  inclusive TTL cutoff remains creation second plus TTL; a cleanup backlog
+  adds pass delays but never extends replay. Downtime or errors extend physical
+  cleanup lag. Publication registers byte-exact expiry work, including a new
+  publication UUID, before Ready; stale work cannot delete a replacement.
+  Until the migration marker exists, each owner enumerates the legacy directory
+  once, then attempts at most the same entry budget of legacy registrations per
+  pass (including the first pass). Unvisited/failed paths remain queued fairly;
+  incomplete enumeration and pre-marker restarts may discover again. A valid
+  peer marker or successful marker publication releases the queue. Afterward,
+  only the persisted index is traversed. Mixed old and index-aware writers are
+  unsupported. The bounded radix cursor prunes due empty branches, including
+  failed-publication leftovers; removal/sync failure retains retry position.
+  Temps have their own bounded directory cursor and independent per-pass
+  budget of the same size; legacy regular temps move there during migration.
+  Exact generated legacy symlinks are unlinked in place, never through their
+  targets, within the locked, trusted runs-dir boundary (also on Windows).
+  Ordinary record opens remain no-follow and reject reparse points.
+  Regular generated temps need verified age of at least 60 seconds, and exact
+  staging symlinks are unlinked without following them. Pending claims (even
+  expired), unexpired Ready, and corrupt/ambiguous records remain safe. Errors
+  are warned with retryable evidence retained; corrupt discovery/index records
+  require operator repair. Shutdown requests cancellation and joins the async
+  resident; cancellation is cooperative between work items, not within blocking
+  filesystem calls. If shutdown grace expires, aborting the resident wrapper
+  can detach an in-flight blocking pass; its completion is not then guaranteed.
+  Positive-integer settings freeze at startup; unset selects the default,
+  while zero, negative, malformed, overflowing, or non-Unicode values refuse
+  startup. Cadence is independent of claim TTL/temp age. The pre-execution
+  ownership recheck
   cannot fully close the window before execution starts: a successor that acts
   in between may let the stale owner briefly start its engine. Such surplus
   execution never commits and is canceled by orphan settlement at commit time,

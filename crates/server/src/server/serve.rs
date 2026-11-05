@@ -1,20 +1,3 @@
-use anyhow::Result;
-use axum::Router;
-use axum::extract::DefaultBodyLimit;
-use axum::http::HeaderValue;
-use axum::http::Method;
-#[cfg(feature = "server-cors")]
-use axum::http::header;
-use axum::middleware as axum_middleware;
-use axum::routing::{get, put};
-use service::LocalService;
-use std::collections::BTreeMap;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
-#[cfg(feature = "server-cors")]
-use tower_http::cors::CorsLayer;
-
 use super::config::{AppState, ServerConfig};
 use super::generators::{
     describe_generator, healthz, list_generators, llm_catalog, openapi, read_generator_asset,
@@ -34,9 +17,24 @@ use super::run_detail::{
     run_artifacts, run_events, run_snapshot,
 };
 use super::runs::{fork_run, list_runs, start_run};
+use anyhow::Result;
+use axum::Router;
+use axum::extract::DefaultBodyLimit;
+use axum::http::HeaderValue;
+use axum::http::Method;
+#[cfg(feature = "server-cors")]
+use axum::http::header;
+use axum::middleware as axum_middleware;
+use axum::routing::{get, put};
 #[cfg(feature = "server-cors")]
 use policy::IDEMPOTENCY_HEADER;
-
+use service::LocalService;
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
+#[cfg(feature = "server-cors")]
+use tower_http::cors::CorsLayer;
 pub async fn serve_with_listener(
     config: ServerConfig,
     listener: tokio::net::TcpListener,
@@ -52,7 +50,6 @@ pub async fn serve_with_listener(
     let settle = policy.shutdown_settle;
     serve_with_resolved_policy_and_deadline(policy, config, listener, settle).await
 }
-
 /// Serve with an already-resolved policy: the single-freeze boot path.
 /// `main.rs` resolves once before bind and passes the frozen policy here,
 /// so validation and use observe identical values even if the environment
@@ -66,7 +63,6 @@ pub async fn serve_with_resolved_policy(
     let settle = policy.shutdown_settle;
     serve_with_resolved_policy_and_deadline(policy, config, listener, settle).await
 }
-
 /// Serve with an explicit outer shutdown deadline. Production passes the
 /// frozen `SHUTDOWN_SETTLE_SECS` policy value; tests may pass a short deadline
 /// so timeout paths run quickly (E05).
@@ -140,7 +136,6 @@ pub struct ResolvedServerPolicy {
     /// and at least the drain value): outer settlement deadline after drain.
     pub shutdown_settle: std::time::Duration,
 }
-
 fn reject_zero_explicit_max(config: &ServerConfig) -> Result<(), String> {
     if config.max_request_bytes == Some(0) {
         return Err("max_request_bytes must be greater than zero when set".into());
@@ -156,11 +151,9 @@ fn reject_zero_explicit_max(config: &ServerConfig) -> Result<(), String> {
     }
     Ok(())
 }
-
 pub fn resolve_server_policy(config: &ServerConfig) -> Result<ResolvedServerPolicy, String> {
     resolve_server_policy_with_container_timeouts(config, policy::ContainerTimeouts::from_env()?)
 }
-
 /// Resolve server policy with the daemon bundle already frozen by CLI startup.
 pub fn resolve_server_policy_with_container_timeouts(
     config: &ServerConfig,
@@ -549,6 +542,15 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
     // race the recovery admission (E04).
     service.resume_recovered_runs().await;
     let mut tasks = ResidentTasks::start(&service, &shutdown, auto_gc);
+    let maintenance = Arc::clone(&state.idempotency_sweep);
+    let runs = state.runs_dir.clone();
+    let stop = shutdown.clone();
+    let handle = tokio::spawn(async move {
+        maintenance.run(runs, idempotency_ttl, stop).await;
+        Ok(())
+    });
+    tasks.abort_handles.push(handle.abort_handle());
+    tasks.handles.push(handle);
     // Resident OTLP export: best-effort delivery, cancelled by the shared
     // shutdown token, never on the run execution path. Owned by
     // ResidentTasks so an outer-deadline timeout aborts and joins it like
@@ -663,11 +665,9 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
     }
     Ok(actual_addr)
 }
-
 // Shutdown phase durations are resolved once in `ResolvedServerPolicy`.
 // The configured total from signal to exit is `shutdown_drain + shutdown_settle`;
 // do not duplicate that policy in fixed constants.
-
 /// Single shutdown initiation for the serve path (E05): cancels the shared
 /// token owned by the service. `LocalService::mark_shutting_down`
 /// cancels this same token; serve calls only this helper so the token is
@@ -676,7 +676,6 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
 fn initiate_shutdown(shutdown: &CancellationToken) {
     shutdown.cancel();
 }
-
 /// Owns the server's resident maintenance tasks. `Drop` aborts them and
 /// every engine task, so an aborted or panicking serve future cannot leak
 /// resumers or runs that hold service clones and the run-store lock (E05).
@@ -702,7 +701,6 @@ struct ResidentTasks {
     otlp_handle: Option<tokio::task::JoinHandle<()>>,
     otlp_abort: Option<tokio::task::AbortHandle>,
 }
-
 impl ResidentTasks {
     fn start(service: &LocalService, shutdown: &CancellationToken, auto_gc: bool) -> Self {
         let mut handles = Vec::new();
@@ -726,7 +724,6 @@ impl ResidentTasks {
             otlp_abort: None,
         }
     }
-
     /// Takes ownership of the OTLP exporter task so shutdown and abort
     /// paths join it like every other resident (F01).
     fn spawn_otlp(&mut self, future: impl std::future::Future<Output = ()> + Send + 'static) {
@@ -734,7 +731,6 @@ impl ResidentTasks {
         self.otlp_abort = Some(handle.abort_handle());
         self.otlp_handle = Some(handle);
     }
-
     /// H04: borrows instead of consuming so the abort guard (`Drop`)
     /// lives until BOTH resident join and run settlement complete. The
     /// caller disarms engine cleanup only after the join (see
@@ -748,21 +744,21 @@ impl ResidentTasks {
         // 5 s grace period, so one wedged task cannot delay the rest or
         // the run convergence that follows: the total wait is ~5 s, never
         // 5 s per task (E05). A wedged task is aborted after its grace so
-        // no detached task survives shutdown. A panicking task or a task
-        // that ended with Err (for example the GC task after bounded
+        // no async wrapper survives shutdown; an in-flight spawn_blocking
+        // closure cannot be aborted and may outlive its wrapper. A panicking
+        // task or a task that ended with Err (for example the GC task after
         // retries) is returned as an error so the outer shutdown outcome
         // cannot claim clean success while swallowing the failure (E05).
-        // Waiters live in `self.waiters` so an outer-deadline timeout that
-        // drops this future aborts them via `Drop` instead of detaching
-        // them with resident handles inside (E05).
+        // `self.waiters` aborts them via Drop, rather than detaching resident
+        // handles, if an outer-deadline timeout drops this future (E05).
         for mut handle in self.handles.drain(..) {
             self.waiters.spawn(async move {
                 match tokio::time::timeout(std::time::Duration::from_secs(5), &mut handle).await {
                     Err(_) => {
                         handle.abort();
-                        // Confirm termination so no detached task keeps a
-                        // service clone (and the run-store lock) alive
-                        // after the grace period (F01).
+                        // Confirm wrapper termination so no resident task
+                        // retains its service clone/run-store lock after grace
+                        // (F01); blocking work may outlive the wrapper.
                         let _ = handle.await;
                         tracing::warn!("resident task exceeded the shutdown grace period; aborted");
                         Err("resident task exceeded the shutdown grace period".to_string())
@@ -826,7 +822,6 @@ impl ResidentTasks {
             )),
         }
     }
-
     /// H04: disarms the abort-path engine cleanup after BOTH resident join
     /// and run settlement complete. Called once by the shutdown owner after
     /// the `join!`; the abort path (outer deadline, serve abort) never calls
@@ -835,7 +830,6 @@ impl ResidentTasks {
         self.service = None;
     }
 }
-
 impl Drop for ResidentTasks {
     fn drop(&mut self) {
         // Abort-path cleanup (H04): the graceful path disarms via
@@ -869,7 +863,6 @@ impl Drop for ResidentTasks {
         }
     }
 }
-
 pub(crate) fn build_router(
     state: &Arc<AppState>,
     config: &ServerConfig,
@@ -977,7 +970,6 @@ pub(crate) fn build_router(
     };
     Ok(app)
 }
-
 /// Single CORS parser: strings become validated header values exactly once
 /// per boot or router build, and the validated values flow into layer
 /// construction so no second parse exists (E04). Validation is semantic,
@@ -1065,7 +1057,6 @@ pub(crate) fn parse_cors_origins(cors_origins: &[String]) -> Result<Vec<HeaderVa
     }
     Ok(validated)
 }
-
 #[cfg(feature = "server-cors")]
 fn apply_cors_layer(app: Router, validated_cors: &[HeaderValue]) -> Result<Router> {
     // No parsing here: the caller parsed once and passes validated values
@@ -1100,7 +1091,6 @@ fn apply_cors_layer(app: Router, validated_cors: &[HeaderValue]) -> Result<Route
             ]),
     ))
 }
-
 #[cfg(not(feature = "server-cors"))]
 fn apply_cors_layer(_app: Router, validated_cors: &[HeaderValue]) -> Result<Router> {
     if !validated_cors.is_empty() {
@@ -1110,7 +1100,6 @@ fn apply_cors_layer(_app: Router, validated_cors: &[HeaderValue]) -> Result<Rout
     }
     Ok(_app)
 }
-
 /// Rejects new mutating API work once graceful shutdown has started so the
 /// drain phase cannot admit runs the shutdown snapshot never saw (E05).
 /// The refusal uses the JSON problem shape like every other API error, so
@@ -1132,14 +1121,12 @@ async fn reject_mutating_requests_during_shutdown(
     }
     next.run(request).await
 }
-
 /// Installs the SIGTERM handler up front so a broken signal setup fails
 /// the boot instead of silently degrading graceful shutdown later (E05).
 #[cfg(unix)]
 fn install_terminate_signal() -> Result<tokio::signal::unix::Signal, std::io::Error> {
     tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
 }
-
 /// Waits for a shutdown signal. Stopping new work, stopping resident tasks,
 /// and settling active runs are the caller's ordered responsibility, so the
 /// library never calls `process::exit` and embedded hosts observe graceful
@@ -1156,7 +1143,6 @@ pub(crate) async fn shutdown_signal(mut terminate: tokio::signal::unix::Signal) 
         _ = terminate.recv() => {}
     }
 }
-
 /// Waits for a shutdown signal (non-Unix variant of [`shutdown_signal`]).
 /// Platform matrix (E05, documented in `docs/operations.md`):
 /// Unix waits for Ctrl-C or SIGTERM; Windows waits for Ctrl-C plus the
@@ -1192,7 +1178,6 @@ pub(crate) async fn shutdown_signal() {
         }
     }
 }
-
 /// Windows SIGTERM-equivalent wait (E05): Ctrl-C plus console/service
 /// controls. Each installed handler races; a missing handler (install
 /// failure above) is skipped, never a hang. Separated for unit clarity;
@@ -1222,7 +1207,6 @@ async fn windows_shutdown_signal(
         } => {}
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1685,6 +1685,7 @@ async fn matching_pending_start_waits_after_package_removal() {
     state.idempotency.lock().await.insert(
         key.to_string(),
         IdempotencyEntry::ready(crate::durable::DurableIdempotencyRecord {
+            publication_id: None,
             key: key.to_string(),
             digest,
             created_at_unix: crate::durable::now_unix().expect("clock"),

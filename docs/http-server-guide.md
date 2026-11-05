@@ -166,24 +166,60 @@ owner and replay its result; a pending request owned by another process may
 return `503 Service Unavailable`. Reusing a still-bound key with changed
 content returns `409 Conflict`.
 
-Expired Ready files are physically deleted later: new claim attempts that reach
-publication drive one resumable sweep pass when due, serialized with peers under the
-shared idempotency lock. Each server instance has its own cadence and cursor;
-idle servers and replay-only traffic do not advance maintenance, and restart
-begins a new traversal. Pending claim files (including expired claims),
-unexpired Ready records, and corrupt or ambiguous records are not swept. Exact
-abandoned staging temps are cleaned in the same pass using their existing age
-rules. Sweep failures are warned and do not refuse the new claim; other claim
-publishers serialize behind the bounded pass.
+Ready expires when the wall clock reaches its persisted creation second plus
+`IDEMPOTENCY_TTL_SECS` (the cutoff is inclusive). Replay never renews it.
+Peers sharing a store must use matching TTL settings and reasonably
+synchronized wall clocks; a shorter TTL or fast clock can end another
+peer's intended replay window early.
+Physical deletion is asynchronous: a service-owned resident task runs at startup
+and after each `IDEMPOTENCY_SWEEP_INTERVAL_SECS` delay (default 60), even with no
+requests. Each pass retires at most `IDEMPOTENCY_SWEEP_MAX_ENTRIES` due expiry obligations (default 256), under
+the shared idempotency lock. A backlog adds successive pass delays; errors or a
+stopped service can extend cleanup lag. Expired mappings do not replay during
+that lag. Shutdown requests cancellation and joins the resident task. Checks
+between lock polls, discovery entries, migration attempts, radix steps and temp
+entries are cooperative; filesystem calls already in progress are not
+interruptible. If shutdown grace expires, aborting the async resident can detach
+its in-flight blocking pass; joining that wrapper does not prove the pass ended.
 
-`IDEMPOTENCY_SWEEP_INTERVAL_SECS` defaults to 60 and controls the minimum
-monotonic interval between passes, independently of claim TTL/staging age.
-`IDEMPOTENCY_SWEEP_MAX_ENTRIES` defaults to 256 and bounds **all** directory
-entries yielded per pass, including ignored names. The cursor resumes on later
-due passes and reopens after EOF. These settings, `IDEMPOTENCY_TTL_SECS`, and
-`IDEMPOTENCY_MAX_ENTRIES` are resolved once at startup: unset selects the
-default; zero, negative, non-integer, overflowing, or non-Unicode values refuse
-startup.
+Each Ready publication first persists an expiry-index entry under that lock.
+The index identifies the exact publication, including a fresh publication UUID,
+so obsolete work cannot delete a replacement even if its generation restarts.
+While the completion marker is absent, each owner performs one locked legacy
+directory discovery. Enumeration is one-time and unbatched, but registration
+attempts (including the first batch) are limited to
+`IDEMPOTENCY_SWEEP_MAX_ENTRIES` legacy paths per pass, independently of expiry
+and temp cleanup. Unvisited and failed paths survive in a round-robin retry
+queue; incomplete enumeration may restart. A restart before completion discovers
+again. The marker is published only after every path resolves; observing a valid
+peer marker or publishing it releases the entire queue. Errors are warned for
+retry; corrupt or foreign records require operator repair, never speculative
+deletion. With the marker present, maintenance traverses only bounded due index
+work, not all Ready files, including after restart. Retirement attempts are
+bounded at twice the entry budget, and radix traversal/pruning at 256 steps per
+budget slot (the u64 index has sixteen hex levels). Cursors resume across passes.
+Empty index paths, including those left by a failed publication, are pruned by
+that cursor once due; failed removal/sync retains its position for retry without
+a separate tree scan. Pending claims (even expired ones) and unexpired Ready
+remain untouched. Do not mix pre-index writers with index-aware servers in one
+store.
+
+Exact generated staging temps live separately and have an independent budget
+of at most `IDEMPOTENCY_SWEEP_MAX_ENTRIES` yielded temp entries per pass; Ready
+keys cannot consume it. Legacy regular staging temps move there during migration;
+exact generated legacy symlinks are instead unlinked in place without opening or
+following their targets (including Windows file/directory symlinks). This is safe
+within the shared-lock, trusted runs-directory boundary: staging leaves are
+expendable, their exact generated names are checked, and their ancestry must not
+be mutated by uncoordinated actors. Ordinary record opens still reject symlinks
+and reparse points. Regular temps require verified age of at least 60 seconds;
+exact generated staging symlinks are unlinked without following them. Unknown
+names remain untouched.
+Maintenance failures are warned and retryable evidence is retained; maintenance
+and publishers serialize on the same lock. The settings above,
+`IDEMPOTENCY_TTL_SECS`, and `IDEMPOTENCY_MAX_ENTRIES` freeze at startup: unset
+selects the default; zero, negative, non-integer, overflowing, or non-Unicode
+values refuse startup. Cadence is independent of pending-claim TTL/temp age.
 
 The same header is accepted by `POST /api/runs/{id}/fork`,
 `PUT /api/runs/{id}/questions/{qid}`,

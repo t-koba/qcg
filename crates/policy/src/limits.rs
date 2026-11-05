@@ -198,10 +198,10 @@ pub const IDEMPOTENCY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Process-local cache/admission budget; Pending entries resist capacity eviction.
 pub const IDEMPOTENCY_MAX_ENTRIES: usize = 1024;
 
-/// Per-server-instance minimum interval between opportunistic idempotency sweep passes.
+/// Per-server-instance delay between idle idempotency maintenance passes.
 pub const IDEMPOTENCY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Maximum directory entries yielded per idempotency sweep pass, including ignored names.
+/// Independent per-pass limits for legacy registrations, due retirements and temp entries.
 pub const IDEMPOTENCY_SWEEP_MAX_ENTRIES: usize = 256;
 
 /// Default bound on `generator_runs_total` series exported by `/metrics`.

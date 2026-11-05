@@ -1,3 +1,6 @@
+use super::config::AppState;
+use super::error::ApiHttpError;
+use super::idempotency::{IdempotentCall, with_idempotency};
 use anyhow::Result;
 use api::{AnswerPayload, ConfirmDecision};
 use axum::Json;
@@ -13,11 +16,6 @@ use std::io::{self, Write};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-
-use super::config::AppState;
-use super::error::ApiHttpError;
-use super::idempotency::{IdempotentCall, with_idempotency};
-
 pub(crate) async fn run_snapshot(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -31,7 +29,6 @@ pub(crate) async fn run_snapshot(
         .map_err(ApiHttpError::from_api)?;
     conditional_response(&headers, body, "application/json")
 }
-
 pub(crate) async fn invalidate_run(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -45,7 +42,6 @@ pub(crate) async fn invalidate_run(
             .map_err(ApiHttpError::from_api)?,
     ))
 }
-
 pub(crate) async fn delete_run(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -57,7 +53,6 @@ pub(crate) async fn delete_run(
         .map_err(ApiHttpError::from_api)?;
     Ok(StatusCode::NO_CONTENT)
 }
-
 pub(crate) async fn read_run_bundle(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -141,7 +136,6 @@ pub(crate) async fn read_run_bundle(
         .body(Body::from_stream(stream))
         .map_err(ApiHttpError::internal)
 }
-
 pub(crate) async fn answer_run(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -179,7 +173,6 @@ pub(crate) async fn answer_run(
     })
     .await
 }
-
 pub(crate) async fn confirm_run(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -215,7 +208,6 @@ pub(crate) async fn confirm_run(
     })
     .await
 }
-
 pub(crate) async fn cancel_run(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -244,7 +236,6 @@ pub(crate) async fn cancel_run(
     })
     .await
 }
-
 pub(crate) async fn cancel_run_from_path(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -262,7 +253,6 @@ pub(crate) async fn cancel_run_from_path(
     };
     cancel_run(State(state), headers, Path(id.to_string())).await
 }
-
 pub(crate) async fn dispatch_fallback(
     method: Method,
     original_uri: OriginalUri,
@@ -276,7 +266,6 @@ pub(crate) async fn dispatch_fallback(
         Vec::new(),
     ))
 }
-
 pub(crate) fn unsafe_generator_asset_path(path: &str) -> bool {
     let Some((prefix, asset_path)) = path.split_once("/assets/") else {
         return false;
@@ -290,7 +279,6 @@ pub(crate) fn unsafe_generator_asset_path(path: &str) -> bool {
         || encoded.contains("%2f")
         || encoded.contains("%5c")
 }
-
 pub(crate) async fn run_events(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -450,7 +438,6 @@ pub(crate) async fn run_events(
         .keep_alive(KeepAlive::default())
         .into_response())
 }
-
 /// Seq-aware shutdown marker (E05): the marker carries the next seq after
 /// the last delivered event with a stable id (`seq` as the SSE id) so
 /// clients resume via `Last-Event-ID` from it. Suppressed when a terminal
@@ -498,7 +485,6 @@ fn shutdown_marker_stream_dynamic(
     })
     .filter_map(std::future::ready)
 }
-
 /// Static-seq marker for the history-only drain path (E05): the last
 /// delivered seq is already final (no live tail), so the next seq is frozen
 /// at stream construction. Terminal suppression still applies.
@@ -512,7 +498,6 @@ fn shutdown_marker_stream_with_seq(
     ));
     shutdown_marker_stream_dynamic(shutdown, last, terminal_seen)
 }
-
 pub(crate) async fn run_artifacts(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -529,7 +514,6 @@ pub(crate) async fn run_artifacts(
     // entry point computes the digest once from the served bytes.
     conditional_response(&headers, body, "application/json")
 }
-
 /// The exact-body ETag shared by every conditional JSON endpoint, so a
 /// digest change can never diverge between snapshot and artifact paths
 /// (E16). Single hash: callers pass bytes, never a precomputed validator.
@@ -537,18 +521,15 @@ pub(crate) fn body_etag(body: &[u8]) -> String {
     use sha2::{Digest as _, Sha256};
     weak_etag(&hex::encode(Sha256::digest(body)))
 }
-
 fn weak_etag(value: &str) -> String {
     format!("W/\"{value}\"")
 }
-
 /// Parsed `If-None-Match` precondition (RFC 7232).
 enum IfNoneMatch {
     Absent,
     Star,
     Tags(Vec<String>),
 }
-
 /// Parses `If-None-Match` fail-closed: `*` alone, or a comma-separated
 /// entity-tag list where each entry is `[W/]"opaque-tag"`. Any malformed
 /// value (empty, trailing comma, bare `*` inside a list, lowercase `w/`,
@@ -591,7 +572,6 @@ fn parse_if_none_match(headers: &HeaderMap) -> Result<IfNoneMatch, ApiHttpError>
     }
     Ok(IfNoneMatch::Tags(tags))
 }
-
 /// Weak comparison of a current opaque tag against a parsed precondition:
 /// `*` matches any existing representation, otherwise any listed tag equal
 /// to the current one matches (E16).
@@ -602,7 +582,6 @@ fn if_none_match_matches(precondition: &IfNoneMatch, current_opaque: &str) -> bo
         IfNoneMatch::Tags(tags) => tags.iter().any(|tag| tag == current_opaque),
     }
 }
-
 /// Current opaque tag from a weak ETag value (`W/"..."` or `"..."`).
 fn current_opaque_tag(etag: &str) -> String {
     etag.trim()
@@ -610,7 +589,6 @@ fn current_opaque_tag(etag: &str) -> String {
         .trim_matches('"')
         .to_string()
 }
-
 /// Single conditional-bytes entry point (E16): callers pass the exact
 /// bytes to serve plus the content type; the validator is the exact-body
 /// digest computed once here, so no caller-supplied ETag can diverge from
@@ -630,7 +608,6 @@ pub(crate) fn conditional_response(
     let served = body_etag(&body);
     conditional_response_with_etag(headers, body, content_type, &served)
 }
-
 /// Core conditional responder sharing one precomputed validator (E16):
 /// [`conditional_response`] funnels here so the hash runs exactly once per
 /// response. `served` must be `body_etag(&body)`.
@@ -657,7 +634,6 @@ fn conditional_response_with_etag(
         .body(Body::from(body))
         .map_err(ApiHttpError::internal)
 }
-
 /// Exact-body validator response shared by conditional reads and mutation
 /// responses: one builder so status-only callers cannot diverge the
 /// validator, content type, or cache headers (E16). `location` carries an
@@ -680,7 +656,6 @@ pub(crate) fn json_response_with_etag(
         .body(Body::from(body))
         .map_err(ApiHttpError::internal)
 }
-
 /// Single byte ranges; unsupported units/multipart ranges are ignored.
 /// If-Range only enables partial delivery for the exact strong validator.
 fn artifact_range(headers: &HeaderMap, etag: &str, size: u64) -> Result<Option<(u64, u64)>, ()> {
@@ -723,7 +698,6 @@ fn artifact_range(headers: &HeaderMap, etag: &str, size: u64) -> Result<Option<(
     }
     Ok(Some((start, end)))
 }
-
 pub(crate) async fn read_artifact(
     State(state): State<Arc<AppState>>,
     Path((id, path)): Path<(String, String)>,
@@ -738,7 +712,6 @@ pub(crate) async fn read_artifact(
     let strong_etag = format!("\"{}\"", artifact.sha256);
     let precondition = parse_if_none_match(&headers)?;
     let not_modified = if_none_match_matches(&precondition, &artifact.sha256);
-
     // Read and verify one bounded snapshot from an open file; its strong ETag
     // names the served bytes, not a later path read.
     let mut file = tokio::fs::File::open(&resolved)
@@ -801,7 +774,6 @@ pub(crate) async fn read_artifact(
             .map_err(ApiHttpError::internal)?;
     }
     drop(file);
-
     if not_modified {
         return Response::builder()
             .status(StatusCode::NOT_MODIFIED)
@@ -855,7 +827,6 @@ pub(crate) async fn read_artifact(
         .body(Body::from_stream(stream))
         .map_err(ApiHttpError::internal)
 }
-
 pub(crate) async fn read_artifacts_zip(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -938,11 +909,9 @@ pub(crate) async fn read_artifacts_zip(
         .body(Body::from_stream(stream))
         .map_err(ApiHttpError::internal)
 }
-
 pub(crate) struct ChannelWriter {
     sender: mpsc::Sender<Result<Vec<u8>, io::Error>>,
 }
-
 impl Write for ChannelWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.sender
@@ -950,12 +919,10 @@ impl Write for ChannelWriter {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "zip response stream closed"))?;
         Ok(buf.len())
     }
-
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
-
 /// Merges two NDJSON record streams by their shared seq space. A line that
 /// does not parse or carries no seq fails the request instead of being
 /// dropped silently: the journal view must never hide corruption.
@@ -986,7 +953,6 @@ fn merge_record_streams(durable: &[u8], observed: &[u8]) -> Result<Vec<u8>, ApiH
     }
     Ok(bytes)
 }
-
 pub(crate) async fn read_journal(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1152,7 +1118,6 @@ pub(crate) async fn read_journal(
         .body(body)
         .map_err(ApiHttpError::internal)
 }
-
 pub(crate) async fn read_cost_metrics(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1169,7 +1134,6 @@ pub(crate) async fn read_cost_metrics(
     let body = serde_json::to_vec(&metrics).map_err(ApiHttpError::internal)?;
     conditional_response(&headers, body, "application/json")
 }
-
 pub(crate) fn content_type_for_name(path: &str) -> &'static str {
     match path.rsplit('.').next() {
         Some("css") => "text/css; charset=utf-8",
@@ -1195,7 +1159,6 @@ pub(crate) fn content_type_for_name(path: &str) -> &'static str {
         _ => "application/octet-stream",
     }
 }
-
 pub(crate) fn content_disposition_attachment(path: &str) -> String {
     let file_name = path
         .rsplit('/')
@@ -1204,7 +1167,6 @@ pub(crate) fn content_disposition_attachment(path: &str) -> String {
         .replace(['"', '\\', '\r', '\n'], "_");
     format!("attachment; filename=\"{file_name}\"")
 }
-
 /// Verify a singly-served artifact against its manifest before delivery.
 /// Size alone cannot detect a same-length post-completion swap, so the
 /// sha256 is always compared, matching the ZIP/bundle verification.
@@ -1229,7 +1191,6 @@ pub(crate) fn verify_artifact_measurement(
     }
     Ok(())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

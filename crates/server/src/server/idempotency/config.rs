@@ -119,6 +119,7 @@ mod tests {
         let ttl = policy::IDEMPOTENCY_TTL;
         let (completed, _) = tokio::sync::watch::channel(false);
         let record = |key: &str, created| DurableIdempotencyRecord {
+            publication_id: None,
             key: key.into(),
             digest: "digest".into(),
             run_id: "run".into(),
