@@ -1167,23 +1167,23 @@ remain excluded from package identity. This is an additive schema-v2 field;
 legacy/direct events may omit `package_sha256` for read-only observation.
 
 Execution re-verifies the snapshot after queueing and before entering the
-engine. Restart recovery refuses non-terminal runs without a package identity,
-with a missing snapshot, or with mismatched content; it never reloads the current
-installed package to repair them. Such a refusal can prevent service startup or
-shared-store refresh until the store is repaired or the affected run is removed
-under the normal store ownership rules. Forks likewise verify and copy the source
-run's snapshot and refuse missing/legacy/mismatched content. A previously admitted
-fork retry verifies its own snapshot instead. Copy/checkpoint failures clean only
-the fresh target, never the source or a pre-existing target. Package pinning does
-not relax recovery refusal for indeterminate external effects.
+engine. Service restart recovery rehydrates non-terminal service runs only when
+they carry a package identity and their pinned snapshot is present and matches;
+it never reloads the current installed package to repair them. A missing
+identity or snapshot, or mismatched content, can prevent service startup or
+shared-store refresh until that service run is repaired or removed under the
+normal store ownership rules. Forks likewise verify and copy the source run's
+snapshot and refuse missing/legacy/mismatched content. A previously admitted
+fork retry verifies its own snapshot instead. Copy/checkpoint failures clean
+only the fresh target, never the source or a pre-existing target. Package
+pinning does not relax recovery refusal for indeterminate external effects.
 
-**Direct execution is not package-pinned by this slice.** Direct/ephemeral runs
-continue to use their supplied generator root, including reads after scheduler
-queue delay; they have no durable package admission snapshot. If interrupted
-before terminal settlement, they cannot be resumed and the recovery rule above
-may refuse service startup until the run is repaired or removed under normal
-store ownership. Their existing pre-engine queue-delay accounting limitation
-also remains unchanged.
+**Direct execution is not package-pinned by the service.** `qcg run` uses its
+supplied generator root and has no durable service admission snapshot.
+Recognized direct journals are not service-owned or scheduled by service
+recovery; they remain visible with their recorded non-terminal status. For
+continuation or discard, follow the [CLI reference](cli-reference.md). The
+existing pre-engine queue-delay accounting limitation remains unchanged.
 
 ## Run families: fork links and await
 
