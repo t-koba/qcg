@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { InputField } from "./api/client";
-import { encodeBase64, fieldKind, fieldSchema, isBlockingSchemaIssue, isSafeFileName, MAX_SCHEMA_NODES, normalizeList, removePath, resolveSchemaReferences, schemaKind, schemaNodeCount, setPath, validateField, validateInputField, validateSchemaValue, valueNodeCountExceeded } from "./field";
+import { encodeBase64, fieldKind, fieldSchema, isBlockingSchemaIssue, isSafeFileName, MAX_SCHEMA_NODES, normalizeList, removePath, resolveSchemaReferences, schemaDefaultOr, schemaKind, schemaNodeCount, setPath, validateField, validateInputField, validateSchemaValue, valueNodeCountExceeded } from "./field";
 
 function field(overrides: Partial<InputField> = {}): InputField {
   return { id: "value", label: null, label_i18n: {}, type: "string", required: false, default: null, pattern: null, options: [], option_labels_i18n: {}, min_items: null, item_type: null, ...overrides };
@@ -45,6 +45,18 @@ describe("field contracts", () => {
   it("keeps an unconstrained schema on the JSON editor fallback", () => {
     expect(schemaKind({}, { nested: ["value"] }, "vendor.untyped")).toBe("json");
     expect(schemaKind({ type: ["string", "null"] })).toBe("union");
+  });
+
+  it("preserves explicit null schema defaults and falls back only when absent", () => {
+    let fallbackCalls = 0;
+    const fallback = () => {
+      fallbackCalls += 1;
+      return "generated";
+    };
+    expect(schemaDefaultOr({ default: null }, fallback)).toBeNull();
+    expect(fallbackCalls).toBe(0);
+    expect(schemaDefaultOr({}, fallback)).toBe("generated");
+    expect(fallbackCalls).toBe(1);
   });
 
   it("counts the complete schema tree for the renderer limit", () => {

@@ -14,6 +14,7 @@
     schemaBoolean,
     schemaBranches,
     schemaDefault,
+    schemaDefaultOr,
     schemaInputType,
     schemaKind,
     schemaNumber,
@@ -254,7 +255,7 @@
   function addArrayItem(): void {
     if (!canAddItem) return;
     const itemSchema = itemSchemaForIndex(arrayValue.length);
-    const next = schemaDefault(itemSchema) ?? defaultForSchema(itemSchema);
+    const next = schemaDefaultOr(itemSchema, () => defaultForSchema(itemSchema));
     emit([...arrayValue, next]);
   }
 
@@ -266,7 +267,8 @@
   function addObjectProperty(): void {
     const key = newProperty.trim();
     if (!key || key in objectValue || key in objectProperties) return;
-    const next = schemaDefault(additionalSchema || {}) ?? defaultForSchema(additionalSchema || {});
+    const schema = additionalSchema || {};
+    const next = schemaDefaultOr(schema, () => defaultForSchema(schema));
     updateChild([...path, key], next);
     newProperty = "";
   }
