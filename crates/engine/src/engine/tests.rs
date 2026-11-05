@@ -7889,12 +7889,12 @@ impl StepExecutor for EpisodeProbeStep {
 #[tokio::test]
 async fn active_direct_short_episodes_preserve_subseconds_and_pin_mode() {
     let run_dir = temp_run_dir("active-short-episodes");
-    let mut manifest = manifest(vec![
+    let manifest = manifest(vec![
         node("ask1", "test.episode_probe"),
         node("ask2", "test.episode_probe"),
         node("ask3", "test.episode_probe"),
     ]);
-    manifest.budget.max_elapsed_seconds = Some(10);
+    // Exact deadline behavior is covered elsewhere; this test isolates subsecond totals and mode pinning.
     let mut registry = StepRegistry::new();
     registry.register(EpisodeProbeStep);
     let engine = Engine::new(registry);
