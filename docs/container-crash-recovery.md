@@ -112,12 +112,33 @@ crashed. Safe reconciliation needs both instance-safe destruction and a durable
 creation token with authoritative terminal status or an acknowledged
 cancel/drain barrier that prevents late resource creation. Neither is provided
 by the current adapter or established by the CLI or sequential API diagnostic.
-Docker and rootless Podman require separate backend verification; do not
-assume that a property on one holds for the other. Podman's filtering or storage APIs need
-their own ownership/removal analysis, not a claim of equivalence to Docker's
-CLI. Missing resources, daemon errors, and cleanup failures must remain
-unresolved, not successful cleanup. An empty lookup must never clear a durable
-Started operation.
+
+Review of the version-pinned create contracts found no durable create-request
+handle or cancellation acknowledgement. Docker Engine v1.48 specifies a 201
+`ContainerCreateResponse` for `POST /containers/create`; Moby v28.0.4's
+[`postContainersCreate` handler](https://github.com/moby/moby/blob/v28.0.4/api/server/router/container/container_routes.go)
+waits for `ContainerCreate(ctx, ...)` and writes that response after it returns.
+Podman v4.9.3 registers `POST /libpod/containers/create` with a 201
+`containerCreateResponse`; its
+[Libpod handler](https://github.com/containers/podman/blob/v4.9.3/pkg/api/handlers/libpod/containers_create.go)
+waits for `ExecuteCreate(r.Context(), ...)` and then returns the container ID
+and warnings. The
+[Docker v1.48 API schema](https://github.com/moby/moby/blob/v28.0.4/api/swagger.yaml)
+and [Podman v4.9.3 route contract](https://github.com/containers/podman/blob/v4.9.3/pkg/api/server/register_containers.go)
+expose a result on successful response, but no durable create-job ID or
+request-specific terminal-status or cancellation acknowledgement.
+Both implementations pass request context downstream, but these sources do not
+establish that client disconnect aborts or rolls back all side effects, and no
+direct disconnect test was run. A lost response therefore leaves no
+caller-observable terminal result; it does not prove that creation was canceled
+or rolled back. Keep that case unresolved, even if a later lookup is empty.
+
+Docker and rootless Podman still require separate backend verification; do not
+assume that a property on one holds for the other. Podman's filtering or
+storage APIs need their own ownership/removal analysis, not a claim of
+equivalence to Docker's CLI. Missing resources, daemon errors, and cleanup
+failures must remain unresolved, not successful cleanup. An empty lookup must
+never clear a durable Started operation.
 
 ## Real-backend identity diagnostic
 
