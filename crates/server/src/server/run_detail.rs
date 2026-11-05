@@ -739,9 +739,8 @@ pub(crate) async fn read_artifact(
     let precondition = parse_if_none_match(&headers)?;
     let not_modified = if_none_match_matches(&precondition, &artifact.sha256);
 
-    // Bound before allocating and verify from the opened description. The
-    // response is built from this byte snapshot, not a later read of the
-    // mutable inode, so its strong ETag names the bytes actually delivered.
+    // Read and verify one bounded snapshot from an open file; its strong ETag
+    // names the served bytes, not a later path read.
     let mut file = tokio::fs::File::open(&resolved)
         .await
         .map_err(ApiHttpError::internal)?;
@@ -762,8 +761,7 @@ pub(crate) async fn read_artifact(
             metadata.len()
         )));
     }
-    // `read_artifact_with_limits` bounds the manifest size by the configured
-    // artifact cap; reserve safely and never retain beyond that exact size.
+    // The manifest's configured byte cap also bounds the delivery buffer.
     let expected_capacity = usize::try_from(artifact.bytes).map_err(ApiHttpError::internal)?;
     let mut verified_bytes = Vec::new();
     if !not_modified {
@@ -776,8 +774,7 @@ pub(crate) async fn read_artifact(
         use tokio::io::AsyncReadExt as _;
         let mut hasher = sha2::Sha256::new();
         let mut seen: u64 = 0;
-        // Manifest size + 1 detects post-stat growth without reading or
-        // retaining an unbounded replacement file.
+        // Reading at most manifest size + 1 detects growth without unbounded retention.
         let mut remaining = artifact.bytes.saturating_add(1);
         let mut chunk = vec![0u8; 64 * 1024];
         loop {
@@ -829,8 +826,7 @@ pub(crate) async fn read_artifact(
     let content_type = artifact
         .mime
         .unwrap_or_else(|| content_type_for_name(&artifact.path).to_string());
-    // Range bounds are within artifact.bytes, verified above against this
-    // immutable snapshot. Bound delivery chunks and stop on shutdown (E05/E16).
+    // Ranges use this verified snapshot; stream in bounded chunks and stop on shutdown (E05/E16).
     use tokio::io::AsyncReadExt as _;
     let mut reader = std::io::Cursor::new(verified_bytes);
     reader.set_position(start);

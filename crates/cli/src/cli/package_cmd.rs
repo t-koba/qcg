@@ -184,8 +184,7 @@ pub(crate) fn package(
             limits.max_bytes,
         )
         .map_err(|error| std::io::Error::other(error.to_string()))
-    })?;
-    Ok(())
+    })
 }
 
 fn check_package_output_limits(

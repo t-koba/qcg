@@ -84,35 +84,26 @@ impl ArtifactZipLimits {
 /// writers are unsupported there (E15).
 fn open_archive_nofollow(archive: &Utf8Path) -> Result<File, ServiceError> {
     #[cfg(unix)]
-    {
+    let file = {
         use std::os::unix::fs::OpenOptionsExt as _;
-        match std::fs::OpenOptions::new()
+        std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(archive)
-        {
-            Ok(file) => {
-                if !file.metadata().map_err(ServiceError::Io)?.is_file() {
-                    return Err(ServiceError::Invalid(format!(
-                        "package archive `{archive}` is not a regular file"
-                    )));
-                }
-                Ok(file)
-            }
-            Err(error) => {
+            .map_err(|error| {
                 if std::fs::symlink_metadata(archive)
                     .is_ok_and(|meta| meta.file_type().is_symlink())
                 {
-                    return Err(ServiceError::Invalid(format!(
+                    ServiceError::Invalid(format!(
                         "package archive `{archive}` is a symbolic link; refusing to read"
-                    )));
+                    ))
+                } else {
+                    ServiceError::Io(error)
                 }
-                Err(ServiceError::Io(error))
-            }
-        }
-    }
+            })?
+    };
     #[cfg(not(unix))]
-    {
+    let file = {
         match std::fs::symlink_metadata(archive) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 return Err(ServiceError::Invalid(format!(
@@ -132,13 +123,14 @@ fn open_archive_nofollow(archive: &Utf8Path) -> Result<File, ServiceError> {
             Ok(_) => {}
             Err(error) => return Err(ServiceError::Io(error)),
         }
-        if !file.metadata().map_err(ServiceError::Io)?.is_file() {
-            return Err(ServiceError::Invalid(format!(
-                "package archive `{archive}` is not a regular file"
-            )));
-        }
-        Ok(file)
+        file
+    };
+    if !file.metadata().map_err(ServiceError::Io)?.is_file() {
+        return Err(ServiceError::Invalid(format!(
+            "package archive `{archive}` is not a regular file"
+        )));
     }
+    Ok(file)
 }
 
 /// Pinned unpack-target directory fd (Unix): opened once with
@@ -328,14 +320,9 @@ fn with_parent_fd<T>(
             }
         }
     }
-    let (leaf, parents) = match components.split_last() {
-        Some(split) => split,
-        None => {
-            return Err(ServiceError::Invalid(format!(
-                "unpack path `{relative}` is empty"
-            )));
-        }
-    };
+    let (leaf, parents) = components
+        .split_last()
+        .ok_or_else(|| ServiceError::Invalid(format!("unpack path `{relative}` is empty")))?;
     let mut current: Option<PinnedDir> = None;
     for part in parents {
         let base: &PinnedDir = current.as_ref().unwrap_or(root);
@@ -909,24 +896,6 @@ fn create_parent_dirs(target: &Utf8Path, dir: &Utf8Path) -> Result<(), ServiceEr
         }
     }
     Ok(())
-}
-
-/// Ensures `path` is a plain directory without following a pre-existing
-/// symlink: `create_dir_all` would silently accept one and later writes
-/// would land outside the target (E15).
-#[cfg(not(unix))]
-fn ensure_plain_dir(path: &Utf8Path) -> Result<(), ServiceError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(ServiceError::Invalid(format!(
-            "package path `{path}` collides with an existing symbolic link"
-        ))),
-        Ok(metadata) if metadata.is_dir() => Ok(()),
-        Ok(_) => Err(ServiceError::Invalid(format!(
-            "package path `{path}` collides with an existing file"
-        ))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => create_plain_dir(path),
-        Err(error) => Err(ServiceError::Io(error)),
-    }
 }
 
 /// Creates one directory with an owner-only mode first, so the process
@@ -1637,19 +1606,15 @@ fn verify_package_inventory(root: &Utf8Path, limits: &PackageLimits) -> Result<(
 /// the open and fails closed on any link, with a documented residual
 /// window.
 fn open_verified_file_nofollow(path: &Utf8Path, relative: &str) -> Result<File, ServiceError> {
-    match open_source_entry_nofollow(path) {
-        Ok(file) => Ok(file),
-        Err(error) => {
-            if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
-                return Err(ServiceError::Invalid(format!(
-                    "package contains a symbolic link: {relative}"
-                )));
-            }
-            Err(ServiceError::Invalid(format!(
+    open_source_entry_nofollow(path).map_err(|error| {
+        if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            ServiceError::Invalid(format!("package contains a symbolic link: {relative}"))
+        } else {
+            ServiceError::Invalid(format!(
                 "failed to inspect package file `{relative}`: {error}"
-            )))
+            ))
         }
-    }
+    })
 }
 
 /// Sanitized mode bits from handle metadata for SBOM mode verification

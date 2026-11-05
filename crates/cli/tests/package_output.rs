@@ -93,7 +93,7 @@ fn package_bare_output_symlink_is_refused_without_following() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn package_default_output_works_from_non_utf8_current_directory() {
     use std::os::unix::ffi::OsStrExt as _;
