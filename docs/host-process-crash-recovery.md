@@ -115,9 +115,31 @@ indeterminate operation or bypasses Started/Repeat policy.
 
 ## Other platforms
 
-- **macOS:** the current process-group mechanism is escapable. No supported
-  descendant boundary that survives qcg SIGKILL has been established for
-  arbitrary host commands or MCP stdio.
+- **macOS:** qcg launches host commands and host MCP stdio servers in
+  dedicated Unix process groups. Group-wide live cleanup reaches only members
+  that remain in the group; a descendant can leave it with `setsid`. The
+  Apple [`launchd.plist(5)`
+  documentation](https://github.com/apple-oss-distributions/launchd/blob/main/man/launchd.plist.5)
+  describes cleanup of remaining processes with the launchd job's *same*
+  process-group ID (unless `AbandonProcessGroup` disables that behavior), not
+  ownership of an arbitrary descendant tree. Apple's [Technical Note
+  TN2083](https://developer.apple.com/library/archive/technotes/tn2083/_index.html)
+  likewise describes signaling the associated process group and identifies
+  `setsid` as a way for a child to leave it. Even if qcg itself is a launchd
+  job, its command's separately created process group is outside that
+  same-PGID cleanup; an escaped descendant is outside its command group too.
+  The reviewed macOS process/launchd mechanisms therefore provide no
+  established, non-escapable descendant boundary tied to qcg's lifetime for
+  arbitrary host commands or MCP stdio. A helper, process-tree walk, kqueue
+  exit notification, or saved PID/PGID is not durable ownership after qcg
+  dies; process enumeration and numeric identities cannot establish that an
+  escaped process is still the original workload. Do not claim crash cleanup
+  on macOS. If a deployment requires that guarantee, use Linux with explicit
+  delegated cgroup-v2 recovery or supply a separately validated outer
+  containment boundary. Otherwise the deployment must accept unresolved host
+  effects after a qcg crash, or the product must deny host commands/MCP stdio
+  on macOS when that residual risk is unacceptable; retain the journal and
+  `Started` evidence for reconciliation.
 - **Windows:** the engine command path calls Tokio `Command::spawn()` before
   creating, configuring, and assigning its per-command Job Object. Its explicit
   process flag is `CREATE_NEW_PROCESS_GROUP`, not `CREATE_SUSPENDED`, so payload
