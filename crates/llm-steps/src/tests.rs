@@ -1004,7 +1004,8 @@ fn mcp_confirmation_summary_never_contains_argument_values() {
     let summary = mcp_argument_summary(&json!({
         "password": "must-not-appear",
         "nested": { "token": "also-secret" }
-    }));
+    }))
+    .unwrap();
     let encoded = summary.to_string();
     assert_eq!(summary["argument_names"], json!(["nested", "password"]));
     assert!(summary["encoded_bytes"].as_u64().is_some());
@@ -1016,10 +1017,18 @@ fn mcp_confirmation_summary_never_contains_argument_values() {
 fn mcp_confirmation_summary_journals_fetch_destinations() {
     // The approval digest and the operation_started audit bind the
     // extracted hosts; pure-query calls journal an empty list.
-    let fetch = mcp_argument_summary(&json!({"url": "https://Example.TEST/x?q=1"}));
+    let fetch = mcp_argument_summary(&json!({"url": "https://Example.TEST/x?q=1"})).unwrap();
     assert_eq!(fetch["destinations"], json!(["example.test"]));
-    let query = mcp_argument_summary(&json!({"query": "rust"}));
+    let query = mcp_argument_summary(&json!({"query": "rust"})).unwrap();
     assert_eq!(query["destinations"], json!([]));
+}
+
+#[test]
+fn mcp_confirmation_summary_uses_fallible_classification() {
+    let summary =
+        mcp_argument_summary(&json!({"urls":["example.test/path", "//example.test/x"]})).unwrap();
+    assert_eq!(summary["destinations"], json!(["example.test"]));
+    assert!(mcp_argument_summary(&json!({"url":"//"})).is_err());
 }
 
 #[test]

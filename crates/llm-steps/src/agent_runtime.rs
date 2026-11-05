@@ -824,7 +824,7 @@ fn pending_call_digest(
             // swapped payload recomputes a different digest and fails the
             // confirm binding below instead of riding it.
             let target = format!("{server}/{tool}");
-            let details = Some(crate::mcp_forms::mcp_argument_summary(&call.args));
+            let details = Some(crate::mcp_forms::mcp_argument_summary(&call.args).ok()?);
             engine::RunContext::operation_digest(&target, &details).ok()
         }
         _ => None,
@@ -1572,7 +1572,12 @@ pub(crate) async fn execute_agent_tool(
                     node,
                     &format!("mcp:{name}"),
                     &format!("{server}/{remote_tool}"),
-                    Some(mcp_argument_summary(args)),
+                    Some(
+                        mcp_argument_summary(args).map_err(|message| StepError::Refused {
+                            node: node.id.clone(),
+                            message: message.into(),
+                        })?,
+                    ),
                     call_id,
                 )?
             {

@@ -4744,11 +4744,15 @@ protocol session for each run, even though OAuth credentials and token refresh
 state are shared by the process-level profile runtime.
 
 Server-side fetch destinations are a second, independent ceiling: every
-whole-value `http(s)` URL string anywhere in the tool arguments contributes
-its lowercased host, and each host must be listed in the profile's operator-owned
-`allowed_destinations` (exact match or `"*"`, hosts only with IPv6 literals in bracketed form `"[2001:db8::1]"`, never full URLs).
-The default is empty, so calls with no extracted host (for example pure-query
-search) pass while any fetch URL is refused until the operator allows its host
+whole-value absolute HTTP(S), protocol-relative `//host/path`, and
+schemeless hostname/IP target strings anywhere in the tool arguments contribute
+their lowercased host. Known URL/URI/host/hostname/target and common
+href/link/domain/endpoint/website/destination/site slots reject ambiguous values. Each extracted
+host must be listed in the profile's operator-owned `allowed_destinations`
+(exact match or `"*"`, hosts only with IPv6 literals in bracketed form
+`"[2001:db8::1]"`, never full URLs). The default is empty, so genuine host-free
+calls (for example `{"query":"rust"}`) pass while fetch targets are refused
+until the operator allows their host
 in `providers.toml`. The server endpoint host never implies destination rights:
 listing `mcp.exa.ai` does not authorize fetching `example.com`. The check runs
 both at argument validation and at execution before any guard or remote touch,

@@ -103,7 +103,14 @@ pub(crate) fn stable_mcp_input_requests(required: &McpInputRequired) -> Vec<(&St
     requests
 }
 
-pub(crate) fn mcp_argument_summary(arguments: &Value) -> Value {
+/// Summarize approval inputs without copying raw arguments into the form.
+/// Destination hosts are the deliberate plaintext audit exception; queries,
+/// paths and credentials never become summary fields. The full payload is
+/// bound by its digest, not by this display-only list of argument names.
+/// A malformed destination cannot produce an approvable query-only summary.
+/// Callers must propagate the error (or decline to derive an approval digest)
+/// rather than substituting an empty host list for a failed classification.
+pub(crate) fn mcp_argument_summary(arguments: &Value) -> Result<Value, &'static str> {
     let mut names = arguments
         .as_object()
         .map(|values| values.keys().cloned().collect::<Vec<_>>())
@@ -123,13 +130,13 @@ pub(crate) fn mcp_argument_summary(arguments: &Value) -> Value {
     // Journaled fetch destinations for the operator allowlist audit and
     // the approval digest below: hosts are not secrets, mirroring HTTP
     // targets journaled in plaintext.
-    let destinations: Vec<String> = policy::extract_mcp_destinations(arguments)
+    let destinations: Vec<String> = policy::extract_mcp_destinations(arguments)?
         .into_iter()
         .collect();
-    json!({
+    Ok(json!({
         "argument_names": names,
         "encoded_bytes": bytes.len(),
         "arguments_sha256": hex::encode(Sha256::digest(&bytes)),
         "destinations": destinations,
-    })
+    }))
 }

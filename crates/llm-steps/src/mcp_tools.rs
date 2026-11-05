@@ -66,6 +66,10 @@ impl McpAgentTools {
     /// narrowing too (exact match, empty means query-only). Calls with no
     /// extracted host pass, so pure-query search keeps working while fetch
     /// requires an explicit allow. Denials are `Refused`, never silent.
+    /// Classification errors also refuse: URL/host/target slots must not
+    /// become query-only merely because their contents are malformed.
+    /// The shared classifier handles arrays and schemeless references;
+    /// its errors contain no argument values, including credentials.
     ///
     /// When a static miss meets a configured `destination_decider` that the
     /// narrowing would still admit, sync validation defers: it passes so the
@@ -89,7 +93,13 @@ impl McpAgentTools {
             .get(&tool.server)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let extracted: Vec<String> = policy::extract_mcp_destinations(args).into_iter().collect();
+        let extracted: Vec<String> = policy::extract_mcp_destinations(args)
+            .map_err(|message| StepError::Refused {
+                node: node.id.clone(),
+                message: message.into(),
+            })?
+            .into_iter()
+            .collect();
         let denied: Vec<&String> = extracted
             .iter()
             .filter(|host| !policy::mcp_destination_is_allowed(allowed, host))
@@ -391,59 +401,24 @@ impl McpAgentTools {
             )
         })?;
         let server = tool.server.as_str();
-        let extracted: Vec<String> = policy::extract_mcp_destinations(args).into_iter().collect();
-        if extracted.is_empty() {
-            return Ok(());
-        }
-        // Same order as sync validation: the static ceiling first, then the
-        // narrowing, so both gates refuse identically and delegation only
-        // ever widens a miss the narrowing would still admit.
+        // Keep one policy owner for validation and execution: a deferred
+        // static miss is the only non-static success returned by this gate.
+        // In particular, ambiguity and narrowing denials cannot reach a
+        // command even when its operator policy would answer allow.
+        // An empty classified set passes the all-hosts check below.
+        let extracted = self.check_destinations(node, alias, args)?;
         let allowed = self
             .destinations
-            .get(&tool.server)
+            .get(server)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let static_miss = extracted
+        if extracted
             .iter()
-            .any(|host| !policy::mcp_destination_is_allowed(allowed, host));
-        if !static_miss {
-            if let Some(Some(narrow)) = self.declared.get(alias) {
-                let denied: Vec<&String> = extracted
-                    .iter()
-                    .filter(|host| !narrow.iter().any(|allowed| allowed == *host))
-                    .collect();
-                if !denied.is_empty() {
-                    let denied = denied
-                        .into_iter()
-                        .map(String::as_str)
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    return Err(StepError::Refused {
-                        node: node.id.clone(),
-                        message: format!(
-                            "MCP tool `{alias}` destination `{denied}` is not in tool `{alias}` destinations"
-                        ),
-                    });
-                }
-            }
+            .all(|host| policy::mcp_destination_is_allowed(allowed, host))
+        {
             return Ok(());
         }
-        let narrow_blocks = match self.declared.get(alias) {
-            Some(Some(narrow)) => extracted
-                .iter()
-                .any(|host| !narrow.iter().any(|allowed| allowed == host)),
-            _ => false,
-        };
-        let Some((argv, timeout)) = self.deciders.get(&tool.server).filter(|_| !narrow_blocks)
-        else {
-            let denied = extracted.join(", ");
-            return Err(StepError::Refused {
-                node: node.id.clone(),
-                message: format!(
-                    "MCP tool `{alias}` destination `{denied}` is not in server `{server}` allowed_destinations; ask the operator to allow it in providers.toml"
-                ),
-            });
-        };
+        let (argv, timeout) = &self.deciders[server]; // check_destinations admitted this static miss.
         let gateway = engine::CmdGateway::new(
             ctx.run.contract.manifest.permissions.clone(),
             ctx.run.fs.workspace().to_owned(),
@@ -708,7 +683,7 @@ mod tests {
     #[test]
     fn destination_policy_denies_unlisted_fetch_but_passes_query() {
         let node = node();
-        // Empty default denies every extracted host; host-only calls pass.
+        // Empty default denies every extracted host; query-only calls pass.
         let tools = harness(Vec::new());
         let error = tools
             .validate_args(&node, "fetch", &json!({"url": "https://example.test/x"}))
@@ -736,6 +711,51 @@ mod tests {
         tools
             .validate_args(&node, "fetch", &json!({"url": "https://other.test/x"}))
             .expect("wildcard must allow any destination");
+    }
+
+    #[test]
+    fn schemeless_destinations_obey_ceiling_and_narrowing() {
+        let node = node();
+        for target in [
+            "https://example.test/x",
+            "example.test",
+            "example.test/path",
+            "//example.test/x",
+        ] {
+            let args = json!({"urls":[target]});
+            for (allowed, narrow, pass) in [
+                (vec![], None, false),
+                (vec!["other.test"], None, false),
+                (vec!["example.test"], None, true),
+                (vec!["*"], Some(vec!["example.test"]), true),
+                (vec!["*"], Some(vec!["other.test"]), false),
+                (vec!["example.test"], Some(vec![]), false),
+            ] {
+                let tools = harness_with_declared(
+                    allowed.into_iter().map(str::to_owned).collect(),
+                    narrow.map(|v| v.into_iter().map(str::to_owned).collect()),
+                );
+                assert_eq!(tools.validate_args(&node, "fetch", &args).is_ok(), pass);
+                tools
+                    .validate_args(&node, "fetch", &json!({"query":"rust"}))
+                    .unwrap();
+            }
+            let tools = harness_with_decider(vec![], None, (vec!["decider".into()], 5));
+            tools
+                .validate_args(&node, "fetch", &args)
+                .expect("parseable miss defers");
+        }
+        let tools = harness_with_decider(vec!["*".into()], None, (vec!["decider".into()], 5));
+        for args in [
+            json!({"url":"not a URL"}),
+            json!({"urls":["example.test","//"]}),
+            json!({"target":"private-unparseable-value"}),
+        ] {
+            let error = tools.validate_args(&node, "fetch", &args).unwrap_err();
+            assert!(matches!(error, StepError::Refused { .. }));
+            assert!(error.to_string().contains("ambiguous MCP destination"));
+            assert!(!error.to_string().contains("private-unparseable-value"));
+        }
     }
 
     fn harness_with_decider(

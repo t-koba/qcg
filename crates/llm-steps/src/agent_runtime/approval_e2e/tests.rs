@@ -32,7 +32,17 @@ impl ServerHandler for CountingTool {
             tools: vec![Tool::new(
                 "echo",
                 "Capture original arguments, optionally requesting user input.",
-                json!({"type": "object"}).as_object().unwrap().clone(),
+                json!({
+                    "type":"object",
+                    "properties": {
+                        "url":{"type":"string"},
+                        "urls":{"type":"array", "items":{"type":"string"}},
+                        "query":{"type":"string"}
+                    }
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
             )],
             ..Default::default()
         })
@@ -85,6 +95,10 @@ impl Drop for MockMcp {
 
 impl MockMcp {
     async fn start() -> Self {
+        Self::start_with_policy(json!([]), json!([])).await
+    }
+
+    async fn start_with_policy(destinations: Value, decider: Value) -> Self {
         let hits = Arc::new(Mutex::new(vec![]));
         let tool = CountingTool(hits.clone());
         let service: StreamableHttpService<CountingTool, LocalSessionManager> =
@@ -102,7 +116,8 @@ impl MockMcp {
         let spec = serde_json::from_value(json!({
             "id": "mock", "transport": "streamable_http", "lifecycle": "discover",
             "url": format!("http://{address}/mcp"), "auth": "none",
-            "allowed_hosts": ["127.0.0.1"], "timeout_seconds": 3
+            "allowed_hosts": ["127.0.0.1"], "timeout_seconds": 3,
+            "allowed_destinations": destinations, "destination_decider": decider
         }))
         .unwrap();
         let mut runtime = test_runtime();
@@ -1120,4 +1135,77 @@ async fn an_already_exhausted_checkpoint_reports_spent_iterations_without_reexec
         })
     );
     api::RunEvent::from_flat(event).expect("top-level event decodes");
+}
+
+#[tokio::test]
+async fn mcp_execution_checks_schemeless_policy_and_never_delegates_ambiguity() {
+    for (allowed, narrow, allow_fetch, decider) in [
+        (json!([]), None, false, json!([])),
+        (json!(["example.test"]), None, true, json!([])),
+        (json!(["other.test"]), None, false, json!([])),
+        (json!(["*"]), Some(json!(["example.test"])), true, json!([])),
+        (json!(["*"]), Some(json!(["other.test"])), false, json!([])),
+        (json!(["example.test"]), Some(json!([])), false, json!([])),
+        // This command cannot run. Ambiguity must be refused before either
+        // the static wildcard hit or the decider fallback can admit it.
+        (json!(["*"]), None, true, json!(["must-not-execute"])),
+        (json!([]), None, false, json!(["must-not-execute"])),
+    ] {
+        let harness = ApprovalHarness::setup("mcp-destination-gate");
+        let mock = MockMcp::start_with_policy(allowed, decider).await;
+        let run = run(&harness, BTreeMap::new());
+        let journal = journal(&harness);
+        let mut vars = contract::ValueBag::with_inputs(BTreeMap::new());
+        let ctx = context(&run, &journal, &mut vars, &mock.runtime);
+        let node = node();
+        let mut declarations = tools();
+        if let Some(narrow) = narrow {
+            let ToolDecl::Mcp { destinations, .. } = &mut declarations[0] else {
+                unreachable!()
+            };
+            *destinations = Some(serde_json::from_value(narrow).unwrap());
+        }
+        let mcp = McpAgentTools::prepare(&ctx, &node, &mock.runtime, &declarations)
+            .await
+            .unwrap();
+        for args in [
+            json!({"urls":["example.test"]}),
+            json!({"url":"//example.test/x"}),
+        ] {
+            if allow_fetch {
+                mcp.validate_args(&node, "remote", &args)
+                    .expect("the discovered fetch schema accepts URL and URL-array arguments");
+            }
+            assert_eq!(
+                mcp.authorize_destinations(&ctx, &node, "remote", &args)
+                    .await
+                    .is_ok(),
+                allow_fetch
+            );
+        }
+        let before = harness.journal_text();
+        for args in [
+            json!({"urls":["example.test","//"]}),
+            json!({"url":"not a URL"}),
+        ] {
+            let error = mcp
+                .authorize_destinations(&ctx, &node, "remote", &args)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, StepError::Refused { .. }));
+            assert!(error.to_string().contains("ambiguous MCP destination"));
+        }
+        assert_eq!(
+            before,
+            harness.journal_text(),
+            "ambiguity never journals a decider verdict"
+        );
+        mcp.authorize_destinations(&ctx, &node, "remote", &json!({"query":"rust"}))
+            .await
+            .unwrap();
+        assert!(
+            mock.hits().is_empty(),
+            "no remote tool call is needed for authorization"
+        );
+    }
 }

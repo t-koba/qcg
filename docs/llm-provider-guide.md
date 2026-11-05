@@ -532,11 +532,17 @@ one of these hosts in `[permissions].network`; the registry never grants that
 permission by itself.
 
 `allowed_destinations` is the separate operator ceiling for server-side fetch:
-every whole-value `http(s)` URL string in the tool arguments contributes its
-host, and each host must be listed here (exact match or `"*"`, hosts only; IPv6 literals use the bracketed form `"[2001:db8::1]"`). A contract may narrow this ceiling per `mcp` tool with `destinations` (absent inherits; explicit list allows only those hosts, empty means query-only); see the contract reference.
-It defaults to empty — host-free calls such as pure-query search pass, while
-any fetch URL is refused until its host is listed. The endpoint host above
-never implies destination rights. To migrate a fetch tool (for example an
+whole-value absolute HTTP(S), protocol-relative `//host/path`, and schemeless
+hostname/IP targets contribute their canonical host. Ambiguous values in known
+destination slots refuse before any decider; ordinary query text and prose
+mentions do not become hosts. Each extracted host must be listed here (exact
+match or `"*"`, hosts only; IPv6 literals use the bracketed form
+`"[2001:db8::1]"`). A contract may narrow this ceiling per `mcp` tool with
+`destinations` (absent inherits; explicit list allows only those hosts, empty
+means query-only); see the contract reference. It defaults to empty — genuine
+host-free calls such as `{"query":"rust"}` pass, while any fetch target is
+refused until its host is listed. The endpoint host above never implies
+destination rights. To migrate a fetch tool (for example an
 Exa/Parallel fetch behind a custom `[[mcp_server]]` row), add each host the
 model may ask the server to fetch; the built-in `exa-public` and
 `parallel-public` profiles ship with the empty default, so their fetch tools

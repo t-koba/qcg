@@ -464,8 +464,15 @@ pub(crate) async fn execute_mcp_tool(
                     // replay: resume recomputes the extraction from live
                     // args and refuses on mismatch. Hosts are not secrets,
                     // mirroring HTTP targets journaled in plaintext.
+                    // Classification failure aborts suspension recording;
+                    // it is not an empty destination set. Reusing the same
+                    // classifier on resume keeps these bindings comparable.
                     let journal_destinations = Value::Array(
                         policy::extract_mcp_destinations(&journal_args)
+                            .map_err(|message| StepError::Refused {
+                                node: node.id.clone(),
+                                message: message.into(),
+                            })?
                             .into_iter()
                             .map(Value::String)
                             .collect(),
@@ -524,20 +531,26 @@ pub(crate) fn canonical_mcp_key_args(args: &Value) -> Value {
 /// written before this policy carry no `destinations` field and skip the
 /// comparison; the execution-time gate still applies the current
 /// `allowed_destinations` to those resumes.
+/// Validate the live shape before redaction, too: credential-name redaction
+/// may replace a value, but must never hide a malformed live reference.
+/// The canonical extraction then preserves existing checkpoint identity;
+/// neither extraction can replace an error with a query-only empty list.
+/// Old descriptors skip only comparison, not destination classification.
 pub(crate) fn check_resumed_mcp_destinations(
     pending_key: &str,
     pending: &Value,
     args: &Value,
 ) -> Result<(), String> {
-    let Some(journaled) = pending.get("destinations") else {
-        return Ok(());
-    };
+    policy::extract_mcp_destinations(args)?;
     let live = Value::Array(
-        policy::extract_mcp_destinations(&canonical_mcp_key_args(args))
+        policy::extract_mcp_destinations(&canonical_mcp_key_args(args))?
             .into_iter()
             .map(Value::String)
             .collect(),
     );
+    let Some(journaled) = pending.get("destinations") else {
+        return Ok(());
+    };
     if journaled != &live {
         return Err(format!(
             "MCP continuation `{pending_key}` holds different destinations; refusing resume"
@@ -1094,6 +1107,25 @@ mod tests {
         let other = pending_key_for_agent_mcp("node", "server-2", "alias", "call-1", &args)
             .expect("pending key serialization is infallible in tests");
         assert_ne!(agent_key, other, "server must separate continuations");
+    }
+
+    #[test]
+    fn resumed_destinations_classify_schemeless_and_refuse_ambiguity() {
+        let pending = json!({"destinations":["example.test"]});
+        for args in [
+            json!({"urls":["example.test/path", "//example.test/x"]}),
+            json!({"url":"https://example.test/x?secret=value"}),
+        ] {
+            check_resumed_mcp_destinations("key", &pending, &args).unwrap();
+            assert!(
+                check_resumed_mcp_destinations("key", &json!({"destinations":[]}), &args).is_err()
+            );
+        }
+        for pending in [pending, json!({"destinations":[]}), json!({})] {
+            assert!(
+                check_resumed_mcp_destinations("key", &pending, &json!({"urls":["//"]})).is_err()
+            );
+        }
     }
 
     #[test]

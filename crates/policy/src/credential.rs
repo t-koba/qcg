@@ -9,71 +9,35 @@
 /// closed by stripping the query entirely rather than leaking a possible
 /// credential.
 pub fn redact_all_query_values(url: &str) -> String {
-    // Split off the fragment first so `#` never smuggles a value.
-    let (before_fragment, fragment) = match url.find('#') {
-        Some(index) => (&url[..index], Some(&url[index + 1..])),
-        None => (url, None),
-    };
-    let Some(query_start) = before_fragment.find('?') else {
-        return format!(
-            "{}{}",
-            redact_matrix_params(&strip_url_userinfo(before_fragment)),
-            redact_url_fragment(fragment)
-        );
-    };
-    let (base, query) = before_fragment.split_at(query_start);
-    let query = &query[1..];
-    if query.is_empty() {
-        return format!(
-            "{}{}",
-            redact_matrix_params(&strip_url_userinfo(base)),
-            redact_url_fragment(fragment)
-        );
-    }
-    let mut redacted = String::with_capacity(url.len());
-    redacted.push_str(&redact_matrix_params(&strip_url_userinfo(base)));
-    redacted.push('?');
-    for (index, pair) in split_query_pairs(query).enumerate() {
-        if index > 0 {
-            // Preserve the original separator (`&` or `;`).
-            let sep = query_separator_at(query, index);
-            redacted.push(sep);
-        }
-        match pair.find('=') {
-            Some(eq) => {
-                redacted.push_str(&pair[..eq + 1]);
-                redacted.push_str("[REDACTED]");
+    let (before_fragment, fragment) = url
+        .split_once('#')
+        .map_or((url, None), |(base, fragment)| (base, Some(fragment)));
+    let (base, query) = before_fragment
+        .split_once('?')
+        .unwrap_or((before_fragment, ""));
+    let mut redacted = redact_matrix_params(&strip_url_userinfo(base));
+    if !query.is_empty() {
+        redacted.push('?');
+        // Each piece owns its separator, so values and original separators
+        // are handled in one pass rather than re-scanning for each pair.
+        for piece in query.split_inclusive(['&', ';']) {
+            let (pair, separator) = if piece.ends_with(['&', ';']) {
+                piece.split_at(piece.len() - 1)
+            } else {
+                (piece, "")
+            };
+            match pair.split_once('=') {
+                Some((key, _)) => {
+                    redacted.push_str(key);
+                    redacted.push_str("=[REDACTED]");
+                }
+                None => redacted.push_str(pair),
             }
-            None => {
-                // A bare key with no value carries nothing to leak.
-                redacted.push_str(pair);
-            }
+            redacted.push_str(separator);
         }
     }
     redacted.push_str(&redact_url_fragment(fragment));
     redacted
-}
-
-/// Splits a query string on both `&` and `;` separators, preserving
-/// empty segments so the redacted shape stays stable.
-fn split_query_pairs(query: &str) -> impl Iterator<Item = &str> {
-    query.split(['&', ';'])
-}
-
-/// Returns the separator character preceding the `index`-th pair by
-/// re-walking the query. Falls back to `&` when the shape is unexpected;
-/// fail-closed direction keeps redaction, never plaintext.
-fn query_separator_at(query: &str, index: usize) -> char {
-    let mut seen = 0;
-    for ch in query.chars() {
-        if ch == '&' || ch == ';' {
-            seen += 1;
-            if seen == index {
-                return ch;
-            }
-        }
-    }
-    '&'
 }
 
 /// Redacts `;` matrix parameters in the path (for example
@@ -122,48 +86,33 @@ fn strip_url_userinfo(url: &str) -> String {
     }
 }
 
-/// Redacts a URL fragment's values like query values, preserving only the
-/// `#` marker itself. Both `&` and `;` separators are redacted so
-/// `#a=1;b=2` cannot smuggle a value.
+/// Redacts every nonempty fragment value, including bare tokens, while
+/// preserving keys, `#`, and both `&`/`;` separators.
 fn redact_url_fragment(fragment: Option<&str>) -> String {
     let Some(fragment) = fragment else {
         return String::new();
     };
-    if fragment.is_empty() {
-        return "#".to_string();
-    }
     let mut redacted = String::from("#");
-    let mut current = String::new();
-    let flush = |current: &mut String, redacted: &mut String| {
-        if current.is_empty() {
-            return;
-        }
-        match current.find('=') {
-            Some(eq) => {
-                redacted.push_str(&current[..eq + 1]);
-                redacted.push_str("[REDACTED]");
-            }
-            None => redacted.push_str("[REDACTED]"),
-        }
-        current.clear();
-    };
-    for ch in fragment.chars() {
-        if ch == '&' || ch == ';' {
-            flush(&mut current, &mut redacted);
-            redacted.push(ch);
+    for piece in fragment.split_inclusive(['&', ';']) {
+        let (pair, separator) = if piece.ends_with(['&', ';']) {
+            piece.split_at(piece.len() - 1)
         } else {
-            current.push(ch);
+            (piece, "")
+        };
+        if !pair.is_empty() {
+            if let Some((key, _)) = pair.split_once('=') {
+                redacted.push_str(key);
+                redacted.push('=');
+            }
+            redacted.push_str("[REDACTED]");
         }
+        redacted.push_str(separator);
     }
-    flush(&mut current, &mut redacted);
     redacted
 }
 
-/// Strips credentials and query values from free-text error strings.
-/// Truncation alone is not redaction (E09-2): every `http(s)://` token has
-/// all of its query VALUES replaced (keys stay visible) via
-/// [`redact_all_query_values`], so an error naming a URL never echoes a
-/// secret. Non-URL text passes through unchanged.
+/// Redacts userinfo and query values in every `http(s)://` token in free text;
+/// truncation alone is not redaction (E09-2). Non-URL text passes through.
 pub fn redact_urls_in_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let bytes = text.as_bytes();
@@ -399,68 +348,119 @@ pub fn redact_credential_assignments_in_text(text: &str) -> String {
 }
 
 /// Canonicalizes a full HTTP URL with sorted query pairs for digest
-/// binding (E09a). Different queries bind different digests; the same pairs
-/// in different orders bind identically. Implemented lexically (no new
-/// dependencies): split at `?`/`#`, sort `&`/`;`-separated pairs. This is
-/// the single shared canonicalizer used by both the plain HTTP step and
+/// binding (E09a), sorting `&`/`;` pairs lexically without changing fragments.
+/// The single shared canonicalizer used by both the plain HTTP step and
 /// the agent HTTP tool so the two paths produce byte-identical canonical
 /// URLs and cannot fork approvals (E09).
 pub fn canonical_http_url(url: &str) -> String {
-    let (before_fragment, fragment) = match url.find('#') {
-        Some(index) => (&url[..index], Some(&url[index..])),
-        None => (url, None),
+    let (before_fragment, fragment) = url.find('#').map_or((url, ""), |i| url.split_at(i));
+    let Some((base, query)) = before_fragment.split_once('?') else {
+        return url.to_owned();
     };
-    let Some(query_start) = before_fragment.find('?') else {
-        return url.to_string();
-    };
-    let (base, query) = before_fragment.split_at(query_start);
-    let query = &query[1..];
     if query.is_empty() {
-        return url.to_string();
+        return url.to_owned();
     }
     let mut pairs: Vec<&str> = query.split(['&', ';']).collect();
     pairs.sort_unstable();
-    let mut canonical = String::with_capacity(url.len());
-    canonical.push_str(base);
-    canonical.push('?');
-    canonical.push_str(&pairs.join("&"));
-    if let Some(fragment) = fragment {
-        canonical.push_str(fragment);
-    }
-    canonical
+    format!("{base}?{}{fragment}", pairs.join("&"))
 }
 
-/// Extracts server-side fetch destinations from MCP tool arguments: every
-/// **whole-value** string that parses as an `http(s)` URL contributes its
-/// lowercased host. The walk is recursive over objects and arrays with
-/// deduplication via the returned set. Non-strings, relative URLs, other
-/// schemes, and URLs mentioned inside longer prose are ignored on purpose:
-/// substring scanning would gate file content that merely mentions a URL
-/// and would need secret-aware redaction; a server shown to interpret
-/// substrings as fetch targets needs its own observed-behavior experiment
-/// before this rule grows.
-/// Host comparison is string-only with no DNS pinning: remote resolution
-/// stays outside qcg (documented residual, same as the existing
-/// `network_deny_private_ips` scope, which covers qcg-originated fetches).
-pub fn extract_mcp_destinations(args: &serde_json::Value) -> std::collections::BTreeSet<String> {
-    fn walk(value: &serde_json::Value, hosts: &mut std::collections::BTreeSet<String>) {
+/// Classifies whole-value HTTP(S), schemeless, and protocol-relative MCP targets.
+/// Host-shaped strings count anywhere; recognized target slots refuse ambiguous
+/// values without echoing them. Prose is not scanned; hosts are not DNS-pinned.
+pub fn extract_mcp_destinations(
+    args: &serde_json::Value,
+) -> Result<std::collections::BTreeSet<String>, &'static str> {
+    const AMBIGUOUS: &str = "ambiguous MCP destination; refusing the call";
+    const TARGET_SLOTS: &str =
+        "url uri href link host hostname domain endpoint website target destination site";
+    fn walk(
+        value: &serde_json::Value,
+        target: bool,
+        hosts: &mut std::collections::BTreeSet<String>,
+    ) -> Result<(), &'static str> {
         match value {
             serde_json::Value::String(text) => {
-                if let Ok(url) = url::Url::parse(text.trim())
-                    && matches!(url.scheme(), "http" | "https")
-                    && let Some(host) = url.host_str()
+                let text = text.trim();
+                let lower = text.to_ascii_lowercase();
+                let explicit = lower.starts_with("http:") || lower.starts_with("https:");
+                let relative = text.starts_with("//");
+                let authority = text.split(['/', '?', '#']).next().unwrap_or("");
+                let hostname = authority
+                    .split_once(':')
+                    .map_or(authority, |(host, _)| host);
+                let hostlike = !authority.contains(char::is_whitespace)
+                    && !authority.contains('@')
+                    && (hostname.contains('.')
+                        || hostname.eq_ignore_ascii_case("localhost")
+                        || authority.parse::<std::net::IpAddr>().is_ok()
+                        || authority.starts_with('['));
+                let scheme_like = text
+                    .split_once("://")
+                    .is_some_and(|(prefix, _)| !prefix.contains(char::is_whitespace));
+                if !target && !explicit && !relative && !hostlike && !scheme_like {
+                    return Ok(());
+                }
+                if scheme_like && !explicit {
+                    return Err(AMBIGUOUS);
+                }
+                let candidate = if explicit {
+                    text.to_owned()
+                } else if relative {
+                    format!("https:{text}")
+                } else if hostlike {
+                    if let Ok(ip) = text.parse::<std::net::Ipv6Addr>() {
+                        format!("https://[{ip}]")
+                    } else {
+                        format!("https://{text}")
+                    }
+                } else {
+                    return Err(AMBIGUOUS);
+                };
+                let (_, rest) = candidate.split_once("://").ok_or(AMBIGUOUS)?;
+                let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+                let unusual = text.starts_with("///")
+                    || text
+                        .chars()
+                        .any(|c| c.is_whitespace() || c.is_control() || c == '\\');
+                if unusual
+                    || (relative && authority.contains('@'))
+                    || (!explicit && authority.contains('%'))
                 {
-                    hosts.insert(host.to_lowercase());
+                    return Err(AMBIGUOUS);
+                }
+                let url = url::Url::parse(&candidate).map_err(|_| AMBIGUOUS)?;
+                let host = url.host_str().ok_or(AMBIGUOUS)?;
+                if !matches!(url.scheme(), "http" | "https") {
+                    return Err(AMBIGUOUS);
+                }
+                hosts.insert(host.to_lowercase());
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, target, hosts)?;
                 }
             }
-            serde_json::Value::Array(items) => items.iter().for_each(|item| walk(item, hosts)),
-            serde_json::Value::Object(map) => map.values().for_each(|value| walk(value, hosts)),
+            serde_json::Value::Object(map) => {
+                for (key, value) in map {
+                    let key = key.to_ascii_lowercase();
+                    let slot = key
+                        .rsplit(['_', '-'])
+                        .next()
+                        .unwrap_or("")
+                        .trim_end_matches('s');
+                    let target = target || TARGET_SLOTS.split_whitespace().any(|name| name == slot);
+                    walk(value, target, hosts)?;
+                }
+            }
+            _ if target => return Err(AMBIGUOUS),
             _ => {}
         }
+        Ok(())
     }
     let mut hosts = std::collections::BTreeSet::new();
-    walk(args, &mut hosts);
-    hosts
+    walk(args, false, &mut hosts)?;
+    Ok(hosts)
 }
 
 /// Reports whether a lowercased destination host is covered by an operator
@@ -587,6 +587,22 @@ mod tests {
     }
 
     #[test]
+    fn redaction_preserves_empty_segments_and_bare_query_keys() {
+        assert_eq!(
+            redact_all_query_values("https://a.test/p?;&bare&&x=secret;#;bare&&k=secret;"),
+            "https://a.test/p?;&bare&&x=[REDACTED];#;[REDACTED]&&k=[REDACTED];"
+        );
+        assert_eq!(
+            redact_all_query_values("https://a.test/p?#"),
+            "https://a.test/p#"
+        );
+        assert_eq!(
+            redact_all_query_values("https://a.test/é?clé=secret#clé=secret"),
+            "https://a.test/é?clé=[REDACTED]#clé=[REDACTED]"
+        );
+    }
+
+    #[test]
     fn matrix_and_semicolon_query_values_are_redacted() {
         // E09j: `;` matrix parameters and `;` query separators must not
         // smuggle values past `?`-only redaction.
@@ -692,59 +708,83 @@ mod tests {
     }
 
     #[test]
-    fn mcp_destination_extraction_gates_whole_value_urls_only() {
+    fn mcp_destination_classification() {
         use serde_json::json;
         use std::collections::BTreeSet;
-        // Pure-query search extracts nothing and keeps passing.
-        assert_eq!(
-            extract_mcp_destinations(&json!({"query": "rust", "numResults": 5})),
-            BTreeSet::new()
-        );
-        // A fetch URL extracts its lowercased host.
-        assert_eq!(
-            extract_mcp_destinations(&json!({"url": "https://Example.COM/path?q=1"})),
-            BTreeSet::from(["example.com".to_string()])
-        );
-        // Nested arrays extract every host, deduplicated and sorted.
-        assert_eq!(
-            extract_mcp_destinations(&json!({
-                "urls": ["https://b.test/x", "https://a.test/y", "https://a.test/z"],
-                "nested": {"deep": ["https://b.test/other"]},
-            })),
-            BTreeSet::from(["a.test".to_string(), "b.test".to_string()])
-        );
-        // Non-http schemes, relative URLs, bare hosts, and prose
-        // mentioning a URL extract nothing (no false positives on file
-        // content that merely mentions a URL).
-        assert_eq!(
-            extract_mcp_destinations(&json!({
-                "command": "fetch file:///etc/passwd",
-                "path": "/relative/path",
-                "host": "example.com",
-                "notes": "see https://example.test/docs for details",
-                "count": 3,
-                "flag": true,
-                "nothing": null,
-            })),
-            BTreeSet::new()
-        );
-        // Surrounding whitespace and case do not smuggle a host past the
-        // allow check: extraction still yields the canonical host.
-        assert_eq!(
-            extract_mcp_destinations(&json!({"url": "  HTTPS://Example.COM:8443/x  "})),
-            BTreeSet::from(["example.com".to_string()])
-        );
-        // IPv6 fetch extracts the canonical bracketed literal (`Url`
-        // normalizes case/zeros), so an explicit allow entry can cover it
-        // without falling back to `"*"`.
-        assert_eq!(
-            extract_mcp_destinations(&json!({"url": "https://[2001:DB8::1]/x"})),
-            BTreeSet::from(["[2001:db8::1]".to_string()])
-        );
-        assert_eq!(
-            extract_mcp_destinations(&json!({"url": "https://[::1]:8443/x"})),
-            BTreeSet::from(["[::1]".to_string()])
-        );
+        for (args, expected) in [
+            (json!({"query":"rust", "count":3}), vec![]),
+            (
+                json!({"time":"10:30", "email":"worker@example.com"}),
+                vec![],
+            ),
+            (
+                json!({"notes":"see https://example.test/docs for details",
+                    "command":"fetch file:///etc/passwd", "path":"/relative/path"}),
+                vec![],
+            ),
+            (
+                json!({"url":"  HTTPS://Example.COM:8443/x?q=1  "}),
+                vec!["example.com"],
+            ),
+            (
+                json!({"url":"https://[2001:DB8::1]/x"}),
+                vec!["[2001:db8::1]"],
+            ),
+            (json!({"url":"https://[::1]:8443/x"}), vec!["[::1]"]),
+            (
+                json!({"urls":["example.com", "//b.test/path", ["https://example.com/z"]],
+                    "nested":{"uri":"a.test/path"}}),
+                vec!["a.test", "b.test", "example.com"],
+            ),
+            (
+                json!({"host":"127.0.0.1", "target":"::1", "hosts":["localhost"]}),
+                vec!["127.0.0.1", "[::1]", "localhost"],
+            ),
+            (
+                json!({"anything":["example.com/path", "//example.com/x", "rust"]}),
+                vec!["example.com"],
+            ),
+        ] {
+            assert_eq!(
+                extract_mcp_destinations(&args).unwrap(),
+                expected
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<BTreeSet<_>>(),
+                "{args}"
+            );
+        }
+        for args in [
+            json!({"urls":["example.com", "not a URL"]}),
+            json!({"target":"uncertain"}),
+            json!({"url":"/relative/path"}),
+            json!({"uri":""}),
+            json!({"host":null}),
+            json!({"urls":["a.test",42]}),
+            json!({"anything":"//"}),
+            json!({"url":"///example.com"}),
+            json!({"anything":"https://"}),
+            json!({"anything":"http:/example.com"}),
+            json!({"url":"https://exa mple.com/secret"}),
+            json!({"url":"https://[::1"}),
+            json!({"url":"file:///etc/passwd"}),
+            json!({"url":"ftp://example.com"}),
+            json!({"url":"mailto:user@example.com"}),
+            json!({"url":"user@example.com"}),
+            json!({"url":"//example.com:bad/secret"}),
+            json!({"url":"//user@example.com/path"}),
+            json!({"url":"//example.com%2e/path"}),
+            json!({"anything":"example.com/path with spaces"}),
+            json!({"anything":"//example.com/path with spaces"}),
+            json!({"fetch_url":"not a URL"}),
+            json!({"urls":[{"nested":{"target":"not a URL"}}]}),
+        ] {
+            assert_eq!(
+                extract_mcp_destinations(&args),
+                Err("ambiguous MCP destination; refusing the call"),
+                "{args}"
+            );
+        }
         // Allow matching is exact-or-wildcard, fail-closed otherwise.
         assert!(mcp_destination_is_allowed(
             &["example.com".to_string()],

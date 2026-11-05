@@ -182,9 +182,10 @@ Streamable HTTP profiles require each `allowed_hosts` entry in the contract's
 `permissions.commands`; their child environment is cleared and receives only
 `PATH`, configured non-sensitive `env`, and explicitly mapped `env_from` values.
 Each profile also carries an operator-owned `allowed_destinations` ceiling for
-server-side fetch (hosts extracted from whole-value `http(s)` URL arguments,
-empty by default which denies every extracted host). To allow a fetch
-destination, add its host to the server's row in `providers.toml` and restart
+server-side fetch (hosts extracted from absolute HTTP(S), protocol-relative,
+and schemeless hostname/IP target values; ambiguous destination slots refuse).
+The ceiling is empty by default and denies every extracted host. To allow a
+fetch destination, add its host to the server's row in `providers.toml` and restart
 qcg; tightening the list applies retroactively to resumed calls. A row may
 additionally configure a fallback-only `destination_decider` command plus
 bounded `destination_decider_timeout_seconds` for a static miss the per-tool

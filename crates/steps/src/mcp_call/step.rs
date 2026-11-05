@@ -106,7 +106,6 @@ impl StepExecutor for McpCallStep {
                     names
                 })
                 .unwrap_or_default(),
-            // Bind full arguments: approving one call cannot authorize a regenerated payload.
             "arguments_sha256": hex::encode(sha2::Sha256::digest(&argument_bytes)),
         }));
         let confirm_target = format!("{}/{}", params.server, params.tool);
@@ -198,8 +197,7 @@ impl StepExecutor for McpCallStep {
         )
     }
 }
-/// Re-extract hosts and enforce static `allowed_destinations` before delegating misses to the operator decider.
-/// Static hits skip it; journal host-only verdicts, recheck fresh policy on resume, and propagate cancellation.
+/// Reclassify before static policy/decider checks; audit hosts only and recheck fresh policy on resume.
 async fn authorize_direct_destinations(
     ctx: &StepContext<'_>,
     node: &NodeDef,
@@ -208,21 +206,20 @@ async fn authorize_direct_destinations(
     tool: &str,
     args: &Value,
 ) -> Result<(), engine::StepError> {
-    if check_direct_destinations(node, server, tool, profile.allowed_destinations(), args).is_ok() {
+    let extracted = check_direct_destinations(
+        node,
+        server,
+        tool,
+        profile.allowed_destinations(),
+        args,
+        profile.destination_decider().is_some(),
+    )?;
+    let Some(argv) = profile.destination_decider().filter(|_| {
+        extracted
+            .iter()
+            .any(|host| !policy::mcp_destination_is_allowed(profile.allowed_destinations(), host))
+    }) else {
         return Ok(());
-    }
-    let extracted: Vec<String> = policy::extract_mcp_destinations(args).into_iter().collect();
-    if extracted.is_empty() {
-        return Ok(());
-    }
-    let Some(argv) = profile.destination_decider() else {
-        let denied = extracted.join(", ");
-        return Err(engine::StepError::Refused {
-            node: node.id.clone(),
-            message: format!(
-                "MCP tool `{server}/{tool}` destination `{denied}` is not in server `{server}` allowed_destinations; ask the operator to allow it in providers.toml"
-            ),
-        });
     };
     let timeout = profile.destination_decider_timeout_seconds();
     let gateway = engine::CmdGateway::new(
@@ -270,33 +267,36 @@ async fn authorize_direct_destinations(
         }
     }
 }
-/// Fail closed unless every host matches an exact or wildcard allowlist; host-free search passes, fetch needs operator allow; denial is `Refused`.
 fn check_direct_destinations(
     node: &NodeDef,
     server: &str,
     tool: &str,
     allowed: &[String],
     args: &Value,
-) -> Result<(), engine::StepError> {
-    let extracted: Vec<String> = policy::extract_mcp_destinations(args).into_iter().collect();
-    let denied: Vec<&String> = extracted
+    defer_static_miss: bool,
+) -> Result<Vec<String>, engine::StepError> {
+    let extracted: Vec<String> = policy::extract_mcp_destinations(args)
+        .map_err(|message| StepError::Refused {
+            node: node.id.clone(),
+            message: message.into(),
+        })?
+        .into_iter()
+        .collect();
+    let denied: Vec<&str> = extracted
         .iter()
         .filter(|host| !policy::mcp_destination_is_allowed(allowed, host))
+        .map(String::as_str)
         .collect();
-    if !denied.is_empty() {
-        let denied = denied
-            .into_iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .join(", ");
+    if !defer_static_miss && !denied.is_empty() {
         return Err(engine::StepError::Refused {
             node: node.id.clone(),
             message: format!(
-                "MCP tool `{server}/{tool}` destination `{denied}` is not in server `{server}` allowed_destinations; ask the operator to allow it in providers.toml"
+                "MCP tool `{server}/{tool}` destination `{}` is not in server `{server}` allowed_destinations; ask the operator to allow it in providers.toml",
+                denied.join(", ")
             ),
         });
     }
-    Ok(())
+    Ok(extracted)
 }
 #[cfg(test)]
 mod tests {
@@ -322,15 +322,56 @@ mod tests {
     }
 
     #[test]
+    fn direct_schemeless_and_ambiguous_destinations() {
+        for args in [
+            json!({"urls":["example.test"]}),
+            json!({"url":"//example.test/x"}),
+            json!({"nested":["https://example.test/x", ["example.test/path"]]}),
+        ] {
+            assert!(check_direct_destinations(&node(), "exa", "fetch", &[], &args, false).is_err());
+            for allowed in ["example.test", "*"] {
+                assert_eq!(
+                    check_direct_destinations(
+                        &node(),
+                        "exa",
+                        "fetch",
+                        &[allowed.into()],
+                        &args,
+                        false
+                    )
+                    .unwrap(),
+                    vec!["example.test".to_owned()]
+                );
+            }
+            check_direct_destinations(&node(), "exa", "fetch", &[], &args, true).unwrap();
+        }
+        for defer in [false, true] {
+            for args in [
+                json!({"url":"not a URL"}),
+                json!({"urls":["example.test","//"]}),
+                json!({"target":"private-unparseable-value"}),
+            ] {
+                let error =
+                    check_direct_destinations(&node(), "exa", "fetch", &["*".into()], &args, defer)
+                        .unwrap_err();
+                assert!(matches!(error, StepError::Refused { .. }));
+                assert!(error.to_string().contains("ambiguous MCP destination"));
+                assert!(!error.to_string().contains("private-unparseable-value"));
+            }
+        }
+    }
+
+    #[test]
     fn direct_destination_policy_denies_unlisted_fetch_but_passes_query() {
         let node = node();
-        // Empty default denies every extracted host; host-only calls pass.
+        // Empty default denies every extracted host; query-only calls pass.
         let error = check_direct_destinations(
             &node,
             "exa-public",
             "web_fetch_exa",
             &[],
             &json!({"url": "https://example.test/x"}),
+            false,
         )
         .expect_err("unlisted fetch destination must be refused");
         assert!(
@@ -343,6 +384,7 @@ mod tests {
             "web_search_exa",
             &[],
             &json!({"query": "rust", "numResults": 5}),
+            false,
         )
         .expect("pure-query search must pass the empty default");
         // An explicit operator allow passes fetch; other hosts still fail.
@@ -352,6 +394,7 @@ mod tests {
             "web_fetch_exa",
             &["example.test".to_string()],
             &json!({"url": "https://example.test/x"}),
+            false,
         )
         .expect("listed destination must pass");
         assert!(
@@ -361,6 +404,7 @@ mod tests {
                 "web_fetch_exa",
                 &["example.test".to_string()],
                 &json!({"url": "https://other.test/x"}),
+                false,
             )
             .is_err(),
             "unlisted hosts stay denied under a non-empty list"
@@ -372,6 +416,7 @@ mod tests {
             "web_fetch_exa",
             &["*".to_string()],
             &json!({"url": "https://other.test/x"}),
+            false,
         )
         .expect("wildcard must allow any destination");
     }
