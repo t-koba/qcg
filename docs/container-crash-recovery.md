@@ -101,17 +101,19 @@ selector likewise accepts a name or ID and exposes force/removal options.
 Neither endpoint requires the expected immutable ID, ownership label, or
 generation as a condition on deletion. Calling these routes directly through
 HTTP or an SDK therefore does not, by itself, remove the verified-ID-to-delete
-race. This is an API-contract review, not a direct API race test; an alternative
-must be checked against its exact supported server implementation and version.
+race. The bounded diagnostic below now exercises these routes sequentially,
+but it does not race a concurrent replacement or fence an in-flight create; an
+alternative must still be checked against its exact supported server
+implementation and version.
 
 An ownership-conditional removal primitive would address only replacement at
 delete time. It would not fence an asynchronous create submitted before qcg
 crashed. Safe reconciliation needs both instance-safe destruction and a durable
 creation token with authoritative terminal status or an acknowledged
 cancel/drain barrier that prevents late resource creation. Neither is provided
-by the current adapter or established by the CLI diagnostic. Docker and
-rootless Podman require separate backend verification; do not assume that a
-property on one holds for the other. Podman's filtering or storage APIs need
+by the current adapter or established by the CLI or sequential API diagnostic.
+Docker and rootless Podman require separate backend verification; do not
+assume that a property on one holds for the other. Podman's filtering or storage APIs need
 their own ownership/removal analysis, not a claim of equivalence to Docker's
 CLI. Missing resources, daemon errors, and cleanup failures must remain
 unresolved, not successful cleanup. An empty lookup must never clear a durable
@@ -123,8 +125,10 @@ Started operation.
 probe for a **disposable local daemon with no concurrent resource mutation**:
 
 ```sh
-python3 scripts/probe-container-identity.py docker --command-timeout 30
-python3 scripts/probe-container-identity.py podman --command-timeout 30
+python3 scripts/probe-container-identity.py docker \
+  --command-timeout 30 --api-response-limit 1048576
+python3 scripts/probe-container-identity.py podman \
+  --command-timeout 30 --api-response-limit 1048576
 ```
 
 It builds a static C fixture with the local compiler (`--compiler`, default
@@ -133,22 +137,32 @@ It needs no base-image download. It creates and removes an owned fixture, then
 creates another owned fixture whose name equals the first fixture's full ID.
 Only after inspecting that alias and checking its actual ID, name and test
 label does it deliberately try the stale-ID removal. This is a counterexample
-probe, **not** a proposed cleanup algorithm. Ordinary fixture cleanup verifies
-IDs and labels too, under the disposable/quiescent-daemon precondition that
-production recovery cannot assume.
+probe, **not** a proposed cleanup algorithm. It then creates a second fixture
+for a direct API probe: Docker uses the same local Unix endpoint as its CLI;
+rootless Podman starts a temporary service on a private Unix socket. It records
+server/API versions, inspects the stale full-ID token through the backend's
+versioned API route, and submits DELETE only if that route resolves to the
+expected different-ID fixture and the fixture's ID, name and ownership label
+are verified. A 404/no-alias observation skips DELETE. API response bodies are
+bounded by the required `--api-response-limit` argument. Ordinary fixture
+cleanup verifies IDs and labels too, under the disposable/quiescent-daemon
+precondition that production recovery cannot assume.
 
 The exact workflow publication
 [`a1ff46772f9da523cc58629d087eaf39ba49dc12`](https://github.com/t-koba/qcg/actions/runs/42098124987)
 observed Docker CLI 28.0.4 and rootless Podman 4.9.3 both resolving the stale
 full-ID string as a replacement's name and removing that different-ID fixture.
-These are tested CLI behaviors only: the run did not exercise API removal,
-server-version negotiation, a concurrent replacement race, or qcg SIGKILL
-recovery, and it does not establish crash cleanup.
+These are tested CLI behaviors only: that publication predates the direct API
+probe and did not exercise API removal or server-version negotiation. A later
+run of the updated workflow can establish only the documented sequential API
+identity behavior, not a concurrent replacement race or qcg SIGKILL recovery;
+none of these diagnostics establishes crash cleanup.
 
-A successful JSON result reports whether the stale-ID removal deleted the
-different-ID fixture; it explicitly reports that crash cleanup is **not
-certified**. Failure to create the alias, backend unavailability, or failed
-removal is inconclusive, not evidence of an ID-only primitive. Timeouts and
+The JSON result separates CLI and API observations and includes API version
+metadata, inspect status, delete status and whether the known different-ID
+fixture disappeared. `crash_cleanup_certified` remains **false** in every
+result. Failure to create the alias, backend unavailability, or an unconfirmed
+API state is inconclusive, not evidence of an ID-only primitive. Timeouts and
 failed creates/imports can leave fixtures: discard the disposable daemon, or
 retain its evidence for manual reconciliation. There are no absence-based
 cleanup retries. Per-command bounds are supplied by the caller; the dedicated
@@ -158,8 +172,9 @@ Ubuntu 24.04 workflow configures 30 seconds and a five-minute job deadline.
 separately after a relevant `mizu` push or explicit dispatch. A green diagnostic
 job is not crash-cleanup acceptance. Its real-backend results must be read
 before selecting a production primitive; preparing the workflow does not mean
-it has run. Local guard tests only cover the diagnostic's refusal on ownership
-mismatch/unavailability and reporting of cleanup failure.
+it has run. Local tests cover diagnostic refusal on ownership mismatch,
+unknown API metadata, and unavailability, plus Unix transport bounds; they do
+not establish daemon behavior.
 
 CLI doubles cannot establish daemon resource replacement, ID-or-name
 resolution, or conditional-deletion semantics. Normal lifecycle and
