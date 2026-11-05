@@ -394,7 +394,7 @@ pub fn extract_mcp_destinations(
                     && (hostname.contains('.')
                         || hostname.eq_ignore_ascii_case("localhost")
                         || authority.parse::<std::net::IpAddr>().is_ok()
-                        || authority.starts_with('['));
+                        || (authority.starts_with('[') && authority.contains(':')));
                 let scheme_like = text
                     .split_once("://")
                     .is_some_and(|(prefix, _)| !prefix.contains(char::is_whitespace));
@@ -713,6 +713,7 @@ mod tests {
         use std::collections::BTreeSet;
         for (args, expected) in [
             (json!({"query":"rust", "count":3}), vec![]),
+            (json!({"token":"[REDACTED]"}), vec![]),
             (
                 json!({"time":"10:30", "email":"worker@example.com"}),
                 vec![],
@@ -758,6 +759,7 @@ mod tests {
             json!({"urls":["example.com", "not a URL"]}),
             json!({"target":"uncertain"}),
             json!({"url":"/relative/path"}),
+            json!({"url":"[REDACTED]"}),
             json!({"uri":""}),
             json!({"host":null}),
             json!({"urls":["a.test",42]}),
