@@ -9,6 +9,15 @@ on:
       - scripts/probe-container-identity.py
       - scripts/test-probe-container-identity.py
       - scripts/fixtures/container-hold.c
+      # Re-run diagnostics when container provisioning or recovery paths change.
+      - crates/container/**
+      - crates/steps/src/container_backend.rs
+      - crates/service/src/lifecycle.rs
+      - crates/service/src/run_dirs.rs
+      - crates/service/src/runs_api.rs
+      - crates/service/src/runs_api/**
+      - crates/service/src/tests/shared_recovery.rs
+      - crates/service/src/tests/retention_gc.rs
 
 permissions:
   contents: read
