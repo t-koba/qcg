@@ -259,6 +259,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn accepts_delegated_subtree() {
         let config =
@@ -268,6 +269,14 @@ mod tests {
             config.parent().unwrap(),
             Path::new("/sys/fs/cgroup/qcg.slice")
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_linux_mount_path_as_nonabsolute() {
+        let error = HostCgroupConfig::from_parent(Some(PathBuf::from("/sys/fs/cgroup/qcg.slice")))
+            .unwrap_err();
+        assert!(error.contains(HOST_CGROUP_PARENT_ENV), "{error}");
     }
 
     #[test]
