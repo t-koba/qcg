@@ -1,6 +1,6 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { RunStore } from "./run-store.svelte";
-import type { RunSnapshot } from "./api/client";
+import type { FormSpec, RunSnapshot } from "./api/client";
 const snapshot = (seq: number, state: RunSnapshot["state"]): RunSnapshot => ({
   run_id: "test",
   generator_id: "demo",
@@ -192,4 +192,36 @@ it("restores a pending start after reload without replacing its reviewed hash", 
   expect(loadPendingStarts()).toEqual([original]);
   restored.destroy();
   vi.unstubAllGlobals();
+});
+
+it("preserves explicit null answers and defaults only missing values", async () => {
+  const store = new RunStore();
+  store.applySnapshot(snapshot(1, "succeeded"));
+  store.currentRun = "test";
+  const question = {
+    id: "question-1",
+    fields: [{ id: "nullable", default: "fallback" }],
+  } as unknown as FormSpec;
+  const put = vi.fn().mockResolvedValue(snapshot(2, "succeeded"));
+  store.api.put = put as unknown as typeof store.api.put;
+
+  store.question = question;
+  store.values = { "question:nullable": null };
+  await store.answerQuestion();
+  expect(put).toHaveBeenNthCalledWith(
+    1,
+    "/api/runs/test/questions/question-1",
+    { values: { nullable: null } },
+    expect.any(String),
+  );
+
+  store.question = question;
+  store.values = {};
+  await store.answerQuestion();
+  expect(put).toHaveBeenNthCalledWith(
+    2,
+    "/api/runs/test/questions/question-1",
+    { values: { nullable: "fallback" } },
+    expect.any(String),
+  );
 });

@@ -604,7 +604,10 @@ export class RunStore {
   async answerQuestion(overrideValues?: Record<string, unknown>): Promise<void> {
     const tab = this.currentTab();
     if (!tab || !this.question || tab.pendingAction) return;
-    const values = overrideValues || Object.fromEntries(this.question.fields.map((field) => [field.id, this.values[`question:${field.id}`] ?? field.default]));
+    const values = overrideValues || Object.fromEntries(this.question.fields.map((field: FormSpec["fields"][number]) => {
+      const value = this.values[`question:${field.id}`];
+      return [field.id, value === undefined ? field.default : value];
+    }));
     const key = await sha256Hex(canonicalJson({ run: tab.runId, question: this.question.id, values }));
     const { op, version } = this.beginTabOp(tab, "answering");
     try {

@@ -33,9 +33,10 @@
     >
       <div class="field-grid">
         {#each store.question.fields as field}
+          {@const answer = store.values[`question:${field.id}`]}
           <FieldControl
             {field}
-            value={store.values[`question:${field.id}`] ?? field.default}
+            value={answer === undefined ? field.default : answer}
             valueKey={`question:${field.id}`}
             requiredLabel={messages.required}
             {language}
