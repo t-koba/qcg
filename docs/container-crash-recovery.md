@@ -169,15 +169,27 @@ bounded by the required `--api-response-limit` argument. Ordinary fixture
 cleanup verifies IDs and labels too, under the disposable/quiescent-daemon
 precondition that production recovery cannot assume.
 
-The exact workflow publication
+The earlier CLI publication
 [`a1ff46772f9da523cc58629d087eaf39ba49dc12`](https://github.com/t-koba/qcg/actions/runs/42098124987)
 observed Docker CLI 28.0.4 and rootless Podman 4.9.3 both resolving the stale
 full-ID string as a replacement's name and removing that different-ID fixture.
-These are tested CLI behaviors only: that publication predates the direct API
-probe and did not exercise API removal or server-version negotiation. A later
-run of the updated workflow can establish only the documented sequential API
-identity behavior, not a concurrent replacement race or qcg SIGKILL recovery;
-none of these diagnostics establishes crash cleanup.
+The updated direct API probe then ran on SHA
+`f75b3e2eefac649079a23fd97f71d6ce0814fa66` (source commit `1c0d960`) in
+[workflow run 42108752211](https://github.com/t-koba/qcg/actions/runs/42108752211).
+Docker client/server 28.0.4 negotiated Engine API 1.48; API inspection of the
+stale full-ID token returned 200 for the replacement fixture, and DELETE by
+that token returned 204 and removed the different-ID fixture. Rootless Podman
+client/server 4.9.3 reported compat API 1.41 and Libpod API 4.9.3; API
+inspection likewise returned 200 for the replacement, and DELETE returned 200
+and removed it. The exact artifacts are recorded as evidence
+`5b653de423a54df99886f6cb1027dc32` (Docker) and
+`895e39ae781e464ebd16d9bb60d78732` (Podman).
+
+These real-backend results establish only the tested sequential stale-ID/name
+resolution and deletion behavior. They do not test a concurrent replacement
+race, qcg SIGKILL recovery, or create/cancel fencing, and neither result
+certifies crash cleanup. Future diagnostic results must likewise be read before
+selecting any production primitive.
 
 The JSON result separates CLI and API observations and includes API version
 metadata, inspect status, delete status and whether the known different-ID
