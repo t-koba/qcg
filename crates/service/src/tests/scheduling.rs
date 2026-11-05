@@ -395,12 +395,14 @@ async fn bounded_scheduler_comparison_boundary_safety_and_interrupt_latency() {
                 )
                 .unwrap();
                 let lifetime = (last - first).to_std().unwrap();
-                assert!(
-                    lifetime
-                        >= Duration::from_nanos(ledger.active_nanoseconds)
-                            + Duration::from_millis(50),
-                    "urgent execution's preempted wait must not be charged"
-                );
+                if mode == PreemptionMode::StepBoundary {
+                    assert!(
+                        lifetime
+                            >= Duration::from_nanos(ledger.active_nanoseconds)
+                                + Duration::from_millis(50),
+                        "boundary-yielded victim's urgent wait must not be charged"
+                    );
+                }
 
                 // Boundary yielding resumes a second execution episode;
                 // interrupt preemption with a Started operation is refused
