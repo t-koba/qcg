@@ -1,3 +1,4 @@
+pub(crate) mod artifact_response;
 mod config;
 mod error;
 mod generators;

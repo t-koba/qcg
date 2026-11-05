@@ -492,6 +492,8 @@ command = ["sh", "-c", "sleep 30"]"#;
             idempotency_sweep: Default::default(),
             api_token_digest: None,
             artifact_limits: service::ArtifactZipLimits::default(),
+            artifact_response_budget:
+                crate::server::artifact_response::ArtifactResponseBudget::new(None).unwrap(),
             asset_limit: None,
             max_request_bytes: None,
             metrics_policy: MetricsPolicy::default(),
@@ -573,6 +575,8 @@ command = ["sh", "-c", "sleep 30"]"#;
             idempotency_sweep: Default::default(),
             api_token_digest: Some(sha256_bytes("secret")),
             artifact_limits: service::ArtifactZipLimits::default(),
+            artifact_response_budget:
+                crate::server::artifact_response::ArtifactResponseBudget::new(None).unwrap(),
             asset_limit: None,
             max_request_bytes: None,
             metrics_policy: MetricsPolicy::default(),
@@ -769,6 +773,8 @@ command = ["sh", "-c", "sleep 30"]"#;
             idempotency_sweep: Default::default(),
             api_token_digest: None,
             artifact_limits: service::ArtifactZipLimits::default(),
+            artifact_response_budget:
+                crate::server::artifact_response::ArtifactResponseBudget::new(None).unwrap(),
             asset_limit: None,
             max_request_bytes: None,
             metrics_policy: MetricsPolicy::default(),

@@ -669,6 +669,7 @@ async fn run_async() -> Result<std::process::ExitCode> {
             api_token,
             max_request_bytes,
             max_artifact_bytes,
+            max_artifact_response_bytes,
             max_artifact_entries,
             max_asset_bytes,
         } => {
@@ -691,6 +692,7 @@ async fn run_async() -> Result<std::process::ExitCode> {
                 api_token,
                 max_request_bytes,
                 max_artifact_bytes,
+                max_artifact_response_bytes,
                 max_artifact_entries,
                 max_asset_bytes,
             };
@@ -725,6 +727,7 @@ async fn run_async() -> Result<std::process::ExitCode> {
                 api_token: None,
                 max_request_bytes: None,
                 max_artifact_bytes: None,
+                max_artifact_response_bytes: None,
                 max_artifact_entries: None,
                 max_asset_bytes: None,
             };

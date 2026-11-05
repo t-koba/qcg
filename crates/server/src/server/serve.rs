@@ -134,6 +134,9 @@ fn reject_zero_explicit_max(config: &ServerConfig) -> Result<(), String> {
     if config.max_artifact_bytes == Some(0) {
         return Err("max_artifact_bytes must be greater than zero when set".into());
     }
+    if config.max_artifact_response_bytes == Some(0) {
+        return Err("max_artifact_response_bytes must be greater than zero when set".into());
+    }
     if config.max_artifact_entries == Some(0) {
         return Err("max_artifact_entries must be greater than zero when set".into());
     }
@@ -303,10 +306,9 @@ pub fn resolve_server_policy_with_container_timeouts(
     if config.max_tracked_runs > 1_000_000 {
         return Err("max_tracked_runs must be at most 1000000".into());
     }
-    // Explicit-max byte/count knobs: `max_request_bytes` falls back to the
-    // documented default when omitted (never unlimited); the remaining
-    // `None` knobs mean no mechanistic limit. Some(0) would block every
-    // request, so it refuses boot (E04).
+    // Validate explicit limits before service construction. Omitted values
+    // use each knob's documented default (or no limit where documented);
+    // explicit zero would block the feature, so it refuses boot (E04).
     reject_zero_explicit_max(config)?;
     // Run-store mode is an exhaustive enum: every variant is explicitly
     // accepted here so adding a variant forces a boot decision (E04).
@@ -525,6 +527,10 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
             max_bytes: config.max_artifact_bytes,
             max_entries: config.max_artifact_entries,
         },
+        artifact_response_budget: super::artifact_response::ArtifactResponseBudget::new(
+            config.max_artifact_response_bytes,
+        )
+        .map_err(anyhow::Error::msg)?,
         asset_limit: config.max_asset_bytes,
         max_request_bytes: config.max_request_bytes,
         // Freeze the already-resolved metrics policy: scrapes never
@@ -1309,6 +1315,7 @@ mod tests {
             api_token: Some("secret".into()),
             max_request_bytes: None,
             max_artifact_bytes: None,
+            max_artifact_response_bytes: None,
             max_artifact_entries: None,
             max_asset_bytes: None,
             max_total_steps: None,
@@ -1671,6 +1678,7 @@ command = ["sh", "-c", "sleep 30"]"#,
             api_token: None,
             max_request_bytes: None,
             max_artifact_bytes: None,
+            max_artifact_response_bytes: None,
             max_artifact_entries: None,
             max_asset_bytes: None,
             max_total_steps: None,
@@ -1992,6 +2000,7 @@ command = ["sh", "-c", "sleep 30"]"#,
             api_token: None,
             max_request_bytes: None,
             max_artifact_bytes: None,
+            max_artifact_response_bytes: None,
             max_artifact_entries: None,
             max_asset_bytes: None,
             max_total_steps: None,
@@ -2894,6 +2903,10 @@ command = ["sh", "-c", "sleep 30"]"#,
         // `Vec<fn + str>` shape below the type-complexity lint (E04).
         type KnobCase = (fn(&mut ServerConfig), &'static str);
         let zero_cases: Vec<KnobCase> = vec![
+            (
+                |config: &mut ServerConfig| config.max_artifact_response_bytes = Some(0),
+                "max_artifact_response_bytes",
+            ),
             (
                 |config: &mut ServerConfig| config.max_request_bytes = Some(0),
                 "max_request_bytes",

@@ -254,6 +254,7 @@ the automatic sweeps skip such a store instead.
   [--run-store exclusive|shared-filesystem]
   [--cors-origin origin]... [--api-token token]
   [--max-request-bytes N] [--max-artifact-bytes N]
+  [--max-artifact-response-bytes N]
   [--max-artifact-entries N] [--max-asset-bytes N]`
 - `qcg dev [--bind 127.0.0.1] [--port 0] [--generators-dir dir]
   [--runs-dir dir] [--max-active-runs 8] [--providers PATH]
@@ -499,7 +500,17 @@ path is unchanged. Only offline mocks have been tested, not real accounts. See
   start/fork snapshots plus `artifacts`, single `artifacts/{path}`, and
   `artifacts.zip`). Unset means the provisional shared default (16 MiB,
   1,000 entries) for those routes only, never unlimited. Larger explicit
-  values are honored. Other routes (`bundle`, run-list) are not
-  covered; producer `output_*` limits and direct CLI behavior are unchanged.
+  values are honored as per-artifact limits; a single-artifact response must
+  also fit `MAX_ARTIFACT_RESPONSE_BYTES` (raise that budget separately when
+  needed). Other routes (`bundle`, run-list) are not covered; producer
+  `output_*` limits and direct CLI behavior are unchanged.
+- `MAX_ARTIFACT_RESPONSE_BYTES` (default `67108864`, 64 MiB;
+  `--max-artifact-response-bytes`): aggregate verified single-artifact response
+  snapshot bytes for `qcg serve`, frozen at boot and required to be positive.
+  The default admits four 16 MiB bodies. A response reserves its full artifact
+  size (also for ranges) until body drop; errors release it. A body over budget
+  returns `413`; temporary exhaustion returns `503`, before body reads. `304`
+  responses verify without retaining a snapshot and are not charged. This is
+  not a total-RSS bound and does not cover other endpoints or their buffers.
 - `MAX_ASSET_BYTES` (default `16777216`, 16 MiB): maximum bytes for one served
   generator package asset. Omitted means the hard default, never unlimited.

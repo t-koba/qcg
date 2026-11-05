@@ -235,6 +235,12 @@ pub(crate) enum Command {
         /// Explicit max only. Omitted means no mechanistic limit.
         #[arg(long = "max-artifact-bytes", env = "MAX_ARTIFACT_BYTES")]
         max_artifact_bytes: Option<u64>,
+        /// Aggregate single-artifact response snapshots (default 64 MiB); must be positive.
+        #[arg(
+            long = "max-artifact-response-bytes",
+            env = "MAX_ARTIFACT_RESPONSE_BYTES"
+        )]
+        max_artifact_response_bytes: Option<u64>,
         /// Explicit max only. Omitted means no mechanistic limit.
         #[arg(long = "max-artifact-entries", env = "MAX_ARTIFACT_ENTRIES")]
         max_artifact_entries: Option<usize>,
@@ -475,4 +481,34 @@ pub(crate) enum AuthCommand {
         #[arg(long)]
         forget: bool,
     },
+}
+
+#[cfg(test)]
+mod artifact_response_tests {
+    use super::*;
+    use clap::CommandFactory as _;
+
+    #[test]
+    fn artifact_response_budget_flag_and_env_binding() {
+        let cli =
+            Cli::try_parse_from(["qcg", "serve", "--max-artifact-response-bytes", "123"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Serve {
+                max_artifact_response_bytes: Some(123),
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from(["qcg", "serve", "--max-artifact-response-bytes", "-1"]).is_err()
+        );
+        let command = Cli::command();
+        let arg = command
+            .find_subcommand("serve")
+            .unwrap()
+            .get_arguments()
+            .find(|arg| arg.get_id() == "max_artifact_response_bytes")
+            .unwrap();
+        assert_eq!(arg.get_env().unwrap(), "MAX_ARTIFACT_RESPONSE_BYTES");
+    }
 }

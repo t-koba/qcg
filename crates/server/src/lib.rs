@@ -50,6 +50,10 @@ pub(crate) fn test_state(
         idempotency_sweep: Default::default(),
         api_token_digest,
         artifact_limits: service::ArtifactZipLimits::default(),
+        artifact_response_budget: crate::server::artifact_response::ArtifactResponseBudget::new(
+            None,
+        )
+        .unwrap(),
         asset_limit: None,
         max_request_bytes: None,
         metrics_policy: crate::server::MetricsPolicy::default(),

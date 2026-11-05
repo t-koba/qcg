@@ -27,6 +27,8 @@ pub struct ServerConfig {
     pub max_request_bytes: Option<usize>,
     /// Dedicated-route default (16 MiB); bundle/generic service stay explicit-only.
     pub max_artifact_bytes: Option<u64>,
+    /// Aggregate single-artifact response snapshots; omitted uses 64 MiB.
+    pub max_artifact_response_bytes: Option<u64>,
     /// Dedicated-route default (1,000 entries); bundle/generic stay explicit-only.
     pub max_artifact_entries: Option<usize>,
     /// Omitted uses `policy::DEFAULT_MAX_ASSET_BYTES` (16 MiB), not unlimited.
@@ -94,6 +96,8 @@ pub(crate) struct AppState {
     pub(crate) idempotency_sweep: std::sync::Arc<super::idempotency::durable::IdempotencySweep>,
     pub(crate) api_token_digest: Option<[u8; 32]>,
     pub(crate) artifact_limits: service::ArtifactZipLimits,
+    pub(crate) artifact_response_budget:
+        std::sync::Arc<super::artifact_response::ArtifactResponseBudget>,
     pub(crate) asset_limit: Option<usize>,
     /// Configured request body override surfaced by /healthz. `None`
     /// means the documented default (`policy::DEFAULT_MAX_REQUEST_BYTES`);

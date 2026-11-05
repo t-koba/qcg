@@ -734,7 +734,13 @@ pub(crate) async fn read_artifact(
             metadata.len()
         )));
     }
-    // The manifest's configured byte cap also bounds the delivery buffer.
+    // Conditional responses verify without retaining a snapshot. All other
+    // responses reserve the full manifest size before allocation or reading.
+    let reservation = if not_modified {
+        None
+    } else {
+        Some(state.artifact_response_budget.reserve(artifact.bytes)?)
+    };
     let expected_capacity = usize::try_from(artifact.bytes).map_err(ApiHttpError::internal)?;
     let mut verified_bytes = Vec::new();
     if !not_modified {
@@ -804,7 +810,11 @@ pub(crate) async fn read_artifact(
     reader.set_position(start);
     let shutdown = state.shutdown.clone();
     let stream = tokio_util::io::ReaderStream::with_capacity(reader.take(length), 64 * 1024)
-        .take_until(async move { shutdown.cancelled().await });
+        .take_until(async move { shutdown.cancelled().await })
+        .map(move |chunk| {
+            let _keep_reservation = &reservation;
+            chunk
+        });
     let mut response = Response::builder()
         .status(if partial {
             StatusCode::PARTIAL_CONTENT
@@ -1531,6 +1541,8 @@ mod tests {
             idempotency_sweep: Default::default(),
             api_token_digest: None,
             artifact_limits: service::ArtifactZipLimits::default(),
+            artifact_response_budget:
+                crate::server::artifact_response::ArtifactResponseBudget::new(None).unwrap(),
             asset_limit: None,
             max_request_bytes: None,
             metrics_policy: crate::server::MetricsPolicy::default(),
@@ -1598,7 +1610,7 @@ mod tests {
         let service =
             crate::test_service(workspace.join("fixtures/generators"), runs.clone(), None)
                 .expect("service should initialize");
-        let state = Arc::new(crate::server::config::AppState {
+        let mut state = Arc::new(crate::server::config::AppState {
             service,
             runs_dir: runs.clone(),
             oauth_origin: None,
@@ -1610,6 +1622,8 @@ mod tests {
             idempotency_sweep: Default::default(),
             api_token_digest: None,
             artifact_limits: service::ArtifactZipLimits::default(),
+            artifact_response_budget:
+                crate::server::artifact_response::ArtifactResponseBudget::new(None).unwrap(),
             asset_limit: None,
             max_request_bytes: None,
             metrics_policy: crate::server::MetricsPolicy::default(),
@@ -1654,6 +1668,10 @@ mod tests {
             hex::encode(sha2::Sha256::digest(&original)),
             artifact.sha256
         );
+        // Exact full-body admission; even a range reserves the entire snapshot.
+        Arc::get_mut(&mut state).unwrap().artifact_response_budget =
+            super::super::artifact_response::ArtifactResponseBudget::new(Some(artifact.bytes))
+                .unwrap();
         // 200 delivery carries the manifest sha256 as the strong ETag.
         let response = read_artifact(
             State(state.clone()),
@@ -1674,6 +1692,31 @@ mod tests {
             etag,
             format!("\"{}\"", artifact.sha256),
             "the strong ETag must name the manifest sha256"
+        );
+        let exhausted = read_artifact(
+            State(state.clone()),
+            Path((run_id.clone(), "README.md".into())),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            exhausted.problem.status, 503,
+            "unpolled body owns the reservation"
+        );
+        let mut conditional = HeaderMap::new();
+        conditional.insert(header::IF_NONE_MATCH, etag.parse().unwrap());
+        assert_eq!(
+            read_artifact(
+                State(state.clone()),
+                Path((run_id.clone(), "README.md".into())),
+                conditional,
+            )
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::NOT_MODIFIED,
+            "304 is outside the body budget"
         );
         // Same-inode writes after response creation cannot change the
         // already-verified representation named by the strong ETag.
@@ -1734,6 +1777,45 @@ mod tests {
                     .is_empty()
             );
         }
+        // Consuming the first body freed its reservation. A range still owns
+        // the full snapshot until dropped, not just its one delivered byte.
+        let mut range = HeaderMap::new();
+        range.insert(header::RANGE, "bytes=0-0".parse().unwrap());
+        let partial = read_artifact(
+            State(state.clone()),
+            Path((run_id.clone(), "README.md".into())),
+            range,
+        )
+        .await
+        .unwrap();
+        assert_eq!(partial.status(), StatusCode::PARTIAL_CONTENT);
+        assert!(state.artifact_response_budget.reserve(1).is_err());
+        drop(partial);
+        drop(
+            state
+                .artifact_response_budget
+                .reserve(artifact.bytes)
+                .unwrap(),
+        );
+        let mut invalid_range = HeaderMap::new();
+        invalid_range.insert(header::RANGE, "bytes=99999-".parse().unwrap());
+        assert_eq!(
+            read_artifact(
+                State(state.clone()),
+                Path((run_id.clone(), "README.md".into())),
+                invalid_range,
+            )
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::RANGE_NOT_SATISFIABLE
+        );
+        drop(
+            state
+                .artifact_response_budget
+                .reserve(artifact.bytes)
+                .unwrap(),
+        );
         // A same-size content swap before a new request still fails closed.
         let mut swapped = original.clone();
         if let Some(first) = swapped.first_mut() {
@@ -1741,6 +1823,24 @@ mod tests {
         }
         assert_eq!(swapped.len(), original.len(), "swap must keep the size");
         std::fs::write(&resolved, &swapped).expect("swap should write");
+        // Exhaustion wins over digest failure: overload is rejected before reading.
+        let held = state
+            .artifact_response_budget
+            .reserve(artifact.bytes)
+            .unwrap();
+        assert_eq!(
+            read_artifact(
+                State(state.clone()),
+                Path((run_id.clone(), "README.md".into())),
+                HeaderMap::new(),
+            )
+            .await
+            .unwrap_err()
+            .problem
+            .status,
+            503
+        );
+        drop(held);
         read_artifact(
             State(state.clone()),
             Path((run_id.clone(), "README.md".to_string())),
@@ -1748,6 +1848,28 @@ mod tests {
         )
         .await
         .expect_err("a same-size content swap must refuse delivery");
+        drop(
+            state
+                .artifact_response_budget
+                .reserve(artifact.bytes)
+                .unwrap(),
+        );
+        // An individual response over budget is 413, even with corrupted contents.
+        Arc::get_mut(&mut state).unwrap().artifact_response_budget =
+            super::super::artifact_response::ArtifactResponseBudget::new(Some(artifact.bytes - 1))
+                .unwrap();
+        assert_eq!(
+            read_artifact(
+                State(state.clone()),
+                Path((run_id.clone(), "README.md".into())),
+                HeaderMap::new(),
+            )
+            .await
+            .unwrap_err()
+            .problem
+            .status,
+            413
+        );
         let _ = std::fs::remove_dir_all(&runs);
     }
 
@@ -1787,6 +1909,8 @@ mod tests {
             idempotency_sweep: Default::default(),
             api_token_digest: None,
             artifact_limits: service::ArtifactZipLimits::default(),
+            artifact_response_budget:
+                crate::server::artifact_response::ArtifactResponseBudget::new(None).unwrap(),
             asset_limit: None,
             max_request_bytes: None,
             metrics_policy: crate::server::MetricsPolicy::default(),
@@ -1893,6 +2017,8 @@ mod tests {
                 idempotency_sweep: Default::default(),
                 api_token_digest: None,
                 artifact_limits: limits,
+                artifact_response_budget:
+                    super::super::artifact_response::ArtifactResponseBudget::new(None).unwrap(),
                 asset_limit: None,
                 max_request_bytes: None,
                 metrics_policy: crate::server::MetricsPolicy::default(),
@@ -2209,26 +2335,29 @@ mod tests {
         )
         .expect("full bytes");
         let capped = (full_bytes.len() - 1) as u64;
-        let state = Arc::new(crate::server::config::AppState {
-            service: service.clone(),
-            runs_dir: runs.clone(),
-            oauth_origin: None,
-            oauth_allowed_origins: BTreeSet::new(),
-            oauth_callback_url: None,
-            idempotency: tokio::sync::Mutex::new(BTreeMap::new()),
-            idempotency_ttl: policy::IDEMPOTENCY_TTL,
-            idempotency_max_entries: policy::IDEMPOTENCY_MAX_ENTRIES,
-            idempotency_sweep: Default::default(),
-            api_token_digest: None,
-            artifact_limits: service::ArtifactZipLimits {
-                max_bytes: Some(capped),
-                max_entries: None,
-            },
-            asset_limit: None,
-            max_request_bytes: None,
-            metrics_policy: crate::server::MetricsPolicy::default(),
-            shutdown: tokio_util::sync::CancellationToken::new(),
-        });
+        let state =
+            Arc::new(crate::server::config::AppState {
+                service: service.clone(),
+                runs_dir: runs.clone(),
+                oauth_origin: None,
+                oauth_allowed_origins: BTreeSet::new(),
+                oauth_callback_url: None,
+                idempotency: tokio::sync::Mutex::new(BTreeMap::new()),
+                idempotency_ttl: policy::IDEMPOTENCY_TTL,
+                idempotency_max_entries: policy::IDEMPOTENCY_MAX_ENTRIES,
+                idempotency_sweep: Default::default(),
+                api_token_digest: None,
+                artifact_limits: service::ArtifactZipLimits {
+                    max_bytes: Some(capped),
+                    max_entries: None,
+                },
+                artifact_response_budget:
+                    super::super::artifact_response::ArtifactResponseBudget::new(None).unwrap(),
+                asset_limit: None,
+                max_request_bytes: None,
+                metrics_policy: crate::server::MetricsPolicy::default(),
+                shutdown: tokio_util::sync::CancellationToken::new(),
+            });
         let response = read_artifacts_zip(State(state.clone()), Path(run_id.clone()))
             .await
             .expect("zip handler sends headers before the stream fails");
@@ -2272,6 +2401,8 @@ mod tests {
                 idempotency_sweep: Default::default(),
                 api_token_digest: None,
                 artifact_limits: limits,
+                artifact_response_budget:
+                    super::super::artifact_response::ArtifactResponseBudget::new(None).unwrap(),
                 asset_limit: None,
                 max_request_bytes: None,
                 metrics_policy: crate::server::MetricsPolicy::default(),
@@ -2409,6 +2540,8 @@ mod tests {
             idempotency_sweep: Default::default(),
             api_token_digest: None,
             artifact_limits: service::ArtifactZipLimits::default(),
+            artifact_response_budget:
+                crate::server::artifact_response::ArtifactResponseBudget::new(None).unwrap(),
             asset_limit: None,
             max_request_bytes: None,
             metrics_policy: crate::server::MetricsPolicy::default(),
@@ -2627,6 +2760,8 @@ mod tests {
                 idempotency_sweep: Default::default(),
                 api_token_digest: None,
                 artifact_limits: limits,
+                artifact_response_budget:
+                    super::super::artifact_response::ArtifactResponseBudget::new(None).unwrap(),
                 asset_limit: None,
                 max_request_bytes: None,
                 metrics_policy: crate::server::MetricsPolicy::default(),
