@@ -323,6 +323,12 @@ export function schemaDefaultOr(schema: JsonSchema, fallback: () => unknown): un
   return value === undefined ? fallback() : value;
 }
 
+export function schemaBranchInitialValue(schema: JsonSchema): unknown {
+  const value = schemaDefault(schema);
+  if (value !== undefined) return value;
+  return schemaKind(schema) === "object" ? {} : undefined;
+}
+
 /** Count JSON values up to the renderer budget so a hostile schema cannot force a full scan. */
 export function schemaNodeCount(schema: JsonSchema, max = MAX_SCHEMA_NODES): number {
   return countNodesCapped(schema, max);

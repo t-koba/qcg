@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { InputField } from "./api/client";
-import { encodeBase64, fieldKind, fieldSchema, isBlockingSchemaIssue, isSafeFileName, MAX_SCHEMA_NODES, normalizeList, removePath, resolveSchemaReferences, schemaDefaultOr, schemaKind, schemaNodeCount, setPath, validateField, validateInputField, validateSchemaValue, valueNodeCountExceeded } from "./field";
+import { encodeBase64, fieldKind, fieldSchema, isBlockingSchemaIssue, isSafeFileName, MAX_SCHEMA_NODES, normalizeList, removePath, resolveSchemaReferences, schemaBranchInitialValue, schemaDefaultOr, schemaKind, schemaNodeCount, setPath, validateField, validateInputField, validateSchemaValue, valueNodeCountExceeded } from "./field";
 
 function field(overrides: Partial<InputField> = {}): InputField {
   return { id: "value", label: null, label_i18n: {}, type: "string", required: false, default: null, pattern: null, options: [], option_labels_i18n: {}, min_items: null, item_type: null, ...overrides };
@@ -57,6 +57,16 @@ describe("field contracts", () => {
     expect(fallbackCalls).toBe(0);
     expect(schemaDefaultOr({}, fallback)).toBe("generated");
     expect(fallbackCalls).toBe(1);
+  });
+
+  it("initializes empty object union branches without overriding declared defaults", () => {
+    const branch = { type: "object", properties: {}, additionalProperties: false };
+    expect(schemaBranchInitialValue(branch)).toEqual({});
+    expect(validateSchemaValue(branch, {})).toEqual([]);
+    expect(schemaBranchInitialValue({ type: "object", default: null })).toBeNull();
+    expect(schemaBranchInitialValue({ type: "null", const: null })).toBeNull();
+    expect(schemaBranchInitialValue({ type: "string", default: "chosen" })).toBe("chosen");
+    expect(schemaBranchInitialValue({ type: "string" })).toBeUndefined();
   });
 
   it("counts the complete schema tree for the renderer limit", () => {

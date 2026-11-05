@@ -13,6 +13,7 @@
     pathString,
     schemaBoolean,
     schemaBranches,
+    schemaBranchInitialValue,
     schemaDefault,
     schemaDefaultOr,
     schemaInputType,
@@ -248,8 +249,7 @@
 
   function updateUnion(index: number): void {
     selectedBranch = index;
-    const next = schemaDefault(branches[index] || {});
-    emit(next);
+    emit(schemaBranchInitialValue(branches[index] || {}));
   }
 
   function addArrayItem(): void {
