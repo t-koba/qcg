@@ -19,6 +19,11 @@ const UNIX_MODE_SYMLINK: u32 = 0o120000;
 #[cfg(unix)]
 const UNIX_MODE_DIR: u32 = 0o040000;
 
+#[cfg(unix)]
+const PACKAGE_BUILD_DIR_MODE: u32 = 0o700;
+#[cfg(not(unix))]
+const PACKAGE_BUILD_DIR_MODE: u32 = 0o600;
+
 /// Default entry-count bound for package archives (flood gate).
 pub const DEFAULT_PACKAGE_MAX_ENTRIES: usize = 1000;
 /// Default expanded-bytes bound for package archives (bomb gate, 10 MiB).
@@ -352,9 +357,9 @@ fn stage_file_fd(
     files::stage_file_at(parent.fd, file_name, mode, 3, copy).map_err(ServiceError::Io)
 }
 
-/// Creates or adopts one archive directory leaf under a pinned parent fd
-/// with its final sanitized mode applied on the handle (E15). A symlink at
-/// the leaf is never created through, chmodded through, or replaced.
+/// Creates or adopts one directory leaf under a pinned parent fd and applies
+/// its sanitized mode on the handle (E15). Construction and final modes are
+/// both applied here; a symlink is never followed, chmodded through, or replaced.
 #[cfg(unix)]
 fn create_dir_leaf_fd(parent: &PinnedDir, file_name: &str, mode: u32) -> Result<(), ServiceError> {
     let mode = sanitize_restored_mode(mode);
@@ -623,6 +628,7 @@ pub fn unpack_package(
     let archive = rawzip::ZipArchive::from_file(file, &mut buffer).map_err(invalid_zip)?;
     validate_entry_count(&archive, &mut buffer, limits.max_entries)?;
     let mut unpacked_bytes = 0_u64;
+    let mut directories = Vec::new();
     // Pin the target directory once (Unix): every parent creation and file
     // staging below runs relative to this fd (E15).
     #[cfg(unix)]
@@ -703,12 +709,12 @@ pub fn unpack_package(
                 remaining,
                 limits.max_bytes,
             )?;
-            // Directory leaves are created (or adopted) with their final
-            // sanitized mode applied on a handle, never chmodded through a
-            // pathname link (E15).
+            // Keep explicit directories writable while entries are created;
+            // restore their archive modes only after all descendants exist.
+            // Unix changes remain pinned-handle-relative (E15).
             #[cfg(unix)]
             with_parent_fd(&pinned_target, &rel, |parent, leaf| {
-                create_dir_leaf_fd(parent, leaf, archived_mode)
+                create_dir_leaf_fd(parent, leaf, PACKAGE_BUILD_DIR_MODE)
             })?;
             #[cfg(not(unix))]
             {
@@ -716,8 +722,9 @@ pub fn unpack_package(
                 if let Some(parent) = out.parent() {
                     create_parent_dirs(target, parent)?;
                 }
-                unpack_dir_leaf_path(&out, &rel, archived_mode)?;
+                package_dir_leaf_path(&out, &rel, PACKAGE_BUILD_DIR_MODE)?;
             }
+            directories.push((rel, archived_mode));
         } else {
             // File leaves are staged with the final mode applied BEFORE the
             // rename; no post-rename chmod ever runs (E15).
@@ -766,15 +773,27 @@ pub fn unpack_package(
         }
     }
     verify_package_inventory(target, limits)?;
+    directories.sort_unstable_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
+    for (rel, mode) in directories {
+        #[cfg(unix)]
+        with_parent_fd(&pinned_target, &rel, |parent, leaf| {
+            create_dir_leaf_fd(parent, leaf, mode)
+        })?;
+        #[cfg(not(unix))]
+        {
+            let out = target.join(&rel);
+            package_dir_leaf_path(&out, &rel, mode)?;
+        }
+    }
     Ok(())
 }
 
-/// Non-Unix archive directory leaf: probe, create, re-probe, then apply the
-/// final mode. The re-probe before the mode change refuses a link planted
+/// Non-Unix package directory leaf: probe, create, re-probe, then apply the
+/// requested mode. The re-probe before the mode change refuses a link planted
 /// in the create window; a residual pathname race remains and untrusted
 /// concurrent writers are unsupported on non-Unix (E15).
 #[cfg(not(unix))]
-fn unpack_dir_leaf_path(out: &Utf8Path, rel: &Utf8PathBuf, mode: u32) -> Result<(), ServiceError> {
+fn package_dir_leaf_path(out: &Utf8Path, rel: &Utf8Path, mode: u32) -> Result<(), ServiceError> {
     // A pre-existing symlink or file at the directory path must never be
     // created through or chmodded through (E15).
     match std::fs::symlink_metadata(out) {
@@ -1216,6 +1235,7 @@ pub fn copy_dir_all(
     collect_identity_entries(source, limits)?;
     let mut entry_count = 0_usize;
     let mut copied_bytes = 0_u64;
+    let mut directories = Vec::new();
     // Pin the target once (Unix): destination parents and file staging run
     // relative to this fd (E15).
     #[cfg(unix)]
@@ -1295,16 +1315,17 @@ pub fn copy_dir_all(
                     "package source changed while being copied: {path}"
                 )));
             }
+            let mode = explicit_source_mode(&source_metadata, true);
             #[cfg(unix)]
             with_parent_fd(&pinned_target, rel, |parent, leaf| {
-                create_dir_leaf_fd(parent, leaf, explicit_source_mode(&source_metadata, true))
+                create_dir_leaf_fd(parent, leaf, PACKAGE_BUILD_DIR_MODE)
             })?;
             #[cfg(not(unix))]
             {
                 let dest = target.join(rel);
-                ensure_plain_dir(&dest)?;
-                apply_restored_mode(&dest, explicit_source_mode(&source_metadata, true))?;
+                package_dir_leaf_path(&dest, rel, PACKAGE_BUILD_DIR_MODE)?;
             }
+            directories.push((rel.to_path_buf(), mode));
             continue;
         }
         if !file_type.is_file() {
@@ -1376,6 +1397,18 @@ pub fn copy_dir_all(
                 }
                 Ok(())
             })?;
+        }
+    }
+    directories.sort_unstable_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
+    for (rel, mode) in directories {
+        #[cfg(unix)]
+        with_parent_fd(&pinned_target, &rel, |parent, leaf| {
+            create_dir_leaf_fd(parent, leaf, mode)
+        })?;
+        #[cfg(not(unix))]
+        {
+            let dest = target.join(&rel);
+            package_dir_leaf_path(&dest, &rel, mode)?;
         }
     }
     Ok(())
@@ -2106,6 +2139,141 @@ mod tests {
         let error = crate::run_package::verify(&target, &expected)
             .expect_err("changed snapshot must fail closed");
         assert!(error.to_string().contains("identity mismatch"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_package_directories_are_restored_after_materialization() {
+        use std::io::Write as _;
+        use std::os::unix::{fs::PermissionsExt as _, process::CommandExt as _};
+
+        const ROOT_ENV: &str = "QCG_READ_ONLY_PACKAGE_TEST_ROOT";
+
+        fn assert_mode(path: &Utf8Path, expected: u32) {
+            assert_eq!(
+                std::fs::metadata(path)
+                    .expect("directory metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                expected,
+                "unexpected mode for {path}"
+            );
+        }
+
+        fn exercise(root: &Utf8Path) {
+            let source = root.join("source");
+            let archive = root.join("read-only.pkg");
+            let copied = root.join("copied");
+            let unpacked = root.join("unpacked");
+            let expected = package_identity_sha256(&source, &PackageLimits::default())
+                .expect("source identity");
+            copy_dir_all(&source, &copied, &PackageLimits::default())
+                .expect("read-only source directories should copy");
+            crate::run_package::verify(&copied, &expected)
+                .expect("copied package identity should match");
+            unpack_package(&archive, &unpacked, &PackageLimits::default())
+                .expect("read-only archive directories should unpack");
+
+            for target in [&copied, &unpacked] {
+                assert_eq!(
+                    std::fs::read(target.join("readonly/nested/data.txt")).expect("nested payload"),
+                    b"payload"
+                );
+                assert_mode(&target.join("readonly"), 0o555);
+                assert_mode(&target.join("readonly/nested"), 0o555);
+            }
+        }
+
+        if let Some(root) = std::env::var_os(ROOT_ENV) {
+            let root = Utf8PathBuf::from_path_buf(root.into()).expect("test root is UTF-8");
+            exercise(&root);
+            return;
+        }
+
+        let root = temp_dir("read-only-directories");
+        let _temp_guard = TempGuard(root.clone());
+        let source = root.join("source");
+        std::fs::create_dir_all(source.join("readonly/nested")).expect("source directories");
+        std::fs::write(source.join("qcg.toml"), b"manifest").expect("source manifest");
+        std::fs::write(source.join("readonly/nested/data.txt"), b"payload")
+            .expect("source payload");
+        std::fs::create_dir(root.join("copied")).expect("copy target");
+        std::fs::create_dir(root.join("unpacked")).expect("unpack target");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755))
+            .expect("test root traversal mode");
+        std::fs::set_permissions(root.join("copied"), std::fs::Permissions::from_mode(0o777))
+            .expect("copy target writable");
+        std::fs::set_permissions(
+            root.join("unpacked"),
+            std::fs::Permissions::from_mode(0o777),
+        )
+        .expect("unpack target writable");
+        std::fs::set_permissions(
+            source.join("readonly/nested"),
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .expect("nested source read-only");
+        std::fs::set_permissions(
+            source.join("readonly"),
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .expect("source read-only");
+
+        let body = b"payload";
+        let sha256 = hex::encode(Sha256::digest(body));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        let mut writer =
+            zip::ZipWriter::new(File::create(root.join("read-only.pkg")).expect("package archive"));
+        writer
+            .add_directory("readonly/", options.unix_permissions(0o555))
+            .expect("read-only archive directory");
+        writer
+            .add_directory("readonly/nested/", options.unix_permissions(0o555))
+            .expect("read-only nested archive directory");
+        writer
+            .start_file("readonly/nested/data.txt", options.unix_permissions(0o644))
+            .expect("archive payload entry");
+        writer.write_all(body).expect("archive payload");
+        let sbom = test_sbom(vec![test_sbom_file(
+            "readonly/nested/data.txt",
+            &sha256,
+            0o644,
+        )]);
+        drop(finish_archive(writer, options, &sbom));
+
+        if unsafe { libc::geteuid() } == 0 {
+            let output =
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .arg("read_only_package_directories_are_restored_after_materialization")
+                    .arg("--nocapture")
+                    .env(ROOT_ENV, root.as_str())
+                    .uid(65534)
+                    .gid(65534)
+                    .output()
+                    .expect("unprivileged test child");
+            assert!(
+                output.status.success(),
+                "unprivileged package test failed: stdout={}, stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        } else {
+            exercise(&root);
+        }
+
+        for path in [
+            source.join("readonly/nested"),
+            source.join("readonly"),
+            root.join("copied/readonly/nested"),
+            root.join("copied/readonly"),
+            root.join("unpacked/readonly/nested"),
+            root.join("unpacked/readonly"),
+        ] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                .expect("restore writable mode for test cleanup");
+        }
     }
 
     #[test]
