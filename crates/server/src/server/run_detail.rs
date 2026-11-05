@@ -845,36 +845,17 @@ pub(crate) async fn read_artifact(
                 .map_err(ApiHttpError::internal);
         }
     };
-    let start_usize = usize::try_from(start).map_err(ApiHttpError::internal)?;
-    let length_usize = usize::try_from(length).map_err(ApiHttpError::internal)?;
-    let end = start_usize
-        .checked_add(length_usize)
-        .ok_or_else(|| ApiHttpError::internal("artifact range offset overflowed"))?;
-    if end > verified_bytes.len() {
-        return Err(ApiHttpError::internal(
-            "verified artifact snapshot is shorter than the requested range",
-        ));
-    }
     let content_type = artifact
         .mime
         .unwrap_or_else(|| content_type_for_name(&artifact.path).to_string());
-    // Keep body delivery bounded and cancellable while serving chunks from
-    // the immutable, already-verified snapshot (E05/E16).
+    // Range bounds are within artifact.bytes, verified above against this
+    // immutable snapshot. Bound delivery chunks and stop on shutdown (E05/E16).
+    use tokio::io::AsyncReadExt as _;
+    let mut reader = std::io::Cursor::new(verified_bytes);
+    reader.set_position(start);
     let shutdown = state.shutdown.clone();
-    let stream = futures_util::stream::unfold(
-        (verified_bytes, start_usize, end),
-        |(verified_bytes, offset, end)| async move {
-            if offset >= end {
-                return None;
-            }
-            let chunk_end = offset.saturating_add(64 * 1024).min(end);
-            let chunk = verified_bytes[offset..chunk_end].to_vec();
-            Some((Ok::<_, io::Error>(chunk), (verified_bytes, chunk_end, end)))
-        },
-    )
-    .take_until(async move {
-        shutdown.cancelled().await;
-    });
+    let stream = tokio_util::io::ReaderStream::with_capacity(reader.take(length), 64 * 1024)
+        .take_until(async move { shutdown.cancelled().await });
     let mut response = Response::builder()
         .status(if partial {
             StatusCode::PARTIAL_CONTENT
