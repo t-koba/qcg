@@ -425,6 +425,13 @@ path is unchanged. Only offline mocks have been tested, not real accounts. See
   phases. Settle must be at least drain; out-of-range values
   refuse boot. Total shutdown time is the sum of the configured drain and
   settle phases (180 s by default; at most 7200 s).
+- `SHUTDOWN_TASK_GRACE_SECS` (default `5`, range `0..=3600`): per-task
+  grace for managed resident tasks and the OTLP exporter, resolved once at
+  boot. Tasks join concurrently during settlement; an expired grace aborts
+  and joins the async task and reports an error (`0` gives no waiting grace).
+  The outer `SHUTDOWN_SETTLE_SECS` deadline still wins if shorter; this
+  setting does not extend either shutdown phase. Malformed or out-of-range
+  values refuse boot.
 - `CONTAINER_CREATE_TIMEOUT_SECS` (default `600`),
   `CONTAINER_START_TIMEOUT_SECS` (default `120`),
   `CONTAINER_ADMIN_TIMEOUT_SECS` (default `60`), and

@@ -448,7 +448,13 @@ timeout is returned as an error to the host. The HTTP drain is bounded by
 least drain. The total bound from signal to exit is the sum of the configured
 phases: 180 s by default, at most 7200 s under their validated ranges. The
 outer deadline starts after the drain, so a wedged drain delays settlement
-by design but is cut at its configured bound. Startup order is policy resolve,
+by design but is cut at its configured bound. Each managed resident task and
+OTLP exporter gets `SHUTDOWN_TASK_GRACE_SECS` to join concurrently during
+settlement (default 5 s, range 0..=3600; `0` gives no waiting grace). This
+policy is validated and frozen at boot. An expired per-task grace aborts and
+joins the async task and reports an error; blocking work may outlive its
+wrapper. The outer settle deadline still wins if shorter, so a longer task
+grace does not extend the shutdown bound. Startup order is policy resolve,
 service build, router build, then recovery before resident tasks; shutdown order
 is signal, mutating-work gate, HTTP drain, then resident-task and active-run
 settlement concurrently under the outer deadline. Settled runs are terminal and cover every tracked

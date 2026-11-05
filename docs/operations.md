@@ -830,7 +830,15 @@ of these configured phases: 180 s by default, at most 7200 s under the
 validated ranges. `SHUTDOWN_SETTLE_SECS` must be at least
 `SHUTDOWN_DRAIN_SECS`. The outer deadline starts after the HTTP drain
 completes, so a wedged drain delays settlement by design but is cut at its
-configured bound with a warning. Startup order is resolve deployment policy
+configured bound with a warning. `SHUTDOWN_TASK_GRACE_SECS` is the per-task
+join grace for managed residents (including maintenance) and the OTLP
+exporter: default 5 s, range 0..=3600, validated and frozen once at boot;
+malformed or out-of-range values refuse boot. All task joins run concurrently
+during settlement, not serially. A value of `0` gives no waiting grace. On
+expiry the async task is aborted and joined and shutdown reports an error;
+in-flight blocking work may outlive its wrapper. The outer settle deadline
+still wins if shorter: task grace never adds to the drain or settle budgets.
+Startup order is resolve deployment policy
 once, build the service, build the router, then start recovery
 (`resume_recovered_runs`) before resident tasks; shutdown order is signal,
 stop accepting mutating work (shared token), HTTP drain, mark the service

@@ -135,6 +135,9 @@ pub struct ResolvedServerPolicy {
     /// `SHUTDOWN_SETTLE_SECS` policy value (default 150, range 1..=3600,
     /// and at least the drain value): outer settlement deadline after drain.
     pub shutdown_settle: std::time::Duration,
+    /// Per-task grace (`SHUTDOWN_TASK_GRACE_SECS`, default 5, range 0..=3600).
+    /// The outer settlement deadline remains authoritative when shorter.
+    pub shutdown_task_grace: std::time::Duration,
 }
 fn reject_zero_explicit_max(config: &ServerConfig) -> Result<(), String> {
     if config.max_request_bytes == Some(0) {
@@ -227,6 +230,12 @@ pub fn resolve_server_policy_with_container_timeouts(
         150,
         policy::MIN_SHUTDOWN_PHASE_SECS,
         policy::MAX_SHUTDOWN_PHASE_SECS,
+    )?);
+    let shutdown_task_grace = std::time::Duration::from_secs(policy::parse_bounded_env(
+        "SHUTDOWN_TASK_GRACE_SECS",
+        5,
+        0,
+        3600,
     )?);
     if shutdown_settle < shutdown_drain {
         return Err("SHUTDOWN_SETTLE_SECS must be at least SHUTDOWN_DRAIN_SECS".to_string());
@@ -367,6 +376,7 @@ pub fn resolve_server_policy_with_container_timeouts(
         queued_resumer_secs,
         shutdown_drain,
         shutdown_settle,
+        shutdown_task_grace,
     })
 }
 pub(crate) async fn serve_with_resolved_policy_and_deadline(
@@ -418,6 +428,7 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
         queued_resumer_secs,
         shutdown_drain,
         shutdown_settle: _,
+        shutdown_task_grace,
     } = policy;
     tracing::info!(
         idempotency_ttl_secs = idempotency_ttl.as_secs(),
@@ -621,8 +632,10 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
     // and swallowed (E05).
     let outcome = tokio::time::timeout(shutdown_deadline, async move {
         let mut tasks = tasks;
-        let (tasks_result, runs_result) =
-            tokio::join!(tasks.shutdown(), service.shutdown_active_runs());
+        let (tasks_result, runs_result) = tokio::join!(
+            tasks.shutdown(shutdown_task_grace),
+            service.shutdown_active_runs()
+        );
         // H04: both sides are done here (join! completed), so the abort
         // guard is disarmed exactly once. The timeout path drops `tasks`
         // without reaching this line, preserving forced recovery.
@@ -665,9 +678,8 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
     }
     Ok(actual_addr)
 }
-// Shutdown phase durations are resolved once in `ResolvedServerPolicy`.
-// The configured total from signal to exit is `shutdown_drain + shutdown_settle`;
-// do not duplicate that policy in fixed constants.
+// Frozen shutdown budgets bound drain + settlement; task grace stays within
+// settlement, never extending the total.
 /// Single shutdown initiation for the serve path (E05): cancels the shared
 /// token owned by the service. `LocalService::mark_shutting_down`
 /// cancels this same token; serve calls only this helper so the token is
@@ -731,29 +743,17 @@ impl ResidentTasks {
         self.otlp_abort = Some(handle.abort_handle());
         self.otlp_handle = Some(handle);
     }
-    /// H04: borrows instead of consuming so the abort guard (`Drop`)
-    /// lives until BOTH resident join and run settlement complete. The
-    /// caller disarms engine cleanup only after the join (see
-    /// [`Self::disarm_engine_cleanup`]); dropping `self` after a lone
-    /// resident join must not abort still-settling engine tasks.
-    async fn shutdown(&mut self) -> Result<()> {
-        // The token was already cancelled when the signal fired, so the
-        // loops exit at their next select. Await them instead of aborting:
-        // aborting mid-iteration could strand a run that the task just
-        // admitted (E05). Every task is awaited concurrently with its own
-        // 5 s grace period, so one wedged task cannot delay the rest or
-        // the run convergence that follows: the total wait is ~5 s, never
-        // 5 s per task (E05). A wedged task is aborted after its grace so
-        // no async wrapper survives shutdown; an in-flight spawn_blocking
-        // closure cannot be aborted and may outlive its wrapper. A panicking
-        // task or a task that ended with Err (for example the GC task after
-        // retries) is returned as an error so the outer shutdown outcome
-        // cannot claim clean success while swallowing the failure (E05).
-        // `self.waiters` aborts them via Drop, rather than detaching resident
-        // handles, if an outer-deadline timeout drops this future (E05).
+    /// Borrow so the abort guard survives until both resident joins and run
+    /// settlement finish; the caller disarms engine cleanup after their join (H04).
+    async fn shutdown(&mut self, grace: std::time::Duration) -> Result<()> {
+        // The shared token is already cancelled. Join every task concurrently
+        // under its configured grace, bounded by the outer settlement deadline.
+        // Abort and join wedged async wrappers; spawn_blocking work may outlive
+        // them. Return all task failures rather than claiming clean success.
+        // Retain waiters on self so Drop aborts them if the outer deadline wins.
         for mut handle in self.handles.drain(..) {
             self.waiters.spawn(async move {
-                match tokio::time::timeout(std::time::Duration::from_secs(5), &mut handle).await {
+                match tokio::time::timeout(grace, &mut handle).await {
                     Err(_) => {
                         handle.abort();
                         // Confirm wrapper termination so no resident task
@@ -779,7 +779,7 @@ impl ResidentTasks {
         }
         if let Some(mut otlp) = self.otlp_handle.take() {
             self.waiters.spawn(async move {
-                match tokio::time::timeout(std::time::Duration::from_secs(5), &mut otlp).await {
+                match tokio::time::timeout(grace, &mut otlp).await {
                     Err(_) => {
                         otlp.abort();
                         let _ = otlp.await;
@@ -1509,7 +1509,7 @@ mod tests {
             otlp_abort: None,
         };
         let error = tasks
-            .shutdown()
+            .shutdown(std::time::Duration::from_secs(5))
             .await
             .expect_err("a panicking task must fail shutdown");
         assert!(
@@ -1518,41 +1518,58 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn wedged_tasks_do_not_delay_each_other() {
-        // E05: every resident task gets its own concurrent 5 s grace, so
-        // two wedged tasks settle in ~5 s total, never ~10 s sequential.
-        // Both must be aborted and reported as one error.
-        let first = tokio::spawn(async move {
-            std::future::pending::<()>().await;
-            Ok::<(), service::ServiceError>(())
-        });
-        let second = tokio::spawn(async move {
-            std::future::pending::<()>().await;
-            Ok::<(), service::ServiceError>(())
-        });
-        let mut tasks = ResidentTasks {
-            handles: vec![first, second],
-            abort_handles: vec![],
-            waiters: tokio::task::JoinSet::new(),
-            service: None,
-            otlp_handle: None,
-            otlp_abort: None,
-        };
-        let started = tokio::time::Instant::now();
-        let error = tasks
-            .shutdown()
-            .await
-            .expect_err("wedged tasks must fail shutdown");
-        assert!(
-            error.to_string().contains("grace period"),
-            "the timeout must be reported: {error}"
-        );
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(9),
-            "concurrent grace must bound the total wait: {:?}",
-            started.elapsed()
-        );
+    #[tokio::test(start_paused = true)]
+    async fn resident_and_otlp_tasks_obey_grace_concurrently() {
+        async fn finish_later() {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        }
+        // Short/zero grace aborts all three together; long grace permits work
+        // beyond the former fixed five seconds to finish without an error.
+        for grace_secs in [0, 1, 30] {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    tokio::spawn(async {
+                        finish_later().await;
+                        Ok::<(), service::ServiceError>(())
+                    })
+                })
+                .collect();
+            let abort_handles = handles.iter().map(|h| h.abort_handle()).collect();
+            let mut tasks = ResidentTasks {
+                handles,
+                abort_handles,
+                waiters: tokio::task::JoinSet::new(),
+                service: None,
+                otlp_handle: None,
+                otlp_abort: None,
+            };
+            tasks.spawn_otlp(finish_later());
+            let started = tokio::time::Instant::now();
+            let result = tasks
+                .shutdown(std::time::Duration::from_secs(grace_secs))
+                .await;
+            if grace_secs < 10 {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("3 resident tasks failed"), "{error}");
+                assert!(
+                    error.contains("resident task exceeded the shutdown grace period"),
+                    "{error}"
+                );
+                assert!(
+                    error.contains("OTLP exporter exceeded the shutdown grace period"),
+                    "{error}"
+                );
+            } else {
+                result.expect("long grace permits all tasks to complete");
+            }
+            assert_eq!(
+                started.elapsed(),
+                std::time::Duration::from_secs(grace_secs.min(10))
+            );
+            assert!(tasks.abort_handles.iter().all(|h| h.is_finished()));
+            assert!(tasks.otlp_abort.as_ref().unwrap().is_finished());
+            assert!(tasks.waiters.is_empty());
+        }
     }
 
     #[tokio::test]
@@ -1727,11 +1744,10 @@ command = ["sh", "-c", "sleep 30"]"#,
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn abort_handles_survive_graceful_drain() {
-        // F01: waiters move the original JoinHandles inside during graceful
-        // shutdown; the retained abort handles let Drop stop the originals
-        // even after an outer-deadline timeout aborts the waiters.
+        // The outer deadline wins over a longer per-task grace, even after
+        // handles have moved into waiters. Drop must abort both task types.
         let handle = tokio::spawn(async {
             std::future::pending::<()>().await;
             Ok::<(), service::ServiceError>(())
@@ -1745,19 +1761,18 @@ command = ["sh", "-c", "sleep 30"]"#,
             otlp_handle: None,
             otlp_abort: None,
         };
-        // Simulate the graceful path draining `handles` into waiters, then
-        // an outer timeout dropping everything mid-wait.
-        let drained = std::mem::take(&mut tasks.handles);
-        assert_eq!(drained.len(), 1);
-        drop(tasks);
-        assert!(
-            abort.is_finished() || {
-                // Give the abort a moment to land; the task never exits alone.
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                abort.is_finished()
-            },
-            "the original resident must stop via its retained abort handle"
-        );
+        tasks.spawn_otlp(std::future::pending());
+        let otlp_abort = tasks.otlp_abort.clone().unwrap();
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), async move {
+            tasks.shutdown(std::time::Duration::from_secs(30)).await
+        })
+        .await;
+        assert!(outcome.is_err(), "the outer deadline must win");
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(1));
+        tokio::task::yield_now().await;
+        assert!(abort.is_finished(), "resident task must not detach");
+        assert!(otlp_abort.is_finished(), "OTLP exporter must not detach");
     }
 
     #[tokio::test]
@@ -1790,13 +1805,17 @@ command = ["sh", "-c", "sleep 30"]"#,
                 Ok::<(), anyhow::Error>(())
             };
             if order == "resident-first" {
-                let (tasks_result, runs_result) =
-                    tokio::join!(tasks.shutdown(), fake_run_settlement);
+                let (tasks_result, runs_result) = tokio::join!(
+                    tasks.shutdown(std::time::Duration::from_secs(5)),
+                    fake_run_settlement
+                );
                 tasks_result.expect("resident join should succeed");
                 runs_result.expect("run settlement should succeed");
             } else {
-                let (runs_result, tasks_result) =
-                    tokio::join!(fake_run_settlement, tasks.shutdown(),);
+                let (runs_result, tasks_result) = tokio::join!(
+                    fake_run_settlement,
+                    tasks.shutdown(std::time::Duration::from_secs(5)),
+                );
                 runs_result.expect("run settlement should succeed");
                 tasks_result.expect("resident join should succeed");
             }
@@ -1939,8 +1958,10 @@ command = ["sh", "-c", "sleep 30"]"#,
         // let one phase consume the other's budget.
         let outcome = tokio::time::timeout(std::time::Duration::from_millis(200), async move {
             let mut tasks = tasks;
-            let (tasks_result, runs_result) =
-                tokio::join!(tasks.shutdown(), service.shutdown_active_runs());
+            let (tasks_result, runs_result) = tokio::join!(
+                tasks.shutdown(std::time::Duration::from_secs(5)),
+                service.shutdown_active_runs()
+            );
             tasks.disarm_engine_cleanup();
             tasks_result?;
             runs_result.map_err(anyhow::Error::from)
@@ -2360,6 +2381,7 @@ command = ["sh", "-c", "sleep 30"]"#,
             "QUEUED_RESUMER_SECS",
             "SHUTDOWN_DRAIN_SECS",
             "SHUTDOWN_SETTLE_SECS",
+            "SHUTDOWN_TASK_GRACE_SECS",
         ] {
             unset(variable);
         }
@@ -2382,6 +2404,18 @@ command = ["sh", "-c", "sleep 30"]"#,
         );
         assert_eq!(policy.shutdown_drain.as_secs(), 30);
         assert_eq!(policy.shutdown_settle.as_secs(), 150);
+        assert_eq!(policy.shutdown_task_grace.as_secs(), 5);
+        for value in ["-1", "3601", "no", "18446744073709551616"] {
+            set("SHUTDOWN_TASK_GRACE_SECS", value);
+            let error = resolve_server_policy(&config).unwrap_err();
+            assert!(error.contains("SHUTDOWN_TASK_GRACE_SECS"), "{error}");
+        }
+        for seconds in [0, 1, 3600] {
+            set("SHUTDOWN_TASK_GRACE_SECS", &seconds.to_string());
+            let frozen = resolve_server_policy(&config).unwrap();
+            unset("SHUTDOWN_TASK_GRACE_SECS");
+            assert_eq!(frozen.shutdown_task_grace.as_secs(), seconds);
+        }
 
         unset("READ_CACHE_MAX_BYTES");
         assert_eq!(
