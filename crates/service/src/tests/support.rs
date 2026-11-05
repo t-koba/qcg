@@ -630,14 +630,18 @@ pub(crate) async fn pause_suspension_commit(run_dir: &Utf8Path) {
 }
 
 // Path-scoped, one-shot checkpoints; dropping the probe removes unused gates.
+#[cfg(unix)]
 type QueueGate = (
     tokio::sync::oneshot::Sender<Utf8PathBuf>,
     tokio::sync::oneshot::Receiver<()>,
 );
+#[cfg(unix)]
 static QUEUE_GATES: std::sync::LazyLock<Mutex<BTreeMap<(Utf8PathBuf, &'static str), QueueGate>>> =
     std::sync::LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
+#[cfg(unix)]
 pub(crate) struct QueueProbe(pub(crate) Utf8PathBuf);
+#[cfg(unix)]
 impl QueueProbe {
     pub(crate) fn gate(
         &self,
@@ -658,6 +662,7 @@ impl QueueProbe {
         (observed, release)
     }
 }
+#[cfg(unix)]
 impl Drop for QueueProbe {
     fn drop(&mut self) {
         QUEUE_GATES
@@ -667,6 +672,7 @@ impl Drop for QueueProbe {
     }
 }
 
+#[cfg(unix)]
 pub(crate) async fn queue_checkpoint(run_dir: &Utf8Path, phase: &'static str) {
     let gate = {
         let mut gates = QUEUE_GATES.lock().unwrap();

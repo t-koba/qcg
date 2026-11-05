@@ -1428,7 +1428,7 @@ impl LocalService {
                     {
                         break permit;
                     }
-                    #[cfg(test)]
+                    #[cfg(all(test, unix))]
                     crate::tests::support::queue_checkpoint(&run_dir, "waiting").await;
                     tokio::select! {
                         _ = cancellation.cancelled() => {
@@ -1440,7 +1440,7 @@ impl LocalService {
                         _ = notified => continue,
                     }
                 };
-                #[cfg(test)]
+                #[cfg(all(test, unix))]
                 crate::tests::support::queue_checkpoint(&run_dir, "admitted").await;
                 let (package_state, journaled) = {
                     let mut runs = service.inner.runs.write().await;
@@ -1848,7 +1848,7 @@ impl LocalService {
             {
                 break permit;
             }
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             crate::tests::support::queue_checkpoint(run_dir, "waiting").await;
             // Direct runs wait without preempting; shutdown ends the wait (E05).
             tokio::select! {
@@ -1860,7 +1860,7 @@ impl LocalService {
                 _ = notified => continue,
             }
         };
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         crate::tests::support::queue_checkpoint(run_dir, "admitted").await;
         {
             let mut runs = self.inner.runs.write().await;
