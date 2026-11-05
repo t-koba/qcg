@@ -432,6 +432,7 @@ pub(crate) fn claim_durable_pending(
     digest: &str,
     reserved_run_id: Option<String>,
     ttl: std::time::Duration,
+    sweep: &IdempotencySweep,
 ) -> Result<ClaimOutcome, ApiHttpError> {
     // Serialize check-then-publish under the single cross-process
     // idempotency lock: temp + rename alone cannot arbitrate two
@@ -530,9 +531,9 @@ pub(crate) fn claim_durable_pending(
     // misclassified as corrupt would delete a live owner's claim and split
     // the key into two owners (A03). Staging and replacement are separate
     // steps: a crash between them leaves the predecessor mapping intact
-    // (D04). Stale-temp reclamation is periodic (shared interval) and its
-    // partial-sweep error fails the claim instead of looking clean (E02).
-    reap_stale_claim_tmps(runs_dir).map_err(ApiHttpError::internal)?;
+    // (D04). Bounded maintenance uses the frozen per-process cadence; its
+    // errors are reported without blocking unrelated admissions.
+    sweep.run_locked(runs_dir, ttl);
     // Temp names are unique per attempt; on collision retry with a fresh id
     // instead of failing the admission (E02). Under the claim lock no live
     // publisher contends, so repeated collisions mean planted files.
@@ -612,139 +613,164 @@ fn replace_pending(tmp: &camino::Utf8Path, path: &camino::Utf8Path) -> std::io::
     std::fs::rename(tmp.as_std_path(), path.as_std_path())
 }
 
-/// Best-effort reaping of claim temp files left by crashed publishers.
-/// Only files older than the pending TTL are removed; anything newer may
-/// belong to a live publisher mid-write. Claim temps are staged under the
-/// cross-process idempotency lock (not per-file locks), so the mtime gate
-/// is the correct liveness signal; symlinks are never followed (E02).
-/// Periodic, not per-claim: at most one directory scan per `PENDING_TTL_SECS`
-/// interval (shared with cancel sweeps) so steady traffic never pays a
-/// `read_dir` per admission, and a collision retry never double-scans (E02).
-/// Iteration errors are collected best-effort and the first is returned
-/// after finishing the sweep, so a partial sweep never looks clean (E02).
-/// Last stale-temp sweep per idempotency store. Per-store (not global):
-/// parallel tests and independent stores must never suppress each other's
-/// sweep, and one hot store must not starve another's reclamation (E02).
-static LAST_TEMP_SWEEP_UNIX: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, u64>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
-#[cfg(test)]
-fn reset_temp_sweep_for_tests() {
-    LAST_TEMP_SWEEP_UNIX
-        .lock()
-        .expect("temp sweep clock should lock")
-        .clear();
+/// Per-AppState maintenance cursor. Call only under `.idempotency.lock`,
+/// before taking this mutex; peers serialize deletion with all publications.
+/// New claims advance at most one bounded pass when due. Replay/idle traffic
+/// does not drive maintenance. EOF or iterator failure discards the cursor.
+#[derive(Debug)]
+pub(crate) struct IdempotencySweep {
+    interval: std::time::Duration,
+    max_entries: usize,
+    state: std::sync::Mutex<SweepState>,
 }
 
-fn reap_stale_claim_tmps(runs_dir: &Utf8PathBuf) -> Result<(), String> {
-    let now_for_gate = match now_unix() {
-        Ok(now) => now,
-        Err(_) => {
-            tracing::warn!(
-                "stale idempotency temp sweep skipped: system clock is before the Unix epoch"
-            );
-            return Ok(());
-        }
-    };
-    let dir = idempotency_dir(runs_dir);
-    let dir_key = dir.as_str().to_string();
-    {
-        // Fail closed on a poisoned sweep clock: a poisoned mutex means a
-        // previous sweep panicked while holding the lock, so proceeding
-        // would run the sweep on unverified throttle state. The caller
-        // surfaces this as a persistence error instead of claiming cleanly.
-        let mut last = match LAST_TEMP_SWEEP_UNIX.lock() {
-            Ok(guard) => guard,
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "stale idempotency temp sweep skipped: sweep clock is poisoned"
-                );
-                return Err(format!(
-                    "stale idempotency temp sweep clock is poisoned: {error}"
-                ));
-            }
-        };
-        let previous = last.get(&dir_key).copied().unwrap_or(0);
-        if previous != 0 && now_for_gate.saturating_sub(previous) < PENDING_TTL_SECS {
-            return Ok(());
-        }
-        last.insert(dir_key, now_for_gate);
+#[derive(Debug, Default)]
+struct SweepState {
+    last_attempt: Option<std::time::Instant>,
+    entries: Option<std::fs::ReadDir>,
+}
+
+impl Default for IdempotencySweep {
+    fn default() -> Self {
+        Self::new(
+            policy::IDEMPOTENCY_SWEEP_INTERVAL,
+            policy::IDEMPOTENCY_SWEEP_MAX_ENTRIES,
+        )
     }
-    let entries = match std::fs::read_dir(dir.as_std_path()) {
-        Ok(entries) => entries,
-        // A missing store directory simply has nothing to reap; any other
-        // scan failure is surfaced instead of looking like a clean sweep
-        // (E02).
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            tracing::warn!(dir = %dir, %error, "stale idempotency temp sweep failed");
-            return Err(error.to_string());
+}
+
+impl IdempotencySweep {
+    pub(crate) fn new(interval: std::time::Duration, max_entries: usize) -> Self {
+        Self {
+            interval,
+            max_entries,
+            state: Default::default(),
         }
+    }
+
+    fn run_locked(&self, runs_dir: &Utf8PathBuf, ttl: std::time::Duration) {
+        if let Err(error) = self.pass_at(runs_dir, ttl, std::time::Instant::now(), now_unix) {
+            tracing::warn!(%error, "idempotency sweep incomplete");
+        }
+    }
+
+    // Injectable clocks keep cadence and expiry tests independent of wall time.
+    // Exactly one Unix timestamp is obtained per due pass, before any deletion.
+    fn pass_at(
+        &self,
+        runs_dir: &Utf8PathBuf,
+        ttl: std::time::Duration,
+        instant: std::time::Instant,
+        unix: impl FnOnce() -> Result<u64, String>,
+    ) -> Result<usize, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "idempotency sweep state poisoned")?;
+        if state
+            .last_attempt
+            .is_some_and(|last| instant.saturating_duration_since(last) < self.interval)
+        {
+            return Ok(0);
+        }
+        state.last_attempt = Some(instant);
+        let now = unix()?;
+        if state.entries.is_none() {
+            state.entries =
+                Some(std::fs::read_dir(idempotency_dir(runs_dir)).map_err(|e| e.to_string())?);
+        }
+        let mut consumed = 0;
+        let mut first_error = None;
+        for _ in 0..self.max_entries {
+            match state.entries.as_mut().expect("opened cursor").next() {
+                None => {
+                    state.entries = None;
+                    break;
+                }
+                Some(Err(error)) => {
+                    state.entries = None;
+                    first_error.get_or_insert_with(|| error.to_string());
+                    break;
+                }
+                Some(Ok(entry)) => {
+                    consumed += 1; // Count every yielded entry, including unrelated names.
+                    let path = entry.path();
+                    if let Err(error) = sweep_entry(entry, now, ttl) {
+                        first_error.get_or_insert_with(|| format!("{}: {error}", path.display()));
+                    }
+                }
+            }
+        }
+        first_error.map_or(Ok(consumed), Err)
+    }
+}
+
+fn canonical_key_hash(name: &str) -> bool {
+    name.len() == 64
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
+fn generated_temp(name: &str) -> bool {
+    let Some((stem, suffix)) = name.split_once(".tmp-") else {
+        return false;
     };
-    let Ok(now) = now_unix() else {
-        tracing::warn!(
-            "stale idempotency temp sweep skipped: system clock is before the Unix epoch"
-        );
+    canonical_key_hash(stem.strip_suffix(".pending").unwrap_or(stem))
+        && uuid::Uuid::parse_str(suffix).is_ok_and(|id| {
+            id.get_version_num() == 7
+                && id.get_variant() == uuid::Variant::RFC4122
+                && id.to_string() == suffix
+        })
+}
+
+fn sweep_entry(entry: std::fs::DirEntry, now: u64, ttl: std::time::Duration) -> Result<(), String> {
+    let name = entry.file_name();
+    let Some(name) = name.to_str() else {
         return Ok(());
     };
-    let mut first_error: Option<String> = None;
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                tracing::warn!(dir = %dir, %error, "stale idempotency temp sweep incomplete");
-                if first_error.is_none() {
-                    first_error = Some(error.to_string());
-                }
-                continue;
-            }
+    let path = Utf8PathBuf::from_path_buf(entry.path()).map_err(|_| "non-UTF8 idempotency path")?;
+    if name.strip_suffix(".json").is_some_and(canonical_key_hash) {
+        let bytes = match read_bounded_idempotency_file(&path) {
+            BoundedRead::Present(bytes) => bytes,
+            BoundedRead::Absent => return Ok(()),
+            BoundedRead::Unreadable(error) => return Err(error),
         };
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            // Non-UTF8 names never match temp patterns via lossy conversion (E02).
-            continue;
-        };
-        if !name.contains(".tmp-") {
-            continue;
+        let record: DurableIdempotencyRecord =
+            serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        if format!(
+            "{}.json",
+            hex::encode(Sha256::digest(record.key.as_bytes()))
+        ) != name
+        {
+            return Err("idempotency sweep record key/hash mismatch".into());
         }
-        // Never follow a symlink temp: remove the link only (E02).
-        // A single metadata probe serves both checks: no second stat (E02).
-        let meta = match std::fs::symlink_metadata(entry.path()) {
-            Ok(meta) => meta,
-            Err(error) => {
-                tracing::warn!(path = %entry.path().display(), %error, "idempotency temp unreadable; skipping reap");
-                if first_error.is_none() {
-                    first_error = Some(error.to_string());
-                }
-                continue;
-            }
-        };
-        if meta.file_type().is_symlink() {
-            if let Err(error) = std::fs::remove_file(entry.path()) {
-                tracing::warn!(path = %entry.path().display(), %error, "failed to reap symlinked idempotency temp");
-                if first_error.is_none() {
-                    first_error = Some(error.to_string());
-                }
-            }
-            continue;
+        if !record.expired_at(now, ttl) {
+            return Ok(());
         }
-        let stale = meta
-            .modified()
-            .ok()
-            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-            .is_some_and(|elapsed| now.saturating_sub(elapsed.as_secs()) >= PENDING_TTL_SECS);
-        if stale && let Err(error) = std::fs::remove_file(entry.path()) {
-            tracing::warn!(path = %entry.path().display(), %error, "failed to reap stale idempotency temp");
-            if first_error.is_none() {
-                first_error = Some(error.to_string());
+    } else if generated_temp(name) {
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+        // Preserve the existing rule: unlink exact staging symlinks, never
+        // follow them. Regular staging files require verified stale mtime.
+        if !meta.file_type().is_symlink() {
+            if !meta.is_file() {
+                return Ok(());
+            }
+            let modified = meta
+                .modified()
+                .map_err(|e| e.to_string())?
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_secs();
+            if now.saturating_sub(modified) < PENDING_TTL_SECS {
+                return Ok(());
             }
         }
+    } else {
+        // In particular, never reclaim pending claims, even expired ones.
+        return Ok(());
     }
-    match first_error {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
+    std::fs::remove_file(path).map_err(|e| e.to_string())
 }
 
 #[derive(Debug)]
@@ -1736,6 +1762,7 @@ mod tests {
             digest,
             Some(reserved_run_id.to_string()),
             policy::IDEMPOTENCY_TTL,
+            &IdempotencySweep::default(),
         )
     }
 
@@ -2494,33 +2521,242 @@ mod tests {
         let _ = std::fs::remove_dir_all(runs_dir.as_std_path());
     }
 
+    fn sweep_ready(runs: &Utf8PathBuf, key: &str, created: u64) -> Utf8PathBuf {
+        let path = idempotency_path(runs, key);
+        let record = DurableIdempotencyRecord {
+            key: key.into(),
+            digest: "digest".into(),
+            run_id: "run-A".into(),
+            created_at_unix: created,
+            generation: 1,
+        };
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        path
+    }
+
     #[test]
-    fn stale_claim_tmps_reap_by_age_only() {
-        // E02: only abandoned publisher temps are reaped; a fresh temp
-        // from a live publisher is never touched. Reclamation is periodic,
-        // so the test forces the interval gate open first.
-        use std::time::{Duration, SystemTime};
-        reset_temp_sweep_for_tests();
-        let runs_dir = temp_runs_dir("claim-tmp-reap");
-        std::fs::create_dir_all(idempotency_dir(&runs_dir).as_std_path())
-            .expect("idempotency dir should be created");
-        let stale = idempotency_dir(&runs_dir).join("abc.tmp-old");
-        let fresh = idempotency_dir(&runs_dir).join("abc.tmp-new");
-        std::fs::write(stale.as_std_path(), b"{}").expect("stale temp should be written");
-        std::fs::write(fresh.as_std_path(), b"{}").expect("fresh temp should be written");
-        let aged = SystemTime::now()
-            .checked_sub(Duration::from_secs(3600))
-            .expect("aged time should exist");
-        std::fs::File::options()
-            .write(true)
-            .open(stale.as_std_path())
-            .expect("stale temp should open")
-            .set_modified(aged)
-            .expect("stale temp should age");
-        reap_stale_claim_tmps(&runs_dir).expect("temp sweep should succeed");
-        assert!(!stale.exists(), "an abandoned temp must be reaped");
-        assert!(fresh.exists(), "a fresh temp must survive the reap");
-        let _ = std::fs::remove_dir_all(runs_dir.as_std_path());
+    fn bounded_sweep_progress_cadence_and_restart_preserve_live_evidence() {
+        use std::time::{Duration, Instant};
+        let runs = temp_runs_dir("bounded-sweep");
+        let _lock = acquire_idempotency_lock(&runs).unwrap();
+        let dir = idempotency_dir(&runs);
+        let now = now_unix().unwrap();
+        let ttl = Duration::from_secs(100);
+        let interval = Duration::from_secs(7); // Independent of TTL/temp age.
+        let sweep = IdempotencySweep::new(interval, 2);
+        let instant = Instant::now();
+        let mut preserved = Vec::new();
+        for name in [
+            "unrelated.json".to_string(),
+            "abc.tmp-old".to_string(),
+            format!("not-a-hash.pending.tmp-{}", uuid::Uuid::now_v7()),
+            format!("{}.pending.tmp-invalid", "a".repeat(64)),
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, b"keep").unwrap();
+            preserved.push(path);
+        }
+        // At first every entry is ignored (four unrelated names plus the
+        // shared lock). They still consume the complete two-entry budget.
+        for (pass, expected) in [2, 2, 1].into_iter().enumerate() {
+            assert_eq!(
+                sweep
+                    .pass_at(&runs, ttl, instant + interval * pass as u32, || Ok(now))
+                    .unwrap(),
+                expected
+            );
+        }
+        assert!(sweep.state.lock().unwrap().entries.is_none());
+        let instant = instant + interval * 3;
+        let expired: Vec<_> = (0..9)
+            .map(|i| sweep_ready(&runs, &format!("old-{i}"), now - 100))
+            .collect();
+        let live = sweep_ready(&runs, "live", now);
+        preserved.push(live);
+        for (key, created) in [("live-pending", now), ("expired-pending", now - 1000)] {
+            let path = pending_path(&runs, key);
+            let record = DurablePendingRecord {
+                key: key.into(),
+                digest: "digest".into(),
+                run_id: Some("run-pending".into()),
+                owner: "owner".into(),
+                created_at_unix: created,
+                generation: 2,
+            };
+            std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+            preserved.push(path);
+        }
+        let mut stale = Vec::new();
+        for key_path in [idempotency_path(&runs, "temp"), pending_path(&runs, "temp")] {
+            for age in [0, PENDING_TTL_SECS] {
+                let path = key_path.with_extension(format!("tmp-{}", uuid::Uuid::now_v7()));
+                let file = std::fs::File::create(&path).unwrap();
+                file.set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(UNIX_EPOCH + Duration::from_secs(now - age)),
+                )
+                .unwrap();
+                if age == 0 {
+                    preserved.push(path);
+                } else {
+                    stale.push(path);
+                }
+            }
+        }
+        let originals: Vec<_> = preserved
+            .iter()
+            .map(|p| std::fs::read(p).unwrap())
+            .collect();
+        let count = sweep.pass_at(&runs, ttl, instant, || Ok(now)).unwrap();
+        assert_eq!(
+            count, 2,
+            "all yielded entries, not just eligible records, consume budget"
+        );
+        assert_eq!(
+            sweep
+                .pass_at(
+                    &runs,
+                    ttl,
+                    instant + interval - Duration::from_nanos(1),
+                    || panic!("gate must not read wall clock")
+                )
+                .unwrap(),
+            0
+        );
+        let mut passes = 1;
+        while sweep.state.lock().unwrap().entries.is_some() {
+            assert!(
+                passes < 30,
+                "cursor must reach EOF instead of restarting a prefix"
+            );
+            let count = sweep
+                .pass_at(&runs, ttl, instant + interval * passes, || Ok(now))
+                .unwrap();
+            assert!(count <= 2);
+            passes += 1;
+        }
+        assert!(expired.iter().chain(&stale).all(|p| !p.exists()));
+        for (path, bytes) in preserved.iter().zip(originals) {
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+        // An unexpired Ready record still replays via another process-local
+        // sweep state, just as after restart. Replay must not run maintenance.
+        drop(_lock);
+        let peer = IdempotencySweep::default();
+        assert!(matches!(
+            claim_durable_pending(&runs, "live", "digest", None, ttl, &peer),
+            Ok(ClaimOutcome::Ready(_))
+        ));
+        assert!(peer.state.lock().unwrap().last_attempt.is_none());
+        let _lock = acquire_idempotency_lock(&runs).unwrap();
+        // A new traversal sees entries created after EOF.
+        let late = sweep_ready(&runs, "late", now - 100);
+        for i in passes..passes + 30 {
+            assert!(
+                sweep
+                    .pass_at(&runs, ttl, instant + interval * i, || Ok(now))
+                    .unwrap()
+                    <= 2
+            );
+            if !late.exists() {
+                break;
+            }
+        }
+        assert!(!late.exists(), "EOF must reopen on the next due pass");
+        let triggered = sweep_ready(&runs, "unrelated-triggered", now - 100);
+        drop(_lock);
+        assert!(matches!(
+            claim_durable_pending(&runs, "new-key", "digest", None, ttl, &peer),
+            Ok(ClaimOutcome::Owner { .. })
+        ));
+        assert!(
+            !triggered.exists(),
+            "publishing a new claim must drive maintenance"
+        );
+        assert!(peer.state.lock().unwrap().last_attempt.is_some());
+        let _ = std::fs::remove_dir_all(runs);
+    }
+
+    #[test]
+    fn sweep_preserves_corrupt_mismatched_linked_records_and_unverified_clock() {
+        use std::time::{Duration, Instant};
+        let runs = temp_runs_dir("sweep-safety");
+        let _lock = acquire_idempotency_lock(&runs).unwrap();
+        let expired = sweep_ready(&runs, "old", 1);
+        let corrupt = idempotency_path(&runs, "corrupt");
+        std::fs::write(&corrupt, b"{").unwrap();
+        let mismatch = idempotency_path(&runs, "wrong-key");
+        std::fs::copy(&expired, &mismatch).unwrap();
+        let preserved = vec![corrupt, mismatch];
+        #[cfg(unix)]
+        let (preserved, temp_link) = {
+            let mut preserved = preserved;
+            let target = runs.join("outside.json");
+            std::fs::copy(&expired, &target).unwrap();
+            let link = idempotency_path(&runs, "linked");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            preserved.extend([link, target]);
+            let temp_link = pending_path(&runs, "linked")
+                .with_extension(format!("tmp-{}", uuid::Uuid::now_v7()));
+            std::os::unix::fs::symlink(preserved.last().unwrap(), &temp_link).unwrap();
+            (preserved, temp_link)
+        };
+        let originals: Vec<_> = preserved
+            .iter()
+            .map(|p| std::fs::read(p).unwrap())
+            .collect();
+        let sweep = IdempotencySweep::new(Duration::from_secs(1), 32);
+        let instant = Instant::now();
+        assert!(
+            sweep
+                .pass_at(&runs, Duration::from_secs(1), instant, || Err(
+                    "bad clock".into()
+                ))
+                .is_err()
+        );
+        assert!(expired.exists());
+        assert!(
+            sweep
+                .pass_at(
+                    &runs,
+                    Duration::from_secs(1),
+                    instant + Duration::from_secs(1),
+                    || Ok(1000)
+                )
+                .is_err()
+        );
+        assert!(
+            !expired.exists(),
+            "one corrupt entry must not prevent progress over others"
+        );
+        for (path, bytes) in preserved.iter().zip(originals) {
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+        assert!(
+            sweep.state.lock().unwrap().entries.is_none(),
+            "errors in records still permit EOF"
+        );
+        #[cfg(unix)]
+        assert!(
+            std::fs::symlink_metadata(&temp_link).is_err(),
+            "exact staging link must be unlinked without touching target"
+        );
+        let poison = IdempotencySweep::default();
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = poison.state.lock().unwrap();
+            panic!("poison");
+        });
+        let old = sweep_ready(&runs, "after-poison", 1);
+        assert!(
+            poison
+                .pass_at(&runs, Duration::from_secs(1), instant, || panic!(
+                    "poison must not inspect files"
+                ))
+                .is_err()
+        );
+        assert!(old.exists());
+        drop(_lock);
+        let _ = std::fs::remove_dir_all(runs);
     }
 
     fn outcome_name(outcome: &ClaimOutcome) -> &'static str {

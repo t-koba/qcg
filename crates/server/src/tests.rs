@@ -1305,6 +1305,7 @@ async fn concurrent_idempotent_start_creates_one_run() {
             &digest,
             None,
             policy::IDEMPOTENCY_TTL,
+            &state.idempotency_sweep,
         )
         .expect("re-claim should not error")
         {

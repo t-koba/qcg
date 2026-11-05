@@ -350,7 +350,12 @@ where
                         let digest = request_digest.clone();
                         let reserved = carried_adopted.clone().or(reserved_run_id.clone());
                         let adopted = match claim_durable_pending_async(
-                            runs_dir, key, digest, reserved, policy_ttl,
+                            runs_dir,
+                            key,
+                            digest,
+                            reserved,
+                            policy_ttl,
+                            state.idempotency_sweep.clone(),
                         )
                         .await?
                         {
@@ -856,9 +861,10 @@ async fn claim_durable_pending_async(
     digest: String,
     reserved_run_id: Option<String>,
     ttl: std::time::Duration,
+    sweep: Arc<durable::IdempotencySweep>,
 ) -> Result<ClaimOutcome, ApiHttpError> {
     tokio::task::spawn_blocking(move || {
-        claim_durable_pending(&runs_dir, &key, &digest, reserved_run_id, ttl)
+        claim_durable_pending(&runs_dir, &key, &digest, reserved_run_id, ttl, &sweep)
     })
     .await
     .map_err(|error| ApiHttpError::internal(format!("idempotency claim task failed: {error}")))?
@@ -1000,6 +1006,7 @@ mod tests {
             idempotency: tokio::sync::Mutex::new(BTreeMap::new()),
             idempotency_ttl: policy::IDEMPOTENCY_TTL,
             idempotency_max_entries: policy::IDEMPOTENCY_MAX_ENTRIES,
+            idempotency_sweep: Default::default(),
             api_token_digest: None,
             artifact_limits: service::ArtifactZipLimits::default(),
             asset_limit: None,
@@ -1046,6 +1053,7 @@ mod tests {
             &digest,
             Some("run-A".into()),
             policy::IDEMPOTENCY_TTL,
+            &state.idempotency_sweep,
         )
         .expect("claim should not error")
         {
@@ -1092,6 +1100,7 @@ mod tests {
             &digest,
             Some("run-A".into()),
             policy::IDEMPOTENCY_TTL,
+            &state.idempotency_sweep,
         )
         .expect("reclaim should not error")
         {

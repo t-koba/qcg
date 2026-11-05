@@ -47,6 +47,7 @@ pub(crate) fn test_state(
         idempotency: tokio::sync::Mutex::new(std::collections::BTreeMap::new()),
         idempotency_ttl: policy::IDEMPOTENCY_TTL,
         idempotency_max_entries: policy::IDEMPOTENCY_MAX_ENTRIES,
+        idempotency_sweep: Default::default(),
         api_token_digest,
         artifact_limits: service::ArtifactZipLimits::default(),
         asset_limit: None,

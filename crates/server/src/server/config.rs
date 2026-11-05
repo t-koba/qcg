@@ -91,6 +91,7 @@ pub(crate) struct AppState {
     /// by two standards and boot drift is impossible (E04).
     pub(crate) idempotency_ttl: std::time::Duration,
     pub(crate) idempotency_max_entries: usize,
+    pub(crate) idempotency_sweep: std::sync::Arc<super::idempotency::durable::IdempotencySweep>,
     pub(crate) api_token_digest: Option<[u8; 32]>,
     pub(crate) artifact_limits: service::ArtifactZipLimits,
     pub(crate) asset_limit: Option<usize>,

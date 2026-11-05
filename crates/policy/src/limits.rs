@@ -192,11 +192,17 @@ pub const DEFAULT_MCP_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 /// Request header carrying the idempotency key.
 pub const IDEMPOTENCY_HEADER: &str = "idempotency-key";
 
-/// How long an idempotency record is retained.
+/// Replay TTL from initial durable Ready publication (physical deletion may lag).
 pub const IDEMPOTENCY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Maximum idempotency records retained per server.
+/// Process-local cache/admission budget; Pending entries resist capacity eviction.
 pub const IDEMPOTENCY_MAX_ENTRIES: usize = 1024;
+
+/// Per-server-instance minimum interval between opportunistic idempotency sweep passes.
+pub const IDEMPOTENCY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Maximum directory entries yielded per idempotency sweep pass, including ignored names.
+pub const IDEMPOTENCY_SWEEP_MAX_ENTRIES: usize = 256;
 
 /// Default bound on `generator_runs_total` series exported by `/metrics`.
 /// Deployment policy may set any value within the mechanism bounds; the

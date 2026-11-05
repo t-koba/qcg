@@ -94,6 +94,8 @@ pub struct ResolvedServerPolicy {
     pub read_cache_max_bytes: usize,
     pub idempotency_ttl: std::time::Duration,
     pub idempotency_max_entries: usize,
+    pub idempotency_sweep_interval: std::time::Duration,
+    pub idempotency_sweep_max_entries: usize,
     pub max_total_steps: Option<usize>,
     pub validated_cors: Vec<HeaderValue>,
     pub auto_gc: bool,
@@ -168,6 +170,10 @@ pub fn resolve_server_policy_with_container_timeouts(
         .map_err(|detail| format!("invalid idempotency configuration: {detail}"))?;
     let idempotency_max_entries = super::idempotency::effective_idempotency_max_entries()
         .map_err(|detail| format!("invalid idempotency configuration: {detail}"))?;
+    let idempotency_sweep_interval =
+        super::idempotency::config::effective_idempotency_sweep_interval()?;
+    let idempotency_sweep_max_entries =
+        super::idempotency::config::effective_idempotency_sweep_max_entries()?;
     let max_total_steps = super::config::effective_max_total_steps(config.max_total_steps)
         .map_err(|detail| format!("invalid max_total_steps step budget configuration: {detail}"))?;
     let validated_cors = parse_cors_origins(&config.cors_origins)
@@ -345,6 +351,8 @@ pub fn resolve_server_policy_with_container_timeouts(
         read_cache_max_bytes,
         idempotency_ttl,
         idempotency_max_entries,
+        idempotency_sweep_interval,
+        idempotency_sweep_max_entries,
         max_total_steps,
         validated_cors,
         auto_gc,
@@ -394,6 +402,8 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
         read_cache_max_bytes,
         idempotency_ttl,
         idempotency_max_entries,
+        idempotency_sweep_interval,
+        idempotency_sweep_max_entries,
         max_total_steps,
         validated_cors,
         auto_gc,
@@ -419,6 +429,8 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
     tracing::info!(
         idempotency_ttl_secs = idempotency_ttl.as_secs(),
         idempotency_max_entries,
+        idempotency_sweep_interval_secs = idempotency_sweep_interval.as_secs(),
+        idempotency_sweep_max_entries,
         max_request_bytes = super::config::effective_max_request_bytes(config.max_request_bytes),
         max_total_steps = max_total_steps,
         auto_gc,
@@ -500,6 +512,10 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
         // the environment (E04).
         idempotency_ttl,
         idempotency_max_entries,
+        idempotency_sweep: Arc::new(super::idempotency::durable::IdempotencySweep::new(
+            idempotency_sweep_interval,
+            idempotency_sweep_max_entries,
+        )),
         api_token_digest: config.api_token.as_deref().map(sha256_bytes),
         artifact_limits: service::ArtifactZipLimits {
             max_bytes: config.max_artifact_bytes,

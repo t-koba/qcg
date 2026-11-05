@@ -682,22 +682,39 @@ Admission records and run coordination locks are different mechanisms.
 
 - Admission records are persistent: idempotency mappings under
   `<runs-dir>/idempotency/` plus the durable `run_queued` journal event. The
-  default mapping retention is 24 hours (`IDEMPOTENCY_TTL_SECS` configures it),
-  and `IDEMPOTENCY_MAX_ENTRIES` bounds retained entries. A retained key with
-  identical content replays the original result; same-process identical
+  default replay TTL is 24 hours from initial Ready publication
+  (`IDEMPOTENCY_TTL_SECS` configures it). `IDEMPOTENCY_MAX_ENTRIES` bounds only
+  the process-local cache/admission map, not durable records; Pending entries
+  resist capacity eviction and can temporarily exceed the budget. A retained
+  key with identical content replays the original result; same-process identical
   pending requests wait and replay, while a request encountering another
   process's pending claim may return `503 Service Unavailable`. Changed
-  content for a still-bound key returns `409 Conflict`. Expiry/eviction makes
-  the key eligible for new admission: a reuse may start another run and repeat
-  side effects. Expiry does not delete or undo the original run. Clients must
-  retain the original run ID and reconcile it rather than depend on an expired
-  key. In-memory Ready caches and durable records expire from the same
-  persisted creation time; loading or replaying a record does not renew it.
-  The pre-execution ownership recheck cannot fully close the window before
-  execution starts: a successor that acts in between may let the stale owner
-  briefly start its engine. Such surplus execution never commits and is
-  canceled by the orphan settlement at commit time, so every stale execution
-  converges or cancels and never leaks (E02).
+  content for a still-bound key returns `409 Conflict`. Expiry, not cache
+  eviction, makes the key eligible for new admission: a reuse may start
+  another run and repeat side effects. Expiry does not delete or undo the
+  original run. Clients must retain the original run ID and reconcile it
+  rather than depend on an expired key. In-memory Ready caches and durable
+  records expire from the same persisted creation time; loading or replaying a
+  record does not renew it. There is no absolute durable record count cap.
+  Physical deletion happens later through opportunistic maintenance: new claim
+  attempts reaching durable publication advance one resumable bounded pass
+  under the shared idempotency lock; idle servers and replay-only traffic do
+  not. Each server instance has its own cursor and monotonic cadence, and
+  restart begins a new
+  traversal. `IDEMPOTENCY_SWEEP_INTERVAL_SECS` defaults to 60 seconds and
+  `IDEMPOTENCY_SWEEP_MAX_ENTRIES` to 256 yielded directory entries per pass
+  (including ignored names). The positive-integer settings freeze at startup;
+  unset selects the default, while zero, negative, malformed, overflowing, or
+  non-Unicode values refuse startup. The scan cadence is independent of pending
+  claim TTL/staging age. It removes only expired, verifiable Ready records and
+  exact stale staging temps; pending claims (including expired ones),
+  unexpired Ready records, and corrupt/ambiguous records remain. Sweep failures
+  are warned without refusing the current claim; other claim publishers
+  serialize behind the bounded pass. The pre-execution ownership recheck
+  cannot fully close the window before execution starts: a successor that acts
+  in between may let the stale owner briefly start its engine. Such surplus
+  execution never commits and is canceled by orphan settlement at commit time,
+  so every stale execution converges or cancels and never leaks (E02).
 - Admission and preemption-handoff locks use separate fixed-size shard sets
   in `.admission-shards/` and `.handoff-shards/` under the runs directory.
   They are intentionally never unlinked: removing a locked file would let a
@@ -717,17 +734,6 @@ second boundary advances the body (and the validator) even when nothing
 else changed, so an unrelated `200` there is correct, not stale
 (`live_metrics` in `crates/service/src/summaries/metrics.rs`).
 
-A retained `Idempotency-Key` with identical content replays the original
-result instead of starting a duplicate run; changed content for a still-bound
-key returns `409 Conflict`. Same-process identical pending requests wait and
-replay; a pending request owned by another process may return `503`. The
-24-hour default retention is subject to `IDEMPOTENCY_TTL_SECS` and the
-`IDEMPOTENCY_MAX_ENTRIES` limit. Ready caches preserve the persisted record's
-creation time rather than restarting its TTL. After expiry or eviction,
-reuse may be admitted as new and start another run or repeat side effects;
-expiry does not remove or undo the original. Preserve its run ID and reconcile
-that run rather than rely on an expired key. Records under
-`<runs-dir>/idempotency/` survive restarts and shared-store peers while retained.
 If a run still reaches `Waiting` or
 `Confirming`, answer mechanically with
 `PUT /api/runs/{id}/questions/{qid}` or

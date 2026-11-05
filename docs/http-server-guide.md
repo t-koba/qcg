@@ -154,22 +154,44 @@ complete package tree and participates in start idempotency. A committed
 start retried with the same key, body, and identity replays the original run
 even if the installed package has since changed or disappeared. An
 `Idempotency-Key` header enables request replay while its mapping is retained.
-The default retention is 24 hours, configurable with `IDEMPOTENCY_TTL_SECS`;
-`IDEMPOTENCY_MAX_ENTRIES` also bounds retained entries. Records are persisted
-under `<runs-dir>/idempotency/` and shared across process restarts and
-shared-store peers. A retained key with identical request content replays the
+The default replay TTL is 24 hours from initial Ready publication, configurable
+with `IDEMPOTENCY_TTL_SECS`. Records persist under `<runs-dir>/idempotency/`
+through process-local cache eviction, restarts, and shared-store peers.
+`IDEMPOTENCY_MAX_ENTRIES` (default 1024) governs only the process-local
+cache/admission map; Pending entries are protected from capacity eviction and
+can temporarily exceed this budget. There is no absolute durable record count
+cap. A retained key with identical request content replays the
 original result. Identical pending requests in the same process wait for the
 owner and replay its result; a pending request owned by another process may
 return `503 Service Unavailable`. Reusing a still-bound key with changed
 content returns `409 Conflict`.
 
+Expired Ready files are physically deleted later: new claim attempts that reach
+publication drive one resumable sweep pass when due, serialized with peers under the
+shared idempotency lock. Each server instance has its own cadence and cursor;
+idle servers and replay-only traffic do not advance maintenance, and restart
+begins a new traversal. Pending claim files (including expired claims),
+unexpired Ready records, and corrupt or ambiguous records are not swept. Exact
+abandoned staging temps are cleaned in the same pass using their existing age
+rules. Sweep failures are warned and do not refuse the new claim; other claim
+publishers serialize behind the bounded pass.
+
+`IDEMPOTENCY_SWEEP_INTERVAL_SECS` defaults to 60 and controls the minimum
+monotonic interval between passes, independently of claim TTL/staging age.
+`IDEMPOTENCY_SWEEP_MAX_ENTRIES` defaults to 256 and bounds **all** directory
+entries yielded per pass, including ignored names. The cursor resumes on later
+due passes and reopens after EOF. These settings, `IDEMPOTENCY_TTL_SECS`, and
+`IDEMPOTENCY_MAX_ENTRIES` are resolved once at startup: unset selects the
+default; zero, negative, non-integer, overflowing, or non-Unicode values refuse
+startup.
+
 The same header is accepted by `POST /api/runs/{id}/fork`,
 `PUT /api/runs/{id}/questions/{qid}`,
 `PUT /api/runs/{id}/confirmations/{cid}`, and `POST /api/runs/{id}:cancel`.
-Once a mapping expires or is evicted, that key no longer guarantees
-deduplication: an otherwise eligible reuse can be admitted as a new request,
-starting another run or repeating side effects. Expiry removes only the
-idempotency mapping; it does not delete, cancel, or undo the original run.
+Once a mapping expires (not when its cache entry is evicted), that key no
+longer guarantees deduplication: an otherwise eligible reuse can be admitted
+as a new request, starting another run or repeating side effects. Expiry
+removes only the idempotency mapping; it does not delete, cancel, or undo the original run.
 Clients should retain the original `run_id` and reconcile its state rather
 than rely on reuse of an expired key. In-memory Ready caches keep the persisted
 record's original creation time, so reading or replaying a mapping does not

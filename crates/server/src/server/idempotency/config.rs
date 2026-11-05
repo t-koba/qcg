@@ -8,42 +8,45 @@ use policy::{IDEMPOTENCY_MAX_ENTRIES, IDEMPOTENCY_TTL};
 use std::collections::BTreeMap;
 use std::time::Instant;
 
-/// Effective in-memory entry cap resolved once at boot:
-/// `IDEMPOTENCY_MAX_ENTRIES` overrides the compiled default (3.2).
-/// There is exactly one standard: an invalid value refuses boot, never a
-/// silent fallback. Frozen into AppState like the TTL above (E04).
-pub(crate) fn effective_idempotency_max_entries() -> Result<usize, String> {
-    match std::env::var("IDEMPOTENCY_MAX_ENTRIES") {
-        Err(_) => Ok(IDEMPOTENCY_MAX_ENTRIES),
+/// Frozen positive-integer deployment settings; unset alone selects the
+/// default. Invalid or non-Unicode values refuse startup, never fall back.
+fn positive_env<T: std::str::FromStr + PartialOrd + Default>(
+    name: &str,
+    default: T,
+) -> Result<T, String> {
+    match std::env::var(name) {
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("invalid {name}: must be Unicode")),
         Ok(value) => value
-            .parse::<usize>()
+            .parse::<T>()
             .ok()
-            .filter(|entries| *entries > 0)
-            .ok_or_else(|| {
-                format!("invalid IDEMPOTENCY_MAX_ENTRIES `{value}`: must be a positive integer")
-            }),
+            .filter(|v| *v > T::default())
+            .ok_or_else(|| format!("invalid {name}: must be a positive integer")),
     }
 }
 
-/// Effective idempotency TTL resolved once at boot: `IDEMPOTENCY_TTL_SECS`
-/// overrides the compiled default so operators tune retention without a
-/// rebuild (3.2). There is exactly one standard: an invalid value refuses
-/// boot, never a silent fallback. The resolved value freezes into AppState
-/// and every request and prune path uses the frozen copy, never re-reads
-/// the environment, so boot validation and request handling cannot drift
-/// (E04).
+pub(crate) fn effective_idempotency_max_entries() -> Result<usize, String> {
+    positive_env("IDEMPOTENCY_MAX_ENTRIES", IDEMPOTENCY_MAX_ENTRIES)
+}
+
 pub(crate) fn effective_idempotency_ttl() -> Result<std::time::Duration, String> {
-    match std::env::var("IDEMPOTENCY_TTL_SECS") {
-        Err(_) => Ok(IDEMPOTENCY_TTL),
-        Ok(value) => value
-            .parse::<u64>()
-            .ok()
-            .filter(|secs| *secs > 0)
-            .map(std::time::Duration::from_secs)
-            .ok_or_else(|| {
-                format!("invalid IDEMPOTENCY_TTL_SECS `{value}`: must be a positive integer")
-            }),
-    }
+    positive_env("IDEMPOTENCY_TTL_SECS", IDEMPOTENCY_TTL.as_secs())
+        .map(std::time::Duration::from_secs)
+}
+
+pub(crate) fn effective_idempotency_sweep_interval() -> Result<std::time::Duration, String> {
+    positive_env(
+        "IDEMPOTENCY_SWEEP_INTERVAL_SECS",
+        policy::IDEMPOTENCY_SWEEP_INTERVAL.as_secs(),
+    )
+    .map(std::time::Duration::from_secs)
+}
+
+pub(crate) fn effective_idempotency_sweep_max_entries() -> Result<usize, String> {
+    positive_env(
+        "IDEMPOTENCY_SWEEP_MAX_ENTRIES",
+        policy::IDEMPOTENCY_SWEEP_MAX_ENTRIES,
+    )
 }
 
 #[derive(Debug)]
@@ -164,36 +167,59 @@ mod tests {
         // startup instead of degrading silently; each error names the
         // offending variable.
         let _guard = ENV_GUARD.lock().expect("env lock");
-        for (variable, value) in [
-            ("IDEMPOTENCY_TTL_SECS", "0"),
-            ("IDEMPOTENCY_TTL_SECS", "soon"),
-            ("IDEMPOTENCY_MAX_ENTRIES", "0"),
-            ("IDEMPOTENCY_MAX_ENTRIES", "many"),
-        ] {
-            // SAFETY: the guard serializes environment mutation across
-            // tests in this module.
+        type Setting = (&'static str, fn() -> Result<u64, String>);
+        let settings: [Setting; 4] = [
+            ("IDEMPOTENCY_TTL_SECS", || {
+                effective_idempotency_ttl().map(|value| value.as_secs())
+            }),
+            ("IDEMPOTENCY_MAX_ENTRIES", || {
+                effective_idempotency_max_entries().map(|value| value as u64)
+            }),
+            ("IDEMPOTENCY_SWEEP_INTERVAL_SECS", || {
+                effective_idempotency_sweep_interval().map(|value| value.as_secs())
+            }),
+            ("IDEMPOTENCY_SWEEP_MAX_ENTRIES", || {
+                effective_idempotency_sweep_max_entries().map(|value| value as u64)
+            }),
+        ];
+        for (variable, resolve) in settings {
+            // SAFETY: this test is isolated in its own process, with the guard held.
             unsafe {
-                std::env::set_var(variable, value);
+                std::env::remove_var(variable);
             }
-            let error: String = if variable == "IDEMPOTENCY_TTL_SECS" {
-                effective_idempotency_ttl()
-                    .map(|_| ())
-                    .expect_err("invalid ttl must fail")
-            } else {
-                effective_idempotency_max_entries()
-                    .map(drop)
-                    .expect_err("invalid max entries must fail")
-            };
-            assert!(
-                error.contains(variable),
-                "policy errors must name {variable}"
-            );
-            // SAFETY: still holding the guard.
+            resolve().expect("unset selects default");
+            for value in ["0", "-1", "", "many", "18446744073709551616"] {
+                unsafe {
+                    std::env::set_var(variable, value);
+                }
+                assert!(resolve().unwrap_err().contains(variable));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStringExt;
+                unsafe {
+                    std::env::set_var(variable, std::ffi::OsString::from_vec(vec![0xff]));
+                }
+                assert!(
+                    resolve().unwrap_err().contains(variable),
+                    "non-Unicode is not unset"
+                );
+            }
+            unsafe {
+                std::env::set_var(variable, "7");
+            }
+            assert_eq!(resolve().expect("positive override accepted"), 7);
             unsafe {
                 std::env::remove_var(variable);
             }
         }
-        assert!(effective_idempotency_ttl().is_ok());
-        assert!(effective_idempotency_max_entries().is_ok());
+        assert_eq!(
+            effective_idempotency_sweep_interval().unwrap(),
+            policy::IDEMPOTENCY_SWEEP_INTERVAL
+        );
+        assert_eq!(
+            effective_idempotency_sweep_max_entries().unwrap(),
+            policy::IDEMPOTENCY_SWEEP_MAX_ENTRIES
+        );
     }
 }
