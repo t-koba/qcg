@@ -1,5 +1,5 @@
 use crate::artifacts::{api_internal, event_kinds};
-use crate::queue::{PriorityPermits, queue_head};
+use crate::queue::{PriorityPermits, notify_head_advanced, queue_head};
 use crate::run_dirs::{
     app_registry, claim_run_execution_owner, consume_cancel_control, direct_run_id,
     direct_run_meta_dir, is_regular_directory, is_regular_file, list_pending_cancel_controls,
@@ -1544,6 +1544,9 @@ impl LocalService {
                     record.owner_id = service.inner.owner_id.clone();
                     (package_state, journaled)
                 };
+                // Advancing the queue head may expose a spare slot; wake
+                // waiters only after releasing the run-map write lock.
+                notify_head_advanced(&service.inner.queue_notify);
                 // Verify after queue delay and reload only the derived snapshot.
                 // Never execute the installed package, even if the snapshot vanished.
                 let pinned =
@@ -1870,6 +1873,7 @@ impl LocalService {
                 record.cancellation = run.cancellation.clone();
             }
         }
+        notify_head_advanced(&self.inner.queue_notify);
         let policy = crate::types::ResolvedExecutionPolicy::resolve(
             contract.manifest.budget.max_steps,
             self.inner.deployment_policy.max_total_steps,

@@ -37,6 +37,12 @@ pub(crate) fn queue_head(runs: &BTreeMap<String, RunRecord>) -> Option<String> {
         .map(|(run_id, _)| run_id.clone())
 }
 
+/// Wake queue waiters after the head leaves `Queued`; unlike permit release,
+/// this transition can expose another run while spare capacity remains.
+pub(crate) fn notify_head_advanced(notify: &tokio::sync::Notify) {
+    notify.notify_waiters();
+}
+
 /// Victim for priority preemption: capacity is judged on total running runs,
 /// including cooperative yields still draining, then the lowest-priority
 /// eligible run below the arrival priority is evicted.
