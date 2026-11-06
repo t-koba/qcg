@@ -164,6 +164,61 @@ async fn gate_process() {
         None,
         tokio_util::sync::CancellationToken::new(),
     ));
+    if let Some(scope @ ("start_run" | "fork_run")) = mode.strip_suffix("-pre-admission") {
+        let body = fs::read(runs.join("creation-request")).unwrap();
+        let target = fs::read_to_string(runs.join("creation-target")).unwrap();
+        let package = fs::read_to_string(runs.join("creation-package")).unwrap();
+        let reserved = if scope == "start_run" {
+            let request: api::StartRun = serde_json::from_slice(&body).unwrap();
+            state
+                .service
+                .reserve_start_run_id(&request.generator_id)
+                .unwrap()
+        } else {
+            state.service.reserve_fork_run_id(&target).await.unwrap()
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(policy::IDEMPOTENCY_HEADER, KEY.parse().unwrap());
+        with_idempotency(IdempotentCall {
+            state: &state,
+            headers: &headers,
+            scope,
+            target: &target,
+            body: &body,
+            digest_context: (scope == "start_run").then_some(package.as_bytes()),
+            created: true,
+            reserved_run_id: Some(reserved.clone()),
+            execute: |context| async {
+                assert_eq!(context.reserved_run_id.as_ref(), Some(&reserved));
+                assert!(!runs.join(&reserved).exists());
+                // The gate and Pending reservation exist, but neither service
+                // admission API has been called. The parent kills us here.
+                barrier(&runs, "creation-before-admission").await;
+                if scope == "start_run" {
+                    state
+                        .service
+                        .start_run_with_package_identity(
+                            serde_json::from_slice(&body).unwrap(),
+                            context.reserved_run_id,
+                            &package,
+                        )
+                        .await
+                } else {
+                    state
+                        .service
+                        .fork_run_with_id(
+                            &target,
+                            serde_json::from_slice(&body).unwrap(),
+                            context.reserved_run_id,
+                        )
+                        .await
+                }
+            },
+        })
+        .await
+        .unwrap();
+        panic!("parent must kill request before service admission");
+    }
     if let Some(scope @ ("answer" | "confirm")) = mode.strip_suffix("-crash") {
         let (id, interaction): (String, String) =
             serde_json::from_slice(&fs::read(runs.join("interaction-target")).unwrap()).unwrap();
@@ -809,4 +864,227 @@ async fn interaction_process_crash(scope: &str) {
     // Do not launch the approved command when releasing the test-owned lease.
     state.service.mark_shutting_down();
     drop(lease);
+}
+
+#[tokio::test]
+async fn start_process_crash_before_admission_retries_reserved_run_to_ready() {
+    creation_process_crash("start_run").await;
+}
+
+#[tokio::test]
+async fn fork_process_crash_before_admission_retries_reserved_run_to_ready() {
+    creation_process_crash("fork_run").await;
+}
+
+// Process termination on the shared filesystem only, not power-loss durability.
+async fn creation_process_crash(scope: &str) {
+    let fixture = Fixture(
+        Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "qcg-{scope}-pre-admission-{}",
+                uuid::Uuid::now_v7()
+            )),
+    );
+    let runs = &fixture.0;
+    let owner = shared_service(runs);
+    let request = api::StartRun {
+        generator_id: "hello-template".into(),
+        inputs: std::collections::BTreeMap::from([("name".into(), serde_json::json!("gate"))]),
+        ..Default::default()
+    };
+    let (target, body, package) = if scope == "start_run" {
+        let package = owner
+            .describe(&request.generator_id)
+            .await
+            .unwrap()
+            .package_sha256;
+        (
+            String::new(),
+            serde_json::to_vec(&request).unwrap(),
+            package,
+        )
+    } else {
+        let source = owner.start_run(request).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !owner
+                .snapshot(source.clone())
+                .await
+                .unwrap()
+                .state
+                .is_terminal()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let journal = fs::read_to_string(
+            owner
+                .run_dir_for(&source)
+                .await
+                .unwrap()
+                .join("meta/journal.jsonl"),
+        )
+        .unwrap();
+        let at_seq = journal
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["t"] == "run_started")
+            .unwrap()["seq"]
+            .as_u64()
+            .unwrap();
+        let request = api::ForkRun {
+            at_seq,
+            state_patch: api::ForkStatePatch {
+                inputs: std::collections::BTreeMap::from([(
+                    "name".into(),
+                    serde_json::json!("forked-gate"),
+                )]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        (source, serde_json::to_vec(&request).unwrap(), String::new())
+    };
+    // In particular, release the fork source's service before spawning a peer.
+    owner.mark_shutting_down();
+    drop(owner);
+    fs::write(runs.join("creation-request"), &body).unwrap();
+    fs::write(runs.join("creation-target"), &target).unwrap();
+    fs::write(runs.join("creation-package"), &package).unwrap();
+    let mut child = spawn(runs, &format!("{scope}-pre-admission"));
+    wait_file(runs, "creation-before-admission");
+    let original = fs::read(pending(runs)).unwrap();
+    let claim: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    let reserved = claim["run_id"].as_str().unwrap().to_owned();
+    let digest = request_digest(
+        scope,
+        &target,
+        &body,
+        (scope == "start_run").then_some(package.as_bytes()),
+    );
+    assert_eq!(claim["digest"], digest);
+    assert!(
+        !runs.join(&reserved).exists(),
+        "reserved run is not admitted"
+    );
+    assert!(
+        durable::load_durable_ready_result(runs, KEY, policy::IDEMPOTENCY_TTL)
+            .unwrap()
+            .is_none()
+    );
+    // No retry or concurrent claim read runs during this timestamp-only seam.
+    // Age is not authority to steal the still-busy execution gate.
+    assert_eq!(age_claim(runs), original);
+    let aged = fs::read(pending(runs)).unwrap();
+    let mut expected = claim.clone();
+    expected["created_at_unix"] = 1.into();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&aged).unwrap(),
+        expected
+    );
+    assert!(ExecutionGate::try_acquire(runs, KEY).unwrap().is_none());
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    assert_eq!(
+        fs::read(pending(runs)).unwrap(),
+        aged,
+        "death retains Pending evidence"
+    );
+    assert!(!runs.join(&reserved).exists());
+    assert!(
+        durable::load_durable_ready_result(runs, KEY, policy::IDEMPOTENCY_TTL)
+            .unwrap()
+            .is_none()
+    );
+    let state = Arc::new(crate::test_state(
+        shared_service(runs),
+        runs.clone(),
+        None,
+        tokio_util::sync::CancellationToken::new(),
+    ));
+    let before = state.service.list_run_items().await.unwrap();
+    assert_eq!(before.len(), usize::from(scope == "fork_run"));
+    if scope == "fork_run" {
+        assert_eq!(before[0].run_id, target);
+    }
+    assert_eq!(
+        fs::read(pending(runs)).unwrap(),
+        aged,
+        "restart retains Pending until retry"
+    );
+    let retry = || async {
+        let mut headers = HeaderMap::new();
+        headers.insert(policy::IDEMPOTENCY_HEADER, KEY.parse().unwrap());
+        if scope == "start_run" {
+            headers.insert("x-qcg-package-sha256", package.parse().unwrap());
+            crate::server::runs::start_run(
+                axum::extract::State(state.clone()),
+                headers,
+                axum::Json(serde_json::from_slice(&body).unwrap()),
+            )
+            .await
+        } else {
+            crate::server::runs::fork_run(
+                axum::extract::State(state.clone()),
+                headers,
+                axum::extract::Path(target.clone()),
+                axum::Json(serde_json::from_slice(&body).unwrap()),
+            )
+            .await
+        }
+    };
+    let mut publication = None;
+    for _ in 0..2 {
+        let response = tokio::time::timeout(Duration::from_secs(10), retry())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+        assert_eq!(
+            response.headers()[axum::http::header::LOCATION],
+            format!("/api/runs/{reserved}")
+        );
+        let snapshot: api::RunSnapshot = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(snapshot.run_id, reserved);
+        // Check the committed Ready mapping before checking Pending retirement.
+        let ready = durable::load_durable_ready_result(runs, KEY, policy::IDEMPOTENCY_TTL)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ready.run_id, reserved);
+        assert_eq!(ready.digest, digest);
+        assert!(ready.generation > claim["generation"].as_u64().unwrap());
+        if let Some(previous) = &publication {
+            assert_eq!(
+                &ready.publication_id, previous,
+                "replay must not republish Ready"
+            );
+        }
+        publication = Some(ready.publication_id);
+        assert!(!pending(runs).exists());
+        let mappings: Vec<serde_json::Value> = fs::read_dir(runs.join("idempotency"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .map(|path| serde_json::from_slice(&fs::read(path).unwrap()).unwrap())
+            .collect();
+        assert_eq!(mappings.len(), 1, "exactly one Ready mapping");
+        assert_eq!(mappings[0]["key"], KEY);
+        assert_eq!(mappings[0]["run_id"], reserved);
+        let after = state.service.list_run_items().await.unwrap();
+        assert_eq!(after.len(), before.len() + 1, "exactly one new admission");
+        assert_eq!(
+            after.iter().filter(|item| item.run_id == reserved).count(),
+            1
+        );
+        if scope == "fork_run" {
+            assert_eq!(after.iter().filter(|item| item.run_id == target).count(), 1);
+        }
+    }
 }
