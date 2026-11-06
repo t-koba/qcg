@@ -137,17 +137,32 @@ async fn gate_process() {
     };
     let runs = Utf8PathBuf::from(root);
     let mode = std::env::var("QCG_GATE_TEST_MODE").unwrap();
+    if mode == "collision" {
+        let gate = ExecutionGate::try_acquire(&runs, "customer-11")
+            .unwrap()
+            .unwrap();
+        assert!(
+            ExecutionGate::try_acquire(&runs, "customer-5")
+                .unwrap()
+                .is_none()
+        );
+        barrier(&runs, "collision-held").await;
+        drop(gate);
+        return;
+    }
+    if mode == "leftover" {
+        let _gate = ExecutionGate::try_acquire(&runs, KEY).unwrap().unwrap();
+        // Deliberately skip destructors: the OS releases locks, not directory entries.
+        std::process::exit(0);
+    }
     if mode == "probe" {
         // This process cannot replace, release or commit the expired same-key
         // claim: it cannot obtain the capability required by those APIs.
         let before = fs::read(pending(&runs)).unwrap();
         assert!(ExecutionGate::try_acquire(&runs, KEY).unwrap().is_none());
-        // A separate shard can both claim and release: no metadata lock was
+        // A distinct key can both claim and release: no metadata lock was
         // held while the same-key process was waiting at a barrier.
-        let other = (0..)
-            .map(|n| format!("other-{n}"))
-            .find(|k| Sha256::digest(k.as_bytes())[0] != Sha256::digest(KEY.as_bytes())[0])
-            .unwrap();
+        let other = "other-key".to_owned();
         let gate = ExecutionGate::try_acquire(&runs, &other).unwrap().unwrap();
         let (owner, generation) = match durable::claim_durable_pending_gated(
             &gate,
@@ -434,6 +449,80 @@ async fn gate_process() {
     }
 }
 
+#[tokio::test]
+async fn colliding_keys_hold_gates_concurrently_and_waiters_cancel_cleanly() {
+    let fixture = Fixture(
+        Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!("qcg-gate-collision-{}", uuid::Uuid::now_v7())),
+    );
+    let runs = &fixture.0;
+    assert_eq!(Sha256::digest("customer-5")[0], 0x6b);
+    assert_eq!(Sha256::digest("customer-11")[0], 0x6b);
+    let first = ExecutionGate::try_acquire(runs, "customer-5")
+        .unwrap()
+        .unwrap();
+    let mut second = spawn(runs, "collision");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !runs.join("collision-held").exists() {
+        assert!(
+            second.0.try_wait().unwrap().is_none(),
+            "distinct-key child exited before reaching its gate barrier"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "collision gate barrier timed out"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        ExecutionGate::try_acquire(runs, "customer-11")
+            .unwrap()
+            .is_none()
+    );
+    // An unrelated gate is not a capability for this key, even on the old shard.
+    assert!(
+        durable::claim_durable_pending_gated(
+            &first,
+            "customer-11",
+            "digest",
+            None,
+            policy::IDEMPOTENCY_TTL,
+            &Default::default()
+        )
+        .is_err()
+    );
+    for key in ["customer-5", "customer-11"] {
+        let wait = acquire_execution_gate(runs.clone(), key.into(), "digest".into());
+        tokio::pin!(wait);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut wait)
+                .await
+                .is_err()
+        );
+    }
+    // Canceled waiters have closed their probes. Each release may reclaim its
+    // inode immediately; the next opener never sees an old waiter acquire it.
+    drop(first);
+    let reopened = ExecutionGate::try_acquire(runs, "customer-5")
+        .unwrap()
+        .unwrap();
+    assert!(
+        ExecutionGate::try_acquire(runs, "customer-5")
+            .unwrap()
+            .is_none()
+    );
+    fs::write(runs.join("collision-held-go"), b"").unwrap();
+    assert!(second.success());
+    drop(reopened);
+    assert_eq!(
+        fs::read_dir(runs.join("idempotency/.execution"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
 #[test]
 fn expired_owner_is_fenced_before_and_after_service_acceptance() {
     let fixture = Fixture(
@@ -470,26 +559,16 @@ fn expired_owner_is_fenced_before_and_after_service_acceptance() {
         fs::read_to_string(runs.join("accepted-run")).unwrap()
     );
     assert!(!pending(runs).exists());
-    // Gate leaves survive Ready release. An already-open
-    // handle must still arbitrate with fresh opens (no unlink/inode ABA).
-    let shard = Sha256::digest(KEY.as_bytes())[0];
-    let path = runs
-        .join("idempotency")
-        .join(format!(".execution-{shard:02x}.lock"));
-    let old_handle = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .unwrap();
+    // Successful completion leaves no per-key coordination state.
+    assert_eq!(
+        fs::read_dir(runs.join("idempotency/.execution"))
+            .unwrap()
+            .count(),
+        0
+    );
     let gate = ExecutionGate::try_acquire(runs, KEY).unwrap().unwrap();
-    assert!(matches!(
-        old_handle.try_lock(),
-        Err(fs::TryLockError::WouldBlock)
-    ));
-    drop(gate);
-    old_handle.try_lock().unwrap();
     assert!(ExecutionGate::try_acquire(runs, KEY).unwrap().is_none());
-    drop(old_handle);
+    drop(gate);
     assert!(ExecutionGate::try_acquire(runs, KEY).unwrap().is_some());
 }
 

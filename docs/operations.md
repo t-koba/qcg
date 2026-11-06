@@ -252,9 +252,9 @@ shard prevents same-ID creation from racing deletion.
 A contended deletion reports a retryable conflict; service GC skips contended
 candidates rather than waiting. Maintenance, admission, and handoff
 coordination files live outside run directories; shard counts are fixed.
-Per-run execution locks live
-in run metadata. Never unlink a coordination file while any process uses the
-store.
+Per-run execution locks live in run metadata. Never manually unlink coordination
+files while any process uses the store. Only exact-key idempotency gates have
+automated registry-protected reclamation, described below.
 Publication syncs a same-directory temporary file, atomically renames it to
 the authoritative name without replacement under the store lease, and syncs
 the directory on Unix. A crash before publication leaves only an ignored
@@ -762,11 +762,16 @@ Admission records and run coordination locks are different mechanisms.
   pass (including the first pass). Unvisited/failed paths remain queued fairly;
   incomplete enumeration and pre-marker restarts may discover again. A valid
   peer marker or successful marker publication releases the queue. Afterward,
-  only the persisted index is traversed. Mixed old and index-aware writers are
-  unsupported. The bounded radix cursor prunes due empty branches, including
+  Ready discovery traverses only the persisted index. Mixed old and index-aware
+  writers are unsupported. The bounded radix cursor prunes due empty branches, including
   failed-publication leftovers; removal/sync failure retains retry position.
-  Temps have their own bounded directory cursor and independent per-pass
-  budget of the same size; legacy regular temps move there during migration.
+  Temps and `.execution/` key gates each have an independent bounded directory
+  cursor and per-pass budget of the same size. Gate reclamation tries the stable
+  `.execution-registry.lock`, then the key lock; held gates are skipped, and all
+  probes close before unlink under the registry. Normal final gate drop uses
+  the same reclamation protocol; crash/deferred leftovers await these passes.
+  Requests never scan this directory. Legacy regular temps move to `.temps/`
+  during migration.
   Exact generated legacy symlinks are unlinked in place, never through their
   targets, within the locked, trusted runs-dir boundary (also on Windows).
   Ordinary record opens remain no-follow and reject reparse points.
@@ -785,11 +790,13 @@ Admission records and run coordination locks are different mechanisms.
   Positive-integer settings freeze at startup; unset selects the default,
   while zero, negative, malformed, overflowing, or non-Unicode values refuse
   startup. Cadence is independent of claim TTL/temp age. The pre-execution
-  ownership recheck
-  cannot fully close the window before execution starts: a successor that acts
-  in between may let the stale owner briefly start its engine. Such surplus
-  execution never commits and is canceled by orphan settlement at commit time,
-  so every stale execution converges or cancels and never leaks (E02).
+  ownership recheck and service acceptance retain the same exact-key execution
+  gate through Ready publication. Lease age alone cannot displace that holder;
+  process death releases its OS lock, not ambiguous Pending evidence. Quiesce
+  all peers before protocol upgrades, including from first-byte execution
+  shards; mixed-version writers are unsupported. Never manually remove gate or
+  registry files while peers are live. These locks do not promise power-loss
+  durability. See the HTTP server guide for the gate lifecycle.
 - Admission and preemption-handoff locks use separate fixed-size shard sets
   in `.admission-shards/` and `.handoff-shards/` under the runs directory.
   They are intentionally never unlinked: removing a locked file would let a

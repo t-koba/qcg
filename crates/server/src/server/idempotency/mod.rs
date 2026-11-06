@@ -1,8 +1,6 @@
-//! Idempotency-Key admission for run mutations: same key plus same
-//! request digest returns the same run, same key plus different content
-//! conflicts, across restarts and processes. In-memory entries live in
-//! [`config`], the durable claim protocol in [`durable`], owner cleanup in
-//! [`guard`]; this module orchestrates admission, waiting, and commit.
+//! Idempotent mutation admission, wait and commit: equal key/digest replays;
+//! changed content conflicts across restarts/peers. See [`config`] for memory,
+//! [`durable`] for gated ownership, [`guard`] for request-local cleanup.
 
 pub(crate) mod config;
 pub(crate) mod durable;
@@ -196,9 +194,8 @@ where
     Ok(StartIdempotencyLookup::Absent)
 }
 
-/// Admit keyed mutations by scope/target/body/context digest (None preserves legacy
-/// bytes). Start/fork reserve before claiming and adopt after crashes; mutations
-/// require the adopted reservation to match their original target.
+/// Digest-gated mutations: start/fork reserve and adopt; other mutations require
+/// the adopted reservation to match their target. None context preserves legacy digests.
 pub(crate) async fn with_idempotency<F, Fut>(
     call: IdempotentCall<'_, F, Fut>,
 ) -> Result<Response, ApiHttpError>
@@ -219,10 +216,7 @@ where
     } = call;
     let request_digest = request_digest(scope, target, body, digest_context);
     let Some(idempotency_key) = idempotency_key(headers)? else {
-        // Unkeyed requests skip the claim/commit protocol, but a run-creating
-        // handler has already reserved its run id; the executor must receive
-        // it so the run is created under that reservation instead of failing
-        // closed. Answer/confirm/cancel executors check it against their target.
+        // Unkeyed starts still need their reservation; mutations validate it against their target.
         let run_id = execute(ExecutorContext {
             reserved_run_id: reserved_run_id.clone(),
             operation_id: None,
@@ -506,8 +500,7 @@ where
         let (owner, generation) = claim_owner.clone().zip(claim_generation).ok_or_else(|| {
             ApiHttpError::internal("idempotency admission completed without a claim identity")
         })?;
-        // Claim, validation and service acceptance share the same gate.
-        // Expiry observations cannot authorize replacement while it is held.
+        // The gate spans claim/validation/service acceptance; expiry cannot replace its owner.
         match check_pending_owner_async(
             Arc::clone(
                 execution_gate
@@ -560,18 +553,15 @@ where
     {
         Ok(run_id) => run_id,
         Err(error) => {
-            // Errors do not prove absence of effects: cancel may already have
-            // published a mailbox. Retain the durable claim and its acceptance
-            // ID; withdraw only memory waiters. Other route reconciliation is
-            // still incomplete, so this can hold even an effect-free failure.
+            // Errors cannot prove absence of effects. Retain durable evidence/acceptance ID;
+            // only memory waiters withdraw, including for an unreconciled effect-free failure.
             PendingIdempotencyGuard::withdraw(Arc::clone(state), idempotency_key.clone(), owner_id)
                 .await;
             pending_guard.disarm();
             return Err(ApiHttpError::from_api(error));
         }
     };
-    // Best-effort run-side reverse mapping recovers start/fork after Ready
-    // loss. Mutation targets need no orphan scan or sidecar; Ready is primary.
+    // Start/fork sidecars recover Ready loss; mutation targets need neither scan nor sidecar.
     if matches!(scope, "start_run" | "fork_run")
         && let Err(error) = write_orphan_record_async(
             gate.clone(),
@@ -646,8 +636,7 @@ where
                 && committed.run_id != run_id
             {
                 settle_orphan(run_id.clone()).await?;
-                // Owner-checked release cannot remove a successor. Keep the original
-                // storage error if this best-effort release also fails.
+                // Owner-checked release protects successors; preserve the original storage error.
                 let _ = release_durable_pending_async(
                     gate.clone(),
                     idempotency_key.clone(),
@@ -737,7 +726,7 @@ where
 
 /// Admission precedes the final exact canonical identity/TTL check. Expiry or
 /// replacement falls through to normal claiming; cached records cannot replay
-/// a journal that GC was allowed to collect. No execution-shard read lock.
+/// a journal that GC was allowed to collect. No execution-gate read lock.
 async fn replay_ready(
     state: &Arc<AppState>,
     record: durable::DurableIdempotencyRecord,

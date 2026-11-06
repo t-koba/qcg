@@ -1,5 +1,4 @@
-//! Cross-process pending/Ready protocol: locked atomic publication,
-//! conservative reads and owner-checked mutation.
+//! Cross-process Pending/Ready: gated ownership, conservative reads and locked atomic publication.
 use super::idempotency_conflict;
 use crate::server::error::ApiHttpError;
 use camino::Utf8PathBuf;
@@ -15,8 +14,7 @@ pub(crate) struct DurableIdempotencyRecord {
     pub(crate) digest: String,
     pub(crate) run_id: String,
     pub(crate) created_at_unix: u64,
-    /// Claim generation that committed this record. Required: records
-    /// without a generation are corrupt, never defaulted.
+    /// Required committing generation; missing is corrupt, never defaulted.
     pub(crate) generation: u64,
     /// Fresh identity per publication, including when generations restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -31,56 +29,13 @@ fn idempotency_dir(runs_dir: &Utf8PathBuf) -> Utf8PathBuf {
     runs_dir.join("idempotency")
 }
 fn idempotency_path(runs_dir: &Utf8PathBuf, key: &str) -> Utf8PathBuf {
-    idempotency_dir(runs_dir).join(format!(
-        "{}.json",
-        hex::encode(Sha256::digest(key.as_bytes()))
-    ))
+    idempotency_dir(runs_dir).join(format!("{}.json", hex::encode(Sha256::digest(key))))
 }
 fn pending_path(runs_dir: &Utf8PathBuf, key: &str) -> Utf8PathBuf {
-    idempotency_dir(runs_dir).join(format!(
-        "{}.pending.json",
-        hex::encode(Sha256::digest(key.as_bytes()))
-    ))
+    idempotency_path(runs_dir, key).with_extension("pending.json")
 }
-/// Permanent 256 execution shards (first SHA-256 byte): never unlink/rotate.
-/// Collisions serialize; upgrades require quiescing old protocol peers.
-pub(crate) struct ExecutionGate {
-    file: File,
-    runs_dir: Utf8PathBuf,
-    shard: u8,
-}
-impl ExecutionGate {
-    pub(crate) fn try_acquire(runs_dir: &Utf8PathBuf, key: &str) -> Result<Option<Self>, String> {
-        let dir = idempotency_dir(runs_dir);
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let shard = Sha256::digest(key.as_bytes())[0];
-        let path = dir.join(format!(".execution-{shard:02x}.lock"));
-        let file = open_no_follow(&path, true, true, true, false).map_err(|e| e.to_string())?;
-        match file.try_lock() {
-            Ok(()) => Ok(Some(Self {
-                file,
-                runs_dir: runs_dir.clone(),
-                shard,
-            })),
-            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-            Err(std::fs::TryLockError::Error(e)) => Err(e.to_string()),
-        }
-    }
-    fn validate(&self, key: &str) -> Result<(), String> {
-        if self.shard != Sha256::digest(key.as_bytes())[0] {
-            return Err("wrong idempotency execution gate".into());
-        }
-        Ok(())
-    }
-}
-impl Drop for ExecutionGate {
-    fn drop(&mut self) {
-        // Final Arc drop explicitly unlocks; fork/pre-exec descriptors must not extend ownership.
-        if let Err(error) = self.file.unlock() {
-            tracing::warn!(%error, "idempotency execution gate unlock failed");
-        }
-    }
-}
+mod execution;
+pub(crate) use execution::ExecutionGate;
 // Reuse existing peer wait policy, not an additional gate timeout.
 pub(super) const PEER_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 pub(super) const PEER_POLL: std::time::Duration = std::time::Duration::from_millis(100);
@@ -98,13 +53,11 @@ fn test_gate(runs_dir: &Utf8PathBuf, key: &str) -> Result<ExecutionGate, String>
         std::thread::sleep(PEER_POLL);
     }
 }
-/// Claim, store, release and expiry share one cross-process lock.
-/// A generation check and its conditional mutation must be indivisible.
+/// Metadata lock makes owner/generation checks and conditional mutations indivisible.
 fn acquire_idempotency_lock(runs_dir: &Utf8PathBuf) -> Result<File, String> {
     std::fs::create_dir_all(idempotency_dir(runs_dir).as_std_path())
         .map_err(|error| format!("failed to persist idempotency record: {error}"))?;
     let lock_path = idempotency_dir(runs_dir).join(".idempotency.lock");
-    // Lock opens use the same no-follow primitive as records.
     let lock_file = open_no_follow(&lock_path, true, true, true, false)
         .map_err(|error| format!("failed to persist idempotency record: {error}"))?;
     lock_file
@@ -400,8 +353,7 @@ fn reap_expired_ready_snapshot(
     }
     Ok((Some(record), generation))
 }
-/// One past the highest parsed generation; absent counts as zero. Corrupt
-/// records fail before reaching this computation.
+/// Parsed generation floor: absent counts as zero; corrupt records never get here.
 fn pending_generation_from_parsed(pending_generation: u64, ready_generation: u64) -> u64 {
     pending_generation.max(ready_generation).saturating_add(1)
 }
@@ -511,7 +463,7 @@ pub(crate) fn claim_durable_pending_for_target_gated(
 ) -> Result<ClaimOutcome, ApiHttpError> {
     let runs_dir = &gate.runs_dir;
     gate.validate(key).map_err(ApiHttpError::internal)?;
-    // Do not wait for maintenance while holding the key shard. GC snapshots
+    // Do not wait for maintenance while holding the key gate. GC snapshots
     // associations under this lease, then releases metadata before run locks.
     let _maintenance = service::try_lock_store_maintenance(runs_dir)
         .map_err(|e| ApiHttpError::internal(e.to_string()))?
@@ -520,11 +472,8 @@ pub(crate) fn claim_durable_pending_for_target_gated(
                 "run store maintenance is busy; retry with the same key",
             )
         })?;
-    // Temp+rename is atomic but cannot arbitrate owners; hold the shared lock.
     let _lock_held = acquire_idempotency_lock(runs_dir).map_err(ApiHttpError::internal)?;
-    // One snapshot orders Ready convergence before any pending mutation.
     let mut snapshot = read_key_files_snapshot(runs_dir, key).map_err(ApiHttpError::internal)?;
-    // Parse each file once, retaining the expired Ready generation floor.
     let (committed_opt, ready_generation) =
         match reap_expired_ready_snapshot(runs_dir, key, &mut snapshot, ttl) {
             Ok(result) => result,
@@ -599,7 +548,6 @@ pub(crate) fn claim_durable_pending_for_target_gated(
         })?;
     }
     let owner = uuid::Uuid::now_v7().to_string();
-    // Expired records still floor the generation; absence floors at zero.
     let generation = pending_generation_from_parsed(pending_generation, ready_generation);
     let record = DurablePendingRecord {
         key: key.to_string(),
@@ -613,8 +561,7 @@ pub(crate) fn claim_durable_pending_for_target_gated(
     let bytes = serde_json::to_vec(&record).map_err(|error| {
         ApiHttpError::internal(format!("failed to persist idempotency record: {error}"))
     })?;
-    // Stage separately so a crash leaves the predecessor intact. Collisions
-    // get fresh names; repeated collisions fail closed. Expiry is resident-owned.
+    // Exclusive staging preserves the predecessor; resident maintenance owns leftovers.
     let mut attempts = 0;
     let tmp = loop {
         if attempts >= 3 {
@@ -634,7 +581,6 @@ pub(crate) fn claim_durable_pending_for_target_gated(
             Ok(()) => break tmp,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 tracing::warn!(path = %tmp, "claim staging collision; retrying with a fresh id");
-                // Retry with a fresh id; never overwrite a staging collision.
                 continue;
             }
             Err(error) => {
@@ -644,8 +590,7 @@ pub(crate) fn claim_durable_pending_for_target_gated(
             }
         }
     };
-    // Only failed rename leaves a temp. A subsequent directory-sync failure
-    // is a persistence error, not evidence of a leftover temp.
+    // Only failed rename leaves a temp; sync failure is still a persistence error.
     if let Err(error) = rename_verified(&tmp, &path) {
         return Err(ApiHttpError::internal(
             match std::fs::remove_file(tmp.as_std_path()) {
@@ -797,13 +742,8 @@ pub(crate) enum OwnerCheck {
     /// Absent claim: re-enter claim as for a superseded owner.
     Absent,
 }
-/// Recheck owner, generation, digest and key under the shared lock before
-/// execution. The caller holds this key's execution gate, so wall-clock
-/// expiry alone cannot supersede the exact holder: a successor must acquire
-/// the gate to replace the claim. A descheduled, adopted owner still cannot
-/// commit and must not start a stale reservation. Unreadable/foreign claims
-/// fail closed. Expiry remains takeover authority only for a successor that
-/// acquires the gate after release (claim adoption).
+/// Recheck exact key/owner/generation/digest under metadata lock; damage fails closed.
+/// The gate keeps an expired holder authoritative until release, not just until its lease.
 #[cfg(test)]
 pub(crate) fn check_pending_owner(
     runs_dir: &Utf8PathBuf,
@@ -859,10 +799,8 @@ enum PendingRead {
     /// Unusable evidence: never overwrite or wait over potentially live ownership.
     Unusable(String),
 }
-/// Bound record reads: oversize content is foreign damage, never usable state.
 use service::MAX_IDEMPOTENCY_FILE_BYTES;
-/// Absence is reported explicitly so a file vanishing mid-check (a
-/// concurrent release) keeps its historical meaning instead of failing.
+/// Bounded reads distinguish absence (including concurrent release) from damage.
 enum BoundedRead {
     Present(Vec<u8>),
     Absent,
@@ -1181,21 +1119,15 @@ async fn wait_for_peer_ready_with_deadline(
 pub(crate) enum StoreReadyError {
     /// The key already committed a different request digest.
     DigestConflict,
-    /// I/O, corrupt reads, or a superseded generation: details for the
-    /// 500 path, never a second terminal outcome.
+    /// I/O, corruption or supersession: 500 detail, never another terminal outcome.
     Storage(String),
 }
 impl std::fmt::Display for StoreReadyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::DigestConflict => {
-                write!(
-                    f,
-                    "Idempotency-Key was already used with a different request"
-                )
-            }
-            Self::Storage(detail) => write!(f, "{detail}"),
-        }
+        f.write_str(match self {
+            Self::DigestConflict => "Idempotency-Key was already used with a different request",
+            Self::Storage(detail) => detail,
+        })
     }
 }
 impl From<String> for StoreReadyError {
@@ -1203,14 +1135,9 @@ impl From<String> for StoreReadyError {
         Self::Storage(detail)
     }
 }
-/// Publish only for a matching owner/generation/digest/reserved-run claim
-/// observed while holding this key's execution gate. Wall-clock expiry alone
-/// does not refuse the exact holder: a successor must acquire the gate to
-/// replace the claim, so an aged exact claim may still commit. Mismatched or
-/// foreign identities are still refused, and expiry remains takeover
-/// authority for a successor that acquires the gate after release. Equal-
-/// digest Ready converges without renewing its timestamp, but only for a
-/// matching claim or Absent replay; unusable pending evidence is refused.
+/// Publish under the gate for an exact owner/generation/digest/reserved-run claim,
+/// even past its lease. Equal-digest Ready converges without renewing TTL only
+/// with a matching or absent claim; damaged/foreign evidence fails closed.
 #[cfg(test)]
 pub(crate) fn store_durable_ready(
     runs_dir: &Utf8PathBuf,
@@ -1235,17 +1162,9 @@ pub(crate) fn store_durable_ready_gated(
 ) -> Result<DurableIdempotencyRecord, StoreReadyError> {
     let runs_dir = &gate.runs_dir;
     gate.validate(key)?;
-    std::fs::create_dir_all(idempotency_dir(runs_dir).as_std_path())
-        .map_err(|error| error.to_string())?;
     let path = idempotency_path(runs_dir, key);
-    // Temp+rename is atomic but cannot arbitrate owners; hold the shared lock.
     let _lock_held = acquire_idempotency_lock(runs_dir)?;
-    // Ready convergence and pending ownership use one locked snapshot.
     let mut snapshot = read_key_files_snapshot(runs_dir, key)?;
-    // Gate-aware ownership: the exact holder may commit even after the
-    // wall-clock timestamp, because no gate-aware successor could have
-    // replaced the claim while this gate is held. Mismatched identities
-    // are still refused; expiry remains takeover authority after release.
     let check_live_ownership = |pending: &DurablePendingRecord| -> Result<(), StoreReadyError> {
         if pending.owner != owner {
             return Err(StoreReadyError::Storage(
@@ -1346,10 +1265,6 @@ pub(crate) fn store_durable_ready_gated(
                 .unwrap(),
         );
         {
-            // No-follow leaf opens relative to pinned immediate parents on Unix/Windows.
-            // Ancestors of that parent, including the configured store, must stay trusted.
-            // Create via O_EXCL then open existing: avoids macOS racing-create ENOENT.
-            // Bounded retry on deletion churn; links and persistent churn fail closed.
             let open_result = open_no_follow(&tmp, false, true, false, true);
             match open_result {
                 Ok(mut file) => {
@@ -1436,10 +1351,6 @@ pub(crate) fn write_orphan_record(
     }
     let tmp = path.with_extension(format!("tmp-{}", uuid::Uuid::now_v7()));
     {
-        // No-follow leaf opens relative to pinned immediate parents on Unix/Windows.
-        // Ancestors of that parent, including the configured store, must stay trusted.
-        // Create via O_EXCL then open existing: avoids macOS racing-create ENOENT.
-        // Bounded retry on deletion churn; links and persistent churn fail closed.
         let mut file =
             open_no_follow(&tmp, false, true, false, true).map_err(|error| error.to_string())?;
         file.write_all(&bytes).map_err(|error| error.to_string())?;
@@ -1537,27 +1448,6 @@ pub(crate) fn find_orphan_run(
 }
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    #[test]
-    fn execution_gate_unlocks_on_final_arc_even_with_inherited_descriptor() {
-        let runs = Utf8PathBuf::from_path_buf(std::env::temp_dir())
-            .unwrap()
-            .join(format!("gate-final-drop-{}", uuid::Uuid::now_v7()));
-        let gate = ExecutionGate::try_acquire(&runs, "key").unwrap().unwrap();
-        // dup shares the open file description, just as a pre-exec fork
-        // does, without forking a multithreaded test process.
-        let inherited = gate.file.try_clone().unwrap();
-        let owner = std::sync::Arc::new(gate);
-        let blocking_writer = owner.clone();
-        drop(owner);
-        assert!(ExecutionGate::try_acquire(&runs, "key").unwrap().is_none());
-        drop(blocking_writer);
-        let successor = ExecutionGate::try_acquire(&runs, "key").unwrap().unwrap();
-        drop(inherited);
-        assert!(ExecutionGate::try_acquire(&runs, "key").unwrap().is_none());
-        drop(successor);
-        std::fs::remove_dir_all(runs).unwrap();
-    }
 
     use super::*;
 

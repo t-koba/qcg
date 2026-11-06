@@ -9,6 +9,7 @@ pub(crate) struct IdempotencySweep {
     interval: Duration,
     max_entries: usize,
     temps: Mutex<Option<fs::ReadDir>>,
+    gates: Mutex<Option<fs::ReadDir>>,
     migration: Mutex<Option<MigrationCursor>>,
     due: Mutex<DueCursor>,
 }
@@ -26,6 +27,7 @@ impl IdempotencySweep {
             interval,
             max_entries,
             temps: Default::default(),
+            gates: Default::default(),
             migration: Default::default(),
             due: Default::default(),
         }
@@ -54,7 +56,7 @@ impl IdempotencySweep {
             }
         }
     }
-    // Independent bounded migration, retirement, traversal and temp work (see server guide).
+    // Independent bounded migration, retirement, traversal, temp and gate work (see server guide).
     fn pass_at(
         &self,
         runs: &Utf8PathBuf,
@@ -92,21 +94,38 @@ impl IdempotencySweep {
             }
             Ok(())
         })();
-        let temp_result = self.clean_temps(runs, now, stop);
+        let temp_result = self.clean_files(temp_dir(runs)?, &self.temps, stop, |entry| {
+            clean_temp(entry, now)
+        });
+        ensure_dir(&execution::directory(runs))?;
+        let gate_result =
+            self.clean_files(execution::directory(runs), &self.gates, stop, |entry| {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| n.strip_suffix(".lock").is_some_and(canonical_key_hash))
+                {
+                    let path = Utf8PathBuf::from_path_buf(entry.path())
+                        .map_err(|_| "non-UTF8 gate path")?;
+                    execution::reclaim(runs, &path)?;
+                }
+                Ok(())
+            });
         check_stop(stop)?;
         result
             .and(temp_result)
+            .and(gate_result)
             .and(failure.map_or(Ok(()), Err))
             .map(|()| consumed)
     }
-    fn clean_temps(
+    fn clean_files(
         &self,
-        runs: &Utf8PathBuf,
-        now: u64,
+        dir: Utf8PathBuf,
+        cursor: &Mutex<Option<fs::ReadDir>>,
         stop: &CancellationToken,
+        clean: impl Fn(fs::DirEntry) -> Result<(), String>,
     ) -> Result<(), String> {
-        let dir = temp_dir(runs)?;
-        let mut cursor = self.temps.lock().map_err(|_| "temp cursor poisoned")?;
+        let mut cursor = cursor.lock().map_err(|_| "cleanup cursor poisoned")?;
         if cursor.is_none() {
             *cursor = Some(fs::read_dir(dir).map_err(|e| e.to_string())?);
         }
@@ -116,7 +135,7 @@ impl IdempotencySweep {
                 *cursor = None;
                 break;
             };
-            clean_temp(entry.map_err(|e| e.to_string())?, now)?;
+            clean(entry.map_err(|e| e.to_string())?)?;
         }
         Ok(())
     }
@@ -552,48 +571,90 @@ mod tests {
     }
 
     #[test]
-    fn maintenance_never_unlinks_held_or_idle_execution_gates() {
+    fn maintenance_reclaims_process_exit_leftovers_with_bounded_cursor() {
+        let runs = runs();
+        assert!(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "server::idempotency::execution_gate_tests::gate_process"
+                ])
+                .env("QCG_GATE_TEST_RUNS", runs.as_str())
+                .env("QCG_GATE_TEST_MODE", "leftover")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let dir = execution::directory(&runs);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        // Two more abandoned files demonstrate the independent one-entry budget.
+        for key in ["abandoned-1", "abandoned-2"] {
+            fs::write(
+                dir.join(format!("{}.lock", hex::encode(Sha256::digest(key)))),
+                b"",
+            )
+            .unwrap();
+        }
+        fs::write(idempotency_dir(&runs).join(".expiry-complete"), b"1").unwrap();
+        let sweep = IdempotencySweep::new(Duration::from_secs(1), 1);
+        for remaining in (0..3).rev() {
+            sweep
+                .pass_at(
+                    &runs,
+                    Duration::from_secs(1),
+                    || Ok(u64::MAX),
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), remaining);
+        }
+        fs::remove_dir_all(runs).unwrap();
+    }
+
+    #[test]
+    fn maintenance_reclaims_idle_but_not_held_execution_gates() {
         let runs = runs();
         let key = "gate-retention";
         let held = ExecutionGate::try_acquire(&runs, key).unwrap().unwrap();
-        let path = idempotency_dir(&runs).join(format!(
-            ".execution-{:02x}.lock",
-            Sha256::digest(key.as_bytes())[0]
-        ));
-        let opened = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        let sweep = IdempotencySweep::default();
-        sweep
-            .pass_at(
-                &runs,
-                Duration::from_secs(1),
-                || Ok(u64::MAX),
-                &CancellationToken::new(),
-            )
-            .unwrap();
+        let path =
+            execution::directory(&runs).join(format!("{}.lock", hex::encode(Sha256::digest(key))));
+        fs::write(idempotency_dir(&runs).join(".expiry-complete"), b"1").unwrap();
+        let sweep = IdempotencySweep::new(Duration::from_secs(1), 1);
+        let pass = || {
+            sweep
+                .pass_at(
+                    &runs,
+                    Duration::from_secs(1),
+                    || Ok(u64::MAX),
+                    &CancellationToken::new(),
+                )
+                .unwrap()
+        };
+        pass();
+        assert!(path.exists());
         assert!(ExecutionGate::try_acquire(&runs, key).unwrap().is_none());
-        assert!(matches!(
-            opened.try_lock(),
-            Err(fs::TryLockError::WouldBlock)
-        ));
+        // An independent registry owner makes final-drop cleanup defer.
+        let registry = open_no_follow(
+            &idempotency_dir(&runs).join(".execution-registry.lock"),
+            true,
+            true,
+            false,
+            false,
+        )
+        .unwrap();
+        registry.try_lock().unwrap();
         drop(held);
-        sweep
-            .pass_at(
-                &runs,
-                Duration::from_secs(1),
-                || Ok(u64::MAX),
-                &CancellationToken::new(),
-            )
-            .unwrap();
-        opened.try_lock().unwrap();
-        assert!(
-            ExecutionGate::try_acquire(&runs, key).unwrap().is_none(),
-            "fresh opens must still share the idle inode"
-        );
-        drop(opened);
+        assert!(path.exists());
+        drop(registry);
+        for _ in 0..3 {
+            pass();
+        }
+        assert!(!path.exists());
+        let successor = ExecutionGate::try_acquire(&runs, key).unwrap().unwrap();
+        pass();
+        assert!(ExecutionGate::try_acquire(&runs, key).unwrap().is_none());
+        drop(successor);
+        assert!(!path.exists(), "normal completion reclaims promptly");
         fs::remove_dir_all(runs).unwrap();
     }
 

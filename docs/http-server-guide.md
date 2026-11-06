@@ -167,20 +167,39 @@ cancellation or error wakes them to retry through durable admission instead.
 A pending request owned by another process may return `503 Service Unavailable`.
 Reusing a still-bound key with changed content normally returns `409 Conflict`.
 Busy-gate contention can instead time out with `503`, even when a different
-digest would otherwise conflict: expired claims and shard collisions need
-not expose a live conflicting claim before the gate is acquired.
+digest would otherwise conflict: expired claims need not expose a live
+conflicting claim before the gate is acquired.
 
 Keyed durable ownership and service acceptance share a cross-process execution
 gate, held from claim validation through execution and Ready publication.
-The SHA-256 hash of the key selects a stable gate by its first byte: at most
-256 `.execution-XX.lock` files in the idempotency directory, outside deletable
-run directories. This byte-addressed namespace is a shared protocol, not a
-per-host tuning setting; colliding keys serialize. Gate files are permanent
-coordination state: never unlink, replace, or rotate them, including when idle.
-A waiter or blocked writer may already hold an open handle to the same inode.
+Each full SHA-256 key hash names one `.execution/<hash>.lock` file under
+`<runs-dir>/idempotency/`, outside deletable run directories. Unrelated keys
+no longer share first-byte execution shards. A permanent
+`.execution-registry.lock` serializes only file open/try-lock/close and
+reclamation, never gate waiting or request execution. Both locks are tried
+without blocking: an unsuccessful contender closes its key handle before
+releasing the registry and polling. There are no retained open waiters.
+Final gate release explicitly unlocks and closes its handle, then tries the
+registry and rechecks the key file's lock before closing/unlinking it. A busy
+registry or replacement holder defers reclamation. This ordering prevents an
+open racing cleanup from later locking a retired inode. Do not open, unlink,
+replace or rotate these coordination files outside this protocol while peers
+are running; the registry itself is never reclaimed.
+Normal completions reclaim promptly. Crash/deferred leftovers are reclaimed
+by the resident idempotency task, with an independent directory cursor visiting
+at most `IDEMPOTENCY_SWEEP_MAX_ENTRIES` key-file entries per pass at the existing
+`IDEMPOTENCY_SWEEP_INTERVAL_SECS` cadence. Held gates are skipped regardless of
+age; no per-request directory scan or permanent per-key state is required.
+This bounds work per pass, not the number of simultaneously active/crashed keys;
+downtime, contention and errors extend cleanup lag. OS locks cover process death,
+not power-loss durability. File locking uses `std::fs::File::try_lock`/`unlock`
+(available before the workspace's Rust 1.99 MSRV): Unix advisory flock and Windows
+LockFileEx semantics. Windows opens share delete access; reclamation closes the
+probe before removal. All peers must use the same protocol on a filesystem
+supporting these locks; Unix/Windows no-follow opens remain mandatory.
 Claim publication tries the store `.maintenance.lock` after the gate and before
 `.idempotency.lock`; busy maintenance returns retryable `503` without waiting
-under the key shard. Existing mutation targets are rechecked under maintenance
+under the key gate. Existing mutation targets are rechecked under maintenance
 before Pending publication: the run directory, metadata directory and journal
 must be real directories/a regular file, not symlinks. No process waits for a gate or run admission while
 holding the metadata lock. Request cancellation stops gate
@@ -247,8 +266,12 @@ writers before upgrading a shared store, and upgrade every writer before
 resuming. Reconcile legacy Pending operations and their associated runs under
 quiescence before manually resolving their records; do not simply delete them
 or manufacture IDs to unblock retries. Mixed-version writers are unsupported:
-old binaries neither preserve these IDs nor honor execution gates. Ready format
-and TTL are unchanged. Keep runs-directory ancestry trusted and unchanged.
+older pre-fence binaries neither preserve these IDs nor honor execution gates;
+first-byte-shard binaries use a different gate namespace and cannot coordinate
+with exact-key gates. Stop every peer before either upgrade or rollback. Under
+quiescence, obsolete `.execution-XX.lock` shard files may be removed; never
+remove live protocol coordination files. Ready format and TTL are unchanged.
+Keep runs-directory ancestry trusted and unchanged.
 
 Ready expires when the wall clock reaches its persisted creation second plus
 `IDEMPOTENCY_TTL_SECS` (the cutoff is inclusive). Replay never renews it.
