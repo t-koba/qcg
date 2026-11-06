@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <title>SchemaField component test</title>
+  <body>
+    <script type="module">
+      import { flushSync, mount, unmount } from "svelte";
+      import SchemaField from "../src/SchemaField.svelte";
+
+      window.renderSchemaField = async (schema, value) => {
+        const target = document.createElement("div");
+        document.body.append(target);
+        const emitted = [];
+        const component = mount(SchemaField, {
+          target,
+          props: {
+            schema, value, required: true, idPrefix: "single-branch",
+            onValue: (path, value) => emitted.push({ path, value }),
+            onFile: async () => undefined,
+          },
+        });
+        try {
+          flushSync();
+          return { emitted, options: target.querySelectorAll("select option").length };
+        } finally {
+          await unmount(component);
+          target.remove();
+        }
+      };
+    </script>
+  </body>
+</html>

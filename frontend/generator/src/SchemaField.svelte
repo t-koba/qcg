@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import type { InputField } from "./api/client";
   import SchemaErrorList from "./SchemaErrorList.svelte";
   import SchemaField from "./SchemaField.svelte";
@@ -190,6 +191,13 @@
   let canRemoveItem = $derived(arrayValue.length > (numeric(schema.minItems, 0) ?? 0));
   let branches = $derived(schemaBranches(schema));
   let activeBranch = $derived(branches[selectedBranch] || branches[0] || {});
+
+  onMount(() => {
+    if (branches.length === 1 && value === undefined) {
+      const initial = schemaBranchInitialValue(branches[0]);
+      if (initial !== undefined) emit(initial);
+    }
+  });
   let options = $derived(optionValues(schema, field));
   let inputType = $derived(schemaInputType(schema, ui, canonicalType));
   let constraintHint = $derived(buildConstraintHint(schema, language));

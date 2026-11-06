@@ -189,6 +189,9 @@ jobs:
         run: |
           npm --prefix frontend/generator exec -- playwright install --with-deps chromium
 
+      - name: SchemaField component interaction
+        run: node frontend/generator/scripts/test-schema-field.mjs
+
       - name: UI Playwright smoke
         run: node scripts/e2e-ui-playwright.mjs
 
