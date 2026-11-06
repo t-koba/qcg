@@ -120,6 +120,7 @@ impl LocalService {
                 }
                 _ => None,
             };
+            let check_run_dir = persist.run_dir.clone();
             // One durable timestamp shared by the journal event and the
             // memory record so restarts observe the same requeue order.
             let queued_now = chrono::Utc::now();
@@ -138,7 +139,11 @@ impl LocalService {
                             "run is already terminal".into(),
                         ));
                     }
-                    if state.cancel_requested {
+                    if state.cancel_requested
+                        || !crate::run_dirs::list_pending_cancel_controls(&check_run_dir)
+                            .map_err(|error| JournalError::InvalidEvent(error.to_string()))?
+                            .is_empty()
+                    {
                         return Err(JournalError::PreconditionFailed(
                             "a cancel was accepted".into(),
                         ));
@@ -316,16 +321,11 @@ impl LocalService {
                             "run is already terminal".into(),
                         ));
                     }
-                    if !approved
-                        && !crate::run_dirs::list_pending_cancel_controls(&check_run_dir)
+                    if state.cancel_requested
+                        || !crate::run_dirs::list_pending_cancel_controls(&check_run_dir)
                             .map_err(|error| JournalError::InvalidEvent(error.to_string()))?
                             .is_empty()
                     {
-                        return Err(JournalError::PreconditionFailed(
-                            "a cancel mailbox was accepted".into(),
-                        ));
-                    }
-                    if state.cancel_requested {
                         return Err(JournalError::PreconditionFailed(
                             "a cancel was accepted".into(),
                         ));

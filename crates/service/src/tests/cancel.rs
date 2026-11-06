@@ -430,6 +430,18 @@ enabled = false"#,
             .count(),
         1
     );
+    let cancel_seq = events
+        .iter()
+        .find(|event| event["t"] == "user_cancel_requested")
+        .expect("accepted cancel should be journaled")["seq"]
+        .as_u64()
+        .expect("cancel event sequence");
+    if let Some(answer) = events.iter().find(|event| event["t"] == "user_answered") {
+        assert!(
+            answer["seq"].as_u64().expect("answer event sequence") < cancel_seq,
+            "an answer accepted before cancellation must precede its journal event"
+        );
+    }
     assert!(
         !events
             .iter()
@@ -900,6 +912,69 @@ enabled = false"#,
             .join(format!("cancel-{ghost}.json"))
             .exists(),
         "a requester-less control must be consumed"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn accepted_cancel_mailbox_blocks_a_later_answer() {
+    let root = temp_run_dir("cancel-mailbox-answer-order");
+    let _guard = TempGuard(root.clone());
+    let generators =
+        Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+    let service = test_service(vec![generators], root.join("runs"));
+    let id = service
+        .start_run(StartRun {
+            generator_id: "ask-user".into(),
+            inputs: BTreeMap::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("interactive run should start");
+    let waiting = wait_for_snapshot(&service, &id, RunStatus::Waiting).await;
+    let question = waiting.question.expect("run should ask its question");
+    let run_dir = service.run_dir_for(&id).await.expect("run directory");
+    let limits = engine::JournalLimits::from(
+        &service.inner.runs.read().await[&id]
+            .contract
+            .manifest
+            .runtime,
+    );
+    let operation = uuid::Uuid::now_v7().to_string();
+    crate::run_dirs::request_remote_cancel_with_id(&run_dir, &id, "peer", &operation, limits)
+        .expect("cancel mailbox should publish first");
+
+    let answer = service
+        .answer(
+            id.clone(),
+            question.id,
+            AnswerPayload {
+                values: BTreeMap::from([("answer".into(), json!("brief"))]),
+            },
+        )
+        .await;
+    if answer.is_err() {
+        service
+            .cancel_with_operation_id(id.clone(), operation)
+            .await
+            .expect("the first accepted cancel should settle");
+    }
+    assert!(
+        answer.is_err(),
+        "a later answer must not be accepted after durable cancel publication"
+    );
+    assert_eq!(
+        wait_for_terminal_snapshot(&service, &id).await.state,
+        RunStatus::Canceled
+    );
+    let events = read_journal_events(&run_dir).expect("journal should parse");
+    assert!(!events.iter().any(|event| event["t"] == "user_answered"));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["t"] == "user_cancel_requested")
+            .count(),
+        1
     );
 }
 

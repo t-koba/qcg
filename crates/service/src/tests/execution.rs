@@ -3224,6 +3224,67 @@ async fn cancel_mailbox_precedes_denial_acceptance() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn cancel_mailbox_precedes_confirmation_approval() {
+    let service = test_service(
+        vec![Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators")],
+        temp_run_dir("cancel-approval-order"),
+    );
+    let id = service
+        .start_run(StartRun {
+            generator_id: "side-effect-confirm".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let prompt = wait_for_snapshot(&service, &id, RunStatus::Confirming)
+        .await
+        .confirm
+        .unwrap();
+    let run_dir = service.run_dir_for(&id).await.unwrap();
+    let operation = uuid::Uuid::now_v7().to_string();
+    let limits = engine::JournalLimits::from(
+        &service.inner.runs.read().await[&id]
+            .contract
+            .manifest
+            .runtime,
+    );
+    crate::run_dirs::request_remote_cancel_with_id(&run_dir, &id, "peer", &operation, limits)
+        .unwrap();
+    assert!(
+        service
+            .confirm(
+                id.clone(),
+                prompt.id,
+                ConfirmDecision {
+                    decision: ConfirmationDecision::Approve,
+                }
+            )
+            .await
+            .is_err()
+    );
+    service
+        .cancel_with_operation_id(id.clone(), operation)
+        .await
+        .unwrap();
+    assert_eq!(
+        wait_for_terminal_snapshot(&service, &id).await.state,
+        RunStatus::Canceled
+    );
+    let events: Vec<Value> = read_journal_string(&service, id)
+        .await
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(!events.iter().any(|event| event["t"] == "user_confirmed"));
+    assert!(
+        !events.iter().any(|event| {
+            event["t"] == "side_effect" && event["decision"] == "approved_by_user"
+        })
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn accepted_denial_cannot_be_overtaken_by_cancel() {
     let service = test_service(
         vec![Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators")],

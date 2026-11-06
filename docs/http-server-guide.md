@@ -193,14 +193,17 @@ cannot supersede an owner that still holds its execution gate.
 
 A service execution that returns an error preserves its Pending claim: the
 error alone does not prove the operation had no effects. During ordinary
-operation, cancel mailbox publication and acceptance of a denied confirmation
-serialize under the run's journal lock. If the mailbox is published first, the
-denial append is refused and the cancel is drained idempotently. If denial was
-already accepted, cancel publishes no mailbox and reconciles that denial; a
-failed reconciliation preserves the accepted decision and retryable Pending
-evidence. A mailbox from an accepted cancel remains on an error; shutdown may
-withdraw only a newly published mailbox when refusing that request, as noted
-below. An error while reconciling an earlier denial is not an accepted cancel.
+operation, cancel mailbox publication serializes with new answer and
+confirmation acceptance under the run's journal lock. If a valid mailbox is
+published first, new answers and approvals or denials are refused before their
+journal append; execution admission also rechecks the mailbox before running a
+resumed step. An accepted answer or approval remains cancelable by a later
+request. Conversely, a denial already accepted before cancel publication is
+reconciled by cancel without publishing a mailbox; a failed reconciliation
+preserves the accepted decision and retryable Pending evidence. A mailbox from
+an accepted cancel remains on an error; shutdown may withdraw only a newly
+published mailbox when refusing that request, as noted below. An error while
+reconciling an earlier denial is not an accepted cancel.
 Releasing the claim on error could let a retry execute as a fresh owner over an
 already-accepted operation. Only the process-local waiter entry is withdrawn
 and woken; the
