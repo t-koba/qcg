@@ -658,19 +658,44 @@ mod tests {
         let root = root.0.as_path();
         let (a, _) = journal_at(root.join("a"));
         let (b, _) = journal_at(root.join("b"));
+        // Timestamp precision changes String charges even for equal-length paths.
+        for (run, ts) in [
+            (&a, "2026-01-01T00:00:00.123+00:00"),
+            (&b, "2026-01-01T00:00:00.123456789+00:00"),
+        ] {
+            let path = run_meta_dir(run).join("journal.jsonl");
+            let mut event: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            event["ts"] = serde_json::json!(ts);
+            std::fs::write(path, format!("{event}\n")).unwrap();
+        }
         let probe = ReadStore::new(1, policy::DEFAULT_READ_CACHE_BYTES);
         probe.list_item(&a).unwrap();
-        let compact = probe.entries.lock().unwrap().bytes;
+        let compact_a = probe.entries.lock().unwrap().bytes;
         probe.read(&a).unwrap();
-        let full = probe.entries.lock().unwrap().bytes;
-        assert!(compact < full / 4);
-        let store = ReadStore::new(1, compact);
-        for run in [&a, &b, &a] {
+        let full_a = probe.entries.lock().unwrap().bytes;
+        probe.list_item(&b).unwrap();
+        let compact_b =
+            probe.entries.lock().unwrap().views[&run_meta_dir(&b).join("journal.jsonl")].bytes;
+        probe.read(&b).unwrap();
+        let full_b = probe.entries.lock().unwrap().bytes;
+        let full = full_a.max(full_b);
+        assert!(compact_a.max(compact_b) < full_a.min(full_b) / 4);
+        // Admit either entry individually, but never both together. Otherwise an
+        // oversized b is returned uncached and the final a is still a cache hit.
+        let capacity = compact_a.max(compact_b);
+        assert!(capacity < compact_a + compact_b);
+        assert!(full < full_a + compact_b);
+        let store = ReadStore::new(1, capacity);
+        for (run, bytes) in [(&a, compact_a), (&b, compact_b), (&a, compact_a)] {
             store.list_item(run).unwrap();
             let cache = store.entries.lock().unwrap();
+            let key = run_meta_dir(run).join("journal.jsonl");
             assert_eq!(cache.views.len(), 1);
-            assert_eq!(cache.bytes, compact);
+            assert_eq!(cache.bytes, bytes);
+            assert_eq!(cache.views[&key].bytes, bytes);
             assert_eq!(cache.recency.len(), 1);
+            assert_eq!(cache.recency.first_key_value().unwrap().0.1, key);
         }
         assert_eq!(store.applied.load(Ordering::Relaxed), 3);
         let store = ReadStore::new(1, full);
@@ -712,7 +737,7 @@ mod tests {
             cache.views.values().map(|entry| entry.bytes).sum::<usize>()
         );
         assert_eq!(cache.views.len(), cache.recency.len());
-        let disabled = ReadStore::new(1, compact - 1);
+        let disabled = ReadStore::new(1, compact_a - 1);
         disabled.list_item(&a).unwrap();
         assert!(disabled.entries.lock().unwrap().views.is_empty());
     }
