@@ -1689,17 +1689,31 @@ async fn matching_pending_start_waits_after_package_removal() {
     .expect_err("different body must conflict with the pending claim");
     assert_eq!(conflict.problem.status, StatusCode::CONFLICT.as_u16());
 
-    state.idempotency.lock().await.insert(
-        key.to_string(),
-        IdempotencyEntry::ready(crate::durable::DurableIdempotencyRecord {
-            publication_id: None,
-            key: key.to_string(),
-            digest,
-            created_at_unix: crate::durable::now_unix().expect("clock"),
-            run_id: run_id.clone(),
-            generation: 1,
-        }),
-    );
+    let ready_record = crate::durable::DurableIdempotencyRecord {
+        publication_id: None,
+        key: key.to_string(),
+        digest,
+        created_at_unix: crate::durable::now_unix().expect("clock"),
+        run_id: run_id.clone(),
+        generation: 1,
+    };
+    let idempotency_dir = root.join("runs").join("idempotency");
+    std::fs::create_dir_all(&idempotency_dir).expect("create durable idempotency directory");
+    use sha2::Digest as _;
+    let ready_path = idempotency_dir.join(format!(
+        "{}.json",
+        hex::encode(sha2::Sha256::digest(key.as_bytes())),
+    ));
+    std::fs::write(
+        ready_path,
+        serde_json::to_vec(&ready_record).expect("serialize durable ready record"),
+    )
+    .expect("persist canonical ready record");
+    state
+        .idempotency
+        .lock()
+        .await
+        .insert(key.to_string(), IdempotencyEntry::ready(ready_record));
     completed.send(true).expect("wake pending retry");
     let response = retry
         .await
@@ -1919,10 +1933,12 @@ async fn concurrent_same_key_starts_converge_on_one_run() {
         .expect("runs dir should be readable")
         .flatten()
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        // The idempotency bookkeeping directory, the store lock, and
-        // per-run admission locks are not runs.
+        // Idempotency bookkeeping and all coordination locks are not runs.
         .filter(|name| {
-            name != "idempotency" && name != ".service.lock" && !name.starts_with(".admission-")
+            name != "idempotency"
+                && name != ".service.lock"
+                && name != ".maintenance.lock"
+                && !name.starts_with(".admission-")
         })
         .collect();
     let created: Vec<_> = after.difference(&before).collect();
